@@ -16,7 +16,7 @@ categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
 # Core dependencies
-rmcp = { version = "0.1", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "0.12", features = ["server", "transport-io", "macros"] }
 lsp-types = "0.97"
 tokio = { version = "1.48", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
