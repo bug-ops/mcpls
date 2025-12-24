@@ -1,0 +1,59 @@
+# Example MCPLS configuration file
+# Copy to ~/.config/mcpls/mcpls.toml or specify with --config flag
+
+# Workspace settings
+[workspace]
+# Root directories for the workspace
+roots = [
+    # Add your project paths here
+    # "/home/user/projects/myproject",
+]
+
+# Position encoding preference (utf-8 is more efficient for Rust)
+position_encodings = ["utf-8", "utf-16"]
+
+# Rust - rust-analyzer
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+timeout_seconds = 30
+
+# Uncomment and configure as needed:
+
+# [lsp_servers.initialization_options]
+# cargo.features = "all"
+# checkOnSave.command = "clippy"
+
+# Python - pyright
+# [[lsp_servers]]
+# language_id = "python"
+# command = "pyright-langserver"
+# args = ["--stdio"]
+# file_patterns = ["**/*.py"]
+# timeout_seconds = 30
+
+# TypeScript/JavaScript - typescript-language-server
+# [[lsp_servers]]
+# language_id = "typescript"
+# command = "typescript-language-server"
+# args = ["--stdio"]
+# file_patterns = ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"]
+# timeout_seconds = 30
+
+# Go - gopls
+# [[lsp_servers]]
+# language_id = "go"
+# command = "gopls"
+# args = ["serve"]
+# file_patterns = ["**/*.go"]
+# timeout_seconds = 30
+
+# C/C++ - clangd
+# [[lsp_servers]]
+# language_id = "c"
+# command = "clangd"
+# args = ["--background-index"]
+# file_patterns = ["**/*.c", "**/*.h", "**/*.cpp", "**/*.hpp"]
+# timeout_seconds = 30
