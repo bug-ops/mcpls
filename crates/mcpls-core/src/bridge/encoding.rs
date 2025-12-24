@@ -58,6 +58,115 @@ pub fn lsp_to_mcp_position(pos: Position) -> (u32, u32) {
     (pos.line + 1, pos.character + 1)
 }
 
+/// Position encoding converter for handling UTF-8/UTF-16/UTF-32 conversions.
+///
+/// Different LSP servers may use different character encodings. This converter
+/// handles the conversion between byte offsets and character offsets based on
+/// the negotiated encoding.
+#[derive(Debug, Clone)]
+pub struct EncodingConverter {
+    encoding: PositionEncoding,
+}
+
+impl EncodingConverter {
+    /// Create a new encoding converter with the specified encoding.
+    #[must_use]
+    pub fn new(encoding: PositionEncoding) -> Self {
+        Self { encoding }
+    }
+
+    /// Convert byte offset to character offset in the configured encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The byte offset is not on a character boundary
+    /// - The encoding is unsupported
+    pub fn byte_offset_to_character(&self, text: &str, byte_offset: usize) -> Result<u32, String> {
+        if byte_offset > text.len() {
+            return Err(format!(
+                "Byte offset {} exceeds text length {}",
+                byte_offset,
+                text.len()
+            ));
+        }
+
+        match self.encoding {
+            PositionEncoding::Utf8 => Ok(byte_offset as u32),
+            PositionEncoding::Utf16 => {
+                let utf16_units = text[..byte_offset].encode_utf16().count();
+                Ok(utf16_units as u32)
+            }
+            PositionEncoding::Utf32 => {
+                let code_points = text[..byte_offset].chars().count();
+                Ok(code_points as u32)
+            }
+        }
+    }
+
+    /// Convert character offset to byte offset in the configured encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The character offset is out of bounds
+    /// - The encoding is unsupported
+    pub fn character_to_byte_offset(
+        &self,
+        text: &str,
+        character_offset: u32,
+    ) -> Result<usize, String> {
+        match self.encoding {
+            PositionEncoding::Utf8 => {
+                let byte_offset = character_offset as usize;
+                if byte_offset > text.len() {
+                    return Err(format!(
+                        "Character offset {} exceeds text length {}",
+                        character_offset,
+                        text.len()
+                    ));
+                }
+                Ok(byte_offset)
+            }
+            PositionEncoding::Utf16 => {
+                let mut utf16_count = 0u32;
+                for (byte_idx, ch) in text.char_indices() {
+                    if utf16_count >= character_offset {
+                        return Ok(byte_idx);
+                    }
+                    utf16_count += ch.len_utf16() as u32;
+                }
+                if utf16_count == character_offset {
+                    Ok(text.len())
+                } else {
+                    Err(format!(
+                        "Character offset {} out of bounds (max UTF-16 units: {})",
+                        character_offset, utf16_count
+                    ))
+                }
+            }
+            PositionEncoding::Utf32 => text
+                .char_indices()
+                .nth(character_offset as usize)
+                .map(|(byte_idx, _)| byte_idx)
+                .or_else(|| {
+                    if character_offset == text.chars().count() as u32 {
+                        Some(text.len())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Character offset {} out of bounds (max code points: {})",
+                        character_offset,
+                        text.chars().count()
+                    )
+                }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,9 +221,86 @@ mod tests {
 
     #[test]
     fn test_position_encoding_parsing() {
-        assert_eq!(PositionEncoding::from_lsp("utf-8"), Some(PositionEncoding::Utf8));
-        assert_eq!(PositionEncoding::from_lsp("utf-16"), Some(PositionEncoding::Utf16));
-        assert_eq!(PositionEncoding::from_lsp("utf-32"), Some(PositionEncoding::Utf32));
+        assert_eq!(
+            PositionEncoding::from_lsp("utf-8"),
+            Some(PositionEncoding::Utf8)
+        );
+        assert_eq!(
+            PositionEncoding::from_lsp("utf-16"),
+            Some(PositionEncoding::Utf16)
+        );
+        assert_eq!(
+            PositionEncoding::from_lsp("utf-32"),
+            Some(PositionEncoding::Utf32)
+        );
         assert_eq!(PositionEncoding::from_lsp("invalid"), None);
+    }
+
+    #[test]
+    fn test_utf8_encoding() {
+        let converter = EncodingConverter::new(PositionEncoding::Utf8);
+        let text = "Hello, world!";
+
+        let char_offset = converter.byte_offset_to_character(text, 7).unwrap();
+        assert_eq!(char_offset, 7);
+
+        let byte_offset = converter.character_to_byte_offset(text, 7).unwrap();
+        assert_eq!(byte_offset, 7);
+    }
+
+    #[test]
+    fn test_utf16_encoding_with_emoji() {
+        let converter = EncodingConverter::new(PositionEncoding::Utf16);
+        let text = "Hello 😀 world";
+
+        let char_offset = converter.byte_offset_to_character(text, 6).unwrap();
+        assert_eq!(char_offset, 6);
+
+        let char_offset = converter.byte_offset_to_character(text, 10).unwrap();
+        assert_eq!(char_offset, 8);
+
+        let byte_offset = converter.character_to_byte_offset(text, 6).unwrap();
+        assert_eq!(byte_offset, 6);
+
+        let byte_offset = converter.character_to_byte_offset(text, 8).unwrap();
+        assert_eq!(byte_offset, 10);
+    }
+
+    #[test]
+    fn test_utf16_encoding_roundtrip() {
+        let converter = EncodingConverter::new(PositionEncoding::Utf16);
+        let text = "Hello 🌍 world!";
+
+        for byte_idx in [0, 6, 10, 11] {
+            let char_offset = converter.byte_offset_to_character(text, byte_idx).unwrap();
+            let back_to_byte = converter.character_to_byte_offset(text, char_offset).unwrap();
+            assert_eq!(byte_idx, back_to_byte);
+        }
+    }
+
+    #[test]
+    fn test_utf32_encoding() {
+        let converter = EncodingConverter::new(PositionEncoding::Utf32);
+        let text = "Hello 😀 world";
+
+        let char_offset = converter.byte_offset_to_character(text, 6).unwrap();
+        assert_eq!(char_offset, 6);
+
+        let char_offset = converter.byte_offset_to_character(text, 10).unwrap();
+        assert_eq!(char_offset, 7);
+
+        let byte_offset = converter.character_to_byte_offset(text, 7).unwrap();
+        assert_eq!(byte_offset, 10);
+    }
+
+    #[test]
+    fn test_encoding_edge_cases() {
+        let converter = EncodingConverter::new(PositionEncoding::Utf8);
+
+        assert!(converter.byte_offset_to_character("test", 100).is_err());
+        assert!(converter.character_to_byte_offset("test", 100).is_err());
+
+        let end_offset = converter.byte_offset_to_character("test", 4).unwrap();
+        assert_eq!(end_offset, 4);
     }
 }
