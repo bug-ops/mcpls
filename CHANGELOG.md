@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2024-12-24
+## [0.1.0] - 2025-12-25
 
 Initial release of mcpls - Universal MCP to LSP bridge enabling AI agents to access semantic code intelligence.
 
@@ -148,14 +148,12 @@ Initial release of mcpls - Universal MCP to LSP bridge enabling AI agents to acc
 ## Technical Details
 
 **Architecture**:
-```
-AI Agent (Claude)
-    ↓ MCP Protocol (JSON-RPC 2.0)
-mcpls Server (rmcp)
-    ↓ Translation Layer
-LSP Client Manager
-    ↓ LSP Protocol (JSON-RPC 2.0)
-Language Servers (rust-analyzer, pyright, etc.)
+```mermaid
+flowchart TB
+    A["AI Agent (Claude)"] <-->|"MCP Protocol"| B["mcpls Server (rmcp)"]
+    B --> C["Translation Layer"]
+    C --> D["LSP Client Manager"]
+    D <-->|"LSP Protocol"| E["Language Servers"]
 ```
 
 **Dependencies**:
