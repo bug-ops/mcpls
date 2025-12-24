@@ -121,7 +121,7 @@ args = ["--stdio"]  # Many servers require --stdio flag
 ### `file_patterns`
 
 **Type**: Array of strings (glob patterns)
-**Required**: Yes
+**Required**: No (defaults to empty array)
 
 File patterns to associate with this language server.
 
@@ -172,6 +172,25 @@ python.analysis.typeCheckingMode = "strict"
 ```
 
 See your language server documentation for available options.
+
+### `env`
+
+**Type**: Table (key-value pairs)
+**Default**: `{}`
+
+Environment variables to set for the LSP server process.
+
+```toml
+[[lsp_servers]]
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+file_patterns = ["**/*.py"]
+
+[lsp_servers.env]
+PYTHONPATH = "/custom/path"
+VIRTUAL_ENV = "/path/to/venv"
+```
 
 ## Environment Variables
 
