@@ -1,7 +1,8 @@
 //! LSP server configuration types.
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 /// Configuration for a single LSP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,8 @@
 //! Command-line argument parsing.
 
-use clap::Parser;
 use std::path::PathBuf;
+
+use clap::Parser;
 
 /// Universal MCP to LSP Bridge
 ///

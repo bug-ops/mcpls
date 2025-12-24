@@ -2,9 +2,13 @@
 //!
 //! Tracks open documents and their versions for LSP synchronization.
 
-use lsp_types::Uri;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use lsp_types::{DidOpenTextDocumentParams, TextDocumentItem, Uri};
+
+use crate::error::{Error, Result};
+use crate::lsp::LspClient;
 
 /// State of a single document.
 #[derive(Debug, Clone)]
@@ -19,18 +23,53 @@ pub struct DocumentState {
     pub content: String,
 }
 
+/// Resource limits for document tracking.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceLimits {
+    /// Maximum number of open documents (0 = unlimited).
+    pub max_documents: usize,
+    /// Maximum file size in bytes (0 = unlimited).
+    pub max_file_size: u64,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_documents: 100,
+            max_file_size: 10 * 1024 * 1024, // 10MB
+        }
+    }
+}
+
 /// Tracks document state across the workspace.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DocumentTracker {
     /// Open documents by file path.
     documents: HashMap<PathBuf, DocumentState>,
+    /// Resource limits for tracking.
+    limits: ResourceLimits,
+}
+
+impl Default for DocumentTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DocumentTracker {
-    /// Create a new document tracker.
+    /// Create a new document tracker with default limits.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limits(ResourceLimits::default())
+    }
+
+    /// Create a new document tracker with custom limits.
+    #[must_use]
+    pub fn with_limits(limits: ResourceLimits) -> Self {
+        Self {
+            documents: HashMap::new(),
+            limits,
+        }
     }
 
     /// Check if a document is currently open.
@@ -60,7 +99,30 @@ impl DocumentTracker {
     /// Open a document and track its state.
     ///
     /// Returns the document URI for use in LSP requests.
-    pub fn open(&mut self, path: PathBuf, content: String) -> Uri {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Document limit is exceeded
+    /// - File size limit is exceeded
+    pub fn open(&mut self, path: PathBuf, content: String) -> Result<Uri> {
+        // Check document limit
+        if self.limits.max_documents > 0 && self.documents.len() >= self.limits.max_documents {
+            return Err(Error::DocumentLimitExceeded {
+                current: self.documents.len(),
+                max: self.limits.max_documents,
+            });
+        }
+
+        // Check file size limit
+        let size = content.len() as u64;
+        if self.limits.max_file_size > 0 && size > self.limits.max_file_size {
+            return Err(Error::FileSizeLimitExceeded {
+                size,
+                max: self.limits.max_file_size,
+            });
+        }
+
         let uri = path_to_uri(&path);
         let language_id = detect_language(&path);
 
@@ -72,7 +134,7 @@ impl DocumentTracker {
         };
 
         self.documents.insert(path, state);
-        uri
+        Ok(uri)
     }
 
     /// Update a document's content and increment its version.
@@ -98,6 +160,50 @@ impl DocumentTracker {
     /// Close all documents.
     pub fn close_all(&mut self) -> Vec<DocumentState> {
         self.documents.drain().map(|(_, state)| state).collect()
+    }
+
+    /// Ensure a document is open, opening it lazily if necessary.
+    ///
+    /// If the document is already open, returns its URI immediately.
+    /// Otherwise, reads the file from disk, opens it in the tracker,
+    /// and sends a `didOpen` notification to the LSP server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be read from disk
+    /// - The `didOpen` notification fails to send
+    /// - Resource limits are exceeded
+    pub async fn ensure_open(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
+        if let Some(state) = self.documents.get(path) {
+            return Ok(state.uri.clone());
+        }
+
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| Error::FileIo {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+
+        let uri = self.open(path.to_path_buf(), content.clone())?;
+        let state = self
+            .documents
+            .get(path)
+            .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?;
+
+        let params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: state.language_id.clone(),
+                version: state.version,
+                text: content,
+            },
+        };
+
+        lsp_client.notify("textDocument/didOpen", params).await?;
+
+        Ok(uri)
     }
 }
 
@@ -173,7 +279,9 @@ mod tests {
 
         assert!(!tracker.is_open(&path));
 
-        tracker.open(path.clone(), "fn main() {}".to_string());
+        tracker
+            .open(path.clone(), "fn main() {}".to_string())
+            .unwrap();
         assert!(tracker.is_open(&path));
         assert_eq!(tracker.len(), 1);
 
@@ -187,5 +295,45 @@ mod tests {
         tracker.close(&path);
         assert!(!tracker.is_open(&path));
         assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn test_document_limit() {
+        let limits = ResourceLimits {
+            max_documents: 2,
+            max_file_size: 100,
+        };
+        let mut tracker = DocumentTracker::with_limits(limits);
+
+        // First two documents should succeed
+        tracker
+            .open(PathBuf::from("/test/file1.rs"), "fn test1() {}".to_string())
+            .unwrap();
+        tracker
+            .open(PathBuf::from("/test/file2.rs"), "fn test2() {}".to_string())
+            .unwrap();
+
+        // Third should fail
+        let result = tracker.open(PathBuf::from("/test/file3.rs"), "fn test3() {}".to_string());
+        assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+    }
+
+    #[test]
+    fn test_file_size_limit() {
+        let limits = ResourceLimits {
+            max_documents: 10,
+            max_file_size: 10,
+        };
+        let mut tracker = DocumentTracker::with_limits(limits);
+
+        // Small file should succeed
+        tracker
+            .open(PathBuf::from("/test/small.rs"), "fn f(){}".to_string())
+            .unwrap();
+
+        // Large file should fail
+        let large_content = "x".repeat(100);
+        let result = tracker.open(PathBuf::from("/test/large.rs"), large_content);
+        assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
     }
 }

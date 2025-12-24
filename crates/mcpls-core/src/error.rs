@@ -97,6 +97,42 @@ pub enum Error {
     /// Server process terminated unexpectedly.
     #[error("LSP server process terminated unexpectedly")]
     ServerTerminated,
+
+    /// Invalid tool parameters provided.
+    #[error("invalid tool parameters: {0}")]
+    InvalidToolParams(String),
+
+    /// File I/O error occurred.
+    #[error("file I/O error for {path:?}: {source}")]
+    FileIo {
+        /// Path to the file.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Path is outside allowed workspace boundaries.
+    #[error("path outside workspace: {0}")]
+    PathOutsideWorkspace(PathBuf),
+
+    /// Document limit exceeded.
+    #[error("document limit exceeded: {current}/{max}")]
+    DocumentLimitExceeded {
+        /// Current number of documents.
+        current: usize,
+        /// Maximum allowed documents.
+        max: usize,
+    },
+
+    /// File size limit exceeded.
+    #[error("file size limit exceeded: {size} bytes (max: {max} bytes)")]
+    FileSizeLimitExceeded {
+        /// Actual file size.
+        size: u64,
+        /// Maximum allowed size.
+        max: u64,
+    },
 }
 
 /// A specialized Result type for mcpls-core operations.
