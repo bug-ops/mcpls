@@ -91,10 +91,10 @@ pub struct FormatDocumentParams {
     pub insert_spaces: bool,
 }
 
-fn default_tab_size() -> u32 {
+const fn default_tab_size() -> u32 {
     4
 }
 
-fn default_insert_spaces() -> bool {
+const fn default_insert_spaces() -> bool {
     true
 }

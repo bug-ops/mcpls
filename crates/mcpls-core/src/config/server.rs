@@ -34,7 +34,7 @@ pub struct LspServerConfig {
     pub timeout_seconds: u64,
 }
 
-fn default_timeout() -> u64 {
+const fn default_timeout() -> u64 {
     30
 }
 

@@ -1,6 +1,5 @@
 //! MCP to LSP translation layer.
 
-use crate::error::Result;
 use crate::lsp::LspClient;
 use std::collections::HashMap;
 
@@ -32,42 +31,19 @@ impl Translator {
 
     /// Get the document tracker.
     #[must_use]
-    pub fn document_tracker(&self) -> &DocumentTracker {
+    pub const fn document_tracker(&self) -> &DocumentTracker {
         &self.document_tracker
     }
 
     /// Get a mutable reference to the document tracker.
-    pub fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
+    pub const fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
         &mut self.document_tracker
     }
 
-    /// Initialize all registered LSP clients.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any client fails to initialize.
-    pub async fn initialize_all(&mut self) -> Result<()> {
-        for client in self.lsp_clients.values_mut() {
-            client.initialize().await?;
-        }
-        Ok(())
-    }
+    // TODO: These methods will be implemented in Phase 3-5
+    // Initialize and shutdown are now handled by LspServer in lifecycle.rs
 
-    /// Shutdown all registered LSP clients.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any client fails to shutdown.
-    pub async fn shutdown_all(&mut self) -> Result<()> {
-        // Close all tracked documents
-        let _closed = self.document_tracker.close_all();
-
-        // Shutdown all clients
-        for client in self.lsp_clients.values_mut() {
-            client.shutdown().await?;
-        }
-        Ok(())
-    }
+    // Future implementation will use LspServer instead of LspClient directly
 }
 
 impl Default for Translator {

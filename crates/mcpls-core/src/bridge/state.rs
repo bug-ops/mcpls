@@ -110,16 +110,15 @@ pub fn path_to_uri(path: &Path) -> Uri {
     } else {
         format!("file://{}", path.display())
     };
+    // Path-to-URI conversion should always succeed for valid paths
+    #[allow(clippy::expect_used)]
     uri_string.parse().expect("failed to create URI from path")
 }
 
 /// Detect the language ID from a file path.
 #[must_use]
 pub fn detect_language(path: &Path) -> String {
-    let extension = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match extension {
         "rs" => "rust",
@@ -155,6 +154,7 @@ pub fn detect_language(path: &Path) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

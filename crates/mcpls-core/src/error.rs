@@ -71,6 +71,32 @@ pub enum Error {
     /// Server shutdown requested.
     #[error("server shutdown requested")]
     Shutdown,
+
+    /// LSP server failed to spawn.
+    #[error("failed to spawn LSP server '{command}': {source}")]
+    ServerSpawnFailed {
+        /// Command that failed to spawn.
+        command: String,
+        /// Underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// LSP protocol error during message parsing.
+    #[error("LSP protocol error: {0}")]
+    LspProtocolError(String),
+
+    /// Invalid URI format.
+    #[error("invalid URI: {0}")]
+    InvalidUri(String),
+
+    /// Position encoding error.
+    #[error("position encoding error: {0}")]
+    EncodingError(String),
+
+    /// Server process terminated unexpectedly.
+    #[error("LSP server process terminated unexpectedly")]
+    ServerTerminated,
 }
 
 /// A specialized Result type for mcpls-core operations.
