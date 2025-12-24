@@ -33,7 +33,7 @@ jobs:
             artifact: mcpls-windows-x86_64.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -67,7 +67,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -88,7 +88,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo publish -p mcpls-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
       - run: cargo publish -p mcpls --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
