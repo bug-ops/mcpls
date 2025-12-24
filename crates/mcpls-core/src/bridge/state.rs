@@ -279,7 +279,9 @@ mod tests {
 
         assert!(!tracker.is_open(&path));
 
-        tracker.open(path.clone(), "fn main() {}".to_string()).unwrap();
+        tracker
+            .open(path.clone(), "fn main() {}".to_string())
+            .unwrap();
         assert!(tracker.is_open(&path));
         assert_eq!(tracker.len(), 1);
 
@@ -304,8 +306,12 @@ mod tests {
         let mut tracker = DocumentTracker::with_limits(limits);
 
         // First two documents should succeed
-        tracker.open(PathBuf::from("/test/file1.rs"), "fn test1() {}".to_string()).unwrap();
-        tracker.open(PathBuf::from("/test/file2.rs"), "fn test2() {}".to_string()).unwrap();
+        tracker
+            .open(PathBuf::from("/test/file1.rs"), "fn test1() {}".to_string())
+            .unwrap();
+        tracker
+            .open(PathBuf::from("/test/file2.rs"), "fn test2() {}".to_string())
+            .unwrap();
 
         // Third should fail
         let result = tracker.open(PathBuf::from("/test/file3.rs"), "fn test3() {}".to_string());
@@ -321,7 +327,9 @@ mod tests {
         let mut tracker = DocumentTracker::with_limits(limits);
 
         // Small file should succeed
-        tracker.open(PathBuf::from("/test/small.rs"), "fn f(){}".to_string()).unwrap();
+        tracker
+            .open(PathBuf::from("/test/small.rs"), "fn f(){}".to_string())
+            .unwrap();
 
         // Large file should fail
         let large_content = "x".repeat(100);

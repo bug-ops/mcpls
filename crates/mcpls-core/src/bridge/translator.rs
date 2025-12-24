@@ -236,12 +236,10 @@ impl Translator {
     ///
     /// Returns `Error::PathOutsideWorkspace` if the path is outside all workspace roots.
     fn validate_path(&self, path: &Path) -> Result<PathBuf> {
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| Error::FileIo {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
+        let canonical = path.canonicalize().map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
 
         // If no workspace roots configured, allow any path (backward compatibility)
         if self.workspace_roots.is_empty() {
@@ -283,7 +281,10 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self.document_tracker.ensure_open(&validated_path, &client).await?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspHoverParams {
@@ -328,7 +329,10 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self.document_tracker.ensure_open(&validated_path, &client).await?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = GotoDefinitionParams {
@@ -386,7 +390,10 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self.document_tracker.ensure_open(&validated_path, &client).await?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = ReferenceParams {
@@ -430,7 +437,10 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self.document_tracker.ensure_open(&validated_path, &client).await?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
 
         let params = lsp_types::DocumentDiagnosticParams {
             text_document: TextDocumentIdentifier { uri },
@@ -496,7 +506,10 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self.document_tracker.ensure_open(&validated_path, &client).await?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspRenameParams {
@@ -554,7 +567,10 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self.document_tracker.ensure_open(&validated_path, &client).await?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
@@ -613,7 +629,10 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self.document_tracker.ensure_open(&validated_path, &client).await?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
 
         let params = DocumentSymbolParams {
             text_document: TextDocumentIdentifier { uri },
@@ -660,7 +679,10 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self.document_tracker.ensure_open(&validated_path, &client).await?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
 
         let params = DocumentFormattingParams {
             text_document: TextDocumentIdentifier { uri },
@@ -744,9 +766,11 @@ fn convert_document_symbol(symbol: DocumentSymbol) -> Symbol {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use std::fs;
+
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn test_translator_new() {
@@ -809,8 +833,14 @@ mod tests {
     #[test]
     fn test_normalize_range() {
         let lsp_range = lsp_types::Range {
-            start: lsp_types::Position { line: 0, character: 0 },
-            end: lsp_types::Position { line: 2, character: 5 },
+            start: lsp_types::Position {
+                line: 0,
+                character: 0,
+            },
+            end: lsp_types::Position {
+                line: 2,
+                character: 5,
+            },
         };
 
         let mcp_range = normalize_range(lsp_range);
