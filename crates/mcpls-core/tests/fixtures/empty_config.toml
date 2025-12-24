@@ -1,0 +1,7 @@
+# Empty configuration for E2E testing
+# No LSP servers configured - tests protocol only
+
+[workspace]
+roots = []
+
+# No LSP servers - we're only testing the MCP protocol layer
