@@ -15,7 +15,7 @@ pub struct Args {
     /// Path to configuration file
     ///
     /// If not specified, searches for mcpls.toml in:
-    /// 1. $MCPLS_CONFIG environment variable
+    /// 1. `$MCPLS_CONFIG` environment variable
     /// 2. Current directory
     /// 3. ~/.config/mcpls/mcpls.toml
     #[arg(short, long, value_name = "FILE", env = "MCPLS_CONFIG")]

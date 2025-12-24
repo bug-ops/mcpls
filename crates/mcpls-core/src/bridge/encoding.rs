@@ -31,7 +31,7 @@ impl PositionEncoding {
 
     /// Convert to LSP position encoding kind string.
     #[must_use]
-    pub fn to_lsp(&self) -> &'static str {
+    pub const fn to_lsp(&self) -> &'static str {
         match self {
             Self::Utf8 => "utf-8",
             Self::Utf16 => "utf-16",
@@ -45,7 +45,7 @@ impl PositionEncoding {
 /// MCP tools use 1-based line and column numbers for human readability.
 /// LSP uses 0-based positions internally.
 #[must_use]
-pub fn mcp_to_lsp_position(line: u32, character: u32) -> Position {
+pub const fn mcp_to_lsp_position(line: u32, character: u32) -> Position {
     Position {
         line: line.saturating_sub(1),
         character: character.saturating_sub(1),
@@ -54,7 +54,7 @@ pub fn mcp_to_lsp_position(line: u32, character: u32) -> Position {
 
 /// Convert LSP position (0-based) to MCP position (1-based).
 #[must_use]
-pub fn lsp_to_mcp_position(pos: Position) -> (u32, u32) {
+pub const fn lsp_to_mcp_position(pos: Position) -> (u32, u32) {
     (pos.line + 1, pos.character + 1)
 }
 
@@ -68,10 +68,11 @@ pub struct EncodingConverter {
     encoding: PositionEncoding,
 }
 
+#[allow(dead_code)] // Will be used when LSP client integration is complete
 impl EncodingConverter {
     /// Create a new encoding converter with the specified encoding.
     #[must_use]
-    pub fn new(encoding: PositionEncoding) -> Self {
+    pub const fn new(encoding: PositionEncoding) -> Self {
         Self { encoding }
     }
 
@@ -82,12 +83,12 @@ impl EncodingConverter {
     /// Returns an error if:
     /// - The byte offset is not on a character boundary
     /// - The encoding is unsupported
+    #[allow(clippy::cast_possible_truncation)] // LSP positions use u32, truncation acceptable
     pub fn byte_offset_to_character(&self, text: &str, byte_offset: usize) -> Result<u32, String> {
         if byte_offset > text.len() {
+            let text_len = text.len();
             return Err(format!(
-                "Byte offset {} exceeds text length {}",
-                byte_offset,
-                text.len()
+                "Byte offset {byte_offset} exceeds text length {text_len}"
             ));
         }
 
@@ -111,6 +112,7 @@ impl EncodingConverter {
     /// Returns an error if:
     /// - The character offset is out of bounds
     /// - The encoding is unsupported
+    #[allow(clippy::cast_possible_truncation)] // LSP positions use u32, truncation acceptable
     pub fn character_to_byte_offset(
         &self,
         text: &str,
@@ -120,10 +122,9 @@ impl EncodingConverter {
             PositionEncoding::Utf8 => {
                 let byte_offset = character_offset as usize;
                 if byte_offset > text.len() {
+                    let text_len = text.len();
                     return Err(format!(
-                        "Character offset {} exceeds text length {}",
-                        character_offset,
-                        text.len()
+                        "Character offset {character_offset} exceeds text length {text_len}"
                     ));
                 }
                 Ok(byte_offset)
@@ -140,8 +141,7 @@ impl EncodingConverter {
                     Ok(text.len())
                 } else {
                     Err(format!(
-                        "Character offset {} out of bounds (max UTF-16 units: {})",
-                        character_offset, utf16_count
+                        "Character offset {character_offset} out of bounds (max UTF-16 units: {utf16_count})"
                     ))
                 }
             }
@@ -157,10 +157,9 @@ impl EncodingConverter {
                     }
                 })
                 .ok_or_else(|| {
+                    let max_code_points = text.chars().count();
                     format!(
-                        "Character offset {} out of bounds (max code points: {})",
-                        character_offset,
-                        text.chars().count()
+                        "Character offset {character_offset} out of bounds (max code points: {max_code_points})"
                     )
                 }),
         }
@@ -168,6 +167,7 @@ impl EncodingConverter {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -273,7 +273,9 @@ mod tests {
 
         for byte_idx in [0, 6, 10, 11] {
             let char_offset = converter.byte_offset_to_character(text, byte_idx).unwrap();
-            let back_to_byte = converter.character_to_byte_offset(text, char_offset).unwrap();
+            let back_to_byte = converter
+                .character_to_byte_offset(text, char_offset)
+                .unwrap();
             assert_eq!(byte_idx, back_to_byte);
         }
     }

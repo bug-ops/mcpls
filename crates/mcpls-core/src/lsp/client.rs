@@ -4,15 +4,15 @@ use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::{InboundMessage, JsonRpcRequest, RequestId};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use std::sync::atomic::{AtomicI64, Ordering};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tracing::{debug, error, trace, warn};
 
 /// LSP client with async request/response handling.
@@ -48,7 +48,10 @@ enum ClientCommand {
         response_tx: oneshot::Sender<Result<Value>>,
     },
     /// Send a notification (no response expected).
-    SendNotification { method: String, params: Option<Value> },
+    SendNotification {
+        method: String,
+        params: Option<Value>,
+    },
     /// Shutdown the client.
     Shutdown,
 }
@@ -74,21 +77,15 @@ impl LspClient {
     /// Create client from transport (for testing or custom spawning).
     ///
     /// This method initializes the background message loop with the provided transport.
-    pub(crate) fn from_transport(
-        config: LspServerConfig,
-        transport: LspTransport,
-    ) -> Self {
+    pub(crate) fn from_transport(config: LspServerConfig, transport: LspTransport) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
-        let receiver_task = tokio::spawn(Self::message_loop(
-            transport,
-            command_rx,
-            pending_requests,
-        ));
+        let receiver_task =
+            tokio::spawn(Self::message_loop(transport, command_rx, pending_requests));
 
         Self {
             config,
@@ -162,7 +159,7 @@ impl LspClient {
             .map_err(|_| Error::ServerTerminated)??;
 
         serde_json::from_value(result_value)
-            .map_err(|e| Error::LspProtocolError(format!("Failed to deserialize response: {}", e)))
+            .map_err(|e| Error::LspProtocolError(format!("Failed to deserialize response: {e}")))
     }
 
     /// Send notification (fire-and-forget, no response expected).
@@ -203,7 +200,7 @@ impl LspClient {
 
         if let Some(task) = self.receiver_task.take() {
             task.await
-                .map_err(|e| Error::Transport(format!("Receiver task failed: {}", e)))??;
+                .map_err(|e| Error::Transport(format!("Receiver task failed: {e}")))??;
         }
 
         *self.state.lock().await = super::ServerState::Shutdown;
@@ -289,6 +286,7 @@ impl LspClient {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

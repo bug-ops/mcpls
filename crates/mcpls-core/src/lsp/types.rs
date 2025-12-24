@@ -76,6 +76,7 @@ pub enum InboundMessage {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -108,7 +109,8 @@ mod tests {
 
     #[test]
     fn test_error_response_deserialization() {
-        let json_str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
+        let json_str =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
         let response: JsonRpcResponse = serde_json::from_str(json_str).unwrap();
 
         assert_eq!(response.jsonrpc, "2.0");

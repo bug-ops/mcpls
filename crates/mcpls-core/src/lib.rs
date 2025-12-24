@@ -46,6 +46,7 @@ pub use error::Error;
 /// - LSP server initialization fails
 /// - MCP server setup fails
 /// - Configuration is invalid
+#[allow(clippy::unused_async)] // Will use async when implementation is complete
 pub async fn serve(_config: ServerConfig) -> Result<(), Error> {
     // TODO: Implement server initialization
     // 1. Initialize LSP clients based on configuration

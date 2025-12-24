@@ -1,15 +1,15 @@
 //! Logging initialization and configuration.
 
 use anyhow::{Context, Result};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Initialize the logging subsystem.
 ///
 /// # Errors
 ///
 /// Returns an error if the log level is invalid or initialization fails.
-pub fn init(level: String) -> Result<()> {
-    let filter = EnvFilter::try_new(&level)
+pub fn init(level: &str) -> Result<()> {
+    let filter = EnvFilter::try_new(level)
         .or_else(|_| EnvFilter::try_new("info"))
         .context("failed to parse log level")?;
 

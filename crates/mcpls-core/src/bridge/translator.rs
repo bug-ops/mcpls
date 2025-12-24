@@ -31,12 +31,12 @@ impl Translator {
 
     /// Get the document tracker.
     #[must_use]
-    pub fn document_tracker(&self) -> &DocumentTracker {
+    pub const fn document_tracker(&self) -> &DocumentTracker {
         &self.document_tracker
     }
 
     /// Get a mutable reference to the document tracker.
-    pub fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
+    pub const fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
         &mut self.document_tracker
     }
 

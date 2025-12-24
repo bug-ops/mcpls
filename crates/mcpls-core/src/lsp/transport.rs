@@ -85,7 +85,7 @@ impl LspTransport {
             .get("content-length")
             .ok_or_else(|| Error::LspProtocolError("Missing Content-Length header".to_string()))?
             .parse::<usize>()
-            .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {}", e)))?;
+            .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
 
         let content = self.read_content(content_length).await?;
 
@@ -95,11 +95,11 @@ impl LspTransport {
 
         if value.get("id").is_some() {
             let response: JsonRpcResponse = serde_json::from_value(value)
-                .map_err(|e| Error::LspProtocolError(format!("Invalid response: {}", e)))?;
+                .map_err(|e| Error::LspProtocolError(format!("Invalid response: {e}")))?;
             Ok(InboundMessage::Response(response))
         } else {
             let notification: JsonRpcNotification = serde_json::from_value(value)
-                .map_err(|e| Error::LspProtocolError(format!("Invalid notification: {}", e)))?;
+                .map_err(|e| Error::LspProtocolError(format!("Invalid notification: {e}")))?;
             Ok(InboundMessage::Notification(notification))
         }
     }
@@ -138,11 +138,12 @@ impl LspTransport {
         self.stdout.read_exact(&mut buffer).await?;
 
         String::from_utf8(buffer)
-            .map_err(|e| Error::LspProtocolError(format!("Invalid UTF-8 in content: {}", e)))
+            .map_err(|e| Error::LspProtocolError(format!("Invalid UTF-8 in content: {e}")))
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -12,9 +12,8 @@ use crate::error::{Error, Result};
 use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
 use lsp_types::{
-    ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams,
-    InitializeResult, InitializedParams, PositionEncodingKind, ServerCapabilities, Uri,
-    WorkspaceFolder,
+    ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
+    InitializedParams, PositionEncodingKind, ServerCapabilities, Uri, WorkspaceFolder,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -41,13 +40,13 @@ pub enum ServerState {
 impl ServerState {
     /// Check if the server is ready to handle requests.
     #[must_use]
-    pub fn is_ready(&self) -> bool {
+    pub const fn is_ready(&self) -> bool {
         matches!(self, Self::Ready)
     }
 
     /// Check if the server can accept new requests.
     #[must_use]
-    pub fn can_accept_requests(&self) -> bool {
+    pub const fn can_accept_requests(&self) -> bool {
         matches!(self, Self::Ready)
     }
 }
@@ -139,16 +138,19 @@ impl LspServer {
             .workspace_roots
             .iter()
             .map(|root| {
-                let path_str = root
-                    .to_str()
-                    .ok_or_else(|| Error::InvalidUri(format!("Invalid UTF-8 in path: {:?}", root)))?;
+                let path_str = root.to_str().ok_or_else(|| {
+                    let root_display = root.display();
+                    Error::InvalidUri(format!("Invalid UTF-8 in path: {root_display}"))
+                })?;
                 let uri_str = if cfg!(windows) {
                     format!("file:///{}", path_str.replace('\\', "/"))
                 } else {
-                    format!("file://{}", path_str)
+                    format!("file://{path_str}")
                 };
-                let uri = Uri::from_str(&uri_str)
-                    .map_err(|_| Error::InvalidUri(format!("Invalid workspace root: {:?}", root)))?;
+                let uri = Uri::from_str(&uri_str).map_err(|_| {
+                    let root_display = root.display();
+                    Error::InvalidUri(format!("Invalid workspace root: {root_display}"))
+                })?;
                 Ok(WorkspaceFolder {
                     uri,
                     name: root
@@ -208,7 +210,7 @@ impl LspServer {
             .request("initialize", params, Duration::from_secs(30))
             .await
             .map_err(|e| Error::LspInitFailed {
-                message: format!("Initialize request failed: {}", e),
+                message: format!("Initialize request failed: {e}"),
             })?;
 
         let position_encoding = result
@@ -226,7 +228,7 @@ impl LspServer {
             .notify("initialized", InitializedParams {})
             .await
             .map_err(|e| Error::LspInitFailed {
-                message: format!("Initialized notification failed: {}", e),
+                message: format!("Initialized notification failed: {e}"),
             })?;
 
         Ok((result.capabilities, position_encoding))
@@ -234,7 +236,7 @@ impl LspServer {
 
     /// Get server capabilities.
     #[must_use]
-    pub fn capabilities(&self) -> &ServerCapabilities {
+    pub const fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
     }
 
@@ -246,7 +248,7 @@ impl LspServer {
 
     /// Get client for making requests.
     #[must_use]
-    pub fn client(&self) -> &LspClient {
+    pub const fn client(&self) -> &LspClient {
         &self.client
     }
 
@@ -265,9 +267,7 @@ impl LspServer {
             .request("shutdown", serde_json::Value::Null, Duration::from_secs(5))
             .await?;
 
-        self.client
-            .notify("exit", serde_json::Value::Null)
-            .await?;
+        self.client.notify("exit", serde_json::Value::Null).await?;
 
         self.client.shutdown().await?;
 
@@ -277,6 +277,7 @@ impl LspServer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
