@@ -9,4 +9,9 @@ mod translator;
 
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 pub use state::{DocumentState, DocumentTracker};
-pub use translator::Translator;
+pub use translator::{
+    Completion, CompletionsResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult,
+    DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult, Location,
+    Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit, Translator,
+    DefinitionResult,
+};

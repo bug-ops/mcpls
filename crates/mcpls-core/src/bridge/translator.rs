@@ -128,9 +128,13 @@ pub struct ReferencesResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticSeverity {
+    /// Error diagnostic.
     Error,
+    /// Warning diagnostic.
     Warning,
+    /// Informational diagnostic.
     Information,
+    /// Hint diagnostic.
     Hint,
 }
 
