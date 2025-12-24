@@ -185,7 +185,7 @@ jobs:
           mv mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}.zip ../../../
 
       - name: Upload artifact to workflow
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}
           path: mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}.${{ matrix.archive_ext }}
