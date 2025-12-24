@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # Required for trusted publishing to crates.io
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +43,8 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Optional: use environment for additional protection
+    # environment: release
     steps:
       - uses: actions/checkout@v6
 
@@ -53,9 +56,12 @@ jobs:
         with:
           shared-key: "publish"
 
+      # Trusted Publishing: get short-lived token via OIDC
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Publish mcpls-core
-        run: cargo publish --package mcpls-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        continue-on-error: false
+        run: cargo publish --package mcpls-core
 
       - name: Wait for mcpls-core to be available on crates.io
         run: sleep 60
@@ -73,8 +79,7 @@ jobs:
           echo "mcpls-core not indexed after 5 minutes, proceeding anyway"
 
       - name: Publish mcpls
-        run: cargo publish --package mcpls --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        continue-on-error: false
+        run: cargo publish --package mcpls
 
   build-release:
     name: Build Release Binary (${{ matrix.name }})
