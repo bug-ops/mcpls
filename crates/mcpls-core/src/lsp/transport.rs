@@ -8,13 +8,15 @@
 //! {"jsonrpc":"2.0",...}
 //! ```
 
-use crate::error::{Error, Result};
-use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcResponse};
-use serde_json::Value;
 use std::collections::HashMap;
+
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tracing::{trace, warn};
+
+use crate::error::{Error, Result};
+use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcResponse};
 
 /// LSP transport layer handling header-content format.
 ///

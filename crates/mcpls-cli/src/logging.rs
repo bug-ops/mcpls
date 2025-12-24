@@ -1,7 +1,8 @@
 //! Logging initialization and configuration.
 
 use anyhow::{Context, Result};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// Initialize the logging subsystem.
 ///

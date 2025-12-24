@@ -78,8 +78,9 @@ pub enum InboundMessage {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn test_request_serialization() {

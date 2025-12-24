@@ -7,20 +7,22 @@
 //! 4. Active request handling
 //! 5. Graceful shutdown sequence
 
-use crate::config::LspServerConfig;
-use crate::error::{Error, Result};
-use crate::lsp::client::LspClient;
-use crate::lsp::transport::LspTransport;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::str::FromStr;
+
 use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
     InitializedParams, PositionEncodingKind, ServerCapabilities, Uri, WorkspaceFolder,
 };
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::str::FromStr;
 use tokio::process::Command;
 use tokio::time::Duration;
 use tracing::{debug, info};
+
+use crate::config::LspServerConfig;
+use crate::error::{Error, Result};
+use crate::lsp::client::LspClient;
+use crate::lsp::transport::LspTransport;
 
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

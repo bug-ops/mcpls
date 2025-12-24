@@ -33,8 +33,15 @@ pub mod error;
 pub mod lsp;
 pub mod mcp;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use bridge::Translator;
 pub use config::ServerConfig;
 pub use error::Error;
+use lsp::{LspServer, ServerInitConfig};
+use mcp::ToolHandlers;
+use tokio::sync::Mutex;
 
 /// Start the MCPLS server with the given configuration.
 ///
@@ -46,13 +53,47 @@ pub use error::Error;
 /// - LSP server initialization fails
 /// - MCP server setup fails
 /// - Configuration is invalid
-#[allow(clippy::unused_async)] // Will use async when implementation is complete
-pub async fn serve(_config: ServerConfig) -> Result<(), Error> {
-    // TODO: Implement server initialization
-    // 1. Initialize LSP clients based on configuration
-    // 2. Set up MCP server with rmcp
-    // 3. Register MCP tools
-    // 4. Start serving requests
-    tracing::info!("MCPLS server starting...");
+pub async fn serve(config: ServerConfig) -> Result<(), Error> {
+    tracing::info!("Starting MCPLS server...");
+
+    let mut translator = Translator::new();
+    let workspace_roots = if config.workspace.roots.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        config.workspace.roots.clone()
+    };
+
+    translator.set_workspace_roots(workspace_roots.clone());
+
+    for lsp_config in config.lsp_servers {
+        tracing::info!(
+            "Spawning LSP server for language '{}': {} {:?}",
+            lsp_config.language_id,
+            lsp_config.command,
+            lsp_config.args
+        );
+
+        let server_init_config = ServerInitConfig {
+            server_config: lsp_config.clone(),
+            workspace_roots: workspace_roots.clone(),
+            initialization_options: lsp_config.initialization_options.clone(),
+        };
+
+        let server = LspServer::spawn(server_init_config).await?;
+        let client = server.client().clone();
+
+        translator.register_client(lsp_config.language_id.clone(), client);
+    }
+
+    let translator = Arc::new(Mutex::new(translator));
+    let _tool_handlers = ToolHandlers::new(translator);
+
+    tracing::info!("MCPLS server initialized successfully");
+
+    // TODO: Integrate with rmcp to serve MCP protocol over stdio
+    // For now, just keep the server alive
+    tokio::signal::ctrl_c().await.ok();
+
+    tracing::info!("MCPLS server shutting down");
     Ok(())
 }

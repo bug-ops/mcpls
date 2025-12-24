@@ -1,19 +1,21 @@
 //! LSP client implementation with async request/response handling.
 
-use crate::config::LspServerConfig;
-use crate::error::{Error, Result};
-use crate::lsp::transport::LspTransport;
-use crate::lsp::types::{InboundMessage, JsonRpcRequest, RequestId};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, error, trace, warn};
+
+use crate::config::LspServerConfig;
+use crate::error::{Error, Result};
+use crate::lsp::transport::LspTransport;
+use crate::lsp::types::{InboundMessage, JsonRpcRequest, RequestId};
 
 /// LSP client with async request/response handling.
 ///
@@ -38,6 +40,18 @@ pub struct LspClient {
 
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
+}
+
+impl Clone for LspClient {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            state: Arc::clone(&self.state),
+            request_counter: Arc::clone(&self.request_counter),
+            command_tx: self.command_tx.clone(),
+            receiver_task: None,
+        }
+    }
 }
 
 /// Commands for client control.
