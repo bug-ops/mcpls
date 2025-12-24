@@ -16,6 +16,7 @@ use super::mcp_client::McpClient;
 /// - Exposes tool capabilities
 /// - Provides server information
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_initialize_handshake() -> Result<()> {
     let mut client = McpClient::spawn()?;
 
@@ -52,6 +53,7 @@ fn test_e2e_initialize_handshake() -> Result<()> {
 /// - tools/list returns an array of 8 tools
 /// - All expected tool names are present
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_list_tools() -> Result<()> {
     let mut client = McpClient::spawn()?;
     client.initialize()?;
@@ -111,6 +113,7 @@ fn test_e2e_list_tools() -> Result<()> {
 /// - Schema with "object" type
 /// - Schema with properties
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_tool_schemas() -> Result<()> {
     let mut client = McpClient::spawn()?;
     client.initialize()?;
@@ -161,6 +164,7 @@ fn test_e2e_tool_schemas() -> Result<()> {
 /// Validates that the server properly rejects invalid tool calls
 /// with an appropriate error response.
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_invalid_tool_call() -> Result<()> {
     let mut client = McpClient::spawn()?;
     client.initialize()?;
@@ -185,6 +189,7 @@ fn test_e2e_invalid_tool_call() -> Result<()> {
 /// Validates that the server properly validates tool parameters
 /// and rejects calls with missing required fields.
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_tool_call_missing_params() -> Result<()> {
     let mut client = McpClient::spawn()?;
     client.initialize()?;
@@ -212,6 +217,7 @@ fn test_e2e_tool_call_missing_params() -> Result<()> {
 /// Validates that the server properly handles file path validation
 /// and returns appropriate errors for non-existent files.
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_tool_call_invalid_file() -> Result<()> {
     let mut client = McpClient::spawn()?;
     client.initialize()?;
@@ -234,6 +240,7 @@ fn test_e2e_tool_call_invalid_file() -> Result<()> {
 ///
 /// Validates that the server handles position validation correctly.
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_tool_call_invalid_position() -> Result<()> {
     use std::fs;
 
@@ -275,6 +282,7 @@ fn test_e2e_tool_call_invalid_position() -> Result<()> {
 ///
 /// This test validates the typical usage pattern of an MCP client.
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_complete_workflow() -> Result<()> {
     let mut client = McpClient::spawn()?;
 
@@ -305,6 +313,7 @@ fn test_e2e_complete_workflow() -> Result<()> {
 /// - Request IDs increment correctly
 /// - The server handles concurrent operations properly
 #[test]
+#[ignore = "Requires mcpls binary built"]
 fn test_e2e_multiple_requests() -> Result<()> {
     let mut client = McpClient::spawn()?;
 

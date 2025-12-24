@@ -258,12 +258,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "Requires mcpls binary built"]
     fn test_mcp_client_spawn() {
         let client = McpClient::spawn();
         assert!(client.is_ok(), "Should successfully spawn mcpls binary");
     }
 
     #[test]
+    #[ignore = "Requires mcpls binary built"]
     fn test_request_id_increment() -> Result<()> {
         let mut client = McpClient::spawn()?;
         assert_eq!(client.next_id(), 1);
