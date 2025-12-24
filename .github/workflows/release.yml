@@ -3,92 +3,214 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref }}
+          name: Release v${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crate:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "publish"
+
+      - name: Publish mcpls-core
+        run: cargo publish --package mcpls-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: false
+
+      - name: Wait for mcpls-core to be available on crates.io
+        run: sleep 60
+
+      - name: Verify mcpls-core is indexed
+        run: |
+          for i in {1..10}; do
+            if cargo search mcpls-core | grep -q "mcpls-core"; then
+              echo "mcpls-core is indexed"
+              exit 0
+            fi
+            echo "Waiting for mcpls-core to be indexed (attempt $i/10)..."
+            sleep 30
+          done
+          echo "mcpls-core not indexed after 5 minutes, proceeding anyway"
+
+      - name: Publish mcpls
+        run: cargo publish --package mcpls --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: false
+
+  build-release:
+    name: Build Release Binary (${{ matrix.name }})
+    needs: create-release
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: mcpls-linux-x86_64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact: mcpls-linux-x86_64-musl
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: mcpls-macos-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: mcpls-macos-aarch64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: mcpls-windows-x86_64.exe
+          # Linux x86_64 (GNU)
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-x86_64
+            archive_ext: tar.gz
+
+          # Linux x86_64 (musl - static binary)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-x86_64-musl
+            archive_ext: tar.gz
+
+          # macOS x86_64 (Intel)
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: macos-x86_64
+            archive_ext: tar.gz
+
+          # macOS aarch64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: macos-aarch64
+            archive_ext: tar.gz
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x86_64
+            archive_ext: zip
 
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.4
 
-      - name: Install musl-tools
+      - name: Configure sccache
+        shell: bash
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.target }}"
+
+      - name: Install musl-tools (Linux musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} --package mcpls
 
-      - name: Rename binary (Unix)
+      - name: Strip binary (Unix)
         if: runner.os != 'Windows'
-        run: mv target/${{ matrix.target }}/release/mcpls ${{ matrix.artifact }}
+        run: strip target/${{ matrix.target }}/release/mcpls
 
-      - name: Rename binary (Windows)
-        if: runner.os == 'Windows'
-        run: mv target/${{ matrix.target }}/release/mcpls.exe ${{ matrix.artifact }}
+      - name: Get binary name
+        id: get_binary
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            echo "binary=mcpls.exe" >> $GITHUB_OUTPUT
+          else
+            echo "binary=mcpls" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Upload artifact
+      - name: Check binary size
+        shell: bash
+        run: |
+          ls -lh target/${{ matrix.target }}/release/${{ steps.get_binary.outputs.binary }}
+          du -sh target/${{ matrix.target }}/release/${{ steps.get_binary.outputs.binary }}
+
+      - name: Create archive (Unix)
+        if: matrix.archive_ext == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}.tar.gz mcpls
+          mv mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}.tar.gz ../../..
+
+      - name: Create archive (Windows)
+        if: matrix.archive_ext == 'zip'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}.zip mcpls.exe
+          mv mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}.zip ../../../
+
+      - name: Upload artifact to workflow
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}
+          path: mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}.${{ matrix.archive_ext }}
+          retention-days: 7
 
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create release
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
-          generate_release_notes: true
-          files: artifacts/**/*
+          tag_name: ${{ github.ref }}
+          files: mcpls-${{ needs.create-release.outputs.version }}-${{ matrix.name }}.${{ matrix.archive_ext }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish:
-    name: Publish to crates.io
-    needs: release
+      - name: sccache stats
+        run: sccache --show-stats
+
+  # All release jobs passed
+  release-success:
+    name: Release Success
+    needs: [create-release, publish-crate, build-release]
     runs-on: ubuntu-latest
+    if: always()
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish -p mcpls-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - run: cargo publish -p mcpls --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Check all jobs
+        run: |
+          if [[ "${{ needs.create-release.result }}" != "success" ]] || \
+             [[ "${{ needs.publish-crate.result }}" != "success" ]] || \
+             [[ "${{ needs.build-release.result }}" != "success" ]]; then
+            echo "One or more release jobs failed"
+            exit 1
+          fi
+          echo "All release jobs passed successfully!"
+          echo "Version ${{ needs.create-release.outputs.version }} released!"
