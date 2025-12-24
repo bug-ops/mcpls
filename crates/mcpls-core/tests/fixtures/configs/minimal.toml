@@ -1,0 +1,9 @@
+# Minimal configuration for testing
+[workspace]
+roots = []
+
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
