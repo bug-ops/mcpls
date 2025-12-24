@@ -632,6 +632,7 @@ dependencies = [
  "lsp-types",
  "rmcp",
  "rstest",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",

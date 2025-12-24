@@ -40,7 +40,7 @@ use bridge::Translator;
 pub use config::ServerConfig;
 pub use error::Error;
 use lsp::{LspServer, ServerInitConfig};
-use mcp::ToolHandlers;
+use rmcp::ServiceExt;
 use tokio::sync::Mutex;
 
 /// Start the MCPLS server with the given configuration.
@@ -86,13 +86,22 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     }
 
     let translator = Arc::new(Mutex::new(translator));
-    let _tool_handlers = ToolHandlers::new(translator);
+
+    tracing::info!("Starting MCP server with rmcp...");
+    let mcp_server = mcp::McplsServer::new(translator);
 
     tracing::info!("MCPLS server initialized successfully");
+    tracing::info!("Listening for MCP requests on stdio...");
 
-    // TODO: Integrate with rmcp to serve MCP protocol over stdio
-    // For now, just keep the server alive
-    tokio::signal::ctrl_c().await.ok();
+    let service = mcp_server
+        .serve(rmcp::transport::stdio())
+        .await
+        .map_err(|e| Error::McpServer(format!("Failed to start MCP server: {e}")))?;
+
+    service
+        .waiting()
+        .await
+        .map_err(|e| Error::McpServer(format!("MCP server error: {e}")))?;
 
     tracing::info!("MCPLS server shutting down");
     Ok(())

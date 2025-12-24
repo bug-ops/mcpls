@@ -1,0 +1,358 @@
+//! MCP server implementation using rmcp.
+//!
+//! This module provides the MCP server that exposes LSP capabilities
+//! as MCP tools using the rmcp SDK.
+
+use std::sync::Arc;
+
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use tokio::sync::Mutex;
+
+use super::handlers::HandlerContext;
+use super::tools::{
+    CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
+    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
+};
+use crate::bridge::Translator;
+
+/// MCP server that exposes LSP capabilities as tools.
+#[derive(Clone)]
+pub struct McplsServer {
+    context: Arc<HandlerContext>,
+    tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
+}
+
+#[tool_router]
+impl McplsServer {
+    /// Create a new MCP server with the given translator.
+    #[must_use]
+    pub fn new(translator: Arc<Mutex<Translator>>) -> Self {
+        let context = Arc::new(HandlerContext::new(translator));
+        Self {
+            context,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Get hover information at a position in a file.
+    #[tool(description = "Get hover information (type, documentation) at a position in a file")]
+    async fn get_hover(&self, params: Parameters<HoverParams>) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_hover(params.0.file_path, params.0.line, params.0.character)
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get the definition location of a symbol.
+    #[tool(description = "Get the definition location of a symbol at the specified position")]
+    async fn get_definition(
+        &self,
+        params: Parameters<DefinitionParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_definition(params.0.file_path, params.0.line, params.0.character)
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Find all references to a symbol.
+    #[tool(description = "Find all references to a symbol at the specified position")]
+    async fn get_references(
+        &self,
+        params: Parameters<ReferencesParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_references(
+                    params.0.file_path,
+                    params.0.line,
+                    params.0.character,
+                    params.0.include_declaration,
+                )
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get diagnostics for a file.
+    #[tool(description = "Get diagnostics (errors, warnings) for a file")]
+    async fn get_diagnostics(
+        &self,
+        params: Parameters<DiagnosticsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_diagnostics(params.0.file_path).await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Rename a symbol across the workspace.
+    #[tool(description = "Rename a symbol across the workspace")]
+    async fn rename_symbol(&self, params: Parameters<RenameParams>) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_rename(
+                    params.0.file_path,
+                    params.0.line,
+                    params.0.character,
+                    params.0.new_name,
+                )
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get code completion suggestions.
+    #[tool(description = "Get code completion suggestions at a position in a file")]
+    async fn get_completions(
+        &self,
+        params: Parameters<CompletionsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_completions(
+                    params.0.file_path,
+                    params.0.line,
+                    params.0.character,
+                    params.0.trigger,
+                )
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get all symbols in a document.
+    #[tool(description = "Get all symbols (functions, classes, variables) in a document")]
+    async fn get_document_symbols(
+        &self,
+        params: Parameters<DocumentSymbolsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_document_symbols(params.0.file_path).await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Format a document according to language server rules.
+    #[tool(description = "Format a document according to the language server's formatting rules")]
+    async fn format_document(
+        &self,
+        params: Parameters<FormatDocumentParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_format_document(
+                    params.0.file_path,
+                    params.0.tab_size,
+                    params.0.insert_spaces,
+                )
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for McplsServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "mcpls".to_string(),
+                title: Some("MCPLS - MCP to LSP Bridge".to_string()),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                icons: None,
+                website_url: Some("https://github.com/bug-ops/mcpls".to_string()),
+            },
+            instructions: Some(
+                concat!(
+                    "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
+                    "capabilities as MCP tools for semantic code intelligence. ",
+                    "Supports hover, definition, references, diagnostics, rename, ",
+                    "completions, symbols, and formatting."
+                )
+                .to_string(),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_server() -> McplsServer {
+        let translator = Translator::new();
+        McplsServer::new(Arc::new(Mutex::new(translator)))
+    }
+
+    #[tokio::test]
+    async fn test_server_info() {
+        let server = create_test_server();
+        let info = server.get_info();
+
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2024_11_05);
+        assert!(info.capabilities.tools.is_some());
+        assert_eq!(info.server_info.name, "mcpls");
+        assert!(info.instructions.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_hover_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(HoverParams {
+            file_path: "/nonexistent/file.rs".to_string(),
+            line: 1,
+            character: 1,
+        });
+
+        // This should return an error (no LSP server configured)
+        let result = server.get_hover(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_definition_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(DefinitionParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
+        });
+
+        let result = server.get_definition(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_references_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(ReferencesParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
+            include_declaration: false,
+        });
+
+        let result = server.get_references(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(DiagnosticsParams {
+            file_path: "/test/file.rs".to_string(),
+        });
+
+        let result = server.get_diagnostics(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rename_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(RenameParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
+            new_name: "new_name".to_string(),
+        });
+
+        let result = server.rename_symbol(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_completions_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(CompletionsParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
+            trigger: None,
+        });
+
+        let result = server.get_completions(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_document_symbols_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(DocumentSymbolsParams {
+            file_path: "/test/file.rs".to_string(),
+        });
+
+        let result = server.get_document_symbols(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_format_document_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(FormatDocumentParams {
+            file_path: "/test/file.rs".to_string(),
+            tab_size: 4,
+            insert_spaces: true,
+        });
+
+        let result = server.format_document(params).await;
+        assert!(result.is_err());
+    }
+}
