@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Andrei G. <k05h31@gmail.com>"]
@@ -15,7 +15,7 @@ keywords = ["mcp", "lsp", "language-server", "ai", "claude"]
 categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
-# Sorted alphabetically, versions only (features in crate manifests)
+# Sorted alphabetically
 anyhow = "1.0"
 assert_cmd = "2.0"
 async-trait = "0.1"
@@ -23,6 +23,7 @@ clap = "4.5"
 dirs = "6.0"
 futures = "0.3"
 lsp-types = "0.97"
+mcpls-core = { path = "crates/mcpls-core", version = "0.1.1" }
 predicates = "3.1"
 rmcp = "0.12"
 rstest = "0.26"
