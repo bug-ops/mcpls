@@ -118,6 +118,11 @@ impl LspTransport {
             line.clear();
             self.stdout.read_line(&mut line).await?;
 
+            // EOF - stream closed
+            if line.is_empty() {
+                return Err(Error::ServerTerminated);
+            }
+
             if line == "\r\n" || line == "\n" {
                 break;
             }

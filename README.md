@@ -24,7 +24,26 @@ AI coding assistants are remarkably capable, but they're working blind. They see
 - **Safe refactoring** — Rename symbols with confidence, workspace-wide
 
 > [!TIP]
-> Zero configuration for Rust projects. Just install and go — rust-analyzer works out of the box.
+> Zero configuration for Rust projects. Just install mcpls and a language server — ready to go.
+
+## Prerequisites
+
+For Rust projects, install rust-analyzer:
+
+```bash
+# Via rustup (recommended)
+rustup component add rust-analyzer
+
+# Or via Homebrew (macOS)
+brew install rust-analyzer
+
+# Or via package manager (Linux)
+# Ubuntu/Debian: sudo apt install rust-analyzer
+# Arch: sudo pacman -S rust-analyzer
+```
+
+> [!IMPORTANT]
+> mcpls requires a language server to be installed. Without rust-analyzer, you'll see "LSP server process terminated unexpectedly" errors.
 
 ## Installation
 

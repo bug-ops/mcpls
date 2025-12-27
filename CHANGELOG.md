@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2025-12-27
+
+Patch release with bug fix and documentation improvements.
+
+### Fixed
+
+- **Infinite loop on EOF** — Fixed infinite warning loop when LSP server terminates or stdin reaches EOF. Now returns `ServerTerminated` error cleanly instead of flooding logs with "Malformed header" warnings.
+
+### Added
+
+- **Prerequisites section in README** — Added rust-analyzer installation instructions with multiple methods (rustup, Homebrew, package managers). Includes important note about "LSP server process terminated unexpectedly" error when language server is missing.
+
 ## [0.2.0] - 2025-12-27
 
 Enhanced LSP features release with 5 new MCP tools for advanced code intelligence.
@@ -276,6 +288,7 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/bug-ops/mcpls/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bug-ops/mcpls/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bug-ops/mcpls/releases/tag/v0.1.0
