@@ -36,6 +36,10 @@ pub enum Error {
     #[error("no LSP server configured for language: {0}")]
     NoServerForLanguage(String),
 
+    /// No LSP server is currently configured.
+    #[error("no LSP server configured")]
+    NoServerConfigured,
+
     /// Configuration error.
     #[error("configuration error: {0}")]
     Config(String),

@@ -99,3 +99,56 @@ const fn default_tab_size() -> u32 {
 const fn default_insert_spaces() -> bool {
     true
 }
+
+/// Parameters for the `workspace_symbol_search` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceSymbolParams {
+    /// Search query for symbol names (supports partial matching).
+    pub query: String,
+    /// Optional filter by symbol kind (function, class, variable, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+    /// Maximum results to return (default: 100).
+    #[serde(default = "default_max_results")]
+    pub limit: u32,
+}
+
+const fn default_max_results() -> u32 {
+    100
+}
+
+/// Parameters for the `get_code_actions` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CodeActionsParams {
+    /// Absolute path to the file.
+    pub file_path: String,
+    /// Start line (1-based).
+    pub start_line: u32,
+    /// Start character (1-based).
+    pub start_character: u32,
+    /// End line (1-based).
+    pub end_line: u32,
+    /// End character (1-based).
+    pub end_character: u32,
+    /// Optional filter by action kind (quickfix, refactor, source, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+}
+
+/// Parameters for the `prepare_call_hierarchy` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CallHierarchyPrepareParams {
+    /// Absolute path to the file.
+    pub file_path: String,
+    /// Line number (1-based).
+    pub line: u32,
+    /// Character/column number (1-based).
+    pub character: u32,
+}
+
+/// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CallHierarchyCallsParams {
+    /// The call hierarchy item to get calls for (from prepare response).
+    pub item: serde_json::Value,
+}

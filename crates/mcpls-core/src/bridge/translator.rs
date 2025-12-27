@@ -4,11 +4,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use lsp_types::{
-    CompletionParams, CompletionTriggerKind, DocumentFormattingParams, DocumentSymbol,
-    DocumentSymbolParams, FormattingOptions, GotoDefinitionParams, Hover, HoverContents,
-    HoverParams as LspHoverParams, MarkedString, PartialResultParams, ReferenceContext,
-    ReferenceParams, RenameParams as LspRenameParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, WorkDoneProgressParams, WorkspaceEdit,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
+    CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, CompletionParams,
+    CompletionTriggerKind, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+    FormattingOptions, GotoDefinitionParams, Hover, HoverContents, HoverParams as LspHoverParams,
+    MarkedString, PartialResultParams, ReferenceContext, ReferenceParams,
+    RenameParams as LspRenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
@@ -233,6 +236,140 @@ pub struct FormatDocumentResult {
     pub edits: Vec<TextEdit>,
 }
 
+/// A workspace symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSymbol {
+    /// Name of the symbol.
+    pub name: String,
+    /// Kind of symbol.
+    pub kind: String,
+    /// Location of the symbol.
+    pub location: Location,
+    /// Optional container name (parent scope).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
+/// Result of workspace symbol search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSymbolResult {
+    /// List of symbols found.
+    pub symbols: Vec<WorkspaceSymbol>,
+}
+
+/// A single code action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeAction {
+    /// Title of the code action.
+    pub title: String,
+    /// Kind of code action (quickfix, refactor, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Diagnostics that this action resolves.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Workspace edit to apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<WorkspaceEditDescription>,
+    /// Command to execute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandDescription>,
+    /// Whether this is the preferred action.
+    #[serde(default)]
+    pub is_preferred: bool,
+}
+
+/// Description of a workspace edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEditDescription {
+    /// Changes to apply to documents.
+    pub changes: Vec<DocumentChanges>,
+}
+
+/// Description of a command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandDescription {
+    /// Title of the command.
+    pub title: String,
+    /// Command identifier.
+    pub command: String,
+    /// Command arguments.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub arguments: Vec<serde_json::Value>,
+}
+
+/// Result of code actions request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeActionsResult {
+    /// Available code actions.
+    pub actions: Vec<CodeAction>,
+}
+
+/// A call hierarchy item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallHierarchyItemResult {
+    /// Name of the symbol.
+    pub name: String,
+    /// Kind of symbol.
+    pub kind: String,
+    /// More detail for this item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// URI of the document.
+    pub uri: String,
+    /// Range of the symbol.
+    pub range: Range,
+    /// Selection range (identifier location).
+    pub selection_range: Range,
+    /// Opaque data to pass to incoming/outgoing calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Result of call hierarchy prepare request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallHierarchyPrepareResult {
+    /// List of callable items at the position.
+    pub items: Vec<CallHierarchyItemResult>,
+}
+
+/// An incoming call (caller of the current item).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingCall {
+    /// The item that calls the current item.
+    pub from: CallHierarchyItemResult,
+    /// Ranges where the call occurs.
+    pub from_ranges: Vec<Range>,
+}
+
+/// Result of incoming calls request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingCallsResult {
+    /// List of incoming calls.
+    pub calls: Vec<IncomingCall>,
+}
+
+/// An outgoing call (callee from the current item).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutgoingCall {
+    /// The item being called.
+    pub to: CallHierarchyItemResult,
+    /// Ranges where the call occurs.
+    pub from_ranges: Vec<Range>,
+}
+
+/// Result of outgoing calls request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutgoingCallsResult {
+    /// List of outgoing calls.
+    pub calls: Vec<OutgoingCall>,
+}
+
+/// Maximum allowed position value for validation.
+const MAX_POSITION_VALUE: u32 = 1_000_000;
+/// Maximum allowed range size in lines.
+const MAX_RANGE_LINES: u32 = 10_000;
+
 impl Translator {
     /// Validate that a path is within allowed workspace boundaries.
     ///
@@ -269,6 +406,44 @@ impl Translator {
             .get(&language_id)
             .cloned()
             .ok_or(Error::NoServerForLanguage(language_id))
+    }
+
+    /// Parse and validate a file URI, returning the validated path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URI doesn't have a file:// scheme
+    /// - The path is outside workspace boundaries
+    fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
+        let uri_str = uri.as_str();
+
+        // Validate file:// scheme
+        if !uri_str.starts_with("file://") {
+            return Err(Error::InvalidToolParams(format!(
+                "Invalid URI scheme, expected file:// but got: {uri_str}"
+            )));
+        }
+
+        // Extract path after file://
+        let path_str = &uri_str["file://".len()..];
+
+        // Handle Windows paths: file:///C:/path -> /C:/path -> C:/path
+        // On Windows, URIs have format file:///C:/path, so we need to strip the leading /
+        #[cfg(windows)]
+        let path_str = if path_str.len() >= 3
+            && path_str.starts_with('/')
+            && path_str.chars().nth(2) == Some(':')
+        {
+            &path_str[1..]
+        } else {
+            path_str
+        };
+
+        let path = PathBuf::from(path_str);
+
+        // Validate path is within workspace
+        self.validate_path(&path)
     }
 
     /// Handle hover request.
@@ -717,6 +892,397 @@ impl Translator {
 
         Ok(result)
     }
+
+    /// Handle workspace symbol search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or no server is configured.
+    pub async fn handle_workspace_symbol(
+        &mut self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+    ) -> Result<WorkspaceSymbolResult> {
+        const MAX_QUERY_LENGTH: usize = 1000;
+        const VALID_SYMBOL_KINDS: &[&str] = &[
+            "File",
+            "Module",
+            "Namespace",
+            "Package",
+            "Class",
+            "Method",
+            "Property",
+            "Field",
+            "Constructor",
+            "Enum",
+            "Interface",
+            "Function",
+            "Variable",
+            "Constant",
+            "String",
+            "Number",
+            "Boolean",
+            "Array",
+            "Object",
+            "Key",
+            "Null",
+            "EnumMember",
+            "Struct",
+            "Event",
+            "Operator",
+            "TypeParameter",
+        ];
+
+        // Validate query length
+        if query.len() > MAX_QUERY_LENGTH {
+            return Err(Error::InvalidToolParams(format!(
+                "Query too long: {} chars (max {MAX_QUERY_LENGTH})",
+                query.len()
+            )));
+        }
+
+        // Validate kind filter
+        if let Some(ref kind) = kind_filter {
+            if !VALID_SYMBOL_KINDS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(kind))
+            {
+                return Err(Error::InvalidToolParams(format!(
+                    "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
+                )));
+            }
+        }
+
+        // Workspace search requires at least one LSP client
+        let client = self
+            .lsp_clients
+            .values()
+            .next()
+            .cloned()
+            .ok_or(Error::NoServerConfigured)?;
+
+        let params = LspWorkspaceSymbolParams {
+            query,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<lsp_types::SymbolInformation>> = client
+            .request("workspace/symbol", params, timeout_duration)
+            .await?;
+
+        let mut symbols: Vec<WorkspaceSymbol> = response
+            .unwrap_or_default()
+            .into_iter()
+            .map(|sym| WorkspaceSymbol {
+                name: sym.name,
+                kind: format!("{:?}", sym.kind),
+                location: Location {
+                    uri: sym.location.uri.to_string(),
+                    range: normalize_range(sym.location.range),
+                },
+                container_name: sym.container_name,
+            })
+            .collect();
+
+        // Apply kind filter if specified
+        if let Some(kind) = kind_filter {
+            symbols.retain(|s| s.kind.eq_ignore_ascii_case(&kind));
+        }
+
+        // Limit results
+        symbols.truncate(limit as usize);
+
+        Ok(WorkspaceSymbolResult { symbols })
+    }
+
+    /// Handle code actions request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the file cannot be opened.
+    pub async fn handle_code_actions(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult> {
+        const VALID_ACTION_KINDS: &[&str] = &[
+            "quickfix",
+            "refactor",
+            "refactor.extract",
+            "refactor.inline",
+            "refactor.rewrite",
+            "source",
+            "source.organizeImports",
+        ];
+
+        // Validate kind filter
+        if let Some(ref kind) = kind_filter {
+            if !VALID_ACTION_KINDS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(kind))
+            {
+                return Err(Error::InvalidToolParams(format!(
+                    "Invalid kind_filter: '{kind}'. Valid values: {VALID_ACTION_KINDS:?}"
+                )));
+            }
+        }
+
+        // Validate range
+        if start_line < 1 || start_character < 1 || end_line < 1 || end_character < 1 {
+            return Err(Error::InvalidToolParams(
+                "Line and character positions must be >= 1".to_string(),
+            ));
+        }
+
+        // Validate position upper bounds
+        if start_line > MAX_POSITION_VALUE
+            || start_character > MAX_POSITION_VALUE
+            || end_line > MAX_POSITION_VALUE
+            || end_character > MAX_POSITION_VALUE
+        {
+            return Err(Error::InvalidToolParams(format!(
+                "Position values must be <= {MAX_POSITION_VALUE}"
+            )));
+        }
+
+        // Validate range size
+        if end_line.saturating_sub(start_line) > MAX_RANGE_LINES {
+            return Err(Error::InvalidToolParams(format!(
+                "Range size must be <= {MAX_RANGE_LINES} lines"
+            )));
+        }
+
+        if start_line > end_line || (start_line == end_line && start_character > end_character) {
+            return Err(Error::InvalidToolParams(
+                "Start position must be before or equal to end position".to_string(),
+            ));
+        }
+
+        let path = PathBuf::from(&file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
+
+        let range = lsp_types::Range {
+            start: mcp_to_lsp_position(start_line, start_character),
+            end: mcp_to_lsp_position(end_line, end_character),
+        };
+
+        // Build context with optional kind filter
+        let only = kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k)]);
+
+        let params = lsp_types::CodeActionParams {
+            text_document: TextDocumentIdentifier { uri },
+            range,
+            context: lsp_types::CodeActionContext {
+                diagnostics: vec![],
+                only,
+                trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<lsp_types::CodeActionResponse> = client
+            .request("textDocument/codeAction", params, timeout_duration)
+            .await?;
+
+        let response_vec = response.unwrap_or_default();
+        let mut actions = Vec::with_capacity(response_vec.len());
+
+        for action_or_command in response_vec {
+            let action = match action_or_command {
+                lsp_types::CodeActionOrCommand::CodeAction(action) => convert_code_action(action),
+                lsp_types::CodeActionOrCommand::Command(cmd) => {
+                    let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+                    CodeAction {
+                        title: cmd.title.clone(),
+                        kind: None,
+                        diagnostics: Vec::new(),
+                        edit: None,
+                        command: Some(CommandDescription {
+                            title: cmd.title,
+                            command: cmd.command,
+                            arguments,
+                        }),
+                        is_preferred: false,
+                    }
+                }
+            };
+            actions.push(action);
+        }
+
+        Ok(CodeActionsResult { actions })
+    }
+
+    /// Handle call hierarchy prepare request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the file cannot be opened.
+    pub async fn handle_call_hierarchy_prepare(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<CallHierarchyPrepareResult> {
+        // Validate position bounds
+        if line < 1 || character < 1 {
+            return Err(Error::InvalidToolParams(
+                "Line and character positions must be >= 1".to_string(),
+            ));
+        }
+
+        if line > MAX_POSITION_VALUE || character > MAX_POSITION_VALUE {
+            return Err(Error::InvalidToolParams(format!(
+                "Position values must be <= {MAX_POSITION_VALUE}"
+            )));
+        }
+
+        let path = PathBuf::from(&file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
+        let lsp_position = mcp_to_lsp_position(line, character);
+
+        let params = LspCallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: lsp_position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<CallHierarchyItem>> = client
+            .request(
+                "textDocument/prepareCallHierarchy",
+                params,
+                timeout_duration,
+            )
+            .await?;
+
+        // Pre-allocate and build result
+        let lsp_items = response.unwrap_or_default();
+        let mut items = Vec::with_capacity(lsp_items.len());
+        for item in lsp_items {
+            items.push(convert_call_hierarchy_item(item));
+        }
+
+        Ok(CallHierarchyPrepareResult { items })
+    }
+
+    /// Handle incoming calls request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the item is invalid.
+    pub async fn handle_incoming_calls(
+        &mut self,
+        item: serde_json::Value,
+    ) -> Result<IncomingCallsResult> {
+        let lsp_item: CallHierarchyItem = serde_json::from_value(item)
+            .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
+
+        // Parse and validate the URI
+        let path = self.parse_file_uri(&lsp_item.uri)?;
+        let client = self.get_client_for_file(&path)?;
+
+        let params = CallHierarchyIncomingCallsParams {
+            item: lsp_item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<CallHierarchyIncomingCall>> = client
+            .request("callHierarchy/incomingCalls", params, timeout_duration)
+            .await?;
+
+        // Pre-allocate and build result
+        let lsp_calls = response.unwrap_or_default();
+        let mut calls = Vec::with_capacity(lsp_calls.len());
+
+        for call in lsp_calls {
+            let from_ranges = {
+                let mut ranges = Vec::with_capacity(call.from_ranges.len());
+                for range in call.from_ranges {
+                    ranges.push(normalize_range(range));
+                }
+                ranges
+            };
+
+            calls.push(IncomingCall {
+                from: convert_call_hierarchy_item(call.from),
+                from_ranges,
+            });
+        }
+
+        Ok(IncomingCallsResult { calls })
+    }
+
+    /// Handle outgoing calls request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the item is invalid.
+    pub async fn handle_outgoing_calls(
+        &mut self,
+        item: serde_json::Value,
+    ) -> Result<OutgoingCallsResult> {
+        let lsp_item: CallHierarchyItem = serde_json::from_value(item)
+            .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
+
+        // Parse and validate the URI
+        let path = self.parse_file_uri(&lsp_item.uri)?;
+        let client = self.get_client_for_file(&path)?;
+
+        let params = CallHierarchyOutgoingCallsParams {
+            item: lsp_item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<CallHierarchyOutgoingCall>> = client
+            .request("callHierarchy/outgoingCalls", params, timeout_duration)
+            .await?;
+
+        // Pre-allocate and build result
+        let lsp_calls = response.unwrap_or_default();
+        let mut calls = Vec::with_capacity(lsp_calls.len());
+
+        for call in lsp_calls {
+            let from_ranges = {
+                let mut ranges = Vec::with_capacity(call.from_ranges.len());
+                for range in call.from_ranges {
+                    ranges.push(normalize_range(range));
+                }
+                ranges
+            };
+
+            calls.push(OutgoingCall {
+                to: convert_call_hierarchy_item(call.to),
+                from_ranges,
+            });
+        }
+
+        Ok(OutgoingCallsResult { calls })
+    }
 }
 
 /// Extract hover contents as markdown string.
@@ -767,12 +1333,92 @@ fn convert_document_symbol(symbol: DocumentSymbol) -> Symbol {
     }
 }
 
+/// Convert LSP call hierarchy item to MCP call hierarchy item.
+fn convert_call_hierarchy_item(item: CallHierarchyItem) -> CallHierarchyItemResult {
+    CallHierarchyItemResult {
+        name: item.name,
+        kind: format!("{:?}", item.kind),
+        detail: item.detail,
+        uri: item.uri.to_string(),
+        range: normalize_range(item.range),
+        selection_range: normalize_range(item.selection_range),
+        data: item.data,
+    }
+}
+
+/// Convert LSP code action to MCP code action.
+fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
+    let diagnostics = action.diagnostics.map_or_else(Vec::new, |diags| {
+        let mut result = Vec::with_capacity(diags.len());
+        for d in diags {
+            result.push(Diagnostic {
+                range: normalize_range(d.range),
+                severity: match d.severity {
+                    Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+                    Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+                    Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                        DiagnosticSeverity::Information
+                    }
+                    Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+                    _ => DiagnosticSeverity::Information,
+                },
+                message: d.message,
+                code: d.code.map(|c| match c {
+                    lsp_types::NumberOrString::Number(n) => n.to_string(),
+                    lsp_types::NumberOrString::String(s) => s,
+                }),
+            });
+        }
+        result
+    });
+
+    let edit = action.edit.map(|edit| {
+        let changes = edit.changes.map_or_else(Vec::new, |changes_map| {
+            let mut result = Vec::with_capacity(changes_map.len());
+            for (uri, edits) in changes_map {
+                let mut text_edits = Vec::with_capacity(edits.len());
+                for e in edits {
+                    text_edits.push(TextEdit {
+                        range: normalize_range(e.range),
+                        new_text: e.new_text,
+                    });
+                }
+                result.push(DocumentChanges {
+                    uri: uri.to_string(),
+                    edits: text_edits,
+                });
+            }
+            result
+        });
+        WorkspaceEditDescription { changes }
+    });
+
+    let command = action.command.map(|cmd| {
+        let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+        CommandDescription {
+            title: cmd.title,
+            command: cmd.command,
+            arguments,
+        }
+    });
+
+    CodeAction {
+        title: action.title,
+        kind: action.kind.map(|k| k.as_str().to_string()),
+        diagnostics,
+        edit,
+        command,
+        is_preferred: action.is_preferred.unwrap_or(false),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::fs;
 
     use tempfile::TempDir;
+    use url::Url;
 
     use super::*;
 
@@ -882,5 +1528,441 @@ mod tests {
         let contents = lsp_types::HoverContents::Markup(markup);
         let result = extract_hover_contents(contents);
         assert_eq!(result, "# Documentation");
+    }
+
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_no_server() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await;
+        assert!(matches!(result, Err(Error::NoServerConfigured)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_invalid_kind() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_code_actions(
+                "/tmp/test.rs".to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("invalid_kind".to_string()),
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_valid_kind_quickfix() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("quickfix".to_string()),
+            )
+            .await;
+        // Will fail due to no LSP server, but validates kind is accepted
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_valid_kind_refactor() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("refactor".to_string()),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_valid_kind_refactor_extract() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("refactor.extract".to_string()),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_valid_kind_source() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("source.organizeImports".to_string()),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_invalid_range_zero() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_code_actions("/tmp/test.rs".to_string(), 0, 1, 1, 10, None)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_invalid_range_order() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_code_actions("/tmp/test.rs".to_string(), 10, 5, 5, 1, None)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_empty_range() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        // Empty range (same position) should be valid
+        let result = translator
+            .handle_code_actions(test_file.to_str().unwrap().to_string(), 1, 5, 1, 5, None)
+            .await;
+        // Will fail due to no LSP server, but validates range is accepted
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[test]
+    fn test_convert_code_action_minimal() {
+        let lsp_action = lsp_types::CodeAction {
+            title: "Fix issue".to_string(),
+            kind: None,
+            diagnostics: None,
+            edit: None,
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action);
+        assert_eq!(result.title, "Fix issue");
+        assert!(result.kind.is_none());
+        assert!(result.diagnostics.is_empty());
+        assert!(result.edit.is_none());
+        assert!(result.command.is_none());
+        assert!(!result.is_preferred);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_convert_code_action_with_diagnostics_all_severities() {
+        let lsp_diagnostics = vec![
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "Error message".to_string(),
+                code: Some(lsp_types::NumberOrString::Number(1)),
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 1,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                message: "Warning message".to_string(),
+                code: Some(lsp_types::NumberOrString::String("W001".to_string())),
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 2,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::INFORMATION),
+                message: "Info message".to_string(),
+                code: None,
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 3,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::HINT),
+                message: "Hint message".to_string(),
+                code: None,
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+        ];
+
+        let lsp_action = lsp_types::CodeAction {
+            title: "Fix all issues".to_string(),
+            kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+            diagnostics: Some(lsp_diagnostics),
+            edit: None,
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action);
+        assert_eq!(result.diagnostics.len(), 4);
+        assert!(matches!(
+            result.diagnostics[0].severity,
+            DiagnosticSeverity::Error
+        ));
+        assert!(matches!(
+            result.diagnostics[1].severity,
+            DiagnosticSeverity::Warning
+        ));
+        assert!(matches!(
+            result.diagnostics[2].severity,
+            DiagnosticSeverity::Information
+        ));
+        assert!(matches!(
+            result.diagnostics[3].severity,
+            DiagnosticSeverity::Hint
+        ));
+        assert_eq!(result.diagnostics[0].code, Some("1".to_string()));
+        assert_eq!(result.diagnostics[1].code, Some("W001".to_string()));
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn test_convert_code_action_with_workspace_edit() {
+        use std::collections::HashMap;
+        use std::str::FromStr;
+
+        let uri = lsp_types::Uri::from_str("file:///test.rs").unwrap();
+        let mut changes_map = HashMap::new();
+        changes_map.insert(
+            uri,
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                new_text: "fixed".to_string(),
+            }],
+        );
+
+        let lsp_action = lsp_types::CodeAction {
+            title: "Apply fix".to_string(),
+            kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+            diagnostics: None,
+            edit: Some(lsp_types::WorkspaceEdit {
+                changes: Some(changes_map),
+                document_changes: None,
+                change_annotations: None,
+            }),
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action);
+        assert!(result.edit.is_some());
+        let edit = result.edit.unwrap();
+        assert_eq!(edit.changes.len(), 1);
+        assert_eq!(edit.changes[0].uri, "file:///test.rs");
+        assert_eq!(edit.changes[0].edits.len(), 1);
+        assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
+        assert!(result.is_preferred);
+    }
+
+    #[test]
+    fn test_convert_code_action_with_command() {
+        let lsp_action = lsp_types::CodeAction {
+            title: "Run command".to_string(),
+            kind: Some(lsp_types::CodeActionKind::REFACTOR),
+            diagnostics: None,
+            edit: None,
+            command: Some(lsp_types::Command {
+                title: "Execute refactor".to_string(),
+                command: "refactor.extract".to_string(),
+                arguments: Some(vec![serde_json::json!("arg1"), serde_json::json!(42)]),
+            }),
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action);
+        assert!(result.command.is_some());
+        let cmd = result.command.unwrap();
+        assert_eq!(cmd.title, "Execute refactor");
+        assert_eq!(cmd.command, "refactor.extract");
+        assert_eq!(cmd.arguments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_hierarchy_prepare_invalid_position_zero() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 0, 1)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+
+        let result = translator
+            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1, 0)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_hierarchy_prepare_invalid_position_too_large() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1_000_001, 1)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+
+        let result = translator
+            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1, 1_000_001)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_incoming_calls_invalid_json() {
+        let mut translator = Translator::new();
+        let invalid_item = serde_json::json!({"invalid": "structure"});
+        let result = translator.handle_incoming_calls(invalid_item).await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_outgoing_calls_invalid_json() {
+        let mut translator = Translator::new();
+        let invalid_item = serde_json::json!({"invalid": "structure"});
+        let result = translator.handle_outgoing_calls(invalid_item).await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_parse_file_uri_invalid_scheme() {
+        let translator = Translator::new();
+        let uri: lsp_types::Uri = "http://example.com/file.rs".parse().unwrap();
+        let result = translator.parse_file_uri(&uri);
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_parse_file_uri_valid_scheme() {
+        let translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        // Use url crate for cross-platform file URI creation
+        let file_url = Url::from_file_path(&test_file).unwrap();
+        let uri: lsp_types::Uri = file_url.as_str().parse().unwrap();
+        let result = translator.parse_file_uri(&uri);
+        assert!(result.is_ok());
     }
 }

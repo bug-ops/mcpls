@@ -677,3 +677,170 @@ async fn test_out_of_bounds_position() {
     // The actual result might be Ok(empty) or Err, both are acceptable
     // We just want to ensure it doesn't hang or crash
 }
+
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_workspace_symbol_search_basic() {
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    let translator = setup_rust_analyzer().await;
+
+    // Give rust-analyzer time to index the workspace
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Search for "User" struct
+    let result = timeout(
+        Duration::from_secs(10),
+        translator
+            .lock()
+            .await
+            .handle_workspace_symbol("User".to_string(), None, 100),
+    )
+    .await;
+
+    assert!(result.is_ok(), "Should not timeout");
+    let symbol_result = result.unwrap();
+    assert!(
+        symbol_result.is_ok(),
+        "Should successfully search symbols: {:?}",
+        symbol_result.err()
+    );
+
+    let symbols = symbol_result.unwrap();
+    let symbols_str = serde_json::to_string(&symbols).unwrap();
+    println!("Workspace symbols for 'User': {}", symbols_str);
+
+    // Should find the User struct
+    assert!(
+        !symbols.symbols.is_empty(),
+        "Should find at least one symbol for 'User'"
+    );
+
+    // Verify at least one result is the User struct
+    let has_user_struct = symbols.symbols.iter().any(|s| s.name == "User");
+    assert!(has_user_struct, "Should find User struct in results");
+}
+
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_workspace_symbol_search_with_kind_filter() {
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    let translator = setup_rust_analyzer().await;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Search for symbols and filter by Struct kind
+    let result = timeout(
+        Duration::from_secs(10),
+        translator.lock().await.handle_workspace_symbol(
+            String::new(), // Empty query to get all symbols
+            Some("Struct".to_string()),
+            100,
+        ),
+    )
+    .await;
+
+    assert!(result.is_ok(), "Should not timeout");
+    let symbol_result = result.unwrap();
+
+    if let Ok(symbols) = symbol_result {
+        println!("Found {} struct symbols", symbols.symbols.len());
+
+        // All results should be structs
+        for symbol in &symbols.symbols {
+            assert_eq!(
+                symbol.kind, "Struct",
+                "All filtered results should be Struct kind"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_workspace_symbol_search_max_results() {
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    let translator = setup_rust_analyzer().await;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Search with very low limit
+    let result = timeout(
+        Duration::from_secs(10),
+        translator
+            .lock()
+            .await
+            .handle_workspace_symbol(String::new(), None, 5),
+    )
+    .await;
+
+    assert!(result.is_ok(), "Should not timeout");
+    let symbol_result = result.unwrap();
+
+    if let Ok(symbols) = symbol_result {
+        println!("Found {} symbols (limited to 5)", symbols.symbols.len());
+        assert!(
+            symbols.symbols.len() <= 5,
+            "Should respect max_results limit of 5"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_workspace_symbol_search_function() {
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    let translator = setup_rust_analyzer().await;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Search for function symbols
+    let result = timeout(
+        Duration::from_secs(10),
+        translator.lock().await.handle_workspace_symbol(
+            "create".to_string(),
+            Some("Function".to_string()),
+            100,
+        ),
+    )
+    .await;
+
+    assert!(result.is_ok(), "Should not timeout");
+    let symbol_result = result.unwrap();
+
+    if let Ok(symbols) = symbol_result {
+        println!("Found {} function symbols", symbols.symbols.len());
+
+        // All results should be functions
+        for symbol in &symbols.symbols {
+            assert_eq!(
+                symbol.kind, "Function",
+                "All filtered results should be Function kind"
+            );
+        }
+
+        // Should find functions with "create" in the name
+        if !symbols.symbols.is_empty() {
+            let has_create = symbols
+                .symbols
+                .iter()
+                .any(|s| s.name.to_lowercase().contains("create"));
+            println!("Has 'create' in name: {}", has_create);
+        }
+    }
+}
