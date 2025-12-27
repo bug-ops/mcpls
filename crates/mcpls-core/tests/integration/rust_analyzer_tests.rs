@@ -10,7 +10,7 @@
     clippy::unnecessary_unwrap
 )]
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use mcpls_core::bridge::Translator;
@@ -21,6 +21,20 @@ use tokio::time::timeout;
 
 use crate::common::test_utils::{rust_analyzer_available, rust_workspace_path};
 
+static INIT_TRACING: Once = Once::new();
+
+fn init_tracing() {
+    INIT_TRACING.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::TRACE.into()),
+            )
+            .with_test_writer()
+            .init();
+    });
+}
+
 /// Setup helper to spawn rust-analyzer and create a translator.
 ///
 /// This function:
@@ -29,6 +43,7 @@ use crate::common::test_utils::{rust_analyzer_available, rust_workspace_path};
 /// 3. Creates and configures a Translator
 /// 4. Returns the translator wrapped in Arc<Mutex>
 async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
+    init_tracing();
     let workspace_path = rust_workspace_path();
 
     let lsp_config = LspServerConfig {

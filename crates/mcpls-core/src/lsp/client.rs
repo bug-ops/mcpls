@@ -17,6 +17,9 @@ use crate::error::{Error, Result};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::{InboundMessage, JsonRpcRequest, RequestId};
 
+/// Type alias for pending request tracking map.
+type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
+
 /// LSP client with async request/response handling.
 ///
 /// This client manages communication with an LSP server, handling:
@@ -231,7 +234,23 @@ impl LspClient {
     async fn message_loop(
         mut transport: LspTransport,
         mut command_rx: mpsc::Receiver<ClientCommand>,
-        pending_requests: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Value>>>>>,
+        pending_requests: Arc<Mutex<PendingRequests>>,
+    ) -> Result<()> {
+        debug!("Message loop started");
+        let result =
+            Self::message_loop_inner(&mut transport, &mut command_rx, &pending_requests).await;
+        if let Err(ref e) = result {
+            error!("Message loop exiting with error: {}", e);
+        } else {
+            debug!("Message loop exiting normally");
+        }
+        result
+    }
+
+    async fn message_loop_inner(
+        transport: &mut LspTransport,
+        command_rx: &mut mpsc::Receiver<ClientCommand>,
+        pending_requests: &Arc<Mutex<PendingRequests>>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -262,7 +281,13 @@ impl LspClient {
                 }
 
                 message = transport.receive() => {
-                    let message = message?;
+                    let message = match message {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!("Transport receive error: {}", e);
+                            return Err(e);
+                        }
+                    };
                     match message {
                         InboundMessage::Response(response) => {
                             trace!("Received response: id={:?}", response.id);
@@ -279,7 +304,14 @@ impl LspClient {
                                 } else if let Some(result) = response.result {
                                     let _ = sender.send(Ok(result));
                                 } else {
-                                    warn!("Response with neither result nor error: {:?}", response.id);
+                                    // LSP spec allows null result for some requests (e.g., hover with no info).
+                                    // Treat as successful response with null value.
+                                    debug_assert!(
+                                        response.result.is_none() && response.error.is_none(),
+                                        "This branch should only be reached when both result and error are None"
+                                    );
+                                    trace!("Response with null result: {:?}", response.id);
+                                    let _ = sender.send(Ok(Value::Null));
                                 }
                             } else {
                                 warn!("Received response for unknown request ID: {:?}", response.id);
@@ -323,5 +355,53 @@ mod tests {
 
         let client = LspClient::new(config);
         assert_eq!(client.language_id(), "rust");
+    }
+
+    #[tokio::test]
+    async fn test_null_response_handling() {
+        use crate::lsp::types::{JsonRpcResponse, RequestId};
+
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+
+        let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
+
+        pending_requests
+            .lock()
+            .await
+            .insert(RequestId::Number(1), response_tx);
+
+        let null_response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            result: None,
+            error: None,
+        };
+
+        let sender = pending_requests.lock().await.remove(&null_response.id);
+        if let Some(sender) = sender {
+            let _ = sender.send(Ok(Value::Null));
+        }
+
+        let timeout_result =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), response_rx).await;
+
+        assert!(timeout_result.is_ok(), "Should not timeout");
+
+        let channel_result = timeout_result.unwrap();
+        assert!(
+            channel_result.is_ok(),
+            "Channel should not be closed: {:?}",
+            channel_result.err()
+        );
+
+        let response = channel_result.unwrap();
+        assert!(
+            response.is_ok(),
+            "Should receive Ok(Value::Null), not Err: {:?}",
+            response.err()
+        );
+
+        let value = response.unwrap();
+        assert_eq!(value, Value::Null, "Should receive Value::Null");
     }
 }
