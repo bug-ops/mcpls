@@ -1,31 +1,30 @@
 # mcpls
 
-[![CI](https://github.com/bug-ops/mcpls/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/mcpls/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/mcpls.svg)](https://crates.io/crates/mcpls)
-[![Documentation](https://docs.rs/mcpls-core/badge.svg)](https://docs.rs/mcpls-core)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![Crates.io](https://img.shields.io/crates/v/mcpls)](https://crates.io/crates/mcpls)
+[![docs.rs](https://img.shields.io/docsrs/mcpls-core)](https://docs.rs/mcpls-core)
+[![CI](https://img.shields.io/github/actions/workflow/status/bug-ops/mcpls/ci.yml?branch=main)](https://github.com/bug-ops/mcpls/actions)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
-Universal MCP to LSP bridge - expose Language Server Protocol capabilities as MCP tools for AI agents.
+**Stop treating code as text. Give your AI agent a compiler's understanding.**
 
-## Overview
+mcpls is a universal bridge between AI coding assistants and language servers. It exposes the full power of LSP — type inference, cross-reference analysis, semantic navigation — through the Model Context Protocol, enabling AI agents to reason about code the way IDEs do.
 
-**mcpls** bridges the gap between AI coding assistants and language servers, enabling semantic code intelligence through the Model Context Protocol (MCP). Instead of treating code as plain text, AI agents can now access:
+## Why mcpls?
 
-- Type information and documentation via hover
-- Go-to-definition for symbol navigation
-- Find all references across the codebase
-- Compiler diagnostics and errors
-- Code completion suggestions
-- Symbol renaming with workspace-wide changes
-- Document formatting
+AI coding assistants are remarkably capable, but they're working blind. They see code as text, not as the structured, typed, interconnected system it actually is. When Claude asks "what type is this variable?" it's guessing from context. When it refactors a function, it's hoping it found all the callers.
 
-## Features
+**mcpls changes that.** By bridging MCP and LSP, it gives AI agents access to:
 
-- **Single binary** - No runtime dependencies (Node.js, Python, etc.)
-- **Multi-language support** - Works with any LSP-compliant language server
-- **Zero-config for Rust** - Built-in rust-analyzer support
-- **TOML configuration** - Familiar format for Rust developers
-- **Memory safe** - Built in Rust for reliability in long-running processes
+- **Type information** — Know exactly what a variable is, not what it might be
+- **Cross-references** — Find every usage of a symbol across your entire codebase
+- **Semantic navigation** — Jump to definitions, implementations, type declarations
+- **Real diagnostics** — See actual compiler errors, not hallucinated ones
+- **Intelligent completions** — Get suggestions that respect scope and types
+- **Safe refactoring** — Rename symbols with confidence, workspace-wide
+
+> [!TIP]
+> Zero configuration for Rust projects. Just install and go — rust-analyzer works out of the box.
 
 ## Installation
 
@@ -34,6 +33,18 @@ Universal MCP to LSP bridge - expose Language Server Protocol capabilities as MC
 ```bash
 cargo install mcpls
 ```
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest):
+
+| Platform | Architecture | Download |
+|----------|--------------|----------|
+| Linux | x86_64 | [mcpls-linux-x86_64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
+| Linux | x86_64 (static) | [mcpls-linux-x86_64-musl.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
+| macOS | Intel | [mcpls-macos-x86_64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
+| macOS | Apple Silicon | [mcpls-macos-aarch64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
+| Windows | x86_64 | [mcpls-windows-x86_64.zip](https://github.com/bug-ops/mcpls/releases/latest) |
 
 ### From source
 
@@ -47,7 +58,7 @@ cargo install --path crates/mcpls-cli
 
 ### 1. Configure Claude Code
 
-Add mcpls to your Claude Code MCP configuration:
+Add mcpls to your MCP configuration (`~/.claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -60,17 +71,11 @@ Add mcpls to your Claude Code MCP configuration:
 }
 ```
 
-### 2. Create configuration (optional)
+### 2. Configure language servers (optional)
 
-For custom LSP servers, create `~/.config/mcpls/mcpls.toml`:
+For languages beyond Rust, create `~/.config/mcpls/mcpls.toml`:
 
 ```toml
-[[lsp_servers]]
-language_id = "rust"
-command = "rust-analyzer"
-args = []
-file_patterns = ["**/*.rs"]
-
 [[lsp_servers]]
 language_id = "python"
 command = "pyright-langserver"
@@ -84,32 +89,38 @@ args = ["--stdio"]
 file_patterns = ["**/*.ts", "**/*.tsx"]
 ```
 
-### 3. Use with Claude
-
-Claude can now use semantic code intelligence:
+### 3. Experience the difference
 
 ```
-User: What type is the variable on line 42?
-Claude: [Uses get_hover tool] This is a `Vec<String>` - a growable array of strings.
+You: What's the return type of process_request on line 47?
 
-User: Find all usages of the `process` function
-Claude: [Uses get_references tool] Found 5 references across 3 files...
+Claude: [get_hover] It returns Result<Response, ApiError> where:
+        - Response is defined in src/types.rs:23
+        - ApiError is an enum with variants: Network, Parse, Timeout
+
+You: Find everywhere ApiError::Timeout is handled
+
+Claude: [get_references] Found 4 matches:
+        - src/handlers/api.rs:89 — retry logic
+        - src/handlers/api.rs:156 — logging
+        - src/middleware/timeout.rs:34 — wrapper
+        - tests/api_tests.rs:201 — test case
 ```
 
-## Available MCP Tools
+## MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `get_hover` | Get type information and documentation at a position |
-| `get_definition` | Jump to symbol definition |
-| `get_references` | Find all references to a symbol |
-| `get_diagnostics` | Get compiler errors and warnings |
-| `get_completions` | Get code completion suggestions |
-| `rename_symbol` | Rename a symbol across the workspace |
-| `get_document_symbols` | List all symbols in a document |
-| `format_document` | Format a document |
+| Tool | What it does |
+|------|--------------|
+| `get_hover` | Type signatures, documentation, inferred types at any position |
+| `get_definition` | Jump to where a symbol is defined — across files, across crates |
+| `get_references` | Every usage of a symbol in your workspace |
+| `get_diagnostics` | Real compiler errors and warnings, not guesses |
+| `get_completions` | Context-aware suggestions that respect types and scope |
+| `rename_symbol` | Workspace-wide rename with full reference tracking |
+| `get_document_symbols` | Structured outline — functions, types, constants, imports |
+| `format_document` | Apply language-specific formatting rules |
 
-## Configuration Reference
+## Configuration
 
 ### Environment Variables
 
@@ -119,15 +130,13 @@ Claude: [Uses get_references tool] Found 5 references across 3 files...
 | `MCPLS_LOG` | Log level (trace, debug, info, warn, error) | `info` |
 | `MCPLS_LOG_JSON` | Output logs as JSON | `false` |
 
-### Configuration File
+### Full Configuration Example
 
 ```toml
-# Workspace settings
 [workspace]
 roots = ["/path/to/project"]
 position_encodings = ["utf-8", "utf-16"]
 
-# LSP server definitions
 [[lsp_servers]]
 language_id = "rust"
 command = "rust-analyzer"
@@ -136,81 +145,92 @@ file_patterns = ["**/*.rs"]
 timeout_seconds = 30
 
 [lsp_servers.initialization_options]
-# Server-specific initialization options
 cargo.features = "all"
+checkOnSave.command = "clippy"
+
+[lsp_servers.env]
+RUST_BACKTRACE = "1"
 ```
+
+> [!NOTE]
+> See [Configuration Reference](docs/user-guide/configuration.md) for all options.
 
 ## Supported Language Servers
 
-mcpls works with any LSP-compliant language server. Tested with:
+mcpls works with any LSP 3.17 compliant server. Battle-tested with:
 
-- **Rust**: rust-analyzer
-- **Python**: pyright, pylsp
-- **TypeScript/JavaScript**: typescript-language-server
-- **Go**: gopls
-- **C/C++**: clangd
+| Language | Server | Notes |
+|----------|--------|-------|
+| Rust | rust-analyzer | Zero-config, built-in support |
+| Python | pyright | Full type inference |
+| TypeScript/JS | typescript-language-server | JSX/TSX support |
+| Go | gopls | Modules and workspaces |
+| C/C++ | clangd | compile_commands.json |
+| Java | jdtls | Maven/Gradle projects |
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph AI["AI Agent (Claude)"]
+    end
+
+    subgraph mcpls["mcpls Server"]
+        MCP["MCP Server<br/>(rmcp)"]
+        Trans["Translation Layer"]
+        LSP["LSP Clients<br/>Manager"]
+        MCP --> Trans --> LSP
+    end
+
+    subgraph Servers["Language Servers"]
+        RA["rust-analyzer"]
+        PY["pyright"]
+        TS["tsserver"]
+        Other["..."]
+    end
+
+    AI <-->|"MCP Protocol<br/>(JSON-RPC 2.0)"| mcpls
+    mcpls <-->|"LSP Protocol<br/>(JSON-RPC 2.0)"| Servers
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    AI Agent (Claude)                     │
-└─────────────────────────┬───────────────────────────────┘
-                          │ MCP Protocol (JSON-RPC 2.0)
-┌─────────────────────────▼───────────────────────────────┐
-│                     mcpls Server                         │
-│  ┌────────────┐  ┌─────────────────┐  ┌──────────────┐  │
-│  │ MCP Server │→ │Translation Layer│→ │ LSP Clients  │  │
-│  │   (rmcp)   │  │                 │  │   Manager    │  │
-│  └────────────┘  └─────────────────┘  └──────────────┘  │
-└─────────────────────────────────────────────────────────┘
-                          │ LSP Protocol (JSON-RPC 2.0)
-┌─────────────────────────▼───────────────────────────────┐
-│         rust-analyzer, pyright, tsserver, ...            │
-└─────────────────────────────────────────────────────────┘
-```
+
+**Key design decisions:**
+
+- **Single binary** — No Node.js, Python, or other runtime dependencies
+- **Async-first** — Tokio-based, handles multiple LSP servers concurrently
+- **Memory-safe** — Pure Rust, zero `unsafe` blocks
+- **Resource-bounded** — Configurable limits on documents and file sizes
+
+## Documentation
+
+- [Getting Started](docs/user-guide/getting-started.md) — First-time setup
+- [Configuration Reference](docs/user-guide/configuration.md) — All options explained
+- [Tools Reference](docs/user-guide/tools-reference.md) — Deep dive into each tool
+- [Troubleshooting](docs/user-guide/troubleshooting.md) — Common issues and solutions
+- [Installation Guide](docs/user-guide/installation.md) — Platform-specific instructions
 
 ## Development
 
-### Prerequisites
-
-- Rust 1.85+ (Edition 2024)
-- cargo
-
-### Building
-
 ```bash
+# Build
 cargo build
-```
 
-### Testing
+# Test (uses nextest for speed)
+cargo nextest run
 
-```bash
-cargo test
-```
-
-### Running locally
-
-```bash
+# Run locally
 cargo run -- --log-level debug
 ```
 
+**Requirements:** Rust 1.85+ (Edition 2024)
+
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-Licensed under either of:
+Dual-licensed under [Apache 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+---
 
-at your option.
-
-## Acknowledgments
-
-- [Model Context Protocol](https://modelcontextprotocol.io/) by Anthropic
-- [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) by Microsoft
-- [rmcp](https://github.com/modelcontextprotocol/rust-sdk) - Official MCP Rust SDK
-- [lsp-types](https://github.com/gluon-lang/lsp-types) - LSP type definitions for Rust
+**mcpls** — Because AI deserves to understand code, not just read it.

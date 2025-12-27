@@ -4,9 +4,11 @@
 //! to AI agents.
 
 mod handlers;
+mod server;
 mod tools;
 
-pub use handlers::ToolHandler;
+pub use handlers::{ToolHandler, ToolHandlers};
+pub use server::McplsServer;
 pub use tools::{
     CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
     FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,

@@ -1,9 +1,10 @@
 //! MCP tool parameter definitions.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Parameters for the `get_hover` tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HoverParams {
     /// Absolute path to the file.
     pub file_path: String,
@@ -14,7 +15,7 @@ pub struct HoverParams {
 }
 
 /// Parameters for the `get_definition` tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefinitionParams {
     /// Absolute path to the file.
     pub file_path: String,
@@ -25,7 +26,7 @@ pub struct DefinitionParams {
 }
 
 /// Parameters for the `get_references` tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReferencesParams {
     /// Absolute path to the file.
     pub file_path: String,
@@ -39,14 +40,14 @@ pub struct ReferencesParams {
 }
 
 /// Parameters for the `get_diagnostics` tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiagnosticsParams {
     /// Absolute path to the file.
     pub file_path: String,
 }
 
 /// Parameters for the `rename_symbol` tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RenameParams {
     /// Absolute path to the file.
     pub file_path: String,
@@ -59,7 +60,7 @@ pub struct RenameParams {
 }
 
 /// Parameters for the `get_completions` tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompletionsParams {
     /// Absolute path to the file.
     pub file_path: String,
@@ -72,14 +73,14 @@ pub struct CompletionsParams {
 }
 
 /// Parameters for the `get_document_symbols` tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentSymbolsParams {
     /// Absolute path to the file.
     pub file_path: String,
 }
 
 /// Parameters for the `format_document` tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FormatDocumentParams {
     /// Absolute path to the file.
     pub file_path: String,
@@ -91,10 +92,10 @@ pub struct FormatDocumentParams {
     pub insert_spaces: bool,
 }
 
-fn default_tab_size() -> u32 {
+const fn default_tab_size() -> u32 {
     4
 }
 
-fn default_insert_spaces() -> bool {
+const fn default_insert_spaces() -> bool {
     true
 }

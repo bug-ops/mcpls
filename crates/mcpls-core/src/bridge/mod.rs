@@ -7,6 +7,10 @@ mod encoding;
 mod state;
 mod translator;
 
-pub use encoding::{lsp_to_mcp_position, mcp_to_lsp_position, PositionEncoding};
+pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 pub use state::{DocumentState, DocumentTracker};
-pub use translator::Translator;
+pub use translator::{
+    Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
+    DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
+    Location, Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit, Translator,
+};

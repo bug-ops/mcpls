@@ -11,21 +11,23 @@ keywords = ["mcp", "lsp", "language-server", "protocol"]
 categories = ["development-tools"]
 
 [dependencies]
-rmcp.workspace = true
-lsp-types.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-async-trait.workspace = true
-futures.workspace = true
-toml.workspace = true
-dirs.workspace = true
+async-trait = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+lsp-types = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-io", "macros"] }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+toml = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-rstest.workspace = true
-tempfile.workspace = true
+anyhow = { workspace = true }
+rstest = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

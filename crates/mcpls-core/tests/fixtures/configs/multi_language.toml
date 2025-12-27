@@ -1,0 +1,21 @@
+# Multi-language configuration for testing
+[workspace]
+roots = []
+
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+
+[[lsp_servers]]
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+file_patterns = ["**/*.py"]
+
+[[lsp_servers]]
+language_id = "typescript"
+command = "typescript-language-server"
+args = ["--stdio"]
+file_patterns = ["**/*.ts", "**/*.tsx"]

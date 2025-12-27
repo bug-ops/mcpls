@@ -5,11 +5,12 @@
 
 mod server;
 
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 pub use server::LspServerConfig;
 
 use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 
 /// Main configuration for the MCPLS server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
