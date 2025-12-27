@@ -116,3 +116,21 @@ pub struct WorkspaceSymbolParams {
 const fn default_max_results() -> u32 {
     100
 }
+
+/// Parameters for the `get_code_actions` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CodeActionsParams {
+    /// Absolute path to the file.
+    pub file_path: String,
+    /// Start line (1-based).
+    pub start_line: u32,
+    /// Start character (1-based).
+    pub start_character: u32,
+    /// End line (1-based).
+    pub end_line: u32,
+    /// End character (1-based).
+    pub end_character: u32,
+    /// Optional filter by action kind (quickfix, refactor, source, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+}

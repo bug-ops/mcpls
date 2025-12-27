@@ -255,6 +255,59 @@ pub struct WorkspaceSymbolResult {
     pub symbols: Vec<WorkspaceSymbol>,
 }
 
+/// A single code action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeAction {
+    /// Title of the code action.
+    pub title: String,
+    /// Kind of code action (quickfix, refactor, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Diagnostics that this action resolves.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Workspace edit to apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<WorkspaceEditDescription>,
+    /// Command to execute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandDescription>,
+    /// Whether this is the preferred action.
+    #[serde(default)]
+    pub is_preferred: bool,
+}
+
+/// Description of a workspace edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEditDescription {
+    /// Changes to apply to documents.
+    pub changes: Vec<DocumentChanges>,
+}
+
+/// Description of a command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandDescription {
+    /// Title of the command.
+    pub title: String,
+    /// Command identifier.
+    pub command: String,
+    /// Command arguments.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub arguments: Vec<serde_json::Value>,
+}
+
+/// Result of code actions request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeActionsResult {
+    /// Available code actions.
+    pub actions: Vec<CodeAction>,
+}
+
+/// Maximum allowed position value for validation.
+const MAX_POSITION_VALUE: u32 = 1_000_000;
+/// Maximum allowed range size in lines.
+const MAX_RANGE_LINES: u32 = 10_000;
+
 impl Translator {
     /// Validate that a path is within allowed workspace boundaries.
     ///
@@ -844,6 +897,134 @@ impl Translator {
 
         Ok(WorkspaceSymbolResult { symbols })
     }
+
+    /// Handle code actions request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the file cannot be opened.
+    pub async fn handle_code_actions(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult> {
+        const VALID_ACTION_KINDS: &[&str] = &[
+            "quickfix",
+            "refactor",
+            "refactor.extract",
+            "refactor.inline",
+            "refactor.rewrite",
+            "source",
+            "source.organizeImports",
+        ];
+
+        // Validate kind filter
+        if let Some(ref kind) = kind_filter {
+            if !VALID_ACTION_KINDS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(kind))
+            {
+                return Err(Error::InvalidToolParams(format!(
+                    "Invalid kind_filter: '{kind}'. Valid values: {VALID_ACTION_KINDS:?}"
+                )));
+            }
+        }
+
+        // Validate range
+        if start_line < 1 || start_character < 1 || end_line < 1 || end_character < 1 {
+            return Err(Error::InvalidToolParams(
+                "Line and character positions must be >= 1".to_string(),
+            ));
+        }
+
+        // Validate position upper bounds
+        if start_line > MAX_POSITION_VALUE
+            || start_character > MAX_POSITION_VALUE
+            || end_line > MAX_POSITION_VALUE
+            || end_character > MAX_POSITION_VALUE
+        {
+            return Err(Error::InvalidToolParams(format!(
+                "Position values must be <= {MAX_POSITION_VALUE}"
+            )));
+        }
+
+        // Validate range size
+        if end_line.saturating_sub(start_line) > MAX_RANGE_LINES {
+            return Err(Error::InvalidToolParams(format!(
+                "Range size must be <= {MAX_RANGE_LINES} lines"
+            )));
+        }
+
+        if start_line > end_line || (start_line == end_line && start_character > end_character) {
+            return Err(Error::InvalidToolParams(
+                "Start position must be before or equal to end position".to_string(),
+            ));
+        }
+
+        let path = PathBuf::from(&file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
+
+        let range = lsp_types::Range {
+            start: mcp_to_lsp_position(start_line, start_character),
+            end: mcp_to_lsp_position(end_line, end_character),
+        };
+
+        // Build context with optional kind filter
+        let only = kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k)]);
+
+        let params = lsp_types::CodeActionParams {
+            text_document: TextDocumentIdentifier { uri },
+            range,
+            context: lsp_types::CodeActionContext {
+                diagnostics: vec![],
+                only,
+                trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<lsp_types::CodeActionResponse> = client
+            .request("textDocument/codeAction", params, timeout_duration)
+            .await?;
+
+        let response_vec = response.unwrap_or_default();
+        let mut actions = Vec::with_capacity(response_vec.len());
+
+        for action_or_command in response_vec {
+            let action = match action_or_command {
+                lsp_types::CodeActionOrCommand::CodeAction(action) => convert_code_action(action),
+                lsp_types::CodeActionOrCommand::Command(cmd) => {
+                    let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+                    CodeAction {
+                        title: cmd.title.clone(),
+                        kind: None,
+                        diagnostics: Vec::new(),
+                        edit: None,
+                        command: Some(CommandDescription {
+                            title: cmd.title,
+                            command: cmd.command,
+                            arguments,
+                        }),
+                        is_preferred: false,
+                    }
+                }
+            };
+            actions.push(action);
+        }
+
+        Ok(CodeActionsResult { actions })
+    }
 }
 
 /// Extract hover contents as markdown string.
@@ -891,6 +1072,72 @@ fn convert_document_symbol(symbol: DocumentSymbol) -> Symbol {
         children: symbol
             .children
             .map(|children| children.into_iter().map(convert_document_symbol).collect()),
+    }
+}
+
+/// Convert LSP code action to MCP code action.
+fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
+    let diagnostics = action.diagnostics.map_or_else(Vec::new, |diags| {
+        let mut result = Vec::with_capacity(diags.len());
+        for d in diags {
+            result.push(Diagnostic {
+                range: normalize_range(d.range),
+                severity: match d.severity {
+                    Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+                    Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+                    Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                        DiagnosticSeverity::Information
+                    }
+                    Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+                    _ => DiagnosticSeverity::Information,
+                },
+                message: d.message,
+                code: d.code.map(|c| match c {
+                    lsp_types::NumberOrString::Number(n) => n.to_string(),
+                    lsp_types::NumberOrString::String(s) => s,
+                }),
+            });
+        }
+        result
+    });
+
+    let edit = action.edit.map(|edit| {
+        let changes = edit.changes.map_or_else(Vec::new, |changes_map| {
+            let mut result = Vec::with_capacity(changes_map.len());
+            for (uri, edits) in changes_map {
+                let mut text_edits = Vec::with_capacity(edits.len());
+                for e in edits {
+                    text_edits.push(TextEdit {
+                        range: normalize_range(e.range),
+                        new_text: e.new_text,
+                    });
+                }
+                result.push(DocumentChanges {
+                    uri: uri.to_string(),
+                    edits: text_edits,
+                });
+            }
+            result
+        });
+        WorkspaceEditDescription { changes }
+    });
+
+    let command = action.command.map(|cmd| {
+        let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+        CommandDescription {
+            title: cmd.title,
+            command: cmd.command,
+            arguments,
+        }
+    });
+
+    CodeAction {
+        title: action.title,
+        kind: action.kind.map(|k| k.as_str().to_string()),
+        diagnostics,
+        edit,
+        command,
+        is_preferred: action.is_preferred.unwrap_or(false),
     }
 }
 
@@ -1018,5 +1265,366 @@ mod tests {
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
         assert!(matches!(result, Err(Error::NoServerConfigured)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_invalid_kind() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_code_actions(
+                "/tmp/test.rs".to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("invalid_kind".to_string()),
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_valid_kind_quickfix() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("quickfix".to_string()),
+            )
+            .await;
+        // Will fail due to no LSP server, but validates kind is accepted
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_valid_kind_refactor() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("refactor".to_string()),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_valid_kind_refactor_extract() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("refactor.extract".to_string()),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_valid_kind_source() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                1,
+                1,
+                1,
+                10,
+                Some("source.organizeImports".to_string()),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_invalid_range_zero() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_code_actions("/tmp/test.rs".to_string(), 0, 1, 1, 10, None)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_invalid_range_order() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_code_actions("/tmp/test.rs".to_string(), 10, 5, 5, 1, None)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_empty_range() {
+        use tempfile::TempDir;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        // Empty range (same position) should be valid
+        let result = translator
+            .handle_code_actions(test_file.to_str().unwrap().to_string(), 1, 5, 1, 5, None)
+            .await;
+        // Will fail due to no LSP server, but validates range is accepted
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[test]
+    fn test_convert_code_action_minimal() {
+        let lsp_action = lsp_types::CodeAction {
+            title: "Fix issue".to_string(),
+            kind: None,
+            diagnostics: None,
+            edit: None,
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action);
+        assert_eq!(result.title, "Fix issue");
+        assert!(result.kind.is_none());
+        assert!(result.diagnostics.is_empty());
+        assert!(result.edit.is_none());
+        assert!(result.command.is_none());
+        assert!(!result.is_preferred);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_convert_code_action_with_diagnostics_all_severities() {
+        let lsp_diagnostics = vec![
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "Error message".to_string(),
+                code: Some(lsp_types::NumberOrString::Number(1)),
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 1,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                message: "Warning message".to_string(),
+                code: Some(lsp_types::NumberOrString::String("W001".to_string())),
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 2,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::INFORMATION),
+                message: "Info message".to_string(),
+                code: None,
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 3,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::HINT),
+                message: "Hint message".to_string(),
+                code: None,
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+        ];
+
+        let lsp_action = lsp_types::CodeAction {
+            title: "Fix all issues".to_string(),
+            kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+            diagnostics: Some(lsp_diagnostics),
+            edit: None,
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action);
+        assert_eq!(result.diagnostics.len(), 4);
+        assert!(matches!(
+            result.diagnostics[0].severity,
+            DiagnosticSeverity::Error
+        ));
+        assert!(matches!(
+            result.diagnostics[1].severity,
+            DiagnosticSeverity::Warning
+        ));
+        assert!(matches!(
+            result.diagnostics[2].severity,
+            DiagnosticSeverity::Information
+        ));
+        assert!(matches!(
+            result.diagnostics[3].severity,
+            DiagnosticSeverity::Hint
+        ));
+        assert_eq!(result.diagnostics[0].code, Some("1".to_string()));
+        assert_eq!(result.diagnostics[1].code, Some("W001".to_string()));
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn test_convert_code_action_with_workspace_edit() {
+        use std::collections::HashMap;
+        use std::str::FromStr;
+
+        let uri = lsp_types::Uri::from_str("file:///test.rs").unwrap();
+        let mut changes_map = HashMap::new();
+        changes_map.insert(
+            uri,
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                new_text: "fixed".to_string(),
+            }],
+        );
+
+        let lsp_action = lsp_types::CodeAction {
+            title: "Apply fix".to_string(),
+            kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+            diagnostics: None,
+            edit: Some(lsp_types::WorkspaceEdit {
+                changes: Some(changes_map),
+                document_changes: None,
+                change_annotations: None,
+            }),
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action);
+        assert!(result.edit.is_some());
+        let edit = result.edit.unwrap();
+        assert_eq!(edit.changes.len(), 1);
+        assert_eq!(edit.changes[0].uri, "file:///test.rs");
+        assert_eq!(edit.changes[0].edits.len(), 1);
+        assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
+        assert!(result.is_preferred);
+    }
+
+    #[test]
+    fn test_convert_code_action_with_command() {
+        let lsp_action = lsp_types::CodeAction {
+            title: "Run command".to_string(),
+            kind: Some(lsp_types::CodeActionKind::REFACTOR),
+            diagnostics: None,
+            edit: None,
+            command: Some(lsp_types::Command {
+                title: "Execute refactor".to_string(),
+                command: "refactor.extract".to_string(),
+                arguments: Some(vec![serde_json::json!("arg1"), serde_json::json!(42)]),
+            }),
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action);
+        assert!(result.command.is_some());
+        let cmd = result.command.unwrap();
+        assert_eq!(cmd.title, "Execute refactor");
+        assert_eq!(cmd.command, "refactor.extract");
+        assert_eq!(cmd.arguments.len(), 2);
     }
 }

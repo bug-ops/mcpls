@@ -12,8 +12,9 @@ use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
 use super::tools::{
-    CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
-    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams, WorkspaceSymbolParams,
+    CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
+    DocumentSymbolsParams, FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
+    WorkspaceSymbolParams,
 };
 use crate::bridge::Translator;
 
@@ -224,6 +225,35 @@ impl McplsServer {
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
+
+    /// Get code actions for a range.
+    #[tool(
+        description = "Get available code actions (quick fixes, refactorings) for a range in a file"
+    )]
+    async fn get_code_actions(
+        &self,
+        params: Parameters<CodeActionsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_code_actions(
+                    params.0.file_path,
+                    params.0.start_line,
+                    params.0.start_character,
+                    params.0.end_line,
+                    params.0.end_character,
+                    params.0.kind_filter,
+                )
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
 }
 
 #[tool_handler]
@@ -385,6 +415,21 @@ mod tests {
             limit: 100,
         });
         let result = server.workspace_symbol_search(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_code_actions_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(CodeActionsParams {
+            file_path: "/test/file.rs".to_string(),
+            start_line: 10,
+            start_character: 5,
+            end_line: 10,
+            end_character: 15,
+            kind_filter: None,
+        });
+        let result = server.get_code_actions(params).await;
         assert!(result.is_err());
     }
 }
