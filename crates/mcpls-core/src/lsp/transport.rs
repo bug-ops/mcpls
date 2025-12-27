@@ -116,10 +116,15 @@ impl LspTransport {
 
         loop {
             line.clear();
-            self.stdout.read_line(&mut line).await?;
+            let bytes_read = self.stdout.read_line(&mut line).await?;
 
-            // EOF - stream closed
-            if line.is_empty() {
+            // EOF - stream closed (read_line returns 0 bytes on EOF)
+            if bytes_read == 0 || line.is_empty() {
+                trace!(
+                    "EOF detected in read_headers: bytes_read={}, line_len={}",
+                    bytes_read,
+                    line.len()
+                );
                 return Err(Error::ServerTerminated);
             }
 

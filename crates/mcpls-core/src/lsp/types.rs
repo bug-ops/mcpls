@@ -155,4 +155,28 @@ mod tests {
         let parsed_str: RequestId = serde_json::from_str("\"request-1\"").unwrap();
         assert_eq!(parsed_str, RequestId::String("request-1".to_string()));
     }
+
+    #[test]
+    fn test_null_response_deserialization() {
+        let json_str = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let response: JsonRpcResponse = serde_json::from_str(json_str).unwrap();
+
+        assert_eq!(response.jsonrpc, "2.0");
+        assert_eq!(response.id, RequestId::Number(1));
+        assert!(response.result.is_none());
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn test_null_vs_missing_result() {
+        let null_json = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let null_response: JsonRpcResponse = serde_json::from_str(null_json).unwrap();
+        assert!(null_response.result.is_none());
+
+        let missing_json = r#"{"jsonrpc":"2.0","id":1}"#;
+        let missing_response: JsonRpcResponse = serde_json::from_str(missing_json).unwrap();
+        assert!(missing_response.result.is_none());
+
+        assert_eq!(null_response.result, missing_response.result);
+    }
 }
