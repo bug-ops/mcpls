@@ -99,3 +99,20 @@ const fn default_tab_size() -> u32 {
 const fn default_insert_spaces() -> bool {
     true
 }
+
+/// Parameters for the `workspace_symbol_search` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceSymbolParams {
+    /// Search query for symbol names (supports partial matching).
+    pub query: String,
+    /// Optional filter by symbol kind (function, class, variable, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+    /// Maximum results to return (default: 100).
+    #[serde(default = "default_max_results")]
+    pub limit: u32,
+}
+
+const fn default_max_results() -> u32 {
+    100
+}

@@ -11,5 +11,5 @@ pub use handlers::{ToolHandler, ToolHandlers};
 pub use server::McplsServer;
 pub use tools::{
     CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
-    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
+    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams, WorkspaceSymbolParams,
 };

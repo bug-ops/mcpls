@@ -9,6 +9,7 @@ use lsp_types::{
     HoverParams as LspHoverParams, MarkedString, PartialResultParams, ReferenceContext,
     ReferenceParams, RenameParams as LspRenameParams, TextDocumentIdentifier,
     TextDocumentPositionParams, WorkDoneProgressParams, WorkspaceEdit,
+    WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
@@ -231,6 +232,27 @@ pub struct DocumentSymbolsResult {
 pub struct FormatDocumentResult {
     /// List of edits to format the document.
     pub edits: Vec<TextEdit>,
+}
+
+/// A workspace symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSymbol {
+    /// Name of the symbol.
+    pub name: String,
+    /// Kind of symbol.
+    pub kind: String,
+    /// Location of the symbol.
+    pub location: Location,
+    /// Optional container name (parent scope).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
+/// Result of workspace symbol search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSymbolResult {
+    /// List of symbols found.
+    pub symbols: Vec<WorkspaceSymbol>,
 }
 
 impl Translator {
@@ -717,6 +739,111 @@ impl Translator {
 
         Ok(result)
     }
+
+    /// Handle workspace symbol search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or no server is configured.
+    pub async fn handle_workspace_symbol(
+        &mut self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+    ) -> Result<WorkspaceSymbolResult> {
+        const MAX_QUERY_LENGTH: usize = 1000;
+        const VALID_SYMBOL_KINDS: &[&str] = &[
+            "File",
+            "Module",
+            "Namespace",
+            "Package",
+            "Class",
+            "Method",
+            "Property",
+            "Field",
+            "Constructor",
+            "Enum",
+            "Interface",
+            "Function",
+            "Variable",
+            "Constant",
+            "String",
+            "Number",
+            "Boolean",
+            "Array",
+            "Object",
+            "Key",
+            "Null",
+            "EnumMember",
+            "Struct",
+            "Event",
+            "Operator",
+            "TypeParameter",
+        ];
+
+        // Validate query length
+        if query.len() > MAX_QUERY_LENGTH {
+            return Err(Error::InvalidToolParams(format!(
+                "Query too long: {} chars (max {MAX_QUERY_LENGTH})",
+                query.len()
+            )));
+        }
+
+        // Validate kind filter
+        if let Some(ref kind) = kind_filter {
+            if !VALID_SYMBOL_KINDS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(kind))
+            {
+                return Err(Error::InvalidToolParams(format!(
+                    "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
+                )));
+            }
+        }
+
+        // Workspace search requires at least one LSP client
+        let client = self
+            .lsp_clients
+            .values()
+            .next()
+            .cloned()
+            .ok_or(Error::NoServerConfigured)?;
+
+        let params = LspWorkspaceSymbolParams {
+            query,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<lsp_types::SymbolInformation>> = client
+            .request("workspace/symbol", params, timeout_duration)
+            .await?;
+
+        let mut symbols: Vec<WorkspaceSymbol> = response
+            .unwrap_or_default()
+            .into_iter()
+            .map(|sym| WorkspaceSymbol {
+                name: sym.name,
+                kind: format!("{:?}", sym.kind),
+                location: Location {
+                    uri: sym.location.uri.to_string(),
+                    range: normalize_range(sym.location.range),
+                },
+                container_name: sym.container_name,
+            })
+            .collect();
+
+        // Apply kind filter if specified
+        if let Some(kind) = kind_filter {
+            symbols.retain(|s| s.kind.eq_ignore_ascii_case(&kind));
+        }
+
+        // Limit results
+        symbols.truncate(limit as usize);
+
+        Ok(WorkspaceSymbolResult { symbols })
+    }
 }
 
 /// Extract hover contents as markdown string.
@@ -882,5 +1009,14 @@ mod tests {
         let contents = lsp_types::HoverContents::Markup(markup);
         let result = extract_hover_contents(contents);
         assert_eq!(result, "# Documentation");
+    }
+
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_no_server() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await;
+        assert!(matches!(result, Err(Error::NoServerConfigured)));
     }
 }

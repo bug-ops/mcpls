@@ -10,7 +10,7 @@ use crate::bridge::Translator;
 use crate::error::{Error, Result};
 use crate::mcp::tools::{
     CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
-    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
+    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams, WorkspaceSymbolParams,
 };
 
 /// Trait for handling MCP tool calls.
@@ -538,6 +538,73 @@ impl ToolHandler for FormatDocumentHandler {
     }
 }
 
+/// Handler for the `workspace_symbol_search` tool.
+pub struct WorkspaceSymbolHandler {
+    context: Arc<HandlerContext>,
+}
+
+impl WorkspaceSymbolHandler {
+    /// Create a new workspace symbol handler.
+    #[must_use]
+    pub const fn new(context: Arc<HandlerContext>) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for WorkspaceSymbolHandler {
+    async fn handle(&self, params: Value) -> Result<Value> {
+        let params: WorkspaceSymbolParams = serde_json::from_value(params).map_err(|e| {
+            Error::InvalidToolParams(format!("Invalid workspace symbol params: {e}"))
+        })?;
+
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_workspace_symbol(params.query, params.kind_filter, params.limit)
+                .await?
+        };
+
+        Ok(serde_json::to_value(result)?)
+    }
+
+    fn name(&self) -> &'static str {
+        "workspace_symbol_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search for symbols across the entire workspace by name or pattern"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query (fuzzy, case-insensitive)"
+                },
+                "kind_filter": {
+                    "type": "string",
+                    "description": "Filter by symbol kind (function, class, struct, enum, etc.)",
+                    "enum": [
+                        "Function", "Method", "Class", "Interface", "Struct",
+                        "Enum", "Variable", "Constant", "Module", "Namespace"
+                    ]
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "default": 100,
+                    "description": "Maximum number of results to return"
+                }
+            },
+            "required": ["query"]
+        })
+    }
+}
+
 /// Factory for creating all tool handlers.
 pub struct ToolHandlers {
     handlers: Vec<Box<dyn ToolHandler>>,
@@ -558,6 +625,7 @@ impl ToolHandlers {
             Box::new(CompletionsHandler::new(Arc::clone(&context))),
             Box::new(DocumentSymbolsHandler::new(Arc::clone(&context))),
             Box::new(FormatDocumentHandler::new(Arc::clone(&context))),
+            Box::new(WorkspaceSymbolHandler::new(Arc::clone(&context))),
         ];
 
         Self { handlers }
@@ -643,6 +711,14 @@ mod tests {
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
 
+    #[tokio::test]
+    async fn test_workspace_symbol_handler_invalid_params() {
+        let handler = WorkspaceSymbolHandler::new(create_test_context());
+        let invalid_params = json!({});
+        let result = handler.handle(invalid_params).await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
     #[test]
     fn test_handler_metadata() {
         let context = create_test_context();
@@ -672,5 +748,8 @@ mod tests {
 
         let format = FormatDocumentHandler::new(Arc::clone(&context));
         assert_eq!(format.name(), "format_document");
+
+        let workspace_symbol = WorkspaceSymbolHandler::new(Arc::clone(&context));
+        assert_eq!(workspace_symbol.name(), "workspace_symbol_search");
     }
 }

@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use super::handlers::HandlerContext;
 use super::tools::{
     CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
-    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
+    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams, WorkspaceSymbolParams,
 };
 use crate::bridge::Translator;
 
@@ -204,6 +204,26 @@ impl McplsServer {
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
+
+    /// Search for symbols across the workspace.
+    #[tool(description = "Search for symbols across the entire workspace by name or pattern")]
+    async fn workspace_symbol_search(
+        &self,
+        params: Parameters<WorkspaceSymbolParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_workspace_symbol(params.0.query, params.0.kind_filter, params.0.limit)
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string_pretty(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
 }
 
 #[tool_handler]
@@ -353,6 +373,18 @@ mod tests {
         });
 
         let result = server.format_document(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_workspace_symbol_search_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(WorkspaceSymbolParams {
+            query: "User".to_string(),
+            kind_filter: None,
+            limit: 100,
+        });
+        let result = server.workspace_symbol_search(params).await;
         assert!(result.is_err());
     }
 }
