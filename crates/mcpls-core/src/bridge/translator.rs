@@ -425,8 +425,22 @@ impl Translator {
             )));
         }
 
-        // Extract path without intermediate allocation
-        let path = PathBuf::from(&uri_str["file://".len()..]);
+        // Extract path after file://
+        let path_str = &uri_str["file://".len()..];
+
+        // Handle Windows paths: file:///C:/path -> /C:/path -> C:/path
+        // On Windows, URIs have format file:///C:/path, so we need to strip the leading /
+        #[cfg(windows)]
+        let path_str = if path_str.len() >= 3
+            && path_str.starts_with('/')
+            && path_str.chars().nth(2) == Some(':')
+        {
+            &path_str[1..]
+        } else {
+            path_str
+        };
+
+        let path = PathBuf::from(path_str);
 
         // Validate path is within workspace
         self.validate_path(&path)
@@ -1404,6 +1418,7 @@ mod tests {
     use std::fs;
 
     use tempfile::TempDir;
+    use url::Url;
 
     use super::*;
 
@@ -1944,8 +1959,9 @@ mod tests {
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let uri_str = format!("file://{}", test_file.to_string_lossy());
-        let uri: lsp_types::Uri = uri_str.parse().unwrap();
+        // Use url crate for cross-platform file URI creation
+        let file_url = Url::from_file_path(&test_file).unwrap();
+        let uri: lsp_types::Uri = file_url.as_str().parse().unwrap();
         let result = translator.parse_file_uri(&uri);
         assert!(result.is_ok());
     }
