@@ -56,6 +56,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
     let mut translator = Translator::new();
     translator.set_workspace_roots(vec![workspace_path]);
     translator.register_client("rust".to_string(), client);
+    translator.register_server("rust".to_string(), server);
 
     Arc::new(Mutex::new(translator))
 }

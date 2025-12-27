@@ -69,6 +69,20 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
+    /// Child process handle. Kept alive for process lifetime management.
+    /// When dropped, the process is terminated via SIGKILL (`kill_on_drop`).
+    _child: tokio::process::Child,
+}
+
+impl std::fmt::Debug for LspServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LspServer")
+            .field("client", &self.client)
+            .field("capabilities", &self.capabilities)
+            .field("position_encoding", &self.position_encoding)
+            .field("_child", &"<process>")
+            .finish()
+    }
 }
 
 impl LspServer {
@@ -124,6 +138,7 @@ impl LspServer {
             client,
             capabilities,
             position_encoding,
+            _child: child,
         })
     }
 
