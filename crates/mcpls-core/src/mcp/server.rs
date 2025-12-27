@@ -40,12 +40,17 @@ impl McplsServer {
 
     /// Get hover information at a position in a file.
     #[tool(description = "Get hover information (type, documentation) at a position in a file")]
-    async fn get_hover(&self, params: Parameters<HoverParams>) -> Result<String, McpError> {
+    async fn get_hover(
+        &self,
+        Parameters(HoverParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<HoverParams>,
+    ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_hover(params.0.file_path, params.0.line, params.0.character)
-                .await
+            translator.handle_hover(file_path, line, character).await
         };
 
         match result {
@@ -59,12 +64,16 @@ impl McplsServer {
     #[tool(description = "Get the definition location of a symbol at the specified position")]
     async fn get_definition(
         &self,
-        params: Parameters<DefinitionParams>,
+        Parameters(DefinitionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<DefinitionParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_definition(params.0.file_path, params.0.line, params.0.character)
+                .handle_definition(file_path, line, character)
                 .await
         };
 
@@ -79,17 +88,17 @@ impl McplsServer {
     #[tool(description = "Find all references to a symbol at the specified position")]
     async fn get_references(
         &self,
-        params: Parameters<ReferencesParams>,
+        Parameters(ReferencesParams {
+            file_path,
+            line,
+            character,
+            include_declaration,
+        }): Parameters<ReferencesParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_references(
-                    params.0.file_path,
-                    params.0.line,
-                    params.0.character,
-                    params.0.include_declaration,
-                )
+                .handle_references(file_path, line, character, include_declaration)
                 .await
         };
 
@@ -104,11 +113,11 @@ impl McplsServer {
     #[tool(description = "Get diagnostics (errors, warnings) for a file")]
     async fn get_diagnostics(
         &self,
-        params: Parameters<DiagnosticsParams>,
+        Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_diagnostics(params.0.file_path).await
+            translator.handle_diagnostics(file_path).await
         };
 
         match result {
@@ -120,16 +129,19 @@ impl McplsServer {
 
     /// Rename a symbol across the workspace.
     #[tool(description = "Rename a symbol across the workspace")]
-    async fn rename_symbol(&self, params: Parameters<RenameParams>) -> Result<String, McpError> {
+    async fn rename_symbol(
+        &self,
+        Parameters(RenameParams {
+            file_path,
+            line,
+            character,
+            new_name,
+        }): Parameters<RenameParams>,
+    ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_rename(
-                    params.0.file_path,
-                    params.0.line,
-                    params.0.character,
-                    params.0.new_name,
-                )
+                .handle_rename(file_path, line, character, new_name)
                 .await
         };
 
@@ -144,17 +156,17 @@ impl McplsServer {
     #[tool(description = "Get code completion suggestions at a position in a file")]
     async fn get_completions(
         &self,
-        params: Parameters<CompletionsParams>,
+        Parameters(CompletionsParams {
+            file_path,
+            line,
+            character,
+            trigger,
+        }): Parameters<CompletionsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_completions(
-                    params.0.file_path,
-                    params.0.line,
-                    params.0.character,
-                    params.0.trigger,
-                )
+                .handle_completions(file_path, line, character, trigger)
                 .await
         };
 
@@ -169,11 +181,11 @@ impl McplsServer {
     #[tool(description = "Get all symbols (functions, classes, variables) in a document")]
     async fn get_document_symbols(
         &self,
-        params: Parameters<DocumentSymbolsParams>,
+        Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_document_symbols(params.0.file_path).await
+            translator.handle_document_symbols(file_path).await
         };
 
         match result {
@@ -187,16 +199,16 @@ impl McplsServer {
     #[tool(description = "Format a document according to the language server's formatting rules")]
     async fn format_document(
         &self,
-        params: Parameters<FormatDocumentParams>,
+        Parameters(FormatDocumentParams {
+            file_path,
+            tab_size,
+            insert_spaces,
+        }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_format_document(
-                    params.0.file_path,
-                    params.0.tab_size,
-                    params.0.insert_spaces,
-                )
+                .handle_format_document(file_path, tab_size, insert_spaces)
                 .await
         };
 
@@ -211,12 +223,16 @@ impl McplsServer {
     #[tool(description = "Search for symbols across the entire workspace by name or pattern")]
     async fn workspace_symbol_search(
         &self,
-        params: Parameters<WorkspaceSymbolParams>,
+        Parameters(WorkspaceSymbolParams {
+            query,
+            kind_filter,
+            limit,
+        }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_workspace_symbol(params.0.query, params.0.kind_filter, params.0.limit)
+                .handle_workspace_symbol(query, kind_filter, limit)
                 .await
         };
 
@@ -233,18 +249,25 @@ impl McplsServer {
     )]
     async fn get_code_actions(
         &self,
-        params: Parameters<CodeActionsParams>,
+        Parameters(CodeActionsParams {
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter,
+        }): Parameters<CodeActionsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
                 .handle_code_actions(
-                    params.0.file_path,
-                    params.0.start_line,
-                    params.0.start_character,
-                    params.0.end_line,
-                    params.0.end_character,
-                    params.0.kind_filter,
+                    file_path,
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                    kind_filter,
                 )
                 .await
         };
@@ -260,16 +283,16 @@ impl McplsServer {
     #[tool(description = "Prepare call hierarchy at a position, returns callable items")]
     async fn prepare_call_hierarchy(
         &self,
-        params: Parameters<CallHierarchyPrepareParams>,
+        Parameters(CallHierarchyPrepareParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<CallHierarchyPrepareParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_call_hierarchy_prepare(
-                    params.0.file_path,
-                    params.0.line,
-                    params.0.character,
-                )
+                .handle_call_hierarchy_prepare(file_path, line, character)
                 .await
         };
 
@@ -284,11 +307,11 @@ impl McplsServer {
     #[tool(description = "Get functions that call the specified item (callers)")]
     async fn get_incoming_calls(
         &self,
-        params: Parameters<CallHierarchyCallsParams>,
+        Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_incoming_calls(params.0.item).await
+            translator.handle_incoming_calls(item).await
         };
 
         match result {
@@ -302,11 +325,11 @@ impl McplsServer {
     #[tool(description = "Get functions called by the specified item (callees)")]
     async fn get_outgoing_calls(
         &self,
-        params: Parameters<CallHierarchyCallsParams>,
+        Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_outgoing_calls(params.0.item).await
+            translator.handle_outgoing_calls(item).await
         };
 
         match result {
@@ -320,11 +343,11 @@ impl McplsServer {
     #[tool(description = "Get cached diagnostics for a file from LSP server notifications")]
     async fn get_cached_diagnostics(
         &self,
-        params: Parameters<CachedDiagnosticsParams>,
+        Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_cached_diagnostics(&params.0.file_path)
+            translator.handle_cached_diagnostics(&file_path)
         };
 
         match result {
@@ -338,11 +361,11 @@ impl McplsServer {
     #[tool(description = "Get recent LSP server log messages with optional level filtering")]
     async fn get_server_logs(
         &self,
-        params: Parameters<ServerLogsParams>,
+        Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_server_logs(params.0.limit, params.0.min_level)
+            translator.handle_server_logs(limit, min_level)
         };
 
         match result {
@@ -356,11 +379,11 @@ impl McplsServer {
     #[tool(description = "Get recent LSP server messages (showMessage notifications)")]
     async fn get_server_messages(
         &self,
-        params: Parameters<ServerMessagesParams>,
+        Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_server_messages(params.0.limit)
+            translator.handle_server_messages(limit)
         };
 
         match result {
