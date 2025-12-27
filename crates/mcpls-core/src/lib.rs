@@ -116,6 +116,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         let client = server.client().clone();
 
         translator.register_client(lsp_config.language_id.clone(), client);
+        translator.register_server(lsp_config.language_id.clone(), server);
     }
 
     let translator = Arc::new(Mutex::new(translator));
