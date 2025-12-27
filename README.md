@@ -119,6 +119,11 @@ Claude: [get_references] Found 4 matches:
 | `rename_symbol` | Workspace-wide rename with full reference tracking |
 | `get_document_symbols` | Structured outline — functions, types, constants, imports |
 | `format_document` | Apply language-specific formatting rules |
+| `workspace_symbol_search` | Find symbols by name across the entire workspace |
+| `get_code_actions` | Quick fixes, refactorings, and source actions at a position |
+| `prepare_call_hierarchy` | Get callable items at a position for call hierarchy |
+| `get_incoming_calls` | Find all callers of a function (who calls this?) |
+| `get_outgoing_calls` | Find all callees of a function (what does this call?) |
 
 ## Configuration
 

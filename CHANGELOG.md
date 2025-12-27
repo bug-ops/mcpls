@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-12-27
+
+Enhanced LSP features release with 5 new MCP tools for advanced code intelligence.
+
+### Added
+
+**New MCP Tools (5 tools)**:
+- `workspace_symbol_search` — Search for symbols by name across the entire workspace with optional kind filtering and result limits
+- `get_code_actions` — Get available code actions (quick fixes, refactorings) at a position or range, with kind filtering support
+- `prepare_call_hierarchy` — Prepare call hierarchy at a cursor position, returning callable items for further exploration
+- `get_incoming_calls` — Find all callers of a function (who calls this?) with location information
+- `get_outgoing_calls` — Find all callees of a function (what does this call?) with call site ranges
+
+**Testing & Quality**:
+- 33 new unit tests for enhanced features (105 total tests, up from 72)
+- Comprehensive validation tests for position bounds and input parameters
+- Handler tests for all new MCP tools
+- Cross-platform file URI handling for Windows compatibility
+
+**Security Enhancements**:
+- URI scheme validation for call hierarchy (enforces `file://` scheme)
+- Path validation in all call hierarchy handlers
+- JSON size limits for call hierarchy item deserialization
+- Position upper bound validation (max 1,000,000 for line/character)
+
+### Changed
+
+- Updated test count from 72 to 105 tests
+- MCP tool handlers now use compact JSON serialization for better performance
+- Enhanced position validation with upper bounds across all position-based tools
+
+### Fixed
+
+- Cross-platform file URI handling now works correctly on Windows
+- URL crate added for proper file URI creation in tests
+
 ## [0.1.0] - 2025-12-25
 
 Initial release of mcpls - Universal MCP to LSP bridge enabling AI agents to access semantic code intelligence.
@@ -218,13 +254,13 @@ Add to `~/.claude/mcp.json`:
 
 ## Future Roadmap
 
-**Phase 7** (Enhanced Features):
-- Workspace symbol search across files
-- Code actions (quick fixes, refactorings)
-- Semantic tokens (syntax highlighting)
-- Call hierarchy (incoming/outgoing calls)
-- Type hierarchy
-- Inlay hints
+**Phase 7** (Enhanced Features) — ✅ **Completed in v0.2.0**:
+- ✅ Workspace symbol search across files
+- ✅ Code actions (quick fixes, refactorings)
+- ✅ Call hierarchy (incoming/outgoing calls)
+- Semantic tokens (syntax highlighting) — planned
+- Type hierarchy — planned
+- Inlay hints — planned
 
 **Phase 8** (Performance & Scale):
 - LSP server connection pooling
@@ -240,5 +276,6 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bug-ops/mcpls/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bug-ops/mcpls/releases/tag/v0.1.0
