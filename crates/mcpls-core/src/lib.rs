@@ -42,6 +42,43 @@ pub use error::Error;
 use lsp::{LspServer, ServerInitConfig};
 use rmcp::ServiceExt;
 use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+/// Resolve workspace roots from config or current directory.
+///
+/// If no workspace roots are provided in the configuration, this function
+/// will use the current working directory, canonicalized for security.
+///
+/// # Returns
+///
+/// A vector of workspace root paths. If config roots are provided, they are
+/// returned as-is. Otherwise, returns the canonicalized current directory,
+/// falling back to relative "." if canonicalization fails.
+fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
+    if config_roots.is_empty() {
+        match std::env::current_dir() {
+            Ok(cwd) => match cwd.canonicalize() {
+                Ok(canonical) => {
+                    info!(
+                        "Using current directory as workspace root: {}",
+                        canonical.display()
+                    );
+                    vec![canonical]
+                }
+                Err(e) => {
+                    warn!("Failed to canonicalize current directory: {e}");
+                    vec![PathBuf::from(".")]
+                }
+            },
+            Err(e) => {
+                warn!("Failed to get current directory: {e}");
+                vec![PathBuf::from(".")]
+            }
+        }
+    } else {
+        config_roots.to_vec()
+    }
+}
 
 /// Start the MCPLS server with the given configuration.
 ///
@@ -57,11 +94,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     tracing::info!("Starting MCPLS server...");
 
     let mut translator = Translator::new();
-    let workspace_roots = if config.workspace.roots.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        config.workspace.roots.clone()
-    };
+    let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
 
     translator.set_workspace_roots(workspace_roots.clone());
 
@@ -105,4 +138,34 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 
     tracing::info!("MCPLS server shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_workspace_roots_empty_config() {
+        let roots = resolve_workspace_roots(&[]);
+        assert_eq!(roots.len(), 1);
+        assert!(
+            roots[0].is_absolute(),
+            "Workspace root should be absolute path"
+        );
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_with_config() {
+        let config_roots = vec![PathBuf::from("/test/root")];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots, config_roots);
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_multiple_paths() {
+        let config_roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots, config_roots);
+        assert_eq!(roots.len(), 2);
+    }
 }
