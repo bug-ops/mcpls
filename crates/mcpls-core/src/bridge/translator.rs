@@ -387,6 +387,20 @@ pub struct OutgoingCallsResult {
     pub calls: Vec<OutgoingCall>,
 }
 
+/// Result of server logs request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerLogsResult {
+    /// List of log entries.
+    pub logs: Vec<crate::bridge::notifications::LogEntry>,
+}
+
+/// Result of server messages request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMessagesResult {
+    /// List of server messages.
+    pub messages: Vec<crate::bridge::notifications::ServerMessage>,
+}
+
 /// Maximum allowed position value for validation.
 const MAX_POSITION_VALUE: u32 = 1_000_000;
 /// Maximum allowed range size in lines.
@@ -1305,6 +1319,113 @@ impl Translator {
 
         Ok(OutgoingCallsResult { calls })
     }
+
+    /// Handle cached diagnostics request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid or outside workspace boundaries.
+    pub fn handle_cached_diagnostics(&mut self, file_path: &str) -> Result<DiagnosticsResult> {
+        let path = PathBuf::from(file_path);
+        let validated_path = self.validate_path(&path)?;
+
+        // Convert path to URI format for cache lookup
+        let uri = format!("file://{}", validated_path.display());
+
+        let diagnostics =
+            self.notification_cache
+                .get_diagnostics(&uri)
+                .map_or_else(Vec::new, |diag_info| {
+                    diag_info
+                        .diagnostics
+                        .iter()
+                        .map(|diag| Diagnostic {
+                            range: normalize_range(diag.range),
+                            severity: match diag.severity {
+                                Some(lsp_types::DiagnosticSeverity::ERROR) => {
+                                    DiagnosticSeverity::Error
+                                }
+                                Some(lsp_types::DiagnosticSeverity::WARNING) => {
+                                    DiagnosticSeverity::Warning
+                                }
+                                Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                                    DiagnosticSeverity::Information
+                                }
+                                Some(lsp_types::DiagnosticSeverity::HINT) => {
+                                    DiagnosticSeverity::Hint
+                                }
+                                _ => DiagnosticSeverity::Information,
+                            },
+                            message: diag.message.clone(),
+                            code: diag.code.as_ref().map(|c| match c {
+                                lsp_types::NumberOrString::Number(n) => n.to_string(),
+                                lsp_types::NumberOrString::String(s) => s.clone(),
+                            }),
+                        })
+                        .collect()
+                });
+
+        Ok(DiagnosticsResult { diagnostics })
+    }
+
+    /// Handle server logs request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `min_level` parameter is invalid.
+    pub fn handle_server_logs(
+        &mut self,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult> {
+        use crate::bridge::notifications::LogLevel;
+
+        let min_level_filter = if let Some(level_str) = min_level {
+            let level = match level_str.to_lowercase().as_str() {
+                "error" => LogLevel::Error,
+                "warning" => LogLevel::Warning,
+                "info" => LogLevel::Info,
+                "debug" => LogLevel::Debug,
+                _ => {
+                    return Err(Error::InvalidToolParams(format!(
+                        "Invalid min_level: '{level_str}'. Valid values: error, warning, info, debug"
+                    )));
+                }
+            };
+            Some(level)
+        } else {
+            None
+        };
+
+        let all_logs = self.notification_cache.get_logs();
+
+        let logs: Vec<_> = all_logs
+            .iter()
+            .filter(|log| {
+                min_level_filter.is_none_or(|min| match min {
+                    LogLevel::Error => matches!(log.level, LogLevel::Error),
+                    LogLevel::Warning => matches!(log.level, LogLevel::Error | LogLevel::Warning),
+                    LogLevel::Info => !matches!(log.level, LogLevel::Debug),
+                    LogLevel::Debug => true,
+                })
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+
+        Ok(ServerLogsResult { logs })
+    }
+
+    /// Handle server messages request.
+    ///
+    /// # Errors
+    ///
+    /// This method does not return errors.
+    pub fn handle_server_messages(&mut self, limit: usize) -> Result<ServerMessagesResult> {
+        let all_messages = self.notification_cache.get_messages();
+        let messages: Vec<_> = all_messages.iter().take(limit).cloned().collect();
+        Ok(ServerMessagesResult { messages })
+    }
 }
 
 /// Extract hover contents as markdown string.
@@ -2004,5 +2125,96 @@ mod tests {
         let uri: lsp_types::Uri = file_url.as_str().parse().unwrap();
         let result = translator.parse_file_uri(&uri);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_cached_diagnostics_empty() {
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator.handle_cached_diagnostics(test_file.to_str().unwrap());
+        assert!(result.is_ok());
+        let diags = result.unwrap();
+        assert_eq!(diags.diagnostics.len(), 0);
+    }
+
+    #[test]
+    fn test_handle_server_logs_with_filter() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        // Add some logs
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "error msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Warning, "warning msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Info, "info msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Debug, "debug msg".to_string());
+
+        // Test with error filter
+        let result = translator.handle_server_logs(10, Some("error".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 1);
+        assert_eq!(logs.logs[0].message, "error msg");
+
+        // Test with warning filter (includes error and warning)
+        let result = translator.handle_server_logs(10, Some("warning".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 2);
+
+        // Test with info filter (excludes debug)
+        let result = translator.handle_server_logs(10, Some("info".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 3);
+
+        // Test with debug filter (includes all)
+        let result = translator.handle_server_logs(10, Some("debug".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 4);
+
+        // Test with invalid filter
+        let result = translator.handle_server_logs(10, Some("invalid".to_string()));
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[test]
+    fn test_handle_server_messages_limit() {
+        use crate::bridge::notifications::MessageType;
+
+        let mut translator = Translator::new();
+
+        // Add some messages
+        for i in 0..10 {
+            translator
+                .notification_cache_mut()
+                .store_message(MessageType::Info, format!("message {i}"));
+        }
+
+        // Test limit
+        let result = translator.handle_server_messages(5);
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert_eq!(messages.messages.len(), 5);
+        assert_eq!(messages.messages[0].message, "message 0");
+        assert_eq!(messages.messages[4].message, "message 4");
+
+        // Test limit larger than available
+        let result = translator.handle_server_messages(100);
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert_eq!(messages.messages.len(), 10);
     }
 }

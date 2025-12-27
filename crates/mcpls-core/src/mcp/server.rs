@@ -12,9 +12,10 @@ use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
 use super::tools::{
-    CallHierarchyCallsParams, CallHierarchyPrepareParams, CodeActionsParams, CompletionsParams,
-    DefinitionParams, DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams,
-    ReferencesParams, RenameParams, WorkspaceSymbolParams,
+    CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
+    CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
+    DocumentSymbolsParams, FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
+    ServerLogsParams, ServerMessagesParams, WorkspaceSymbolParams,
 };
 use crate::bridge::Translator;
 
@@ -306,6 +307,60 @@ impl McplsServer {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator.handle_outgoing_calls(params.0.item).await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get cached diagnostics for a file.
+    #[tool(description = "Get cached diagnostics for a file from LSP server notifications")]
+    async fn get_cached_diagnostics(
+        &self,
+        params: Parameters<CachedDiagnosticsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_cached_diagnostics(&params.0.file_path)
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get recent LSP server log messages.
+    #[tool(description = "Get recent LSP server log messages with optional level filtering")]
+    async fn get_server_logs(
+        &self,
+        params: Parameters<ServerLogsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_server_logs(params.0.limit, params.0.min_level)
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get recent LSP server messages.
+    #[tool(description = "Get recent LSP server messages (showMessage notifications)")]
+    async fn get_server_messages(
+        &self,
+        params: Parameters<ServerMessagesParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_server_messages(params.0.limit)
         };
 
         match result {

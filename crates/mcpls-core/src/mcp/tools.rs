@@ -152,3 +152,37 @@ pub struct CallHierarchyCallsParams {
     /// The call hierarchy item to get calls for (from prepare response).
     pub item: serde_json::Value,
 }
+
+/// Parameters for the `get_cached_diagnostics` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CachedDiagnosticsParams {
+    /// Absolute path to the file.
+    pub file_path: String,
+}
+
+/// Parameters for the `get_server_logs` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ServerLogsParams {
+    /// Maximum number of log entries to return.
+    #[serde(default = "default_log_limit")]
+    pub limit: usize,
+    /// Minimum log level to include (error, warning, info, debug).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_level: Option<String>,
+}
+
+const fn default_log_limit() -> usize {
+    50
+}
+
+/// Parameters for the `get_server_messages` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ServerMessagesParams {
+    /// Maximum number of messages to return.
+    #[serde(default = "default_message_limit")]
+    pub limit: usize,
+}
+
+const fn default_message_limit() -> usize {
+    20
+}
