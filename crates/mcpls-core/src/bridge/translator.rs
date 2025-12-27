@@ -16,8 +16,8 @@ use lsp_types::{
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 
-use super::DocumentTracker;
 use super::state::detect_language;
+use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer};
@@ -31,6 +31,8 @@ pub struct Translator {
     lsp_servers: HashMap<String, LspServer>,
     /// Document state tracker.
     document_tracker: DocumentTracker,
+    /// Notification cache for LSP server notifications.
+    notification_cache: NotificationCache,
     /// Allowed workspace roots for path validation.
     workspace_roots: Vec<PathBuf>,
 }
@@ -43,6 +45,7 @@ impl Translator {
             lsp_clients: HashMap::new(),
             lsp_servers: HashMap::new(),
             document_tracker: DocumentTracker::new(),
+            notification_cache: NotificationCache::new(),
             workspace_roots: vec![],
         }
     }
@@ -71,6 +74,17 @@ impl Translator {
     /// Get a mutable reference to the document tracker.
     pub const fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
         &mut self.document_tracker
+    }
+
+    /// Get the notification cache.
+    #[must_use]
+    pub const fn notification_cache(&self) -> &NotificationCache {
+        &self.notification_cache
+    }
+
+    /// Get a mutable reference to the notification cache.
+    pub const fn notification_cache_mut(&mut self) -> &mut NotificationCache {
+        &mut self.notification_cache
     }
 
     // TODO: These methods will be implemented in Phase 3-5

@@ -4,10 +4,14 @@
 //! MCP tool calls and LSP requests/responses.
 
 mod encoding;
+mod notifications;
 mod state;
 mod translator;
 
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
+pub use notifications::{
+    DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
+};
 pub use state::{DocumentState, DocumentTracker};
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
