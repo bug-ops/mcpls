@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use lsp_types::{
-    CompletionParams, CompletionTriggerKind, DocumentFormattingParams, DocumentSymbol,
-    DocumentSymbolParams, FormattingOptions, GotoDefinitionParams, Hover, HoverContents,
-    HoverParams as LspHoverParams, MarkedString, PartialResultParams, ReferenceContext,
-    ReferenceParams, RenameParams as LspRenameParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, WorkDoneProgressParams, WorkspaceEdit,
-    WorkspaceSymbolParams as LspWorkspaceSymbolParams,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
+    CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, CompletionParams,
+    CompletionTriggerKind, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+    FormattingOptions, GotoDefinitionParams, Hover, HoverContents, HoverParams as LspHoverParams,
+    MarkedString, PartialResultParams, ReferenceContext, ReferenceParams,
+    RenameParams as LspRenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
@@ -303,6 +305,66 @@ pub struct CodeActionsResult {
     pub actions: Vec<CodeAction>,
 }
 
+/// A call hierarchy item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallHierarchyItemResult {
+    /// Name of the symbol.
+    pub name: String,
+    /// Kind of symbol.
+    pub kind: String,
+    /// More detail for this item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// URI of the document.
+    pub uri: String,
+    /// Range of the symbol.
+    pub range: Range,
+    /// Selection range (identifier location).
+    pub selection_range: Range,
+    /// Opaque data to pass to incoming/outgoing calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Result of call hierarchy prepare request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallHierarchyPrepareResult {
+    /// List of callable items at the position.
+    pub items: Vec<CallHierarchyItemResult>,
+}
+
+/// An incoming call (caller of the current item).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingCall {
+    /// The item that calls the current item.
+    pub from: CallHierarchyItemResult,
+    /// Ranges where the call occurs.
+    pub from_ranges: Vec<Range>,
+}
+
+/// Result of incoming calls request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingCallsResult {
+    /// List of incoming calls.
+    pub calls: Vec<IncomingCall>,
+}
+
+/// An outgoing call (callee from the current item).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutgoingCall {
+    /// The item being called.
+    pub to: CallHierarchyItemResult,
+    /// Ranges where the call occurs.
+    pub from_ranges: Vec<Range>,
+}
+
+/// Result of outgoing calls request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutgoingCallsResult {
+    /// List of outgoing calls.
+    pub calls: Vec<OutgoingCall>,
+}
+
 /// Maximum allowed position value for validation.
 const MAX_POSITION_VALUE: u32 = 1_000_000;
 /// Maximum allowed range size in lines.
@@ -344,6 +406,30 @@ impl Translator {
             .get(&language_id)
             .cloned()
             .ok_or(Error::NoServerForLanguage(language_id))
+    }
+
+    /// Parse and validate a file URI, returning the validated path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URI doesn't have a file:// scheme
+    /// - The path is outside workspace boundaries
+    fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
+        let uri_str = uri.as_str();
+
+        // Validate file:// scheme
+        if !uri_str.starts_with("file://") {
+            return Err(Error::InvalidToolParams(format!(
+                "Invalid URI scheme, expected file:// but got: {uri_str}"
+            )));
+        }
+
+        // Extract path without intermediate allocation
+        let path = PathBuf::from(&uri_str["file://".len()..]);
+
+        // Validate path is within workspace
+        self.validate_path(&path)
     }
 
     /// Handle hover request.
@@ -1025,6 +1111,164 @@ impl Translator {
 
         Ok(CodeActionsResult { actions })
     }
+
+    /// Handle call hierarchy prepare request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the file cannot be opened.
+    pub async fn handle_call_hierarchy_prepare(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<CallHierarchyPrepareResult> {
+        // Validate position bounds
+        if line < 1 || character < 1 {
+            return Err(Error::InvalidToolParams(
+                "Line and character positions must be >= 1".to_string(),
+            ));
+        }
+
+        if line > MAX_POSITION_VALUE || character > MAX_POSITION_VALUE {
+            return Err(Error::InvalidToolParams(format!(
+                "Position values must be <= {MAX_POSITION_VALUE}"
+            )));
+        }
+
+        let path = PathBuf::from(&file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
+        let lsp_position = mcp_to_lsp_position(line, character);
+
+        let params = LspCallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: lsp_position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<CallHierarchyItem>> = client
+            .request(
+                "textDocument/prepareCallHierarchy",
+                params,
+                timeout_duration,
+            )
+            .await?;
+
+        // Pre-allocate and build result
+        let lsp_items = response.unwrap_or_default();
+        let mut items = Vec::with_capacity(lsp_items.len());
+        for item in lsp_items {
+            items.push(convert_call_hierarchy_item(item));
+        }
+
+        Ok(CallHierarchyPrepareResult { items })
+    }
+
+    /// Handle incoming calls request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the item is invalid.
+    pub async fn handle_incoming_calls(
+        &mut self,
+        item: serde_json::Value,
+    ) -> Result<IncomingCallsResult> {
+        let lsp_item: CallHierarchyItem = serde_json::from_value(item)
+            .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
+
+        // Parse and validate the URI
+        let path = self.parse_file_uri(&lsp_item.uri)?;
+        let client = self.get_client_for_file(&path)?;
+
+        let params = CallHierarchyIncomingCallsParams {
+            item: lsp_item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<CallHierarchyIncomingCall>> = client
+            .request("callHierarchy/incomingCalls", params, timeout_duration)
+            .await?;
+
+        // Pre-allocate and build result
+        let lsp_calls = response.unwrap_or_default();
+        let mut calls = Vec::with_capacity(lsp_calls.len());
+
+        for call in lsp_calls {
+            let from_ranges = {
+                let mut ranges = Vec::with_capacity(call.from_ranges.len());
+                for range in call.from_ranges {
+                    ranges.push(normalize_range(range));
+                }
+                ranges
+            };
+
+            calls.push(IncomingCall {
+                from: convert_call_hierarchy_item(call.from),
+                from_ranges,
+            });
+        }
+
+        Ok(IncomingCallsResult { calls })
+    }
+
+    /// Handle outgoing calls request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the item is invalid.
+    pub async fn handle_outgoing_calls(
+        &mut self,
+        item: serde_json::Value,
+    ) -> Result<OutgoingCallsResult> {
+        let lsp_item: CallHierarchyItem = serde_json::from_value(item)
+            .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
+
+        // Parse and validate the URI
+        let path = self.parse_file_uri(&lsp_item.uri)?;
+        let client = self.get_client_for_file(&path)?;
+
+        let params = CallHierarchyOutgoingCallsParams {
+            item: lsp_item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<CallHierarchyOutgoingCall>> = client
+            .request("callHierarchy/outgoingCalls", params, timeout_duration)
+            .await?;
+
+        // Pre-allocate and build result
+        let lsp_calls = response.unwrap_or_default();
+        let mut calls = Vec::with_capacity(lsp_calls.len());
+
+        for call in lsp_calls {
+            let from_ranges = {
+                let mut ranges = Vec::with_capacity(call.from_ranges.len());
+                for range in call.from_ranges {
+                    ranges.push(normalize_range(range));
+                }
+                ranges
+            };
+
+            calls.push(OutgoingCall {
+                to: convert_call_hierarchy_item(call.to),
+                from_ranges,
+            });
+        }
+
+        Ok(OutgoingCallsResult { calls })
+    }
 }
 
 /// Extract hover contents as markdown string.
@@ -1072,6 +1316,19 @@ fn convert_document_symbol(symbol: DocumentSymbol) -> Symbol {
         children: symbol
             .children
             .map(|children| children.into_iter().map(convert_document_symbol).collect()),
+    }
+}
+
+/// Convert LSP call hierarchy item to MCP call hierarchy item.
+fn convert_call_hierarchy_item(item: CallHierarchyItem) -> CallHierarchyItemResult {
+    CallHierarchyItemResult {
+        name: item.name,
+        kind: format!("{:?}", item.kind),
+        detail: item.detail,
+        uri: item.uri.to_string(),
+        range: normalize_range(item.range),
+        selection_range: normalize_range(item.selection_range),
+        data: item.data,
     }
 }
 
@@ -1626,5 +1883,70 @@ mod tests {
         assert_eq!(cmd.title, "Execute refactor");
         assert_eq!(cmd.command, "refactor.extract");
         assert_eq!(cmd.arguments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_hierarchy_prepare_invalid_position_zero() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 0, 1)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+
+        let result = translator
+            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1, 0)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_hierarchy_prepare_invalid_position_too_large() {
+        let mut translator = Translator::new();
+        let result = translator
+            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1_000_001, 1)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+
+        let result = translator
+            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1, 1_000_001)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_incoming_calls_invalid_json() {
+        let mut translator = Translator::new();
+        let invalid_item = serde_json::json!({"invalid": "structure"});
+        let result = translator.handle_incoming_calls(invalid_item).await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handle_outgoing_calls_invalid_json() {
+        let mut translator = Translator::new();
+        let invalid_item = serde_json::json!({"invalid": "structure"});
+        let result = translator.handle_outgoing_calls(invalid_item).await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_parse_file_uri_invalid_scheme() {
+        let translator = Translator::new();
+        let uri: lsp_types::Uri = "http://example.com/file.rs".parse().unwrap();
+        let result = translator.parse_file_uri(&uri);
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_parse_file_uri_valid_scheme() {
+        let translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let uri_str = format!("file://{}", test_file.to_string_lossy());
+        let uri: lsp_types::Uri = uri_str.parse().unwrap();
+        let result = translator.parse_file_uri(&uri);
+        assert!(result.is_ok());
     }
 }

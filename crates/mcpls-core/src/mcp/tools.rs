@@ -134,3 +134,21 @@ pub struct CodeActionsParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_filter: Option<String>,
 }
+
+/// Parameters for the `prepare_call_hierarchy` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CallHierarchyPrepareParams {
+    /// Absolute path to the file.
+    pub file_path: String,
+    /// Line number (1-based).
+    pub line: u32,
+    /// Character/column number (1-based).
+    pub character: u32,
+}
+
+/// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CallHierarchyCallsParams {
+    /// The call hierarchy item to get calls for (from prepare response).
+    pub item: serde_json::Value,
+}

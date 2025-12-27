@@ -12,9 +12,9 @@ use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
 use super::tools::{
-    CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
-    DocumentSymbolsParams, FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
-    WorkspaceSymbolParams,
+    CallHierarchyCallsParams, CallHierarchyPrepareParams, CodeActionsParams, CompletionsParams,
+    DefinitionParams, DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams,
+    ReferencesParams, RenameParams, WorkspaceSymbolParams,
 };
 use crate::bridge::Translator;
 
@@ -48,7 +48,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -68,7 +68,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -93,7 +93,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -111,7 +111,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -133,7 +133,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -158,7 +158,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -176,7 +176,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -200,7 +200,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -220,7 +220,7 @@ impl McplsServer {
         };
 
         match result {
-            Ok(value) => serde_json::to_string_pretty(&value)
+            Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
@@ -246,6 +246,66 @@ impl McplsServer {
                     params.0.kind_filter,
                 )
                 .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Prepare call hierarchy at a position.
+    #[tool(description = "Prepare call hierarchy at a position, returns callable items")]
+    async fn prepare_call_hierarchy(
+        &self,
+        params: Parameters<CallHierarchyPrepareParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_call_hierarchy_prepare(
+                    params.0.file_path,
+                    params.0.line,
+                    params.0.character,
+                )
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get incoming calls (callers).
+    #[tool(description = "Get functions that call the specified item (callers)")]
+    async fn get_incoming_calls(
+        &self,
+        params: Parameters<CallHierarchyCallsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_incoming_calls(params.0.item).await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get outgoing calls (callees).
+    #[tool(description = "Get functions called by the specified item (callees)")]
+    async fn get_outgoing_calls(
+        &self,
+        params: Parameters<CallHierarchyCallsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_outgoing_calls(params.0.item).await
         };
 
         match result {
@@ -430,6 +490,60 @@ mod tests {
             kind_filter: None,
         });
         let result = server.get_code_actions(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_call_hierarchy_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(CallHierarchyPrepareParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
+        });
+        let result = server.prepare_call_hierarchy(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_calls_tool_with_params() {
+        let server = create_test_server();
+        let item = serde_json::json!({
+            "name": "test_function",
+            "kind": 12,
+            "uri": "file:///test/file.rs",
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 10}
+            },
+            "selectionRange": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 10}
+            }
+        });
+        let params = Parameters(CallHierarchyCallsParams { item });
+        let result = server.get_incoming_calls(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_calls_tool_with_params() {
+        let server = create_test_server();
+        let item = serde_json::json!({
+            "name": "test_function",
+            "kind": 12,
+            "uri": "file:///test/file.rs",
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 10}
+            },
+            "selectionRange": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 10}
+            }
+        });
+        let params = Parameters(CallHierarchyCallsParams { item });
+        let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
     }
 }

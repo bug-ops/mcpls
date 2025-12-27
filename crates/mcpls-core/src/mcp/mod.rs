@@ -10,6 +10,7 @@ mod tools;
 pub use handlers::{ToolHandler, ToolHandlers};
 pub use server::McplsServer;
 pub use tools::{
-    CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
-    FormatDocumentParams, HoverParams, ReferencesParams, RenameParams, WorkspaceSymbolParams,
+    CallHierarchyCallsParams, CallHierarchyPrepareParams, CompletionsParams, DefinitionParams,
+    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams, ReferencesParams,
+    RenameParams, WorkspaceSymbolParams,
 };

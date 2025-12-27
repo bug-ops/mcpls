@@ -9,9 +9,9 @@ use tokio::sync::Mutex;
 use crate::bridge::Translator;
 use crate::error::{Error, Result};
 use crate::mcp::tools::{
-    CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
-    DocumentSymbolsParams, FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
-    WorkspaceSymbolParams,
+    CallHierarchyCallsParams, CallHierarchyPrepareParams, CodeActionsParams, CompletionsParams,
+    DefinitionParams, DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams,
+    ReferencesParams, RenameParams, WorkspaceSymbolParams,
 };
 
 /// Trait for handling MCP tool calls.
@@ -703,6 +703,168 @@ impl ToolHandler for CodeActionsHandler {
     }
 }
 
+/// Handler for the `prepare_call_hierarchy` tool.
+pub struct CallHierarchyPrepareHandler {
+    context: Arc<HandlerContext>,
+}
+
+impl CallHierarchyPrepareHandler {
+    /// Create a new call hierarchy prepare handler.
+    #[must_use]
+    pub const fn new(context: Arc<HandlerContext>) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for CallHierarchyPrepareHandler {
+    async fn handle(&self, params: Value) -> Result<Value> {
+        let params: CallHierarchyPrepareParams = serde_json::from_value(params).map_err(|e| {
+            Error::InvalidToolParams(format!("Invalid call hierarchy prepare params: {e}"))
+        })?;
+
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_call_hierarchy_prepare(params.file_path, params.line, params.character)
+                .await?
+        };
+
+        Ok(serde_json::to_value(result)?)
+    }
+
+    fn name(&self) -> &'static str {
+        "prepare_call_hierarchy"
+    }
+
+    fn description(&self) -> &'static str {
+        "Prepare call hierarchy at a position, returns callable items"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Absolute path to the file"
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1_000_000,
+                    "description": "Line number (1-based)"
+                },
+                "character": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1_000_000,
+                    "description": "Column/character number (1-based)"
+                }
+            },
+            "required": ["file_path", "line", "character"]
+        })
+    }
+}
+
+/// Handler for the `get_incoming_calls` tool.
+pub struct IncomingCallsHandler {
+    context: Arc<HandlerContext>,
+}
+
+impl IncomingCallsHandler {
+    /// Create a new incoming calls handler.
+    #[must_use]
+    pub const fn new(context: Arc<HandlerContext>) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for IncomingCallsHandler {
+    async fn handle(&self, params: Value) -> Result<Value> {
+        let params: CallHierarchyCallsParams = serde_json::from_value(params)
+            .map_err(|e| Error::InvalidToolParams(format!("Invalid incoming calls params: {e}")))?;
+
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_incoming_calls(params.item).await?
+        };
+
+        Ok(serde_json::to_value(result)?)
+    }
+
+    fn name(&self) -> &'static str {
+        "get_incoming_calls"
+    }
+
+    fn description(&self) -> &'static str {
+        "Get functions that call the specified item (callers)"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "item": {
+                    "type": "object",
+                    "description": "Call hierarchy item from prepare_call_hierarchy response"
+                }
+            },
+            "required": ["item"]
+        })
+    }
+}
+
+/// Handler for the `get_outgoing_calls` tool.
+pub struct OutgoingCallsHandler {
+    context: Arc<HandlerContext>,
+}
+
+impl OutgoingCallsHandler {
+    /// Create a new outgoing calls handler.
+    #[must_use]
+    pub const fn new(context: Arc<HandlerContext>) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for OutgoingCallsHandler {
+    async fn handle(&self, params: Value) -> Result<Value> {
+        let params: CallHierarchyCallsParams = serde_json::from_value(params)
+            .map_err(|e| Error::InvalidToolParams(format!("Invalid outgoing calls params: {e}")))?;
+
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_outgoing_calls(params.item).await?
+        };
+
+        Ok(serde_json::to_value(result)?)
+    }
+
+    fn name(&self) -> &'static str {
+        "get_outgoing_calls"
+    }
+
+    fn description(&self) -> &'static str {
+        "Get functions called by the specified item (callees)"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "item": {
+                    "type": "object",
+                    "description": "Call hierarchy item from prepare_call_hierarchy response"
+                }
+            },
+            "required": ["item"]
+        })
+    }
+}
+
 /// Factory for creating all tool handlers.
 pub struct ToolHandlers {
     handlers: Vec<Box<dyn ToolHandler>>,
@@ -725,6 +887,9 @@ impl ToolHandlers {
             Box::new(FormatDocumentHandler::new(Arc::clone(&context))),
             Box::new(WorkspaceSymbolHandler::new(Arc::clone(&context))),
             Box::new(CodeActionsHandler::new(Arc::clone(&context))),
+            Box::new(CallHierarchyPrepareHandler::new(Arc::clone(&context))),
+            Box::new(IncomingCallsHandler::new(Arc::clone(&context))),
+            Box::new(OutgoingCallsHandler::new(Arc::clone(&context))),
         ];
 
         Self { handlers }
@@ -840,6 +1005,89 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_call_hierarchy_prepare_handler_valid_params() {
+        let handler = CallHierarchyPrepareHandler::new(create_test_context());
+        let params = json!({
+            "file_path": "/tmp/test.rs",
+            "line": 10,
+            "character": 5
+        });
+        let result = handler.handle(params).await;
+        // Expected to fail because no LSP server is running
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_call_hierarchy_prepare_handler_invalid_params() {
+        let handler = CallHierarchyPrepareHandler::new(create_test_context());
+        let invalid_params = json!({"file_path": "test.rs"});
+        let result = handler.handle(invalid_params).await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_incoming_calls_handler_valid_params() {
+        let handler = IncomingCallsHandler::new(create_test_context());
+        let params = json!({
+            "item": {
+                "name": "test_function",
+                "kind": 12,
+                "uri": "file:///tmp/test.rs",
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 10}
+                },
+                "selectionRange": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 10}
+                }
+            }
+        });
+        let result = handler.handle(params).await;
+        // Expected to fail because no LSP server is running or file doesn't exist
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_calls_handler_invalid_params() {
+        let handler = IncomingCallsHandler::new(create_test_context());
+        let invalid_params = json!({"wrong_field": "value"});
+        let result = handler.handle(invalid_params).await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_calls_handler_valid_params() {
+        let handler = OutgoingCallsHandler::new(create_test_context());
+        let params = json!({
+            "item": {
+                "name": "test_function",
+                "kind": 12,
+                "uri": "file:///tmp/test.rs",
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 10}
+                },
+                "selectionRange": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 10}
+                }
+            }
+        });
+        let result = handler.handle(params).await;
+        // Expected to fail because no LSP server is running or file doesn't exist
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_calls_handler_invalid_params() {
+        let handler = OutgoingCallsHandler::new(create_test_context());
+        let invalid_params = json!({"invalid": "data"});
+        let result = handler.handle(invalid_params).await;
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
     #[test]
     fn test_handler_metadata() {
         let context = create_test_context();
@@ -877,5 +1125,20 @@ mod tests {
         assert_eq!(code_actions.name(), "get_code_actions");
         assert!(!code_actions.description().is_empty());
         assert!(code_actions.schema().is_object());
+
+        let prepare_call = CallHierarchyPrepareHandler::new(Arc::clone(&context));
+        assert_eq!(prepare_call.name(), "prepare_call_hierarchy");
+        assert!(!prepare_call.description().is_empty());
+        assert!(prepare_call.schema().is_object());
+
+        let incoming = IncomingCallsHandler::new(Arc::clone(&context));
+        assert_eq!(incoming.name(), "get_incoming_calls");
+        assert!(!incoming.description().is_empty());
+        assert!(incoming.schema().is_object());
+
+        let outgoing = OutgoingCallsHandler::new(Arc::clone(&context));
+        assert_eq!(outgoing.name(), "get_outgoing_calls");
+        assert!(!outgoing.description().is_empty());
+        assert!(outgoing.schema().is_object());
     }
 }
