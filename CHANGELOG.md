@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2025-12-27
+
+Patch release with critical bug fixes for LSP server process management.
+
+### Fixed
+
+- **LSP child process lifetime** — Fixed critical bug where the LSP server process (rust-analyzer) was killed immediately after initialization. The `tokio::process::Child` handle was not being stored, causing `kill_on_drop` to terminate the process. Now the server process stays alive for the lifetime of the MCP session.
+
+- **Absolute workspace path** — Fixed workspace path resolution to use absolute paths with canonicalization. Previously, when no workspace roots were configured, a relative path `"."` was used which resulted in invalid `file://.` URI that rust-analyzer couldn't handle.
+
+### Added
+
+- **Codecov badge** — Added code coverage badge to README with Codecov integration.
+
+### Changed
+
+- **CI workflow** — Fixed codecov upload by adding token for protected branches.
+- **Test runner** — Switched from `cargo test` to `cargo nextest run` in CI and documentation for faster test execution.
+
 ## [0.2.1] - 2025-12-27
 
 Patch release with bug fix and documentation improvements.

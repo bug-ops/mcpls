@@ -11,6 +11,7 @@ This project follows the [Rust Code of Conduct](https://www.rust-lang.org/polici
 ### Prerequisites
 
 - Rust 1.85+ (Edition 2024)
+- [cargo-nextest](https://nexte.st/) for running tests: `cargo install cargo-nextest`
 - A language server for testing (e.g., rust-analyzer)
 
 ### Setting Up Development Environment
@@ -28,12 +29,12 @@ This project follows the [Rust Code of Conduct](https://www.rust-lang.org/polici
 
 3. Run tests:
    ```bash
-   cargo test
+   cargo nextest run
    ```
 
 4. Run clippy:
    ```bash
-   cargo clippy --all-targets --all-features
+   cargo clippy --all-targets --all-features -- -D warnings
    ```
 
 ## Development Workflow
@@ -70,9 +71,9 @@ docs(readme): add pyright configuration example
 
 1. Create a feature branch from `main`
 2. Make your changes with clear, focused commits
-3. Ensure all tests pass: `cargo test`
-4. Ensure clippy is happy: `cargo clippy --all-targets`
-5. Ensure code is formatted: `cargo fmt --check`
+3. Ensure all tests pass: `cargo nextest run`
+4. Ensure clippy is happy: `cargo clippy --all-targets --all-features -- -D warnings`
+5. Ensure code is formatted: `cargo +nightly fmt --check`
 6. Update documentation if needed
 7. Submit a pull request
 
@@ -82,7 +83,7 @@ docs(readme): add pyright configuration example
 - [ ] Documentation updated
 - [ ] CHANGELOG.md updated (for user-facing changes)
 - [ ] No clippy warnings
-- [ ] Code formatted with `cargo fmt`
+- [ ] Code formatted with `cargo +nightly fmt`
 
 ## Project Structure
 
