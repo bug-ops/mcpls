@@ -18,6 +18,9 @@ use tracing::{trace, warn};
 use crate::error::{Error, Result};
 use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcResponse};
 
+/// Maximum allowed Content-Length (10 MB)
+const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
+
 /// LSP transport layer handling header-content format.
 ///
 /// This transport handles the LSP protocol's header-content message format,
@@ -88,6 +91,12 @@ impl LspTransport {
             .ok_or_else(|| Error::LspProtocolError("Missing Content-Length header".to_string()))?
             .parse::<usize>()
             .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
+
+        if content_length > MAX_CONTENT_LENGTH {
+            return Err(Error::LspProtocolError(format!(
+                "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
+            )));
+        }
 
         let content = self.read_content(content_length).await?;
 

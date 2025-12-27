@@ -1,5 +1,8 @@
 //! JSON-RPC 2.0 message types for LSP communication.
 
+use std::borrow::Cow;
+
+use lsp_types::{Diagnostic, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -73,6 +76,130 @@ pub enum InboundMessage {
     Response(JsonRpcResponse),
     /// Notification from server.
     Notification(JsonRpcNotification),
+}
+
+/// LSP log message parameters (window/logMessage).
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
+pub struct LogMessageParams {
+    /// The message type.
+    #[serde(rename = "type")]
+    pub type_: i32,
+    /// The message.
+    pub message: String,
+}
+
+/// LSP show message parameters (window/showMessage).
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
+pub struct ShowMessageParams {
+    /// The message type.
+    #[serde(rename = "type")]
+    pub type_: i32,
+    /// The message.
+    pub message: String,
+}
+
+/// LSP publish diagnostics parameters (textDocument/publishDiagnostics).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
+pub struct PublishDiagnosticsParams {
+    /// The URI for which diagnostics are reported.
+    pub uri: Uri,
+    /// Optional version number of the document.
+    pub version: Option<i32>,
+    /// The diagnostics.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Typed LSP notification variants.
+#[derive(Debug)]
+#[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
+pub enum LspNotification {
+    /// textDocument/publishDiagnostics
+    PublishDiagnostics(PublishDiagnosticsParams),
+    /// window/logMessage
+    LogMessage(LogMessageParams),
+    /// window/showMessage
+    ShowMessage(ShowMessageParams),
+    /// Unknown or unhandled notification
+    Other {
+        /// Method name.
+        method: Cow<'static, str>,
+        /// Optional parameters.
+        params: Option<serde_json::Value>,
+    },
+}
+
+impl LspNotification {
+    /// Parse a notification from method name and params.
+    ///
+    /// Attempts to deserialize known notification types based on the method name.
+    /// Falls back to `Other` variant for unknown methods or deserialization failures.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::lsp::types::LspNotification;
+    /// use serde_json::json;
+    ///
+    /// let params = json!({
+    ///     "type": 3,
+    ///     "message": "Server started"
+    /// });
+    /// let notification = LspNotification::parse("window/logMessage", Some(params));
+    ///
+    /// match notification {
+    ///     LspNotification::LogMessage(log) => {
+    ///         assert_eq!(log.type_, 3);
+    ///         assert_eq!(log.message, "Server started");
+    ///     }
+    ///     _ => panic!("Expected LogMessage variant"),
+    /// }
+    /// ```
+    #[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
+    pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
+        match method {
+            "textDocument/publishDiagnostics" => {
+                if let Some(p) = params {
+                    if let Ok(parsed) = serde_json::from_value(p) {
+                        return Self::PublishDiagnostics(parsed);
+                    }
+                }
+                Self::Other {
+                    method: Cow::Owned(method.to_string()),
+                    params: None,
+                }
+            }
+            "window/logMessage" => {
+                if let Some(p) = params {
+                    if let Ok(parsed) = serde_json::from_value(p) {
+                        return Self::LogMessage(parsed);
+                    }
+                }
+                Self::Other {
+                    method: Cow::Owned(method.to_string()),
+                    params: None,
+                }
+            }
+            "window/showMessage" => {
+                if let Some(p) = params {
+                    if let Ok(parsed) = serde_json::from_value(p) {
+                        return Self::ShowMessage(parsed);
+                    }
+                }
+                Self::Other {
+                    method: Cow::Owned(method.to_string()),
+                    params: None,
+                }
+            }
+            _ => Self::Other {
+                method: Cow::Owned(method.to_string()),
+                params,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -178,5 +305,197 @@ mod tests {
         assert!(missing_response.result.is_none());
 
         assert_eq!(null_response.result, missing_response.result);
+    }
+
+    #[test]
+    fn test_log_message_notification_parsing() {
+        let params = json!({
+            "type": 3,
+            "message": "Server started successfully"
+        });
+
+        let notification = super::LspNotification::parse("window/logMessage", Some(params));
+
+        match notification {
+            super::LspNotification::LogMessage(log) => {
+                assert_eq!(log.type_, 3);
+                assert_eq!(log.message, "Server started successfully");
+            }
+            _ => panic!("Expected LogMessage variant"),
+        }
+    }
+
+    #[test]
+    fn test_show_message_notification_parsing() {
+        let params = json!({
+            "type": 1,
+            "message": "Error occurred"
+        });
+
+        let notification = super::LspNotification::parse("window/showMessage", Some(params));
+
+        match notification {
+            super::LspNotification::ShowMessage(msg) => {
+                assert_eq!(msg.type_, 1);
+                assert_eq!(msg.message, "Error occurred");
+            }
+            _ => panic!("Expected ShowMessage variant"),
+        }
+    }
+
+    #[test]
+    fn test_publish_diagnostics_notification_parsing() {
+        let params = json!({
+            "uri": "file:///test.rs",
+            "version": 1,
+            "diagnostics": [
+                {
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 5}
+                    },
+                    "severity": 1,
+                    "message": "unused variable"
+                }
+            ]
+        });
+
+        let notification =
+            super::LspNotification::parse("textDocument/publishDiagnostics", Some(params));
+
+        match notification {
+            super::LspNotification::PublishDiagnostics(diag) => {
+                assert_eq!(diag.uri.to_string(), "file:///test.rs");
+                assert_eq!(diag.version, Some(1));
+                assert_eq!(diag.diagnostics.len(), 1);
+                assert_eq!(diag.diagnostics[0].message, "unused variable");
+            }
+            _ => panic!("Expected PublishDiagnostics variant"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_notification_method() {
+        let params = json!({"someKey": "someValue"});
+
+        let notification = super::LspNotification::parse("unknown/method", Some(params.clone()));
+
+        match notification {
+            super::LspNotification::Other { method, params: p } => {
+                assert_eq!(method, "unknown/method");
+                assert_eq!(p, Some(params));
+            }
+            _ => panic!("Expected Other variant"),
+        }
+    }
+
+    #[test]
+    fn test_notification_with_no_params() {
+        let notification = super::LspNotification::parse("some/notification", None);
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "some/notification");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant"),
+        }
+    }
+
+    #[test]
+    fn test_malformed_log_message_params() {
+        let malformed_params = json!({
+            "invalidField": "value"
+        });
+
+        let notification =
+            super::LspNotification::parse("window/logMessage", Some(malformed_params));
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "window/logMessage");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant for malformed params"),
+        }
+    }
+
+    #[test]
+    fn test_malformed_show_message_params() {
+        let malformed_params = json!({
+            "type": "not_a_number",
+            "message": "test"
+        });
+
+        let notification =
+            super::LspNotification::parse("window/showMessage", Some(malformed_params));
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "window/showMessage");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant for malformed params"),
+        }
+    }
+
+    #[test]
+    fn test_malformed_publish_diagnostics_params() {
+        let malformed_params = json!({
+            "uri": 123,
+            "diagnostics": "not_an_array"
+        });
+
+        let notification = super::LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(malformed_params),
+        );
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "textDocument/publishDiagnostics");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant for malformed params"),
+        }
+    }
+
+    #[test]
+    fn test_log_message_with_none_params() {
+        let notification = super::LspNotification::parse("window/logMessage", None);
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "window/logMessage");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant when params is None"),
+        }
+    }
+
+    #[test]
+    fn test_show_message_with_none_params() {
+        let notification = super::LspNotification::parse("window/showMessage", None);
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "window/showMessage");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant when params is None"),
+        }
+    }
+
+    #[test]
+    fn test_publish_diagnostics_with_none_params() {
+        let notification = super::LspNotification::parse("textDocument/publishDiagnostics", None);
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "textDocument/publishDiagnostics");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant when params is None"),
+        }
     }
 }
