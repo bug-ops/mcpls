@@ -50,6 +50,18 @@ pub enum LogLevel {
     Debug,
 }
 
+impl From<lsp_types::MessageType> for LogLevel {
+    fn from(msg_type: lsp_types::MessageType) -> Self {
+        match msg_type {
+            lsp_types::MessageType::ERROR => Self::Error,
+            lsp_types::MessageType::WARNING => Self::Warning,
+            lsp_types::MessageType::INFO => Self::Info,
+            // LOG and unknown message types default to Debug
+            _ => Self::Debug,
+        }
+    }
+}
+
 /// A message from the LSP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerMessage {
@@ -73,6 +85,18 @@ pub enum MessageType {
     Info,
     /// Log message.
     Log,
+}
+
+impl From<lsp_types::MessageType> for MessageType {
+    fn from(msg_type: lsp_types::MessageType) -> Self {
+        match msg_type {
+            lsp_types::MessageType::ERROR => Self::Error,
+            lsp_types::MessageType::WARNING => Self::Warning,
+            lsp_types::MessageType::INFO => Self::Info,
+            // LOG and unknown message types default to Log
+            _ => Self::Log,
+        }
+    }
 }
 
 /// Cache for LSP server notifications.

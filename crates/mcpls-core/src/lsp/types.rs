@@ -2,7 +2,8 @@
 
 use std::borrow::Cow;
 
-use lsp_types::{Diagnostic, Uri};
+// Re-export LSP notification types from lsp_types to avoid duplication.
+pub use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParams};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -78,56 +79,26 @@ pub enum InboundMessage {
     Notification(JsonRpcNotification),
 }
 
-/// LSP log message parameters (window/logMessage).
-#[derive(Debug, Serialize, Deserialize)]
-#[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
-pub struct LogMessageParams {
-    /// The message type.
-    #[serde(rename = "type")]
-    pub type_: i32,
-    /// The message.
-    pub message: String,
-}
-
-/// LSP show message parameters (window/showMessage).
-#[derive(Debug, Serialize, Deserialize)]
-#[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
-pub struct ShowMessageParams {
-    /// The message type.
-    #[serde(rename = "type")]
-    pub type_: i32,
-    /// The message.
-    pub message: String,
-}
-
-/// LSP publish diagnostics parameters (textDocument/publishDiagnostics).
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
-pub struct PublishDiagnosticsParams {
-    /// The URI for which diagnostics are reported.
-    pub uri: Uri,
-    /// Optional version number of the document.
-    pub version: Option<i32>,
-    /// The diagnostics.
-    pub diagnostics: Vec<Diagnostic>,
-}
-
 /// Typed LSP notification variants.
+///
+/// Uses types from `lsp_types` crate for LSP-standard notifications.
 #[derive(Debug)]
-#[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
 pub enum LspNotification {
     /// textDocument/publishDiagnostics
     PublishDiagnostics(PublishDiagnosticsParams),
     /// window/logMessage
+    #[allow(dead_code)] // Used in Phase 4
     LogMessage(LogMessageParams),
     /// window/showMessage
+    #[allow(dead_code)] // Used in Phase 4
     ShowMessage(ShowMessageParams),
     /// Unknown or unhandled notification
     Other {
         /// Method name.
+        #[allow(dead_code)] // Used in Phase 4
         method: Cow<'static, str>,
         /// Optional parameters.
+        #[allow(dead_code)] // Used in Phase 4
         params: Option<serde_json::Value>,
     },
 }
@@ -152,13 +123,13 @@ impl LspNotification {
     ///
     /// match notification {
     ///     LspNotification::LogMessage(log) => {
-    ///         assert_eq!(log.type_, 3);
+    ///         // lsp_types uses `typ` field with MessageType struct
+    ///         assert_eq!(log.typ, lsp_types::MessageType::INFO);
     ///         assert_eq!(log.message, "Server started");
     ///     }
     ///     _ => panic!("Expected LogMessage variant"),
     /// }
     /// ```
-    #[allow(dead_code)] // TODO: Remove when integrated with notification cache (Phase 3)
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
         match method {
             "textDocument/publishDiagnostics" => {
@@ -318,7 +289,8 @@ mod tests {
 
         match notification {
             super::LspNotification::LogMessage(log) => {
-                assert_eq!(log.type_, 3);
+                // lsp_types uses `typ` field with MessageType struct
+                assert_eq!(log.typ, lsp_types::MessageType::INFO);
                 assert_eq!(log.message, "Server started successfully");
             }
             _ => panic!("Expected LogMessage variant"),
@@ -336,7 +308,8 @@ mod tests {
 
         match notification {
             super::LspNotification::ShowMessage(msg) => {
-                assert_eq!(msg.type_, 1);
+                // lsp_types uses `typ` field with MessageType struct
+                assert_eq!(msg.typ, lsp_types::MessageType::ERROR);
                 assert_eq!(msg.message, "Error occurred");
             }
             _ => panic!("Expected ShowMessage variant"),

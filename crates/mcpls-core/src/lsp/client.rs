@@ -15,7 +15,10 @@ use tracing::{debug, error, trace, warn};
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
 use crate::lsp::transport::LspTransport;
-use crate::lsp::types::{InboundMessage, JsonRpcRequest, RequestId};
+use crate::lsp::types::{InboundMessage, JsonRpcRequest, LspNotification, RequestId};
+
+/// JSON-RPC protocol version.
+const JSONRPC_VERSION: &str = "2.0";
 
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
@@ -46,6 +49,10 @@ pub struct LspClient {
 }
 
 impl Clone for LspClient {
+    /// Creates a clone that shares the underlying connection.
+    ///
+    /// The clone does not own the receiver task and cannot perform shutdown.
+    /// All clones share the same command channel for sending requests.
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -80,7 +87,10 @@ impl LspClient {
     /// start the server and complete the initialization handshake.
     #[must_use]
     pub fn new(config: LspServerConfig) -> Self {
-        let (command_tx, _command_rx) = mpsc::channel(100);
+        // Placeholder channel - the receiver is intentionally dropped since
+        // the client starts uninitialized. A real channel is created when
+        // `from_transport` or `from_transport_with_notifications` is called.
+        let (command_tx, _command_rx) = mpsc::channel(1); // Minimal capacity for placeholder
 
         Self {
             config,
@@ -101,8 +111,44 @@ impl LspClient {
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
-        let receiver_task =
-            tokio::spawn(Self::message_loop(transport, command_rx, pending_requests));
+        let receiver_task = tokio::spawn(Self::message_loop(
+            transport,
+            command_rx,
+            pending_requests,
+            None,
+        ));
+
+        Self {
+            config,
+            state,
+            request_counter,
+            command_tx,
+            receiver_task: Some(receiver_task),
+        }
+    }
+
+    /// Create client from transport with notification forwarding.
+    ///
+    /// Notifications received from the LSP server will be parsed and sent
+    /// through the provided channel.
+    #[allow(dead_code)] // Used in Phase 4
+    pub(crate) fn from_transport_with_notifications(
+        config: LspServerConfig,
+        transport: LspTransport,
+        notification_tx: mpsc::Sender<LspNotification>,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(super::ServerState::Initializing));
+        let request_counter = Arc::new(AtomicI64::new(1));
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+
+        let (command_tx, command_rx) = mpsc::channel(100);
+
+        let receiver_task = tokio::spawn(Self::message_loop(
+            transport,
+            command_rx,
+            pending_requests,
+            Some(notification_tx),
+        ));
 
         Self {
             config,
@@ -154,7 +200,7 @@ impl LspClient {
         let (response_tx, response_rx) = oneshot::channel();
 
         let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id: id.clone(),
             method: method.to_string(),
             params: Some(params_value),
@@ -235,10 +281,16 @@ impl LspClient {
         mut transport: LspTransport,
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
+        notification_tx: Option<mpsc::Sender<LspNotification>>,
     ) -> Result<()> {
         debug!("Message loop started");
-        let result =
-            Self::message_loop_inner(&mut transport, &mut command_rx, &pending_requests).await;
+        let result = Self::message_loop_inner(
+            &mut transport,
+            &mut command_rx,
+            &pending_requests,
+            notification_tx.as_ref(),
+        )
+        .await;
         if let Err(ref e) = result {
             error!("Message loop exiting with error: {}", e);
         } else {
@@ -251,6 +303,7 @@ impl LspClient {
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
+        notification_tx: Option<&mpsc::Sender<LspNotification>>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -296,7 +349,12 @@ impl LspClient {
 
                             if let Some(sender) = sender {
                                 if let Some(error) = response.error {
-                                    error!("LSP error response: {} (code {})", error.message, error.code);
+                                    let message = if error.message.len() > 200 {
+                                        format!("{}... (truncated)", &error.message[..200])
+                                    } else {
+                                        error.message.clone()
+                                    };
+                                    error!("LSP error response: {} (code {})", message, error.code);
                                     let _ = sender.send(Err(Error::LspServerError {
                                         code: error.code,
                                         message: error.message,
@@ -306,10 +364,6 @@ impl LspClient {
                                 } else {
                                     // LSP spec allows null result for some requests (e.g., hover with no info).
                                     // Treat as successful response with null value.
-                                    debug_assert!(
-                                        response.result.is_none() && response.error.is_none(),
-                                        "This branch should only be reached when both result and error are None"
-                                    );
                                     trace!("Response with null result: {:?}", response.id);
                                     let _ = sender.send(Ok(Value::Null));
                                 }
@@ -319,8 +373,28 @@ impl LspClient {
                         }
                         InboundMessage::Notification(notification) => {
                             debug!("Received notification: {}", notification.method);
-                            // TODO: Handle server notifications (diagnostics, etc.)
-                            // For Phase 2, just log and ignore
+
+                            // Parse notification into typed variant
+                            let typed = LspNotification::parse(&notification.method, notification.params);
+
+                            // Forward to notification handler if sender is available
+                            if let Some(tx) = notification_tx {
+                                // Log diagnostics count since it's useful for debugging
+                                if let LspNotification::PublishDiagnostics(ref params) = typed {
+                                    debug!(
+                                        "Forwarding diagnostics for {}: {} items",
+                                        params.uri.as_str(),
+                                        params.diagnostics.len()
+                                    );
+                                } else {
+                                    trace!("Forwarding notification: {:?}", typed);
+                                }
+
+                                // Send the notification with backpressure handling
+                                if tx.try_send(typed).is_err() {
+                                    warn!("Notification channel full or closed, dropping notification");
+                                }
+                            }
                         }
                     }
                 }
