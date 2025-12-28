@@ -299,11 +299,186 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_server_state() {
+    fn test_server_state_ready() {
         assert!(ServerState::Ready.is_ready());
-        assert!(!ServerState::Uninitialized.is_ready());
-
         assert!(ServerState::Ready.can_accept_requests());
+    }
+
+    #[test]
+    fn test_server_state_uninitialized() {
+        assert!(!ServerState::Uninitialized.is_ready());
+        assert!(!ServerState::Uninitialized.can_accept_requests());
+    }
+
+    #[test]
+    fn test_server_state_initializing() {
+        assert!(!ServerState::Initializing.is_ready());
         assert!(!ServerState::Initializing.can_accept_requests());
+    }
+
+    #[test]
+    fn test_server_state_shutting_down() {
+        assert!(!ServerState::ShuttingDown.is_ready());
+        assert!(!ServerState::ShuttingDown.can_accept_requests());
+    }
+
+    #[test]
+    fn test_server_state_shutdown() {
+        assert!(!ServerState::Shutdown.is_ready());
+        assert!(!ServerState::Shutdown.can_accept_requests());
+    }
+
+    #[test]
+    fn test_server_state_equality() {
+        assert_eq!(ServerState::Ready, ServerState::Ready);
+        assert_ne!(ServerState::Ready, ServerState::Uninitialized);
+        assert_eq!(ServerState::Shutdown, ServerState::Shutdown);
+    }
+
+    #[test]
+    fn test_server_state_clone() {
+        let state = ServerState::Ready;
+        let cloned = state;
+        assert_eq!(state, cloned);
+    }
+
+    #[test]
+    fn test_server_state_debug() {
+        let state = ServerState::Ready;
+        let debug_str = format!("{state:?}");
+        assert!(debug_str.contains("Ready"));
+    }
+
+    #[test]
+    fn test_server_init_config_clone() {
+        let config = ServerInitConfig {
+            server_config: LspServerConfig::rust_analyzer(),
+            workspace_roots: vec![PathBuf::from("/tmp/workspace")],
+            initialization_options: Some(serde_json::json!({"key": "value"})),
+        };
+
+        #[allow(clippy::redundant_clone)]
+        let cloned = config.clone();
+        assert_eq!(cloned.server_config.language_id, "rust");
+        assert_eq!(cloned.workspace_roots.len(), 1);
+    }
+
+    #[test]
+    fn test_server_init_config_debug() {
+        let config = ServerInitConfig {
+            server_config: LspServerConfig::pyright(),
+            workspace_roots: vec![],
+            initialization_options: None,
+        };
+
+        let debug_str = format!("{config:?}");
+        assert!(debug_str.contains("python"));
+        assert!(debug_str.contains("pyright"));
+    }
+
+    #[test]
+    fn test_server_init_config_with_options() {
+        use std::collections::HashMap;
+
+        let init_opts = serde_json::json!({
+            "settings": {
+                "python": {
+                    "analysis": {
+                        "typeCheckingMode": "strict"
+                    }
+                }
+            }
+        });
+
+        let mut env = HashMap::new();
+        env.insert("PYTHONPATH".to_string(), "/usr/lib".to_string());
+
+        let config = ServerInitConfig {
+            server_config: LspServerConfig {
+                language_id: "python".to_string(),
+                command: "pyright-langserver".to_string(),
+                args: vec!["--stdio".to_string()],
+                env,
+                file_patterns: vec!["**/*.py".to_string()],
+                initialization_options: Some(init_opts.clone()),
+                timeout_seconds: 10,
+            },
+            workspace_roots: vec![PathBuf::from("/workspace")],
+            initialization_options: Some(init_opts),
+        };
+
+        assert!(config.initialization_options.is_some());
+        assert_eq!(config.workspace_roots.len(), 1);
+    }
+
+    #[test]
+    fn test_server_init_config_empty_workspace() {
+        let config = ServerInitConfig {
+            server_config: LspServerConfig::typescript(),
+            workspace_roots: vec![],
+            initialization_options: None,
+        };
+
+        assert!(config.workspace_roots.is_empty());
+    }
+
+    #[test]
+    fn test_server_init_config_multiple_workspaces() {
+        let config = ServerInitConfig {
+            server_config: LspServerConfig::rust_analyzer(),
+            workspace_roots: vec![
+                PathBuf::from("/workspace1"),
+                PathBuf::from("/workspace2"),
+                PathBuf::from("/workspace3"),
+            ],
+            initialization_options: None,
+        };
+
+        assert_eq!(config.workspace_roots.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_lsp_server_getters() {
+        use lsp_types::ServerCapabilities;
+
+        let mock_child = tokio::process::Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mock_stdin = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+
+        let mock_stdout = tokio::process::Command::new("echo")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+
+        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+        let server = LspServer {
+            client,
+            capabilities: ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            _child: mock_child,
+        };
+
+        assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
+        assert!(server.capabilities().text_document_sync.is_none());
+
+        let debug_str = format!("{server:?}");
+        assert!(debug_str.contains("LspServer"));
+        assert!(debug_str.contains("<process>"));
     }
 }

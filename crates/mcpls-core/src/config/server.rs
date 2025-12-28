@@ -82,3 +82,127 @@ impl LspServerConfig {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rust_analyzer_defaults() {
+        let config = LspServerConfig::rust_analyzer();
+
+        assert_eq!(config.language_id, "rust");
+        assert_eq!(config.command, "rust-analyzer");
+        assert!(config.args.is_empty());
+        assert!(config.env.is_empty());
+        assert_eq!(config.file_patterns, vec!["**/*.rs"]);
+        assert!(config.initialization_options.is_none());
+        assert_eq!(config.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_pyright_defaults() {
+        let config = LspServerConfig::pyright();
+
+        assert_eq!(config.language_id, "python");
+        assert_eq!(config.command, "pyright-langserver");
+        assert_eq!(config.args, vec!["--stdio"]);
+        assert!(config.env.is_empty());
+        assert_eq!(config.file_patterns, vec!["**/*.py"]);
+        assert!(config.initialization_options.is_none());
+        assert_eq!(config.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_typescript_defaults() {
+        let config = LspServerConfig::typescript();
+
+        assert_eq!(config.language_id, "typescript");
+        assert_eq!(config.command, "typescript-language-server");
+        assert_eq!(config.args, vec!["--stdio"]);
+        assert!(config.env.is_empty());
+        assert_eq!(config.file_patterns, vec!["**/*.ts", "**/*.tsx"]);
+        assert!(config.initialization_options.is_none());
+        assert_eq!(config.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_default_timeout() {
+        assert_eq!(default_timeout(), 30);
+    }
+
+    #[test]
+    fn test_custom_config() {
+        let mut env = HashMap::new();
+        env.insert("RUST_LOG".to_string(), "debug".to_string());
+
+        let config = LspServerConfig {
+            language_id: "custom".to_string(),
+            command: "custom-lsp".to_string(),
+            args: vec!["--flag".to_string()],
+            env: env.clone(),
+            file_patterns: vec!["**/*.custom".to_string()],
+            initialization_options: Some(serde_json::json!({"key": "value"})),
+            timeout_seconds: 60,
+        };
+
+        assert_eq!(config.language_id, "custom");
+        assert_eq!(config.command, "custom-lsp");
+        assert_eq!(config.args, vec!["--flag"]);
+        assert_eq!(config.env.get("RUST_LOG"), Some(&"debug".to_string()));
+        assert_eq!(config.file_patterns, vec!["**/*.custom"]);
+        assert!(config.initialization_options.is_some());
+        assert_eq!(config.timeout_seconds, 60);
+    }
+
+    #[test]
+    fn test_serde_roundtrip() {
+        let original = LspServerConfig::rust_analyzer();
+
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: LspServerConfig = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.language_id, original.language_id);
+        assert_eq!(deserialized.command, original.command);
+        assert_eq!(deserialized.args, original.args);
+        assert_eq!(deserialized.timeout_seconds, original.timeout_seconds);
+    }
+
+    #[test]
+    fn test_clone() {
+        let config = LspServerConfig::rust_analyzer();
+        let cloned = config.clone();
+
+        assert_eq!(cloned.language_id, config.language_id);
+        assert_eq!(cloned.command, config.command);
+        assert_eq!(cloned.timeout_seconds, config.timeout_seconds);
+    }
+
+    #[test]
+    fn test_empty_env() {
+        let config = LspServerConfig::rust_analyzer();
+        assert!(config.env.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_file_patterns() {
+        let config = LspServerConfig::typescript();
+        assert_eq!(config.file_patterns.len(), 2);
+        assert!(config.file_patterns.contains(&"**/*.ts".to_string()));
+        assert!(config.file_patterns.contains(&"**/*.tsx".to_string()));
+    }
+
+    #[test]
+    fn test_initialization_options_none_by_default() {
+        let configs = vec![
+            LspServerConfig::rust_analyzer(),
+            LspServerConfig::pyright(),
+            LspServerConfig::typescript(),
+        ];
+
+        for config in configs {
+            assert!(config.initialization_options.is_none());
+        }
+    }
+}

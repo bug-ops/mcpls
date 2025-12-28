@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::lsp::LspClient;
 
 /// State of a single document.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentState {
     /// Document URI.
     pub uri: Uri,
@@ -334,6 +334,311 @@ mod tests {
         // Large file should fail
         let large_content = "x".repeat(100);
         let result = tracker.open(PathBuf::from("/test/large.rs"), large_content);
+        assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
+    }
+
+    #[test]
+    fn test_resource_limits_default() {
+        let limits = ResourceLimits::default();
+        assert_eq!(limits.max_documents, 100);
+        assert_eq!(limits.max_file_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_resource_limits_custom() {
+        let limits = ResourceLimits {
+            max_documents: 50,
+            max_file_size: 5 * 1024 * 1024,
+        };
+        assert_eq!(limits.max_documents, 50);
+        assert_eq!(limits.max_file_size, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_resource_limits_zero_unlimited() {
+        let limits = ResourceLimits {
+            max_documents: 0,
+            max_file_size: 0,
+        };
+        let mut tracker = DocumentTracker::with_limits(limits);
+
+        // Should allow many documents when limit is 0
+        for i in 0..200 {
+            tracker
+                .open(
+                    PathBuf::from(format!("/test/file{i}.rs")),
+                    "content".to_string(),
+                )
+                .unwrap();
+        }
+        assert_eq!(tracker.len(), 200);
+
+        // Should allow large files when limit is 0
+        let huge_content = "x".repeat(100_000_000);
+        tracker
+            .open(PathBuf::from("/test/huge.rs"), huge_content)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_document_tracker_default() {
+        let tracker = DocumentTracker::default();
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
+    }
+
+    #[test]
+    fn test_document_state_clone() {
+        let state = DocumentState {
+            uri: "file:///test.rs".parse().unwrap(),
+            language_id: "rust".to_string(),
+            version: 5,
+            content: "fn main() {}".to_string(),
+        };
+
+        #[allow(clippy::redundant_clone)]
+        let cloned = state.clone();
+        assert_eq!(cloned.uri, state.uri);
+        assert_eq!(cloned.language_id, state.language_id);
+        assert_eq!(cloned.version, 5);
+        assert_eq!(cloned.content, state.content);
+    }
+
+    #[test]
+    fn test_update_nonexistent_document() {
+        let mut tracker = DocumentTracker::new();
+        let path = PathBuf::from("/test/nonexistent.rs");
+
+        let version = tracker.update(&path, "new content".to_string());
+        assert_eq!(
+            version, None,
+            "Updating non-existent document should return None"
+        );
+    }
+
+    #[test]
+    fn test_close_nonexistent_document() {
+        let mut tracker = DocumentTracker::new();
+        let path = PathBuf::from("/test/nonexistent.rs");
+
+        let state = tracker.close(&path);
+        assert_eq!(
+            state, None,
+            "Closing non-existent document should return None"
+        );
+    }
+
+    #[test]
+    fn test_close_all_documents() {
+        let mut tracker = DocumentTracker::new();
+
+        tracker
+            .open(PathBuf::from("/test/file1.rs"), "content1".to_string())
+            .unwrap();
+        tracker
+            .open(PathBuf::from("/test/file2.rs"), "content2".to_string())
+            .unwrap();
+        tracker
+            .open(PathBuf::from("/test/file3.rs"), "content3".to_string())
+            .unwrap();
+
+        assert_eq!(tracker.len(), 3);
+
+        let closed = tracker.close_all();
+        assert_eq!(closed.len(), 3);
+        assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn test_get_nonexistent_document() {
+        let tracker = DocumentTracker::new();
+        let path = PathBuf::from("/test/nonexistent.rs");
+
+        let state = tracker.get(&path);
+        assert!(
+            state.is_none(),
+            "Getting non-existent document should return None"
+        );
+    }
+
+    #[test]
+    fn test_document_version_increments() {
+        let mut tracker = DocumentTracker::new();
+        let path = PathBuf::from("/test/versioned.rs");
+
+        tracker.open(path.clone(), "v1".to_string()).unwrap();
+        assert_eq!(tracker.get(&path).unwrap().version, 1);
+
+        tracker.update(&path, "v2".to_string());
+        assert_eq!(tracker.get(&path).unwrap().version, 2);
+
+        tracker.update(&path, "v3".to_string());
+        assert_eq!(tracker.get(&path).unwrap().version, 3);
+
+        tracker.update(&path, "v4".to_string());
+        assert_eq!(tracker.get(&path).unwrap().version, 4);
+    }
+
+    #[test]
+    fn test_detect_language_all_extensions() {
+        assert_eq!(detect_language(Path::new("main.rs")), "rust");
+        assert_eq!(detect_language(Path::new("script.py")), "python");
+        assert_eq!(detect_language(Path::new("script.pyw")), "python");
+        assert_eq!(detect_language(Path::new("script.pyi")), "python");
+        assert_eq!(detect_language(Path::new("app.js")), "javascript");
+        assert_eq!(detect_language(Path::new("app.mjs")), "javascript");
+        assert_eq!(detect_language(Path::new("app.cjs")), "javascript");
+        assert_eq!(detect_language(Path::new("app.ts")), "typescript");
+        assert_eq!(detect_language(Path::new("app.mts")), "typescript");
+        assert_eq!(detect_language(Path::new("app.cts")), "typescript");
+        assert_eq!(
+            detect_language(Path::new("component.tsx")),
+            "typescriptreact"
+        );
+        assert_eq!(
+            detect_language(Path::new("component.jsx")),
+            "javascriptreact"
+        );
+        assert_eq!(detect_language(Path::new("main.go")), "go");
+        assert_eq!(detect_language(Path::new("main.c")), "c");
+        assert_eq!(detect_language(Path::new("header.h")), "c");
+        assert_eq!(detect_language(Path::new("main.cpp")), "cpp");
+        assert_eq!(detect_language(Path::new("main.cc")), "cpp");
+        assert_eq!(detect_language(Path::new("main.cxx")), "cpp");
+        assert_eq!(detect_language(Path::new("header.hpp")), "cpp");
+        assert_eq!(detect_language(Path::new("header.hh")), "cpp");
+        assert_eq!(detect_language(Path::new("header.hxx")), "cpp");
+        assert_eq!(detect_language(Path::new("Main.java")), "java");
+        assert_eq!(detect_language(Path::new("script.rb")), "ruby");
+        assert_eq!(detect_language(Path::new("index.php")), "php");
+        assert_eq!(detect_language(Path::new("App.swift")), "swift");
+        assert_eq!(detect_language(Path::new("Main.kt")), "kotlin");
+        assert_eq!(detect_language(Path::new("script.kts")), "kotlin");
+        assert_eq!(detect_language(Path::new("Main.scala")), "scala");
+        assert_eq!(detect_language(Path::new("script.sc")), "scala");
+        assert_eq!(detect_language(Path::new("main.zig")), "zig");
+        assert_eq!(detect_language(Path::new("script.lua")), "lua");
+        assert_eq!(detect_language(Path::new("script.sh")), "shellscript");
+        assert_eq!(detect_language(Path::new("script.bash")), "shellscript");
+        assert_eq!(detect_language(Path::new("script.zsh")), "shellscript");
+        assert_eq!(detect_language(Path::new("data.json")), "json");
+        assert_eq!(detect_language(Path::new("config.toml")), "toml");
+        assert_eq!(detect_language(Path::new("config.yaml")), "yaml");
+        assert_eq!(detect_language(Path::new("config.yml")), "yaml");
+        assert_eq!(detect_language(Path::new("data.xml")), "xml");
+        assert_eq!(detect_language(Path::new("index.html")), "html");
+        assert_eq!(detect_language(Path::new("index.htm")), "html");
+        assert_eq!(detect_language(Path::new("styles.css")), "css");
+        assert_eq!(detect_language(Path::new("styles.scss")), "scss");
+        assert_eq!(detect_language(Path::new("styles.less")), "less");
+        assert_eq!(detect_language(Path::new("README.md")), "markdown");
+        assert_eq!(detect_language(Path::new("README.markdown")), "markdown");
+        assert_eq!(detect_language(Path::new("unknown.xyz")), "plaintext");
+        assert_eq!(detect_language(Path::new("no_extension")), "plaintext");
+    }
+
+    #[test]
+    fn test_path_to_uri_unix() {
+        #[cfg(not(windows))]
+        {
+            let path = Path::new("/home/user/project/main.rs");
+            let uri = path_to_uri(path);
+            assert!(
+                uri.as_str()
+                    .starts_with("file:///home/user/project/main.rs")
+            );
+        }
+    }
+
+    #[test]
+    fn test_path_to_uri_with_special_chars() {
+        let path = Path::new("/home/user/project-test/main.rs");
+        let uri = path_to_uri(path);
+        assert!(uri.as_str().starts_with("file://"));
+        assert!(uri.as_str().contains("project-test"));
+    }
+
+    #[test]
+    fn test_document_tracker_concurrent_operations() {
+        let mut tracker = DocumentTracker::new();
+        let path1 = PathBuf::from("/test/file1.rs");
+        let path2 = PathBuf::from("/test/file2.rs");
+
+        tracker.open(path1.clone(), "content1".to_string()).unwrap();
+        tracker.open(path2.clone(), "content2".to_string()).unwrap();
+
+        assert_eq!(tracker.len(), 2);
+        assert!(tracker.is_open(&path1));
+        assert!(tracker.is_open(&path2));
+
+        tracker.update(&path1, "new content1".to_string());
+        assert_eq!(tracker.get(&path1).unwrap().content, "new content1");
+        assert_eq!(tracker.get(&path2).unwrap().content, "content2");
+
+        tracker.close(&path1);
+        assert_eq!(tracker.len(), 1);
+        assert!(!tracker.is_open(&path1));
+        assert!(tracker.is_open(&path2));
+    }
+
+    #[test]
+    fn test_empty_content() {
+        let mut tracker = DocumentTracker::new();
+        let path = PathBuf::from("/test/empty.rs");
+
+        tracker.open(path.clone(), String::new()).unwrap();
+        assert!(tracker.is_open(&path));
+        assert_eq!(tracker.get(&path).unwrap().content, "");
+    }
+
+    #[test]
+    fn test_unicode_content() {
+        let mut tracker = DocumentTracker::new();
+        let path = PathBuf::from("/test/unicode.rs");
+        let content = "fn テスト() { println!(\"こんにちは\"); }";
+
+        tracker.open(path.clone(), content.to_string()).unwrap();
+        assert_eq!(tracker.get(&path).unwrap().content, content);
+    }
+
+    #[test]
+    fn test_document_limit_exact_boundary() {
+        let limits = ResourceLimits {
+            max_documents: 5,
+            max_file_size: 1000,
+        };
+        let mut tracker = DocumentTracker::with_limits(limits);
+
+        for i in 0..5 {
+            tracker
+                .open(
+                    PathBuf::from(format!("/test/file{i}.rs")),
+                    "content".to_string(),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(tracker.len(), 5);
+
+        let result = tracker.open(PathBuf::from("/test/file6.rs"), "content".to_string());
+        assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+    }
+
+    #[test]
+    fn test_file_size_exact_boundary() {
+        let limits = ResourceLimits {
+            max_documents: 10,
+            max_file_size: 100,
+        };
+        let mut tracker = DocumentTracker::with_limits(limits);
+
+        let exact_size_content = "x".repeat(100);
+        tracker
+            .open(PathBuf::from("/test/exact.rs"), exact_size_content)
+            .unwrap();
+
+        let over_size_content = "x".repeat(101);
+        let result = tracker.open(PathBuf::from("/test/over.rs"), over_size_content);
         assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
     }
 }
