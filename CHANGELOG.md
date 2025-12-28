@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-12-28
+
+Major feature release adding LSP notification handling and 3 new MCP tools for real-time diagnostics and server monitoring.
+
+### Added
+
+**New MCP Tools (3 tools)**:
+- `get_cached_diagnostics` — Fast access to push-based diagnostics from LSP server notifications. Returns cached diagnostics without triggering new analysis, ideal for quick error checks.
+- `get_server_logs` — Debug LSP issues with internal log messages (`window/logMessage`). Supports level filtering (error, warning, info, debug) and configurable limits.
+- `get_server_messages` — User-facing messages from the language server (`window/showMessage`). Captures prompts, warnings, and status updates that would normally appear in IDE popups.
+
+**LSP Notification Handling**:
+- New `NotificationCache` for storing LSP server notifications (diagnostics, logs, messages)
+- Bounded channel-based storage with configurable limits (1000 diagnostics, 500 logs, 100 messages)
+- Cross-platform file URI handling with `url::Url` for Windows compatibility
+- Support for `textDocument/publishDiagnostics`, `window/logMessage`, and `window/showMessage` notifications
+
+**Enhanced Tool Descriptions**:
+- All 16 MCP tools now have detailed `#[tool(description)]` explaining purpose, return values, and use cases
+- All parameter structs have `#[schemars(description)]` for JSON schema documentation
+- Helps AI agents understand when and how to use each tool
+
+**Testing**:
+- 28 new tests for notification handling (157 total tests, up from 129)
+- Tests for diagnostic caching with multiple severities, codes, and data
+- Tests for log filtering by level
+- Tests for message type handling
+- Cross-platform URI tests
+
+### Changed
+
+- **MCP Tools reorganized** — README now groups 16 tools into categories: Code Intelligence, Diagnostics & Analysis, Refactoring, Call Hierarchy, Server Monitoring
+- **mcpls-core** — `url` crate moved from dev-dependencies to dependencies for cross-platform URI handling
+- **Documentation** — Updated tools-reference.md with all 16 tools (was 8)
+
+### Fixed
+
+- **Windows file URI format** — Fixed cached diagnostics lookup on Windows. Was using `format!("file://{}", path)` which produces incorrect URIs on Windows (`file://C:/...` instead of `file:///C:/...`). Now uses `Url::from_file_path()` for cross-platform compatibility.
+
+### Removed
+
+- **Dead code cleanup** — Removed ~1100 lines of unused `ToolHandler` trait implementations from `handlers.rs`
+- **ADR documents** — Moved Architecture Decision Records to internal `.local/` folder (not distributed)
+
 ## [0.2.2] - 2025-12-27
 
 Patch release with critical bug fixes for LSP server process management.
@@ -307,7 +351,9 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bug-ops/mcpls/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/bug-ops/mcpls/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/bug-ops/mcpls/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bug-ops/mcpls/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bug-ops/mcpls/releases/tag/v0.1.0
