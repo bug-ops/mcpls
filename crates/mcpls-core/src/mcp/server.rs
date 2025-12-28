@@ -39,7 +39,9 @@ impl McplsServer {
     }
 
     /// Get hover information at a position in a file.
-    #[tool(description = "Get hover information (type, documentation) at a position in a file")]
+    #[tool(
+        description = "Get hover information (type, documentation) at a position in a file. Returns type signatures, documentation comments, and inferred types for the symbol under cursor. Use this to understand what a variable, function, or type represents without navigating to its definition."
+    )]
     async fn get_hover(
         &self,
         Parameters(HoverParams {
@@ -61,7 +63,9 @@ impl McplsServer {
     }
 
     /// Get the definition location of a symbol.
-    #[tool(description = "Get the definition location of a symbol at the specified position")]
+    #[tool(
+        description = "Get the definition location of a symbol at the specified position. Returns file path, line, and character where the symbol (function, variable, type, etc.) is defined. Use this to navigate from a symbol usage to its original declaration or implementation."
+    )]
     async fn get_definition(
         &self,
         Parameters(DefinitionParams {
@@ -85,7 +89,9 @@ impl McplsServer {
     }
 
     /// Find all references to a symbol.
-    #[tool(description = "Find all references to a symbol at the specified position")]
+    #[tool(
+        description = "Find all references to a symbol at the specified position. Returns a list of all locations (file, line, character) where the symbol is used across the workspace. Use this to understand how widely a function/variable/type is used before refactoring, or to find all call sites of a function."
+    )]
     async fn get_references(
         &self,
         Parameters(ReferencesParams {
@@ -110,7 +116,9 @@ impl McplsServer {
     }
 
     /// Get diagnostics for a file.
-    #[tool(description = "Get diagnostics (errors, warnings) for a file")]
+    #[tool(
+        description = "Get diagnostics (errors, warnings) for a file. Triggers language server analysis and returns compilation errors, warnings, hints, and other issues with severity, message, and location. Use this to check code for problems before running or after making changes."
+    )]
     async fn get_diagnostics(
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
@@ -128,7 +136,9 @@ impl McplsServer {
     }
 
     /// Rename a symbol across the workspace.
-    #[tool(description = "Rename a symbol across the workspace")]
+    #[tool(
+        description = "Rename a symbol across the workspace. Returns a list of text edits to apply across all files where the symbol is used. This is a safe refactoring operation that updates the symbol name consistently in declarations, usages, imports, and documentation. Use this instead of find-and-replace for reliable renaming."
+    )]
     async fn rename_symbol(
         &self,
         Parameters(RenameParams {
@@ -153,7 +163,9 @@ impl McplsServer {
     }
 
     /// Get code completion suggestions.
-    #[tool(description = "Get code completion suggestions at a position in a file")]
+    #[tool(
+        description = "Get code completion suggestions at a position in a file. Returns available completions including methods, functions, variables, types, keywords, and snippets with their documentation and type information. Use after typing a dot, colon, or partial identifier to see what can be inserted."
+    )]
     async fn get_completions(
         &self,
         Parameters(CompletionsParams {
@@ -178,7 +190,9 @@ impl McplsServer {
     }
 
     /// Get all symbols in a document.
-    #[tool(description = "Get all symbols (functions, classes, variables) in a document")]
+    #[tool(
+        description = "Get all symbols (functions, classes, variables) in a document. Returns a hierarchical outline of the file including functions, methods, classes, structs, enums, constants, and their locations. Use this to understand file structure, navigate to specific symbols, or get an overview of what a file contains."
+    )]
     async fn get_document_symbols(
         &self,
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
@@ -196,7 +210,9 @@ impl McplsServer {
     }
 
     /// Format a document according to language server rules.
-    #[tool(description = "Format a document according to the language server's formatting rules")]
+    #[tool(
+        description = "Format a document according to the language server's formatting rules. Returns a list of text edits to apply for proper indentation, spacing, and style. The formatting follows language-specific conventions (rustfmt for Rust, prettier for JS/TS, etc.). Use this to automatically fix code style issues."
+    )]
     async fn format_document(
         &self,
         Parameters(FormatDocumentParams {
@@ -220,7 +236,9 @@ impl McplsServer {
     }
 
     /// Search for symbols across the workspace.
-    #[tool(description = "Search for symbols across the entire workspace by name or pattern")]
+    #[tool(
+        description = "Search for symbols across the entire workspace by name or pattern. Supports partial matching and fuzzy search to find functions, types, constants, etc. by name without knowing their exact location. Use this when you know the name of something but not which file it's in, or to discover related symbols."
+    )]
     async fn workspace_symbol_search(
         &self,
         Parameters(WorkspaceSymbolParams {
@@ -245,7 +263,7 @@ impl McplsServer {
 
     /// Get code actions for a range.
     #[tool(
-        description = "Get available code actions (quick fixes, refactorings) for a range in a file"
+        description = "Get available code actions (quick fixes, refactorings) for a range in a file. Returns suggested fixes for diagnostics, refactoring options (extract function, inline variable), and source actions (organize imports, generate code). Each action includes edits to apply. Use this to get IDE-style automated fixes and refactorings."
     )]
     async fn get_code_actions(
         &self,
@@ -280,7 +298,9 @@ impl McplsServer {
     }
 
     /// Prepare call hierarchy at a position.
-    #[tool(description = "Prepare call hierarchy at a position, returns callable items")]
+    #[tool(
+        description = "Prepare call hierarchy at a position, returns callable items. This is the first step for analyzing function call relationships. Returns a call hierarchy item that can be passed to get_incoming_calls or get_outgoing_calls. Use this on a function to start exploring its callers or callees."
+    )]
     async fn prepare_call_hierarchy(
         &self,
         Parameters(CallHierarchyPrepareParams {
@@ -304,7 +324,9 @@ impl McplsServer {
     }
 
     /// Get incoming calls (callers).
-    #[tool(description = "Get functions that call the specified item (callers)")]
+    #[tool(
+        description = "Get functions that call the specified item (callers). Takes a call hierarchy item from prepare_call_hierarchy and returns all functions/methods that call it. Use this to trace backwards through the call graph and understand how a function is invoked and from where."
+    )]
     async fn get_incoming_calls(
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
@@ -322,7 +344,9 @@ impl McplsServer {
     }
 
     /// Get outgoing calls (callees).
-    #[tool(description = "Get functions called by the specified item (callees)")]
+    #[tool(
+        description = "Get functions called by the specified item (callees). Takes a call hierarchy item from prepare_call_hierarchy and returns all functions/methods it calls. Use this to trace forward through the call graph and understand what dependencies a function has."
+    )]
     async fn get_outgoing_calls(
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
@@ -340,7 +364,9 @@ impl McplsServer {
     }
 
     /// Get cached diagnostics for a file.
-    #[tool(description = "Get cached diagnostics for a file from LSP server notifications")]
+    #[tool(
+        description = "Get cached diagnostics for a file from LSP server notifications. Returns diagnostics that were pushed by the language server (rather than requested on-demand). This is faster than get_diagnostics as it uses cached data. Use this to quickly check recent errors/warnings without triggering new analysis."
+    )]
     async fn get_cached_diagnostics(
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
@@ -358,7 +384,9 @@ impl McplsServer {
     }
 
     /// Get recent LSP server log messages.
-    #[tool(description = "Get recent LSP server log messages with optional level filtering")]
+    #[tool(
+        description = "Get recent LSP server log messages with optional level filtering. Returns internal log messages from the language server for debugging LSP issues. Filter by level (error, warning, info, debug) to focus on relevant messages. Use this to diagnose why the language server might not be working correctly."
+    )]
     async fn get_server_logs(
         &self,
         Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
@@ -376,7 +404,9 @@ impl McplsServer {
     }
 
     /// Get recent LSP server messages.
-    #[tool(description = "Get recent LSP server messages (showMessage notifications)")]
+    #[tool(
+        description = "Get recent LSP server messages (showMessage notifications). Returns user-facing messages from the language server like prompts, warnings, and status updates that would normally appear in IDE popups. Use this to see important messages the language server wanted to communicate."
+    )]
     async fn get_server_messages(
         &self,
         Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
