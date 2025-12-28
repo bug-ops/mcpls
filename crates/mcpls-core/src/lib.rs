@@ -142,6 +142,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -168,5 +169,97 @@ mod tests {
         let roots = resolve_workspace_roots(&config_roots);
         assert_eq!(roots, config_roots);
         assert_eq!(roots.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_preserves_order() {
+        let config_roots = vec![
+            PathBuf::from("/workspace/alpha"),
+            PathBuf::from("/workspace/beta"),
+            PathBuf::from("/workspace/gamma"),
+        ];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots[0], PathBuf::from("/workspace/alpha"));
+        assert_eq!(roots[1], PathBuf::from("/workspace/beta"));
+        assert_eq!(roots[2], PathBuf::from("/workspace/gamma"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_single_path() {
+        let config_roots = vec![PathBuf::from("/single/workspace")];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], PathBuf::from("/single/workspace"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_empty_returns_cwd() {
+        let roots = resolve_workspace_roots(&[]);
+        assert!(
+            !roots.is_empty(),
+            "Should return at least one workspace root"
+        );
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_relative_paths() {
+        let config_roots = vec![
+            PathBuf::from("relative/path1"),
+            PathBuf::from("relative/path2"),
+        ];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], PathBuf::from("relative/path1"));
+        assert_eq!(roots[1], PathBuf::from("relative/path2"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_mixed_paths() {
+        let config_roots = vec![
+            PathBuf::from("/absolute/path"),
+            PathBuf::from("relative/path"),
+        ];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], PathBuf::from("/absolute/path"));
+        assert_eq!(roots[1], PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_with_dot_path() {
+        let config_roots = vec![PathBuf::from(".")];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots, config_roots);
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_with_parent_path() {
+        let config_roots = vec![PathBuf::from("..")];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], PathBuf::from(".."));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_unicode_paths() {
+        let config_roots = vec![
+            PathBuf::from("/workspace/テスト"),
+            PathBuf::from("/workspace/тест"),
+        ];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], PathBuf::from("/workspace/テスト"));
+        assert_eq!(roots[1], PathBuf::from("/workspace/тест"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_spaces_in_paths() {
+        let config_roots = vec![
+            PathBuf::from("/workspace/path with spaces"),
+            PathBuf::from("/another path/workspace"),
+        ];
+        let roots = resolve_workspace_roots(&config_roots);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], PathBuf::from("/workspace/path with spaces"));
     }
 }

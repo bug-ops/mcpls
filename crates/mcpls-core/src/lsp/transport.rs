@@ -202,4 +202,113 @@ mod tests {
         assert!(header.ends_with("\r\n\r\n"));
         assert!(content.contains("\"jsonrpc\":\"2.0\""));
     }
+
+    #[test]
+    fn test_header_case_insensitive() {
+        let headers_text = "CONTENT-LENGTH: 123\r\nContent-Type: application/json\r\n";
+        let mut headers = HashMap::new();
+
+        for line in headers_text.lines() {
+            if let Some((key, value)) = line.split_once(':') {
+                headers.insert(key.trim().to_lowercase(), value.trim().to_string());
+            }
+        }
+
+        assert_eq!(headers.get("content-length"), Some(&"123".to_string()));
+    }
+
+    #[test]
+    fn test_max_content_length_constant() {
+        assert_eq!(MAX_CONTENT_LENGTH, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_header_format_with_multiple_headers() {
+        let headers_text =
+            "Content-Length: 42\r\nContent-Type: application/json\r\nX-Custom: value\r\n";
+        let mut headers = HashMap::new();
+
+        for line in headers_text.lines() {
+            if let Some((key, value)) = line.split_once(':') {
+                headers.insert(key.trim().to_lowercase(), value.trim().to_string());
+            }
+        }
+
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers.get("content-length"), Some(&"42".to_string()));
+        assert_eq!(headers.get("x-custom"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_message_serialization_response() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"key": "value"}
+        });
+
+        let content = serde_json::to_string(&response).unwrap();
+        assert!(content.contains("\"jsonrpc\":\"2.0\""));
+        assert!(content.contains("\"id\":1"));
+        assert!(content.contains("\"result\""));
+    }
+
+    #[test]
+    fn test_message_serialization_notification() {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "window/showMessage",
+            "params": {"type": 1, "message": "Hello"}
+        });
+
+        let content = serde_json::to_string(&notification).unwrap();
+        assert!(content.contains("\"method\""));
+        assert!(!content.contains("\"id\""));
+    }
+
+    #[test]
+    fn test_message_serialization_error_response() {
+        let error_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+                "code": -32601,
+                "message": "Method not found"
+            }
+        });
+
+        let content = serde_json::to_string(&error_response).unwrap();
+        assert!(content.contains("\"error\""));
+        assert!(content.contains("-32601"));
+        assert!(content.contains("Method not found"));
+    }
+
+    #[test]
+    fn test_content_length_calculation() {
+        let message = serde_json::json!({"test": "data"});
+        let content = serde_json::to_string(&message).unwrap();
+        let expected_len = content.len();
+
+        let header = format!("Content-Length: {}\r\n\r\n", content.len());
+        assert!(header.contains(&expected_len.to_string()));
+    }
+
+    #[test]
+    fn test_header_without_colon() {
+        let malformed_line = "Malformed header without colon";
+        let result = malformed_line.split_once(':');
+        assert!(result.is_none(), "Should not parse malformed header");
+    }
+
+    #[test]
+    fn test_header_with_whitespace() {
+        let header_line = "  Content-Length  :  456  ";
+        if let Some((key, value)) = header_line.split_once(':') {
+            let key_trimmed = key.trim().to_lowercase();
+            let value_trimmed = value.trim();
+
+            assert_eq!(key_trimmed, "content-length");
+            assert_eq!(value_trimmed, "456");
+        }
+    }
 }

@@ -26,7 +26,7 @@ pub struct ServerConfig {
 }
 
 /// Workspace-level configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     /// Root directories for the workspace.
@@ -37,6 +37,15 @@ pub struct WorkspaceConfig {
     /// Valid values: "utf-8", "utf-16", "utf-32"
     #[serde(default = "default_position_encodings")]
     pub position_encodings: Vec<String>,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            position_encodings: default_position_encodings(),
+        }
+    }
 }
 
 fn default_position_encodings() -> Vec<String> {
@@ -120,5 +129,214 @@ impl Default for ServerConfig {
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig::rust_analyzer()],
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ServerConfig::default();
+        assert_eq!(config.lsp_servers.len(), 1);
+        assert_eq!(config.lsp_servers[0].language_id, "rust");
+        assert_eq!(config.workspace.position_encodings, vec!["utf-8", "utf-16"]);
+    }
+
+    #[test]
+    fn test_default_position_encodings() {
+        let encodings = default_position_encodings();
+        assert_eq!(encodings, vec!["utf-8", "utf-16"]);
+    }
+
+    #[test]
+    fn test_load_from_valid_toml() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [workspace]
+            roots = ["/tmp/workspace"]
+            position_encodings = ["utf-8"]
+
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            timeout_seconds = 30
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(
+            config.workspace.roots,
+            vec![PathBuf::from("/tmp/workspace")]
+        );
+        assert_eq!(config.workspace.position_encodings, vec!["utf-8"]);
+        assert_eq!(config.lsp_servers.len(), 1);
+        assert_eq!(config.lsp_servers[0].language_id, "rust");
+    }
+
+    #[test]
+    fn test_load_from_nonexistent_file() {
+        let result = ServerConfig::load_from(Path::new("/nonexistent/config.toml"));
+        assert!(result.is_err());
+
+        if let Err(Error::ConfigNotFound(path)) = result {
+            assert_eq!(path, PathBuf::from("/nonexistent/config.toml"));
+        } else {
+            panic!("Expected ConfigNotFound error");
+        }
+    }
+
+    #[test]
+    fn test_load_from_invalid_toml() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("invalid.toml");
+
+        fs::write(&config_path, "invalid toml content {{}").unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_empty_language_id() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = ""
+            command = "test"
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_err());
+
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("language_id cannot be empty"));
+        } else {
+            panic!("Expected InvalidConfig error");
+        }
+    }
+
+    #[test]
+    fn test_validate_empty_command() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = ""
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_err());
+
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("command cannot be empty"));
+        } else {
+            panic!("Expected InvalidConfig error");
+        }
+    }
+
+    #[test]
+    fn test_workspace_roots_empty_by_default() {
+        let workspace = WorkspaceConfig::default();
+        assert!(workspace.roots.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_config_defaults() {
+        let workspace = WorkspaceConfig::default();
+        assert!(workspace.roots.is_empty());
+        assert_eq!(workspace.position_encodings, vec!["utf-8", "utf-16"]);
+    }
+
+    #[test]
+    fn test_load_multiple_servers() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("multi.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+
+            [[lsp_servers]]
+            language_id = "python"
+            command = "pyright-langserver"
+            args = ["--stdio"]
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.lsp_servers.len(), 2);
+        assert_eq!(config.lsp_servers[0].language_id, "rust");
+        assert_eq!(config.lsp_servers[1].language_id, "python");
+        assert_eq!(config.lsp_servers[1].args, vec!["--stdio"]);
+    }
+
+    #[test]
+    fn test_deny_unknown_fields() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("unknown.toml");
+
+        let toml_content = r#"
+            unknown_field = "value"
+
+            [workspace]
+            roots = []
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_err(), "Should reject unknown fields");
+    }
+
+    #[test]
+    fn test_empty_config_file() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("empty.toml");
+
+        fs::write(&config_path, "").unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert!(config.workspace.roots.is_empty());
+        assert!(config.lsp_servers.is_empty());
+    }
+
+    #[test]
+    fn test_config_with_initialization_options() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("init_opts.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+
+            [lsp_servers.initialization_options]
+            cargo = { allFeatures = true }
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert!(config.lsp_servers[0].initialization_options.is_some());
     }
 }

@@ -431,11 +431,26 @@ mod tests {
         assert_eq!(client.language_id(), "rust");
     }
 
+    #[test]
+    fn test_client_clone() {
+        let config = LspServerConfig::rust_analyzer();
+        let client = LspClient::new(config);
+
+        #[allow(clippy::redundant_clone)]
+        let cloned = client.clone();
+        assert_eq!(cloned.language_id(), "rust");
+
+        assert!(
+            cloned.receiver_task.is_none(),
+            "Cloned client should not own receiver task"
+        );
+    }
+
     #[tokio::test]
     async fn test_null_response_handling() {
         use crate::lsp::types::{JsonRpcResponse, RequestId};
 
-        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
 
         let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
 
@@ -477,5 +492,143 @@ mod tests {
 
         let value = response.unwrap();
         assert_eq!(value, Value::Null, "Should receive Value::Null");
+    }
+
+    #[tokio::test]
+    async fn test_error_response_handling() {
+        use crate::lsp::types::{JsonRpcError, JsonRpcResponse, RequestId};
+
+        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
+        let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
+
+        pending_requests
+            .lock()
+            .await
+            .insert(RequestId::Number(1), response_tx);
+
+        let error_response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32601,
+                message: "Method not found".to_string(),
+                data: None,
+            }),
+        };
+
+        let sender = pending_requests.lock().await.remove(&error_response.id);
+        if let Some(sender) = sender {
+            if let Some(error) = error_response.error {
+                let _ = sender.send(Err(Error::LspServerError {
+                    code: error.code,
+                    message: error.message,
+                }));
+            }
+        }
+
+        let result = response_rx.await.unwrap();
+        assert!(result.is_err(), "Should receive error");
+
+        if let Err(Error::LspServerError { code, message }) = result {
+            assert_eq!(code, -32601);
+            assert_eq!(message, "Method not found");
+        } else {
+            panic!("Expected LspServerError");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_request_id() {
+        use crate::lsp::types::{JsonRpcResponse, RequestId};
+
+        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
+
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(999),
+            result: Some(Value::Null),
+            error: None,
+        };
+
+        let sender = pending_requests.lock().await.remove(&response.id);
+        assert!(sender.is_none(), "Should not find sender for unknown ID");
+    }
+
+    #[tokio::test]
+    async fn test_long_error_message_truncation() {
+        use crate::lsp::types::{JsonRpcError, JsonRpcResponse, RequestId};
+
+        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
+        let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
+
+        pending_requests
+            .lock()
+            .await
+            .insert(RequestId::Number(1), response_tx);
+
+        let long_message = "x".repeat(250);
+        let error_response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32700,
+                message: long_message.clone(),
+                data: None,
+            }),
+        };
+
+        let sender = pending_requests.lock().await.remove(&error_response.id);
+        if let Some(sender) = sender {
+            if let Some(error) = error_response.error {
+                let _ = sender.send(Err(Error::LspServerError {
+                    code: error.code,
+                    message: error.message,
+                }));
+            }
+        }
+
+        let result = response_rx.await.unwrap();
+        assert!(result.is_err());
+
+        if let Err(Error::LspServerError { code, message }) = result {
+            assert_eq!(code, -32700);
+            assert_eq!(
+                message.len(),
+                250,
+                "Full message should be preserved in Error"
+            );
+        } else {
+            panic!("Expected LspServerError");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_request_ids() {
+        let counter = Arc::new(AtomicI64::new(1));
+
+        let counter1 = Arc::clone(&counter);
+        let counter2 = Arc::clone(&counter);
+        let counter3 = Arc::clone(&counter);
+
+        let handles = vec![
+            tokio::spawn(async move { counter1.fetch_add(1, Ordering::SeqCst) }),
+            tokio::spawn(async move { counter2.fetch_add(1, Ordering::SeqCst) }),
+            tokio::spawn(async move { counter3.fetch_add(1, Ordering::SeqCst) }),
+        ];
+
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(handle.await.unwrap());
+        }
+
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3], "IDs should be unique and sequential");
+    }
+
+    #[test]
+    fn test_jsonrpc_version_constant() {
+        assert_eq!(JSONRPC_VERSION, "2.0");
     }
 }
