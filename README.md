@@ -129,21 +129,46 @@ Claude: [get_references] Found 4 matches:
 
 ## MCP Tools
 
+### Code Intelligence
+
 | Tool | What it does |
 |------|--------------|
 | `get_hover` | Type signatures, documentation, inferred types at any position |
 | `get_definition` | Jump to where a symbol is defined — across files, across crates |
 | `get_references` | Every usage of a symbol in your workspace |
-| `get_diagnostics` | Real compiler errors and warnings, not guesses |
 | `get_completions` | Context-aware suggestions that respect types and scope |
-| `rename_symbol` | Workspace-wide rename with full reference tracking |
 | `get_document_symbols` | Structured outline — functions, types, constants, imports |
-| `format_document` | Apply language-specific formatting rules |
 | `workspace_symbol_search` | Find symbols by name across the entire workspace |
+
+### Diagnostics & Analysis
+
+| Tool | What it does |
+|------|--------------|
+| `get_diagnostics` | Real compiler errors and warnings, not guesses |
+| `get_cached_diagnostics` | Fast access to push-based diagnostics from LSP server |
 | `get_code_actions` | Quick fixes, refactorings, and source actions at a position |
+
+### Refactoring
+
+| Tool | What it does |
+|------|--------------|
+| `rename_symbol` | Workspace-wide rename with full reference tracking |
+| `format_document` | Apply language-specific formatting rules |
+
+### Call Hierarchy
+
+| Tool | What it does |
+|------|--------------|
 | `prepare_call_hierarchy` | Get callable items at a position for call hierarchy |
 | `get_incoming_calls` | Find all callers of a function (who calls this?) |
 | `get_outgoing_calls` | Find all callees of a function (what does this call?) |
+
+### Server Monitoring
+
+| Tool | What it does |
+|------|--------------|
+| `get_server_logs` | Debug LSP issues with internal log messages |
+| `get_server_messages` | User-facing messages from the language server |
 
 ## Configuration
 
