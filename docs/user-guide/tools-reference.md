@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete reference for all 8 MCP tools provided by mcpls.
+Complete reference for all 16 MCP tools provided by mcpls.
 
 ## Overview
 
@@ -8,16 +8,46 @@ mcpls exposes semantic code intelligence from Language Server Protocol (LSP) ser
 
 ## Tool Index
 
+### Code Intelligence Tools
+
 | Tool | LSP Method | Description |
 |------|------------|-------------|
 | [get_hover](#get_hover) | `textDocument/hover` | Type information and documentation |
 | [get_definition](#get_definition) | `textDocument/definition` | Symbol definition location |
 | [get_references](#get_references) | `textDocument/references` | All references to a symbol |
-| [get_diagnostics](#get_diagnostics) | `textDocument/publishDiagnostics` | Compiler errors and warnings |
-| [rename_symbol](#rename_symbol) | `textDocument/rename` | Workspace-wide symbol renaming |
 | [get_completions](#get_completions) | `textDocument/completion` | Code completion suggestions |
 | [get_document_symbols](#get_document_symbols) | `textDocument/documentSymbol` | Document symbol outline |
+| [workspace_symbol_search](#workspace_symbol_search) | `workspace/symbol` | Search symbols across workspace |
+
+### Diagnostics & Formatting Tools
+
+| Tool | LSP Method | Description |
+|------|------------|-------------|
+| [get_diagnostics](#get_diagnostics) | `textDocument/publishDiagnostics` | Compiler errors and warnings |
+| [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications |
 | [format_document](#format_document) | `textDocument/formatting` | Document formatting |
+
+### Refactoring Tools
+
+| Tool | LSP Method | Description |
+|------|------------|-------------|
+| [rename_symbol](#rename_symbol) | `textDocument/rename` | Workspace-wide symbol renaming |
+| [get_code_actions](#get_code_actions) | `textDocument/codeAction` | Quick fixes and refactorings |
+
+### Call Hierarchy Tools
+
+| Tool | LSP Method | Description |
+|------|------------|-------------|
+| [prepare_call_hierarchy](#prepare_call_hierarchy) | `textDocument/prepareCallHierarchy` | Prepare call hierarchy at position |
+| [get_incoming_calls](#get_incoming_calls) | `callHierarchy/incomingCalls` | Functions that call the target |
+| [get_outgoing_calls](#get_outgoing_calls) | `callHierarchy/outgoingCalls` | Functions called by the target |
+
+### Server Monitoring Tools
+
+| Tool | Description |
+|------|-------------|
+| [get_server_logs](#get_server_logs) | Get LSP server log messages |
+| [get_server_messages](#get_server_messages) | Get LSP server show messages |
 
 ---
 
@@ -596,6 +626,270 @@ Claude: [Uses format_document] The file needs formatting changes:
 - Does not apply changes automatically - returns edit plan
 - May fail if formatter is not available
 - Respects `.editorconfig` and formatter configuration files
+
+---
+
+## workspace_symbol_search
+
+Search for symbols across the entire workspace by name or pattern.
+
+### Parameters
+
+```json
+{
+  "query": "User",
+  "kind_filter": null,
+  "limit": 100
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | Yes | Search query for symbol names |
+| `kind_filter` | string | No | Filter by kind (function, class, etc.) |
+| `limit` | integer | No | Maximum results (default: 100) |
+
+### Returns
+
+Array of matching symbols with locations.
+
+### Example Use Cases
+
+**Find type:**
+```
+User: Where is the Config struct defined?
+Claude: [Uses workspace_symbol_search] Found Config in src/config.rs:15
+```
+
+---
+
+## get_code_actions
+
+Get available code actions (quick fixes, refactorings) for a range.
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.rs",
+  "start_line": 10,
+  "start_character": 5,
+  "end_line": 10,
+  "end_character": 15,
+  "kind_filter": null
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `start_line` | integer | Yes | Start line (1-based) |
+| `start_character` | integer | Yes | Start character (1-based) |
+| `end_line` | integer | Yes | End line (1-based) |
+| `end_character` | integer | Yes | End character (1-based) |
+| `kind_filter` | string | No | Filter by action kind (quickfix, refactor, source) |
+
+### Returns
+
+Array of available code actions with edits.
+
+### Example Use Cases
+
+**Quick fix:**
+```
+User: How can I fix this error?
+Claude: [Uses get_code_actions] Available fixes:
+        - Import missing module
+        - Add derive macro
+```
+
+---
+
+## prepare_call_hierarchy
+
+Prepare call hierarchy at a position to get callable items.
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.rs",
+  "line": 10,
+  "character": 5
+}
+```
+
+### Returns
+
+Array of call hierarchy items that can be used with `get_incoming_calls` or `get_outgoing_calls`.
+
+---
+
+## get_incoming_calls
+
+Get functions that call the specified function (callers).
+
+### Parameters
+
+```json
+{
+  "item": { /* CallHierarchyItem from prepare_call_hierarchy */ }
+}
+```
+
+### Example Use Cases
+
+**Find callers:**
+```
+User: What functions call process_data?
+Claude: [Uses get_incoming_calls] Found 5 callers:
+        - main() in src/main.rs:10
+        - run_batch() in src/batch.rs:25
+```
+
+---
+
+## get_outgoing_calls
+
+Get functions called by the specified function (callees).
+
+### Parameters
+
+```json
+{
+  "item": { /* CallHierarchyItem from prepare_call_hierarchy */ }
+}
+```
+
+### Example Use Cases
+
+**Analyze dependencies:**
+```
+User: What does initialize() call?
+Claude: [Uses get_outgoing_calls] The function calls:
+        - load_config()
+        - connect_database()
+        - start_server()
+```
+
+---
+
+## get_cached_diagnostics
+
+Get diagnostics from LSP server push notifications (cached).
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.rs"
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+
+### Returns
+
+```json
+{
+  "file_path": "/path/to/file.rs",
+  "diagnostics": [
+    {
+      "message": "unused variable",
+      "severity": "warning",
+      "range": { "start": { "line": 10, "character": 5 }, "end": { "line": 10, "character": 10 } }
+    }
+  ]
+}
+```
+
+### Notes
+
+- Returns diagnostics pushed by LSP server via `textDocument/publishDiagnostics`
+- More efficient than `get_diagnostics` as it uses cached data
+- May be empty if file hasn't been analyzed yet
+
+---
+
+## get_server_logs
+
+Get recent log messages from LSP servers.
+
+### Parameters
+
+```json
+{
+  "limit": 50,
+  "min_level": "warning"
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `limit` | integer | No | Maximum entries to return (default: 50) |
+| `min_level` | string | No | Minimum level: error, warning, info, debug |
+
+### Returns
+
+```json
+{
+  "logs": [
+    {
+      "level": "warning",
+      "message": "File not found in index",
+      "timestamp": "2024-01-15T10:30:00Z"
+    }
+  ]
+}
+```
+
+### Example Use Cases
+
+**Debug LSP issues:**
+```
+User: Why isn't code completion working?
+Claude: [Uses get_server_logs] Found error in LSP logs:
+        "Failed to load project: Cargo.toml not found"
+```
+
+---
+
+## get_server_messages
+
+Get recent show messages from LSP servers.
+
+### Parameters
+
+```json
+{
+  "limit": 20
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `limit` | integer | No | Maximum entries to return (default: 20) |
+
+### Returns
+
+```json
+{
+  "messages": [
+    {
+      "type": "info",
+      "message": "rust-analyzer is ready",
+      "timestamp": "2024-01-15T10:30:00Z"
+    }
+  ]
+}
+```
+
+### Notes
+
+- Contains user-facing messages from LSP servers
+- Useful for tracking server status and important notifications
 
 ---
 
