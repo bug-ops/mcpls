@@ -7,7 +7,6 @@ mod handlers;
 mod server;
 mod tools;
 
-pub use handlers::{ToolHandler, ToolHandlers};
 pub use server::McplsServer;
 pub use tools::{
     CallHierarchyCallsParams, CallHierarchyPrepareParams, CompletionsParams, DefinitionParams,

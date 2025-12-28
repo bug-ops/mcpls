@@ -756,6 +756,7 @@ version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "dirs",
  "futures",
  "lsp-types",

@@ -12,9 +12,10 @@ use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
 use super::tools::{
-    CallHierarchyCallsParams, CallHierarchyPrepareParams, CodeActionsParams, CompletionsParams,
-    DefinitionParams, DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams,
-    ReferencesParams, RenameParams, WorkspaceSymbolParams,
+    CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
+    CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
+    DocumentSymbolsParams, FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
+    ServerLogsParams, ServerMessagesParams, WorkspaceSymbolParams,
 };
 use crate::bridge::Translator;
 
@@ -38,13 +39,20 @@ impl McplsServer {
     }
 
     /// Get hover information at a position in a file.
-    #[tool(description = "Get hover information (type, documentation) at a position in a file")]
-    async fn get_hover(&self, params: Parameters<HoverParams>) -> Result<String, McpError> {
+    #[tool(
+        description = "Get hover information (type, documentation) at a position in a file. Returns type signatures, documentation comments, and inferred types for the symbol under cursor. Use this to understand what a variable, function, or type represents without navigating to its definition."
+    )]
+    async fn get_hover(
+        &self,
+        Parameters(HoverParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<HoverParams>,
+    ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_hover(params.0.file_path, params.0.line, params.0.character)
-                .await
+            translator.handle_hover(file_path, line, character).await
         };
 
         match result {
@@ -55,15 +63,21 @@ impl McplsServer {
     }
 
     /// Get the definition location of a symbol.
-    #[tool(description = "Get the definition location of a symbol at the specified position")]
+    #[tool(
+        description = "Get the definition location of a symbol at the specified position. Returns file path, line, and character where the symbol (function, variable, type, etc.) is defined. Use this to navigate from a symbol usage to its original declaration or implementation."
+    )]
     async fn get_definition(
         &self,
-        params: Parameters<DefinitionParams>,
+        Parameters(DefinitionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<DefinitionParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_definition(params.0.file_path, params.0.line, params.0.character)
+                .handle_definition(file_path, line, character)
                 .await
         };
 
@@ -75,20 +89,22 @@ impl McplsServer {
     }
 
     /// Find all references to a symbol.
-    #[tool(description = "Find all references to a symbol at the specified position")]
+    #[tool(
+        description = "Find all references to a symbol at the specified position. Returns a list of all locations (file, line, character) where the symbol is used across the workspace. Use this to understand how widely a function/variable/type is used before refactoring, or to find all call sites of a function."
+    )]
     async fn get_references(
         &self,
-        params: Parameters<ReferencesParams>,
+        Parameters(ReferencesParams {
+            file_path,
+            line,
+            character,
+            include_declaration,
+        }): Parameters<ReferencesParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_references(
-                    params.0.file_path,
-                    params.0.line,
-                    params.0.character,
-                    params.0.include_declaration,
-                )
+                .handle_references(file_path, line, character, include_declaration)
                 .await
         };
 
@@ -100,14 +116,16 @@ impl McplsServer {
     }
 
     /// Get diagnostics for a file.
-    #[tool(description = "Get diagnostics (errors, warnings) for a file")]
+    #[tool(
+        description = "Get diagnostics (errors, warnings) for a file. Triggers language server analysis and returns compilation errors, warnings, hints, and other issues with severity, message, and location. Use this to check code for problems before running or after making changes."
+    )]
     async fn get_diagnostics(
         &self,
-        params: Parameters<DiagnosticsParams>,
+        Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_diagnostics(params.0.file_path).await
+            translator.handle_diagnostics(file_path).await
         };
 
         match result {
@@ -118,17 +136,22 @@ impl McplsServer {
     }
 
     /// Rename a symbol across the workspace.
-    #[tool(description = "Rename a symbol across the workspace")]
-    async fn rename_symbol(&self, params: Parameters<RenameParams>) -> Result<String, McpError> {
+    #[tool(
+        description = "Rename a symbol across the workspace. Returns a list of text edits to apply across all files where the symbol is used. This is a safe refactoring operation that updates the symbol name consistently in declarations, usages, imports, and documentation. Use this instead of find-and-replace for reliable renaming."
+    )]
+    async fn rename_symbol(
+        &self,
+        Parameters(RenameParams {
+            file_path,
+            line,
+            character,
+            new_name,
+        }): Parameters<RenameParams>,
+    ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_rename(
-                    params.0.file_path,
-                    params.0.line,
-                    params.0.character,
-                    params.0.new_name,
-                )
+                .handle_rename(file_path, line, character, new_name)
                 .await
         };
 
@@ -140,20 +163,22 @@ impl McplsServer {
     }
 
     /// Get code completion suggestions.
-    #[tool(description = "Get code completion suggestions at a position in a file")]
+    #[tool(
+        description = "Get code completion suggestions at a position in a file. Returns available completions including methods, functions, variables, types, keywords, and snippets with their documentation and type information. Use after typing a dot, colon, or partial identifier to see what can be inserted."
+    )]
     async fn get_completions(
         &self,
-        params: Parameters<CompletionsParams>,
+        Parameters(CompletionsParams {
+            file_path,
+            line,
+            character,
+            trigger,
+        }): Parameters<CompletionsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_completions(
-                    params.0.file_path,
-                    params.0.line,
-                    params.0.character,
-                    params.0.trigger,
-                )
+                .handle_completions(file_path, line, character, trigger)
                 .await
         };
 
@@ -165,14 +190,16 @@ impl McplsServer {
     }
 
     /// Get all symbols in a document.
-    #[tool(description = "Get all symbols (functions, classes, variables) in a document")]
+    #[tool(
+        description = "Get all symbols (functions, classes, variables) in a document. Returns a hierarchical outline of the file including functions, methods, classes, structs, enums, constants, and their locations. Use this to understand file structure, navigate to specific symbols, or get an overview of what a file contains."
+    )]
     async fn get_document_symbols(
         &self,
-        params: Parameters<DocumentSymbolsParams>,
+        Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_document_symbols(params.0.file_path).await
+            translator.handle_document_symbols(file_path).await
         };
 
         match result {
@@ -183,19 +210,21 @@ impl McplsServer {
     }
 
     /// Format a document according to language server rules.
-    #[tool(description = "Format a document according to the language server's formatting rules")]
+    #[tool(
+        description = "Format a document according to the language server's formatting rules. Returns a list of text edits to apply for proper indentation, spacing, and style. The formatting follows language-specific conventions (rustfmt for Rust, prettier for JS/TS, etc.). Use this to automatically fix code style issues."
+    )]
     async fn format_document(
         &self,
-        params: Parameters<FormatDocumentParams>,
+        Parameters(FormatDocumentParams {
+            file_path,
+            tab_size,
+            insert_spaces,
+        }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_format_document(
-                    params.0.file_path,
-                    params.0.tab_size,
-                    params.0.insert_spaces,
-                )
+                .handle_format_document(file_path, tab_size, insert_spaces)
                 .await
         };
 
@@ -207,15 +236,21 @@ impl McplsServer {
     }
 
     /// Search for symbols across the workspace.
-    #[tool(description = "Search for symbols across the entire workspace by name or pattern")]
+    #[tool(
+        description = "Search for symbols across the entire workspace by name or pattern. Supports partial matching and fuzzy search to find functions, types, constants, etc. by name without knowing their exact location. Use this when you know the name of something but not which file it's in, or to discover related symbols."
+    )]
     async fn workspace_symbol_search(
         &self,
-        params: Parameters<WorkspaceSymbolParams>,
+        Parameters(WorkspaceSymbolParams {
+            query,
+            kind_filter,
+            limit,
+        }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_workspace_symbol(params.0.query, params.0.kind_filter, params.0.limit)
+                .handle_workspace_symbol(query, kind_filter, limit)
                 .await
         };
 
@@ -228,22 +263,29 @@ impl McplsServer {
 
     /// Get code actions for a range.
     #[tool(
-        description = "Get available code actions (quick fixes, refactorings) for a range in a file"
+        description = "Get available code actions (quick fixes, refactorings) for a range in a file. Returns suggested fixes for diagnostics, refactoring options (extract function, inline variable), and source actions (organize imports, generate code). Each action includes edits to apply. Use this to get IDE-style automated fixes and refactorings."
     )]
     async fn get_code_actions(
         &self,
-        params: Parameters<CodeActionsParams>,
+        Parameters(CodeActionsParams {
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter,
+        }): Parameters<CodeActionsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
                 .handle_code_actions(
-                    params.0.file_path,
-                    params.0.start_line,
-                    params.0.start_character,
-                    params.0.end_line,
-                    params.0.end_character,
-                    params.0.kind_filter,
+                    file_path,
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                    kind_filter,
                 )
                 .await
         };
@@ -256,19 +298,21 @@ impl McplsServer {
     }
 
     /// Prepare call hierarchy at a position.
-    #[tool(description = "Prepare call hierarchy at a position, returns callable items")]
+    #[tool(
+        description = "Prepare call hierarchy at a position, returns callable items. This is the first step for analyzing function call relationships. Returns a call hierarchy item that can be passed to get_incoming_calls or get_outgoing_calls. Use this on a function to start exploring its callers or callees."
+    )]
     async fn prepare_call_hierarchy(
         &self,
-        params: Parameters<CallHierarchyPrepareParams>,
+        Parameters(CallHierarchyPrepareParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<CallHierarchyPrepareParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator
-                .handle_call_hierarchy_prepare(
-                    params.0.file_path,
-                    params.0.line,
-                    params.0.character,
-                )
+                .handle_call_hierarchy_prepare(file_path, line, character)
                 .await
         };
 
@@ -280,14 +324,16 @@ impl McplsServer {
     }
 
     /// Get incoming calls (callers).
-    #[tool(description = "Get functions that call the specified item (callers)")]
+    #[tool(
+        description = "Get functions that call the specified item (callers). Takes a call hierarchy item from prepare_call_hierarchy and returns all functions/methods that call it. Use this to trace backwards through the call graph and understand how a function is invoked and from where."
+    )]
     async fn get_incoming_calls(
         &self,
-        params: Parameters<CallHierarchyCallsParams>,
+        Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_incoming_calls(params.0.item).await
+            translator.handle_incoming_calls(item).await
         };
 
         match result {
@@ -298,14 +344,76 @@ impl McplsServer {
     }
 
     /// Get outgoing calls (callees).
-    #[tool(description = "Get functions called by the specified item (callees)")]
+    #[tool(
+        description = "Get functions called by the specified item (callees). Takes a call hierarchy item from prepare_call_hierarchy and returns all functions/methods it calls. Use this to trace forward through the call graph and understand what dependencies a function has."
+    )]
     async fn get_outgoing_calls(
         &self,
-        params: Parameters<CallHierarchyCallsParams>,
+        Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_outgoing_calls(params.0.item).await
+            translator.handle_outgoing_calls(item).await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get cached diagnostics for a file.
+    #[tool(
+        description = "Get cached diagnostics for a file from LSP server notifications. Returns diagnostics that were pushed by the language server (rather than requested on-demand). This is faster than get_diagnostics as it uses cached data. Use this to quickly check recent errors/warnings without triggering new analysis."
+    )]
+    async fn get_cached_diagnostics(
+        &self,
+        Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_cached_diagnostics(&file_path)
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get recent LSP server log messages.
+    #[tool(
+        description = "Get recent LSP server log messages with optional level filtering. Returns internal log messages from the language server for debugging LSP issues. Filter by level (error, warning, info, debug) to focus on relevant messages. Use this to diagnose why the language server might not be working correctly."
+    )]
+    async fn get_server_logs(
+        &self,
+        Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_server_logs(limit, min_level)
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get recent LSP server messages.
+    #[tool(
+        description = "Get recent LSP server messages (showMessage notifications). Returns user-facing messages from the language server like prompts, warnings, and status updates that would normally appear in IDE popups. Use this to see important messages the language server wanted to communicate."
+    )]
+    async fn get_server_messages(
+        &self,
+        Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator.handle_server_messages(limit)
         };
 
         match result {
@@ -343,6 +451,7 @@ impl ServerHandler for McplsServer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -545,5 +654,188 @@ mod tests {
         let params = Parameters(CallHierarchyCallsParams { item });
         let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_with_params() {
+        use std::fs;
+
+        use tempfile::TempDir;
+
+        let server = create_test_server();
+
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: test_file.to_str().unwrap().to_string(),
+        });
+
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.get("diagnostics").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_nonexistent_file() {
+        let server = create_test_server();
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: "/nonexistent/file.rs".to_string(),
+        });
+
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_default_params() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 50,
+            min_level: None,
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.get("logs").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_error_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 10,
+            min_level: Some("error".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let logs = parsed.get("logs").unwrap().as_array().unwrap();
+        assert_eq!(logs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_warning_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 100,
+            min_level: Some("warning".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_info_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 50,
+            min_level: Some("info".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_debug_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 20,
+            min_level: Some("debug".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_invalid_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 10,
+            min_level: Some("invalid_level".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_zero_limit() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 0,
+            min_level: None,
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let logs = parsed.get("logs").unwrap().as_array().unwrap();
+        assert_eq!(logs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_messages_tool_with_default_params() {
+        let server = create_test_server();
+        let params = Parameters(ServerMessagesParams { limit: 20 });
+
+        let result = server.get_server_messages(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.get("messages").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_server_messages_tool_with_custom_limit() {
+        let server = create_test_server();
+        let params = Parameters(ServerMessagesParams { limit: 5 });
+
+        let result = server.get_server_messages(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let messages = parsed.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_messages_tool_with_zero_limit() {
+        let server = create_test_server();
+        let params = Parameters(ServerMessagesParams { limit: 0 });
+
+        let result = server.get_server_messages(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let messages = parsed.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_messages_tool_with_large_limit() {
+        let server = create_test_server();
+        let params = Parameters(ServerMessagesParams { limit: 1000 });
+
+        let result = server.get_server_messages(params).await;
+        assert!(result.is_ok());
     }
 }

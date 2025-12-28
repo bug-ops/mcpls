@@ -15,9 +15,10 @@ use lsp_types::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
+use url::Url;
 
-use super::DocumentTracker;
 use super::state::detect_language;
+use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer};
@@ -31,6 +32,8 @@ pub struct Translator {
     lsp_servers: HashMap<String, LspServer>,
     /// Document state tracker.
     document_tracker: DocumentTracker,
+    /// Notification cache for LSP server notifications.
+    notification_cache: NotificationCache,
     /// Allowed workspace roots for path validation.
     workspace_roots: Vec<PathBuf>,
 }
@@ -43,6 +46,7 @@ impl Translator {
             lsp_clients: HashMap::new(),
             lsp_servers: HashMap::new(),
             document_tracker: DocumentTracker::new(),
+            notification_cache: NotificationCache::new(),
             workspace_roots: vec![],
         }
     }
@@ -71,6 +75,17 @@ impl Translator {
     /// Get a mutable reference to the document tracker.
     pub const fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
         &mut self.document_tracker
+    }
+
+    /// Get the notification cache.
+    #[must_use]
+    pub const fn notification_cache(&self) -> &NotificationCache {
+        &self.notification_cache
+    }
+
+    /// Get a mutable reference to the notification cache.
+    pub const fn notification_cache_mut(&mut self) -> &mut NotificationCache {
+        &mut self.notification_cache
     }
 
     // TODO: These methods will be implemented in Phase 3-5
@@ -371,6 +386,20 @@ pub struct OutgoingCall {
 pub struct OutgoingCallsResult {
     /// List of outgoing calls.
     pub calls: Vec<OutgoingCall>,
+}
+
+/// Result of server logs request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerLogsResult {
+    /// List of log entries.
+    pub logs: Vec<crate::bridge::notifications::LogEntry>,
+}
+
+/// Result of server messages request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMessagesResult {
+    /// List of server messages.
+    pub messages: Vec<crate::bridge::notifications::ServerMessage>,
 }
 
 /// Maximum allowed position value for validation.
@@ -1291,6 +1320,115 @@ impl Translator {
 
         Ok(OutgoingCallsResult { calls })
     }
+
+    /// Handle cached diagnostics request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid or outside workspace boundaries.
+    pub fn handle_cached_diagnostics(&mut self, file_path: &str) -> Result<DiagnosticsResult> {
+        let path = PathBuf::from(file_path);
+        let validated_path = self.validate_path(&path)?;
+
+        // Convert path to URI format for cache lookup (cross-platform)
+        let uri = Url::from_file_path(&validated_path)
+            .map_err(|()| Error::InvalidUri(validated_path.display().to_string()))?
+            .to_string();
+
+        let diagnostics =
+            self.notification_cache
+                .get_diagnostics(&uri)
+                .map_or_else(Vec::new, |diag_info| {
+                    diag_info
+                        .diagnostics
+                        .iter()
+                        .map(|diag| Diagnostic {
+                            range: normalize_range(diag.range),
+                            severity: match diag.severity {
+                                Some(lsp_types::DiagnosticSeverity::ERROR) => {
+                                    DiagnosticSeverity::Error
+                                }
+                                Some(lsp_types::DiagnosticSeverity::WARNING) => {
+                                    DiagnosticSeverity::Warning
+                                }
+                                Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                                    DiagnosticSeverity::Information
+                                }
+                                Some(lsp_types::DiagnosticSeverity::HINT) => {
+                                    DiagnosticSeverity::Hint
+                                }
+                                _ => DiagnosticSeverity::Information,
+                            },
+                            message: diag.message.clone(),
+                            code: diag.code.as_ref().map(|c| match c {
+                                lsp_types::NumberOrString::Number(n) => n.to_string(),
+                                lsp_types::NumberOrString::String(s) => s.clone(),
+                            }),
+                        })
+                        .collect()
+                });
+
+        Ok(DiagnosticsResult { diagnostics })
+    }
+
+    /// Handle server logs request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `min_level` parameter is invalid.
+    pub fn handle_server_logs(
+        &mut self,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult> {
+        use crate::bridge::notifications::LogLevel;
+
+        let min_level_filter = if let Some(level_str) = min_level {
+            let level = match level_str.to_lowercase().as_str() {
+                "error" => LogLevel::Error,
+                "warning" => LogLevel::Warning,
+                "info" => LogLevel::Info,
+                "debug" => LogLevel::Debug,
+                _ => {
+                    return Err(Error::InvalidToolParams(format!(
+                        "Invalid min_level: '{level_str}'. Valid values: error, warning, info, debug"
+                    )));
+                }
+            };
+            Some(level)
+        } else {
+            None
+        };
+
+        let all_logs = self.notification_cache.get_logs();
+
+        let logs: Vec<_> = all_logs
+            .iter()
+            .filter(|log| {
+                min_level_filter.is_none_or(|min| match min {
+                    LogLevel::Error => matches!(log.level, LogLevel::Error),
+                    LogLevel::Warning => matches!(log.level, LogLevel::Error | LogLevel::Warning),
+                    LogLevel::Info => !matches!(log.level, LogLevel::Debug),
+                    LogLevel::Debug => true,
+                })
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+
+        Ok(ServerLogsResult { logs })
+    }
+
+    /// Handle server messages request.
+    ///
+    /// # Errors
+    ///
+    /// This method does not return errors.
+    pub fn handle_server_messages(&mut self, limit: usize) -> Result<ServerMessagesResult> {
+        let all_messages = self.notification_cache.get_messages();
+        let messages: Vec<_> = all_messages.iter().take(limit).cloned().collect();
+        Ok(ServerMessagesResult { messages })
+    }
 }
 
 /// Extract hover contents as markdown string.
@@ -1990,5 +2128,550 @@ mod tests {
         let uri: lsp_types::Uri = file_url.as_str().parse().unwrap();
         let result = translator.parse_file_uri(&uri);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_cached_diagnostics_empty() {
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator.handle_cached_diagnostics(test_file.to_str().unwrap());
+        assert!(result.is_ok());
+        let diags = result.unwrap();
+        assert_eq!(diags.diagnostics.len(), 0);
+    }
+
+    #[test]
+    fn test_handle_server_logs_with_filter() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        // Add some logs
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "error msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Warning, "warning msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Info, "info msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Debug, "debug msg".to_string());
+
+        // Test with error filter
+        let result = translator.handle_server_logs(10, Some("error".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 1);
+        assert_eq!(logs.logs[0].message, "error msg");
+
+        // Test with warning filter (includes error and warning)
+        let result = translator.handle_server_logs(10, Some("warning".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 2);
+
+        // Test with info filter (excludes debug)
+        let result = translator.handle_server_logs(10, Some("info".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 3);
+
+        // Test with debug filter (includes all)
+        let result = translator.handle_server_logs(10, Some("debug".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 4);
+
+        // Test with invalid filter
+        let result = translator.handle_server_logs(10, Some("invalid".to_string()));
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[test]
+    fn test_handle_server_messages_limit() {
+        use crate::bridge::notifications::MessageType;
+
+        let mut translator = Translator::new();
+
+        // Add some messages
+        for i in 0..10 {
+            translator
+                .notification_cache_mut()
+                .store_message(MessageType::Info, format!("message {i}"));
+        }
+
+        // Test limit
+        let result = translator.handle_server_messages(5);
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert_eq!(messages.messages.len(), 5);
+        assert_eq!(messages.messages[0].message, "message 0");
+        assert_eq!(messages.messages[4].message, "message 4");
+
+        // Test limit larger than available
+        let result = translator.handle_server_messages(100);
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert_eq!(messages.messages.len(), 10);
+    }
+
+    #[test]
+    fn test_handle_cached_diagnostics_with_data() {
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let canonical_path = test_file.canonicalize().unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: "test error".to_string(),
+            code: Some(lsp_types::NumberOrString::String("E001".to_string())),
+            source: None,
+            code_description: None,
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+
+        translator
+            .notification_cache_mut()
+            .store_diagnostics(&uri, Some(1), vec![diagnostic]);
+
+        let result = translator.handle_cached_diagnostics(test_file.to_str().unwrap());
+        assert!(result.is_ok());
+        let diags = result.unwrap();
+        assert_eq!(diags.diagnostics.len(), 1);
+        assert_eq!(diags.diagnostics[0].message, "test error");
+        assert_eq!(diags.diagnostics[0].code, Some("E001".to_string()));
+        assert!(matches!(
+            diags.diagnostics[0].severity,
+            DiagnosticSeverity::Error
+        ));
+        assert_eq!(diags.diagnostics[0].range.start.line, 1);
+        assert_eq!(diags.diagnostics[0].range.start.character, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_handle_cached_diagnostics_multiple_severities() {
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let canonical_path = test_file.canonicalize().unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        let diagnostics = vec![
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "error".to_string(),
+                code: None,
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 1,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                message: "warning".to_string(),
+                code: None,
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 2,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::INFORMATION),
+                message: "info".to_string(),
+                code: None,
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 3,
+                        character: 5,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::HINT),
+                message: "hint".to_string(),
+                code: None,
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+        ];
+
+        translator
+            .notification_cache_mut()
+            .store_diagnostics(&uri, Some(1), diagnostics);
+
+        let result = translator.handle_cached_diagnostics(test_file.to_str().unwrap());
+        assert!(result.is_ok());
+        let diags = result.unwrap();
+        assert_eq!(diags.diagnostics.len(), 4);
+        assert!(matches!(
+            diags.diagnostics[0].severity,
+            DiagnosticSeverity::Error
+        ));
+        assert!(matches!(
+            diags.diagnostics[1].severity,
+            DiagnosticSeverity::Warning
+        ));
+        assert!(matches!(
+            diags.diagnostics[2].severity,
+            DiagnosticSeverity::Information
+        ));
+        assert!(matches!(
+            diags.diagnostics[3].severity,
+            DiagnosticSeverity::Hint
+        ));
+    }
+
+    #[test]
+    fn test_handle_cached_diagnostics_with_numeric_code() {
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let canonical_path = test_file.canonicalize().unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: "test error".to_string(),
+            code: Some(lsp_types::NumberOrString::Number(42)),
+            source: None,
+            code_description: None,
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+
+        translator
+            .notification_cache_mut()
+            .store_diagnostics(&uri, Some(1), vec![diagnostic]);
+
+        let result = translator.handle_cached_diagnostics(test_file.to_str().unwrap());
+        assert!(result.is_ok());
+        let diags = result.unwrap();
+        assert_eq!(diags.diagnostics.len(), 1);
+        assert_eq!(diags.diagnostics[0].code, Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_handle_cached_diagnostics_invalid_path() {
+        let mut translator = Translator::new();
+        let result = translator.handle_cached_diagnostics("/nonexistent/path/file.rs");
+        assert!(matches!(result, Err(Error::FileIo { .. })));
+    }
+
+    #[test]
+    fn test_handle_server_logs_no_filter() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "error msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Warning, "warning msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Info, "info msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Debug, "debug msg".to_string());
+
+        let result = translator.handle_server_logs(10, None);
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 4);
+    }
+
+    #[test]
+    fn test_handle_server_logs_error_filter_strict() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "error msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Warning, "warning msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Info, "info msg".to_string());
+
+        let result = translator.handle_server_logs(10, Some("error".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 1);
+        assert_eq!(logs.logs[0].message, "error msg");
+    }
+
+    #[test]
+    fn test_handle_server_logs_warning_filter_includes_errors() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "error msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Warning, "warning msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Info, "info msg".to_string());
+
+        let result = translator.handle_server_logs(10, Some("warning".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 2);
+    }
+
+    #[test]
+    fn test_handle_server_logs_info_filter_excludes_debug() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "error msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Info, "info msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Debug, "debug msg".to_string());
+
+        let result = translator.handle_server_logs(10, Some("info".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 2);
+    }
+
+    #[test]
+    fn test_handle_server_logs_debug_filter_includes_all() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "error msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Warning, "warning msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Info, "info msg".to_string());
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Debug, "debug msg".to_string());
+
+        let result = translator.handle_server_logs(10, Some("debug".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 4);
+    }
+
+    #[test]
+    fn test_handle_server_logs_limit_applies_after_filter() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        for i in 0..10 {
+            translator
+                .notification_cache_mut()
+                .store_log(LogLevel::Error, format!("error {i}"));
+        }
+
+        let result = translator.handle_server_logs(5, Some("error".to_string()));
+        assert!(result.is_ok());
+        let logs = result.unwrap();
+        assert_eq!(logs.logs.len(), 5);
+        assert_eq!(logs.logs[0].message, "error 0");
+        assert_eq!(logs.logs[4].message, "error 4");
+    }
+
+    #[test]
+    fn test_handle_server_logs_case_insensitive_level() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut translator = Translator::new();
+
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "error msg".to_string());
+
+        let result = translator.handle_server_logs(10, Some("ERROR".to_string()));
+        assert!(result.is_ok());
+
+        let result = translator.handle_server_logs(10, Some("Error".to_string()));
+        assert!(result.is_ok());
+
+        let result = translator.handle_server_logs(10, Some("eRrOr".to_string()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_server_messages_empty() {
+        let mut translator = Translator::new();
+
+        let result = translator.handle_server_messages(10);
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert_eq!(messages.messages.len(), 0);
+    }
+
+    #[test]
+    fn test_handle_server_messages_with_different_types() {
+        use crate::bridge::notifications::MessageType;
+
+        let mut translator = Translator::new();
+
+        translator
+            .notification_cache_mut()
+            .store_message(MessageType::Error, "error".to_string());
+        translator
+            .notification_cache_mut()
+            .store_message(MessageType::Warning, "warning".to_string());
+        translator
+            .notification_cache_mut()
+            .store_message(MessageType::Info, "info".to_string());
+        translator
+            .notification_cache_mut()
+            .store_message(MessageType::Log, "log".to_string());
+
+        let result = translator.handle_server_messages(10);
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert_eq!(messages.messages.len(), 4);
+        assert_eq!(messages.messages[0].message, "error");
+        assert_eq!(messages.messages[1].message, "warning");
+        assert_eq!(messages.messages[2].message, "info");
+        assert_eq!(messages.messages[3].message, "log");
+    }
+
+    #[test]
+    fn test_handle_server_messages_zero_limit() {
+        use crate::bridge::notifications::MessageType;
+
+        let mut translator = Translator::new();
+
+        translator
+            .notification_cache_mut()
+            .store_message(MessageType::Info, "test".to_string());
+
+        let result = translator.handle_server_messages(0);
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert_eq!(messages.messages.len(), 0);
+    }
+
+    #[test]
+    fn test_handle_cached_diagnostics_path_outside_workspace() {
+        let mut translator = Translator::new();
+        let temp_dir1 = TempDir::new().unwrap();
+        let temp_dir2 = TempDir::new().unwrap();
+
+        translator.set_workspace_roots(vec![temp_dir1.path().to_path_buf()]);
+
+        let test_file = temp_dir2.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let result = translator.handle_cached_diagnostics(test_file.to_str().unwrap());
+        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
     }
 }
