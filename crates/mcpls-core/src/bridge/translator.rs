@@ -2226,7 +2226,9 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = format!("file://{}", canonical_path.display())
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
             .parse()
             .unwrap();
         let diagnostic = lsp_types::Diagnostic {
@@ -2277,7 +2279,9 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = format!("file://{}", canonical_path.display())
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
             .parse()
             .unwrap();
         let diagnostics = vec![
@@ -2397,7 +2401,9 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = format!("file://{}", canonical_path.display())
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
             .parse()
             .unwrap();
         let diagnostic = lsp_types::Diagnostic {
