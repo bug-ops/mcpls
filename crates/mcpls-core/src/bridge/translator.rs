@@ -15,6 +15,7 @@ use lsp_types::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
+use url::Url;
 
 use super::state::detect_language;
 use super::{DocumentTracker, NotificationCache};
@@ -1329,8 +1330,10 @@ impl Translator {
         let path = PathBuf::from(file_path);
         let validated_path = self.validate_path(&path)?;
 
-        // Convert path to URI format for cache lookup
-        let uri = format!("file://{}", validated_path.display());
+        // Convert path to URI format for cache lookup (cross-platform)
+        let uri = Url::from_file_path(&validated_path)
+            .map_err(|()| Error::InvalidUri(validated_path.display().to_string()))?
+            .to_string();
 
         let diagnostics =
             self.notification_cache
