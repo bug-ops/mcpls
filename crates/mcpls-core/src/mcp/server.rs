@@ -421,6 +421,7 @@ impl ServerHandler for McplsServer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -623,5 +624,188 @@ mod tests {
         let params = Parameters(CallHierarchyCallsParams { item });
         let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_with_params() {
+        use std::fs;
+
+        use tempfile::TempDir;
+
+        let server = create_test_server();
+
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: test_file.to_str().unwrap().to_string(),
+        });
+
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.get("diagnostics").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_nonexistent_file() {
+        let server = create_test_server();
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: "/nonexistent/file.rs".to_string(),
+        });
+
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_default_params() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 50,
+            min_level: None,
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.get("logs").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_error_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 10,
+            min_level: Some("error".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let logs = parsed.get("logs").unwrap().as_array().unwrap();
+        assert_eq!(logs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_warning_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 100,
+            min_level: Some("warning".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_info_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 50,
+            min_level: Some("info".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_debug_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 20,
+            min_level: Some("debug".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_invalid_level() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 10,
+            min_level: Some("invalid_level".to_string()),
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_server_logs_tool_with_zero_limit() {
+        let server = create_test_server();
+        let params = Parameters(ServerLogsParams {
+            limit: 0,
+            min_level: None,
+        });
+
+        let result = server.get_server_logs(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let logs = parsed.get("logs").unwrap().as_array().unwrap();
+        assert_eq!(logs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_messages_tool_with_default_params() {
+        let server = create_test_server();
+        let params = Parameters(ServerMessagesParams { limit: 20 });
+
+        let result = server.get_server_messages(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.get("messages").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_server_messages_tool_with_custom_limit() {
+        let server = create_test_server();
+        let params = Parameters(ServerMessagesParams { limit: 5 });
+
+        let result = server.get_server_messages(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let messages = parsed.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_messages_tool_with_zero_limit() {
+        let server = create_test_server();
+        let params = Parameters(ServerMessagesParams { limit: 0 });
+
+        let result = server.get_server_messages(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let messages = parsed.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_messages_tool_with_large_limit() {
+        let server = create_test_server();
+        let params = Parameters(ServerMessagesParams { limit: 1000 });
+
+        let result = server.get_server_messages(params).await;
+        assert!(result.is_ok());
     }
 }
