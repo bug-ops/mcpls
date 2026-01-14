@@ -17,7 +17,7 @@ categories = ["development-tools", "command-line-utilities"]
 [workspace.dependencies]
 # Sorted alphabetically
 anyhow = "1.0"
-assert_cmd = "2.0"
+assert_cmd = "2.1"
 async-trait = "0.1"
 chrono = "0.4.42"
 clap = "4.5"
