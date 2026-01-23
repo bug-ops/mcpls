@@ -1451,6 +1451,43 @@ impl Translator {
         let messages: Vec<_> = all_messages.iter().take(limit).cloned().collect();
         Ok(ServerMessagesResult { messages })
     }
+
+    /// Handle server status request.
+    ///
+    /// Returns the status of all registered LSP servers, including their language ID,
+    /// current state, command, and number of tracked documents.
+    ///
+    /// # Errors
+    ///
+    /// This method does not return errors.
+    pub async fn handle_server_status(&self) -> Result<ServerStatusResult> {
+        let mut servers = Vec::new();
+
+        for (language_id, client) in &self.lsp_clients {
+            let state = client.state().await;
+            let config = client.config();
+
+            let document_count = self
+                .document_tracker
+                .documents()
+                .keys()
+                .filter(|path| detect_language(path) == *language_id)
+                .count();
+
+            servers.push(LspServerStatus {
+                language_id: language_id.clone(),
+                status: state.to_string(),
+                command: config.command.clone(),
+                document_count,
+            });
+        }
+
+        let total_servers = servers.len();
+        Ok(ServerStatusResult {
+            servers,
+            total_servers,
+        })
+    }
 }
 
 /// Extract hover contents as markdown string.
@@ -2825,5 +2862,198 @@ mod tests {
             let deserialized: LspServerStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized.status, status_value);
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_status_empty_workspace() {
+        let mut translator = Translator::new();
+
+        let result = translator.handle_server_status().await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        assert!(status.servers.is_empty());
+        assert_eq!(status.total_servers, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_status_returns_server_status_result() {
+        let translator = Translator::new();
+
+        let result = translator.handle_server_status().await;
+        assert!(result.is_ok());
+
+        let status_result = result.unwrap();
+        assert_eq!(status_result.servers.len(), status_result.total_servers);
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_status_with_registered_client() {
+        use crate::config::LspServerConfig;
+
+        let mut translator = Translator::new();
+
+        let config = LspServerConfig::rust_analyzer();
+        let client = LspClient::new(config);
+        translator.register_client("rust".to_string(), client);
+
+        let result = translator.handle_server_status().await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        assert_eq!(status.total_servers, 1);
+        assert_eq!(status.servers.len(), 1);
+
+        let server_status = &status.servers[0];
+        assert_eq!(server_status.language_id, "rust");
+        assert_eq!(server_status.command, "rust-analyzer");
+        assert_eq!(server_status.status, "uninitialized");
+        assert_eq!(server_status.document_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_status_multiple_servers() {
+        use crate::config::LspServerConfig;
+
+        let mut translator = Translator::new();
+
+        let rust_config = LspServerConfig::rust_analyzer();
+        let rust_client = LspClient::new(rust_config);
+        translator.register_client("rust".to_string(), rust_client);
+
+        let python_config = LspServerConfig::pyright();
+        let python_client = LspClient::new(python_config);
+        translator.register_client("python".to_string(), python_client);
+
+        let result = translator.handle_server_status().await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        assert_eq!(status.total_servers, 2);
+        assert_eq!(status.servers.len(), 2);
+
+        let language_ids: Vec<&str> = status.servers.iter().map(|s| s.language_id.as_str()).collect();
+        assert!(language_ids.contains(&"rust"));
+        assert!(language_ids.contains(&"python"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_status_document_count() {
+        use crate::config::LspServerConfig;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+
+        let test_file1 = temp_dir.path().join("test1.rs");
+        let test_file2 = temp_dir.path().join("test2.rs");
+        fs::write(&test_file1, "fn main() {}").unwrap();
+        fs::write(&test_file2, "fn helper() {}").unwrap();
+
+        translator
+            .document_tracker_mut()
+            .open(test_file1, "fn main() {}".to_string())
+            .unwrap();
+        translator
+            .document_tracker_mut()
+            .open(test_file2, "fn helper() {}".to_string())
+            .unwrap();
+
+        let config = LspServerConfig::rust_analyzer();
+        let client = LspClient::new(config);
+        translator.register_client("rust".to_string(), client);
+
+        let result = translator.handle_server_status().await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        assert_eq!(status.servers.len(), 1);
+
+        let rust_server = &status.servers[0];
+        assert_eq!(rust_server.language_id, "rust");
+        assert_eq!(rust_server.document_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_status_document_count_per_language() {
+        use crate::config::LspServerConfig;
+
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+
+        let rust_file = temp_dir.path().join("test.rs");
+        let python_file = temp_dir.path().join("test.py");
+        fs::write(&rust_file, "fn main() {}").unwrap();
+        fs::write(&python_file, "def main(): pass").unwrap();
+
+        translator
+            .document_tracker_mut()
+            .open(rust_file, "fn main() {}".to_string())
+            .unwrap();
+        translator
+            .document_tracker_mut()
+            .open(python_file, "def main(): pass".to_string())
+            .unwrap();
+
+        let rust_config = LspServerConfig::rust_analyzer();
+        let rust_client = LspClient::new(rust_config);
+        translator.register_client("rust".to_string(), rust_client);
+
+        let python_config = LspServerConfig::pyright();
+        let python_client = LspClient::new(python_config);
+        translator.register_client("python".to_string(), python_client);
+
+        let result = translator.handle_server_status().await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        assert_eq!(status.total_servers, 2);
+
+        for server in &status.servers {
+            if server.language_id == "rust" {
+                assert_eq!(server.document_count, 1);
+            } else if server.language_id == "python" {
+                assert_eq!(server.document_count, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_status_status_lowercase() {
+        use crate::config::LspServerConfig;
+
+        let mut translator = Translator::new();
+
+        let config = LspServerConfig::rust_analyzer();
+        let client = LspClient::new(config);
+        translator.register_client("rust".to_string(), client);
+
+        let result = translator.handle_server_status().await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        let server_status = &status.servers[0];
+
+        let valid_statuses = ["ready", "initializing", "uninitialized", "shutting_down", "shutdown"];
+        assert!(
+            valid_statuses.contains(&server_status.status.as_str()),
+            "Status '{}' should be lowercase",
+            server_status.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_server_status_json_serializable() {
+        let mut translator = Translator::new();
+
+        let result = translator.handle_server_status().await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        let json_result = serde_json::to_string(&status);
+        assert!(json_result.is_ok());
+
+        let json = json_result.unwrap();
+        assert!(json.contains("\"servers\""));
+        assert!(json.contains("\"total_servers\""));
     }
 }
