@@ -97,9 +97,12 @@ Add mcpls to your MCP configuration (`~/.claude/claude_desktop_config.json`):
 
 ### 2. Configure language servers (optional)
 
-For languages beyond Rust, create `~/.config/mcpls/mcpls.toml`:
+For languages beyond Rust, create a configuration file:
 
-```toml
+**Linux/macOS:**
+```bash
+mkdir -p ~/.config/mcpls
+cat > ~/.config/mcpls/mcpls.toml << 'EOF'
 [[lsp_servers]]
 language_id = "python"
 command = "pyright-langserver"
@@ -111,7 +114,17 @@ language_id = "typescript"
 command = "typescript-language-server"
 args = ["--stdio"]
 file_patterns = ["**/*.ts", "**/*.tsx"]
+EOF
 ```
+
+**macOS (alternative XDG location):**
+```bash
+mkdir -p ~/Library/Application\ Support/mcpls
+# Copy or create mcpls.toml in ~/Library/Application Support/mcpls/
+```
+
+> [!NOTE]
+> macOS users: `dirs::config_dir()` returns `~/Library/Application Support/` by default. Use that path if `~/.config/mcpls/` doesn't work.
 
 ### 3. Experience the difference
 

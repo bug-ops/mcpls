@@ -24,6 +24,18 @@ mcpls --log-level debug         # Verbose output
 mcpls --config ./mcpls.toml     # Custom config
 ```
 
+## Configuration
+
+> [!NOTE]
+> Configuration auto-discovery order: `$MCPLS_CONFIG` → `./mcpls.toml` → platform config dir
+
+Create `mcpls.toml` in the appropriate location:
+- **Linux/macOS:** `~/.config/mcpls/mcpls.toml`
+- **macOS (alternative):** `~/Library/Application Support/mcpls/mcpls.toml`
+- **Windows:** `%APPDATA%\mcpls\mcpls.toml`
+
+See the main [README](../../README.md) for configuration examples.
+
 ## Options
 
 | Flag | Description |
@@ -32,9 +44,9 @@ mcpls --config ./mcpls.toml     # Custom config
 | `-l, --log-level <LEVEL>` | trace, debug, info, warn, error |
 | `--log-json` | JSON-formatted logs for tooling |
 
-## Integration
+## Claude Code Integration
 
-Add to Claude Code (`~/.claude/claude_desktop_config.json`):
+Add to your Claude Code configuration (`~/.claude/claude_desktop_config.json`):
 
 ```json
 {
