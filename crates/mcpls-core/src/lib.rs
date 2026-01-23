@@ -13,7 +13,7 @@
 //! - [`mcp`] - MCP tool definitions and handlers
 //! - [`bridge`] - Translation layer between MCP and LSP protocols
 //! - [`config`] - Configuration types and loading
-//! - [`error`] - Error types for the library
+//! - [`mod@error`] - Error types for the library
 //!
 //! ## Example
 //!
