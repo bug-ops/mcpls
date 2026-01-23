@@ -7,6 +7,7 @@
 //! 4. Active request handling
 //! 5. Graceful shutdown sequence
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::str::FromStr;
@@ -20,7 +21,7 @@ use tokio::time::Duration;
 use tracing::{debug, info};
 
 use crate::config::LspServerConfig;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
 
@@ -62,6 +63,103 @@ pub struct ServerInitConfig {
     pub workspace_roots: Vec<PathBuf>,
     /// Initialization options (server-specific JSON).
     pub initialization_options: Option<serde_json::Value>,
+}
+
+/// Result of attempting to spawn multiple LSP servers.
+///
+/// This type enables graceful degradation by collecting both
+/// successful initializations and failures. Use the helper methods
+/// to inspect the outcome and make decisions about how to proceed.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::lsp::ServerInitResult;
+/// use mcpls_core::error::ServerSpawnFailure;
+///
+/// let mut result = ServerInitResult::new();
+///
+/// // Check for different scenarios
+/// if result.all_failed() {
+///     eprintln!("All servers failed to initialize");
+/// } else if result.partial_success() {
+///     println!("Some servers succeeded, some failed");
+/// } else if result.has_servers() {
+///     println!("All servers initialized successfully");
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ServerInitResult {
+    /// Successfully initialized servers (`language_id` -> server).
+    pub servers: HashMap<String, LspServer>,
+    /// Failures that occurred during spawn attempts.
+    pub failures: Vec<ServerSpawnFailure>,
+}
+
+impl ServerInitResult {
+    /// Create a new empty result.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            servers: HashMap::new(),
+            failures: Vec::new(),
+        }
+    }
+
+    /// Check if any servers were successfully initialized.
+    ///
+    /// Returns `true` if at least one server is available for use.
+    #[must_use]
+    pub fn has_servers(&self) -> bool {
+        !self.servers.is_empty()
+    }
+
+    /// Check if all attempted servers failed.
+    ///
+    /// Returns `true` only if there were failures and no servers succeeded.
+    /// Returns `false` for empty results (no servers configured).
+    #[must_use]
+    pub fn all_failed(&self) -> bool {
+        self.servers.is_empty() && !self.failures.is_empty()
+    }
+
+    /// Check if some but not all servers failed.
+    ///
+    /// Returns `true` if there are both successful servers and failures.
+    #[must_use]
+    pub fn partial_success(&self) -> bool {
+        !self.servers.is_empty() && !self.failures.is_empty()
+    }
+
+    /// Get the number of successfully initialized servers.
+    #[must_use]
+    pub fn server_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    /// Get the number of failures.
+    #[must_use]
+    pub fn failure_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    /// Add a successful server.
+    ///
+    /// If a server with the same `language_id` already exists, it will be replaced.
+    pub fn add_server(&mut self, language_id: String, server: LspServer) {
+        self.servers.insert(language_id, server);
+    }
+
+    /// Add a failure.
+    pub fn add_failure(&mut self, failure: ServerSpawnFailure) {
+        self.failures.push(failure);
+    }
+}
+
+impl Default for ServerInitResult {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Managed LSP server instance with capabilities and encoding.
@@ -480,5 +578,312 @@ mod tests {
         let debug_str = format!("{server:?}");
         assert!(debug_str.contains("LspServer"));
         assert!(debug_str.contains("<process>"));
+    }
+
+    #[test]
+    fn test_server_init_result_new_empty() {
+        let result = ServerInitResult::new();
+        assert!(!result.has_servers());
+        assert!(!result.all_failed());
+        assert!(!result.partial_success());
+        assert_eq!(result.server_count(), 0);
+        assert_eq!(result.failure_count(), 0);
+    }
+
+    #[test]
+    fn test_server_init_result_default() {
+        let result = ServerInitResult::default();
+        assert!(!result.has_servers());
+        assert_eq!(result.server_count(), 0);
+        assert_eq!(result.failure_count(), 0);
+    }
+
+    #[test]
+    fn test_server_init_result_all_failures() {
+        let mut result = ServerInitResult::new();
+
+        result.add_failure(ServerSpawnFailure {
+            language_id: "rust".to_string(),
+            command: "rust-analyzer".to_string(),
+            message: "not found".to_string(),
+        });
+
+        result.add_failure(ServerSpawnFailure {
+            language_id: "python".to_string(),
+            command: "pyright".to_string(),
+            message: "permission denied".to_string(),
+        });
+
+        assert!(!result.has_servers());
+        assert!(result.all_failed());
+        assert!(!result.partial_success());
+        assert_eq!(result.server_count(), 0);
+        assert_eq!(result.failure_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_server_init_result_all_success() {
+        let mut result = ServerInitResult::new();
+
+        let mock_child1 = tokio::process::Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mock_stdin1 = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+
+        let mock_stdout1 = tokio::process::Command::new("echo")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+
+        let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
+        let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
+
+        let server1 = LspServer {
+            client: client1,
+            capabilities: lsp_types::ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            _child: mock_child1,
+        };
+
+        result.add_server("rust".to_string(), server1);
+
+        assert!(result.has_servers());
+        assert!(!result.all_failed());
+        assert!(!result.partial_success());
+        assert_eq!(result.server_count(), 1);
+        assert_eq!(result.failure_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_init_result_partial_success() {
+        let mut result = ServerInitResult::new();
+
+        let mock_child = tokio::process::Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mock_stdin = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+
+        let mock_stdout = tokio::process::Command::new("echo")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+
+        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+        let server = LspServer {
+            client,
+            capabilities: lsp_types::ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            _child: mock_child,
+        };
+
+        result.add_server("rust".to_string(), server);
+
+        result.add_failure(ServerSpawnFailure {
+            language_id: "python".to_string(),
+            command: "pyright".to_string(),
+            message: "not found".to_string(),
+        });
+
+        assert!(result.has_servers());
+        assert!(!result.all_failed());
+        assert!(result.partial_success());
+        assert_eq!(result.server_count(), 1);
+        assert_eq!(result.failure_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_server_init_result_multiple_servers() {
+        let mut result = ServerInitResult::new();
+
+        for i in 0..3 {
+            let mock_child = tokio::process::Command::new("echo")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+
+            let mock_stdin = tokio::process::Command::new("cat")
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap()
+                .stdin
+                .take()
+                .unwrap();
+
+            let mock_stdout = tokio::process::Command::new("echo")
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+                .stdout
+                .take()
+                .unwrap();
+
+            let transport = LspTransport::new(mock_stdin, mock_stdout);
+            let config = if i == 0 {
+                LspServerConfig::rust_analyzer()
+            } else if i == 1 {
+                LspServerConfig::pyright()
+            } else {
+                LspServerConfig::typescript()
+            };
+            let client = LspClient::from_transport(config.clone(), transport);
+
+            let server = LspServer {
+                client,
+                capabilities: lsp_types::ServerCapabilities::default(),
+                position_encoding: PositionEncodingKind::UTF8,
+                _child: mock_child,
+            };
+
+            result.add_server(config.language_id, server);
+        }
+
+        assert!(result.has_servers());
+        assert!(!result.all_failed());
+        assert!(!result.partial_success());
+        assert_eq!(result.server_count(), 3);
+        assert_eq!(result.failure_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_init_result_replace_server() {
+        let mut result = ServerInitResult::new();
+
+        let mock_child1 = tokio::process::Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mock_stdin1 = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+
+        let mock_stdout1 = tokio::process::Command::new("echo")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+
+        let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
+        let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
+
+        let server1 = LspServer {
+            client: client1,
+            capabilities: lsp_types::ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            _child: mock_child1,
+        };
+
+        result.add_server("rust".to_string(), server1);
+        assert_eq!(result.server_count(), 1);
+
+        let mock_child2 = tokio::process::Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mock_stdin2 = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+
+        let mock_stdout2 = tokio::process::Command::new("echo")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+
+        let transport2 = LspTransport::new(mock_stdin2, mock_stdout2);
+        let client2 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport2);
+
+        let server2 = LspServer {
+            client: client2,
+            capabilities: lsp_types::ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF16,
+            _child: mock_child2,
+        };
+
+        result.add_server("rust".to_string(), server2);
+        assert_eq!(result.server_count(), 1);
+    }
+
+    #[test]
+    fn test_server_init_result_debug() {
+        let mut result = ServerInitResult::new();
+
+        result.add_failure(ServerSpawnFailure {
+            language_id: "rust".to_string(),
+            command: "rust-analyzer".to_string(),
+            message: "not found".to_string(),
+        });
+
+        let debug_str = format!("{result:?}");
+        assert!(debug_str.contains("ServerInitResult"));
+    }
+
+    #[test]
+    fn test_server_init_result_multiple_failures() {
+        let mut result = ServerInitResult::new();
+
+        result.add_failure(ServerSpawnFailure {
+            language_id: "python".to_string(),
+            command: "pyright".to_string(),
+            message: "not found".to_string(),
+        });
+
+        result.add_failure(ServerSpawnFailure {
+            language_id: "typescript".to_string(),
+            command: "tsserver".to_string(),
+            message: "command not found".to_string(),
+        });
+
+        assert_eq!(result.failure_count(), 2);
+        assert_eq!(result.server_count(), 0);
+        assert!(result.all_failed());
+        assert!(!result.partial_success());
     }
 }
