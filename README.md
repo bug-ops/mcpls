@@ -23,11 +23,15 @@ AI coding assistants are remarkably capable, but they're working blind. They see
 - **Real diagnostics** — See actual compiler errors, not hallucinated ones
 - **Intelligent completions** — Get suggestions that respect scope and types
 - **Safe refactoring** — Rename symbols with confidence, workspace-wide
+- **Graceful degradation** — Use available language servers, even if some fail to initialize
 
 > [!TIP]
 > Zero configuration for Rust projects. Just install mcpls and a language server — ready to go.
 
 ## Prerequisites
+
+> [!TIP]
+> mcpls uses graceful degradation — if one language server fails or isn't installed, it continues with available servers. You don't need all servers installed.
 
 For Rust projects, install rust-analyzer:
 
@@ -44,7 +48,7 @@ brew install rust-analyzer
 ```
 
 > [!IMPORTANT]
-> mcpls requires a language server to be installed. Without rust-analyzer, you'll see "LSP server process terminated unexpectedly" errors.
+> At least one language server must be available. Without any configured servers or if all fail to initialize, mcpls will return a clear error message.
 
 ## Installation
 
@@ -93,9 +97,12 @@ Add mcpls to your MCP configuration (`~/.claude/claude_desktop_config.json`):
 
 ### 2. Configure language servers (optional)
 
-For languages beyond Rust, create `~/.config/mcpls/mcpls.toml`:
+For languages beyond Rust, create a configuration file:
 
-```toml
+**Linux/macOS:**
+```bash
+mkdir -p ~/.config/mcpls
+cat > ~/.config/mcpls/mcpls.toml << 'EOF'
 [[lsp_servers]]
 language_id = "python"
 command = "pyright-langserver"
@@ -107,7 +114,17 @@ language_id = "typescript"
 command = "typescript-language-server"
 args = ["--stdio"]
 file_patterns = ["**/*.ts", "**/*.tsx"]
+EOF
 ```
+
+**macOS (alternative XDG location):**
+```bash
+mkdir -p ~/Library/Application\ Support/mcpls
+# Copy or create mcpls.toml in ~/Library/Application Support/mcpls/
+```
+
+> [!NOTE]
+> macOS users: `dirs::config_dir()` returns `~/Library/Application Support/` by default. Use that path if `~/.config/mcpls/` doesn't work.
 
 ### 3. Experience the difference
 

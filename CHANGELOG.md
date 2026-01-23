@@ -7,9 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+**Graceful LSP Server Degradation** (5-phase implementation, fixes #32):
+- System now continues operating even when some LSP servers fail to initialize
+- Non-Rust developers can use mcpls without rust-analyzer installed
+- Structured error handling with new error types:
+  - `ServerSpawnFailure` struct for individual server failure details (language, command, error message)
+  - `PartialServerInit` variant for partial success scenarios
+  - `AllServersFailedToInit` variant for complete failure
+  - `NoServersAvailable` variant for when no servers can be initialized
+- `ServerInitResult` type for batch initialization result tracking:
+  - Tracks successful servers (HashMap) and failures (Vec) separately
+  - Helper methods: `has_servers()`, `all_failed()`, `partial_success()`
+  - Inspection methods: `server_count()`, `failure_count()`
+- `spawn_batch()` method for initializing multiple LSP servers:
+  - Sequential spawning with graceful degradation
+  - Never panics or returns early on individual failures
+  - Comprehensive logging (info for successes, error for failures)
+  - Returns complete failure information for user feedback
+- Refactored `serve()` function with three graceful degradation outcomes:
+  - All servers succeeded: serve normally
+  - Partial success: log warnings and continue with available servers
+  - All servers failed: return `AllServersFailedToInit` error
+  - No servers available: return `NoServersAvailable` error with clear message
+
+**Testing**:
+- 38 new tests covering all graceful degradation scenarios (337 total tests, up from 299)
+- Tests for empty configs, single failures, multiple failures, and edge cases
+- Tests for logging behavior and error message formatting
+- Integration tests for complete serve() function degradation
+
+**Examples**:
+- Python developer without Rust: Server returns clear error message instead of crashing
+- Partial setup: If only some configured servers fail, system continues with available ones
+- Custom config: Users can configure only the language servers they need
+
 ### Changed
 
 - **Shorter tool descriptions** — Condensed MCP tool descriptions for better compatibility with AI agent context windows
+- **LSP server initialization** — Switched from fail-fast to graceful degradation strategy
+- **Error handling** — More descriptive error messages showing which servers failed and why
+- **Logging** — Added warning-level logs for partial success scenarios
+- **Documentation** — Updated lib.rs crate documentation with graceful degradation overview
+
+### Fixed
+
+- **Documentation link** — Disambiguated `error` module link in crate docs (was causing `rustdoc::broken-intra-doc-links` warning)
 
 ## [0.3.0] - 2025-12-28
 
