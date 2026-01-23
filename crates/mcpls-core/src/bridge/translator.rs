@@ -402,6 +402,28 @@ pub struct ServerMessagesResult {
     pub messages: Vec<crate::bridge::notifications::ServerMessage>,
 }
 
+/// Status information for a single LSP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspServerStatus {
+    /// Language identifier for the server.
+    pub language_id: String,
+    /// Current status of the server.
+    pub status: String,
+    /// Command used to start the server.
+    pub command: String,
+    /// Number of documents tracked by this server.
+    pub document_count: usize,
+}
+
+/// Result of server status request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerStatusResult {
+    /// List of server status entries.
+    pub servers: Vec<LspServerStatus>,
+    /// Total number of servers.
+    pub total_servers: usize,
+}
+
 /// Maximum allowed position value for validation.
 const MAX_POSITION_VALUE: u32 = 1_000_000;
 /// Maximum allowed range size in lines.
@@ -2673,5 +2695,135 @@ mod tests {
 
         let result = translator.handle_cached_diagnostics(test_file.to_str().unwrap());
         assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+    }
+
+    #[test]
+    fn test_lsp_server_status_creation() {
+        let status = LspServerStatus {
+            language_id: "rust".to_string(),
+            status: "ready".to_string(),
+            command: "rust-analyzer".to_string(),
+            document_count: 5,
+        };
+
+        assert_eq!(status.language_id, "rust");
+        assert_eq!(status.status, "ready");
+        assert_eq!(status.command, "rust-analyzer");
+        assert_eq!(status.document_count, 5);
+    }
+
+    #[test]
+    fn test_lsp_server_status_json_serialization() {
+        let status = LspServerStatus {
+            language_id: "rust".to_string(),
+            status: "initializing".to_string(),
+            command: "rust-analyzer".to_string(),
+            document_count: 0,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"language_id\":\"rust\""));
+        assert!(json.contains("\"status\":\"initializing\""));
+        assert!(json.contains("\"command\":\"rust-analyzer\""));
+        assert!(json.contains("\"document_count\":0"));
+    }
+
+    #[test]
+    fn test_lsp_server_status_json_deserialization() {
+        let json = r#"{"language_id":"python","status":"ready","command":"pylsp","document_count":3}"#;
+        let status: LspServerStatus = serde_json::from_str(json).unwrap();
+
+        assert_eq!(status.language_id, "python");
+        assert_eq!(status.status, "ready");
+        assert_eq!(status.command, "pylsp");
+        assert_eq!(status.document_count, 3);
+    }
+
+    #[test]
+    fn test_server_status_result_creation() {
+        let server1 = LspServerStatus {
+            language_id: "rust".to_string(),
+            status: "ready".to_string(),
+            command: "rust-analyzer".to_string(),
+            document_count: 5,
+        };
+        let server2 = LspServerStatus {
+            language_id: "python".to_string(),
+            status: "initializing".to_string(),
+            command: "pylsp".to_string(),
+            document_count: 0,
+        };
+
+        let result = ServerStatusResult {
+            servers: vec![server1, server2],
+            total_servers: 2,
+        };
+
+        assert_eq!(result.servers.len(), 2);
+        assert_eq!(result.total_servers, 2);
+        assert_eq!(result.servers[0].language_id, "rust");
+        assert_eq!(result.servers[1].language_id, "python");
+    }
+
+    #[test]
+    fn test_server_status_result_empty() {
+        let result = ServerStatusResult {
+            servers: vec![],
+            total_servers: 0,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"servers\":[]"));
+        assert!(json.contains("\"total_servers\":0"));
+    }
+
+    #[test]
+    fn test_server_status_result_json_serialization() {
+        let server = LspServerStatus {
+            language_id: "rust".to_string(),
+            status: "ready".to_string(),
+            command: "rust-analyzer".to_string(),
+            document_count: 3,
+        };
+        let result = ServerStatusResult {
+            servers: vec![server],
+            total_servers: 1,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"servers\":["));
+        assert!(json.contains("\"total_servers\":1"));
+        assert!(json.contains("\"language_id\":\"rust\""));
+    }
+
+    #[test]
+    fn test_server_status_result_json_deserialization() {
+        let json = r#"{"servers":[{"language_id":"go","status":"uninitialized","command":"gopls","document_count":0}],"total_servers":1}"#;
+        let result: ServerStatusResult = serde_json::from_str(json).unwrap();
+
+        assert_eq!(result.total_servers, 1);
+        assert_eq!(result.servers.len(), 1);
+        assert_eq!(result.servers[0].language_id, "go");
+        assert_eq!(result.servers[0].status, "uninitialized");
+    }
+
+    #[test]
+    fn test_lsp_server_status_all_valid_statuses() {
+        let valid_statuses = ["ready", "initializing", "uninitialized", "shutting_down", "shutdown"];
+
+        for status_value in valid_statuses {
+            let status = LspServerStatus {
+                language_id: "test".to_string(),
+                status: status_value.to_string(),
+                command: "test-cmd".to_string(),
+                document_count: 0,
+            };
+
+            let json = serde_json::to_string(&status).unwrap();
+            assert!(json.contains(&format!("\"status\":\"{}\"", status_value)));
+
+            let deserialized: LspServerStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized.status, status_value);
+        }
     }
 }
