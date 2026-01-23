@@ -178,6 +178,10 @@ pub enum Error {
         /// Details of each failure.
         failures: Vec<ServerSpawnFailure>,
     },
+
+    /// No LSP servers available (none configured or all failed).
+    #[error("No LSP servers available: {0}")]
+    NoServersAvailable(String),
 }
 
 /// A specialized Result type for mcpls-core operations.
@@ -401,5 +405,24 @@ mod tests {
 
         assert!(err.to_string().contains("some LSP servers failed"));
         assert!(err.to_string().contains("1/2"));
+    }
+
+    #[test]
+    fn test_error_display_no_servers_available() {
+        let err = Error::NoServersAvailable(
+            "No LSP servers available: none configured or all failed to initialize".to_string(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "No LSP servers available: No LSP servers available: none configured or all failed to initialize"
+        );
+    }
+
+    #[test]
+    fn test_error_no_servers_available_with_custom_message() {
+        let custom_msg = "none configured or all failed to initialize";
+        let err = Error::NoServersAvailable(custom_msg.to_string());
+        assert!(err.to_string().contains("No LSP servers available"));
+        assert!(err.to_string().contains(custom_msg));
     }
 }

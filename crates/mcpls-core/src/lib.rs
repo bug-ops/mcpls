@@ -144,6 +144,13 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         }
     }
 
+    // Check if at least one server successfully initialized
+    if !result.has_servers() {
+        return Err(Error::NoServersAvailable(
+            "No LSP servers available: none configured or all failed to initialize".to_string(),
+        ));
+    }
+
     // Register all successfully initialized servers
     let server_count = result.server_count();
     for (language_id, server) in result.servers {
@@ -429,6 +436,70 @@ mod tests {
             assert!(result.all_failed());
             assert!(!result.has_servers());
             assert!(!result.partial_success());
+        }
+
+        #[tokio::test]
+        async fn test_serve_fails_with_no_servers_available() {
+            use crate::config::{LspServerConfig, WorkspaceConfig};
+
+            // Create a config with an invalid server (guaranteed to fail)
+            let config = ServerConfig {
+                workspace: WorkspaceConfig {
+                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                },
+                lsp_servers: vec![LspServerConfig {
+                    language_id: "rust".to_string(),
+                    command: "nonexistent-command-that-will-fail-12345".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec!["**/*.rs".to_string()],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                }],
+            };
+
+            let result = serve(config).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+
+            // The serve function should now return NoServersAvailable error
+            // because all servers failed, but has_servers() returned false
+            assert!(
+                matches!(err, Error::NoServersAvailable(_))
+                    || matches!(err, Error::AllServersFailedToInit { .. }),
+                "Expected NoServersAvailable or AllServersFailedToInit error, got: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_serve_fails_with_empty_config() {
+            use crate::config::WorkspaceConfig;
+
+            // Create a config with no servers
+            let config = ServerConfig {
+                workspace: WorkspaceConfig {
+                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                },
+                lsp_servers: vec![],
+            };
+
+            let result = serve(config).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+
+            // Should return NoServersAvailable because no servers were configured
+            assert!(
+                matches!(err, Error::NoServersAvailable(_)),
+                "Expected NoServersAvailable error, got: {err:?}"
+            );
+
+            if let Error::NoServersAvailable(msg) = err {
+                assert!(msg.contains("none configured"));
+            }
         }
     }
 }
