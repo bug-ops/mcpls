@@ -389,6 +389,86 @@ impl LspServer {
         info!("LSP server shut down successfully");
         Ok(())
     }
+
+    /// Spawn multiple LSP servers in batch mode with graceful degradation.
+    ///
+    /// Attempts to spawn and initialize all configured servers. If some servers
+    /// fail to spawn, the successful servers are still returned. This enables
+    /// graceful degradation where the system can continue to operate with
+    /// partial functionality.
+    ///
+    /// # Behavior
+    ///
+    /// - Attempts to spawn each server sequentially
+    /// - Logs success (info) and failure (error) for each server
+    /// - Accumulates successful servers and failures
+    /// - Never panics or returns early - attempts all servers
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::lsp::{LspServer, ServerInitConfig};
+    /// use mcpls_core::config::LspServerConfig;
+    /// use std::path::PathBuf;
+    ///
+    /// # async fn example() {
+    /// let configs = vec![
+    ///     ServerInitConfig {
+    ///         server_config: LspServerConfig::rust_analyzer(),
+    ///         workspace_roots: vec![PathBuf::from("/workspace")],
+    ///         initialization_options: None,
+    ///     },
+    ///     ServerInitConfig {
+    ///         server_config: LspServerConfig::pyright(),
+    ///         workspace_roots: vec![PathBuf::from("/workspace")],
+    ///         initialization_options: None,
+    ///     },
+    /// ];
+    ///
+    /// let result = LspServer::spawn_batch(&configs).await;
+    ///
+    /// if result.has_servers() {
+    ///     println!("Successfully spawned {} servers", result.server_count());
+    /// }
+    ///
+    /// if result.partial_success() {
+    ///     eprintln!("Warning: {} servers failed", result.failure_count());
+    /// }
+    /// # }
+    /// ```
+    pub async fn spawn_batch(configs: &[ServerInitConfig]) -> ServerInitResult {
+        let mut result = ServerInitResult::new();
+
+        for config in configs {
+            let language_id = config.server_config.language_id.clone();
+            let command = config.server_config.command.clone();
+
+            match Self::spawn(config.clone()).await {
+                Ok(server) => {
+                    info!(
+                        "Successfully spawned LSP server: {} ({})",
+                        language_id, command
+                    );
+                    result.add_server(language_id, server);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to spawn LSP server: {} ({}): {}",
+                        language_id,
+                        command,
+                        e
+                    );
+                    result.add_failure(ServerSpawnFailure {
+                        language_id,
+                        command,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]
@@ -885,5 +965,189 @@ mod tests {
         assert_eq!(result.server_count(), 0);
         assert!(result.all_failed());
         assert!(!result.partial_success());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_batch_empty_configs() {
+        let configs: &[ServerInitConfig] = &[];
+        let result = LspServer::spawn_batch(configs).await;
+
+        assert!(!result.has_servers());
+        assert!(!result.all_failed());
+        assert!(!result.partial_success());
+        assert_eq!(result.server_count(), 0);
+        assert_eq!(result.failure_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_batch_single_invalid_config() {
+        let configs = vec![ServerInitConfig {
+            server_config: LspServerConfig {
+                language_id: "rust".to_string(),
+                command: "nonexistent-command-12345".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                file_patterns: vec!["**/*.rs".to_string()],
+                initialization_options: None,
+                timeout_seconds: 10,
+            },
+            workspace_roots: vec![],
+            initialization_options: None,
+        }];
+
+        let result = LspServer::spawn_batch(&configs).await;
+
+        assert!(!result.has_servers());
+        assert!(result.all_failed());
+        assert!(!result.partial_success());
+        assert_eq!(result.server_count(), 0);
+        assert_eq!(result.failure_count(), 1);
+
+        let failure = &result.failures[0];
+        assert_eq!(failure.language_id, "rust");
+        assert_eq!(failure.command, "nonexistent-command-12345");
+        assert!(failure.message.contains("spawn"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_batch_all_invalid_configs() {
+        let configs = vec![
+            ServerInitConfig {
+                server_config: LspServerConfig {
+                    language_id: "rust".to_string(),
+                    command: "nonexistent-rust-analyzer".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec!["**/*.rs".to_string()],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                },
+                workspace_roots: vec![],
+                initialization_options: None,
+            },
+            ServerInitConfig {
+                server_config: LspServerConfig {
+                    language_id: "python".to_string(),
+                    command: "nonexistent-pyright".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec!["**/*.py".to_string()],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                },
+                workspace_roots: vec![],
+                initialization_options: None,
+            },
+            ServerInitConfig {
+                server_config: LspServerConfig {
+                    language_id: "typescript".to_string(),
+                    command: "nonexistent-tsserver".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec!["**/*.ts".to_string()],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                },
+                workspace_roots: vec![],
+                initialization_options: None,
+            },
+        ];
+
+        let result = LspServer::spawn_batch(&configs).await;
+
+        assert!(!result.has_servers());
+        assert!(result.all_failed());
+        assert!(!result.partial_success());
+        assert_eq!(result.server_count(), 0);
+        assert_eq!(result.failure_count(), 3);
+
+        let failure_languages: Vec<_> = result
+            .failures
+            .iter()
+            .map(|f| f.language_id.as_str())
+            .collect();
+        assert!(failure_languages.contains(&"rust"));
+        assert!(failure_languages.contains(&"python"));
+        assert!(failure_languages.contains(&"typescript"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_batch_multiple_invalid_configs_ordering() {
+        let configs = vec![
+            ServerInitConfig {
+                server_config: LspServerConfig {
+                    language_id: "lang1".to_string(),
+                    command: "cmd1-nonexistent".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec![],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                },
+                workspace_roots: vec![],
+                initialization_options: None,
+            },
+            ServerInitConfig {
+                server_config: LspServerConfig {
+                    language_id: "lang2".to_string(),
+                    command: "cmd2-nonexistent".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec![],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                },
+                workspace_roots: vec![],
+                initialization_options: None,
+            },
+        ];
+
+        let result = LspServer::spawn_batch(&configs).await;
+
+        assert_eq!(result.failure_count(), 2);
+
+        assert_eq!(result.failures[0].language_id, "lang1");
+        assert_eq!(result.failures[0].command, "cmd1-nonexistent");
+
+        assert_eq!(result.failures[1].language_id, "lang2");
+        assert_eq!(result.failures[1].command, "cmd2-nonexistent");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_batch_logs_each_failure() {
+        let configs = vec![
+            ServerInitConfig {
+                server_config: LspServerConfig {
+                    language_id: "test1".to_string(),
+                    command: "nonexistent-test1".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec![],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                },
+                workspace_roots: vec![],
+                initialization_options: None,
+            },
+            ServerInitConfig {
+                server_config: LspServerConfig {
+                    language_id: "test2".to_string(),
+                    command: "nonexistent-test2".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec![],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                },
+                workspace_roots: vec![],
+                initialization_options: None,
+            },
+        ];
+
+        let result = LspServer::spawn_batch(&configs).await;
+
+        assert_eq!(result.failure_count(), 2);
+        assert_eq!(result.failures[0].language_id, "test1");
+        assert_eq!(result.failures[1].language_id, "test2");
     }
 }
