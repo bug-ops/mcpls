@@ -5,12 +5,25 @@
 
 mod server;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 pub use server::LspServerConfig;
 
 use crate::error::{Error, Result};
+
+/// Maps file extensions to LSP language identifiers.
+///
+/// Used to detect the language ID for files based on their extension.
+/// Extensions are mapped to language IDs like "rust", "python", "cpp", etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageExtensionMapping {
+    /// Array of extensions and their corresponding language ID.
+    pub extensions: Vec<String>,
+    /// Language ID to report to the LSP server.
+    pub language_id: String,
+}
 
 /// Main configuration for the MCPLS server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +50,11 @@ pub struct WorkspaceConfig {
     /// Valid values: "utf-8", "utf-16", "utf-32"
     #[serde(default = "default_position_encodings")]
     pub position_encodings: Vec<String>,
+
+    /// File extension to language ID mappings.
+    /// Allows users to customize which file extensions map to which language servers.
+    #[serde(default)]
+    pub language_extensions: Vec<LanguageExtensionMapping>,
 }
 
 impl Default for WorkspaceConfig {
@@ -44,7 +62,44 @@ impl Default for WorkspaceConfig {
         Self {
             roots: Vec::new(),
             position_encodings: default_position_encodings(),
+            language_extensions: Vec::new(),
         }
+    }
+}
+
+impl WorkspaceConfig {
+    /// Build a map of file extensions to language IDs from the configuration.
+    ///
+    /// # Returns
+    ///
+    /// A HashMap where keys are file extensions (without the dot) and values
+    /// are the corresponding language IDs to report to LSP servers.
+    pub fn build_extension_map(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        for mapping in &self.language_extensions {
+            for ext in &mapping.extensions {
+                map.insert(ext.clone(), mapping.language_id.clone());
+            }
+        }
+        map
+    }
+
+    /// Get the language ID for a file extension.
+    ///
+    /// # Arguments
+    ///
+    /// * `extension` - The file extension (without the dot)
+    ///
+    /// # Returns
+    ///
+    /// The language ID if found, `None` otherwise.
+    pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
+        for mapping in &self.language_extensions {
+            if mapping.extensions.contains(&extension.to_string()) {
+                return Some(mapping.language_id.clone());
+            }
+        }
+        None
     }
 }
 
@@ -338,5 +393,109 @@ mod tests {
 
         let config = ServerConfig::load_from(&config_path).unwrap();
         assert!(config.lsp_servers[0].initialization_options.is_some());
+    }
+
+    #[test]
+    fn test_language_extensions_in_config() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("extensions.toml");
+
+        let toml_content = r#"
+            [[workspace.language_extensions]]
+            extensions = ["cpp", "cc", "cxx", "hpp", "hh", "hxx"]
+            language_id = "cpp"
+
+            [[workspace.language_extensions]]
+            extensions = ["nu"]
+            language_id = "nushell"
+
+            [[workspace.language_extensions]]
+            extensions = ["py", "pyw", "pyi"]
+            language_id = "python"
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.workspace.language_extensions.len(), 3);
+
+        // Check C++ extensions
+        assert_eq!(config.workspace.language_extensions[0].language_id, "cpp");
+        assert_eq!(
+            config.workspace.language_extensions[0].extensions,
+            vec!["cpp", "cc", "cxx", "hpp", "hh", "hxx"]
+        );
+
+        // Check Nushell extension
+        assert_eq!(config.workspace.language_extensions[1].language_id, "nushell");
+        assert_eq!(
+            config.workspace.language_extensions[1].extensions,
+            vec!["nu"]
+        );
+    }
+
+    #[test]
+    fn test_build_extension_map() {
+        let workspace = WorkspaceConfig {
+            roots: vec![],
+            position_encodings: vec![],
+            language_extensions: vec![
+                LanguageExtensionMapping {
+                    extensions: vec!["cpp".to_string(), "cc".to_string(), "cxx".to_string()],
+                    language_id: "cpp".to_string(),
+                },
+                LanguageExtensionMapping {
+                    extensions: vec!["nu".to_string()],
+                    language_id: "nushell".to_string(),
+                },
+            ],
+        };
+
+        let map = workspace.build_extension_map();
+        assert_eq!(map.get("cpp"), Some(&"cpp".to_string()));
+        assert_eq!(map.get("cc"), Some(&"cpp".to_string()));
+        assert_eq!(map.get("cxx"), Some(&"cpp".to_string()));
+        assert_eq!(map.get("nu"), Some(&"nushell".to_string()));
+        assert_eq!(map.get("unknown"), None);
+    }
+
+    #[test]
+    fn test_get_language_for_extension() {
+        let workspace = WorkspaceConfig {
+            roots: vec![],
+            position_encodings: vec![],
+            language_extensions: vec![
+                LanguageExtensionMapping {
+                    extensions: vec!["hpp".to_string(), "hh".to_string()],
+                    language_id: "cpp".to_string(),
+                },
+                LanguageExtensionMapping {
+                    extensions: vec!["py".to_string()],
+                    language_id: "python".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            workspace.get_language_for_extension("hpp"),
+            Some("cpp".to_string())
+        );
+        assert_eq!(
+            workspace.get_language_for_extension("hh"),
+            Some("cpp".to_string())
+        );
+        assert_eq!(
+            workspace.get_language_for_extension("py"),
+            Some("python".to_string())
+        );
+        assert_eq!(workspace.get_language_for_extension("unknown"), None);
+    }
+
+    #[test]
+    fn test_empty_language_extensions() {
+        let workspace = WorkspaceConfig::default();
+        let map = workspace.build_extension_map();
+        assert!(map.is_empty());
+        assert_eq!(workspace.get_language_for_extension("cpp"), None);
     }
 }

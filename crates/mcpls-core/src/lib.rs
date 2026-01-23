@@ -447,6 +447,7 @@ mod tests {
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    language_extensions: vec![],
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -482,6 +483,7 @@ mod tests {
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    language_extensions: vec![],
                 },
                 lsp_servers: vec![],
             };
