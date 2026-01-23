@@ -81,9 +81,13 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// TOML parsing error.
+    /// TOML deserialization error.
     #[error("TOML parsing error: {0}")]
-    Toml(#[from] toml::de::Error),
+    TomlDe(#[from] toml::de::Error),
+
+    /// TOML serialization error.
+    #[error("TOML serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
 
     /// LSP client transport error.
     #[error("transport error: {0}")]
@@ -272,11 +276,11 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn test_error_from_toml() {
+    fn test_error_from_toml_de() {
         let toml_str = "[invalid toml";
         let toml_err = toml::from_str::<toml::Value>(toml_str).unwrap_err();
         let err: Error = toml_err.into();
-        assert!(matches!(err, Error::Toml(_)));
+        assert!(matches!(err, Error::TomlDe(_)));
     }
 
     #[test]

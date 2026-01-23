@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 use url::Url;
 
-use super::state::detect_language;
+use super::state::{ResourceLimits, detect_language};
 use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
@@ -45,7 +45,7 @@ impl Translator {
         Self {
             lsp_clients: HashMap::new(),
             lsp_servers: HashMap::new(),
-            document_tracker: DocumentTracker::new(),
+            document_tracker: DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
             notification_cache: NotificationCache::new(),
             workspace_roots: vec![],
         }
@@ -438,7 +438,8 @@ impl Translator {
 
     /// Get a cloned LSP client for a file path based on language detection.
     fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
-        let language_id = detect_language(path);
+        let empty_map = HashMap::new();
+        let language_id = detect_language(path, &empty_map);
         self.lsp_clients
             .get(&language_id)
             .cloned()

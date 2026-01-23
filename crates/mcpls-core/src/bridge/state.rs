@@ -48,27 +48,18 @@ pub struct DocumentTracker {
     documents: HashMap<PathBuf, DocumentState>,
     /// Resource limits for tracking.
     limits: ResourceLimits,
-}
-
-impl Default for DocumentTracker {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Custom file extension to language ID mappings.
+    extension_map: HashMap<String, String>,
 }
 
 impl DocumentTracker {
-    /// Create a new document tracker with default limits.
+    /// Create a new document tracker with custom limits and extension mappings.
     #[must_use]
-    pub fn new() -> Self {
-        Self::with_limits(ResourceLimits::default())
-    }
-
-    /// Create a new document tracker with custom limits.
-    #[must_use]
-    pub fn with_limits(limits: ResourceLimits) -> Self {
+    pub fn new(limits: ResourceLimits, extension_map: HashMap<String, String>) -> Self {
         Self {
             documents: HashMap::new(),
             limits,
+            extension_map,
         }
     }
 
@@ -124,7 +115,7 @@ impl DocumentTracker {
         }
 
         let uri = path_to_uri(&path);
-        let language_id = detect_language(&path);
+        let language_id = detect_language(&path, &self.extension_map);
 
         let state = DocumentState {
             uri: uri.clone(),
@@ -222,41 +213,17 @@ pub fn path_to_uri(path: &Path) -> Uri {
 }
 
 /// Detect the language ID from a file path.
+///
+/// Consults the extension map to determine the language ID for a file.
+/// If the extension is not found in the map, returns "plaintext".
 #[must_use]
-pub fn detect_language(path: &Path) -> String {
+pub fn detect_language(path: &Path, extension_map: &HashMap<String, String>) -> String {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    match extension {
-        "rs" => "rust",
-        "py" | "pyw" | "pyi" => "python",
-        "js" | "mjs" | "cjs" => "javascript",
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "typescriptreact",
-        "jsx" => "javascriptreact",
-        "go" => "go",
-        "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
-        "java" => "java",
-        "rb" => "ruby",
-        "php" => "php",
-        "swift" => "swift",
-        "kt" | "kts" => "kotlin",
-        "scala" | "sc" => "scala",
-        "zig" => "zig",
-        "lua" => "lua",
-        "sh" | "bash" | "zsh" => "shellscript",
-        "json" => "json",
-        "toml" => "toml",
-        "yaml" | "yml" => "yaml",
-        "xml" => "xml",
-        "html" | "htm" => "html",
-        "css" => "css",
-        "scss" => "scss",
-        "less" => "less",
-        "md" | "markdown" => "markdown",
-        _ => "plaintext",
-    }
-    .to_string()
+    extension_map
+        .get(extension)
+        .cloned()
+        .unwrap_or_else(|| "plaintext".to_string())
 }
 
 #[cfg(test)]
@@ -266,15 +233,23 @@ mod tests {
 
     #[test]
     fn test_detect_language() {
-        assert_eq!(detect_language(Path::new("main.rs")), "rust");
-        assert_eq!(detect_language(Path::new("script.py")), "python");
-        assert_eq!(detect_language(Path::new("app.ts")), "typescript");
-        assert_eq!(detect_language(Path::new("unknown.xyz")), "plaintext");
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("py".to_string(), "python".to_string());
+        map.insert("ts".to_string(), "typescript".to_string());
+
+        assert_eq!(detect_language(Path::new("main.rs"), &map), "rust");
+        assert_eq!(detect_language(Path::new("script.py"), &map), "python");
+        assert_eq!(detect_language(Path::new("app.ts"), &map), "typescript");
+        assert_eq!(detect_language(Path::new("unknown.xyz"), &map), "plaintext");
     }
 
     #[test]
     fn test_document_tracker() {
-        let mut tracker = DocumentTracker::new();
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/file.rs");
 
         assert!(!tracker.is_open(&path));
@@ -303,7 +278,10 @@ mod tests {
             max_documents: 2,
             max_file_size: 100,
         };
-        let mut tracker = DocumentTracker::with_limits(limits);
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(limits, map);
 
         // First two documents should succeed
         tracker
@@ -324,7 +302,10 @@ mod tests {
             max_documents: 10,
             max_file_size: 10,
         };
-        let mut tracker = DocumentTracker::with_limits(limits);
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(limits, map);
 
         // Small file should succeed
         tracker
@@ -360,7 +341,10 @@ mod tests {
             max_documents: 0,
             max_file_size: 0,
         };
-        let mut tracker = DocumentTracker::with_limits(limits);
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(limits, map);
 
         // Should allow many documents when limit is 0
         for i in 0..200 {
@@ -378,13 +362,6 @@ mod tests {
         tracker
             .open(PathBuf::from("/test/huge.rs"), huge_content)
             .unwrap();
-    }
-
-    #[test]
-    fn test_document_tracker_default() {
-        let tracker = DocumentTracker::default();
-        assert!(tracker.is_empty());
-        assert_eq!(tracker.len(), 0);
     }
 
     #[test]
@@ -406,7 +383,8 @@ mod tests {
 
     #[test]
     fn test_update_nonexistent_document() {
-        let mut tracker = DocumentTracker::new();
+        let map = HashMap::new();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/nonexistent.rs");
 
         let version = tracker.update(&path, "new content".to_string());
@@ -418,7 +396,8 @@ mod tests {
 
     #[test]
     fn test_close_nonexistent_document() {
-        let mut tracker = DocumentTracker::new();
+        let map = HashMap::new();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/nonexistent.rs");
 
         let state = tracker.close(&path);
@@ -430,7 +409,10 @@ mod tests {
 
     #[test]
     fn test_close_all_documents() {
-        let mut tracker = DocumentTracker::new();
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
 
         tracker
             .open(PathBuf::from("/test/file1.rs"), "content1".to_string())
@@ -451,7 +433,8 @@ mod tests {
 
     #[test]
     fn test_get_nonexistent_document() {
-        let tracker = DocumentTracker::new();
+        let map = HashMap::new();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/nonexistent.rs");
 
         let state = tracker.get(&path);
@@ -463,7 +446,10 @@ mod tests {
 
     #[test]
     fn test_document_version_increments() {
-        let mut tracker = DocumentTracker::new();
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/versioned.rs");
 
         tracker.open(path.clone(), "v1".to_string()).unwrap();
@@ -480,61 +466,122 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_detect_language_all_extensions() {
-        assert_eq!(detect_language(Path::new("main.rs")), "rust");
-        assert_eq!(detect_language(Path::new("script.py")), "python");
-        assert_eq!(detect_language(Path::new("script.pyw")), "python");
-        assert_eq!(detect_language(Path::new("script.pyi")), "python");
-        assert_eq!(detect_language(Path::new("app.js")), "javascript");
-        assert_eq!(detect_language(Path::new("app.mjs")), "javascript");
-        assert_eq!(detect_language(Path::new("app.cjs")), "javascript");
-        assert_eq!(detect_language(Path::new("app.ts")), "typescript");
-        assert_eq!(detect_language(Path::new("app.mts")), "typescript");
-        assert_eq!(detect_language(Path::new("app.cts")), "typescript");
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("py".to_string(), "python".to_string());
+        map.insert("pyw".to_string(), "python".to_string());
+        map.insert("pyi".to_string(), "python".to_string());
+        map.insert("js".to_string(), "javascript".to_string());
+        map.insert("mjs".to_string(), "javascript".to_string());
+        map.insert("cjs".to_string(), "javascript".to_string());
+        map.insert("ts".to_string(), "typescript".to_string());
+        map.insert("mts".to_string(), "typescript".to_string());
+        map.insert("cts".to_string(), "typescript".to_string());
+        map.insert("tsx".to_string(), "typescriptreact".to_string());
+        map.insert("jsx".to_string(), "javascriptreact".to_string());
+        map.insert("go".to_string(), "go".to_string());
+        map.insert("c".to_string(), "c".to_string());
+        map.insert("h".to_string(), "c".to_string());
+        map.insert("cpp".to_string(), "cpp".to_string());
+        map.insert("cc".to_string(), "cpp".to_string());
+        map.insert("cxx".to_string(), "cpp".to_string());
+        map.insert("hpp".to_string(), "cpp".to_string());
+        map.insert("hh".to_string(), "cpp".to_string());
+        map.insert("hxx".to_string(), "cpp".to_string());
+        map.insert("java".to_string(), "java".to_string());
+        map.insert("rb".to_string(), "ruby".to_string());
+        map.insert("php".to_string(), "php".to_string());
+        map.insert("swift".to_string(), "swift".to_string());
+        map.insert("kt".to_string(), "kotlin".to_string());
+        map.insert("kts".to_string(), "kotlin".to_string());
+        map.insert("scala".to_string(), "scala".to_string());
+        map.insert("sc".to_string(), "scala".to_string());
+        map.insert("zig".to_string(), "zig".to_string());
+        map.insert("lua".to_string(), "lua".to_string());
+        map.insert("sh".to_string(), "shellscript".to_string());
+        map.insert("bash".to_string(), "shellscript".to_string());
+        map.insert("zsh".to_string(), "shellscript".to_string());
+        map.insert("json".to_string(), "json".to_string());
+        map.insert("toml".to_string(), "toml".to_string());
+        map.insert("yaml".to_string(), "yaml".to_string());
+        map.insert("yml".to_string(), "yaml".to_string());
+        map.insert("xml".to_string(), "xml".to_string());
+        map.insert("html".to_string(), "html".to_string());
+        map.insert("htm".to_string(), "html".to_string());
+        map.insert("css".to_string(), "css".to_string());
+        map.insert("scss".to_string(), "scss".to_string());
+        map.insert("less".to_string(), "less".to_string());
+        map.insert("md".to_string(), "markdown".to_string());
+        map.insert("markdown".to_string(), "markdown".to_string());
+
+        assert_eq!(detect_language(Path::new("main.rs"), &map), "rust");
+        assert_eq!(detect_language(Path::new("script.py"), &map), "python");
+        assert_eq!(detect_language(Path::new("script.pyw"), &map), "python");
+        assert_eq!(detect_language(Path::new("script.pyi"), &map), "python");
+        assert_eq!(detect_language(Path::new("app.js"), &map), "javascript");
+        assert_eq!(detect_language(Path::new("app.mjs"), &map), "javascript");
+        assert_eq!(detect_language(Path::new("app.cjs"), &map), "javascript");
+        assert_eq!(detect_language(Path::new("app.ts"), &map), "typescript");
+        assert_eq!(detect_language(Path::new("app.mts"), &map), "typescript");
+        assert_eq!(detect_language(Path::new("app.cts"), &map), "typescript");
         assert_eq!(
-            detect_language(Path::new("component.tsx")),
+            detect_language(Path::new("component.tsx"), &map),
             "typescriptreact"
         );
         assert_eq!(
-            detect_language(Path::new("component.jsx")),
+            detect_language(Path::new("component.jsx"), &map),
             "javascriptreact"
         );
-        assert_eq!(detect_language(Path::new("main.go")), "go");
-        assert_eq!(detect_language(Path::new("main.c")), "c");
-        assert_eq!(detect_language(Path::new("header.h")), "c");
-        assert_eq!(detect_language(Path::new("main.cpp")), "cpp");
-        assert_eq!(detect_language(Path::new("main.cc")), "cpp");
-        assert_eq!(detect_language(Path::new("main.cxx")), "cpp");
-        assert_eq!(detect_language(Path::new("header.hpp")), "cpp");
-        assert_eq!(detect_language(Path::new("header.hh")), "cpp");
-        assert_eq!(detect_language(Path::new("header.hxx")), "cpp");
-        assert_eq!(detect_language(Path::new("Main.java")), "java");
-        assert_eq!(detect_language(Path::new("script.rb")), "ruby");
-        assert_eq!(detect_language(Path::new("index.php")), "php");
-        assert_eq!(detect_language(Path::new("App.swift")), "swift");
-        assert_eq!(detect_language(Path::new("Main.kt")), "kotlin");
-        assert_eq!(detect_language(Path::new("script.kts")), "kotlin");
-        assert_eq!(detect_language(Path::new("Main.scala")), "scala");
-        assert_eq!(detect_language(Path::new("script.sc")), "scala");
-        assert_eq!(detect_language(Path::new("main.zig")), "zig");
-        assert_eq!(detect_language(Path::new("script.lua")), "lua");
-        assert_eq!(detect_language(Path::new("script.sh")), "shellscript");
-        assert_eq!(detect_language(Path::new("script.bash")), "shellscript");
-        assert_eq!(detect_language(Path::new("script.zsh")), "shellscript");
-        assert_eq!(detect_language(Path::new("data.json")), "json");
-        assert_eq!(detect_language(Path::new("config.toml")), "toml");
-        assert_eq!(detect_language(Path::new("config.yaml")), "yaml");
-        assert_eq!(detect_language(Path::new("config.yml")), "yaml");
-        assert_eq!(detect_language(Path::new("data.xml")), "xml");
-        assert_eq!(detect_language(Path::new("index.html")), "html");
-        assert_eq!(detect_language(Path::new("index.htm")), "html");
-        assert_eq!(detect_language(Path::new("styles.css")), "css");
-        assert_eq!(detect_language(Path::new("styles.scss")), "scss");
-        assert_eq!(detect_language(Path::new("styles.less")), "less");
-        assert_eq!(detect_language(Path::new("README.md")), "markdown");
-        assert_eq!(detect_language(Path::new("README.markdown")), "markdown");
-        assert_eq!(detect_language(Path::new("unknown.xyz")), "plaintext");
-        assert_eq!(detect_language(Path::new("no_extension")), "plaintext");
+        assert_eq!(detect_language(Path::new("main.go"), &map), "go");
+        assert_eq!(detect_language(Path::new("main.c"), &map), "c");
+        assert_eq!(detect_language(Path::new("header.h"), &map), "c");
+        assert_eq!(detect_language(Path::new("main.cpp"), &map), "cpp");
+        assert_eq!(detect_language(Path::new("main.cc"), &map), "cpp");
+        assert_eq!(detect_language(Path::new("main.cxx"), &map), "cpp");
+        assert_eq!(detect_language(Path::new("header.hpp"), &map), "cpp");
+        assert_eq!(detect_language(Path::new("header.hh"), &map), "cpp");
+        assert_eq!(detect_language(Path::new("header.hxx"), &map), "cpp");
+        assert_eq!(detect_language(Path::new("Main.java"), &map), "java");
+        assert_eq!(detect_language(Path::new("script.rb"), &map), "ruby");
+        assert_eq!(detect_language(Path::new("index.php"), &map), "php");
+        assert_eq!(detect_language(Path::new("App.swift"), &map), "swift");
+        assert_eq!(detect_language(Path::new("Main.kt"), &map), "kotlin");
+        assert_eq!(detect_language(Path::new("script.kts"), &map), "kotlin");
+        assert_eq!(detect_language(Path::new("Main.scala"), &map), "scala");
+        assert_eq!(detect_language(Path::new("script.sc"), &map), "scala");
+        assert_eq!(detect_language(Path::new("main.zig"), &map), "zig");
+        assert_eq!(detect_language(Path::new("script.lua"), &map), "lua");
+        assert_eq!(detect_language(Path::new("script.sh"), &map), "shellscript");
+        assert_eq!(
+            detect_language(Path::new("script.bash"), &map),
+            "shellscript"
+        );
+        assert_eq!(
+            detect_language(Path::new("script.zsh"), &map),
+            "shellscript"
+        );
+        assert_eq!(detect_language(Path::new("data.json"), &map), "json");
+        assert_eq!(detect_language(Path::new("config.toml"), &map), "toml");
+        assert_eq!(detect_language(Path::new("config.yaml"), &map), "yaml");
+        assert_eq!(detect_language(Path::new("config.yml"), &map), "yaml");
+        assert_eq!(detect_language(Path::new("data.xml"), &map), "xml");
+        assert_eq!(detect_language(Path::new("index.html"), &map), "html");
+        assert_eq!(detect_language(Path::new("index.htm"), &map), "html");
+        assert_eq!(detect_language(Path::new("styles.css"), &map), "css");
+        assert_eq!(detect_language(Path::new("styles.scss"), &map), "scss");
+        assert_eq!(detect_language(Path::new("styles.less"), &map), "less");
+        assert_eq!(detect_language(Path::new("README.md"), &map), "markdown");
+        assert_eq!(
+            detect_language(Path::new("README.markdown"), &map),
+            "markdown"
+        );
+        assert_eq!(detect_language(Path::new("unknown.xyz"), &map), "plaintext");
+        assert_eq!(
+            detect_language(Path::new("no_extension"), &map),
+            "plaintext"
+        );
     }
 
     #[test]
@@ -560,7 +607,10 @@ mod tests {
 
     #[test]
     fn test_document_tracker_concurrent_operations() {
-        let mut tracker = DocumentTracker::new();
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path1 = PathBuf::from("/test/file1.rs");
         let path2 = PathBuf::from("/test/file2.rs");
 
@@ -583,7 +633,10 @@ mod tests {
 
     #[test]
     fn test_empty_content() {
-        let mut tracker = DocumentTracker::new();
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/empty.rs");
 
         tracker.open(path.clone(), String::new()).unwrap();
@@ -593,7 +646,10 @@ mod tests {
 
     #[test]
     fn test_unicode_content() {
-        let mut tracker = DocumentTracker::new();
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/unicode.rs");
         let content = "fn テスト() { println!(\"こんにちは\"); }";
 
@@ -607,7 +663,10 @@ mod tests {
             max_documents: 5,
             max_file_size: 1000,
         };
-        let mut tracker = DocumentTracker::with_limits(limits);
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(limits, map);
 
         for i in 0..5 {
             tracker
@@ -630,7 +689,10 @@ mod tests {
             max_documents: 10,
             max_file_size: 100,
         };
-        let mut tracker = DocumentTracker::with_limits(limits);
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(limits, map);
 
         let exact_size_content = "x".repeat(100);
         tracker
@@ -640,5 +702,102 @@ mod tests {
         let over_size_content = "x".repeat(101);
         let result = tracker.open(PathBuf::from("/test/over.rs"), over_size_content);
         assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
+    }
+
+    #[test]
+    fn test_detect_language_with_custom_extension() {
+        let mut map = HashMap::new();
+        map.insert("nu".to_string(), "nushell".to_string());
+
+        assert_eq!(detect_language(Path::new("script.nu"), &map), "nushell");
+
+        let empty_map = HashMap::new();
+        assert_eq!(
+            detect_language(Path::new("script.nu"), &empty_map),
+            "plaintext"
+        );
+    }
+
+    #[test]
+    fn test_detect_language_custom_overrides_default() {
+        let mut custom_map = HashMap::new();
+        custom_map.insert("rs".to_string(), "custom-rust".to_string());
+
+        assert_eq!(
+            detect_language(Path::new("main.rs"), &custom_map),
+            "custom-rust"
+        );
+
+        let mut default_map = HashMap::new();
+        default_map.insert("rs".to_string(), "rust".to_string());
+
+        assert_eq!(detect_language(Path::new("main.rs"), &default_map), "rust");
+    }
+
+    #[test]
+    fn test_detect_language_fallback_to_plaintext() {
+        let mut map = HashMap::new();
+        map.insert("nu".to_string(), "nushell".to_string());
+
+        // .rs not in custom map, should return plaintext
+        assert_eq!(detect_language(Path::new("main.rs"), &map), "plaintext");
+    }
+
+    #[test]
+    fn test_detect_language_empty_map() {
+        let map = HashMap::new();
+        assert_eq!(detect_language(Path::new("main.rs"), &map), "plaintext");
+    }
+
+    #[test]
+    fn test_document_tracker_with_extensions() {
+        let mut map = HashMap::new();
+        map.insert("nu".to_string(), "nushell".to_string());
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+
+        let path = PathBuf::from("/test/script.nu");
+        tracker
+            .open(path.clone(), "# nushell script".to_string())
+            .unwrap();
+
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.language_id, "nushell");
+    }
+
+    #[test]
+    fn test_document_tracker_uses_provided_map() {
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let path = PathBuf::from("/test/main.rs");
+        tracker
+            .open(path.clone(), "fn main() {}".to_string())
+            .unwrap();
+
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.language_id, "rust");
+    }
+
+    #[test]
+    fn test_multiple_extensions_same_language() {
+        let mut map = HashMap::new();
+        map.insert("cpp".to_string(), "c++".to_string());
+        map.insert("cc".to_string(), "c++".to_string());
+        map.insert("cxx".to_string(), "c++".to_string());
+
+        assert_eq!(detect_language(Path::new("main.cpp"), &map), "c++");
+        assert_eq!(detect_language(Path::new("main.cc"), &map), "c++");
+        assert_eq!(detect_language(Path::new("main.cxx"), &map), "c++");
+    }
+
+    #[test]
+    fn test_case_sensitive_extensions() {
+        let mut map = HashMap::new();
+        map.insert("NU".to_string(), "nushell".to_string());
+
+        // Lowercase .nu should not match uppercase "NU" in map
+        assert_eq!(detect_language(Path::new("script.nu"), &map), "plaintext");
     }
 }

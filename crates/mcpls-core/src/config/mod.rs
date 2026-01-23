@@ -62,7 +62,7 @@ impl Default for WorkspaceConfig {
         Self {
             roots: Vec::new(),
             position_encodings: default_position_encodings(),
-            language_extensions: Vec::new(),
+            language_extensions: default_language_extensions(),
         }
     }
 }
@@ -72,8 +72,9 @@ impl WorkspaceConfig {
     ///
     /// # Returns
     ///
-    /// A HashMap where keys are file extensions (without the dot) and values
+    /// A `HashMap` where keys are file extensions (without the dot) and values
     /// are the corresponding language IDs to report to LSP servers.
+    #[must_use]
     pub fn build_extension_map(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for mapping in &self.language_extensions {
@@ -93,6 +94,7 @@ impl WorkspaceConfig {
     /// # Returns
     ///
     /// The language ID if found, `None` otherwise.
+    #[must_use]
     pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
         for mapping in &self.language_extensions {
             if mapping.extensions.contains(&extension.to_string()) {
@@ -107,6 +109,143 @@ fn default_position_encodings() -> Vec<String> {
     vec!["utf-8".to_string(), "utf-16".to_string()]
 }
 
+/// Build default language extension mappings.
+///
+/// Returns all built-in language extensions that MCPLS recognizes by default.
+/// These mappings are used when no custom configuration is provided.
+#[allow(clippy::too_many_lines)]
+fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
+    vec![
+        LanguageExtensionMapping {
+            extensions: vec!["rs".to_string()],
+            language_id: "rust".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["py".to_string(), "pyw".to_string(), "pyi".to_string()],
+            language_id: "python".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["js".to_string(), "mjs".to_string(), "cjs".to_string()],
+            language_id: "javascript".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["ts".to_string(), "mts".to_string(), "cts".to_string()],
+            language_id: "typescript".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["tsx".to_string()],
+            language_id: "typescriptreact".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["jsx".to_string()],
+            language_id: "javascriptreact".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["go".to_string()],
+            language_id: "go".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["c".to_string(), "h".to_string()],
+            language_id: "c".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec![
+                "cpp".to_string(),
+                "cc".to_string(),
+                "cxx".to_string(),
+                "hpp".to_string(),
+                "hh".to_string(),
+                "hxx".to_string(),
+            ],
+            language_id: "cpp".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["java".to_string()],
+            language_id: "java".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["rb".to_string()],
+            language_id: "ruby".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["php".to_string()],
+            language_id: "php".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["swift".to_string()],
+            language_id: "swift".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["kt".to_string(), "kts".to_string()],
+            language_id: "kotlin".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["scala".to_string(), "sc".to_string()],
+            language_id: "scala".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["zig".to_string()],
+            language_id: "zig".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["lua".to_string()],
+            language_id: "lua".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["sh".to_string(), "bash".to_string(), "zsh".to_string()],
+            language_id: "shellscript".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["json".to_string()],
+            language_id: "json".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["toml".to_string()],
+            language_id: "toml".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["yaml".to_string(), "yml".to_string()],
+            language_id: "yaml".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["xml".to_string()],
+            language_id: "xml".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["html".to_string(), "htm".to_string()],
+            language_id: "html".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["css".to_string()],
+            language_id: "css".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["scss".to_string()],
+            language_id: "scss".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["less".to_string()],
+            language_id: "less".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["md".to_string(), "markdown".to_string()],
+            language_id: "markdown".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["cs".to_string()],
+            language_id: "csharp".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["fs".to_string(), "fsi".to_string(), "fsx".to_string()],
+            language_id: "fsharp".to_string(),
+        },
+        LanguageExtensionMapping {
+            extensions: vec!["r".to_string(), "R".to_string()],
+            language_id: "r".to_string(),
+        },
+    ]
+}
+
 impl ServerConfig {
     /// Load configuration from the default path.
     ///
@@ -116,9 +255,13 @@ impl ServerConfig {
     /// 3. `~/.config/mcpls/mcpls.toml` (Linux/macOS)
     /// 4. `%APPDATA%\mcpls\mcpls.toml` (Windows)
     ///
+    /// If no configuration file exists, creates a default configuration file
+    /// in the user's config directory with all default language extensions.
+    ///
     /// # Errors
     ///
-    /// Returns an error if no configuration file is found or if parsing fails.
+    /// Returns an error if parsing an existing config fails.
+    /// If config creation fails, returns default config with graceful degradation.
     pub fn load() -> Result<Self> {
         if let Ok(path) = std::env::var("MCPLS_CONFIG") {
             return Self::load_from(Path::new(&path));
@@ -134,9 +277,20 @@ impl ServerConfig {
             if user_config.exists() {
                 return Self::load_from(&user_config);
             }
+
+            // No config found - create default config file
+            if let Err(e) = Self::create_default_config_file(&user_config) {
+                tracing::warn!(
+                    "Failed to create default config at {}: {}. Using in-memory defaults.",
+                    user_config.display(),
+                    e
+                );
+            } else {
+                tracing::info!("Created default config at {}", user_config.display());
+            }
         }
 
-        // Return default configuration if no config file found
+        // Return default configuration
         Ok(Self::default())
     }
 
@@ -157,6 +311,25 @@ impl ServerConfig {
         let config: Self = toml::from_str(&content)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Create a default configuration file with all built-in extensions.
+    ///
+    /// Creates the parent directory if it doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory or file creation fails.
+    fn create_default_config_file(path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let default_config = Self::default();
+        let toml_content = toml::to_string_pretty(&default_config)?;
+        std::fs::write(path, toml_content)?;
+
+        Ok(())
     }
 
     /// Validate the configuration.
@@ -308,16 +481,12 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_roots_empty_by_default() {
-        let workspace = WorkspaceConfig::default();
-        assert!(workspace.roots.is_empty());
-    }
-
-    #[test]
     fn test_workspace_config_defaults() {
         let workspace = WorkspaceConfig::default();
         assert!(workspace.roots.is_empty());
         assert_eq!(workspace.position_encodings, vec!["utf-8", "utf-16"]);
+        assert!(!workspace.language_extensions.is_empty());
+        assert_eq!(workspace.language_extensions.len(), 30);
     }
 
     #[test]
@@ -427,7 +596,10 @@ mod tests {
         );
 
         // Check Nushell extension
-        assert_eq!(config.workspace.language_extensions[1].language_id, "nushell");
+        assert_eq!(
+            config.workspace.language_extensions[1].language_id,
+            "nushell"
+        );
         assert_eq!(
             config.workspace.language_extensions[1].extensions,
             vec!["nu"]
@@ -492,10 +664,85 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_language_extensions() {
+    fn test_default_language_extensions() {
         let workspace = WorkspaceConfig::default();
         let map = workspace.build_extension_map();
-        assert!(map.is_empty());
-        assert_eq!(workspace.get_language_for_extension("cpp"), None);
+        assert!(!map.is_empty());
+        assert_eq!(
+            workspace.get_language_for_extension("rs"),
+            Some("rust".to_string())
+        );
+        assert_eq!(
+            workspace.get_language_for_extension("py"),
+            Some("python".to_string())
+        );
+        assert_eq!(
+            workspace.get_language_for_extension("cpp"),
+            Some("cpp".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_default_config_file() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls").join("mcpls.toml");
+
+        ServerConfig::create_default_config_file(&config_path).unwrap();
+
+        assert!(config_path.exists());
+
+        let loaded_config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(loaded_config.workspace.language_extensions.len(), 30);
+        assert_eq!(loaded_config.lsp_servers.len(), 1);
+        assert_eq!(loaded_config.lsp_servers[0].language_id, "rust");
+    }
+
+    #[test]
+    fn test_load_returns_default_config() {
+        // When called directly, default() should return config with all language extensions
+        let config = ServerConfig::default();
+        assert_eq!(config.workspace.language_extensions.len(), 30);
+        assert_eq!(config.lsp_servers.len(), 1);
+        assert_eq!(config.lsp_servers[0].language_id, "rust");
+    }
+
+    #[test]
+    fn test_load_does_not_overwrite_existing_config() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls.toml");
+
+        let custom_toml = r#"
+            [workspace]
+            roots = ["/custom/path"]
+
+            [[lsp_servers]]
+            language_id = "python"
+            command = "pyright-langserver"
+        "#;
+
+        fs::write(&config_path, custom_toml).unwrap();
+
+        std::env::set_current_dir(tmp_dir.path()).unwrap();
+        let config = ServerConfig::load().unwrap();
+
+        assert_eq!(config.workspace.roots, vec![PathBuf::from("/custom/path")]);
+        assert_eq!(config.lsp_servers.len(), 1);
+        assert_eq!(config.lsp_servers[0].language_id, "python");
+    }
+
+    #[test]
+    fn test_config_file_creation_with_proper_structure() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("test_config").join("mcpls.toml");
+
+        ServerConfig::create_default_config_file(&config_path).unwrap();
+
+        let content = fs::read_to_string(&config_path).unwrap();
+
+        assert!(content.contains("[workspace]"));
+        assert!(content.contains("[[workspace.language_extensions]]"));
+        assert!(content.contains("[[lsp_servers]]"));
+        assert!(content.contains("language_id = \"rust\""));
+        assert!(content.contains("extensions = [\"rs\"]"));
     }
 }
