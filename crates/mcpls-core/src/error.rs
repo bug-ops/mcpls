@@ -184,7 +184,7 @@ pub enum Error {
     },
 
     /// No LSP servers available (none configured or all failed).
-    #[error("No LSP servers available: {0}")]
+    #[error("{0}")]
     NoServersAvailable(String),
 }
 
@@ -413,12 +413,11 @@ mod tests {
 
     #[test]
     fn test_error_display_no_servers_available() {
-        let err = Error::NoServersAvailable(
-            "No LSP servers available: none configured or all failed to initialize".to_string(),
-        );
+        let err =
+            Error::NoServersAvailable("none configured or all failed to initialize".to_string());
         assert_eq!(
             err.to_string(),
-            "No LSP servers available: No LSP servers available: none configured or all failed to initialize"
+            "none configured or all failed to initialize"
         );
     }
 
@@ -426,7 +425,6 @@ mod tests {
     fn test_error_no_servers_available_with_custom_message() {
         let custom_msg = "none configured or all failed to initialize";
         let err = Error::NoServersAvailable(custom_msg.to_string());
-        assert!(err.to_string().contains("No LSP servers available"));
-        assert!(err.to_string().contains(custom_msg));
+        assert_eq!(err.to_string(), custom_msg);
     }
 }

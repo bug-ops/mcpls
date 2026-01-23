@@ -101,9 +101,10 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
 pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
-    let mut translator = Translator::new();
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
+    let extension_map = config.workspace.build_extension_map();
 
+    let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(workspace_roots.clone());
 
     // Build configurations for batch spawning
@@ -147,7 +148,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     // Check if at least one server successfully initialized
     if !result.has_servers() {
         return Err(Error::NoServersAvailable(
-            "No LSP servers available: none configured or all failed to initialize".to_string(),
+            "none configured or all failed to initialize".to_string(),
         ));
     }
 
