@@ -249,3 +249,70 @@ pub struct ServerMessagesParams {
 const fn default_message_limit() -> usize {
     20
 }
+
+/// Parameters for the `get_server_status` tool.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+#[schemars(description = "Parameters for getting the current status of all LSP servers.")]
+pub struct ServerStatusParams {}
+
+impl<'de> Deserialize<'de> for ServerStatusParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept both null and {} as valid empty params
+        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+        match value {
+            None | Some(serde_json::Value::Object(_) | serde_json::Value::Null) => {
+                Ok(Self {})
+            }
+            Some(_) => Err(serde::de::Error::custom(
+                "expected null or object for ServerStatusParams",
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_status_params_can_be_created() {
+        let _params = ServerStatusParams {};
+    }
+
+    #[test]
+    fn server_status_params_serializes_to_empty_object() {
+        let params = ServerStatusParams {};
+        let json = serde_json::to_string(&params).unwrap();
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn server_status_params_deserializes_from_empty_object() {
+        let params: ServerStatusParams = serde_json::from_str("{}").unwrap();
+        let _ = params;
+    }
+
+    #[test]
+    fn server_status_params_deserializes_from_null() {
+        let params: ServerStatusParams = serde_json::from_str("null").unwrap();
+        let _ = params;
+    }
+
+    #[test]
+    fn server_status_params_implements_debug() {
+        let params = ServerStatusParams {};
+        let debug_str = format!("{:?}", params);
+        assert!(debug_str.contains("ServerStatusParams"));
+    }
+
+    #[test]
+    fn server_status_params_implements_clone() {
+        let params = ServerStatusParams {};
+        let cloned = params.clone();
+        let _ = cloned;
+    }
+}
