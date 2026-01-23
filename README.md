@@ -23,11 +23,15 @@ AI coding assistants are remarkably capable, but they're working blind. They see
 - **Real diagnostics** — See actual compiler errors, not hallucinated ones
 - **Intelligent completions** — Get suggestions that respect scope and types
 - **Safe refactoring** — Rename symbols with confidence, workspace-wide
+- **Graceful degradation** — Use available language servers, even if some fail to initialize
 
 > [!TIP]
 > Zero configuration for Rust projects. Just install mcpls and a language server — ready to go.
 
 ## Prerequisites
+
+> [!TIP]
+> mcpls uses graceful degradation — if one language server fails or isn't installed, it continues with available servers. You don't need all servers installed.
 
 For Rust projects, install rust-analyzer:
 
@@ -44,7 +48,7 @@ brew install rust-analyzer
 ```
 
 > [!IMPORTANT]
-> mcpls requires a language server to be installed. Without rust-analyzer, you'll see "LSP server process terminated unexpectedly" errors.
+> At least one language server must be available. Without any configured servers or if all fail to initialize, mcpls will return a clear error message.
 
 ## Installation
 

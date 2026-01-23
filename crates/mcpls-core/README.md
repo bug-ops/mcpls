@@ -15,6 +15,7 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 - **LSP lifecycle** — Manages language server processes (spawn, initialize, shutdown)
 - **Document tracking** — Lazy-loads files, maintains synchronization state
 - **Configuration** — Parses TOML configs, discovers LSP servers
+- **Graceful degradation** — Continues with available servers, even if some fail to initialize
 
 > [!NOTE]
 > This is the library crate. For the CLI, see [`mcpls`](https://crates.io/crates/mcpls).
@@ -23,7 +24,7 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 
 ```toml
 [dependencies]
-mcpls-core = "0.2"
+mcpls-core = "0.3"
 ```
 
 ## Architecture

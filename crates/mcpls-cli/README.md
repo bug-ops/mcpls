@@ -7,6 +7,9 @@
 
 The mcpls CLI exposes language server intelligence through MCP. One binary, any language, zero runtime dependencies.
 
+> [!TIP]
+> Graceful degradation means you don't need every language server installed. If one fails, mcpls continues with available servers.
+
 ## Installation
 
 ```bash
