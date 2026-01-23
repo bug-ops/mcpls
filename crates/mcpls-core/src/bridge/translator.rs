@@ -422,6 +422,8 @@ pub struct ServerStatusResult {
     pub servers: Vec<LspServerStatus>,
     /// Total number of servers.
     pub total_servers: usize,
+    /// Total number of tracked documents across all servers.
+    pub document_count: usize,
 }
 
 /// Maximum allowed position value for validation.
@@ -1483,9 +1485,11 @@ impl Translator {
         }
 
         let total_servers = servers.len();
+        let document_count = self.document_tracker.documents().len();
         Ok(ServerStatusResult {
             servers,
             total_servers,
+            document_count,
         })
     }
 }
@@ -2794,6 +2798,7 @@ mod tests {
         let result = ServerStatusResult {
             servers: vec![server1, server2],
             total_servers: 2,
+            document_count: 0,
         };
 
         assert_eq!(result.servers.len(), 2);
@@ -2807,6 +2812,7 @@ mod tests {
         let result = ServerStatusResult {
             servers: vec![],
             total_servers: 0,
+            document_count: 0,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -2825,6 +2831,7 @@ mod tests {
         let result = ServerStatusResult {
             servers: vec![server],
             total_servers: 1,
+            document_count: 3,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -2835,10 +2842,11 @@ mod tests {
 
     #[test]
     fn test_server_status_result_json_deserialization() {
-        let json = r#"{"servers":[{"language_id":"go","status":"uninitialized","command":"gopls","document_count":0}],"total_servers":1}"#;
+        let json = r#"{"servers":[{"language_id":"go","status":"uninitialized","command":"gopls","document_count":0}],"total_servers":1,"document_count":0}"#;
         let result: ServerStatusResult = serde_json::from_str(json).unwrap();
 
         assert_eq!(result.total_servers, 1);
+        assert_eq!(result.document_count, 0);
         assert_eq!(result.servers.len(), 1);
         assert_eq!(result.servers[0].language_id, "go");
         assert_eq!(result.servers[0].status, "uninitialized");

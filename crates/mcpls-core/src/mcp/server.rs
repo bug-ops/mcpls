@@ -15,7 +15,7 @@ use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
     DocumentSymbolsParams, FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
-    ServerLogsParams, ServerMessagesParams, WorkspaceSymbolParams,
+    ServerLogsParams, ServerMessagesParams, ServerStatusParams, WorkspaceSymbolParams,
 };
 use crate::bridge::Translator;
 
@@ -414,6 +414,26 @@ impl McplsServer {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator.handle_server_messages(limit)
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get the status of all registered LSP servers.
+    #[tool(
+        description = "Status of all registered LSP servers. Returns server state, command, and document counts."
+    )]
+    async fn get_server_status(
+        &self,
+        Parameters(ServerStatusParams {}): Parameters<ServerStatusParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let translator = self.context.translator.lock().await;
+            translator.handle_server_status().await
         };
 
         match result {
@@ -837,5 +857,50 @@ mod tests {
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_status_tool_empty_workspace() {
+        let server = create_test_server();
+        let params = Parameters(ServerStatusParams {});
+
+        let result = server.get_server_status(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.get("servers").is_some());
+
+        let servers = parsed.get("servers").unwrap().as_array().unwrap();
+        assert_eq!(servers.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_status_tool_returns_json() {
+        let server = create_test_server();
+        let params = Parameters(ServerStatusParams {});
+
+        let result = server.get_server_status(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_server_status_tool_document_count() {
+        let server = create_test_server();
+        let params = Parameters(ServerStatusParams {});
+
+        let result = server.get_server_status(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.get("document_count").is_some());
+
+        let count = parsed.get("document_count").unwrap().as_u64().unwrap();
+        assert_eq!(count, 0);
     }
 }

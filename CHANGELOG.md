@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `get_server_status` — New MCP tool showing registered LSP servers and their status (ready/initializing/etc.), with document counts per language
+
 ### Changed
 
 - **Shorter tool descriptions** — Condensed MCP tool descriptions for better compatibility with AI agent context windows
