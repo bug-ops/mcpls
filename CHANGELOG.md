@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Shorter tool descriptions** — Condensed MCP tool descriptions for better compatibility with AI agent context windows
 - **LSP server initialization** — Switched from fail-fast to graceful degradation strategy
 - **Error handling** — More descriptive error messages showing which servers failed and why
 - **Logging** — Added warning-level logs for partial success scenarios
