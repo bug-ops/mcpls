@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Shorter tool descriptions** — Condensed MCP tool descriptions for better compatibility with AI agent context windows
+
 ## [0.3.0] - 2025-12-28
 
 Major feature release adding LSP notification handling and 3 new MCP tools for real-time diagnostics and server monitoring.
