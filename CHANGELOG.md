@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+**Custom Language Extension Mapping** (fixes #33):
+- User-defined file extension to language ID mappings via configuration
+- Override default extension associations (30 built-in languages supported)
+- Automatic config file creation with default mappings when first run
+- Custom extensions allow support for specialized file types (e.g., Nushell .nu files)
+- Platform-specific configuration locations:
+  - Linux/macOS: `~/.config/mcpls/mcpls.toml`
+  - macOS alternative: `~/Library/Application Support/mcpls/mcpls.toml`
+  - Windows: `%APPDATA%\mcpls\mcpls.toml`
+  - Current directory: `./mcpls.toml`
+  - Custom path via `--config` flag or `$MCPLS_CONFIG` environment variable
+- `WorkspaceConfig::build_extension_map()` method for building extension HashMap
+- `WorkspaceConfig::get_language_for_extension()` method for language lookup
+- 30 default language mappings covering common programming languages:
+  - Rust, Python, JavaScript, TypeScript, Go, C/C++, Java, Ruby, PHP
+  - Swift, Kotlin, Scala, Zig, Lua, Shell scripts
+  - JSON, TOML, YAML, XML, HTML, CSS, SCSS, Less, Markdown
+  - C#, F#, R, TypeScript React (TSX), JavaScript React (JSX)
+
+**Breaking Changes**:
+- `detect_language()` function signature changed: now requires `&HashMap<String, String>` parameter instead of `Option<&HashMap<String, String>>`
+- Extension map is always required (can be empty HashMap if no custom mappings)
+- `DocumentTracker::new()` now requires extension map parameter
+- `Translator::with_extensions()` replaces implicit extension handling
+
+**Examples**:
+- Add Nushell support: `[[language_extensions]] extensions = ["nu"] language_id = "nushell"`
+- Override Rust detection: `[[language_extensions]] extensions = ["rs"] language_id = "custom-rust"`
+- Minimal config with only needed languages reduces memory footprint
+
+**Testing**:
+- 4 new integration tests for extension mapping (321 total tests, up from 317)
+- Tests for custom extension mappings in config
+- Tests for default extension fallback behavior
+- Tests for extension map building and lookup
+- Tests for language detection with custom mappings
+
 **Graceful LSP Server Degradation** (5-phase implementation, fixes #32):
 - System now continues operating even when some LSP servers fail to initialize
 - Non-Rust developers can use mcpls without rust-analyzer installed
