@@ -708,6 +708,9 @@ mod tests {
 
     #[test]
     fn test_load_does_not_overwrite_existing_config() {
+        // Save original directory to restore it after the test
+        let original_dir = std::env::current_dir().unwrap();
+
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
 
@@ -728,6 +731,9 @@ mod tests {
         assert_eq!(config.workspace.roots, vec![PathBuf::from("/custom/path")]);
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "python");
+
+        // Restore original directory to avoid affecting other tests
+        std::env::set_current_dir(original_dir).unwrap();
     }
 
     #[test]

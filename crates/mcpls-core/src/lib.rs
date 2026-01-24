@@ -57,21 +57,30 @@ use tracing::{error, info, warn};
 fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
     if config_roots.is_empty() {
         match std::env::current_dir() {
-            Ok(cwd) => match cwd.canonicalize() {
-                Ok(canonical) => {
-                    info!(
-                        "Using current directory as workspace root: {}",
-                        canonical.display()
-                    );
-                    vec![canonical]
+            Ok(cwd) => {
+                // current_dir() always returns an absolute path
+                match cwd.canonicalize() {
+                    Ok(canonical) => {
+                        info!(
+                            "Using current directory as workspace root: {}",
+                            canonical.display()
+                        );
+                        vec![canonical]
+                    }
+                    Err(e) => {
+                        // Canonicalization can fail if directory was deleted or permissions changed
+                        // but cwd itself is still absolute
+                        warn!(
+                            "Failed to canonicalize current directory: {e}, using non-canonical path"
+                        );
+                        vec![cwd]
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to canonicalize current directory: {e}");
-                    vec![PathBuf::from(".")]
-                }
-            },
+            }
             Err(e) => {
-                warn!("Failed to get current directory: {e}");
+                // This is extremely rare - only happens if cwd was deleted or unlinked
+                // In this case, we have no choice but to use a relative path
+                warn!("Failed to get current directory: {e}, using fallback");
                 vec![PathBuf::from(".")]
             }
         }
