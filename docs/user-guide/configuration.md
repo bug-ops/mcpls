@@ -71,6 +71,93 @@ position_encodings = ["utf-8", "utf-16", "utf-32"]
 
 Most language servers use UTF-16 encoding. mcpls automatically converts between MCP (UTF-8) and LSP encodings.
 
+### `workspace.language_extensions`
+
+**Type**: Array of `LanguageExtensionMapping` objects
+**Default**: 30 built-in language mappings (see below)
+
+Custom file extension to language ID mappings. Allows you to:
+- Add support for specialized file types
+- Override default extension associations
+- Reduce memory usage by including only languages you need
+
+```toml
+[workspace]
+
+# Add Nushell support
+[[language_extensions]]
+extensions = ["nu"]
+language_id = "nushell"
+
+# Override Rust to use custom language ID
+[[language_extensions]]
+extensions = ["rs"]
+language_id = "custom-rust"
+
+# Add multiple extensions for Python
+[[language_extensions]]
+extensions = ["py", "pyi", "pyw"]
+language_id = "python"
+```
+
+#### Default Language Mappings
+
+mcpls includes 30 language mappings by default:
+
+| Language | Extensions | Language ID |
+|----------|-----------|-------------|
+| Rust | rs | rust |
+| Python | py, pyw, pyi | python |
+| JavaScript | js, mjs, cjs | javascript |
+| TypeScript | ts, mts, cts | typescript |
+| TypeScript React | tsx | typescriptreact |
+| JavaScript React | jsx | javascriptreact |
+| Go | go | go |
+| C | c, h | c |
+| C++ | cpp, cc, cxx, hpp, hh, hxx | cpp |
+| Java | java | java |
+| Ruby | rb | ruby |
+| PHP | php | php |
+| Swift | swift | swift |
+| Kotlin | kt, kts | kotlin |
+| Scala | scala, sc | scala |
+| Zig | zig | zig |
+| Lua | lua | lua |
+| Shell | sh, bash, zsh | shellscript |
+| JSON | json | json |
+| TOML | toml | toml |
+| YAML | yaml, yml | yaml |
+| XML | xml | xml |
+| HTML | html, htm | html |
+| CSS | css | css |
+| SCSS | scss | scss |
+| Less | less | less |
+| Markdown | md, markdown | markdown |
+| C# | cs | csharp |
+| F# | fs, fsi, fsx | fsharp |
+| R | r, R | r |
+
+These defaults are automatically included when you don't specify custom `language_extensions`. If you provide any custom mappings, you must include all languages you want to use.
+
+#### Minimal Configuration Strategy
+
+For better performance, configure only the languages you actually use:
+
+```toml
+[workspace]
+
+# Only Rust and Python
+[[language_extensions]]
+extensions = ["rs"]
+language_id = "rust"
+
+[[language_extensions]]
+extensions = ["py", "pyi"]
+language_id = "python"
+```
+
+This reduces memory usage compared to loading all 30 default mappings.
+
 ## LSP Server Configuration
 
 Each `[[lsp_servers]]` section defines a language server.
@@ -300,6 +387,19 @@ roots = [
     "/Users/username/projects/monorepo/cli"
 ]
 
+# Language extensions (optional - defaults will be used if not specified)
+[[language_extensions]]
+extensions = ["rs"]
+language_id = "rust"
+
+[[language_extensions]]
+extensions = ["ts", "tsx"]
+language_id = "typescript"
+
+[[language_extensions]]
+extensions = ["py", "pyi"]
+language_id = "python"
+
 # Rust backend
 [[lsp_servers]]
 language_id = "rust"
@@ -336,6 +436,43 @@ file_patterns = ["**/*.cpp", "**/*.cc", "**/*.cxx", "**/*.h", "**/*.hpp"]
 
 [lsp_servers.initialization_options]
 compilationDatabasePath = "build"
+```
+
+### Custom Language Support (Nushell Example)
+
+```toml
+[workspace]
+roots = ["/Users/username/projects/scripts"]
+
+# Add Nushell language support
+[[language_extensions]]
+extensions = ["nu"]
+language_id = "nushell"
+
+# Keep Rust support for other scripts
+[[language_extensions]]
+extensions = ["rs"]
+language_id = "rust"
+
+# Shell scripts
+[[language_extensions]]
+extensions = ["sh", "bash"]
+language_id = "shellscript"
+
+# Configure Nushell LSP server
+[[lsp_servers]]
+language_id = "nushell"
+command = "nu"
+args = ["--lsp"]
+file_patterns = ["**/*.nu"]
+timeout_seconds = 30
+
+# rust-analyzer for Rust scripts
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
 ```
 
 ## Command-Line Flags
