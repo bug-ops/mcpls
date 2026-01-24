@@ -12,6 +12,54 @@ roots = [
 # Position encoding preference (utf-8 is more efficient for Rust)
 position_encodings = ["utf-8", "utf-16"]
 
+# Language extension mappings (optional)
+# mcpls recognizes 30 languages by default. Customize here to:
+# - Add support for specialized file types
+# - Override default associations
+# - Include only languages you need
+
+# Example: Add Nushell support
+# [[language_extensions]]
+# extensions = ["nu"]
+# language_id = "nushell"
+
+# Example: Override Rust detection to use custom language ID
+# [[language_extensions]]
+# extensions = ["rs"]
+# language_id = "custom-rust"
+
+# Default language extensions (automatically included if not specified):
+# - Rust: rs
+# - Python: py, pyw, pyi
+# - JavaScript: js, mjs, cjs
+# - TypeScript: ts, mts, cts, tsx
+# - Go: go
+# - C: c, h
+# - C++: cpp, cc, cxx, hpp, hh, hxx
+# - Java: java
+# - Ruby: rb
+# - PHP: php
+# - Swift: swift
+# - Kotlin: kt, kts
+# - Scala: scala, sc
+# - Zig: zig
+# - Lua: lua
+# - Shell: sh, bash, zsh
+# - JSON: json
+# - TOML: toml
+# - YAML: yaml, yml
+# - XML: xml
+# - HTML: html, htm
+# - CSS: css
+# - SCSS: scss
+# - Less: less
+# - Markdown: md, markdown
+# - C#: cs
+# - F#: fs, fsi, fsx
+# - R: r, R
+# - JSX: jsx
+# - TSX: tsx (TypeScript React)
+
 # Rust - rust-analyzer
 [[lsp_servers]]
 language_id = "rust"

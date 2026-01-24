@@ -78,6 +78,65 @@ cd mcpls
 cargo install --path crates/mcpls-cli
 ```
 
+## Configuration
+
+### Custom Language Extensions
+
+mcpls recognizes 30 programming languages by default. You can customize file extension mappings to:
+- Add support for specialized file types (e.g., `.nu` for Nushell)
+- Override default associations (e.g., use a custom Rust server)
+- Reduce memory usage by including only languages you use
+
+#### Platform-Specific Config Locations
+
+mcpls searches for configuration files in this order:
+
+| Platform | Default Location | Alternative |
+|----------|-----------------|-------------|
+| Linux | `~/.config/mcpls/mcpls.toml` | `./mcpls.toml` |
+| macOS | `~/.config/mcpls/mcpls.toml` | `~/Library/Application Support/mcpls/mcpls.toml` |
+| Windows | `%APPDATA%\mcpls\mcpls.toml` | `.\mcpls.toml` |
+| Any | `--config /path/to/file` | `$MCPLS_CONFIG` env var |
+
+#### Example: Adding Nushell Support
+
+```toml
+[workspace]
+roots = []  # Auto-detect
+
+# Add Nushell language support
+[[language_extensions]]
+extensions = ["nu"]
+language_id = "nushell"
+
+# Rust is recognized by default, but you can override
+[[language_extensions]]
+extensions = ["rs"]
+language_id = "rust"
+```
+
+#### Example: Minimal Config (Only Essential Languages)
+
+```toml
+[workspace]
+roots = []
+
+# Only configure languages you actually use
+[[language_extensions]]
+extensions = ["rs"]
+language_id = "rust"
+
+[[language_extensions]]
+extensions = ["py", "pyi"]
+language_id = "python"
+
+[[language_extensions]]
+extensions = ["ts", "tsx"]
+language_id = "typescript"
+```
+
+See the [full example configuration](examples/mcpls.toml) for all supported languages and options.
+
 ## Quick Start
 
 ### 1. Configure Claude Code

@@ -81,9 +81,13 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// TOML parsing error.
+    /// TOML deserialization error.
     #[error("TOML parsing error: {0}")]
-    Toml(#[from] toml::de::Error),
+    TomlDe(#[from] toml::de::Error),
+
+    /// TOML serialization error.
+    #[error("TOML serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
 
     /// LSP client transport error.
     #[error("transport error: {0}")]
@@ -180,7 +184,7 @@ pub enum Error {
     },
 
     /// No LSP servers available (none configured or all failed).
-    #[error("No LSP servers available: {0}")]
+    #[error("{0}")]
     NoServersAvailable(String),
 }
 
@@ -272,11 +276,11 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn test_error_from_toml() {
+    fn test_error_from_toml_de() {
         let toml_str = "[invalid toml";
         let toml_err = toml::from_str::<toml::Value>(toml_str).unwrap_err();
         let err: Error = toml_err.into();
-        assert!(matches!(err, Error::Toml(_)));
+        assert!(matches!(err, Error::TomlDe(_)));
     }
 
     #[test]
@@ -409,12 +413,11 @@ mod tests {
 
     #[test]
     fn test_error_display_no_servers_available() {
-        let err = Error::NoServersAvailable(
-            "No LSP servers available: none configured or all failed to initialize".to_string(),
-        );
+        let err =
+            Error::NoServersAvailable("none configured or all failed to initialize".to_string());
         assert_eq!(
             err.to_string(),
-            "No LSP servers available: No LSP servers available: none configured or all failed to initialize"
+            "none configured or all failed to initialize"
         );
     }
 
@@ -422,7 +425,6 @@ mod tests {
     fn test_error_no_servers_available_with_custom_message() {
         let custom_msg = "none configured or all failed to initialize";
         let err = Error::NoServersAvailable(custom_msg.to_string());
-        assert!(err.to_string().contains("No LSP servers available"));
-        assert!(err.to_string().contains(custom_msg));
+        assert_eq!(err.to_string(), custom_msg);
     }
 }
