@@ -5,9 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.1] - 2026-01-24
 
 ### Added
+
+**Custom Language Extension Mapping** (3-phase implementation, fixes #33):
+- Configurable custom file extension-to-language ID mappings in `mcpls.toml`
+- Auto-config creation on first run with 30 sensible default language mappings (Rust, Python, TypeScript, Go, C/C++, Java, and 24 others)
+- Extension map automatically built from configuration and integrated through server initialization pipeline
+- Graceful fallback to `plaintext` language for unknown file extensions
+- Builder pattern for Translator initialization: `Translator::new().with_extensions(HashMap)`
+- Comprehensive test coverage with 4 new integration tests (317 total tests)
+- Platform-specific config paths: Linux/macOS `~/.config/mcpls/`, macOS alternative `~/Library/Application Support/`, Windows `%APPDATA%\mcpls\`
+- Default language extensions table in configuration documentation showing all 30 built-in mappings
 
 **Graceful LSP Server Degradation** (5-phase implementation, fixes #32):
 - System now continues operating even when some LSP servers fail to initialize
@@ -33,27 +43,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - No servers available: return `NoServersAvailable` error with clear message
 
 **Testing**:
-- 38 new tests covering all graceful degradation scenarios (337 total tests, up from 299)
-- Tests for empty configs, single failures, multiple failures, and edge cases
+- 38 new tests covering all graceful degradation scenarios + 4 new tests for extension mapping (317 total tests, up from 275)
+- Tests for empty configs, single failures, multiple failures, edge cases, and extension mapping scenarios
 - Tests for logging behavior and error message formatting
-- Integration tests for complete serve() function degradation
+- Integration tests for complete serve() function degradation and extension map initialization
 
-**Examples**:
-- Python developer without Rust: Server returns clear error message instead of crashing
-- Partial setup: If only some configured servers fail, system continues with available ones
-- Custom config: Users can configure only the language servers they need
+**Documentation Updates**:
+- Configuration documentation with extension mapping table and 30 built-in language mappings
+- Updated README with custom extension configuration examples
+- Added language_extensions section to TOML configuration reference
 
 ### Changed
 
+- **Language detection API** — Breaking change: `detect_language()` now requires explicit `HashMap<String, String>` parameter instead of `Option`. This enables proper extension mapping support.
+- **Error message clarity** — SEC-01: Removed redundant "No LSP servers available" prefix from error messages to reduce information disclosure
 - **Shorter tool descriptions** — Condensed MCP tool descriptions for better compatibility with AI agent context windows
 - **LSP server initialization** — Switched from fail-fast to graceful degradation strategy
 - **Error handling** — More descriptive error messages showing which servers failed and why
 - **Logging** — Added warning-level logs for partial success scenarios
-- **Documentation** — Updated lib.rs crate documentation with graceful degradation overview
+- **Documentation** — Updated lib.rs crate documentation with graceful degradation and extension mapping overview
 
 ### Fixed
 
 - **Documentation link** — Disambiguated `error` module link in crate docs (was causing `rustdoc::broken-intra-doc-links` warning)
+- **Test isolation** — Fixed test isolation issue in `test_load_does_not_overwrite_existing_config` by properly saving and restoring working directory, resolving llvm-cov coverage job failures
 
 ## [0.3.0] - 2025-12-28
 
@@ -399,7 +412,8 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/bug-ops/mcpls/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bug-ops/mcpls/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/bug-ops/mcpls/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/bug-ops/mcpls/compare/v0.2.0...v0.2.1

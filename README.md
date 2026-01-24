@@ -97,7 +97,7 @@ Add mcpls to your MCP configuration (`~/.claude/claude_desktop_config.json`):
 
 ### 2. Configure language servers (optional)
 
-For languages beyond Rust, create a configuration file:
+For languages beyond Rust, create a configuration file. mcpls auto-creates a default config with 30 language mappings on first run.
 
 **Linux/macOS:**
 ```bash
@@ -114,6 +114,11 @@ language_id = "typescript"
 command = "typescript-language-server"
 args = ["--stdio"]
 file_patterns = ["**/*.ts", "**/*.tsx"]
+
+[language_extensions]
+# Custom file extension mappings (optional)
+# Example: map .nushell files to nushell language
+# nushell = ["nushell", ".nushell", ".nu"]
 EOF
 ```
 
@@ -124,7 +129,7 @@ mkdir -p ~/Library/Application\ Support/mcpls
 ```
 
 > [!NOTE]
-> macOS users: `dirs::config_dir()` returns `~/Library/Application Support/` by default. Use that path if `~/.config/mcpls/` doesn't work.
+> macOS users: Configuration is stored in `~/Library/Application Support/mcpls/` by default. You can also use `~/.config/mcpls/` or set `$MCPLS_CONFIG` to a custom path.
 
 ### 3. Experience the difference
 
@@ -217,10 +222,15 @@ checkOnSave.command = "clippy"
 
 [lsp_servers.env]
 RUST_BACKTRACE = "1"
+
+[language_extensions]
+# Custom extension mappings (optional)
+# Format: extension_without_dot = ["language_id", ".ext1", ".ext2"]
+nushell = ["nushell", ".nu", ".nushell"]
 ```
 
 > [!NOTE]
-> See [Configuration Reference](docs/user-guide/configuration.md) for all options.
+> See [Configuration Reference](docs/user-guide/configuration.md) for all options including the 30 built-in language extension mappings.
 
 ## Supported Language Servers
 
@@ -234,6 +244,11 @@ mcpls works with any LSP 3.17 compliant server. Battle-tested with:
 | Go | gopls | Modules and workspaces |
 | C/C++ | clangd | compile_commands.json |
 | Java | jdtls | Maven/Gradle projects |
+| Nushell | nushell-lsp | Custom extension mapping |
+| And 24+ others | Any LSP 3.17 server | See [Configuration Reference](docs/user-guide/configuration.md) for full list |
+
+> [!TIP]
+> By default, mcpls includes 30 language-to-extension mappings. To add custom mappings (e.g., `.nu` → nushell), edit the `language_extensions` section in your config.
 
 ## Architecture
 
