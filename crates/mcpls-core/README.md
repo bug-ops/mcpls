@@ -14,7 +14,8 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 - **Position encoding** — Handles MCP's 1-based positions ↔ LSP's 0-based coordinates
 - **LSP lifecycle** — Manages language server processes (spawn, initialize, shutdown)
 - **Document tracking** — Lazy-loads files, maintains synchronization state
-- **Configuration** — Parses TOML configs, discovers LSP servers
+- **Configuration** — Parses TOML configs, discovers LSP servers, manages language extension mappings
+- **Custom extension mapping** — Configurable file extension-to-language ID mappings with sensible defaults
 - **Graceful degradation** — Continues with available servers, even if some fail to initialize
 
 > [!NOTE]
@@ -24,7 +25,7 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 
 ```toml
 [dependencies]
-mcpls-core = "0.3"
+mcpls-core = "0.3.1"
 ```
 
 ## Architecture

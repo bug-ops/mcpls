@@ -28,13 +28,14 @@ mcpls --config ./mcpls.toml     # Custom config
 
 > [!NOTE]
 > Configuration auto-discovery order: `$MCPLS_CONFIG` → `./mcpls.toml` → platform config dir
+> Auto-creates default config with 30 language mappings on first run.
 
-Create `mcpls.toml` in the appropriate location:
+Create or edit `mcpls.toml` in the appropriate location:
 - **Linux/macOS:** `~/.config/mcpls/mcpls.toml`
 - **macOS (alternative):** `~/Library/Application Support/mcpls/mcpls.toml`
 - **Windows:** `%APPDATA%\mcpls\mcpls.toml`
 
-See the main [README](../../README.md) for configuration examples.
+See the main [README](../../README.md) for configuration examples and custom extension mapping.
 
 ## Options
 
