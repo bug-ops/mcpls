@@ -1,0 +1,61 @@
+# Auto-labeler configuration for mcpls
+# Applied via .github/workflows/labeler.yml
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "*.md"
+          - "docs/**"
+          - "LICENSE*"
+          - "CHANGELOG*"
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "crates/*/Cargo.toml"
+          - "deny.toml"
+
+rust:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.rs"
+          - "crates/**"
+
+ci/cd:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/**"
+          - ".github/actions/**"
+          - ".github/dependabot.yml"
+          - ".github/labeler.yml"
+
+testing:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/*/tests/**"
+          - "crates/**/tests.rs"
+          - "**/test_*.rs"
+          - "**/*_test.rs"
+          - "tests/**"
+
+configuration:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "*.toml"
+          - ".cargo/**"
+          - "rust-toolchain.toml"
+          - "rustfmt.toml"
+          - "clippy.toml"
+          - ".editorconfig"
+
+mcpls-core:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/mcpls-core/**"
+
+mcpls-cli:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/mcpls-cli/**"
