@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-pub use server::LspServerConfig;
+pub use server::{LspServerConfig, ServerHeuristics};
 
 use crate::error::{Error, Result};
 

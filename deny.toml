@@ -8,9 +8,7 @@ all-features = true
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-# paste is unmaintained but it's a transitive dependency from rmcp
-# https://rustsec.org/advisories/RUSTSEC-2024-0436
-ignore = ["RUSTSEC-2024-0436"]
+ignore = []
 
 [licenses]
 allow = [

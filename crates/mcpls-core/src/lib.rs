@@ -116,24 +116,38 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(workspace_roots.clone());
 
-    // Build configurations for batch spawning
-    let server_configs: Vec<ServerInitConfig> = config
+    // Build configurations for batch spawning with heuristics filtering
+    let applicable_configs: Vec<ServerInitConfig> = config
         .lsp_servers
         .iter()
-        .map(|lsp_config| ServerInitConfig {
-            server_config: lsp_config.clone(),
-            workspace_roots: workspace_roots.clone(),
-            initialization_options: lsp_config.initialization_options.clone(),
+        .filter_map(|lsp_config| {
+            let should_spawn = workspace_roots
+                .iter()
+                .any(|root| lsp_config.should_spawn(root));
+
+            if !should_spawn {
+                info!(
+                    "Skipping LSP server '{}' ({}): no project markers found",
+                    lsp_config.language_id, lsp_config.command
+                );
+                return None;
+            }
+
+            Some(ServerInitConfig {
+                server_config: lsp_config.clone(),
+                workspace_roots: workspace_roots.clone(),
+                initialization_options: lsp_config.initialization_options.clone(),
+            })
         })
         .collect();
 
     info!(
-        "Attempting to spawn {} LSP server(s)...",
-        server_configs.len()
+        "Attempting to spawn {} applicable LSP server(s)...",
+        applicable_configs.len()
     );
 
     // Spawn all servers with graceful degradation
-    let result = LspServer::spawn_batch(&server_configs).await;
+    let result = LspServer::spawn_batch(&applicable_configs).await;
 
     // Handle the three possible outcomes
     if result.all_failed() {
@@ -467,6 +481,7 @@ mod tests {
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    heuristics: None,
                 }],
             };
 
