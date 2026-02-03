@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-02-03
+
+### Added
+
+**Server-Specific Heuristics** (fixes #37):
+- Add `ServerHeuristics` struct with `project_markers` field for spawn filtering
+- Prevent spawning LSP servers in projects where they are not applicable
+- OR logic: server spawns if ANY marker file exists in workspace
+- Default heuristics for common LSP servers:
+  - rust-analyzer: `Cargo.toml`, `rust-toolchain.toml`
+  - pyright: `pyproject.toml`, `setup.py`, `requirements.txt`, `pyrightconfig.json`
+  - typescript-language-server: `package.json`, `tsconfig.json`, `jsconfig.json`
+  - gopls: `go.mod`, `go.sum`
+  - clangd: `CMakeLists.txt`, `compile_commands.json`, `Makefile`, `.clangd`
+  - zls: `build.zig`, `build.zig.zon`
+- User-configurable heuristics via `[lsp_servers.heuristics]` in `mcpls.toml`
+- Servers without heuristics always attempt spawn (backward compatible)
+- Skipped servers logged at INFO level for debugging
+- 12 new unit tests for heuristics logic (329 total tests)
+
 ## [0.3.1] - 2026-01-24
 
 ### Added

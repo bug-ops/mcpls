@@ -261,6 +261,47 @@ Claude: [get_references] Found 4 matches:
 | `MCPLS_LOG` | Log level (trace, debug, info, warn, error) | `info` |
 | `MCPLS_LOG_JSON` | Output logs as JSON | `false` |
 
+### Server Heuristics
+
+mcpls uses smart heuristics to spawn only relevant language servers. Each server checks for project markers before starting — if no markers are found, the server is skipped.
+
+| Language | Server | Project Markers |
+|----------|--------|-----------------|
+| Rust | rust-analyzer | `Cargo.toml`, `rust-toolchain.toml` |
+| Python | pyright | `pyproject.toml`, `setup.py`, `requirements.txt`, `pyrightconfig.json` |
+| TypeScript | typescript-language-server | `package.json`, `tsconfig.json`, `jsconfig.json` |
+| Go | gopls | `go.mod`, `go.sum` |
+| C/C++ | clangd | `CMakeLists.txt`, `compile_commands.json`, `Makefile`, `.clangd` |
+| Zig | zls | `build.zig`, `build.zig.zon` |
+
+> [!TIP]
+> Heuristics use OR logic — if ANY marker exists, the server spawns. This prevents spawning rust-analyzer in a Python-only project.
+
+#### Custom Heuristics
+
+Override or disable heuristics per server:
+
+```toml
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+file_patterns = ["**/*.rs"]
+
+# Custom markers (OR logic)
+[lsp_servers.heuristics]
+project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
+```
+
+To always spawn a server regardless of project type, omit the `heuristics` section:
+
+```toml
+[[lsp_servers]]
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+# No heuristics = always spawn
+```
+
 ### Full Configuration Example
 
 ```toml
@@ -274,6 +315,9 @@ command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
 timeout_seconds = 30
+
+[lsp_servers.heuristics]
+project_markers = ["Cargo.toml", "rust-toolchain.toml"]
 
 [lsp_servers.initialization_options]
 cargo.features = "all"
