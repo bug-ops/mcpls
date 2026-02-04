@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-02-04
+
+### Changed
+
+- **Default configuration** — Include all 6 predefined LSP servers in `ServerConfig::default()` instead of just rust-analyzer. Servers included: rust-analyzer, pyright, typescript, gopls, clangd, zls. Heuristics ensure servers only spawn when project markers exist.
+
 ## [0.3.2] - 2026-02-03
 
 ### Added
@@ -432,7 +438,9 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/bug-ops/mcpls/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/bug-ops/mcpls/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/bug-ops/mcpls/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bug-ops/mcpls/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/bug-ops/mcpls/compare/v0.2.1...v0.2.2
