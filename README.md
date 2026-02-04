@@ -13,7 +13,7 @@ mcpls is a universal bridge between AI coding assistants and language servers. I
 
 ## Why mcpls?
 
-AI coding assistants are remarkably capable, but they're working blind. They see code as text, not as the structured, typed, interconnected system it actually is. When Claude asks "what type is this variable?" it's guessing from context. When it refactors a function, it's hoping it found all the callers.
+AI coding assistants are remarkably capable, but they're working blind. They see code as text, not as the structured, typed, interconnected system it actually is.
 
 **mcpls changes that.** By bridging MCP and LSP, it gives AI agents access to:
 
@@ -21,44 +21,19 @@ AI coding assistants are remarkably capable, but they're working blind. They see
 - **Cross-references** — Find every usage of a symbol across your entire codebase
 - **Semantic navigation** — Jump to definitions, implementations, type declarations
 - **Real diagnostics** — See actual compiler errors, not hallucinated ones
-- **Intelligent completions** — Get suggestions that respect scope and types
 - **Safe refactoring** — Rename symbols with confidence, workspace-wide
-- **Graceful degradation** — Use available language servers, even if some fail to initialize
 
 > [!TIP]
-> Zero configuration for Rust projects. Just install mcpls and a language server — ready to go.
-
-## Prerequisites
-
-> [!TIP]
-> mcpls uses graceful degradation — if one language server fails or isn't installed, it continues with available servers. You don't need all servers installed.
-
-For Rust projects, install rust-analyzer:
-
-```bash
-# Via rustup (recommended)
-rustup component add rust-analyzer
-
-# Or via Homebrew (macOS)
-brew install rust-analyzer
-
-# Or via package manager (Linux)
-# Ubuntu/Debian: sudo apt install rust-analyzer
-# Arch: sudo pacman -S rust-analyzer
-```
-
-> [!IMPORTANT]
-> At least one language server must be available. Without any configured servers or if all fail to initialize, mcpls will return a clear error message.
+> Zero configuration for Rust projects. Just install mcpls and rust-analyzer — ready to go.
 
 ## Installation
-
-### From crates.io
 
 ```bash
 cargo install mcpls
 ```
 
-### Pre-built binaries
+<details>
+<summary><strong>Pre-built binaries & other methods</strong></summary>
 
 Download from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest):
 
@@ -70,7 +45,7 @@ Download from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest
 | macOS | Apple Silicon | [mcpls-macos-aarch64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
 | Windows | x86_64 | [mcpls-windows-x86_64.zip](https://github.com/bug-ops/mcpls/releases/latest) |
 
-### From source
+**From source:**
 
 ```bash
 git clone https://github.com/bug-ops/mcpls
@@ -78,70 +53,42 @@ cd mcpls
 cargo install --path crates/mcpls-cli
 ```
 
-## Configuration
+</details>
 
-### Custom Language Extensions
+<details>
+<summary><strong>Prerequisites (language servers)</strong></summary>
 
-mcpls recognizes 30 programming languages by default. You can customize file extension mappings to:
-- Add support for specialized file types (e.g., `.nu` for Nushell)
-- Override default associations (e.g., use a custom Rust server)
-- Reduce memory usage by including only languages you use
+mcpls uses graceful degradation — if one language server fails, it continues with available servers.
 
-#### Platform-Specific Config Locations
-
-mcpls searches for configuration files in this order:
-
-| Platform | Default Location | Alternative |
-|----------|-----------------|-------------|
-| Linux | `~/.config/mcpls/mcpls.toml` | `./mcpls.toml` |
-| macOS | `~/.config/mcpls/mcpls.toml` | `~/Library/Application Support/mcpls/mcpls.toml` |
-| Windows | `%APPDATA%\mcpls\mcpls.toml` | `.\mcpls.toml` |
-| Any | `--config /path/to/file` | `$MCPLS_CONFIG` env var |
-
-#### Example: Adding Nushell Support
-
-```toml
-[workspace]
-roots = []  # Auto-detect
-
-# Add Nushell language support
-[[language_extensions]]
-extensions = ["nu"]
-language_id = "nushell"
-
-# Rust is recognized by default, but you can override
-[[language_extensions]]
-extensions = ["rs"]
-language_id = "rust"
+**Rust (rust-analyzer):**
+```bash
+rustup component add rust-analyzer
+# Or: brew install rust-analyzer (macOS)
 ```
 
-#### Example: Minimal Config (Only Essential Languages)
-
-```toml
-[workspace]
-roots = []
-
-# Only configure languages you actually use
-[[language_extensions]]
-extensions = ["rs"]
-language_id = "rust"
-
-[[language_extensions]]
-extensions = ["py", "pyi"]
-language_id = "python"
-
-[[language_extensions]]
-extensions = ["ts", "tsx"]
-language_id = "typescript"
+**Python (pyright):**
+```bash
+npm install -g pyright
 ```
 
-See the [full example configuration](examples/mcpls.toml) for all supported languages and options.
+**TypeScript:**
+```bash
+npm install -g typescript-language-server typescript
+```
+
+**Go (gopls):**
+```bash
+go install golang.org/x/tools/gopls@latest
+```
+
+> [!IMPORTANT]
+> At least one language server must be available.
+
+</details>
 
 ## Quick Start
 
-### 1. Configure Claude Code
-
-Add mcpls to your MCP configuration (`~/.claude/claude_desktop_config.json`):
+**1. Configure Claude Code** (`~/.claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -154,43 +101,7 @@ Add mcpls to your MCP configuration (`~/.claude/claude_desktop_config.json`):
 }
 ```
 
-### 2. Configure language servers (optional)
-
-For languages beyond Rust, create a configuration file. mcpls auto-creates a default config with 30 language mappings on first run.
-
-**Linux/macOS:**
-```bash
-mkdir -p ~/.config/mcpls
-cat > ~/.config/mcpls/mcpls.toml << 'EOF'
-[[lsp_servers]]
-language_id = "python"
-command = "pyright-langserver"
-args = ["--stdio"]
-file_patterns = ["**/*.py"]
-
-[[lsp_servers]]
-language_id = "typescript"
-command = "typescript-language-server"
-args = ["--stdio"]
-file_patterns = ["**/*.ts", "**/*.tsx"]
-
-[language_extensions]
-# Custom file extension mappings (optional)
-# Example: map .nushell files to nushell language
-# nushell = ["nushell", ".nushell", ".nu"]
-EOF
-```
-
-**macOS (alternative XDG location):**
-```bash
-mkdir -p ~/Library/Application\ Support/mcpls
-# Copy or create mcpls.toml in ~/Library/Application Support/mcpls/
-```
-
-> [!NOTE]
-> macOS users: Configuration is stored in `~/Library/Application Support/mcpls/` by default. You can also use `~/.config/mcpls/` or set `$MCPLS_CONFIG` to a custom path.
-
-### 3. Experience the difference
+**2. Experience the difference:**
 
 ```
 You: What's the return type of process_request on line 47?
@@ -210,7 +121,8 @@ Claude: [get_references] Found 4 matches:
 
 ## MCP Tools
 
-### Code Intelligence
+<details>
+<summary><strong>Code Intelligence</strong></summary>
 
 | Tool | What it does |
 |------|--------------|
@@ -221,7 +133,10 @@ Claude: [get_references] Found 4 matches:
 | `get_document_symbols` | Structured outline — functions, types, constants, imports |
 | `workspace_symbol_search` | Find symbols by name across the entire workspace |
 
-### Diagnostics & Analysis
+</details>
+
+<details>
+<summary><strong>Diagnostics & Analysis</strong></summary>
 
 | Tool | What it does |
 |------|--------------|
@@ -229,31 +144,65 @@ Claude: [get_references] Found 4 matches:
 | `get_cached_diagnostics` | Fast access to push-based diagnostics from LSP server |
 | `get_code_actions` | Quick fixes, refactorings, and source actions at a position |
 
-### Refactoring
+</details>
+
+<details>
+<summary><strong>Refactoring & Call Hierarchy</strong></summary>
 
 | Tool | What it does |
 |------|--------------|
 | `rename_symbol` | Workspace-wide rename with full reference tracking |
 | `format_document` | Apply language-specific formatting rules |
-
-### Call Hierarchy
-
-| Tool | What it does |
-|------|--------------|
 | `prepare_call_hierarchy` | Get callable items at a position for call hierarchy |
 | `get_incoming_calls` | Find all callers of a function (who calls this?) |
 | `get_outgoing_calls` | Find all callees of a function (what does this call?) |
 
-### Server Monitoring
+</details>
+
+<details>
+<summary><strong>Server Monitoring</strong></summary>
 
 | Tool | What it does |
 |------|--------------|
 | `get_server_logs` | Debug LSP issues with internal log messages |
 | `get_server_messages` | User-facing messages from the language server |
 
+</details>
+
 ## Configuration
 
-### Environment Variables
+<details>
+<summary><strong>Server Heuristics</strong></summary>
+
+mcpls uses smart heuristics to spawn only relevant language servers. Each server checks for project markers before starting.
+
+| Language | Server | Project Markers |
+|----------|--------|-----------------|
+| Rust | rust-analyzer | `Cargo.toml`, `rust-toolchain.toml` |
+| Python | pyright | `pyproject.toml`, `setup.py`, `requirements.txt` |
+| TypeScript | typescript-language-server | `package.json`, `tsconfig.json` |
+| Go | gopls | `go.mod`, `go.sum` |
+| C/C++ | clangd | `CMakeLists.txt`, `compile_commands.json`, `Makefile` |
+| Zig | zls | `build.zig`, `build.zig.zon` |
+
+> [!TIP]
+> Heuristics use OR logic — if ANY marker exists, the server spawns.
+
+**Custom heuristics:**
+
+```toml
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+
+[lsp_servers.heuristics]
+project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
+```
+
+</details>
+
+<details>
+<summary><strong>Environment Variables</strong></summary>
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -261,53 +210,23 @@ Claude: [get_references] Found 4 matches:
 | `MCPLS_LOG` | Log level (trace, debug, info, warn, error) | `info` |
 | `MCPLS_LOG_JSON` | Output logs as JSON | `false` |
 
-### Server Heuristics
+**Config file locations:**
 
-mcpls uses smart heuristics to spawn only relevant language servers. Each server checks for project markers before starting — if no markers are found, the server is skipped.
+| Platform | Default Location |
+|----------|-----------------|
+| Linux | `~/.config/mcpls/mcpls.toml` |
+| macOS | `~/.config/mcpls/mcpls.toml` or `~/Library/Application Support/mcpls/` |
+| Windows | `%APPDATA%\mcpls\mcpls.toml` |
 
-| Language | Server | Project Markers |
-|----------|--------|-----------------|
-| Rust | rust-analyzer | `Cargo.toml`, `rust-toolchain.toml` |
-| Python | pyright | `pyproject.toml`, `setup.py`, `requirements.txt`, `pyrightconfig.json` |
-| TypeScript | typescript-language-server | `package.json`, `tsconfig.json`, `jsconfig.json` |
-| Go | gopls | `go.mod`, `go.sum` |
-| C/C++ | clangd | `CMakeLists.txt`, `compile_commands.json`, `Makefile`, `.clangd` |
-| Zig | zls | `build.zig`, `build.zig.zon` |
+</details>
 
-> [!TIP]
-> Heuristics use OR logic — if ANY marker exists, the server spawns. This prevents spawning rust-analyzer in a Python-only project.
-
-#### Custom Heuristics
-
-Override or disable heuristics per server:
-
-```toml
-[[lsp_servers]]
-language_id = "rust"
-command = "rust-analyzer"
-file_patterns = ["**/*.rs"]
-
-# Custom markers (OR logic)
-[lsp_servers.heuristics]
-project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
-```
-
-To always spawn a server regardless of project type, omit the `heuristics` section:
-
-```toml
-[[lsp_servers]]
-language_id = "python"
-command = "pyright-langserver"
-args = ["--stdio"]
-# No heuristics = always spawn
-```
-
-### Full Configuration Example
+<details>
+<summary><strong>Full Configuration Example</strong></summary>
 
 ```toml
 [workspace]
 roots = ["/path/to/project"]
-position_encodings = ["utf-8", "utf-16"]
+heuristics_max_depth = 10
 
 [[lsp_servers]]
 language_id = "rust"
@@ -323,21 +242,21 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml"]
 cargo.features = "all"
 checkOnSave.command = "clippy"
 
-[lsp_servers.env]
-RUST_BACKTRACE = "1"
-
-[language_extensions]
-# Custom extension mappings (optional)
-# Format: extension_without_dot = ["language_id", ".ext1", ".ext2"]
-nushell = ["nushell", ".nu", ".nushell"]
+[[language_extensions]]
+extensions = ["nu"]
+language_id = "nushell"
 ```
 
-> [!NOTE]
-> See [Configuration Reference](docs/user-guide/configuration.md) for all options including the 30 built-in language extension mappings.
+See [Configuration Reference](docs/user-guide/configuration.md) for all options.
+
+</details>
 
 ## Supported Language Servers
 
 mcpls works with any LSP 3.17 compliant server. Battle-tested with:
+
+<details>
+<summary><strong>View supported servers</strong></summary>
 
 | Language | Server | Notes |
 |----------|--------|-------|
@@ -347,13 +266,15 @@ mcpls works with any LSP 3.17 compliant server. Battle-tested with:
 | Go | gopls | Modules and workspaces |
 | C/C++ | clangd | compile_commands.json |
 | Java | jdtls | Maven/Gradle projects |
-| Nushell | nushell-lsp | Custom extension mapping |
-| And 24+ others | Any LSP 3.17 server | See [Configuration Reference](docs/user-guide/configuration.md) for full list |
+| Zig | zls | build.zig support |
+| And 24+ others | Any LSP 3.17 server | See [docs](docs/user-guide/configuration.md) |
 
-> [!TIP]
-> By default, mcpls includes 30 language-to-extension mappings. To add custom mappings (e.g., `.nu` → nushell), edit the `language_extensions` section in your config.
+</details>
 
 ## Architecture
+
+<details>
+<summary><strong>View architecture diagram</strong></summary>
 
 ```mermaid
 flowchart TB
@@ -379,31 +300,26 @@ flowchart TB
 ```
 
 **Key design decisions:**
-
 - **Single binary** — No Node.js, Python, or other runtime dependencies
 - **Async-first** — Tokio-based, handles multiple LSP servers concurrently
 - **Memory-safe** — Pure Rust, zero `unsafe` blocks
 - **Resource-bounded** — Configurable limits on documents and file sizes
 
+</details>
+
 ## Documentation
 
-- [Getting Started](docs/user-guide/getting-started.md) — First-time setup
-- [Configuration Reference](docs/user-guide/configuration.md) — All options explained
-- [Tools Reference](docs/user-guide/tools-reference.md) — Deep dive into each tool
-- [Troubleshooting](docs/user-guide/troubleshooting.md) — Common issues and solutions
-- [Installation Guide](docs/user-guide/installation.md) — Platform-specific instructions
+- [Getting Started](docs/user-guide/getting-started.md)
+- [Configuration Reference](docs/user-guide/configuration.md)
+- [Tools Reference](docs/user-guide/tools-reference.md)
+- [Troubleshooting](docs/user-guide/troubleshooting.md)
 
 ## Development
 
 ```bash
-# Build
-cargo build
-
-# Test (uses nextest for speed)
-cargo nextest run
-
-# Run locally
-cargo run -- --log-level debug
+cargo build              # Build
+cargo nextest run        # Test
+cargo run -- --log-level debug  # Run locally
 ```
 
 **Requirements:** Rust 1.85+ (Edition 2024)
