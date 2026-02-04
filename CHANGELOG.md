@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Default configuration** — Include all 6 predefined LSP servers in `ServerConfig::default()` instead of just rust-analyzer. Servers included: rust-analyzer, pyright, typescript, gopls, clangd, zls. Heuristics ensure servers only spawn when project markers exist.
+- **BREAKING: `LspServerConfig::should_spawn` signature** — Method now accepts `max_depth: Option<usize>` parameter for recursive search depth control.
 
 ## [0.3.2] - 2026-02-03
 
