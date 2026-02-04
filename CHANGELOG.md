@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.3] - 2026-02-04
 
+### Added
+
+- **Recursive heuristics scanning** (fixes #48) — LSP server heuristics now recursively scan workspace subdirectories for project markers, enabling detection of nested projects (e.g., Python bindings in `python/` subfolder of a Cargo project). Features:
+  - `is_applicable_recursive()` method using `ignore` crate for efficient traversal
+  - Hardcoded exclusion list: `node_modules`, `target`, `.git`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `build`, `dist`, `.cargo`, `.rustup`, `vendor`, `coverage`, `.next`, `.nuxt`
+  - Configurable `heuristics_max_depth` (default: 10) in `[workspace]` section
+  - Early termination on first marker match for performance
+  - Respects `.gitignore` patterns automatically
+
 ### Changed
 
 - **Default configuration** — Include all 6 predefined LSP servers in `ServerConfig::default()` instead of just rust-analyzer. Servers included: rust-analyzer, pyright, typescript, gopls, clangd, zls. Heuristics ensure servers only spawn when project markers exist.

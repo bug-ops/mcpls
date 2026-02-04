@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-pub use server::{LspServerConfig, ServerHeuristics};
+pub use server::{DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, ServerHeuristics};
 
 use crate::error::{Error, Result};
 
@@ -55,6 +55,12 @@ pub struct WorkspaceConfig {
     /// Allows users to customize which file extensions map to which language servers.
     #[serde(default)]
     pub language_extensions: Vec<LanguageExtensionMapping>,
+
+    /// Maximum depth for recursive project marker search.
+    /// Controls how deeply nested projects can be detected.
+    /// Default: 10
+    #[serde(default = "default_heuristics_max_depth")]
+    pub heuristics_max_depth: usize,
 }
 
 impl Default for WorkspaceConfig {
@@ -63,8 +69,13 @@ impl Default for WorkspaceConfig {
             roots: Vec::new(),
             position_encodings: default_position_encodings(),
             language_extensions: default_language_extensions(),
+            heuristics_max_depth: default_heuristics_max_depth(),
         }
     }
+}
+
+const fn default_heuristics_max_depth() -> usize {
+    DEFAULT_HEURISTICS_MAX_DEPTH
 }
 
 impl WorkspaceConfig {
@@ -499,6 +510,7 @@ mod tests {
         assert_eq!(workspace.position_encodings, vec!["utf-8", "utf-16"]);
         assert!(!workspace.language_extensions.is_empty());
         assert_eq!(workspace.language_extensions.len(), 30);
+        assert_eq!(workspace.heuristics_max_depth, DEFAULT_HEURISTICS_MAX_DEPTH);
     }
 
     #[test]
@@ -633,6 +645,7 @@ mod tests {
                     language_id: "nushell".to_string(),
                 },
             ],
+            heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
         };
 
         let map = workspace.build_extension_map();
@@ -658,6 +671,7 @@ mod tests {
                     language_id: "python".to_string(),
                 },
             ],
+            heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
         };
 
         assert_eq!(
@@ -762,5 +776,46 @@ mod tests {
         assert!(content.contains("[[lsp_servers]]"));
         assert!(content.contains("language_id = \"rust\""));
         assert!(content.contains("extensions = [\"rs\"]"));
+    }
+
+    #[test]
+    fn test_heuristics_max_depth_default() {
+        let config = WorkspaceConfig::default();
+        assert_eq!(config.heuristics_max_depth, 10);
+    }
+
+    #[test]
+    fn test_heuristics_max_depth_from_config() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("depth.toml");
+
+        let toml_content = r"
+            [workspace]
+            heuristics_max_depth = 5
+        ";
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.workspace.heuristics_max_depth, 5);
+    }
+
+    #[test]
+    fn test_heuristics_max_depth_uses_default_when_not_specified() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("no_depth.toml");
+
+        let toml_content = r"
+            [workspace]
+            roots = []
+        ";
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(
+            config.workspace.heuristics_max_depth,
+            DEFAULT_HEURISTICS_MAX_DEPTH
+        );
     }
 }

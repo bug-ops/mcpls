@@ -2771,6 +2771,7 @@ mod tests {
                 roots: vec![PathBuf::from("/tmp/test-workspace")],
                 position_encodings: vec!["utf-8".to_string()],
                 language_extensions: language_extensions.clone(),
+                heuristics_max_depth: 10,
             },
             lsp_servers: vec![],
         };

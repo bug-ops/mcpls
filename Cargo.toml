@@ -23,6 +23,7 @@ chrono = "0.4.43"
 clap = "4.5"
 dirs = "6.0"
 futures = "0.3"
+ignore = "0.4"
 lsp-types = "0.97"
 mcpls-core = { path = "crates/mcpls-core", version = "0.3.3" }
 predicates = "3.1"

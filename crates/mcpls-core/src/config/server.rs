@@ -3,7 +3,33 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
+
+/// Default max depth for recursive marker search.
+pub const DEFAULT_HEURISTICS_MAX_DEPTH: usize = 10;
+
+/// Directories excluded from recursive marker search.
+/// These are well-known directories that should never contain project markers.
+const EXCLUDED_DIRECTORIES: &[&str] = &[
+    "node_modules",
+    "target",
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "build",
+    "dist",
+    ".cargo",
+    ".rustup",
+    "vendor",
+    "coverage",
+    ".next",
+    ".nuxt",
+];
 
 /// Heuristics for determining if an LSP server should be spawned.
 ///
@@ -45,6 +71,71 @@ impl ServerHeuristics {
         self.project_markers
             .iter()
             .any(|marker| workspace_root.join(marker).exists())
+    }
+
+    /// Check if any marker exists anywhere in the workspace tree.
+    ///
+    /// Recursively searches the workspace for project markers, excluding
+    /// well-known directories like `node_modules`, `target`, `.git`, etc.
+    ///
+    /// # Arguments
+    ///
+    /// * `workspace_root` - Root directory to search from
+    /// * `max_depth` - Maximum recursion depth (default: 10)
+    ///
+    /// # Returns
+    ///
+    /// `true` if any marker is found, `false` otherwise.
+    #[must_use]
+    pub fn is_applicable_recursive(&self, workspace_root: &Path, max_depth: Option<usize>) -> bool {
+        if self.project_markers.is_empty() {
+            return true;
+        }
+
+        // First check the root level (fast path)
+        if self.is_applicable(workspace_root) {
+            return true;
+        }
+
+        let depth = max_depth.unwrap_or(DEFAULT_HEURISTICS_MAX_DEPTH);
+        self.find_any_marker_recursive(workspace_root, depth)
+    }
+
+    /// Search recursively for any marker file.
+    fn find_any_marker_recursive(&self, workspace_root: &Path, max_depth: usize) -> bool {
+        let mut builder = WalkBuilder::new(workspace_root);
+        builder
+            .max_depth(Some(max_depth))
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(false)
+            .follow_links(false)
+            .standard_filters(false)
+            .filter_entry(|entry| {
+                // Skip excluded directories entirely (prevents descending into them)
+                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if EXCLUDED_DIRECTORIES.contains(&name) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+
+        for entry in builder.build().flatten() {
+            let path = entry.path();
+
+            // Check if this entry matches any marker
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                if self.project_markers.iter().any(|m| m == file_name) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 
@@ -90,11 +181,18 @@ const fn default_timeout() -> u64 {
 
 impl LspServerConfig {
     /// Check if this server should be spawned for the given workspace.
+    ///
+    /// Uses recursive marker search to detect nested projects.
+    ///
+    /// # Arguments
+    ///
+    /// * `workspace_root` - Root directory of the workspace
+    /// * `max_depth` - Maximum depth for recursive search (default: 10)
     #[must_use]
-    pub fn should_spawn(&self, workspace_root: &Path) -> bool {
+    pub fn should_spawn(&self, workspace_root: &Path, max_depth: Option<usize>) -> bool {
         self.heuristics
             .as_ref()
-            .is_none_or(|h| h.is_applicable(workspace_root))
+            .is_none_or(|h| h.is_applicable_recursive(workspace_root, max_depth))
     }
 
     /// Create a default configuration for rust-analyzer.
@@ -387,7 +485,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().unwrap();
-        assert!(config.should_spawn(tmp.path()));
+        assert!(config.should_spawn(tmp.path(), None));
     }
 
     #[test]
@@ -396,14 +494,14 @@ mod tests {
         std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
 
         let config = LspServerConfig::rust_analyzer();
-        assert!(config.should_spawn(tmp.path()));
+        assert!(config.should_spawn(tmp.path(), None));
     }
 
     #[test]
     fn test_should_not_spawn_without_markers() {
         let tmp = TempDir::new().unwrap();
         let config = LspServerConfig::rust_analyzer();
-        assert!(!config.should_spawn(tmp.path()));
+        assert!(!config.should_spawn(tmp.path(), None));
     }
 
     #[test]
@@ -459,5 +557,212 @@ mod tests {
         let markers = &config.heuristics.unwrap().project_markers;
         assert!(markers.contains(&"build.zig".to_string()));
         assert!(markers.contains(&"build.zig.zon".to_string()));
+    }
+
+    // Recursive scanning tests
+    #[test]
+    fn test_recursive_empty_markers_always_applicable() {
+        let heuristics = ServerHeuristics::default();
+        let tmp = TempDir::new().unwrap();
+        assert!(heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_marker_at_root() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["Cargo.toml"]);
+        assert!(heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_nested_python_project() {
+        let tmp = TempDir::new().unwrap();
+        // Create Rust project at root
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        // Create nested Python project
+        let python_dir = tmp.path().join("python");
+        std::fs::create_dir(&python_dir).unwrap();
+        std::fs::write(python_dir.join("pyproject.toml"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["pyproject.toml", "setup.py"]);
+        assert!(heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_deeply_nested_marker() {
+        let tmp = TempDir::new().unwrap();
+        // Create a deeply nested structure
+        let deep_path = tmp.path().join("level1").join("level2").join("level3");
+        std::fs::create_dir_all(&deep_path).unwrap();
+        std::fs::write(deep_path.join("go.mod"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["go.mod"]);
+        assert!(heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_no_marker_found() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src").join("main.rs"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["Cargo.toml"]);
+        assert!(!heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_max_depth_respected() {
+        let tmp = TempDir::new().unwrap();
+        // Create marker at depth 5
+        let deep_path = tmp.path().join("a").join("b").join("c").join("d").join("e");
+        std::fs::create_dir_all(&deep_path).unwrap();
+        std::fs::write(deep_path.join("Cargo.toml"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["Cargo.toml"]);
+        // With max_depth=3, should not find marker at depth 5
+        assert!(!heuristics.is_applicable_recursive(tmp.path(), Some(3)));
+        // With max_depth=10 (default), should find it
+        assert!(heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_excludes_node_modules() {
+        let tmp = TempDir::new().unwrap();
+        // Create package.json inside node_modules (should be ignored)
+        let node_modules = tmp.path().join("node_modules").join("some-package");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::write(node_modules.join("package.json"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["package.json"]);
+        assert!(!heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_excludes_target_directory() {
+        let tmp = TempDir::new().unwrap();
+        // Create Cargo.toml inside target (should be ignored)
+        let target = tmp.path().join("target").join("debug");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("Cargo.toml"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["Cargo.toml"]);
+        assert!(!heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_excludes_git_directory() {
+        let tmp = TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git").join("hooks");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("Cargo.toml"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["Cargo.toml"]);
+        assert!(!heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_excludes_pycache() {
+        let tmp = TempDir::new().unwrap();
+        let pycache = tmp.path().join("__pycache__");
+        std::fs::create_dir_all(&pycache).unwrap();
+        std::fs::write(pycache.join("pyproject.toml"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["pyproject.toml"]);
+        assert!(!heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_excludes_venv() {
+        let tmp = TempDir::new().unwrap();
+        let venv = tmp.path().join(".venv").join("lib");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(venv.join("setup.py"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["setup.py"]);
+        assert!(!heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_finds_marker_outside_excluded() {
+        let tmp = TempDir::new().unwrap();
+        // Create excluded dir with marker
+        let node_modules = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::write(node_modules.join("package.json"), "").unwrap();
+        // Create valid marker in src
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("package.json"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["package.json"]);
+        assert!(heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_recursive_monorepo_structure() {
+        let tmp = TempDir::new().unwrap();
+        // Create monorepo with multiple language projects
+        let rust_pkg = tmp.path().join("packages").join("rust-lib");
+        let python_pkg = tmp.path().join("packages").join("python-bindings");
+        let ts_pkg = tmp.path().join("packages").join("typescript-client");
+
+        std::fs::create_dir_all(&rust_pkg).unwrap();
+        std::fs::create_dir_all(&python_pkg).unwrap();
+        std::fs::create_dir_all(&ts_pkg).unwrap();
+
+        std::fs::write(rust_pkg.join("Cargo.toml"), "").unwrap();
+        std::fs::write(python_pkg.join("pyproject.toml"), "").unwrap();
+        std::fs::write(ts_pkg.join("package.json"), "").unwrap();
+
+        // All should be detected
+        let rust_heuristics = ServerHeuristics::with_markers(["Cargo.toml"]);
+        let python_heuristics = ServerHeuristics::with_markers(["pyproject.toml"]);
+        let ts_heuristics = ServerHeuristics::with_markers(["package.json"]);
+
+        assert!(rust_heuristics.is_applicable_recursive(tmp.path(), None));
+        assert!(python_heuristics.is_applicable_recursive(tmp.path(), None));
+        assert!(ts_heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_should_spawn_recursive() {
+        let tmp = TempDir::new().unwrap();
+        // Create nested Python project in Rust workspace
+        let python_dir = tmp.path().join("bindings").join("python");
+        std::fs::create_dir_all(&python_dir).unwrap();
+        std::fs::write(python_dir.join("pyproject.toml"), "").unwrap();
+
+        let config = LspServerConfig::pyright();
+        assert!(config.should_spawn(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_should_spawn_with_custom_max_depth() {
+        let tmp = TempDir::new().unwrap();
+        let deep_path = tmp.path().join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep_path).unwrap();
+        std::fs::write(deep_path.join("Cargo.toml"), "").unwrap();
+
+        let config = LspServerConfig::rust_analyzer();
+        // Shallow depth should not find it
+        assert!(!config.should_spawn(tmp.path(), Some(2)));
+        // Default depth should find it
+        assert!(config.should_spawn(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_default_heuristics_max_depth() {
+        assert_eq!(DEFAULT_HEURISTICS_MAX_DEPTH, 10);
+    }
+
+    #[test]
+    fn test_excluded_directories_constant() {
+        assert!(EXCLUDED_DIRECTORIES.contains(&"node_modules"));
+        assert!(EXCLUDED_DIRECTORIES.contains(&"target"));
+        assert!(EXCLUDED_DIRECTORIES.contains(&".git"));
+        assert!(EXCLUDED_DIRECTORIES.contains(&"__pycache__"));
+        assert!(EXCLUDED_DIRECTORIES.contains(&".venv"));
     }
 }

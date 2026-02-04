@@ -112,6 +112,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
     let extension_map = config.workspace.build_extension_map();
+    let max_depth = Some(config.workspace.heuristics_max_depth);
 
     let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(workspace_roots.clone());
@@ -123,7 +124,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         .filter_map(|lsp_config| {
             let should_spawn = workspace_roots
                 .iter()
-                .any(|root| lsp_config.should_spawn(root));
+                .any(|root| lsp_config.should_spawn(root, max_depth));
 
             if !should_spawn {
                 info!(
@@ -472,6 +473,7 @@ mod tests {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
+                    heuristics_max_depth: 10,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -509,6 +511,7 @@ mod tests {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
+                    heuristics_max_depth: 10,
                 },
                 lsp_servers: vec![],
             };
