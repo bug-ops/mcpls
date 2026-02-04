@@ -355,7 +355,14 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             workspace: WorkspaceConfig::default(),
-            lsp_servers: vec![LspServerConfig::rust_analyzer()],
+            lsp_servers: vec![
+                LspServerConfig::rust_analyzer(),
+                LspServerConfig::pyright(),
+                LspServerConfig::typescript(),
+                LspServerConfig::gopls(),
+                LspServerConfig::clangd(),
+                LspServerConfig::zls(),
+            ],
         }
     }
 }
@@ -372,8 +379,13 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ServerConfig::default();
-        assert_eq!(config.lsp_servers.len(), 1);
+        assert_eq!(config.lsp_servers.len(), 6);
         assert_eq!(config.lsp_servers[0].language_id, "rust");
+        assert_eq!(config.lsp_servers[1].language_id, "python");
+        assert_eq!(config.lsp_servers[2].language_id, "typescript");
+        assert_eq!(config.lsp_servers[3].language_id, "go");
+        assert_eq!(config.lsp_servers[4].language_id, "cpp");
+        assert_eq!(config.lsp_servers[5].language_id, "zig");
         assert_eq!(config.workspace.position_encodings, vec!["utf-8", "utf-16"]);
     }
 
@@ -693,7 +705,7 @@ mod tests {
 
         let loaded_config = ServerConfig::load_from(&config_path).unwrap();
         assert_eq!(loaded_config.workspace.language_extensions.len(), 30);
-        assert_eq!(loaded_config.lsp_servers.len(), 1);
+        assert_eq!(loaded_config.lsp_servers.len(), 6);
         assert_eq!(loaded_config.lsp_servers[0].language_id, "rust");
     }
 
@@ -702,7 +714,7 @@ mod tests {
         // When called directly, default() should return config with all language extensions
         let config = ServerConfig::default();
         assert_eq!(config.workspace.language_extensions.len(), 30);
-        assert_eq!(config.lsp_servers.len(), 1);
+        assert_eq!(config.lsp_servers.len(), 6);
         assert_eq!(config.lsp_servers[0].language_id, "rust");
     }
 
