@@ -39,7 +39,11 @@ const EXCLUDED_DIRECTORIES: &[&str] = &[
 #[serde(deny_unknown_fields)]
 pub struct ServerHeuristics {
     /// Files or directories that indicate this server is applicable.
-    /// The server will spawn if ANY of these markers exist in the workspace root.
+    ///
+    /// The server will spawn if ANY of these markers exist anywhere in the workspace tree
+    /// (searched recursively up to `heuristics_max_depth`). Well-known directories like
+    /// `node_modules`, `target`, `.git` are excluded from the search.
+    ///
     /// If empty, the server will always attempt to spawn.
     #[serde(default)]
     pub project_markers: Vec<String>,
