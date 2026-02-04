@@ -5,6 +5,27 @@
 
 use std::path::PathBuf;
 
+/// Details of a single server spawn failure.
+#[derive(Debug, Clone)]
+pub struct ServerSpawnFailure {
+    /// Language ID of the failed server.
+    pub language_id: String,
+    /// Command that was attempted.
+    pub command: String,
+    /// Error message describing the failure.
+    pub message: String,
+}
+
+impl std::fmt::Display for ServerSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}): {}",
+            self.language_id, self.command, self.message
+        )
+    }
+}
+
 /// The main error type for mcpls-core operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -60,9 +81,13 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// TOML parsing error.
+    /// TOML deserialization error.
     #[error("TOML parsing error: {0}")]
-    Toml(#[from] toml::de::Error),
+    TomlDe(#[from] toml::de::Error),
+
+    /// TOML serialization error.
+    #[error("TOML serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
 
     /// LSP client transport error.
     #[error("transport error: {0}")]
@@ -137,6 +162,30 @@ pub enum Error {
         /// Maximum allowed size.
         max: u64,
     },
+
+    /// Partial server initialization - some servers failed but at least one succeeded.
+    #[error("some LSP servers failed to initialize: {failed_count}/{total_count} servers")]
+    PartialServerInit {
+        /// Number of servers that failed.
+        failed_count: usize,
+        /// Total number of configured servers.
+        total_count: usize,
+        /// Details of each failure.
+        failures: Vec<ServerSpawnFailure>,
+    },
+
+    /// All configured LSP servers failed to initialize.
+    #[error("all LSP servers failed to initialize ({count} configured)")]
+    AllServersFailedToInit {
+        /// Number of servers that were configured.
+        count: usize,
+        /// Details of each failure.
+        failures: Vec<ServerSpawnFailure>,
+    },
+
+    /// No LSP servers available (none configured or all failed).
+    #[error("{0}")]
+    NoServersAvailable(String),
 }
 
 /// A specialized Result type for mcpls-core operations.
@@ -227,11 +276,11 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn test_error_from_toml() {
+    fn test_error_from_toml_de() {
         let toml_str = "[invalid toml";
         let toml_err = toml::from_str::<toml::Value>(toml_str).unwrap_err();
         let err: Error = toml_err.into();
-        assert!(matches!(err, Error::Toml(_)));
+        assert!(matches!(err, Error::TomlDe(_)));
     }
 
     #[test]
@@ -257,5 +306,125 @@ mod tests {
 
         let source = std::error::Error::source(&err);
         assert!(source.is_some());
+    }
+
+    #[test]
+    fn test_server_spawn_failure_display() {
+        let failure = ServerSpawnFailure {
+            language_id: "rust".to_string(),
+            command: "rust-analyzer".to_string(),
+            message: "No such file or directory".to_string(),
+        };
+        assert_eq!(
+            failure.to_string(),
+            "rust (rust-analyzer): No such file or directory"
+        );
+    }
+
+    #[test]
+    fn test_server_spawn_failure_debug() {
+        let failure = ServerSpawnFailure {
+            language_id: "python".to_string(),
+            command: "pyright".to_string(),
+            message: "command not found".to_string(),
+        };
+        let debug_str = format!("{failure:?}");
+        assert!(debug_str.contains("python"));
+        assert!(debug_str.contains("pyright"));
+        assert!(debug_str.contains("command not found"));
+    }
+
+    #[test]
+    fn test_server_spawn_failure_clone() {
+        let failure = ServerSpawnFailure {
+            language_id: "typescript".to_string(),
+            command: "tsserver".to_string(),
+            message: "failed to start".to_string(),
+        };
+        let cloned = failure.clone();
+        assert_eq!(failure.language_id, cloned.language_id);
+        assert_eq!(failure.command, cloned.command);
+        assert_eq!(failure.message, cloned.message);
+    }
+
+    #[test]
+    fn test_error_display_partial_server_init() {
+        let err = Error::PartialServerInit {
+            failed_count: 2,
+            total_count: 3,
+            failures: vec![],
+        };
+        assert_eq!(
+            err.to_string(),
+            "some LSP servers failed to initialize: 2/3 servers"
+        );
+    }
+
+    #[test]
+    fn test_error_display_all_servers_failed_to_init() {
+        let err = Error::AllServersFailedToInit {
+            count: 2,
+            failures: vec![],
+        };
+        assert_eq!(
+            err.to_string(),
+            "all LSP servers failed to initialize (2 configured)"
+        );
+    }
+
+    #[test]
+    fn test_error_all_servers_failed_with_failures() {
+        let failures = vec![
+            ServerSpawnFailure {
+                language_id: "rust".to_string(),
+                command: "rust-analyzer".to_string(),
+                message: "not found".to_string(),
+            },
+            ServerSpawnFailure {
+                language_id: "python".to_string(),
+                command: "pyright".to_string(),
+                message: "permission denied".to_string(),
+            },
+        ];
+
+        let err = Error::AllServersFailedToInit { count: 2, failures };
+
+        assert!(err.to_string().contains("all LSP servers failed"));
+        assert!(err.to_string().contains("2 configured"));
+    }
+
+    #[test]
+    fn test_error_partial_server_init_with_failures() {
+        let failures = vec![ServerSpawnFailure {
+            language_id: "python".to_string(),
+            command: "pyright".to_string(),
+            message: "not found".to_string(),
+        }];
+
+        let err = Error::PartialServerInit {
+            failed_count: 1,
+            total_count: 2,
+            failures,
+        };
+
+        assert!(err.to_string().contains("some LSP servers failed"));
+        assert!(err.to_string().contains("1/2"));
+    }
+
+    #[test]
+    fn test_error_display_no_servers_available() {
+        let err =
+            Error::NoServersAvailable("none configured or all failed to initialize".to_string());
+        assert_eq!(
+            err.to_string(),
+            "none configured or all failed to initialize"
+        );
+    }
+
+    #[test]
+    fn test_error_no_servers_available_with_custom_message() {
+        let custom_msg = "none configured or all failed to initialize";
+        let err = Error::NoServersAvailable(custom_msg.to_string());
+        assert_eq!(err.to_string(), custom_msg);
     }
 }

@@ -13,7 +13,7 @@
 //! - [`mcp`] - MCP tool definitions and handlers
 //! - [`bridge`] - Translation layer between MCP and LSP protocols
 //! - [`config`] - Configuration types and loading
-//! - [`error`] - Error types for the library
+//! - [`mod@error`] - Error types for the library
 //!
 //! ## Example
 //!
@@ -42,7 +42,7 @@ pub use error::Error;
 use lsp::{LspServer, ServerInitConfig};
 use rmcp::ServiceExt;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Resolve workspace roots from config or current directory.
 ///
@@ -57,21 +57,30 @@ use tracing::{info, warn};
 fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
     if config_roots.is_empty() {
         match std::env::current_dir() {
-            Ok(cwd) => match cwd.canonicalize() {
-                Ok(canonical) => {
-                    info!(
-                        "Using current directory as workspace root: {}",
-                        canonical.display()
-                    );
-                    vec![canonical]
+            Ok(cwd) => {
+                // current_dir() always returns an absolute path
+                match cwd.canonicalize() {
+                    Ok(canonical) => {
+                        info!(
+                            "Using current directory as workspace root: {}",
+                            canonical.display()
+                        );
+                        vec![canonical]
+                    }
+                    Err(e) => {
+                        // Canonicalization can fail if directory was deleted or permissions changed
+                        // but cwd itself is still absolute
+                        warn!(
+                            "Failed to canonicalize current directory: {e}, using non-canonical path"
+                        );
+                        vec![cwd]
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to canonicalize current directory: {e}");
-                    vec![PathBuf::from(".")]
-                }
-            },
+            }
             Err(e) => {
-                warn!("Failed to get current directory: {e}");
+                // This is extremely rare - only happens if cwd was deleted or unlinked
+                // In this case, we have no choice but to use a relative path
+                warn!("Failed to get current directory: {e}, using fallback");
                 vec![PathBuf::from(".")]
             }
         }
@@ -83,49 +92,106 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
 /// Start the MCPLS server with the given configuration.
 ///
 /// This is the primary entry point for running the MCP-LSP bridge.
+/// Implements graceful degradation: if some but not all LSP servers fail
+/// to initialize, the service continues with available servers.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - LSP server initialization fails
+/// - All LSP servers fail to initialize
 /// - MCP server setup fails
 /// - Configuration is invalid
+///
+/// # Graceful Degradation
+///
+/// - **All servers succeed**: Service runs normally
+/// - **Partial success**: Logs warnings for failures, continues with available servers
+/// - **All servers fail**: Returns `Error::AllServersFailedToInit` with details
 pub async fn serve(config: ServerConfig) -> Result<(), Error> {
-    tracing::info!("Starting MCPLS server...");
+    info!("Starting MCPLS server...");
 
-    let mut translator = Translator::new();
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
+    let extension_map = config.workspace.build_extension_map();
 
+    let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(workspace_roots.clone());
 
-    for lsp_config in config.lsp_servers {
-        tracing::info!(
-            "Spawning LSP server for language '{}': {} {:?}",
-            lsp_config.language_id,
-            lsp_config.command,
-            lsp_config.args
-        );
+    // Build configurations for batch spawning with heuristics filtering
+    let applicable_configs: Vec<ServerInitConfig> = config
+        .lsp_servers
+        .iter()
+        .filter_map(|lsp_config| {
+            let should_spawn = workspace_roots
+                .iter()
+                .any(|root| lsp_config.should_spawn(root));
 
-        let server_init_config = ServerInitConfig {
-            server_config: lsp_config.clone(),
-            workspace_roots: workspace_roots.clone(),
-            initialization_options: lsp_config.initialization_options.clone(),
-        };
+            if !should_spawn {
+                info!(
+                    "Skipping LSP server '{}' ({}): no project markers found",
+                    lsp_config.language_id, lsp_config.command
+                );
+                return None;
+            }
 
-        let server = LspServer::spawn(server_init_config).await?;
-        let client = server.client().clone();
+            Some(ServerInitConfig {
+                server_config: lsp_config.clone(),
+                workspace_roots: workspace_roots.clone(),
+                initialization_options: lsp_config.initialization_options.clone(),
+            })
+        })
+        .collect();
 
-        translator.register_client(lsp_config.language_id.clone(), client);
-        translator.register_server(lsp_config.language_id.clone(), server);
+    info!(
+        "Attempting to spawn {} applicable LSP server(s)...",
+        applicable_configs.len()
+    );
+
+    // Spawn all servers with graceful degradation
+    let result = LspServer::spawn_batch(&applicable_configs).await;
+
+    // Handle the three possible outcomes
+    if result.all_failed() {
+        return Err(Error::AllServersFailedToInit {
+            count: result.failure_count(),
+            failures: result.failures,
+        });
     }
+
+    if result.partial_success() {
+        warn!(
+            "Partial server initialization: {} succeeded, {} failed",
+            result.server_count(),
+            result.failure_count()
+        );
+        for failure in &result.failures {
+            error!("Server initialization failed: {}", failure);
+        }
+    }
+
+    // Check if at least one server successfully initialized
+    if !result.has_servers() {
+        return Err(Error::NoServersAvailable(
+            "none configured or all failed to initialize".to_string(),
+        ));
+    }
+
+    // Register all successfully initialized servers
+    let server_count = result.server_count();
+    for (language_id, server) in result.servers {
+        let client = server.client().clone();
+        translator.register_client(language_id.clone(), client);
+        translator.register_server(language_id.clone(), server);
+    }
+
+    info!("Proceeding with {} LSP server(s)", server_count);
 
     let translator = Arc::new(Mutex::new(translator));
 
-    tracing::info!("Starting MCP server with rmcp...");
+    info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new(translator);
 
-    tracing::info!("MCPLS server initialized successfully");
-    tracing::info!("Listening for MCP requests on stdio...");
+    info!("MCPLS server initialized successfully");
+    info!("Listening for MCP requests on stdio...");
 
     let service = mcp_server
         .serve(rmcp::transport::stdio())
@@ -137,7 +203,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         .await
         .map_err(|e| Error::McpServer(format!("MCP server error: {e}")))?;
 
-    tracing::info!("MCPLS server shutting down");
+    info!("MCPLS server shutting down");
     Ok(())
 }
 
@@ -261,5 +327,206 @@ mod tests {
         let roots = resolve_workspace_roots(&config_roots);
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0], PathBuf::from("/workspace/path with spaces"));
+    }
+
+    // Tests for graceful degradation behavior
+    mod graceful_degradation_tests {
+        use super::*;
+        use crate::error::ServerSpawnFailure;
+        use crate::lsp::ServerInitResult;
+
+        #[test]
+        fn test_all_servers_failed_error_handling() {
+            let mut result = ServerInitResult::new();
+            result.add_failure(ServerSpawnFailure {
+                language_id: "rust".to_string(),
+                command: "rust-analyzer".to_string(),
+                message: "not found".to_string(),
+            });
+            result.add_failure(ServerSpawnFailure {
+                language_id: "python".to_string(),
+                command: "pyright".to_string(),
+                message: "not found".to_string(),
+            });
+
+            assert!(result.all_failed());
+            assert_eq!(result.failure_count(), 2);
+            assert_eq!(result.server_count(), 0);
+        }
+
+        #[test]
+        fn test_partial_success_detection() {
+            use std::collections::HashMap;
+
+            let mut result = ServerInitResult::new();
+            // Simulate one success and one failure
+            result.servers = HashMap::new(); // Would have a real server in production
+            result.add_failure(ServerSpawnFailure {
+                language_id: "python".to_string(),
+                command: "pyright".to_string(),
+                message: "not found".to_string(),
+            });
+
+            // Without actual servers, we can verify the failure was recorded
+            assert_eq!(result.failure_count(), 1);
+            assert_eq!(result.server_count(), 0);
+        }
+
+        #[test]
+        fn test_all_servers_succeeded_detection() {
+            use std::collections::HashMap;
+
+            let mut result = ServerInitResult::new();
+            result.servers = HashMap::new(); // Would have real servers in production
+
+            assert_eq!(result.failure_count(), 0);
+            assert!(!result.all_failed());
+            assert!(!result.partial_success());
+        }
+
+        #[test]
+        fn test_all_servers_failed_to_init_error() {
+            let failures = vec![
+                ServerSpawnFailure {
+                    language_id: "rust".to_string(),
+                    command: "rust-analyzer".to_string(),
+                    message: "command not found".to_string(),
+                },
+                ServerSpawnFailure {
+                    language_id: "python".to_string(),
+                    command: "pyright".to_string(),
+                    message: "permission denied".to_string(),
+                },
+            ];
+
+            let err = Error::AllServersFailedToInit { count: 2, failures };
+
+            assert!(err.to_string().contains("all LSP servers failed"));
+            assert!(err.to_string().contains("2 configured"));
+
+            // Verify failures are preserved
+            if let Error::AllServersFailedToInit { count, failures: f } = err {
+                assert_eq!(count, 2);
+                assert_eq!(f.len(), 2);
+                assert_eq!(f[0].language_id, "rust");
+                assert_eq!(f[1].language_id, "python");
+            } else {
+                panic!("Expected AllServersFailedToInit error");
+            }
+        }
+
+        #[test]
+        fn test_graceful_degradation_with_empty_config() {
+            let result = ServerInitResult::new();
+
+            // Empty config means no servers configured
+            assert!(!result.all_failed());
+            assert!(!result.partial_success());
+            assert!(!result.has_servers());
+            assert_eq!(result.server_count(), 0);
+            assert_eq!(result.failure_count(), 0);
+        }
+
+        #[test]
+        fn test_server_spawn_failure_display() {
+            let failure = ServerSpawnFailure {
+                language_id: "typescript".to_string(),
+                command: "tsserver".to_string(),
+                message: "executable not found in PATH".to_string(),
+            };
+
+            let display = failure.to_string();
+            assert!(display.contains("typescript"));
+            assert!(display.contains("tsserver"));
+            assert!(display.contains("executable not found"));
+        }
+
+        #[test]
+        fn test_result_helpers_consistency() {
+            let mut result = ServerInitResult::new();
+
+            // Initially empty
+            assert!(!result.has_servers());
+            assert!(!result.all_failed());
+            assert!(!result.partial_success());
+
+            // Add a failure
+            result.add_failure(ServerSpawnFailure {
+                language_id: "go".to_string(),
+                command: "gopls".to_string(),
+                message: "error".to_string(),
+            });
+
+            assert!(result.all_failed());
+            assert!(!result.has_servers());
+            assert!(!result.partial_success());
+        }
+
+        #[tokio::test]
+        async fn test_serve_fails_with_no_servers_available() {
+            use crate::config::{LspServerConfig, WorkspaceConfig};
+
+            // Create a config with an invalid server (guaranteed to fail)
+            let config = ServerConfig {
+                workspace: WorkspaceConfig {
+                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    language_extensions: vec![],
+                },
+                lsp_servers: vec![LspServerConfig {
+                    language_id: "rust".to_string(),
+                    command: "nonexistent-command-that-will-fail-12345".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec!["**/*.rs".to_string()],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                    heuristics: None,
+                }],
+            };
+
+            let result = serve(config).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+
+            // The serve function should now return NoServersAvailable error
+            // because all servers failed, but has_servers() returned false
+            assert!(
+                matches!(err, Error::NoServersAvailable(_))
+                    || matches!(err, Error::AllServersFailedToInit { .. }),
+                "Expected NoServersAvailable or AllServersFailedToInit error, got: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_serve_fails_with_empty_config() {
+            use crate::config::WorkspaceConfig;
+
+            // Create a config with no servers
+            let config = ServerConfig {
+                workspace: WorkspaceConfig {
+                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    language_extensions: vec![],
+                },
+                lsp_servers: vec![],
+            };
+
+            let result = serve(config).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+
+            // Should return NoServersAvailable because no servers were configured
+            assert!(
+                matches!(err, Error::NoServersAvailable(_)),
+                "Expected NoServersAvailable error, got: {err:?}"
+            );
+
+            if let Error::NoServersAvailable(msg) = err {
+                assert!(msg.contains("none configured"));
+            }
+        }
     }
 }

@@ -23,11 +23,15 @@ AI coding assistants are remarkably capable, but they're working blind. They see
 - **Real diagnostics** — See actual compiler errors, not hallucinated ones
 - **Intelligent completions** — Get suggestions that respect scope and types
 - **Safe refactoring** — Rename symbols with confidence, workspace-wide
+- **Graceful degradation** — Use available language servers, even if some fail to initialize
 
 > [!TIP]
 > Zero configuration for Rust projects. Just install mcpls and a language server — ready to go.
 
 ## Prerequisites
+
+> [!TIP]
+> mcpls uses graceful degradation — if one language server fails or isn't installed, it continues with available servers. You don't need all servers installed.
 
 For Rust projects, install rust-analyzer:
 
@@ -44,7 +48,7 @@ brew install rust-analyzer
 ```
 
 > [!IMPORTANT]
-> mcpls requires a language server to be installed. Without rust-analyzer, you'll see "LSP server process terminated unexpectedly" errors.
+> At least one language server must be available. Without any configured servers or if all fail to initialize, mcpls will return a clear error message.
 
 ## Installation
 
@@ -74,6 +78,65 @@ cd mcpls
 cargo install --path crates/mcpls-cli
 ```
 
+## Configuration
+
+### Custom Language Extensions
+
+mcpls recognizes 30 programming languages by default. You can customize file extension mappings to:
+- Add support for specialized file types (e.g., `.nu` for Nushell)
+- Override default associations (e.g., use a custom Rust server)
+- Reduce memory usage by including only languages you use
+
+#### Platform-Specific Config Locations
+
+mcpls searches for configuration files in this order:
+
+| Platform | Default Location | Alternative |
+|----------|-----------------|-------------|
+| Linux | `~/.config/mcpls/mcpls.toml` | `./mcpls.toml` |
+| macOS | `~/.config/mcpls/mcpls.toml` | `~/Library/Application Support/mcpls/mcpls.toml` |
+| Windows | `%APPDATA%\mcpls\mcpls.toml` | `.\mcpls.toml` |
+| Any | `--config /path/to/file` | `$MCPLS_CONFIG` env var |
+
+#### Example: Adding Nushell Support
+
+```toml
+[workspace]
+roots = []  # Auto-detect
+
+# Add Nushell language support
+[[language_extensions]]
+extensions = ["nu"]
+language_id = "nushell"
+
+# Rust is recognized by default, but you can override
+[[language_extensions]]
+extensions = ["rs"]
+language_id = "rust"
+```
+
+#### Example: Minimal Config (Only Essential Languages)
+
+```toml
+[workspace]
+roots = []
+
+# Only configure languages you actually use
+[[language_extensions]]
+extensions = ["rs"]
+language_id = "rust"
+
+[[language_extensions]]
+extensions = ["py", "pyi"]
+language_id = "python"
+
+[[language_extensions]]
+extensions = ["ts", "tsx"]
+language_id = "typescript"
+```
+
+See the [full example configuration](examples/mcpls.toml) for all supported languages and options.
+
 ## Quick Start
 
 ### 1. Configure Claude Code
@@ -93,9 +156,12 @@ Add mcpls to your MCP configuration (`~/.claude/claude_desktop_config.json`):
 
 ### 2. Configure language servers (optional)
 
-For languages beyond Rust, create `~/.config/mcpls/mcpls.toml`:
+For languages beyond Rust, create a configuration file. mcpls auto-creates a default config with 30 language mappings on first run.
 
-```toml
+**Linux/macOS:**
+```bash
+mkdir -p ~/.config/mcpls
+cat > ~/.config/mcpls/mcpls.toml << 'EOF'
 [[lsp_servers]]
 language_id = "python"
 command = "pyright-langserver"
@@ -107,7 +173,22 @@ language_id = "typescript"
 command = "typescript-language-server"
 args = ["--stdio"]
 file_patterns = ["**/*.ts", "**/*.tsx"]
+
+[language_extensions]
+# Custom file extension mappings (optional)
+# Example: map .nushell files to nushell language
+# nushell = ["nushell", ".nushell", ".nu"]
+EOF
 ```
+
+**macOS (alternative XDG location):**
+```bash
+mkdir -p ~/Library/Application\ Support/mcpls
+# Copy or create mcpls.toml in ~/Library/Application Support/mcpls/
+```
+
+> [!NOTE]
+> macOS users: Configuration is stored in `~/Library/Application Support/mcpls/` by default. You can also use `~/.config/mcpls/` or set `$MCPLS_CONFIG` to a custom path.
 
 ### 3. Experience the difference
 
@@ -181,6 +262,47 @@ Claude: [get_references] Found 4 matches:
 | `MCPLS_LOG` | Log level (trace, debug, info, warn, error) | `info` |
 | `MCPLS_LOG_JSON` | Output logs as JSON | `false` |
 
+### Server Heuristics
+
+mcpls uses smart heuristics to spawn only relevant language servers. Each server checks for project markers before starting — if no markers are found, the server is skipped.
+
+| Language | Server | Project Markers |
+|----------|--------|-----------------|
+| Rust | rust-analyzer | `Cargo.toml`, `rust-toolchain.toml` |
+| Python | pyright | `pyproject.toml`, `setup.py`, `requirements.txt`, `pyrightconfig.json` |
+| TypeScript | typescript-language-server | `package.json`, `tsconfig.json`, `jsconfig.json` |
+| Go | gopls | `go.mod`, `go.sum` |
+| C/C++ | clangd | `CMakeLists.txt`, `compile_commands.json`, `Makefile`, `.clangd` |
+| Zig | zls | `build.zig`, `build.zig.zon` |
+
+> [!TIP]
+> Heuristics use OR logic — if ANY marker exists, the server spawns. This prevents spawning rust-analyzer in a Python-only project.
+
+#### Custom Heuristics
+
+Override or disable heuristics per server:
+
+```toml
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+file_patterns = ["**/*.rs"]
+
+# Custom markers (OR logic)
+[lsp_servers.heuristics]
+project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
+```
+
+To always spawn a server regardless of project type, omit the `heuristics` section:
+
+```toml
+[[lsp_servers]]
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+# No heuristics = always spawn
+```
+
 ### Full Configuration Example
 
 ```toml
@@ -195,16 +317,24 @@ args = []
 file_patterns = ["**/*.rs"]
 timeout_seconds = 30
 
+[lsp_servers.heuristics]
+project_markers = ["Cargo.toml", "rust-toolchain.toml"]
+
 [lsp_servers.initialization_options]
 cargo.features = "all"
 checkOnSave.command = "clippy"
 
 [lsp_servers.env]
 RUST_BACKTRACE = "1"
+
+[language_extensions]
+# Custom extension mappings (optional)
+# Format: extension_without_dot = ["language_id", ".ext1", ".ext2"]
+nushell = ["nushell", ".nu", ".nushell"]
 ```
 
 > [!NOTE]
-> See [Configuration Reference](docs/user-guide/configuration.md) for all options.
+> See [Configuration Reference](docs/user-guide/configuration.md) for all options including the 30 built-in language extension mappings.
 
 ## Supported Language Servers
 
@@ -218,6 +348,11 @@ mcpls works with any LSP 3.17 compliant server. Battle-tested with:
 | Go | gopls | Modules and workspaces |
 | C/C++ | clangd | compile_commands.json |
 | Java | jdtls | Maven/Gradle projects |
+| Nushell | nushell-lsp | Custom extension mapping |
+| And 24+ others | Any LSP 3.17 server | See [Configuration Reference](docs/user-guide/configuration.md) for full list |
+
+> [!TIP]
+> By default, mcpls includes 30 language-to-extension mappings. To add custom mappings (e.g., `.nu` → nushell), edit the `language_extensions` section in your config.
 
 ## Architecture
 

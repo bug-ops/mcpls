@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 use url::Url;
 
-use super::state::detect_language;
+use super::state::{ResourceLimits, detect_language};
 use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
@@ -36,6 +36,8 @@ pub struct Translator {
     notification_cache: NotificationCache,
     /// Allowed workspace roots for path validation.
     workspace_roots: Vec<PathBuf>,
+    /// Custom file extension to language ID mappings.
+    extension_map: HashMap<String, String>,
 }
 
 impl Translator {
@@ -45,15 +47,28 @@ impl Translator {
         Self {
             lsp_clients: HashMap::new(),
             lsp_servers: HashMap::new(),
-            document_tracker: DocumentTracker::new(),
+            document_tracker: DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
             notification_cache: NotificationCache::new(),
             workspace_roots: vec![],
+            extension_map: HashMap::new(),
         }
     }
 
     /// Set the workspace roots for path validation.
     pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
         self.workspace_roots = roots;
+    }
+
+    /// Configure custom file extension mappings.
+    ///
+    /// This method sets the extension map and updates the document tracker
+    /// to use the same mappings for language detection.
+    #[must_use]
+    pub fn with_extensions(mut self, extension_map: HashMap<String, String>) -> Self {
+        self.document_tracker =
+            DocumentTracker::new(ResourceLimits::default(), extension_map.clone());
+        self.extension_map = extension_map;
+        self
     }
 
     /// Register an LSP client for a language.
@@ -462,7 +477,7 @@ impl Translator {
 
     /// Get a cloned LSP client for a file path based on language detection.
     fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
-        let language_id = detect_language(path);
+        let language_id = detect_language(path, &self.extension_map);
         self.lsp_clients
             .get(&language_id)
             .cloned()
@@ -3022,6 +3037,63 @@ mod tests {
             } else if server.language_id == "python" {
                 assert_eq!(server.document_count, 1);
             }
+    fn test_translator_with_custom_extensions() {
+        let mut extension_map = HashMap::new();
+        extension_map.insert("nu".to_string(), "nushell".to_string());
+        extension_map.insert("customext".to_string(), "customlang".to_string());
+
+        let translator = Translator::new().with_extensions(extension_map.clone());
+
+        assert_eq!(translator.extension_map.len(), 2);
+        assert_eq!(
+            translator.extension_map.get("nu"),
+            Some(&"nushell".to_string())
+        );
+        assert_eq!(
+            translator.extension_map.get("customext"),
+            Some(&"customlang".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_client_for_file_uses_custom_extension() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("script.nu");
+        fs::write(&test_file, "echo hello").unwrap();
+
+        let mut extension_map = HashMap::new();
+        extension_map.insert("nu".to_string(), "nushell".to_string());
+
+        let translator = Translator::new().with_extensions(extension_map);
+
+        let result = translator.get_client_for_file(&test_file);
+
+        assert!(result.is_err());
+        if let Err(Error::NoServerForLanguage(lang)) = result {
+            assert_eq!(lang, "nushell");
+        } else {
+            panic!("Expected NoServerForLanguage(nushell) error");
+        }
+    }
+
+    #[test]
+    fn test_get_client_for_file_falls_back_to_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("unknown.xyz");
+        fs::write(&test_file, "content").unwrap();
+
+        let mut extension_map = HashMap::new();
+        extension_map.insert("rs".to_string(), "rust".to_string());
+
+        let translator = Translator::new().with_extensions(extension_map);
+
+        let result = translator.get_client_for_file(&test_file);
+
+        assert!(result.is_err());
+        if let Err(Error::NoServerForLanguage(lang)) = result {
+            assert_eq!(lang, "plaintext");
+        } else {
+            panic!("Expected NoServerForLanguage(plaintext) error");
         }
     }
 
@@ -3063,5 +3135,40 @@ mod tests {
         let json = json_result.unwrap();
         assert!(json.contains("\"servers\""));
         assert!(json.contains("\"total_servers\""));
+    async fn test_serve_initializes_translator_with_extensions() {
+        use crate::config::{LanguageExtensionMapping, WorkspaceConfig};
+
+        let language_extensions = vec![
+            LanguageExtensionMapping {
+                extensions: vec!["nu".to_string()],
+                language_id: "nushell".to_string(),
+            },
+            LanguageExtensionMapping {
+                extensions: vec!["rs".to_string()],
+                language_id: "rust".to_string(),
+            },
+        ];
+
+        let config = crate::config::ServerConfig {
+            workspace: WorkspaceConfig {
+                roots: vec![PathBuf::from("/tmp/test-workspace")],
+                position_encodings: vec!["utf-8".to_string()],
+                language_extensions: language_extensions.clone(),
+            },
+            lsp_servers: vec![],
+        };
+
+        let extension_map = config.workspace.build_extension_map();
+        assert_eq!(extension_map.get("nu"), Some(&"nushell".to_string()));
+        assert_eq!(extension_map.get("rs"), Some(&"rust".to_string()));
+
+        let result = crate::serve(config).await;
+        assert!(result.is_err());
+
+        if let Err(crate::error::Error::NoServersAvailable(msg)) = result {
+            assert!(msg.contains("none configured"));
+        } else {
+            panic!("Expected NoServersAvailable error for empty server config");
+        }
     }
 }
