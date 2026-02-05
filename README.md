@@ -164,6 +164,7 @@ Claude: [get_references] Found 4 matches:
 
 | Tool | What it does |
 |------|--------------|
+| `get_server_status` | Show registered LSP servers and their status |
 | `get_server_logs` | Debug LSP issues with internal log messages |
 | `get_server_messages` | User-facing messages from the language server |
 
