@@ -27,7 +27,7 @@ ignore = "0.4"
 lsp-types = "0.97"
 mcpls-core = { path = "crates/mcpls-core", version = "0.3.3" }
 predicates = "3.1"
-rmcp = "0.14"
+rmcp = "0.15"
 rstest = "0.26"
 schemars = "1.2"
 serde = "1.0"
