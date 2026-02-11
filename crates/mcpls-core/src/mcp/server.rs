@@ -434,6 +434,7 @@ impl ServerHandler for McplsServer {
                 name: "mcpls".to_string(),
                 title: Some("MCPLS - MCP to LSP Bridge".to_string()),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                description: Some(env!("CARGO_PKG_DESCRIPTION").to_string()),
                 icons: None,
                 website_url: Some("https://github.com/bug-ops/mcpls".to_string()),
             },
