@@ -54,6 +54,19 @@ impl ServerState {
     }
 }
 
+impl std::fmt::Display for ServerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Uninitialized => "uninitialized",
+            Self::Initializing => "initializing",
+            Self::Ready => "ready",
+            Self::ShuttingDown => "shutting_down",
+            Self::Shutdown => "shutdown",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// Configuration for LSP server initialization.
 #[derive(Debug, Clone)]
 pub struct ServerInitConfig {
@@ -525,6 +538,31 @@ mod tests {
         let state = ServerState::Ready;
         let debug_str = format!("{state:?}");
         assert!(debug_str.contains("Ready"));
+    }
+
+    #[test]
+    fn test_server_state_display_ready() {
+        assert_eq!(format!("{}", ServerState::Ready), "ready");
+    }
+
+    #[test]
+    fn test_server_state_display_initializing() {
+        assert_eq!(format!("{}", ServerState::Initializing), "initializing");
+    }
+
+    #[test]
+    fn test_server_state_display_uninitialized() {
+        assert_eq!(format!("{}", ServerState::Uninitialized), "uninitialized");
+    }
+
+    #[test]
+    fn test_server_state_display_shutting_down() {
+        assert_eq!(format!("{}", ServerState::ShuttingDown), "shutting_down");
+    }
+
+    #[test]
+    fn test_server_state_display_shutdown() {
+        assert_eq!(format!("{}", ServerState::Shutdown), "shutdown");
     }
 
     #[test]

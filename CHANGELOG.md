@@ -112,6 +112,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Documentation link** — Disambiguated `error` module link in crate docs (was causing `rustdoc::broken-intra-doc-links` warning)
 - **Test isolation** — Fixed test isolation issue in `test_load_does_not_overwrite_existing_config` by properly saving and restoring working directory, resolving llvm-cov coverage job failures
 
+### Added
+
+- `get_server_status` — New MCP tool showing registered LSP servers and their status (ready/initializing/etc.), with document counts per language
+
+### Changed
+
+- **Shorter tool descriptions** — Condensed MCP tool descriptions for better compatibility with AI agent context windows
+
 ## [0.3.0] - 2025-12-28
 
 Major feature release adding LSP notification handling and 3 new MCP tools for real-time diagnostics and server monitoring.

@@ -170,6 +170,12 @@ impl LspClient {
         *self.state.lock().await
     }
 
+    /// Get the configuration for this client.
+    #[must_use]
+    pub const fn config(&self) -> &LspServerConfig {
+        &self.config
+    }
+
     /// Send request and wait for response with timeout.
     ///
     /// # Type Parameters
@@ -630,5 +636,65 @@ mod tests {
     #[test]
     fn test_jsonrpc_version_constant() {
         assert_eq!(JSONRPC_VERSION, "2.0");
+    }
+
+    #[tokio::test]
+    async fn test_state_returns_current_state() {
+        let config = LspServerConfig::rust_analyzer();
+        let client = LspClient::new(config);
+
+        let state = client.state().await;
+        assert_eq!(state, super::super::ServerState::Uninitialized);
+    }
+
+    #[test]
+    fn test_config_returns_config_reference() {
+        let config = LspServerConfig::rust_analyzer();
+        let client = LspClient::new(config);
+
+        let config_ref = client.config();
+        assert_eq!(config_ref.language_id, "rust");
+        assert_eq!(config_ref.command, "rust-analyzer");
+    }
+
+    #[test]
+    fn test_config_returns_custom_config() {
+        use std::collections::HashMap;
+
+        let mut env = HashMap::new();
+        env.insert("TEST_VAR".to_string(), "test_value".to_string());
+
+        let config = LspServerConfig {
+            language_id: "custom".to_string(),
+            command: "custom-server".to_string(),
+            args: vec!["--arg1".to_string()],
+            env,
+            file_patterns: vec!["**/*.custom".to_string()],
+            initialization_options: Some(serde_json::json!({"option": true})),
+            timeout_seconds: 45,
+        };
+        let client = LspClient::new(config);
+
+        let config_ref = client.config();
+        assert_eq!(config_ref.language_id, "custom");
+        assert_eq!(config_ref.command, "custom-server");
+        assert_eq!(config_ref.args, vec!["--arg1"]);
+        assert_eq!(config_ref.env.get("TEST_VAR"), Some(&"test_value".to_string()));
+        assert_eq!(config_ref.timeout_seconds, 45);
+    }
+
+    #[test]
+    fn test_config_same_after_clone() {
+        let config = LspServerConfig::pyright();
+        let client = LspClient::new(config);
+        let cloned = client.clone();
+
+        let orig_config = client.config();
+        let cloned_config = cloned.config();
+
+        assert_eq!(orig_config.language_id, cloned_config.language_id);
+        assert_eq!(orig_config.command, cloned_config.command);
+        assert_eq!(orig_config.args, cloned_config.args);
+        assert_eq!(orig_config.timeout_seconds, cloned_config.timeout_seconds);
     }
 }

@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete reference for all 16 MCP tools provided by mcpls.
+Complete reference for all 17 MCP tools provided by mcpls.
 
 ## Overview
 
@@ -46,6 +46,7 @@ mcpls exposes semantic code intelligence from Language Server Protocol (LSP) ser
 
 | Tool | Description |
 |------|-------------|
+| [get_server_status](#get_server_status) | Get registered LSP servers and their status |
 | [get_server_logs](#get_server_logs) | Get LSP server log messages |
 | [get_server_messages](#get_server_messages) | Get LSP server show messages |
 
@@ -810,6 +811,76 @@ Get diagnostics from LSP server push notifications (cached).
 - Returns diagnostics pushed by LSP server via `textDocument/publishDiagnostics`
 - More efficient than `get_diagnostics` as it uses cached data
 - May be empty if file hasn't been analyzed yet
+
+---
+
+## get_server_status
+
+Get the status of all registered LSP servers.
+
+### Parameters
+
+```json
+{}
+```
+
+No parameters required.
+
+### Returns
+
+```json
+{
+  "servers": [
+    {
+      "language_id": "rust",
+      "status": "ready",
+      "command": "rust-analyzer",
+      "document_count": 5
+    },
+    {
+      "language_id": "python",
+      "status": "initializing",
+      "command": "pyright-langserver",
+      "document_count": 0
+    }
+  ],
+  "total_servers": 2,
+  "document_count": 5
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `servers` | array | List of registered LSP servers |
+| `servers[].language_id` | string | Language identifier (rust, python, etc.) |
+| `servers[].status` | string | Server state: ready, initializing, uninitialized, shutting_down, shutdown |
+| `servers[].command` | string | Server command (e.g., rust-analyzer) |
+| `servers[].document_count` | integer | Number of open documents for this language |
+| `total_servers` | integer | Total number of registered servers |
+| `document_count` | integer | Total documents across all servers |
+
+### Example Use Cases
+
+**Check server health:**
+```
+User: Which language servers are running?
+Claude: [Uses get_server_status] 2 servers registered:
+        - rust: ready (rust-analyzer, 5 documents)
+        - python: initializing (pyright-langserver)
+```
+
+**Debug initialization:**
+```
+User: Why isn't completion working for Python files?
+Claude: [Uses get_server_status] The Python server is still initializing.
+        Wait a moment for it to become ready.
+```
+
+### Notes
+
+- Returns empty `servers` array if no LSP servers are configured
+- Status values are always lowercase strings
+- Document count reflects currently open/tracked documents
 
 ---
 
