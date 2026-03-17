@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
@@ -427,27 +427,24 @@ impl McplsServer {
 #[tool_handler]
 impl ServerHandler for McplsServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "mcpls".to_string(),
-                title: Some("MCPLS - MCP to LSP Bridge".to_string()),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                description: Some(env!("CARGO_PKG_DESCRIPTION").to_string()),
-                icons: None,
-                website_url: Some("https://github.com/bug-ops/mcpls".to_string()),
-            },
-            instructions: Some(
-                concat!(
-                    "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
-                    "capabilities as MCP tools for semantic code intelligence. ",
-                    "Supports hover, definition, references, diagnostics, rename, ",
-                    "completions, symbols, and formatting."
-                )
-                .to_string(),
-            ),
-        }
+        let mut implementation = Implementation::new("mcpls", env!("CARGO_PKG_VERSION"));
+        implementation.title = Some("MCPLS - MCP to LSP Bridge".to_string());
+        implementation.description = Some(env!("CARGO_PKG_DESCRIPTION").to_string());
+        implementation.website_url = Some("https://github.com/bug-ops/mcpls".to_string());
+
+        let mut server_info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        server_info.server_info = implementation;
+        server_info.instructions = Some(
+            concat!(
+                "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
+                "capabilities as MCP tools for semantic code intelligence. ",
+                "Supports hover, definition, references, diagnostics, rename, ",
+                "completions, symbols, and formatting."
+            )
+            .to_string(),
+        );
+
+        server_info
     }
 }
 
@@ -466,7 +463,6 @@ mod tests {
         let server = create_test_server();
         let info = server.get_info();
 
-        assert_eq!(info.protocol_version, ProtocolVersion::V_2024_11_05);
         assert!(info.capabilities.tools.is_some());
         assert_eq!(info.server_info.name, "mcpls");
         assert!(info.instructions.is_some());
