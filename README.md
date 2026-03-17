@@ -1,7 +1,7 @@
 # mcpls
 
-[![Crates.io](https://img.shields.io/crates/v/mcpls)](https://crates.io/crates/mcpls)
-[![docs.rs](https://img.shields.io/docsrs/mcpls-core)](https://docs.rs/mcpls-core)
+[![Crates.io](https://img.shields.io/crates/v/mcpls?label=mcpls)](https://crates.io/crates/mcpls)
+[![docs.rs](https://img.shields.io/docsrs/mcpls-core?label=mcpls-core)](https://docs.rs/mcpls-core)
 [![CI](https://img.shields.io/github/actions/workflow/status/bug-ops/mcpls/ci.yml?branch=main)](https://github.com/bug-ops/mcpls/actions)
 [![codecov](https://codecov.io/gh/bug-ops/mcpls/graph/badge.svg?token=FQEDLNF2GS)](https://codecov.io/gh/bug-ops/mcpls)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
