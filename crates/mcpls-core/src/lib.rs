@@ -111,7 +111,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
-    let extension_map = config.workspace.build_extension_map();
+    let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
     let mut translator = Translator::new().with_extensions(extension_map);
