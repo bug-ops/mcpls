@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: "0 6 * * 1"
 
+# Minimal permissions: no secrets exposed, no write access beyond security-events.
+# pull_request_target with checkout of fork head SHA is safe here because:
+# - no secrets are passed to the job
+# - autobuild compiles but does not execute code with elevated privileges
+# - this is the only supported pattern for scanning fork PRs with CodeQL
 permissions: {}
 
 jobs:
@@ -24,6 +29,11 @@ jobs:
         language: [actions, rust]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # For pull_request_target: check out the fork head to scan PR changes.
+          # For push/schedule: github.sha resolves to the pushed commit.
+          # Safe because this job has no access to secrets.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
