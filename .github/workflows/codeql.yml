@@ -1,0 +1,50 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+
+# Minimal permissions: no secrets exposed, no write access beyond security-events.
+# pull_request_target with checkout of fork head SHA is safe here because:
+# - no secrets are passed to the job
+# - autobuild compiles but does not execute code with elevated privileges
+# - this is the only supported pattern for scanning fork PRs with CodeQL
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, rust]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # For pull_request_target: check out the fork head to scan PR changes.
+          # For push/schedule: github.sha resolves to the pushed commit.
+          # Safe because this job has no access to secrets.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
