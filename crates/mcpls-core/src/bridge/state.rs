@@ -87,6 +87,12 @@ impl DocumentTracker {
         self.documents.is_empty()
     }
 
+    /// Get all tracked documents.
+    #[must_use]
+    pub const fn documents(&self) -> &HashMap<PathBuf, DocumentState> {
+        &self.documents
+    }
+
     /// Open a document and track its state.
     ///
     /// Returns the document URI for use in LSP requests.
@@ -705,6 +711,39 @@ mod tests {
     }
 
     #[test]
+    fn test_documents_accessor_returns_empty_map_for_new_tracker() {
+        let tracker = DocumentTracker::new();
+        let docs = tracker.documents();
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_documents_accessor_returns_all_open_documents() {
+        let mut tracker = DocumentTracker::new();
+        let path1 = PathBuf::from("/test/file1.rs");
+        let path2 = PathBuf::from("/test/file2.rs");
+
+        tracker.open(path1.clone(), "content1".to_string()).unwrap();
+        tracker.open(path2.clone(), "content2".to_string()).unwrap();
+
+        let docs = tracker.documents();
+        assert_eq!(docs.len(), 2);
+        assert!(docs.contains_key(&path1));
+        assert!(docs.contains_key(&path2));
+    }
+
+    #[test]
+    fn test_documents_accessor_reflects_document_state() {
+        let mut tracker = DocumentTracker::new();
+        let path = PathBuf::from("/test/file.rs");
+
+        tracker.open(path.clone(), "initial".to_string()).unwrap();
+        tracker.update(&path, "updated".to_string());
+
+        let docs = tracker.documents();
+        let state = docs.get(&path).unwrap();
+        assert_eq!(state.content, "updated");
+        assert_eq!(state.version, 2);
     fn test_detect_language_with_custom_extension() {
         let mut map = HashMap::new();
         map.insert("nu".to_string(), "nushell".to_string());
