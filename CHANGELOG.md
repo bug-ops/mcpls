@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+
+- **C/C++ file pattern language detection** - When `lsp_servers[].file_patterns` include simple extensions such as `**/*.c` or `**/*.h`, mcpls now derives extension-to-language mappings from those patterns and overlays them onto the workspace extension map. This changes the default behavior for matching C/C++ files to prefer the configured LSP server language instead of falling back to built-in mappings or `plaintext`.
 
 ## [0.3.5] - 2026-03-17
 
