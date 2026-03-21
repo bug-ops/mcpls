@@ -121,6 +121,11 @@ impl WorkspaceConfig {
 /// Supports common patterns such as `**/*.rs` and `*.h`.
 /// Returns `None` for patterns without a simple trailing extension.
 fn extract_extension_from_pattern(pattern: &str) -> Option<String> {
+    let basename = pattern.rsplit('/').next().unwrap_or(pattern);
+    if basename.starts_with('.') {
+        return None;
+    }
+
     let (_, ext) = pattern.rsplit_once('.')?;
     if ext.is_empty() {
         return None;
@@ -694,6 +699,29 @@ mod tests {
         assert_eq!(map.get("cxx"), Some(&"cpp".to_string()));
         assert_eq!(map.get("nu"), Some(&"nushell".to_string()));
         assert_eq!(map.get("unknown"), None);
+    }
+
+    #[test]
+    fn test_extract_extension_from_pattern_empty_string() {
+        assert_eq!(extract_extension_from_pattern(""), None);
+    }
+
+    #[test]
+    fn test_extract_extension_from_pattern_without_dot() {
+        assert_eq!(extract_extension_from_pattern("**/*"), None);
+    }
+
+    #[test]
+    fn test_extract_extension_from_pattern_dotfile() {
+        assert_eq!(extract_extension_from_pattern(".gitignore"), None);
+    }
+
+    #[test]
+    fn test_extract_extension_from_pattern_multi_dot_extension() {
+        assert_eq!(
+            extract_extension_from_pattern("foo.tar.gz"),
+            Some("gz".to_string())
+        );
     }
 
     #[test]
