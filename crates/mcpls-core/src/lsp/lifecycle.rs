@@ -291,6 +291,11 @@ impl LspServer {
                     ..Default::default()
                 }),
                 text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                    document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
+                        dynamic_registration: Some(false),
+                        hierarchical_document_symbol_support: Some(true),
+                        ..Default::default()
+                    }),
                     hover: Some(lsp_types::HoverClientCapabilities {
                         dynamic_registration: Some(false),
                         content_format: Some(vec![
