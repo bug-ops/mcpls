@@ -28,7 +28,7 @@ jobs:
       matrix:
         language: [actions, rust]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # For pull_request_target: check out the fork head to scan PR changes.
           # For push/schedule: github.sha resolves to the pushed commit.
