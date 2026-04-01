@@ -39,9 +39,9 @@ use std::sync::Arc;
 use bridge::Translator;
 pub use config::ServerConfig;
 pub use error::Error;
-use lsp::{LspServer, ServerInitConfig};
+use lsp::{LspNotification, LspServer, ServerInitConfig};
 use rmcp::ServiceExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 /// Resolve workspace roots from config or current directory.
@@ -116,6 +116,16 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 
     let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(workspace_roots.clone());
+    let translator = Arc::new(Mutex::new(translator));
+
+    let (notification_tx, mut notification_rx) = mpsc::channel::<LspNotification>(256);
+    let notification_translator = Arc::clone(&translator);
+    tokio::spawn(async move {
+        while let Some(notification) = notification_rx.recv().await {
+            let mut translator = notification_translator.lock().await;
+            translator.handle_notification(notification);
+        }
+    });
 
     // Build configurations for batch spawning with heuristics filtering
     let applicable_configs: Vec<ServerInitConfig> = config
@@ -148,7 +158,8 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     );
 
     // Spawn all servers with graceful degradation
-    let result = LspServer::spawn_batch(&applicable_configs).await;
+    let result =
+        LspServer::spawn_batch_with_notifications(&applicable_configs, Some(notification_tx)).await;
 
     // Handle the three possible outcomes
     if result.all_failed() {
@@ -178,15 +189,16 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 
     // Register all successfully initialized servers
     let server_count = result.server_count();
-    for (language_id, server) in result.servers {
-        let client = server.client().clone();
-        translator.register_client(language_id.clone(), client);
-        translator.register_server(language_id.clone(), server);
+    {
+        let mut translator = translator.lock().await;
+        for (language_id, server) in result.servers {
+            let client = server.client().clone();
+            translator.register_client(language_id.clone(), client);
+            translator.register_server(language_id.clone(), server);
+        }
     }
 
     info!("Proceeding with {} LSP server(s)", server_count);
-
-    let translator = Arc::new(Mutex::new(translator));
 
     info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new(translator);

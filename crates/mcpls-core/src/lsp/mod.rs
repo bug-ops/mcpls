@@ -11,4 +11,7 @@ mod types;
 pub use client::LspClient;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
 pub use transport::LspTransport;
-pub use types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId};
+pub use types::{
+    InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,
+    RequestId,
+};
