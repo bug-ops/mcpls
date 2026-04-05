@@ -20,7 +20,7 @@ jobs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # actions/checkout v6
 
       - name: Get version from tag
         id: get_version
@@ -28,7 +28,7 @@ jobs:
 
       - name: Create Release
         id: create_release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # softprops/action-gh-release v2
         with:
           draft: false
           prerelease: false
@@ -82,22 +82,22 @@ jobs:
             use_cross: false
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # actions/checkout v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # dtolnay/rust-toolchain stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@b6c541758da069b696c176405f63bd11cc1f21f9 # cargo-bins/cargo-binstall main
 
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
         run: cargo binstall --no-confirm cross
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # Swatinem/rust-cache v2
         with:
           shared-key: "release-${{ matrix.target }}"
 
@@ -141,7 +141,7 @@ jobs:
         shell: cmd
 
       - name: Upload release archive
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # softprops/action-gh-release v2
         with:
           files: |
             mcpls-${{ matrix.target }}.*
@@ -156,13 +156,13 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # actions/checkout v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # dtolnay/rust-toolchain stable
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # Swatinem/rust-cache v2
 
       - name: Verify version matches tag
         run: |
@@ -175,10 +175,10 @@ jobs:
 
       - name: Authenticate with crates.io
         id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # rust-lang/crates-io-auth-action v1
 
       - name: Publish crates to crates.io
-        uses: katyo/publish-crates@v2
+        uses: katyo/publish-crates@02cc2f1ad653fb25c7d1ff9eb590a8a50d06186b # katyo/publish-crates v2
         with:
           registry-token: ${{ steps.crates-io-auth.outputs.token }}
           ignore-unpublished-changes: true
@@ -190,14 +190,14 @@ jobs:
     needs: [create-release, build-binaries, publish-crates]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # actions/checkout v6
 
       - name: Get version
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Update release with installation instructions
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # softprops/action-gh-release v2
         with:
           append_body: true
           body: |
