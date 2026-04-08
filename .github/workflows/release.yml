@@ -90,7 +90,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@b6c541758da069b696c176405f63bd11cc1f21f9 # cargo-bins/cargo-binstall main
+        uses: cargo-bins/cargo-binstall@6ed12bbaae779f3fd3ba1477bc9a61a2535a3bb2 # cargo-bins/cargo-binstall main
 
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
