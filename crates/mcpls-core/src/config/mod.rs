@@ -126,7 +126,7 @@ fn extract_extension_from_pattern(pattern: &str) -> Option<String> {
         return None;
     }
 
-    let (_, ext) = pattern.rsplit_once('.')?;
+    let (_, ext) = basename.rsplit_once('.')?;
     if ext.is_empty() {
         return None;
     }
