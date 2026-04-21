@@ -32,8 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # actions/checkout v6
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # dtolnay/rust-toolchain nightly
-        with:
-          components: rustfmt
+      - run: rustup component add rustfmt --toolchain nightly --allow-downgrade
       - run: cargo +nightly fmt --all -- --check
 
   clippy:
