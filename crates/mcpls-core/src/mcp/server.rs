@@ -23,7 +23,6 @@ use crate::bridge::Translator;
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<HandlerContext>,
-    tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
 #[tool_router]
@@ -32,10 +31,7 @@ impl McplsServer {
     #[must_use]
     pub fn new(translator: Arc<Mutex<Translator>>) -> Self {
         let context = Arc::new(HandlerContext::new(translator));
-        Self {
-            context,
-            tool_router: Self::tool_router(),
-        }
+        Self { context }
     }
 
     /// Get hover information at a position in a file.
