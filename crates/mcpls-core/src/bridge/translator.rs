@@ -18,10 +18,10 @@ use tokio::time::Duration;
 use url::Url;
 
 use super::state::{ResourceLimits, detect_language};
-use super::{DocumentTracker, NotificationCache};
+use super::{DocumentTracker, LogLevel, MessageType, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
-use crate::lsp::{LspClient, LspServer};
+use crate::lsp::{LspClient, LspNotification, LspServer};
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 #[derive(Debug)]
@@ -101,6 +101,28 @@ impl Translator {
     /// Get a mutable reference to the notification cache.
     pub const fn notification_cache_mut(&mut self) -> &mut NotificationCache {
         &mut self.notification_cache
+    }
+
+    /// Store a forwarded LSP notification in the local cache.
+    pub fn handle_notification(&mut self, notification: LspNotification) {
+        match notification {
+            LspNotification::PublishDiagnostics(params) => {
+                self.notification_cache.store_diagnostics(
+                    &params.uri,
+                    params.version,
+                    params.diagnostics,
+                );
+            }
+            LspNotification::LogMessage(params) => {
+                self.notification_cache
+                    .store_log(LogLevel::from(params.typ), params.message);
+            }
+            LspNotification::ShowMessage(params) => {
+                self.notification_cache
+                    .store_message(MessageType::from(params.typ), params.message);
+            }
+            LspNotification::Other { .. } => {}
+        }
     }
 
     // TODO: These methods will be implemented in Phase 3-5
@@ -453,11 +475,25 @@ impl Translator {
 
     /// Get a cloned LSP client for a file path based on language detection.
     fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
-        let language_id = detect_language(path, &self.extension_map);
+        let language_id = self.get_language_id_for_file(path);
         self.lsp_clients
             .get(&language_id)
             .cloned()
             .ok_or(Error::NoServerForLanguage(language_id))
+    }
+
+    /// Resolve the language ID for a file path.
+    fn get_language_id_for_file(&self, path: &Path) -> String {
+        detect_language(path, &self.extension_map)
+    }
+
+    /// Determine if the selected server for a file supports pull diagnostics.
+    fn supports_pull_diagnostics(&self, path: &Path) -> bool {
+        let language_id = self.get_language_id_for_file(path);
+        self.lsp_servers
+            .get(&language_id)
+            .and_then(|server| server.capabilities().diagnostic_provider.as_ref())
+            .is_some()
     }
 
     /// Parse and validate a file URI, returning the validated path.
@@ -668,13 +704,18 @@ impl Translator {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
+        let supports_pull_diagnostics = self.supports_pull_diagnostics(&validated_path);
+        let _uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
             .await?;
 
+        if !supports_pull_diagnostics {
+            return self.handle_cached_diagnostics(&file_path);
+        }
+
         let params = lsp_types::DocumentDiagnosticParams {
-            text_document: TextDocumentIdentifier { uri },
+            text_document: TextDocumentIdentifier { uri: _uri },
             identifier: None,
             previous_result_id: None,
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -682,9 +723,16 @@ impl Translator {
         };
 
         let timeout_duration = Duration::from_secs(30);
-        let response: lsp_types::DocumentDiagnosticReportResult = client
+        let response: lsp_types::DocumentDiagnosticReportResult = match client
             .request("textDocument/diagnostic", params, timeout_duration)
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(Error::LspServerError { code: -32601, .. }) => {
+                return self.handle_cached_diagnostics(&file_path);
+            }
+            Err(error) => return Err(error),
+        };
 
         let diagnostics = match response {
             lsp_types::DocumentDiagnosticReportResult::Report(report) => match report {
@@ -1577,11 +1625,19 @@ fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::fs;
+    use std::process::Stdio;
 
+    use lsp_types::{
+        Diagnostic as LspDiagnostic, DiagnosticSeverity as LspDiagnosticSeverity, Position,
+        PositionEncodingKind, PublishDiagnosticsParams, Range as LspRange, ServerCapabilities, Uri,
+    };
     use tempfile::TempDir;
+    use tokio::process::Command;
     use url::Url;
 
     use super::*;
+    use crate::config::LspServerConfig;
+    use crate::lsp::LspTransport;
 
     #[test]
     fn test_translator_new() {
@@ -2156,6 +2212,146 @@ mod tests {
         assert!(result.is_ok());
         let diags = result.unwrap();
         assert_eq!(diags.diagnostics.len(), 0);
+    }
+
+    fn create_test_client(language_id: &str) -> LspClient {
+        let mock_stdin = Command::new("cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+
+        let mock_stdout = Command::new("tail")
+            .arg("-f")
+            .arg("/dev/null")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+
+        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let mut config = LspServerConfig::clangd();
+        config.language_id = language_id.to_string();
+        LspClient::from_transport(config, transport)
+    }
+
+    #[test]
+    fn test_handle_notification_stores_diagnostics() {
+        let mut translator = Translator::new();
+        let uri: Uri = "file:///workspace/test.cpp".parse().unwrap();
+        let diagnostic = LspDiagnostic {
+            range: LspRange {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 3,
+                },
+            },
+            severity: Some(LspDiagnosticSeverity::ERROR),
+            message: "test diagnostic".to_string(),
+            ..Default::default()
+        };
+
+        translator.handle_notification(LspNotification::PublishDiagnostics(
+            PublishDiagnosticsParams {
+                uri: uri.clone(),
+                version: Some(1),
+                diagnostics: vec![diagnostic],
+            },
+        ));
+
+        let cached = translator.notification_cache().get_diagnostics(uri.as_str()).unwrap();
+        assert_eq!(cached.diagnostics.len(), 1);
+        assert_eq!(cached.version, Some(1));
+        assert_eq!(cached.diagnostics[0].message, "test diagnostic");
+    }
+
+    #[test]
+    fn test_handle_notification_stores_logs_and_messages() {
+        let mut translator = Translator::new();
+
+        translator.handle_notification(LspNotification::LogMessage(lsp_types::LogMessageParams {
+            typ: lsp_types::MessageType::WARNING,
+            message: "log entry".to_string(),
+        }));
+        translator.handle_notification(LspNotification::ShowMessage(
+            lsp_types::ShowMessageParams {
+                typ: lsp_types::MessageType::INFO,
+                message: "user message".to_string(),
+            },
+        ));
+
+        let logs = translator.notification_cache().get_logs();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].level, LogLevel::Warning);
+        assert_eq!(logs[0].message, "log entry");
+
+        let messages = translator.notification_cache().get_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_type, MessageType::Info);
+        assert_eq!(messages[0].message, "user message");
+    }
+
+    #[tokio::test]
+    async fn test_handle_diagnostics_falls_back_to_cached_when_pull_unsupported() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.cpp");
+        fs::write(&test_file, "int main() { return 0; }\n").unwrap();
+
+        let client = create_test_client("cpp");
+        let server = LspServer::new_for_tests(
+            client.clone(),
+            ServerCapabilities::default(),
+            PositionEncodingKind::UTF8,
+        );
+
+        let mut extension_map = HashMap::new();
+        extension_map.insert("cpp".to_string(), "cpp".to_string());
+
+        let mut translator = Translator::new().with_extensions(extension_map);
+        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
+        translator.register_client("cpp".to_string(), client);
+        translator.register_server("cpp".to_string(), server);
+
+        let uri = Url::from_file_path(&test_file).unwrap();
+        let diagnostic = LspDiagnostic {
+            range: LspRange {
+                start: Position {
+                    line: 0,
+                    character: 4,
+                },
+                end: Position {
+                    line: 0,
+                    character: 8,
+                },
+            },
+            severity: Some(LspDiagnosticSeverity::WARNING),
+            message: "cached diagnostic".to_string(),
+            ..Default::default()
+        };
+        let cached_uri: Uri = uri.as_str().parse().unwrap();
+        translator
+            .notification_cache_mut()
+            .store_diagnostics(&cached_uri, Some(1), vec![diagnostic]);
+
+        let result = translator
+            .handle_diagnostics(test_file.to_str().unwrap().to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].message, "cached diagnostic");
+        assert!(matches!(
+            result.diagnostics[0].severity,
+            DiagnosticSeverity::Warning
+        ));
     }
 
     #[test]
@@ -2776,7 +2972,7 @@ mod tests {
             lsp_servers: vec![],
         };
 
-        let extension_map = config.workspace.build_extension_map();
+        let extension_map = config.build_effective_extension_map();
         assert_eq!(extension_map.get("nu"), Some(&"nushell".to_string()));
         assert_eq!(extension_map.get("rs"), Some(&"rust".to_string()));
 

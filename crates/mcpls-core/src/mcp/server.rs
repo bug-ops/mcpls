@@ -113,7 +113,7 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location."
+        description = "Diagnostics for a file. Uses pull diagnostics when the server supports them, otherwise falls back to cached published diagnostics."
     )]
     async fn get_diagnostics(
         &self,

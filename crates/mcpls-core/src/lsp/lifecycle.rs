@@ -16,6 +16,7 @@ use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
     InitializedParams, PositionEncodingKind, ServerCapabilities, Uri, WorkspaceFolder,
 };
+use tokio::sync::mpsc;
 use tokio::process::Command;
 use tokio::time::Duration;
 use tracing::{debug, info};
@@ -24,6 +25,7 @@ use crate::config::LspServerConfig;
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
+use crate::lsp::types::LspNotification;
 
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +201,17 @@ impl LspServer {
     /// - Initialize request fails or times out
     /// - Server returns error during initialization
     pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
+        Self::spawn_with_notifications(config, None).await
+    }
+
+    /// Spawn and initialize LSP server with optional notification forwarding.
+    ///
+    /// When a notification sender is provided, server notifications are
+    /// forwarded to the caller for caching or further processing.
+    pub async fn spawn_with_notifications(
+        config: ServerInitConfig,
+        notification_tx: Option<mpsc::Sender<LspNotification>>,
+    ) -> Result<Self> {
         info!(
             "Spawning LSP server: {} {:?}",
             config.server_config.command, config.server_config.args
@@ -226,7 +239,14 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
-        let client = LspClient::from_transport(config.server_config.clone(), transport);
+        let client = match notification_tx {
+            Some(notification_tx) => LspClient::from_transport_with_notifications(
+                config.server_config.clone(),
+                transport,
+                notification_tx,
+            ),
+            None => LspClient::from_transport(config.server_config.clone(), transport),
+        };
 
         let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
 
@@ -367,6 +387,28 @@ impl LspServer {
         &self.client
     }
 
+    /// Create an `LspServer` for unit tests without full LSP initialization.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(
+        client: LspClient,
+        capabilities: ServerCapabilities,
+        position_encoding: PositionEncodingKind,
+    ) -> Self {
+        let child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn test child process");
+
+        Self {
+            client,
+            capabilities,
+            position_encoding,
+            _child: child,
+        }
+    }
+
     /// Shutdown server gracefully.
     ///
     /// Sends shutdown request, waits for response, then sends exit notification.
@@ -437,13 +479,21 @@ impl LspServer {
     /// # }
     /// ```
     pub async fn spawn_batch(configs: &[ServerInitConfig]) -> ServerInitResult {
+        Self::spawn_batch_with_notifications(configs, None).await
+    }
+
+    /// Spawn multiple LSP servers with optional notification forwarding.
+    pub async fn spawn_batch_with_notifications(
+        configs: &[ServerInitConfig],
+        notification_tx: Option<mpsc::Sender<LspNotification>>,
+    ) -> ServerInitResult {
         let mut result = ServerInitResult::new();
 
         for config in configs {
             let language_id = config.server_config.language_id.clone();
             let command = config.server_config.command.clone();
 
-            match Self::spawn(config.clone()).await {
+            match Self::spawn_with_notifications(config.clone(), notification_tx.clone()).await {
                 Ok(server) => {
                     info!(
                         "Successfully spawned LSP server: {} ({})",
