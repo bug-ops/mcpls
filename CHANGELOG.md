@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **C/C++ file pattern language detection** — `lsp_servers[].file_patterns` now derives extension-to-language mappings (e.g. `**/*.c` → `c`, `**/*.h` → `c`) and overlays them onto the workspace extension map, so configured language IDs take precedence over built-in defaults
-
 ## [0.3.6] - 2026-04-21
 
 ### Changed
@@ -30,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **C/C++ file pattern language detection** — `lsp_servers[].file_patterns` now derives extension-to-language mappings (e.g. `**/*.c` → `c`, `**/*.h` → `c`) and overlays them onto the workspace extension map, so configured language IDs take precedence over built-in defaults
 - CI: nightly rustfmt failures when the `rustfmt` component is temporarily unavailable for the latest nightly — now uses `rustup toolchain install nightly --component rustfmt --allow-downgrade`
 - CI: CodeQL workflow now runs for fork pull requests (`pull_request_target`)
 - CI: labeler workflow uses `pull_request_target` to access labels on fork PRs
