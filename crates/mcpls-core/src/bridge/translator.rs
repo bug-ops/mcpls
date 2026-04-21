@@ -2776,7 +2776,7 @@ mod tests {
             lsp_servers: vec![],
         };
 
-        let extension_map = config.workspace.build_extension_map();
+        let extension_map = config.build_effective_extension_map();
         assert_eq!(extension_map.get("nu"), Some(&"nushell".to_string()));
         assert_eq!(extension_map.get("rs"), Some(&"rust".to_string()));
 

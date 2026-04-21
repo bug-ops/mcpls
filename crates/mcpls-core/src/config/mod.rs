@@ -116,6 +116,32 @@ impl WorkspaceConfig {
     }
 }
 
+/// Extract a file extension from a glob-like file pattern.
+///
+/// Supports common patterns such as `**/*.rs` and `*.h`.
+/// Returns `None` for patterns without a simple trailing extension.
+fn extract_extension_from_pattern(pattern: &str) -> Option<String> {
+    let basename = pattern.rsplit('/').next().unwrap_or(pattern);
+    if basename.starts_with('.') {
+        return None;
+    }
+
+    let (_, ext) = basename.rsplit_once('.')?;
+    if ext.is_empty() {
+        return None;
+    }
+
+    // Keep this conservative: only accept plain extension-like tokens.
+    if ext
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Some(ext.to_string())
+    } else {
+        None
+    }
+}
+
 fn default_position_encodings() -> Vec<String> {
     vec!["utf-8".to_string(), "utf-16".to_string()]
 }
@@ -258,6 +284,25 @@ fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
 }
 
 impl ServerConfig {
+    /// Build the effective extension map used for language detection.
+    ///
+    /// Starts with workspace mappings and overlays mappings inferred from
+    /// configured LSP server `file_patterns`.
+    #[must_use]
+    pub fn build_effective_extension_map(&self) -> HashMap<String, String> {
+        let mut map = self.workspace.build_extension_map();
+
+        for server in &self.lsp_servers {
+            for pattern in &server.file_patterns {
+                if let Some(ext) = extract_extension_from_pattern(pattern) {
+                    map.insert(ext, server.language_id.clone());
+                }
+            }
+        }
+
+        map
+    }
+
     /// Load configuration from the default path.
     ///
     /// Default paths checked in order:
@@ -654,6 +699,71 @@ mod tests {
         assert_eq!(map.get("cxx"), Some(&"cpp".to_string()));
         assert_eq!(map.get("nu"), Some(&"nushell".to_string()));
         assert_eq!(map.get("unknown"), None);
+    }
+
+    #[test]
+    fn test_extract_extension_from_pattern_empty_string() {
+        assert_eq!(extract_extension_from_pattern(""), None);
+    }
+
+    #[test]
+    fn test_extract_extension_from_pattern_without_dot() {
+        assert_eq!(extract_extension_from_pattern("**/*"), None);
+    }
+
+    #[test]
+    fn test_extract_extension_from_pattern_dotfile() {
+        assert_eq!(extract_extension_from_pattern(".gitignore"), None);
+    }
+
+    #[test]
+    fn test_extract_extension_from_pattern_multi_dot_extension() {
+        assert_eq!(
+            extract_extension_from_pattern("foo.tar.gz"),
+            Some("gz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_effective_extension_map_overrides_with_file_patterns() {
+        let config = ServerConfig {
+            workspace: WorkspaceConfig::default(),
+            lsp_servers: vec![LspServerConfig {
+                language_id: "cpp".to_string(),
+                command: "clangd".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                file_patterns: vec!["**/*.c".to_string(), "**/*.h".to_string()],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+            }],
+        };
+
+        let map = config.build_effective_extension_map();
+        assert_eq!(map.get("c"), Some(&"cpp".to_string()));
+        assert_eq!(map.get("h"), Some(&"cpp".to_string()));
+    }
+
+    #[test]
+    fn test_build_effective_extension_map_ignores_complex_patterns_without_extension() {
+        let config = ServerConfig {
+            workspace: WorkspaceConfig::default(),
+            lsp_servers: vec![LspServerConfig {
+                language_id: "cpp".to_string(),
+                command: "clangd".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                file_patterns: vec!["**/*".to_string(), "**/*.{h,hpp}".to_string()],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+            }],
+        };
+
+        let map = config.build_effective_extension_map();
+        // Default C/C++ mappings remain unchanged when patterns cannot be parsed.
+        assert_eq!(map.get("h"), Some(&"c".to_string()));
     }
 
     #[test]
