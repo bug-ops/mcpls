@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **LSP API** — Breaking change: `InboundMessage` is now non-exhaustive and includes a server-request variant for LSP server-to-client JSON-RPC requests. Downstream exhaustive matches must include a wildcard arm.
+
+### Fixed
+
+- **LSP server requests** — Handle server-to-client requests such as `client/registerCapability`, fixing tsgo timeouts.
+
 ## [0.3.6] - 2026-04-21
 
 ### Changed

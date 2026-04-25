@@ -72,9 +72,12 @@ pub enum RequestId {
 
 /// Inbound message from LSP server.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum InboundMessage {
     /// Response to a request.
     Response(JsonRpcResponse),
+    /// Request from server to client.
+    Request(JsonRpcRequest),
     /// Notification from server.
     Notification(JsonRpcNotification),
 }
@@ -111,7 +114,7 @@ impl LspNotification {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```rust,ignore
     /// use mcpls_core::lsp::types::LspNotification;
     /// use serde_json::json;
     ///
@@ -130,6 +133,7 @@ impl LspNotification {
     ///     _ => panic!("Expected LogMessage variant"),
     /// }
     /// ```
+    #[must_use]
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
         match method {
             "textDocument/publishDiagnostics" => {

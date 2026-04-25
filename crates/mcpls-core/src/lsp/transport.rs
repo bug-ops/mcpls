@@ -16,7 +16,7 @@ use tokio::process::{ChildStdin, ChildStdout};
 use tracing::{trace, warn};
 
 use crate::error::{Error, Result};
-use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcResponse};
+use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 
 /// Maximum allowed Content-Length (10 MB)
 const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
@@ -104,15 +104,7 @@ impl LspTransport {
 
         let value: Value = serde_json::from_str(&content)?;
 
-        if value.get("id").is_some() {
-            let response: JsonRpcResponse = serde_json::from_value(value)
-                .map_err(|e| Error::LspProtocolError(format!("Invalid response: {e}")))?;
-            Ok(InboundMessage::Response(response))
-        } else {
-            let notification: JsonRpcNotification = serde_json::from_value(value)
-                .map_err(|e| Error::LspProtocolError(format!("Invalid notification: {e}")))?;
-            Ok(InboundMessage::Notification(notification))
-        }
+        parse_inbound_message(value)
     }
 
     /// Read headers until blank line.
@@ -163,10 +155,39 @@ impl LspTransport {
     }
 }
 
+fn parse_inbound_message(value: Value) -> Result<InboundMessage> {
+    if value.get("method").is_some() {
+        if value.get("id").is_some() {
+            let request: JsonRpcRequest = serde_json::from_value(value)
+                .map_err(|e| Error::LspProtocolError(format!("Invalid request: {e}")))?;
+            Ok(InboundMessage::Request(request))
+        } else {
+            let notification: JsonRpcNotification = serde_json::from_value(value)
+                .map_err(|e| Error::LspProtocolError(format!("Invalid notification: {e}")))?;
+            Ok(InboundMessage::Notification(notification))
+        }
+    } else if value.get("id").is_some()
+        && (value.get("result").is_some() || value.get("error").is_some())
+    {
+        let response: JsonRpcResponse = serde_json::from_value(value)
+            .map_err(|e| Error::LspProtocolError(format!("Invalid response: {e}")))?;
+        Ok(InboundMessage::Response(response))
+    } else if value.get("id").is_some() {
+        Err(Error::LspProtocolError(
+            "Response messages with an id must include either result or error".to_string(),
+        ))
+    } else {
+        Err(Error::LspProtocolError(
+            "Message must be a request, response, or notification".to_string(),
+        ))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::lsp::types::RequestId;
 
     #[test]
     fn test_header_parsing() {
@@ -264,6 +285,41 @@ mod tests {
         let content = serde_json::to_string(&notification).unwrap();
         assert!(content.contains("\"method\""));
         assert!(!content.contains("\"id\""));
+    }
+
+    #[test]
+    fn test_server_request_parsing() {
+        let value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "ts1",
+            "method": "client/registerCapability",
+            "params": {"registrations": []}
+        });
+
+        let message = parse_inbound_message(value).unwrap();
+        match message {
+            InboundMessage::Request(request) => {
+                assert_eq!(request.id, RequestId::String("ts1".to_string()));
+                assert_eq!(request.method, "client/registerCapability");
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_id_only_message_is_protocol_error() {
+        let value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1
+        });
+
+        let error = parse_inbound_message(value).unwrap_err();
+        assert!(matches!(error, Error::LspProtocolError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("must include either result or error")
+        );
     }
 
     #[test]

@@ -15,7 +15,9 @@ use tracing::{debug, error, trace, warn};
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
 use crate::lsp::transport::LspTransport;
-use crate::lsp::types::{InboundMessage, JsonRpcRequest, LspNotification, RequestId};
+use crate::lsp::types::{
+    InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
+};
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -371,6 +373,15 @@ impl LspClient {
                                 warn!("Received response for unknown request ID: {:?}", response.id);
                             }
                         }
+                        InboundMessage::Request(request) => {
+                            debug!(
+                                "Received server request: {} (id={:?})",
+                                request.method, request.id
+                            );
+                            let response = Self::server_request_response(request);
+                            let value = serde_json::to_value(&response)?;
+                            transport.send(&value).await?;
+                        }
                         InboundMessage::Notification(notification) => {
                             debug!("Received notification: {}", notification.method);
 
@@ -402,6 +413,51 @@ impl LspClient {
         }
 
         Ok(())
+    }
+
+    fn server_request_response(request: JsonRpcRequest) -> JsonRpcResponse {
+        match Self::server_request_result(&request.method, request.params.as_ref()) {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id,
+                result: None,
+                error: Some(error),
+            },
+        }
+    }
+
+    fn server_request_result(
+        method: &str,
+        params: Option<&Value>,
+    ) -> std::result::Result<Value, JsonRpcError> {
+        match method {
+            "client/registerCapability"
+            | "client/unregisterCapability"
+            | "workspace/workspaceFolders"
+            | "window/showMessageRequest" => Ok(Value::Null),
+            "workspace/configuration" => Ok(Self::workspace_configuration_result(params)),
+            "workspace/applyEdit" => Ok(serde_json::json!({ "applied": false })),
+            _ => Err(JsonRpcError {
+                code: -32601,
+                message: format!("Unhandled server request: {method}"),
+                data: None,
+            }),
+        }
+    }
+
+    fn workspace_configuration_result(params: Option<&Value>) -> Value {
+        let item_count = params
+            .and_then(|value| value.get("items"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+
+        Value::Array(vec![Value::Null; item_count])
     }
 }
 
@@ -444,6 +500,52 @@ mod tests {
             cloned.receiver_task.is_none(),
             "Cloned client should not own receiver task"
         );
+    }
+
+    #[test]
+    fn test_register_capability_request_is_acknowledged() {
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: RequestId::String("ts1".to_string()),
+            method: "client/registerCapability".to_string(),
+            params: Some(serde_json::json!({ "registrations": [] })),
+        };
+
+        let response = LspClient::server_request_response(request);
+
+        assert_eq!(response.id, RequestId::String("ts1".to_string()));
+        assert_eq!(response.result, Some(Value::Null));
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn test_workspace_configuration_request_returns_null_per_item() {
+        let result = LspClient::workspace_configuration_result(Some(&serde_json::json!({
+            "items": [{ "section": "typescript" }, { "section": "editor" }]
+        })));
+
+        assert_eq!(result, serde_json::json!([null, null]));
+    }
+
+    #[test]
+    fn test_unknown_server_request_returns_method_not_found() {
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: RequestId::String("unknown-1".to_string()),
+            method: "custom/request".to_string(),
+            params: None,
+        };
+
+        let response = LspClient::server_request_response(request);
+
+        assert!(response.result.is_none());
+        match response.error {
+            Some(error) => {
+                assert_eq!(error.code, -32601);
+                assert_eq!(error.message, "Unhandled server request: custom/request");
+            }
+            None => panic!("unknown request should return error"),
+        }
     }
 
     #[tokio::test]
