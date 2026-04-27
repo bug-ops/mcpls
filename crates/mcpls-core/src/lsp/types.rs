@@ -73,6 +73,13 @@ pub enum RequestId {
 /// Inbound message from LSP server.
 #[derive(Debug, Clone)]
 pub enum InboundMessage {
+    /// Server-to-client request.
+    ///
+    /// LSP servers may send requests back to the client (e.g.
+    /// `client/registerCapability`, `workspace/configuration`,
+    /// `window/workDoneProgress/create`). The client must respond with a
+    /// matching id, otherwise the server will block waiting.
+    Request(JsonRpcRequest),
     /// Response to a request.
     Response(JsonRpcResponse),
     /// Notification from server.
@@ -130,6 +137,7 @@ impl LspNotification {
     ///     _ => panic!("Expected LogMessage variant"),
     /// }
     /// ```
+    #[must_use]
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
         match method {
             "textDocument/publishDiagnostics" => {

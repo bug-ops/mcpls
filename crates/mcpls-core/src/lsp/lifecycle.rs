@@ -17,13 +17,29 @@ use lsp_types::{
     InitializedParams, PositionEncodingKind, ServerCapabilities, Uri, WorkspaceFolder,
 };
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result, ServerSpawnFailure};
-use crate::lsp::client::LspClient;
+use crate::lsp::client::{LspClient, ServerRequest};
+use crate::lsp::file_watcher::FileWatcher;
 use crate::lsp::transport::LspTransport;
+use crate::lsp::types::{JsonRpcError, LspNotification};
+
+/// JSON-RPC error code returned for server-to-client requests we do not handle.
+const METHOD_NOT_FOUND: i32 = -32601;
+
+/// Channel capacity for inbound server-to-client requests.
+const SERVER_REQUEST_CHANNEL_CAPACITY: usize = 32;
+
+/// Channel capacity for inbound LSP notifications (`publishDiagnostics`,
+/// `window/logMessage`, `window/showMessage`). Sized for short bursts during
+/// indexing and flycheck cycles; on overflow notifications are dropped with
+/// a warning.
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,9 +183,25 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
+    /// Filesystem watcher backing `workspace/didChangeWatchedFiles`. `None`
+    /// when the watcher could not be started; the server still works, just
+    /// without eager external-change forwarding. Held for lifetime only.
+    #[allow(dead_code)]
+    file_watcher: Option<FileWatcher>,
+    /// Background task that dispatches server-to-client requests (e.g.
+    /// `client/registerCapability`) to the file watcher. Held for lifetime
+    /// only; the task exits when the server's request channel closes.
+    #[allow(dead_code)]
+    request_dispatcher: Option<JoinHandle<()>>,
+    /// Receiver for LSP notifications (`publishDiagnostics`,
+    /// `window/logMessage`, `window/showMessage`). The caller is expected to
+    /// take this and pump it into a `NotificationCache`; if left `None` the
+    /// channel is dropped and notifications are silently discarded as before.
+    notification_rx: Option<mpsc::Receiver<LspNotification>>,
     /// Child process handle. Kept alive for process lifetime management.
     /// When dropped, the process is terminated via SIGKILL (`kill_on_drop`).
-    _child: tokio::process::Child,
+    #[allow(dead_code)]
+    child: tokio::process::Child,
 }
 
 impl std::fmt::Debug for LspServer {
@@ -178,7 +210,13 @@ impl std::fmt::Debug for LspServer {
             .field("client", &self.client)
             .field("capabilities", &self.capabilities)
             .field("position_encoding", &self.position_encoding)
-            .field("_child", &"<process>")
+            .field("file_watcher_active", &self.file_watcher.is_some())
+            .field(
+                "request_dispatcher_active",
+                &self.request_dispatcher.is_some(),
+            )
+            .field("notification_rx_taken", &self.notification_rx.is_none())
+            .field("child", &"<process>")
             .finish()
     }
 }
@@ -226,23 +264,79 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
-        let client = LspClient::from_transport(config.server_config.clone(), transport);
+
+        // Build the file watcher *before* the client so we can decide whether
+        // to wire a server-request channel through.
+        //
+        // The client needs a transport-bound LspClient *during* construction
+        // to start its message loop; the watcher needs a clone of that client
+        // to send notifications. We solve the cycle by wiring up the channel
+        // optimistically and only spawning the watcher after the client
+        // exists. If the watcher fails to start, the dispatcher task is not
+        // launched and the receiver is dropped — the message loop then
+        // observes a closed channel and falls back to MethodNotFound.
+        let (server_request_tx, server_request_rx) = mpsc::channel(SERVER_REQUEST_CHANNEL_CAPACITY);
+        let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let client = LspClient::from_transport_with_channels(
+            config.server_config.clone(),
+            transport,
+            Some(notification_tx),
+            Some(server_request_tx),
+        );
 
         let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
 
         info!("LSP server initialized successfully");
 
+        // Start the filesystem watcher and request dispatcher. Failure to
+        // start the watcher is logged but non-fatal: the per-file
+        // stat-on-access path in `bridge::DocumentTracker::ensure_open` still
+        // keeps tracked documents fresh, and unhandled `client/registerCapability`
+        // requests get a `MethodNotFound` reply via the default path.
+        let (file_watcher, request_dispatcher) = match FileWatcher::spawn(
+            config.workspace_roots.clone(),
+            client.clone(),
+        ) {
+            Ok(watcher) => {
+                let dispatcher =
+                    spawn_request_dispatcher(server_request_rx, watcher.clone_handle());
+                (Some(watcher), Some(dispatcher))
+            }
+            Err(e) => {
+                warn!(
+                    "file watcher unavailable for {}: {e} — falling back to stat-on-access only",
+                    config.server_config.language_id
+                );
+                drop(server_request_rx);
+                (None, None)
+            }
+        };
+
         Ok(Self {
             client,
             capabilities,
             position_encoding,
-            _child: child,
+            file_watcher,
+            request_dispatcher,
+            notification_rx: Some(notification_rx),
+            child,
         })
+    }
+
+    /// Take the LSP notification receiver, leaving `None` behind.
+    ///
+    /// The caller is responsible for draining this channel and feeding the
+    /// notifications into a `NotificationCache`. If the receiver is never
+    /// taken, notifications received from the LSP server are silently
+    /// dropped (preserving pre-#102 behaviour for callers that do not opt in).
+    pub const fn take_notification_receiver(&mut self) -> Option<mpsc::Receiver<LspNotification>> {
+        self.notification_rx.take()
     }
 
     /// Perform LSP initialization handshake.
     ///
     /// Sends initialize request and waits for response, then sends initialized notification.
+    #[allow(clippy::too_many_lines)]
     async fn initialize(
         client: &LspClient,
         config: &ServerInitConfig,
@@ -309,6 +403,12 @@ impl LspServer {
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
                     workspace_folders: Some(true),
+                    did_change_watched_files: Some(
+                        lsp_types::DidChangeWatchedFilesClientCapabilities {
+                            dynamic_registration: Some(true),
+                            relative_pattern_support: Some(true),
+                        },
+                    ),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -469,6 +569,88 @@ impl LspServer {
 
         result
     }
+}
+
+/// Spawn the per-server dispatcher that turns inbound `client/registerCapability`
+/// and `client/unregisterCapability` requests into watcher updates.
+///
+/// Other server-to-client methods are not handled here and receive a
+/// `MethodNotFound` reply, which lets the LSP server know it should not block
+/// waiting on us. This task exits when the request channel is closed (which
+/// happens on server shutdown).
+fn spawn_request_dispatcher(
+    mut server_request_rx: mpsc::Receiver<ServerRequest>,
+    watcher: FileWatcher,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(server_request) = server_request_rx.recv().await {
+            let ServerRequest { request, responder } = server_request;
+            let reply = handle_server_request(&watcher, &request.method, request.params).await;
+            let _ = responder.send(reply);
+        }
+        debug!("server-request dispatcher exiting");
+    })
+}
+
+/// Apply a single server-to-client request to the file watcher and return the
+/// JSON-RPC reply we should send back.
+async fn handle_server_request(
+    watcher: &FileWatcher,
+    method: &str,
+    params: Option<serde_json::Value>,
+) -> std::result::Result<serde_json::Value, JsonRpcError> {
+    match method {
+        "client/registerCapability" => {
+            let params: lsp_types::RegistrationParams = parse_params(params)?;
+            for registration in params.registrations {
+                if registration.method != "workspace/didChangeWatchedFiles" {
+                    debug!(
+                        "ignoring registration for unsupported method '{}' (id={})",
+                        registration.method, registration.id
+                    );
+                    continue;
+                }
+                let Some(options) = registration.register_options else {
+                    warn!(
+                        "registration {} for {} missing register_options",
+                        registration.id, registration.method
+                    );
+                    continue;
+                };
+                if let Err(e) = watcher.register(registration.id.clone(), options).await {
+                    warn!(
+                        "failed to install file watcher registration {}: {e}",
+                        registration.id
+                    );
+                }
+            }
+            Ok(serde_json::Value::Null)
+        }
+        "client/unregisterCapability" => {
+            let params: lsp_types::UnregistrationParams = parse_params(params)?;
+            for unreg in params.unregisterations {
+                watcher.unregister(&unreg.id).await;
+            }
+            Ok(serde_json::Value::Null)
+        }
+        other => Err(JsonRpcError {
+            code: METHOD_NOT_FOUND,
+            message: format!("method not found: {other}"),
+            data: None,
+        }),
+    }
+}
+
+/// Deserialize JSON-RPC params or convert the failure into a JSON-RPC error.
+fn parse_params<T: serde::de::DeserializeOwned>(
+    params: Option<serde_json::Value>,
+) -> std::result::Result<T, JsonRpcError> {
+    let value = params.unwrap_or(serde_json::Value::Null);
+    serde_json::from_value(value).map_err(|e| JsonRpcError {
+        code: METHOD_NOT_FOUND,
+        message: format!("invalid params: {e}"),
+        data: None,
+    })
 }
 
 #[cfg(test)]
@@ -650,7 +832,10 @@ mod tests {
             client,
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            _child: mock_child,
+            file_watcher: None,
+            notification_rx: None,
+            request_dispatcher: None,
+            child: mock_child,
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -736,7 +921,10 @@ mod tests {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            _child: mock_child1,
+            file_watcher: None,
+            notification_rx: None,
+            request_dispatcher: None,
+            child: mock_child1,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -782,7 +970,10 @@ mod tests {
             client,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            _child: mock_child,
+            file_watcher: None,
+            notification_rx: None,
+            request_dispatcher: None,
+            child: mock_child,
         };
 
         result.add_server("rust".to_string(), server);
@@ -842,7 +1033,10 @@ mod tests {
                 client,
                 capabilities: lsp_types::ServerCapabilities::default(),
                 position_encoding: PositionEncodingKind::UTF8,
-                _child: mock_child,
+                file_watcher: None,
+                request_dispatcher: None,
+                notification_rx: None,
+                child: mock_child,
             };
 
             result.add_server(config.language_id, server);
@@ -889,7 +1083,10 @@ mod tests {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            _child: mock_child1,
+            file_watcher: None,
+            notification_rx: None,
+            request_dispatcher: None,
+            child: mock_child1,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -925,7 +1122,10 @@ mod tests {
             client: client2,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF16,
-            _child: mock_child2,
+            file_watcher: None,
+            notification_rx: None,
+            request_dispatcher: None,
+            child: mock_child2,
         };
 
         result.add_server("rust".to_string(), server2);

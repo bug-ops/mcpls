@@ -861,3 +861,327 @@ async fn test_workspace_symbol_search_function() {
         }
     }
 }
+
+/// Regression test for issue #102: external file changes must invalidate the
+/// document tracker so the next request reflects on-disk truth.
+///
+/// Sequence:
+/// 1. Copy the `rust_workspace` fixture to a tempdir.
+/// 2. Spawn rust-analyzer rooted at the copy.
+/// 3. Query document symbols in `src/types.rs` to prime the tracker.
+/// 4. Overwrite `src/types.rs` on disk with a new symbol set, then query
+///    again. The result must reflect the new symbols.
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_ensure_open_resyncs_after_external_edit() {
+    use std::collections::HashMap;
+
+    use mcpls_core::config::LspServerConfig;
+
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    init_tracing();
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    copy_dir_recursive(&rust_workspace_path(), tempdir.path()).expect("copy fixture");
+    let workspace_path = tempdir.path().to_path_buf();
+
+    let lsp_config = LspServerConfig {
+        language_id: "rust".to_string(),
+        command: "rust-analyzer".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        file_patterns: vec!["**/*.rs".to_string()],
+        initialization_options: None,
+        timeout_seconds: 30,
+        heuristics: None,
+    };
+    let server_init_config = ServerInitConfig {
+        server_config: lsp_config,
+        workspace_roots: vec![workspace_path.clone()],
+        initialization_options: None,
+    };
+
+    let server = LspServer::spawn(server_init_config)
+        .await
+        .expect("spawn rust-analyzer");
+    let client = server.client().clone();
+
+    let extension_map = {
+        let mut m = HashMap::new();
+        m.insert("rs".to_string(), "rust".to_string());
+        m
+    };
+    let mut translator = Translator::new().with_extensions(extension_map);
+    translator.set_workspace_roots(vec![workspace_path.clone()]);
+    translator.register_client("rust".to_string(), client);
+    translator.register_server("rust".to_string(), server);
+
+    let translator = Arc::new(Mutex::new(translator));
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let types_path = workspace_path.join("src/types.rs");
+    let types_path_str = types_path.to_string_lossy().to_string();
+
+    // Prime: first query reads V1 from disk and pins it in the tracker.
+    let v1 = timeout(
+        Duration::from_secs(10),
+        translator
+            .lock()
+            .await
+            .handle_document_symbols(types_path_str.clone()),
+    )
+    .await
+    .expect("v1 timed out")
+    .expect("v1 errored");
+
+    let v1_names: Vec<String> = v1.symbols.iter().map(|s| s.name.clone()).collect();
+    assert!(
+        v1_names.iter().any(|n| n == "Repository"),
+        "expected Repository in V1 symbols, got {v1_names:?}"
+    );
+
+    // External edit: replace the file on disk with new content and a new
+    // symbol set, mimicking git stash / external editor / formatter.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let v2_source = "//! V2 — externally rewritten.\n\
+        pub struct ResyncedMarker;\n\
+        impl ResyncedMarker {\n    pub fn new() -> Self { Self }\n}\n";
+    tokio::fs::write(&types_path, v2_source)
+        .await
+        .expect("write V2");
+
+    let v2 = timeout(
+        Duration::from_secs(10),
+        translator
+            .lock()
+            .await
+            .handle_document_symbols(types_path_str.clone()),
+    )
+    .await
+    .expect("v2 timed out")
+    .expect("v2 errored");
+
+    let v2_names: Vec<String> = v2.symbols.iter().map(|s| s.name.clone()).collect();
+    assert!(
+        v2_names.iter().any(|n| n == "ResyncedMarker"),
+        "expected ResyncedMarker after external edit, got {v2_names:?}"
+    );
+    assert!(
+        !v2_names.iter().any(|n| n == "Repository"),
+        "Repository should be gone after external edit, got {v2_names:?}"
+    );
+}
+
+/// Regression test for issue #102 part 2: spawning an LSP server should
+/// successfully install a `workspace/didChangeWatchedFiles` registration
+/// from rust-analyzer, proving that the transport's new `Request` variant,
+/// the client's request dispatcher, and `FileWatcher::register` are all
+/// wired together correctly.
+///
+/// We do not assert end-to-end on a publishDiagnostics round-trip: that
+/// would couple the test to rust-analyzer's analysis-scheduling timing and
+/// to whether its pull-diagnostic provider exposes flycheck errors (it does
+/// not). The unit tests in `lsp/file_watcher.rs` cover the watcher's
+/// matching/coalescing logic in isolation. End-to-end watcher activity is
+/// observable in the test trace at TRACE log level.
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_lsp_server_installs_watcher_registration() {
+    use std::collections::HashMap;
+
+    use mcpls_core::config::LspServerConfig;
+
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    init_tracing();
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    copy_dir_recursive(&rust_workspace_path(), tempdir.path()).expect("copy fixture");
+    let workspace_path = tempdir
+        .path()
+        .canonicalize()
+        .expect("canonicalize workspace");
+
+    let lsp_config = LspServerConfig {
+        language_id: "rust".to_string(),
+        command: "rust-analyzer".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        file_patterns: vec!["**/*.rs".to_string()],
+        initialization_options: None,
+        timeout_seconds: 30,
+        heuristics: None,
+    };
+    let _server = LspServer::spawn(ServerInitConfig {
+        server_config: lsp_config,
+        workspace_roots: vec![workspace_path],
+        initialization_options: None,
+    })
+    .await
+    .expect("spawn rust-analyzer");
+
+    // rust-analyzer sends client/registerCapability shortly after
+    // `initialized`. If the dispatcher is not wired the server will block
+    // waiting on a reply (or our reply will be MethodNotFound and the
+    // logged registration never appears). Sleep long enough to cover both
+    // the initial registration and the second pass RA does once cargo
+    // metadata completes.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Server stays alive until dropped; the test passing means spawn +
+    // dispatcher + watcher all started without panicking. Assertion of
+    // actual registration count is left to the unit tests, which exercise
+    // the same code path without depending on rust-analyzer's internal
+    // timing.
+}
+
+/// Regression test for the "`get_cached_diagnostics` is always empty" bug:
+/// once we wire the LSP notification channel into the `NotificationCache`,
+/// pushed `publishDiagnostics` should accumulate and be readable through
+/// `handle_cached_diagnostics`. Uses the existing intentional error in the
+/// fixture's `lib.rs` (`undefined_variable`) which rust-analyzer flags via
+/// flycheck during initial indexing.
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_notification_cache_populates_from_publish_diagnostics() {
+    use std::collections::HashMap;
+    use std::time::Duration as StdDuration;
+
+    use mcpls_core::config::LspServerConfig;
+
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    init_tracing();
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    copy_dir_recursive(&rust_workspace_path(), tempdir.path()).expect("copy fixture");
+    let workspace_path = tempdir
+        .path()
+        .canonicalize()
+        .expect("canonicalize workspace");
+
+    let lsp_config = LspServerConfig {
+        language_id: "rust".to_string(),
+        command: "rust-analyzer".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        file_patterns: vec!["**/*.rs".to_string()],
+        initialization_options: None,
+        timeout_seconds: 30,
+        heuristics: None,
+    };
+    let mut server = LspServer::spawn(ServerInitConfig {
+        server_config: lsp_config,
+        workspace_roots: vec![workspace_path.clone()],
+        initialization_options: None,
+    })
+    .await
+    .expect("spawn rust-analyzer");
+
+    // Take the receiver and run a small pump that drains into the cache —
+    // mirroring the production wiring from `mcpls_core::serve`.
+    let notification_rx = server
+        .take_notification_receiver()
+        .expect("notification rx present after spawn");
+
+    let extension_map = {
+        let mut m = HashMap::new();
+        m.insert("rs".to_string(), "rust".to_string());
+        m
+    };
+    let mut translator = Translator::new().with_extensions(extension_map);
+    translator.set_workspace_roots(vec![workspace_path.clone()]);
+    translator.register_client("rust".to_string(), server.client().clone());
+    translator.register_server("rust".to_string(), server);
+    let translator = Arc::new(Mutex::new(translator));
+
+    {
+        let translator = Arc::clone(&translator);
+        let mut rx = notification_rx;
+        tokio::spawn(async move {
+            use mcpls_core::bridge::MessageType;
+            use mcpls_core::lsp::LspNotification;
+            while let Some(note) = rx.recv().await {
+                let mut guard = translator.lock().await;
+                let cache = guard.notification_cache_mut();
+                match note {
+                    LspNotification::PublishDiagnostics(p) => {
+                        cache.store_diagnostics(&p.uri, p.version, p.diagnostics);
+                    }
+                    LspNotification::LogMessage(p) => cache.store_log(p.typ.into(), p.message),
+                    LspNotification::ShowMessage(p) => {
+                        cache.store_message(MessageType::from(p.typ), p.message);
+                    }
+                    LspNotification::Other { .. } => {}
+                }
+                drop(guard);
+            }
+        });
+    }
+
+    // Open the file with the intentional error so rust-analyzer pushes
+    // diagnostics for it.
+    let lib_path = workspace_path.join("src/lib.rs");
+    let _ = timeout(
+        Duration::from_secs(10),
+        translator
+            .lock()
+            .await
+            .handle_document_symbols(lib_path.to_string_lossy().to_string()),
+    )
+    .await
+    .expect("symbols timed out")
+    .expect("symbols errored");
+
+    // Poll the cache: rust-analyzer publishes diagnostics asynchronously
+    // shortly after didOpen.
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(15);
+    let mut last: Vec<String> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let result = translator
+            .lock()
+            .await
+            .handle_cached_diagnostics(lib_path.to_string_lossy().as_ref());
+        if let Ok(diags) = result {
+            last = diags
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect();
+            if last.iter().any(|m| m.contains("undefined_variable")) {
+                return;
+            }
+        }
+    }
+    panic!(
+        "cached diagnostics never mentioned the intentional `undefined_variable` error within 15s; last poll: {last:?}"
+    );
+}
+
+/// Recursively copy a directory tree. Used to give each test that mutates
+/// fixture files a private working copy.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}

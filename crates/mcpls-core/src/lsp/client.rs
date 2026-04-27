@@ -15,10 +15,13 @@ use tracing::{debug, error, trace, warn};
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
 use crate::lsp::transport::LspTransport;
-use crate::lsp::types::{InboundMessage, JsonRpcRequest, LspNotification, RequestId};
+use crate::lsp::types::{InboundMessage, JsonRpcError, JsonRpcRequest, LspNotification, RequestId};
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
+
+/// JSON-RPC error code for "method not found".
+const METHOD_NOT_FOUND: i32 = -32601;
 
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
@@ -76,8 +79,26 @@ enum ClientCommand {
         method: String,
         params: Option<Value>,
     },
+    /// Send a response to a server-to-client request.
+    SendResponse {
+        id: RequestId,
+        result: std::result::Result<Value, JsonRpcError>,
+    },
     /// Shutdown the client.
     Shutdown,
+}
+
+/// A server-to-client request awaiting a response.
+///
+/// Forwarded by the message loop when a registered handler channel is
+/// configured. The receiver decides how to reply via the included `responder`.
+#[derive(Debug)]
+pub struct ServerRequest {
+    /// The original request (id, method, params).
+    pub request: JsonRpcRequest,
+    /// Channel to send the response back. The message loop turns the result
+    /// into either `result` or `error` on the wire.
+    pub responder: oneshot::Sender<std::result::Result<Value, JsonRpcError>>,
 }
 
 impl LspClient {
@@ -103,28 +124,13 @@ impl LspClient {
 
     /// Create client from transport (for testing or custom spawning).
     ///
-    /// This method initializes the background message loop with the provided transport.
+    /// This method initializes the background message loop with the provided
+    /// transport. Production code uses `from_transport_with_channels`; this
+    /// thin wrapper exists so unit tests can construct a client without
+    /// optional plumbing.
+    #[cfg(test)]
     pub(crate) fn from_transport(config: LspServerConfig, transport: LspTransport) -> Self {
-        let state = Arc::new(Mutex::new(super::ServerState::Initializing));
-        let request_counter = Arc::new(AtomicI64::new(1));
-        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
-
-        let (command_tx, command_rx) = mpsc::channel(100);
-
-        let receiver_task = tokio::spawn(Self::message_loop(
-            transport,
-            command_rx,
-            pending_requests,
-            None,
-        ));
-
-        Self {
-            config,
-            state,
-            request_counter,
-            command_tx,
-            receiver_task: Some(receiver_task),
-        }
+        Self::from_transport_with_channels(config, transport, None, None)
     }
 
     /// Create client from transport with notification forwarding.
@@ -137,6 +143,22 @@ impl LspClient {
         transport: LspTransport,
         notification_tx: mpsc::Sender<LspNotification>,
     ) -> Self {
+        Self::from_transport_with_channels(config, transport, Some(notification_tx), None)
+    }
+
+    /// Create client from transport with both notification and server-request
+    /// channels.
+    ///
+    /// `server_request_tx`, when `Some`, receives every server-to-client request
+    /// (e.g. `client/registerCapability`). The receiver is expected to reply
+    /// via the request's `responder` channel; if the channel is dropped the
+    /// message loop replies with a `MethodNotFound` error.
+    pub(crate) fn from_transport_with_channels(
+        config: LspServerConfig,
+        transport: LspTransport,
+        notification_tx: Option<mpsc::Sender<LspNotification>>,
+        server_request_tx: Option<mpsc::Sender<ServerRequest>>,
+    ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
@@ -146,8 +168,10 @@ impl LspClient {
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
+            command_tx.clone(),
             pending_requests,
-            Some(notification_tx),
+            notification_tx,
+            server_request_tx,
         ));
 
         Self {
@@ -274,21 +298,25 @@ impl LspClient {
     /// Background task: handle message I/O.
     ///
     /// This task runs in the background, handling:
-    /// - Outbound requests and notifications
-    /// - Inbound responses and server notifications
+    /// - Outbound requests, notifications, and responses to server requests
+    /// - Inbound responses, notifications, and server-to-client requests
     /// - Matching responses to pending requests
     async fn message_loop(
         mut transport: LspTransport,
         mut command_rx: mpsc::Receiver<ClientCommand>,
+        command_tx: mpsc::Sender<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
+        server_request_tx: Option<mpsc::Sender<ServerRequest>>,
     ) -> Result<()> {
         debug!("Message loop started");
         let result = Self::message_loop_inner(
             &mut transport,
             &mut command_rx,
+            &command_tx,
             &pending_requests,
             notification_tx.as_ref(),
+            server_request_tx.as_ref(),
         )
         .await;
         if let Err(ref e) = result {
@@ -299,11 +327,14 @@ impl LspClient {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn message_loop_inner(
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
+        command_tx: &mpsc::Sender<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
+        server_request_tx: Option<&mpsc::Sender<ServerRequest>>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -326,6 +357,21 @@ impl LspClient {
                             });
                             transport.send(&notification).await?;
                         }
+                        ClientCommand::SendResponse { id, result } => {
+                            let value = match result {
+                                Ok(value) => serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": value,
+                                }),
+                                Err(error) => serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": error,
+                                }),
+                            };
+                            transport.send(&value).await?;
+                        }
                         ClientCommand::Shutdown => {
                             debug!("Client shutdown requested");
                             break;
@@ -342,6 +388,48 @@ impl LspClient {
                         }
                     };
                     match message {
+                        InboundMessage::Request(request) => {
+                            debug!("Received server request: {} (id={:?})", request.method, request.id);
+
+                            let id = request.id.clone();
+                            let method = request.method.clone();
+
+                            // Forward to a registered handler if configured;
+                            // otherwise reply with MethodNotFound so the
+                            // server does not block.
+                            if let Some(tx) = server_request_tx {
+                                let (resp_tx, resp_rx) = oneshot::channel();
+                                let server_request = ServerRequest {
+                                    request,
+                                    responder: resp_tx,
+                                };
+                                if tx.try_send(server_request).is_err() {
+                                    warn!(
+                                        "Server-request channel full or closed; replying MethodNotFound to {}",
+                                        method
+                                    );
+                                    Self::send_method_not_found(command_tx, id, &method).await;
+                                    continue;
+                                }
+                                let command_tx = command_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = resp_rx.await.unwrap_or_else(|_| {
+                                        Err(JsonRpcError {
+                                            code: METHOD_NOT_FOUND,
+                                            message: format!(
+                                                "no handler responded for method '{method}'"
+                                            ),
+                                            data: None,
+                                        })
+                                    });
+                                    let _ = command_tx
+                                        .send(ClientCommand::SendResponse { id, result })
+                                        .await;
+                                });
+                            } else {
+                                Self::send_method_not_found(command_tx, id, &method).await;
+                            }
+                        }
                         InboundMessage::Response(response) => {
                             trace!("Received response: id={:?}", response.id);
 
@@ -402,6 +490,26 @@ impl LspClient {
         }
 
         Ok(())
+    }
+
+    /// Send a `MethodNotFound` response to a server-to-client request that no
+    /// handler is willing or able to satisfy.
+    async fn send_method_not_found(
+        command_tx: &mpsc::Sender<ClientCommand>,
+        id: RequestId,
+        method: &str,
+    ) {
+        let error = JsonRpcError {
+            code: METHOD_NOT_FOUND,
+            message: format!("method not found: {method}"),
+            data: None,
+        };
+        let _ = command_tx
+            .send(ClientCommand::SendResponse {
+                id,
+                result: Err(error),
+            })
+            .await;
     }
 }
 

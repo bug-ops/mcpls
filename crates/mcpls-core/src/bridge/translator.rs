@@ -20,6 +20,7 @@ use url::Url;
 use super::state::{ResourceLimits, detect_language};
 use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
+use crate::config::DiagnosticsMode;
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer};
 
@@ -38,6 +39,8 @@ pub struct Translator {
     workspace_roots: Vec<PathBuf>,
     /// Custom file extension to language ID mappings.
     extension_map: HashMap<String, String>,
+    /// How `handle_diagnostics` sources its results.
+    diagnostics_mode: DiagnosticsMode,
 }
 
 impl Translator {
@@ -51,12 +54,18 @@ impl Translator {
             notification_cache: NotificationCache::new(),
             workspace_roots: vec![],
             extension_map: HashMap::new(),
+            diagnostics_mode: DiagnosticsMode::default(),
         }
     }
 
     /// Set the workspace roots for path validation.
     pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
         self.workspace_roots = roots;
+    }
+
+    /// Configure how `handle_diagnostics` sources its results.
+    pub const fn set_diagnostics_mode(&mut self, mode: DiagnosticsMode) {
+        self.diagnostics_mode = mode;
     }
 
     /// Configure custom file extension mappings.
@@ -116,7 +125,7 @@ impl Default for Translator {
 }
 
 /// Position in a document (1-based for MCP).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Position2D {
     /// Line number (1-based).
     pub line: u32,
@@ -125,7 +134,7 @@ pub struct Position2D {
 }
 
 /// Range in a document (1-based for MCP).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Range {
     /// Start position.
     pub start: Position2D,
@@ -661,6 +670,18 @@ impl Translator {
 
     /// Handle diagnostics request.
     ///
+    /// Behaviour is controlled by [`Translator::set_diagnostics_mode`]
+    /// (default [`DiagnosticsMode::Hybrid`]):
+    ///
+    /// - [`DiagnosticsMode::Pull`] issues `textDocument/diagnostic`. Misses
+    ///   push-only diagnostics (notably rust-analyzer's flycheck/cargo-check
+    ///   errors) but reflects fresh on-demand analysis.
+    /// - [`DiagnosticsMode::Cached`] reads from the cache populated by
+    ///   `publishDiagnostics`. Cheap; empty for files the LSP server has not
+    ///   analysed.
+    /// - [`DiagnosticsMode::Hybrid`] does pull + cached, deduplicating by
+    ///   `(range, message, code)`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
@@ -673,53 +694,27 @@ impl Translator {
             .ensure_open(&validated_path, &client)
             .await?;
 
-        let params = lsp_types::DocumentDiagnosticParams {
-            text_document: TextDocumentIdentifier { uri },
-            identifier: None,
-            previous_result_id: None,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
+        let mode = self.diagnostics_mode;
+
+        let pull = if matches!(mode, DiagnosticsMode::Pull | DiagnosticsMode::Hybrid) {
+            pull_diagnostics(&client, uri.clone()).await?
+        } else {
+            Vec::new()
         };
 
-        let timeout_duration = Duration::from_secs(30);
-        let response: lsp_types::DocumentDiagnosticReportResult = client
-            .request("textDocument/diagnostic", params, timeout_duration)
-            .await?;
-
-        let diagnostics = match response {
-            lsp_types::DocumentDiagnosticReportResult::Report(report) => match report {
-                lsp_types::DocumentDiagnosticReport::Full(full) => {
-                    full.full_document_diagnostic_report.items
-                }
-                lsp_types::DocumentDiagnosticReport::Unchanged(_) => vec![],
-            },
-            lsp_types::DocumentDiagnosticReportResult::Partial(_) => vec![],
+        let cached = if matches!(mode, DiagnosticsMode::Cached | DiagnosticsMode::Hybrid) {
+            cached_diagnostics(&self.notification_cache, &uri)
+        } else {
+            Vec::new()
         };
 
-        let result = DiagnosticsResult {
-            diagnostics: diagnostics
-                .into_iter()
-                .map(|diag| Diagnostic {
-                    range: normalize_range(diag.range),
-                    severity: match diag.severity {
-                        Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                        Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
-                        Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
-                            DiagnosticSeverity::Information
-                        }
-                        Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
-                        _ => DiagnosticSeverity::Information,
-                    },
-                    message: diag.message,
-                    code: diag.code.map(|c| match c {
-                        lsp_types::NumberOrString::Number(n) => n.to_string(),
-                        lsp_types::NumberOrString::String(s) => s,
-                    }),
-                })
-                .collect(),
+        let diagnostics = match mode {
+            DiagnosticsMode::Pull => pull,
+            DiagnosticsMode::Cached => cached,
+            DiagnosticsMode::Hybrid => merge_diagnostics(pull, cached),
         };
 
-        Ok(result)
+        Ok(DiagnosticsResult { diagnostics })
     }
 
     /// Handle rename request.
@@ -1346,44 +1341,14 @@ impl Translator {
         let validated_path = self.validate_path(&path)?;
 
         // Convert path to URI format for cache lookup (cross-platform)
-        let uri = Url::from_file_path(&validated_path)
+        let uri_str = Url::from_file_path(&validated_path)
             .map_err(|()| Error::InvalidUri(validated_path.display().to_string()))?
             .to_string();
+        let uri: lsp_types::Uri = uri_str.parse().map_err(|_| Error::InvalidUri(uri_str))?;
 
-        let diagnostics =
-            self.notification_cache
-                .get_diagnostics(&uri)
-                .map_or_else(Vec::new, |diag_info| {
-                    diag_info
-                        .diagnostics
-                        .iter()
-                        .map(|diag| Diagnostic {
-                            range: normalize_range(diag.range),
-                            severity: match diag.severity {
-                                Some(lsp_types::DiagnosticSeverity::ERROR) => {
-                                    DiagnosticSeverity::Error
-                                }
-                                Some(lsp_types::DiagnosticSeverity::WARNING) => {
-                                    DiagnosticSeverity::Warning
-                                }
-                                Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
-                                    DiagnosticSeverity::Information
-                                }
-                                Some(lsp_types::DiagnosticSeverity::HINT) => {
-                                    DiagnosticSeverity::Hint
-                                }
-                                _ => DiagnosticSeverity::Information,
-                            },
-                            message: diag.message.clone(),
-                            code: diag.code.as_ref().map(|c| match c {
-                                lsp_types::NumberOrString::Number(n) => n.to_string(),
-                                lsp_types::NumberOrString::String(s) => s.clone(),
-                            }),
-                        })
-                        .collect()
-                });
-
-        Ok(DiagnosticsResult { diagnostics })
+        Ok(DiagnosticsResult {
+            diagnostics: cached_diagnostics(&self.notification_cache, &uri),
+        })
     }
 
     /// Handle server logs request.
@@ -1464,6 +1429,192 @@ fn marked_string_to_string(marked: MarkedString) -> String {
     match marked {
         MarkedString::String(s) => s,
         MarkedString::LanguageString(ls) => format!("```{}\n{}\n```", ls.language, ls.value),
+    }
+}
+
+/// Issue `textDocument/diagnostic` and convert the response.
+async fn pull_diagnostics(client: &LspClient, uri: lsp_types::Uri) -> Result<Vec<Diagnostic>> {
+    let params = lsp_types::DocumentDiagnosticParams {
+        text_document: TextDocumentIdentifier { uri },
+        identifier: None,
+        previous_result_id: None,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let timeout_duration = Duration::from_secs(30);
+    let response: lsp_types::DocumentDiagnosticReportResult = client
+        .request("textDocument/diagnostic", params, timeout_duration)
+        .await?;
+
+    let items = match response {
+        lsp_types::DocumentDiagnosticReportResult::Report(report) => match report {
+            lsp_types::DocumentDiagnosticReport::Full(full) => {
+                full.full_document_diagnostic_report.items
+            }
+            lsp_types::DocumentDiagnosticReport::Unchanged(_) => Vec::new(),
+        },
+        lsp_types::DocumentDiagnosticReportResult::Partial(_) => Vec::new(),
+    };
+    Ok(items.into_iter().map(diagnostic_from_lsp).collect())
+}
+
+/// Read pushed diagnostics for `uri` from the notification cache.
+fn cached_diagnostics(cache: &NotificationCache, uri: &lsp_types::Uri) -> Vec<Diagnostic> {
+    cache
+        .get_diagnostics(&uri.to_string())
+        .map_or_else(Vec::new, |info| {
+            info.diagnostics
+                .iter()
+                .cloned()
+                .map(diagnostic_from_lsp)
+                .collect()
+        })
+}
+
+/// Merge pull and cached diagnostics, deduplicating same-span repeats.
+///
+/// Push diagnostics from rust-analyzer's flycheck and pull diagnostics from
+/// its native provider often report the same underlying error twice with
+/// only path-qualifier differences in the message (e.g. `expected DocItem`
+/// vs `expected types::DocItem`). The dedup key folds away those qualifiers
+/// so the two collapse into one entry, while preserving genuinely-distinct
+/// errors that share a `(range, code)` pair.
+///
+/// The first occurrence of each key wins. Pull entries are processed first,
+/// so on collision the structured pull diagnostic is kept and the cached
+/// (push-only) duplicate is dropped.
+fn merge_diagnostics(pull: Vec<Diagnostic>, cached: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut seen: std::collections::HashSet<DiagnosticDedupKey> =
+        std::collections::HashSet::with_capacity(pull.len() + cached.len());
+    let mut out: Vec<Diagnostic> = Vec::with_capacity(pull.len() + cached.len());
+    for d in pull.into_iter().chain(cached) {
+        if seen.insert(DiagnosticDedupKey::from(&d)) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Dedup key used by [`merge_diagnostics`].
+///
+/// `code` carries the strongest dedup signal (E0599 is E0599 regardless of how
+/// the offending identifier was rendered), so when present we key on
+/// `(range, severity, code)` only and ignore the message entirely. When
+/// `code` is `None` we fall back to a path-qualifier-stripped message so that
+/// `expected DocItem` and `expected types::DocItem` collapse together.
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct DiagnosticDedupKey {
+    range: Range,
+    severity: DiagnosticSeverityKey,
+    discriminator: DedupDiscriminator,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+enum DedupDiscriminator {
+    /// Code is present — fold the message away entirely.
+    Code(String),
+    /// No code — fall back to path-stripped message so qualifier-only
+    /// differences still merge.
+    NormalizedMessage(String),
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+enum DiagnosticSeverityKey {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+impl From<&DiagnosticSeverity> for DiagnosticSeverityKey {
+    fn from(s: &DiagnosticSeverity) -> Self {
+        match s {
+            DiagnosticSeverity::Error => Self::Error,
+            DiagnosticSeverity::Warning => Self::Warning,
+            DiagnosticSeverity::Information => Self::Information,
+            DiagnosticSeverity::Hint => Self::Hint,
+        }
+    }
+}
+
+impl From<&Diagnostic> for DiagnosticDedupKey {
+    fn from(d: &Diagnostic) -> Self {
+        let discriminator = d.code.as_ref().map_or_else(
+            || DedupDiscriminator::NormalizedMessage(normalize_message_for_dedup(&d.message)),
+            |code| DedupDiscriminator::Code(code.clone()),
+        );
+        Self {
+            range: d.range.clone(),
+            severity: DiagnosticSeverityKey::from(&d.severity),
+            discriminator,
+        }
+    }
+}
+
+/// Strip Rust path qualifiers from each `::`-separated identifier in `s`,
+/// keeping only the final segment. `crate::foo::Bar` → `Bar`,
+/// `expected types::DocItem, found DocItem` → `expected DocItem, found DocItem`.
+///
+/// Folds away the qualifier-only differences that produce duplicate
+/// diagnostics in `hybrid` mode, while leaving non-Rust text (whitespace,
+/// punctuation, non-ASCII characters in error messages) untouched.
+fn normalize_message_for_dedup(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_ident_byte(bytes[i]) {
+            // Identifiers and `::`-paths are pure ASCII, so byte-stepping is
+            // safe inside this branch.
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let mut segment_start = start;
+            while i + 2 <= bytes.len() && &bytes[i..i + 2] == b"::" {
+                let after_colons = i + 2;
+                let mut j = after_colons;
+                while j < bytes.len() && is_ident_byte(bytes[j]) {
+                    j += 1;
+                }
+                if j == after_colons {
+                    break;
+                }
+                segment_start = after_colons;
+                i = j;
+            }
+            out.push_str(&s[segment_start..i]);
+        } else {
+            // Outside identifiers we have to step by `char` to keep multi-byte
+            // UTF-8 sequences intact. Find the next char boundary.
+            let ch = s[i..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+const fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Translate an `lsp_types::Diagnostic` into our MCP-shaped `Diagnostic`.
+fn diagnostic_from_lsp(diag: lsp_types::Diagnostic) -> Diagnostic {
+    Diagnostic {
+        range: normalize_range(diag.range),
+        severity: match diag.severity {
+            Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+            Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+            Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+            // INFORMATION + None + unknown → Information.
+            _ => DiagnosticSeverity::Information,
+        },
+        message: diag.message,
+        code: diag.code.map(|c| match c {
+            lsp_types::NumberOrString::Number(n) => n.to_string(),
+            lsp_types::NumberOrString::String(s) => s,
+        }),
     }
 }
 
@@ -2772,6 +2923,7 @@ mod tests {
                 position_encodings: vec!["utf-8".to_string()],
                 language_extensions: language_extensions.clone(),
                 heuristics_max_depth: 10,
+                diagnostics_mode: crate::config::DiagnosticsMode::default(),
             },
             lsp_servers: vec![],
         };
@@ -2788,5 +2940,254 @@ mod tests {
         } else {
             panic!("Expected NoServersAvailable error for empty server config");
         }
+    }
+
+    #[test]
+    fn test_merge_diagnostics_dedupes_by_range_message_code() {
+        let range = Range {
+            start: Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: Position2D {
+                line: 1,
+                character: 5,
+            },
+        };
+        let pull = vec![Diagnostic {
+            range: range.clone(),
+            severity: DiagnosticSeverity::Error,
+            message: "expected `i32`, found `&str`".to_string(),
+            code: Some("E0308".to_string()),
+        }];
+        let cached = vec![
+            // Duplicate of the pull entry — should be dropped.
+            Diagnostic {
+                range: range.clone(),
+                severity: DiagnosticSeverity::Error,
+                message: "expected `i32`, found `&str`".to_string(),
+                code: Some("E0308".to_string()),
+            },
+            // Distinct flycheck-only diagnostic — should be kept.
+            Diagnostic {
+                range,
+                severity: DiagnosticSeverity::Warning,
+                message: "unused variable: `x`".to_string(),
+                code: Some("unused_variables".to_string()),
+            },
+        ];
+
+        let merged = merge_diagnostics(pull, cached);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|d| d.code.as_deref() == Some("E0308")));
+        assert!(
+            merged
+                .iter()
+                .any(|d| d.code.as_deref() == Some("unused_variables"))
+        );
+    }
+
+    #[test]
+    fn test_merge_diagnostics_preserves_pull_when_only_pull() {
+        let pull = vec![Diagnostic {
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 2,
+                },
+            },
+            severity: DiagnosticSeverity::Error,
+            message: "x".to_string(),
+            code: None,
+        }];
+        let merged = merge_diagnostics(pull, Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].message, "x");
+    }
+
+    #[test]
+    fn test_merge_diagnostics_preserves_cached_when_only_cached() {
+        let cached = vec![Diagnostic {
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 2,
+                },
+            },
+            severity: DiagnosticSeverity::Warning,
+            message: "y".to_string(),
+            code: None,
+        }];
+        let merged = merge_diagnostics(Vec::new(), cached);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].message, "y");
+    }
+
+    /// rust-analyzer's native and flycheck pipelines often emit the same
+    /// E0599 with different qualifications of the same identifier. Both
+    /// entries share `(range, severity, code)`, so when `code` is present
+    /// they collapse regardless of the message text.
+    #[test]
+    fn test_merge_diagnostics_dedupes_qualifier_only_difference_with_code() {
+        let range = Range {
+            start: Position2D {
+                line: 87,
+                character: 5,
+            },
+            end: Position2D {
+                line: 87,
+                character: 13,
+            },
+        };
+        let pull = vec![Diagnostic {
+            range: range.clone(),
+            severity: DiagnosticSeverity::Error,
+            message: "no method named `foo` found for enum `DocItem`".to_string(),
+            code: Some("E0599".to_string()),
+        }];
+        let cached = vec![Diagnostic {
+            range,
+            severity: DiagnosticSeverity::Error,
+            message: "no method named `foo` found for enum `types::DocItem`".to_string(),
+            code: Some("E0599".to_string()),
+        }];
+
+        let merged = merge_diagnostics(pull, cached);
+        assert_eq!(merged.len(), 1, "qualifier-only duplicate must collapse");
+        // Pull entry wins — the unqualified form is kept.
+        assert!(merged[0].message.contains("`DocItem`"));
+        assert!(!merged[0].message.contains("types::DocItem"));
+    }
+
+    /// Same span and severity but distinct codes: not the same diagnostic.
+    /// Both must survive the merge.
+    #[test]
+    fn test_merge_diagnostics_keeps_distinct_codes_at_same_span() {
+        let range = Range {
+            start: Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: Position2D {
+                line: 1,
+                character: 10,
+            },
+        };
+        let pull = vec![Diagnostic {
+            range: range.clone(),
+            severity: DiagnosticSeverity::Warning,
+            message: "unused".to_string(),
+            code: Some("dead_code".to_string()),
+        }];
+        let cached = vec![Diagnostic {
+            range,
+            severity: DiagnosticSeverity::Warning,
+            message: "unused".to_string(),
+            code: Some("unused_imports".to_string()),
+        }];
+
+        let merged = merge_diagnostics(pull, cached);
+        assert_eq!(merged.len(), 2);
+    }
+
+    /// When `code` is `None`, fall back to a path-stripped message comparison
+    /// so qualifier-only duplicates still merge.
+    #[test]
+    fn test_merge_diagnostics_dedupes_qualifier_only_difference_without_code() {
+        let range = Range {
+            start: Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: Position2D {
+                line: 1,
+                character: 5,
+            },
+        };
+        let pull = vec![Diagnostic {
+            range: range.clone(),
+            severity: DiagnosticSeverity::Error,
+            message: "expected DocItem".to_string(),
+            code: None,
+        }];
+        let cached = vec![Diagnostic {
+            range,
+            severity: DiagnosticSeverity::Error,
+            message: "expected types::DocItem".to_string(),
+            code: None,
+        }];
+
+        let merged = merge_diagnostics(pull, cached);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].message, "expected DocItem");
+    }
+
+    /// When `code` is `None` and messages differ in non-qualifier ways, the
+    /// entries must NOT merge.
+    #[test]
+    fn test_merge_diagnostics_keeps_genuinely_different_messages_without_code() {
+        let range = Range {
+            start: Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: Position2D {
+                line: 1,
+                character: 5,
+            },
+        };
+        let pull = vec![Diagnostic {
+            range: range.clone(),
+            severity: DiagnosticSeverity::Error,
+            message: "expected DocItem".to_string(),
+            code: None,
+        }];
+        let cached = vec![Diagnostic {
+            range,
+            severity: DiagnosticSeverity::Error,
+            message: "expected SomethingElse".to_string(),
+            code: None,
+        }];
+
+        let merged = merge_diagnostics(pull, cached);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_normalize_message_for_dedup_strips_paths() {
+        assert_eq!(
+            normalize_message_for_dedup("expected types::DocItem, found DocItem"),
+            "expected DocItem, found DocItem"
+        );
+        assert_eq!(normalize_message_for_dedup("crate::foo::Bar"), "Bar");
+        assert_eq!(normalize_message_for_dedup("a::b::c::d"), "d");
+    }
+
+    #[test]
+    fn test_normalize_message_for_dedup_preserves_punctuation_and_unicode() {
+        assert_eq!(
+            normalize_message_for_dedup("expected `i32`, found `&str` — oops"),
+            "expected `i32`, found `&str` — oops"
+        );
+    }
+
+    #[test]
+    fn test_normalize_message_for_dedup_handles_lone_double_colon() {
+        // `::` with no following identifier should be left alone.
+        assert_eq!(normalize_message_for_dedup("foo:: bar"), "foo:: bar");
+    }
+
+    #[test]
+    fn test_normalize_message_for_dedup_idempotent_on_simple_text() {
+        let s = "no method named `foo` found";
+        assert_eq!(normalize_message_for_dedup(s), s);
     }
 }

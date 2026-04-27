@@ -61,6 +61,15 @@ pub struct WorkspaceConfig {
     /// Default: 10
     #[serde(default = "default_heuristics_max_depth")]
     pub heuristics_max_depth: usize,
+
+    /// How `get_diagnostics` sources its results.
+    ///
+    /// See [`DiagnosticsMode`] for the trade-offs. Defaults to
+    /// [`DiagnosticsMode::Hybrid`] because rust-analyzer's pull-style
+    /// diagnostic provider does not surface flycheck (cargo-check) errors,
+    /// so a pull-only path returns empty for the most useful diagnostics.
+    #[serde(default)]
+    pub diagnostics_mode: DiagnosticsMode,
 }
 
 impl Default for WorkspaceConfig {
@@ -70,12 +79,39 @@ impl Default for WorkspaceConfig {
             position_encodings: default_position_encodings(),
             language_extensions: default_language_extensions(),
             heuristics_max_depth: default_heuristics_max_depth(),
+            diagnostics_mode: DiagnosticsMode::default(),
         }
     }
 }
 
 const fn default_heuristics_max_depth() -> usize {
     DEFAULT_HEURISTICS_MAX_DEPTH
+}
+
+/// How the `get_diagnostics` MCP tool sources its results.
+///
+/// LSP servers expose diagnostics in two ways: a *pull* request
+/// (`textDocument/diagnostic`, LSP 3.17), and *push* notifications
+/// (`textDocument/publishDiagnostics`). The two channels do not always carry
+/// the same content. rust-analyzer in particular routes flycheck/cargo-check
+/// errors only through push, so a pull-only client sees empty results for
+/// every file that has not been independently flychecked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticsMode {
+    /// Issue a fresh `textDocument/diagnostic` request to the LSP server.
+    /// Always reflects on-demand analysis but misses push-only diagnostics
+    /// (notably rust-analyzer's flycheck/cargo-check errors).
+    Pull,
+    /// Read from the cache populated by `publishDiagnostics`. Reflects whatever
+    /// the LSP server has pushed; empty for files the server has not analysed.
+    /// Cheap (no LSP round-trip).
+    Cached,
+    /// Issue a pull request *and* merge in any cached push diagnostics for
+    /// the same file. The default. Combines fresh on-demand analysis with
+    /// flycheck-style errors that arrive only through push.
+    #[default]
+    Hybrid,
 }
 
 impl WorkspaceConfig {
@@ -424,7 +460,7 @@ impl Default for ServerConfig {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::fs;
 
@@ -691,6 +727,7 @@ mod tests {
                 },
             ],
             heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
+            diagnostics_mode: DiagnosticsMode::default(),
         };
 
         let map = workspace.build_extension_map();
@@ -782,6 +819,7 @@ mod tests {
                 },
             ],
             heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
+            diagnostics_mode: DiagnosticsMode::default(),
         };
 
         assert_eq!(
@@ -927,5 +965,46 @@ mod tests {
             config.workspace.heuristics_max_depth,
             DEFAULT_HEURISTICS_MAX_DEPTH
         );
+    }
+
+    #[test]
+    fn test_diagnostics_mode_default_is_hybrid() {
+        assert_eq!(DiagnosticsMode::default(), DiagnosticsMode::Hybrid);
+    }
+
+    #[test]
+    fn test_diagnostics_mode_serde_round_trip() {
+        for (mode, expected) in [
+            (DiagnosticsMode::Pull, "\"pull\""),
+            (DiagnosticsMode::Cached, "\"cached\""),
+            (DiagnosticsMode::Hybrid, "\"hybrid\""),
+        ] {
+            let serialized = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(serialized, expected, "for mode {mode:?}");
+            let deserialized: DiagnosticsMode =
+                serde_json::from_str(expected).expect("deserialize");
+            assert_eq!(deserialized, mode);
+        }
+    }
+
+    #[test]
+    fn test_diagnostics_mode_omitted_uses_default() {
+        let toml = "
+[workspace]
+roots = []
+";
+        let cfg: ServerConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.workspace.diagnostics_mode, DiagnosticsMode::default());
+    }
+
+    #[test]
+    fn test_diagnostics_mode_explicit_pull() {
+        let toml = "
+[workspace]
+roots = []
+diagnostics_mode = \"pull\"
+";
+        let cfg: ServerConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.workspace.diagnostics_mode, DiagnosticsMode::Pull);
     }
 }

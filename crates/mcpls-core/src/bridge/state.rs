@@ -4,8 +4,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use lsp_types::{DidOpenTextDocumentParams, TextDocumentItem, Uri};
+use lsp_types::{
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, TextDocumentIdentifier,
+    TextDocumentItem, Uri,
+};
 
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
@@ -21,6 +25,36 @@ pub struct DocumentState {
     pub version: i32,
     /// Document content.
     pub content: String,
+    /// Filesystem signature captured when this state was last synced from disk.
+    ///
+    /// `(mtime, size)` together act as a freshness key: a mismatch on either
+    /// means the on-disk file has changed since the LSP server was last told
+    /// about it, and the document must be re-synced. `mtime` is `None` on
+    /// platforms or filesystems that do not expose a modification time.
+    pub synced_signature: SyncSignature,
+}
+
+/// Filesystem signature used to detect external file changes.
+///
+/// Pairing modification time with size avoids false negatives on filesystems
+/// with low mtime resolution where two writes within the same tick can leave
+/// mtime unchanged while content (and therefore size) differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncSignature {
+    /// Last modification time, if available.
+    pub mtime: Option<SystemTime>,
+    /// File size in bytes.
+    pub size: u64,
+}
+
+impl SyncSignature {
+    /// Signature used before a file has been stat'd. Will not compare equal to
+    /// any real on-disk signature, forcing the first `ensure_open` call to
+    /// take the sync path.
+    pub const UNKNOWN: Self = Self {
+        mtime: None,
+        size: u64::MAX,
+    };
 }
 
 /// Resource limits for document tracking.
@@ -122,6 +156,7 @@ impl DocumentTracker {
             language_id,
             version: 1,
             content,
+            synced_signature: SyncSignature::UNKNOWN,
         };
 
         self.documents.insert(path, state);
@@ -141,6 +176,20 @@ impl DocumentTracker {
         }
     }
 
+    /// Record the on-disk signature for a tracked document.
+    ///
+    /// Used by `ensure_open` after reading or re-reading the file from disk so
+    /// future calls can short-circuit when the signature is unchanged. Returns
+    /// `false` if the document is not tracked.
+    pub fn set_synced_signature(&mut self, path: &Path, signature: SyncSignature) -> bool {
+        if let Some(state) = self.documents.get_mut(path) {
+            state.synced_signature = signature;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Close a document and remove it from tracking.
     ///
     /// Returns the document state if it was open.
@@ -153,20 +202,38 @@ impl DocumentTracker {
         self.documents.drain().map(|(_, state)| state).collect()
     }
 
-    /// Ensure a document is open, opening it lazily if necessary.
+    /// Forget a tracked document without notifying the LSP server.
     ///
-    /// If the document is already open, returns its URI immediately.
-    /// Otherwise, reads the file from disk, opens it in the tracker,
-    /// and sends a `didOpen` notification to the LSP server.
+    /// Used by external-change detection paths (filesystem watchers) so that
+    /// the next `ensure_open` call observes a signature mismatch and re-syncs
+    /// the document. Callers that need to inform the server should additionally
+    /// send `textDocument/didClose` themselves.
+    pub fn invalidate(&mut self, path: &Path) -> Option<DocumentState> {
+        self.documents.remove(path)
+    }
+
+    /// Ensure a document is open and in sync with the on-disk file.
+    ///
+    /// Stats the file on every call and compares the result against the
+    /// tracked `DocumentState`'s signature. If the signature matches, returns
+    /// the cached URI. If it differs (external edit, git checkout, formatter,
+    /// etc.) the file is re-read, the LSP server is sent a
+    /// `textDocument/didClose` followed by a `textDocument/didOpen` with a
+    /// bumped version, and the cached state is replaced. If the document is
+    /// not tracked at all, it is opened for the first time.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The file cannot be read from disk
-    /// - The `didOpen` notification fails to send
+    /// - The file cannot be stat'd or read from disk
+    /// - The `didClose`/`didOpen` notification fails to send
     /// - Resource limits are exceeded
     pub async fn ensure_open(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
-        if let Some(state) = self.documents.get(path) {
+        let signature = stat_signature(path).await?;
+
+        if let Some(state) = self.documents.get(path)
+            && state.synced_signature == signature
+        {
             return Ok(state.uri.clone());
         }
 
@@ -177,25 +244,77 @@ impl DocumentTracker {
                 source: e,
             })?;
 
+        if let Some(existing) = self.documents.get(path) {
+            let close_params = DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: existing.uri.clone(),
+                },
+            };
+            lsp_client
+                .notify("textDocument/didClose", close_params)
+                .await?;
+            // Bump the version on resync so the server sees the reopened
+            // document as a strictly newer state.
+            let new_version = existing.version.saturating_add(1);
+            let language_id = existing.language_id.clone();
+            let uri = existing.uri.clone();
+            if let Some(state) = self.documents.get_mut(path) {
+                state.version = new_version;
+                state.content.clone_from(&content);
+                state.synced_signature = signature;
+            }
+            send_did_open(lsp_client, &uri, &language_id, new_version, content).await?;
+            return Ok(uri);
+        }
+
         let uri = self.open(path.to_path_buf(), content.clone())?;
-        let state = self
+        // Record the signature now that the document is tracked; if the file
+        // is replaced before the next access, the next ensure_open will see a
+        // mismatch and re-sync.
+        self.set_synced_signature(path, signature);
+        let language_id = self
             .documents
             .get(path)
-            .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?;
-
-        let params = DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: uri.clone(),
-                language_id: state.language_id.clone(),
-                version: state.version,
-                text: content,
-            },
-        };
-
-        lsp_client.notify("textDocument/didOpen", params).await?;
-
+            .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?
+            .language_id
+            .clone();
+        send_did_open(lsp_client, &uri, &language_id, 1, content).await?;
         Ok(uri)
     }
+}
+
+/// Stat a file and produce its sync signature.
+///
+/// `mtime` falls back to `None` when the platform does not expose it; in that
+/// case the signature collapses to a size-only comparison.
+async fn stat_signature(path: &Path) -> Result<SyncSignature> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|e| Error::FileIo {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(SyncSignature {
+        mtime: metadata.modified().ok(),
+        size: metadata.len(),
+    })
+}
+
+/// Send a `textDocument/didOpen` notification with the given content.
+async fn send_did_open(
+    lsp_client: &LspClient,
+    uri: &Uri,
+    language_id: &str,
+    version: i32,
+    text: String,
+) -> Result<()> {
+    let params = DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: uri.clone(),
+            language_id: language_id.to_string(),
+            version,
+            text,
+        },
+    };
+    lsp_client.notify("textDocument/didOpen", params).await
 }
 
 /// Convert a file path to a URI.
@@ -371,6 +490,7 @@ mod tests {
             language_id: "rust".to_string(),
             version: 5,
             content: "fn main() {}".to_string(),
+            synced_signature: SyncSignature::UNKNOWN,
         };
 
         #[allow(clippy::redundant_clone)]
@@ -379,6 +499,7 @@ mod tests {
         assert_eq!(cloned.language_id, state.language_id);
         assert_eq!(cloned.version, 5);
         assert_eq!(cloned.content, state.content);
+        assert_eq!(cloned.synced_signature, state.synced_signature);
     }
 
     #[test]
@@ -799,5 +920,83 @@ mod tests {
 
         // Lowercase .nu should not match uppercase "NU" in map
         assert_eq!(detect_language(Path::new("script.nu"), &map), "plaintext");
+    }
+
+    #[test]
+    fn test_sync_signature_unknown_does_not_match_real() {
+        let real = SyncSignature {
+            mtime: Some(SystemTime::UNIX_EPOCH),
+            size: 0,
+        };
+        assert_ne!(SyncSignature::UNKNOWN, real);
+    }
+
+    #[test]
+    fn test_sync_signature_size_change_detected() {
+        let now = SystemTime::now();
+        let a = SyncSignature {
+            mtime: Some(now),
+            size: 100,
+        };
+        let b = SyncSignature {
+            mtime: Some(now),
+            size: 101,
+        };
+        assert_ne!(a, b, "size change must defeat equality even if mtime ties");
+    }
+
+    #[test]
+    fn test_set_synced_signature_records_value() {
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/test/sig.rs");
+        tracker
+            .open(path.clone(), "fn main() {}".to_string())
+            .unwrap();
+
+        let signature = SyncSignature {
+            mtime: Some(SystemTime::now()),
+            size: 12,
+        };
+        assert!(tracker.set_synced_signature(&path, signature));
+        assert_eq!(tracker.get(&path).unwrap().synced_signature, signature);
+    }
+
+    #[test]
+    fn test_set_synced_signature_returns_false_for_unknown_path() {
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let signature = SyncSignature {
+            mtime: None,
+            size: 0,
+        };
+        assert!(!tracker.set_synced_signature(Path::new("/nope.rs"), signature));
+    }
+
+    #[test]
+    fn test_invalidate_removes_state() {
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/test/inv.rs");
+        tracker.open(path.clone(), "x".to_string()).unwrap();
+        assert!(tracker.is_open(&path));
+
+        let removed = tracker.invalidate(&path);
+        assert!(removed.is_some());
+        assert!(!tracker.is_open(&path));
+    }
+
+    #[tokio::test]
+    async fn test_stat_signature_changes_when_file_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.txt");
+        tokio::fs::write(&path, b"v1").await.unwrap();
+
+        let first = stat_signature(&path).await.unwrap();
+
+        // Sleep briefly so mtime resolution on coarse filesystems can advance.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::fs::write(&path, b"v2-longer-content").await.unwrap();
+
+        let second = stat_signature(&path).await.unwrap();
+        assert_ne!(first, second, "signature must change after rewrite");
+        assert_ne!(first.size, second.size);
     }
 }
