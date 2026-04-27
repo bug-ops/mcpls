@@ -35,9 +35,12 @@ Two complementary changes:
    `workspace.didChangeWatchedFiles.dynamic_registration: true`,
    handles the inbound registration request, runs a `notify`-based
    filesystem watcher per server, and forwards matching events as
-   `workspace/didChangeWatchedFiles` notifications. The watcher also
-   invalidates the `DocumentTracker` entry for any affected path so
-   that the next `ensure_open` re-syncs (composes cleanly with #1).
+   `workspace/didChangeWatchedFiles` notifications. The watcher does
+   not invalidate `DocumentTracker` directly: change #1 already
+   re-syncs any tracked document on the next access, so the only job
+   left for the watcher is to keep the LSP's *workspace index* (files
+   mcpls has not opened) live. The two changes compose without
+   coupling.
 
 Manual `reload_workspace` is intentionally out of scope here.
 

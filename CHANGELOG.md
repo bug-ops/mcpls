@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RFC-3986 URI codec** — `bridge::resources` module with percent-encoding via `url::Url::from_file_path`; empty-authority injection is rejected to prevent UNC-path attacks on Windows
 - **Subscription cap** — `ResourceSubscriptions` enforces a `MAX_SUBSCRIPTIONS = 1_000` limit per session to guard against memory exhaustion
 - **MCP tools** — `get_signature_help` (`textDocument/signatureHelp`), `go_to_implementation` (`textDocument/implementation`), `go_to_type_definition` (`textDocument/typeDefinition`), and `get_inlay_hints` (`textDocument/inlayHint`) tools exposing LSP 3.6/3.15/3.17 capabilities (#116)
+- **`workspace/didChangeWatchedFiles` support** (#102, part 2) — mcpls now declares `workspace.didChangeWatchedFiles.dynamic_registration: true` and `relative_pattern_support: true`, handles inbound `client/registerCapability` and `client/unregisterCapability` requests, and runs a per-server filesystem watcher that forwards matched events as `workspace/didChangeWatchedFiles`. This keeps the LSP server's *workspace index* live across external file changes (files mcpls has never opened) for servers that register watchers (rust-analyzer, gopls, pyright, typescript-language-server, clangd). Builds on a new `notify` dependency.
 
 ### Changed
 
