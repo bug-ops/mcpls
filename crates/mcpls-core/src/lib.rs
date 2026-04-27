@@ -280,6 +280,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(workspace_roots.clone());
+    translator.set_diagnostics_mode(config.workspace.diagnostics_mode);
 
     let applicable_configs: Vec<ServerInitConfig> = config
         .lsp_servers
@@ -654,6 +655,7 @@ mod tests {
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    diagnostics_mode: crate::config::DiagnosticsMode::default(),
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -694,6 +696,7 @@ mod tests {
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    diagnostics_mode: crate::config::DiagnosticsMode::default(),
                 },
                 lsp_servers: vec![],
             };

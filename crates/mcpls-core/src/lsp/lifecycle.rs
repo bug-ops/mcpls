@@ -35,6 +35,12 @@ const METHOD_NOT_FOUND: i32 = -32601;
 /// Channel capacity for inbound server-to-client requests.
 const SERVER_REQUEST_CHANNEL_CAPACITY: usize = 32;
 
+/// Channel capacity for inbound LSP notifications (`publishDiagnostics`,
+/// `window/logMessage`, `window/showMessage`). Sized for short bursts during
+/// indexing and flycheck cycles; on overflow notifications are dropped with
+/// a warning.
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
+
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
@@ -275,7 +281,6 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
-        let (notification_tx, notification_rx) = mpsc::channel(64);
         // Build the file watcher *before* the client so we can decide whether
         // to wire a server-request channel through.
         //
@@ -287,6 +292,7 @@ impl LspServer {
         // launched and the receiver is dropped — the message loop then
         // observes a closed channel and falls back to MethodNotFound.
         let (server_request_tx, server_request_rx) = mpsc::channel(SERVER_REQUEST_CHANNEL_CAPACITY);
+        let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
         let client = LspClient::from_transport_with_channels(
             config.server_config.clone(),
             transport,
