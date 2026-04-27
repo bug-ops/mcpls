@@ -16,7 +16,7 @@ use tokio::process::{ChildStdin, ChildStdout};
 use tracing::{trace, warn};
 
 use crate::error::{Error, Result};
-use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcResponse};
+use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 
 /// Maximum allowed Content-Length (10 MB)
 const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
@@ -104,7 +104,19 @@ impl LspTransport {
 
         let value: Value = serde_json::from_str(&content)?;
 
-        if value.get("id").is_some() {
+        // Per JSON-RPC 2.0: a message with both `id` and `method` is a
+        // server-to-client request; `id` alone is a response; `method` alone is
+        // a notification. The previous implementation treated anything with an
+        // `id` as a response, which silently broke `client/registerCapability`
+        // and other server-initiated requests.
+        let has_id = value.get("id").is_some();
+        let has_method = value.get("method").is_some();
+
+        if has_id && has_method {
+            let request: JsonRpcRequest = serde_json::from_value(value)
+                .map_err(|e| Error::LspProtocolError(format!("Invalid request: {e}")))?;
+            Ok(InboundMessage::Request(request))
+        } else if has_id {
             let response: JsonRpcResponse = serde_json::from_value(value)
                 .map_err(|e| Error::LspProtocolError(format!("Invalid response: {e}")))?;
             Ok(InboundMessage::Response(response))
