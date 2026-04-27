@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stale results after external file changes** (#102, part 1) — `DocumentTracker::ensure_open` now stats the file on every call and re-syncs the document with the LSP server (via `textDocument/didClose` + bumped-version `textDocument/didOpen`) when the on-disk signature has changed. Fixes stale `get_hover`, `get_definition`, `get_references`, `get_document_symbols`, `get_diagnostics`, `get_completions`, `get_code_actions`, `format_document`, `rename_symbol`, and call-hierarchy results after edits made outside mcpls (`git stash`/`checkout`, the MCP host's own `Edit`/`Write` tools, formatters, code generators). Works for every configured LSP, including those that do not register `workspace/didChangeWatchedFiles`.
+
 ## [0.3.6] - 2026-04-21
 
 ### Changed

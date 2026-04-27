@@ -861,3 +861,135 @@ async fn test_workspace_symbol_search_function() {
         }
     }
 }
+
+/// Regression test for issue #102: external file changes must invalidate the
+/// document tracker so the next request reflects on-disk truth.
+///
+/// Sequence:
+/// 1. Copy the `rust_workspace` fixture to a tempdir.
+/// 2. Spawn rust-analyzer rooted at the copy.
+/// 3. Query document symbols in `src/types.rs` to prime the tracker.
+/// 4. Overwrite `src/types.rs` on disk with a new symbol set, then query
+///    again. The result must reflect the new symbols.
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_ensure_open_resyncs_after_external_edit() {
+    use std::collections::HashMap;
+
+    use mcpls_core::config::LspServerConfig;
+
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    init_tracing();
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    copy_dir_recursive(&rust_workspace_path(), tempdir.path()).expect("copy fixture");
+    let workspace_path = tempdir.path().to_path_buf();
+
+    let lsp_config = LspServerConfig {
+        language_id: "rust".to_string(),
+        command: "rust-analyzer".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        file_patterns: vec!["**/*.rs".to_string()],
+        initialization_options: None,
+        timeout_seconds: 30,
+        heuristics: None,
+    };
+    let server_init_config = ServerInitConfig {
+        server_config: lsp_config,
+        workspace_roots: vec![workspace_path.clone()],
+        initialization_options: None,
+    };
+
+    let server = LspServer::spawn(server_init_config)
+        .await
+        .expect("spawn rust-analyzer");
+    let client = server.client().clone();
+
+    let extension_map = {
+        let mut m = HashMap::new();
+        m.insert("rs".to_string(), "rust".to_string());
+        m
+    };
+    let mut translator = Translator::new().with_extensions(extension_map);
+    translator.set_workspace_roots(vec![workspace_path.clone()]);
+    translator.register_client("rust".to_string(), client);
+    translator.register_server("rust".to_string(), server);
+
+    let translator = Arc::new(Mutex::new(translator));
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let types_path = workspace_path.join("src/types.rs");
+    let types_path_str = types_path.to_string_lossy().to_string();
+
+    // Prime: first query reads V1 from disk and pins it in the tracker.
+    let v1 = timeout(
+        Duration::from_secs(10),
+        translator
+            .lock()
+            .await
+            .handle_document_symbols(types_path_str.clone()),
+    )
+    .await
+    .expect("v1 timed out")
+    .expect("v1 errored");
+
+    let v1_names: Vec<String> = v1.symbols.iter().map(|s| s.name.clone()).collect();
+    assert!(
+        v1_names.iter().any(|n| n == "Repository"),
+        "expected Repository in V1 symbols, got {v1_names:?}"
+    );
+
+    // External edit: replace the file on disk with new content and a new
+    // symbol set, mimicking git stash / external editor / formatter.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let v2_source = "//! V2 — externally rewritten.\n\
+        pub struct ResyncedMarker;\n\
+        impl ResyncedMarker {\n    pub fn new() -> Self { Self }\n}\n";
+    tokio::fs::write(&types_path, v2_source)
+        .await
+        .expect("write V2");
+
+    let v2 = timeout(
+        Duration::from_secs(10),
+        translator
+            .lock()
+            .await
+            .handle_document_symbols(types_path_str.clone()),
+    )
+    .await
+    .expect("v2 timed out")
+    .expect("v2 errored");
+
+    let v2_names: Vec<String> = v2.symbols.iter().map(|s| s.name.clone()).collect();
+    assert!(
+        v2_names.iter().any(|n| n == "ResyncedMarker"),
+        "expected ResyncedMarker after external edit, got {v2_names:?}"
+    );
+    assert!(
+        !v2_names.iter().any(|n| n == "Repository"),
+        "Repository should be gone after external edit, got {v2_names:?}"
+    );
+}
+
+/// Recursively copy a directory tree. Used to give each test that mutates
+/// fixture files a private working copy.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
