@@ -12,6 +12,14 @@ roots = [
 # Position encoding preference (utf-8 is more efficient for Rust)
 position_encodings = ["utf-8", "utf-16"]
 
+# How `get_diagnostics` sources its results. Default: "hybrid".
+#   "pull"   — only `textDocument/diagnostic`. Misses push-only errors
+#              (e.g. rust-analyzer's flycheck/cargo-check output).
+#   "cached" — only the cache populated from `publishDiagnostics`. Cheap
+#              but empty for files the LSP server has not analysed yet.
+#   "hybrid" — pull + cached, deduplicating on (range, message, code).
+# diagnostics_mode = "hybrid"
+
 # Language extension mappings (optional)
 # mcpls recognizes 30 languages by default. Customize here to:
 # - Add support for specialized file types

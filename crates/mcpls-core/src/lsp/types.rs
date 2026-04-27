@@ -137,6 +137,7 @@ impl LspNotification {
     ///     _ => panic!("Expected LogMessage variant"),
     /// }
     /// ```
+    #[must_use]
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
         match method {
             "textDocument/publishDiagnostics" => {

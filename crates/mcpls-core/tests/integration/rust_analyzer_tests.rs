@@ -1042,6 +1042,133 @@ async fn test_lsp_server_installs_watcher_registration() {
     // timing.
 }
 
+/// Regression test for the "`get_cached_diagnostics` is always empty" bug:
+/// once we wire the LSP notification channel into the `NotificationCache`,
+/// pushed `publishDiagnostics` should accumulate and be readable through
+/// `handle_cached_diagnostics`. Uses the existing intentional error in the
+/// fixture's `lib.rs` (`undefined_variable`) which rust-analyzer flags via
+/// flycheck during initial indexing.
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_notification_cache_populates_from_publish_diagnostics() {
+    use std::collections::HashMap;
+    use std::time::Duration as StdDuration;
+
+    use mcpls_core::config::LspServerConfig;
+
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return;
+    }
+
+    init_tracing();
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    copy_dir_recursive(&rust_workspace_path(), tempdir.path()).expect("copy fixture");
+    let workspace_path = tempdir
+        .path()
+        .canonicalize()
+        .expect("canonicalize workspace");
+
+    let lsp_config = LspServerConfig {
+        language_id: "rust".to_string(),
+        command: "rust-analyzer".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        file_patterns: vec!["**/*.rs".to_string()],
+        initialization_options: None,
+        timeout_seconds: 30,
+        heuristics: None,
+    };
+    let mut server = LspServer::spawn(ServerInitConfig {
+        server_config: lsp_config,
+        workspace_roots: vec![workspace_path.clone()],
+        initialization_options: None,
+    })
+    .await
+    .expect("spawn rust-analyzer");
+
+    // Take the receiver and run a small pump that drains into the cache —
+    // mirroring the production wiring from `mcpls_core::serve`.
+    let notification_rx = server
+        .take_notification_receiver()
+        .expect("notification rx present after spawn");
+
+    let extension_map = {
+        let mut m = HashMap::new();
+        m.insert("rs".to_string(), "rust".to_string());
+        m
+    };
+    let mut translator = Translator::new().with_extensions(extension_map);
+    translator.set_workspace_roots(vec![workspace_path.clone()]);
+    translator.register_client("rust".to_string(), server.client().clone());
+    translator.register_server("rust".to_string(), server);
+    let translator = Arc::new(Mutex::new(translator));
+
+    {
+        let translator = Arc::clone(&translator);
+        let mut rx = notification_rx;
+        tokio::spawn(async move {
+            use mcpls_core::bridge::MessageType;
+            use mcpls_core::lsp::LspNotification;
+            while let Some(note) = rx.recv().await {
+                let mut guard = translator.lock().await;
+                let cache = guard.notification_cache_mut();
+                match note {
+                    LspNotification::PublishDiagnostics(p) => {
+                        cache.store_diagnostics(&p.uri, p.version, p.diagnostics);
+                    }
+                    LspNotification::LogMessage(p) => cache.store_log(p.typ.into(), p.message),
+                    LspNotification::ShowMessage(p) => {
+                        cache.store_message(MessageType::from(p.typ), p.message);
+                    }
+                    LspNotification::Other { .. } => {}
+                }
+                drop(guard);
+            }
+        });
+    }
+
+    // Open the file with the intentional error so rust-analyzer pushes
+    // diagnostics for it.
+    let lib_path = workspace_path.join("src/lib.rs");
+    let _ = timeout(
+        Duration::from_secs(10),
+        translator
+            .lock()
+            .await
+            .handle_document_symbols(lib_path.to_string_lossy().to_string()),
+    )
+    .await
+    .expect("symbols timed out")
+    .expect("symbols errored");
+
+    // Poll the cache: rust-analyzer publishes diagnostics asynchronously
+    // shortly after didOpen.
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(15);
+    let mut last: Vec<String> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let result = translator
+            .lock()
+            .await
+            .handle_cached_diagnostics(lib_path.to_string_lossy().as_ref());
+        if let Ok(diags) = result {
+            last = diags
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect();
+            if last.iter().any(|m| m.contains("undefined_variable")) {
+                return;
+            }
+        }
+    }
+    panic!(
+        "cached diagnostics never mentioned the intentional `undefined_variable` error within 15s; last poll: {last:?}"
+    );
+}
+
 /// Recursively copy a directory tree. Used to give each test that mutates
 /// fixture files a private working copy.
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {

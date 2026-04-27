@@ -36,13 +36,13 @@ pub mod mcp;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bridge::Translator;
+use bridge::{MessageType, Translator};
 pub use config::ServerConfig;
 pub use error::Error;
-use lsp::{LspServer, ServerInitConfig};
+use lsp::{LspNotification, LspServer, ServerInitConfig};
 use rmcp::ServiceExt;
-use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, error, info, warn};
 
 /// Resolve workspace roots from config or current directory.
 ///
@@ -89,6 +89,42 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
+/// Pump LSP notifications from a server's channel into the shared
+/// `NotificationCache`.
+///
+/// Runs until the receiver is closed (i.e. on server shutdown). Each
+/// notification briefly takes the translator lock; this contends with MCP
+/// request handlers but writes are small (a `HashMap::insert` for diagnostics
+/// or `VecDeque::push_back` for logs/messages).
+async fn notification_pump(
+    language_id: String,
+    mut rx: mpsc::Receiver<LspNotification>,
+    translator: std::sync::Arc<Mutex<Translator>>,
+) {
+    debug!("notification pump started for {language_id}");
+    while let Some(note) = rx.recv().await {
+        let mut guard = translator.lock().await;
+        let cache = guard.notification_cache_mut();
+        match note {
+            LspNotification::PublishDiagnostics(params) => {
+                cache.store_diagnostics(&params.uri, params.version, params.diagnostics);
+            }
+            LspNotification::LogMessage(params) => {
+                cache.store_log(params.typ.into(), params.message);
+            }
+            LspNotification::ShowMessage(params) => {
+                cache.store_message(MessageType::from(params.typ), params.message);
+            }
+            LspNotification::Other { .. } => {
+                // Notifications we do not currently cache (e.g.
+                // window/workDoneProgress/*) are dropped silently.
+            }
+        }
+        drop(guard); // release before awaiting `rx.recv` again
+    }
+    debug!("notification pump exiting for {language_id}");
+}
+
 /// Start the MCPLS server with the given configuration.
 ///
 /// This is the primary entry point for running the MCP-LSP bridge.
@@ -116,6 +152,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 
     let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(workspace_roots.clone());
+    translator.set_diagnostics_mode(config.workspace.diagnostics_mode);
 
     // Build configurations for batch spawning with heuristics filtering
     let applicable_configs: Vec<ServerInitConfig> = config
@@ -176,10 +213,17 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         ));
     }
 
-    // Register all successfully initialized servers
+    // Register all successfully initialized servers and collect their
+    // notification receivers so we can pump LSP server notifications
+    // (`publishDiagnostics`, `window/logMessage`, `window/showMessage`)
+    // into the shared `NotificationCache`.
     let server_count = result.server_count();
-    for (language_id, server) in result.servers {
+    let mut notification_receivers = Vec::with_capacity(server_count);
+    for (language_id, mut server) in result.servers {
         let client = server.client().clone();
+        if let Some(rx) = server.take_notification_receiver() {
+            notification_receivers.push((language_id.clone(), rx));
+        }
         translator.register_client(language_id.clone(), client);
         translator.register_server(language_id.clone(), server);
     }
@@ -187,6 +231,13 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     info!("Proceeding with {} LSP server(s)", server_count);
 
     let translator = Arc::new(Mutex::new(translator));
+
+    // Spawn one pump task per server. Each task owns its receiver and
+    // exits when the server closes the channel (i.e. on shutdown).
+    for (language_id, rx) in notification_receivers {
+        let translator = Arc::clone(&translator);
+        tokio::spawn(notification_pump(language_id, rx, translator));
+    }
 
     info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new(translator);
@@ -474,6 +525,7 @@ mod tests {
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    diagnostics_mode: crate::config::DiagnosticsMode::default(),
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -512,6 +564,7 @@ mod tests {
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    diagnostics_mode: crate::config::DiagnosticsMode::default(),
                 },
                 lsp_servers: vec![],
             };

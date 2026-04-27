@@ -10,10 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`workspace/didChangeWatchedFiles` support** (#102, part 2) — mcpls now declares `workspace.didChangeWatchedFiles.dynamic_registration: true` and `relative_pattern_support: true`, handles inbound `client/registerCapability` and `client/unregisterCapability` requests, and runs a per-server filesystem watcher that forwards matched events as `workspace/didChangeWatchedFiles`. This keeps the LSP server's *workspace index* live across external file changes (files mcpls has never opened) for servers that register watchers (rust-analyzer, gopls, pyright, typescript-language-server, clangd). Builds on a new `notify` dependency. The transport now distinguishes server-to-client requests from responses (`InboundMessage::Request`); previously such requests were misclassified as responses.
+- **`workspace.diagnostics_mode` config option** — selects how `get_diagnostics` sources its results: `pull` (LSP `textDocument/diagnostic` only — misses rust-analyzer's flycheck output), `cached` (read the now-populated `publishDiagnostics` cache), or `hybrid` (pull + cached, deduplicated). Default is `hybrid`.
 
 ### Fixed
 
 - **Stale results after external file changes** (#102, part 1) — `DocumentTracker::ensure_open` now stats the file on every call and re-syncs the document with the LSP server (via `textDocument/didClose` + bumped-version `textDocument/didOpen`) when the on-disk signature has changed. Fixes stale `get_hover`, `get_definition`, `get_references`, `get_document_symbols`, `get_diagnostics`, `get_completions`, `get_code_actions`, `format_document`, `rename_symbol`, and call-hierarchy results after edits made outside mcpls (`git stash`/`checkout`, the MCP host's own `Edit`/`Write` tools, formatters, code generators). Works for every configured LSP, including those that do not register `workspace/didChangeWatchedFiles`.
+- **`get_cached_diagnostics` now returns actual data** — previously the `NotificationCache` existed but was never populated in production: the LSP client received `publishDiagnostics`, `window/logMessage`, and `window/showMessage` notifications and dropped them on the floor. mcpls now wires the notification channel through to a per-server pump task that updates the cache. This also makes the new `hybrid` diagnostics mode work.
 
 ## [0.3.6] - 2026-04-21
 

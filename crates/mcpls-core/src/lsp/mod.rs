@@ -14,5 +14,6 @@ pub use file_watcher::FileWatcher;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
 pub use transport::LspTransport;
 pub use types::{
-    InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
+    InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    LspNotification, RequestId,
 };

@@ -27,13 +27,19 @@ use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::{LspClient, ServerRequest};
 use crate::lsp::file_watcher::FileWatcher;
 use crate::lsp::transport::LspTransport;
-use crate::lsp::types::JsonRpcError;
+use crate::lsp::types::{JsonRpcError, LspNotification};
 
 /// JSON-RPC error code returned for server-to-client requests we do not handle.
 const METHOD_NOT_FOUND: i32 = -32601;
 
 /// Channel capacity for inbound server-to-client requests.
 const SERVER_REQUEST_CHANNEL_CAPACITY: usize = 32;
+
+/// Channel capacity for inbound LSP notifications (`publishDiagnostics`,
+/// `window/logMessage`, `window/showMessage`). Sized for short bursts during
+/// indexing and flycheck cycles; on overflow notifications are dropped with
+/// a warning.
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +193,11 @@ pub struct LspServer {
     /// only; the task exits when the server's request channel closes.
     #[allow(dead_code)]
     request_dispatcher: Option<JoinHandle<()>>,
+    /// Receiver for LSP notifications (`publishDiagnostics`,
+    /// `window/logMessage`, `window/showMessage`). The caller is expected to
+    /// take this and pump it into a `NotificationCache`; if left `None` the
+    /// channel is dropped and notifications are silently discarded as before.
+    notification_rx: Option<mpsc::Receiver<LspNotification>>,
     /// Child process handle. Kept alive for process lifetime management.
     /// When dropped, the process is terminated via SIGKILL (`kill_on_drop`).
     #[allow(dead_code)]
@@ -204,6 +215,7 @@ impl std::fmt::Debug for LspServer {
                 "request_dispatcher_active",
                 &self.request_dispatcher.is_some(),
             )
+            .field("notification_rx_taken", &self.notification_rx.is_none())
             .field("child", &"<process>")
             .finish()
     }
@@ -264,10 +276,11 @@ impl LspServer {
         // launched and the receiver is dropped — the message loop then
         // observes a closed channel and falls back to MethodNotFound.
         let (server_request_tx, server_request_rx) = mpsc::channel(SERVER_REQUEST_CHANNEL_CAPACITY);
+        let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
         let client = LspClient::from_transport_with_channels(
             config.server_config.clone(),
             transport,
-            None,
+            Some(notification_tx),
             Some(server_request_tx),
         );
 
@@ -305,8 +318,19 @@ impl LspServer {
             position_encoding,
             file_watcher,
             request_dispatcher,
+            notification_rx: Some(notification_rx),
             child,
         })
+    }
+
+    /// Take the LSP notification receiver, leaving `None` behind.
+    ///
+    /// The caller is responsible for draining this channel and feeding the
+    /// notifications into a `NotificationCache`. If the receiver is never
+    /// taken, notifications received from the LSP server are silently
+    /// dropped (preserving pre-#102 behaviour for callers that do not opt in).
+    pub const fn take_notification_receiver(&mut self) -> Option<mpsc::Receiver<LspNotification>> {
+        self.notification_rx.take()
     }
 
     /// Perform LSP initialization handshake.
@@ -809,6 +833,7 @@ mod tests {
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             file_watcher: None,
+            notification_rx: None,
             request_dispatcher: None,
             child: mock_child,
         };
@@ -897,6 +922,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             file_watcher: None,
+            notification_rx: None,
             request_dispatcher: None,
             child: mock_child1,
         };
@@ -945,6 +971,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             file_watcher: None,
+            notification_rx: None,
             request_dispatcher: None,
             child: mock_child,
         };
@@ -1008,6 +1035,7 @@ mod tests {
                 position_encoding: PositionEncodingKind::UTF8,
                 file_watcher: None,
                 request_dispatcher: None,
+                notification_rx: None,
                 child: mock_child,
             };
 
@@ -1056,6 +1084,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             file_watcher: None,
+            notification_rx: None,
             request_dispatcher: None,
             child: mock_child1,
         };
@@ -1094,6 +1123,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF16,
             file_watcher: None,
+            notification_rx: None,
             request_dispatcher: None,
             child: mock_child2,
         };
