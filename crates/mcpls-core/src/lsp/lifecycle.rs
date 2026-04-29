@@ -192,6 +192,16 @@ impl std::fmt::Debug for LspServer {
 }
 
 impl LspServer {
+    /// Take the notification receiver out of this server, replacing it with a dummy channel.
+    ///
+    /// Use this to extract the receiver for a background pump task before registering
+    /// the server with the translator. After this call, the server's `notification_rx`
+    /// will never receive messages.
+    pub fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
+        let (_, dummy) = tokio::sync::mpsc::channel(1);
+        std::mem::replace(&mut self.notification_rx, dummy)
+    }
+
     /// Spawn and initialize LSP server.
     ///
     /// This performs the complete initialization sequence:

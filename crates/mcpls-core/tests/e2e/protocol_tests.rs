@@ -64,7 +64,7 @@ fn test_e2e_list_tools() -> Result<()> {
         .as_array()
         .unwrap_or_else(|| panic!("tools should be an array"));
 
-    assert_eq!(tools.len(), 16, "Should have exactly 16 tools");
+    assert_eq!(tools.len(), 20, "Should have exactly 20 tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
@@ -85,6 +85,10 @@ fn test_e2e_list_tools() -> Result<()> {
         "get_cached_diagnostics",
         "get_server_logs",
         "get_server_messages",
+        "get_signature_help",
+        "go_to_implementation",
+        "go_to_type_definition",
+        "get_inlay_hints",
     ] {
         assert!(tool_names.contains(expected), "Should have {expected} tool");
     }

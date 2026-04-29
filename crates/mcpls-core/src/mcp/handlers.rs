@@ -8,22 +8,31 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::bridge::Translator;
+use crate::bridge::{ResourceSubscriptions, Translator};
 
 /// Shared context for all tool handlers.
 ///
-/// This struct holds the translator that converts MCP tool calls
-/// to LSP requests and is shared across all tool implementations.
+/// Holds the translator and subscription state. The MCP peer handle is not
+/// stored here because resource-update notifications are sent by the pump
+/// tasks in `lib.rs`, which own their own `Arc<OnceCell<Peer<RoleServer>>>`.
 pub struct HandlerContext {
     /// Translator for converting MCP calls to LSP requests.
     pub translator: Arc<Mutex<Translator>>,
+    /// Set of resource URIs the MCP client has subscribed to.
+    pub subscriptions: Arc<ResourceSubscriptions>,
 }
 
 impl HandlerContext {
     /// Create a new handler context.
     #[must_use]
-    pub const fn new(translator: Arc<Mutex<Translator>>) -> Self {
-        Self { translator }
+    pub const fn new(
+        translator: Arc<Mutex<Translator>>,
+        subscriptions: Arc<ResourceSubscriptions>,
+    ) -> Self {
+        Self {
+            translator,
+            subscriptions,
+        }
     }
 }
 
@@ -34,9 +43,9 @@ mod tests {
 
     #[test]
     fn test_handler_context_creation() {
-        let translator = Translator::new();
-        let context = HandlerContext::new(Arc::new(Mutex::new(translator)));
-        // Context should be created successfully
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let context = HandlerContext::new(translator, subscriptions);
         assert!(Arc::strong_count(&context.translator) == 1);
     }
 }

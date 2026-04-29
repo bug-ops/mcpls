@@ -36,13 +36,126 @@ pub mod mcp;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bridge::Translator;
+use bridge::resources::make_uri;
+use bridge::{ResourceSubscriptions, Translator};
 pub use config::ServerConfig;
 pub use error::Error;
-use lsp::{LspServer, ServerInitConfig};
+use lsp::{LspNotification, LspServer, ServerInitConfig};
 use rmcp::ServiceExt;
-use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use rmcp::model::ResourceUpdatedNotificationParam;
+use tokio::sync::{Mutex, OnceCell};
+use tokio::task::JoinSet;
+use tracing::{debug, error, info, warn};
+
+/// Background task that drains LSP notifications, writes them to the cache,
+/// and forwards `resources/updated` to the MCP peer when subscribed.
+///
+/// The task operates in two phases without explicit state:
+/// - **Phase A** (before peer is set): caches every notification, skips peer notify.
+/// - **Phase B** (after peer is set): additionally fires `notify_resource_updated`
+///   for subscribed `PublishDiagnostics` URIs.
+///
+/// The task exits when:
+/// - The LSP notification channel closes (`rx.recv()` returns `None`).
+/// - The cancellation watch fires (or the sender is dropped).
+/// - `notify_resource_updated` returns an error (peer disconnect / transport closed).
+///
+/// # Note on lock contention (TODO critic-S4)
+/// All cache writes acquire `Arc<Mutex<Translator>>`, which is the same lock used
+/// by every MCP tool call. Splitting `NotificationCache` into its own `Arc<RwLock>`
+/// would eliminate this contention. Tracked as a P2 follow-up.
+pub(crate) async fn diagnostics_pump(
+    _lang: String,
+    mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
+    translator: Arc<Mutex<Translator>>,
+    subs: Arc<ResourceSubscriptions>,
+    peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            // Exit when cancellation is requested or the sender is dropped.
+            result = cancel_rx.changed() => {
+                // Err means the sender was dropped; treat as cancellation.
+                if result.is_err() || *cancel_rx.borrow() {
+                    break;
+                }
+            }
+            msg = rx.recv() => {
+                let Some(notif) = msg else { break };
+                match notif {
+                    LspNotification::PublishDiagnostics(p) => {
+                        // Always cache unconditionally.
+                        {
+                            let mut t = translator.lock().await;
+                            t.notification_cache_mut()
+                                .store_diagnostics(&p.uri, p.version, p.diagnostics);
+                        }
+
+                        // Fast path: skip URI construction when nothing is subscribed.
+                        if subs.is_empty().await {
+                            continue;
+                        }
+
+                        // Notify only when peer is ready and URI is subscribed.
+                        let Some(peer) = peer_cell.get() else { continue };
+                        let Some(path) = bridge::uri_to_path(&p.uri) else { continue };
+                        let Ok(mcp_uri) = make_uri(&path) else { continue };
+
+                        // TODO(critic-S3): on subscribe, replay cached diagnostics once
+                        // so clients that subscribe after the first PublishDiagnostics
+                        // do not have to wait for the next LSP push.
+                        if !subs.contains(&mcp_uri).await {
+                            continue;
+                        }
+
+                        if peer
+                            .notify_resource_updated(ResourceUpdatedNotificationParam::new(
+                                mcp_uri,
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            // Peer disconnected; stop the pump.
+                            break;
+                        }
+                    }
+                    LspNotification::LogMessage(m) => {
+                        let mut t = translator.lock().await;
+                        t.notification_cache_mut()
+                            .store_log(m.typ.into(), m.message);
+                    }
+                    LspNotification::ShowMessage(m) => {
+                        let mut t = translator.lock().await;
+                        t.notification_cache_mut()
+                            .store_message(m.typ.into(), m.message);
+                    }
+                    LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
+                }
+            }
+        }
+    }
+}
+
+/// Register initialized LSP servers with the translator and extract notification receivers.
+///
+/// Takes ownership of the `ServerInitResult`, extracts `notification_rx` from each server
+/// before registration, and returns a map of language-id to receiver for the pump tasks.
+fn register_servers(
+    mut result: lsp::ServerInitResult,
+    translator: &mut bridge::Translator,
+) -> std::collections::HashMap<String, tokio::sync::mpsc::Receiver<lsp::LspNotification>> {
+    let mut receivers = std::collections::HashMap::new();
+    for (lang, server) in &mut result.servers {
+        receivers.insert(lang.clone(), server.take_notification_rx());
+    }
+    for (language_id, server) in result.servers {
+        let client = server.client().clone();
+        translator.register_client(language_id.clone(), client);
+        translator.register_server(language_id.clone(), server);
+    }
+    receivers
+}
 
 /// Resolve workspace roots from config or current directory.
 ///
@@ -147,13 +260,16 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         applicable_configs.len()
     );
 
+    // notification_receivers collects per-language mpsc receivers used by the pump tasks.
+    let mut notification_receivers = std::collections::HashMap::new();
+
     if applicable_configs.is_empty() {
         warn!("No applicable LSP servers configured — starting in protocol-only mode");
     } else {
-        // Spawn all servers with graceful degradation
+        // Spawn all servers with graceful degradation.
         let result = LspServer::spawn_batch(&applicable_configs).await;
 
-        // Handle the three possible outcomes
+        // Handle the three possible outcomes.
         if result.all_failed() {
             return Err(Error::AllServersFailedToInit {
                 count: result.failure_count(),
@@ -172,21 +288,36 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
             }
         }
 
-        // Register all successfully initialized servers
+        // Register servers and extract their notification receivers.
         let server_count = result.server_count();
-        for (language_id, server) in result.servers {
-            let client = server.client().clone();
-            translator.register_client(language_id.clone(), client);
-            translator.register_server(language_id.clone(), server);
-        }
-
+        notification_receivers = register_servers(result, &mut translator);
         info!("Proceeding with {} LSP server(s)", server_count);
     }
 
     let translator = Arc::new(Mutex::new(translator));
+    let subscriptions = Arc::new(ResourceSubscriptions::new());
+    // Peer cell is populated after the MCP transport is established (Phase B).
+    let peer_cell = Arc::new(OnceCell::new());
+
+    // Cancellation for pump tasks: send `true` to request shutdown.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let mut pumps: JoinSet<()> = JoinSet::new();
+
+    // Phase A: start pump tasks before MCP serve so no notifications are dropped
+    // while the transport is being established.
+    for (lang, rx) in notification_receivers {
+        pumps.spawn(diagnostics_pump(
+            lang,
+            rx,
+            Arc::clone(&translator),
+            Arc::clone(&subscriptions),
+            Arc::clone(&peer_cell),
+            cancel_rx.clone(),
+        ));
+    }
 
     info!("Starting MCP server with rmcp...");
-    let mcp_server = mcp::McplsServer::new(translator);
+    let mcp_server = mcp::McplsServer::new(Arc::clone(&translator), Arc::clone(&subscriptions));
 
     info!("MCPLS server initialized successfully");
     info!("Listening for MCP requests on stdio...");
@@ -196,13 +327,24 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         .await
         .map_err(|e| Error::McpServer(format!("Failed to start MCP server: {e}")))?;
 
-    service
+    // Phase B: peer is now available; pump tasks will start sending notifications.
+    if let Err(e) = peer_cell.set(service.peer().clone()) {
+        // The cell can only be set once; a second set means a logic error.
+        debug!("Peer cell already set ({}), ignoring", e);
+    }
+
+    let result = service
         .waiting()
         .await
-        .map_err(|e| Error::McpServer(format!("MCP server error: {e}")))?;
+        .map(|_| ())
+        .map_err(|e| Error::McpServer(format!("MCP server error: {e}")));
+
+    // Signal pump tasks to exit and wait for them.
+    let _ = cancel_tx.send(true);
+    while pumps.join_next().await.is_some() {}
 
     info!("MCPLS server shutting down");
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -525,6 +667,138 @@ mod tests {
                     "serve() must not return NoServersAvailable for empty lsp_servers config"
                 );
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // diagnostics_pump unit tests
+    // ------------------------------------------------------------------
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod pump_tests {
+        use lsp_types::{PublishDiagnosticsParams, Uri};
+        use tokio::sync::{mpsc, watch};
+
+        use super::*;
+
+        fn make_translator() -> Arc<Mutex<Translator>> {
+            Arc::new(Mutex::new(Translator::new()))
+        }
+
+        fn make_subs() -> Arc<ResourceSubscriptions> {
+            Arc::new(ResourceSubscriptions::new())
+        }
+
+        type PeerCell = Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>;
+
+        fn make_peer_cell() -> PeerCell {
+            Arc::new(OnceCell::new())
+        }
+
+        /// `PublishDiagnostics` is cached even when the peer is not yet connected.
+        #[tokio::test]
+        async fn test_pump_caches_before_peer_set() {
+            let translator = make_translator();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (tx, rx) = mpsc::channel(8);
+            // Keep _cancel_tx alive: dropping it causes cancel_rx.changed() to return Err,
+            // which makes the pump exit before processing any messages.
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            let t = Arc::clone(&translator);
+            tokio::spawn(diagnostics_pump(
+                "rust".to_string(),
+                rx,
+                t,
+                Arc::clone(&subs),
+                Arc::clone(&peer_cell),
+                cancel_rx,
+            ));
+
+            let uri: Uri = "file:///test/main.rs".parse().unwrap();
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            // Poll until the pump processes the message or we time out.
+            let cached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    tokio::task::yield_now().await;
+                    let found = {
+                        let guard = translator.lock().await;
+                        guard
+                            .notification_cache()
+                            .get_diagnostics(uri.as_str())
+                            .is_some()
+                    };
+                    if found {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("pump did not cache diagnostics within 5 s");
+            assert!(cached, "diagnostics should be cached before peer is set");
+        }
+
+        /// Pump exits cleanly when the cancel watch sends `true`.
+        #[tokio::test]
+        async fn test_pump_exits_on_cancel() {
+            let translator = make_translator();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(diagnostics_pump(
+                "rust".to_string(),
+                rx,
+                translator,
+                subs,
+                peer_cell,
+                cancel_rx,
+            ));
+
+            cancel_tx.send(true).unwrap();
+            // Pump must finish within a short time after cancellation.
+            tokio::time::timeout(std::time::Duration::from_millis(200), handle)
+                .await
+                .expect("pump did not exit within timeout")
+                .unwrap();
+        }
+
+        /// Pump exits when the cancel sender is dropped (Err branch).
+        #[tokio::test]
+        async fn test_pump_exits_when_cancel_sender_dropped() {
+            let translator = make_translator();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(diagnostics_pump(
+                "rust".to_string(),
+                rx,
+                translator,
+                subs,
+                peer_cell,
+                cancel_rx,
+            ));
+
+            drop(cancel_tx); // triggers Err in cancel_rx.changed()
+            tokio::time::timeout(std::time::Duration::from_millis(200), handle)
+                .await
+                .expect("pump did not exit within timeout")
+                .unwrap();
         }
     }
 }
