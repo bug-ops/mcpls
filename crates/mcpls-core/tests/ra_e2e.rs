@@ -211,7 +211,9 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
     let add_line = find_line(lib_rs, "pub fn add(");
 
     println!("[ra_e2e] waiting for rust-analyzer to index (timeout {timeout_secs}s)…");
+    println!("[ra_e2e] hover probe: file={lib_path} line={add_line}");
 
+    let mut last_print = Instant::now();
     loop {
         // Hover over `add` — the 'a' of "add" is at column 8 (1-based).
         let resp = client.call_tool(
@@ -223,12 +225,31 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
             }),
         );
 
-        if let Ok(r) = resp {
-            let text = assertions::content_text(&r);
-            // Require both "fn add" and "i32" to confirm type-checking is done.
-            if text.contains("fn add") && text.contains("i32") {
-                println!("[ra_e2e] rust-analyzer is ready");
-                return;
+        match &resp {
+            Ok(r) => {
+                let is_err = r["result"]["isError"].as_bool().unwrap_or(false);
+                let text = assertions::content_text(r);
+                // Require both "fn add" and "i32" to confirm type-checking is done.
+                if text.contains("fn add") && text.contains("i32") {
+                    println!("[ra_e2e] rust-analyzer is ready");
+                    return;
+                }
+                // Print status every 10s so CI logs show progress.
+                if last_print.elapsed() >= Duration::from_secs(10) {
+                    let elapsed =
+                        timeout_secs - deadline.saturating_duration_since(Instant::now()).as_secs();
+                    println!(
+                        "[ra_e2e] still waiting ({elapsed}s elapsed): isError={is_err} response={}",
+                        &text[..text.len().min(120)]
+                    );
+                    last_print = Instant::now();
+                }
+            }
+            Err(e) => {
+                if last_print.elapsed() >= Duration::from_secs(10) {
+                    println!("[ra_e2e] hover call error: {e}");
+                    last_print = Instant::now();
+                }
             }
         }
 
@@ -238,7 +259,7 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
              set MCPLS_RA_INDEX_TIMEOUT_SECS to increase the limit"
         );
 
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
