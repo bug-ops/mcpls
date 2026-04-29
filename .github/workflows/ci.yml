@@ -225,7 +225,12 @@ jobs:
       - name: Make binary executable
         if: matrix.os != 'windows-latest'
         run: chmod +x target/debug/mcpls
+      - name: Install rust-analyzer
+        if: matrix.os != 'windows-latest'
+        run: rustup component add rust-analyzer
       - name: Run e2e tests
+        env:
+          MCPLS_SKIP_RA: ${{ matrix.os == 'windows-latest' && '1' || '' }}
         run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test) and test(e2e)'
 
   msrv:
