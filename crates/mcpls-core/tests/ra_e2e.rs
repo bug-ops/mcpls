@@ -213,6 +213,10 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
     println!("[ra_e2e] waiting for rust-analyzer to index (timeout {timeout_secs}s)…");
     println!("[ra_e2e] hover probe: file={lib_path} line={add_line}");
 
+    // Require 3 consecutive successful hover responses to guard against transient
+    // successes during RA's intermediate indexing phases (observed on Windows CI).
+    let required_consecutive: u32 = 3;
+    let mut consecutive = 0u32;
     let mut last_print = Instant::now();
     loop {
         // Hover over `add` — the 'a' of "add" is at column 8 (1-based).
@@ -231,21 +235,28 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
                 let text = assertions::content_text(r);
                 // Require both "fn add" and "i32" to confirm type-checking is done.
                 if text.contains("fn add") && text.contains("i32") {
-                    println!("[ra_e2e] rust-analyzer is ready");
-                    return;
+                    consecutive += 1;
+                    if consecutive >= required_consecutive {
+                        println!("[ra_e2e] rust-analyzer is ready");
+                        return;
+                    }
+                } else {
+                    consecutive = 0;
                 }
                 // Print status every 10s so CI logs show progress.
                 if last_print.elapsed() >= Duration::from_secs(10) {
                     let elapsed =
                         timeout_secs - deadline.saturating_duration_since(Instant::now()).as_secs();
                     println!(
-                        "[ra_e2e] still waiting ({elapsed}s elapsed): isError={is_err} response={}",
+                        "[ra_e2e] still waiting ({elapsed}s elapsed): consecutive={consecutive} \
+                         isError={is_err} response={}",
                         &text[..text.len().min(120)]
                     );
                     last_print = Instant::now();
                 }
             }
             Err(e) => {
+                consecutive = 0;
                 if last_print.elapsed() >= Duration::from_secs(10) {
                     println!("[ra_e2e] hover call error: {e}");
                     last_print = Instant::now();
@@ -830,11 +841,12 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
 /// Tool 14: `get_cached_diagnostics` — push cache populated by `sc_get_diagnostics`.
 ///
 /// `sc_get_diagnostics` opens `broken.rs`, which causes rust-analyzer to push
-/// `textDocument/publishDiagnostics` notifications.  Those arrive asynchronously,
-/// so poll for up to 15 s before declaring the cache empty.
+/// `textDocument/publishDiagnostics` notifications.  Those arrive asynchronously.
+/// Windows CI runners are slower, so allow up to 60 s there.
 fn sc_get_cached_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let broken = workspace.join("src/broken.rs");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let timeout_secs: u64 = if cfg!(windows) { 60 } else { 15 };
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let resp = client
             .call_tool(
@@ -855,9 +867,10 @@ fn sc_get_cached_diagnostics(client: &mut McpClient, workspace: &Path) -> Result
         }
 
         if Instant::now() >= deadline {
-            return Err("get_cached_diagnostics: push cache empty after 15 s; \
+            return Err(format!(
+                "get_cached_diagnostics: push cache empty after {timeout_secs} s; \
                  rust-analyzer did not send publishDiagnostics for broken.rs"
-                .to_owned());
+            ));
         }
         std::thread::sleep(Duration::from_millis(500));
     }
