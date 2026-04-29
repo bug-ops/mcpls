@@ -118,12 +118,11 @@ impl ServerHeuristics {
             .standard_filters(false)
             .filter_entry(|entry| {
                 // Skip excluded directories entirely (prevents descending into them)
-                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if EXCLUDED_DIRECTORIES.contains(&name) {
-                            return false;
-                        }
-                    }
+                if entry.file_type().is_some_and(|ft| ft.is_dir())
+                    && let Some(name) = entry.file_name().to_str()
+                    && EXCLUDED_DIRECTORIES.contains(&name)
+                {
+                    return false;
                 }
                 true
             });
@@ -132,10 +131,10 @@ impl ServerHeuristics {
             let path = entry.path();
 
             // Check if this entry matches any marker
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                if self.project_markers.iter().any(|m| m == file_name) {
-                    return true;
-                }
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                && self.project_markers.iter().any(|m| m == file_name)
+            {
+                return true;
             }
         }
 
