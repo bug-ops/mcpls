@@ -881,6 +881,7 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "Requires rust-analyzer in PATH; set MCPLS_SKIP_RA=1 to skip or MCPLS_RUST_ANALYZER=<path> to override"]
 fn ra_e2e_suite() {
     let ra_path = match resolve_rust_analyzer() {
         Resolution::Found(p) => p,
