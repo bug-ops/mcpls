@@ -17,9 +17,8 @@ use lsp_types::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
-use url::Url;
 
-use super::state::{ResourceLimits, detect_language};
+use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
@@ -1417,10 +1416,9 @@ impl Translator {
         let path = PathBuf::from(file_path);
         let validated_path = self.validate_path(&path)?;
 
-        // Convert path to URI format for cache lookup (cross-platform)
-        let uri = Url::from_file_path(&validated_path)
-            .map_err(|()| Error::InvalidUri(validated_path.display().to_string()))?
-            .to_string();
+        // Use path_to_uri (strips \\?\ on Windows) so the key matches what
+        // rust-analyzer stores in publishDiagnostics notifications.
+        let uri = path_to_uri(&validated_path).to_string();
 
         let diagnostics =
             self.notification_cache
