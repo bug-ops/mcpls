@@ -65,6 +65,7 @@ async fn setup_rust_analyzer() -> (Arc<Mutex<Translator>>, mpsc::Receiver<LspNot
         server_config: lsp_config,
         workspace_roots: vec![workspace_path.clone()],
         initialization_options: None,
+        notification_tx: None,
     };
 
     let mut server = LspServer::spawn(server_init_config)

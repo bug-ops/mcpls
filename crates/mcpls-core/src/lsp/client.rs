@@ -440,6 +440,10 @@ impl LspClient {
             "client/registerCapability"
             | "client/unregisterCapability"
             | "workspace/workspaceFolders"
+            | "workspace/diagnostic/refresh"
+            | "workspace/semanticTokens/refresh"
+            | "workspace/inlayHint/refresh"
+            | "workspace/codeLens/refresh"
             | "window/showMessageRequest" => Ok(Value::Null),
             "workspace/configuration" => Ok(Self::workspace_configuration_result(params)),
             "workspace/applyEdit" => Ok(serde_json::json!({ "applied": false })),
