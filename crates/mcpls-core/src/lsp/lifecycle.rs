@@ -349,16 +349,19 @@ impl LspServer {
                         // CodeAction objects (not just legacy Command objects).
                         code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
                             code_action_kind: lsp_types::CodeActionKindLiteralSupport {
-                                value_set: vec![
-                                    String::new(),
-                                    "quickfix".to_string(),
-                                    "refactor".to_string(),
-                                    "refactor.extract".to_string(),
-                                    "refactor.inline".to_string(),
-                                    "refactor.rewrite".to_string(),
-                                    "source".to_string(),
-                                    "source.organizeImports".to_string(),
-                                ],
+                                value_set: [
+                                    lsp_types::CodeActionKind::EMPTY,
+                                    lsp_types::CodeActionKind::QUICKFIX,
+                                    lsp_types::CodeActionKind::REFACTOR,
+                                    lsp_types::CodeActionKind::REFACTOR_EXTRACT,
+                                    lsp_types::CodeActionKind::REFACTOR_INLINE,
+                                    lsp_types::CodeActionKind::REFACTOR_REWRITE,
+                                    lsp_types::CodeActionKind::SOURCE,
+                                    lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                                ]
+                                .iter()
+                                .map(|k| k.as_str().to_string())
+                                .collect(),
                             },
                         }),
                         ..Default::default()
