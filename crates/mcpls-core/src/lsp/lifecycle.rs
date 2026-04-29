@@ -17,6 +17,7 @@ use lsp_types::{
     InitializedParams, PositionEncodingKind, ServerCapabilities, Uri, WorkspaceFolder,
 };
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::{debug, info};
 
@@ -24,6 +25,7 @@ use crate::config::LspServerConfig;
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
+use crate::lsp::types::LspNotification;
 
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +169,11 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
+    /// Receiver for push notifications from the LSP server.
+    ///
+    /// Extract this before registering the server to receive real-time
+    /// notifications (e.g., `textDocument/publishDiagnostics`, `$/progress`).
+    pub notification_rx: mpsc::Receiver<LspNotification>,
     /// Child process handle. Kept alive for process lifetime management.
     /// When dropped, the process is terminated via SIGKILL (`kill_on_drop`).
     _child: tokio::process::Child,
@@ -178,6 +185,7 @@ impl std::fmt::Debug for LspServer {
             .field("client", &self.client)
             .field("capabilities", &self.capabilities)
             .field("position_encoding", &self.position_encoding)
+            .field("notification_rx", &"<channel>")
             .field("_child", &"<process>")
             .finish()
     }
@@ -226,7 +234,12 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
-        let client = LspClient::from_transport(config.server_config.clone(), transport);
+        let (notification_tx, notification_rx) = mpsc::channel(64);
+        let client = LspClient::from_transport_with_notifications(
+            config.server_config.clone(),
+            transport,
+            notification_tx,
+        );
 
         let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
 
@@ -236,6 +249,7 @@ impl LspServer {
             client,
             capabilities,
             position_encoding,
+            notification_rx,
             _child: child,
         })
     }
@@ -645,11 +659,13 @@ mod tests {
 
         let transport = LspTransport::new(mock_stdin, mock_stdout);
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let (_, mock_notification_rx) = mpsc::channel(1);
 
         let server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
+            notification_rx: mock_notification_rx,
             _child: mock_child,
         };
 
@@ -731,11 +747,13 @@ mod tests {
 
         let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
+        let (_, mock_notification_rx1) = mpsc::channel(1);
 
         let server1 = LspServer {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
+            notification_rx: mock_notification_rx1,
             _child: mock_child1,
         };
 
@@ -777,11 +795,13 @@ mod tests {
 
         let transport = LspTransport::new(mock_stdin, mock_stdout);
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let (_, mock_notification_rx) = mpsc::channel(1);
 
         let server = LspServer {
             client,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
+            notification_rx: mock_notification_rx,
             _child: mock_child,
         };
 
@@ -837,11 +857,13 @@ mod tests {
                 LspServerConfig::typescript()
             };
             let client = LspClient::from_transport(config.clone(), transport);
+            let (_, mock_notification_rx) = mpsc::channel(1);
 
             let server = LspServer {
                 client,
                 capabilities: lsp_types::ServerCapabilities::default(),
                 position_encoding: PositionEncodingKind::UTF8,
+                notification_rx: mock_notification_rx,
                 _child: mock_child,
             };
 
@@ -884,11 +906,13 @@ mod tests {
 
         let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
+        let (_, mock_notification_rx1) = mpsc::channel(1);
 
         let server1 = LspServer {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
+            notification_rx: mock_notification_rx1,
             _child: mock_child1,
         };
 
@@ -920,11 +944,13 @@ mod tests {
 
         let transport2 = LspTransport::new(mock_stdin2, mock_stdout2);
         let client2 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport2);
+        let (_, mock_notification_rx2) = mpsc::channel(1);
 
         let server2 = LspServer {
             client: client2,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF16,
+            notification_rx: mock_notification_rx2,
             _child: mock_child2,
         };
 

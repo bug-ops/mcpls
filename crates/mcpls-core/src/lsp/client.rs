@@ -106,6 +106,7 @@ impl LspClient {
     /// Create client from transport (for testing or custom spawning).
     ///
     /// This method initializes the background message loop with the provided transport.
+    #[cfg(test)]
     pub(crate) fn from_transport(config: LspServerConfig, transport: LspTransport) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
@@ -133,7 +134,6 @@ impl LspClient {
     ///
     /// Notifications received from the LSP server will be parsed and sent
     /// through the provided channel.
-    #[allow(dead_code)] // Used in Phase 4
     pub(crate) fn from_transport_with_notifications(
         config: LspServerConfig,
         transport: LspTransport,
