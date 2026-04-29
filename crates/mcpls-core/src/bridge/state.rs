@@ -217,7 +217,17 @@ pub fn path_to_uri(path: &Path) -> Uri {
         // canonicalize() on Windows adds a \\?\ extended-path prefix.
         // Strip it before building the URI — file:////?\C:/ is not valid.
         let stripped = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
-        format!("file:///{}", stripped.replace('\\', "/"))
+        let uri_path = stripped.replace('\\', "/");
+        // rust-analyzer normalizes Windows drive letters to lowercase (e.g. C: → c:).
+        // Match that normalization so cache lookups key on the same string RA uses.
+        let uri_path = if uri_path.len() >= 2 && uri_path.as_bytes()[1] == b':' {
+            let mut bytes = uri_path.into_bytes();
+            bytes[0] = bytes[0].to_ascii_lowercase();
+            String::from_utf8(bytes).unwrap_or_default()
+        } else {
+            uri_path
+        };
+        format!("file:///{uri_path}")
     } else {
         format!("file://{}", path.display())
     };
@@ -625,6 +635,28 @@ mod tests {
                 uri.as_str()
                     .starts_with("file:///home/user/project/main.rs")
             );
+        }
+    }
+
+    #[test]
+    fn test_path_to_uri_windows_lowercase_drive() {
+        // Simulate a Windows path that canonicalize() would return.
+        // path_to_uri must lowercase the drive letter to match RA's URI normalization.
+        #[cfg(windows)]
+        {
+            let path = Path::new(r"C:\Users\runner\project\main.rs");
+            let uri = path_to_uri(path);
+            assert!(
+                uri.as_str().starts_with("file:///c:/"),
+                "drive letter must be lowercased; got: {}",
+                uri.as_str()
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            // On non-Windows, just verify the function doesn't panic.
+            let path = Path::new("/tmp/test.rs");
+            let _ = path_to_uri(path);
         }
     }
 
