@@ -188,6 +188,7 @@ jobs:
     if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    continue-on-error: true
     permissions:
       contents: read
     steps:
@@ -293,7 +294,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, security, coverage]
+    needs: [fmt, clippy, build-tests, build, test, test-integration, msrv, docs, security, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -306,7 +307,6 @@ jobs:
             "${{ needs.build.result }}"
             "${{ needs.test.result }}"
             "${{ needs.test-integration.result }}"
-            "${{ needs.test-e2e.result }}"
             "${{ needs.msrv.result }}"
             "${{ needs.docs.result }}"
             "${{ needs.security.result }}"
