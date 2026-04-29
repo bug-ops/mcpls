@@ -18,6 +18,8 @@ futures = { workspace = true }
 ignore = { workspace = true }
 lsp-types = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io", "macros"] }
+axum = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true, features = ["rt"] }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -33,6 +35,14 @@ rstest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[features]
+default = []
+transport-http = [
+    "rmcp/transport-streamable-http-server",
+    "dep:axum",
+    "dep:tokio-util",
+]
 
 [lints]
 workspace = true

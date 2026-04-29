@@ -33,8 +33,27 @@ async fn main() -> Result<()> {
         "configuration loaded"
     );
 
-    // Start the server
-    mcpls_core::serve(config).await.context("server error")?;
+    // Select transport based on CLI flags.
+    let transport = {
+        #[cfg(feature = "transport-http")]
+        {
+            match args.listen {
+                Some(bind) => mcpls_core::Transport::Http(mcpls_core::HttpConfig {
+                    bind,
+                    path: args.http_path.clone(),
+                }),
+                None => mcpls_core::Transport::Stdio,
+            }
+        }
+        #[cfg(not(feature = "transport-http"))]
+        {
+            mcpls_core::Transport::Stdio
+        }
+    };
+
+    mcpls_core::serve_with(config, transport)
+        .await
+        .context("server error")?;
 
     tracing::info!("mcpls shutdown complete");
     Ok(())

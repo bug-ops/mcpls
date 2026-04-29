@@ -18,12 +18,18 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use mcpls_core::{serve, ServerConfig};
+//! use mcpls_core::{serve, serve_with, Transport, ServerConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), mcpls_core::Error> {
 //!     let config = ServerConfig::load()?;
+//!     // Stdio (default):
 //!     serve(config).await
+//!     // HTTP (requires `transport-http` feature):
+//!     // serve_with(config, Transport::Http(mcpls_core::HttpConfig {
+//!     //     bind: "127.0.0.1:3000".parse().unwrap(),
+//!     //     path: "/mcp".to_string(),
+//!     // })).await
 //! }
 //! ```
 
@@ -32,6 +38,7 @@ pub mod config;
 pub mod error;
 pub mod lsp;
 pub mod mcp;
+pub mod transport;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,11 +48,16 @@ use bridge::{ResourceSubscriptions, Translator};
 pub use config::ServerConfig;
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
-use rmcp::ServiceExt;
 use rmcp::model::ResourceUpdatedNotificationParam;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinSet;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
+#[cfg(feature = "transport-http")]
+pub use transport::HttpConfig;
+pub use transport::Transport;
+#[cfg(feature = "transport-http")]
+use transport::run_http;
+use transport::run_stdio;
 
 /// Background task that drains LSP notifications, writes them to the cache,
 /// and forwards `resources/updated` to the MCP peer when subscribed.
@@ -202,11 +214,10 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
-/// Start the MCPLS server with the given configuration.
+/// Start the MCPLS server with the given configuration over stdio.
 ///
-/// This is the primary entry point for running the MCP-LSP bridge.
-/// Implements graceful degradation: if some but not all LSP servers fail
-/// to initialize, the service continues with available servers.
+/// This is the backward-compatible entry point. It is equivalent to calling
+/// `serve_with(config, Transport::Stdio)`.
 ///
 /// # Errors
 ///
@@ -221,6 +232,46 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
 /// - **Partial success**: Logs warnings for failures, continues with available servers
 /// - **All servers fail**: Returns `Error::AllServersFailedToInit` with details
 pub async fn serve(config: ServerConfig) -> Result<(), Error> {
+    serve_with(config, Transport::Stdio).await
+}
+
+/// Start the MCPLS server with an explicit transport.
+///
+/// Performs all shared setup (workspace discovery, LSP spawning, translator
+/// initialization, diagnostic pump tasks) and then delegates to the
+/// appropriate transport runner.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - All LSP servers fail to initialize
+/// - The MCP server or transport fails to start
+/// - Configuration is invalid
+///
+/// # DNS rebinding protection (HTTP transport)
+///
+/// When using `Transport::Http`, the underlying rmcp service validates the
+/// inbound `Host` header against an allowlist that defaults to loopback
+/// addresses only (`localhost`, `127.0.0.1`, `::1`). Requests with any other
+/// `Host` value are rejected with `421 Misdirected Request`.
+///
+/// If you bind to a non-loopback address (e.g. `0.0.0.0:3000`) and expose the
+/// service through a reverse proxy, the proxy must forward `Host: localhost`
+/// (or another loopback alias) to the mcpls process. Direct non-loopback
+/// access is intentionally blocked to prevent DNS-rebinding attacks.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use mcpls_core::{serve_with, Transport, ServerConfig};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), mcpls_core::Error> {
+///     let config = ServerConfig::load()?;
+///     serve_with(config, Transport::Stdio).await
+/// }
+/// ```
+pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
@@ -318,26 +369,16 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 
     info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new(Arc::clone(&translator), Arc::clone(&subscriptions));
-
     info!("MCPLS server initialized successfully");
-    info!("Listening for MCP requests on stdio...");
 
-    let service = mcp_server
-        .serve(rmcp::transport::stdio())
-        .await
-        .map_err(|e| Error::McpServer(format!("Failed to start MCP server: {e}")))?;
-
-    // Phase B: peer is now available; pump tasks will start sending notifications.
-    if let Err(e) = peer_cell.set(service.peer().clone()) {
-        // The cell can only be set once; a second set means a logic error.
-        debug!("Peer cell already set ({}), ignoring", e);
-    }
-
-    let result = service
-        .waiting()
-        .await
-        .map(|_| ())
-        .map_err(|e| Error::McpServer(format!("MCP server error: {e}")));
+    let result = match transport {
+        Transport::Stdio => {
+            info!("Listening for MCP requests on stdio...");
+            run_stdio(mcp_server, &peer_cell).await
+        }
+        #[cfg(feature = "transport-http")]
+        Transport::Http(cfg) => run_http(mcp_server, cfg).await,
+    };
 
     // Signal pump tasks to exit and wait for them.
     let _ = cancel_tx.send(true);
