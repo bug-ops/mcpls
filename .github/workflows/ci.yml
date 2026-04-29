@@ -87,7 +87,7 @@ jobs:
 
   test:
     name: Test
-    needs: [detect-changes, fmt, clippy]
+    needs: [detect-changes, fmt, clippy, build]
     if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -107,12 +107,19 @@ jobs:
           shared-key: "ci"
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mcpls-binary
+          path: target/release/
+      - name: Make binary executable
+        run: chmod +x target/release/mcpls
       - name: Run tests
         run: cargo nextest run --workspace --all-features --lib --bins
 
   build:
     name: Build
-    needs: [detect-changes, fmt, clippy]
+    needs: [detect-changes]
     if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -129,10 +136,16 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-targets: "false"
-          shared-key: "ci"
+          shared-key: "build"
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Build release binary
         run: cargo build --release --bin mcpls
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcpls-binary
+          path: target/release/mcpls
+          retention-days: 1
 
   msrv:
     name: MSRV check (1.88)
@@ -189,7 +202,7 @@ jobs:
   coverage:
     name: Coverage
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.run-full-ci == 'true'
-    needs: [detect-changes, fmt, clippy]
+    needs: [detect-changes, fmt, clippy, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -212,6 +225,13 @@ jobs:
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - uses: taiki-e/install-action@caf4aedf2bfe5bfb679703b29290921f4711b2f3 # cargo-llvm-cov
       - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mcpls-binary
+          path: target/release/
+      - name: Make binary executable
+        run: chmod +x target/release/mcpls
       - name: Generate coverage
         run: cargo llvm-cov nextest --workspace --all-features --lib --bins --lcov --output-path lcov.info
       - name: Upload coverage
