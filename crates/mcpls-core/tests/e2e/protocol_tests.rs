@@ -86,10 +86,7 @@ fn test_e2e_list_tools() -> Result<()> {
         "get_server_logs",
         "get_server_messages",
     ] {
-        assert!(
-            tool_names.contains(expected),
-            "Should have {expected} tool"
-        );
+        assert!(tool_names.contains(expected), "Should have {expected} tool");
     }
 
     Ok(())
