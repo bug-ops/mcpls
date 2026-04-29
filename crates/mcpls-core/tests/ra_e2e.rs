@@ -630,14 +630,28 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
     // Target the line with the missing semicolon inside `code_action_target`.
     let ca_line = find_line(&lib_rs, "let ca_var = 1");
 
-    // Open lib.rs and warm up rust-analyzer diagnostics.
+    // Open lib.rs and wait for rust-analyzer to complete type-checking.
+    // Type-checking is required before code actions for type-related fixes appear.
     let _ = client.call_tool(
         "get_diagnostics",
         &json!({ "file_path": lib_rs.to_string_lossy() }),
     );
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(Duration::from_secs(5));
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Cover the whole `let ca_var = 1` line so the range overlaps the diagnostic.
+    let ca_end_col = u32::try_from(
+        fs::read_to_string(&lib_rs)
+            .unwrap_or_default()
+            .lines()
+            .nth((ca_line as usize).saturating_sub(1))
+            .unwrap_or("")
+            .len(),
+    )
+    .unwrap_or(30)
+        + 1;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_inner;
     loop {
         let resp = client
             .call_tool(
@@ -647,13 +661,14 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
                     "start_line": ca_line,
                     "start_character": 1,
                     "end_line": ca_line,
-                    "end_character": 18,
+                    "end_character": ca_end_col,
                 }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
 
         let text = assertions::assert_tool_ok(&resp);
         let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+        last_inner = inner.clone();
 
         let actions = inner["actions"]
             .as_array()
@@ -674,11 +689,11 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
                 .map(|r| assertions::content_text(&r))
                 .unwrap_or_default();
             return Err(format!(
-                "get_code_actions: no actions on missing-semicolon in lib.rs after 15 s\n\
-                 cached_diagnostics={cached}\nactions_response={inner}"
+                "get_code_actions: no actions on missing-semicolon in lib.rs after 30 s\n\
+                 cached_diagnostics={cached}\nactions_response={last_inner}"
             ));
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
