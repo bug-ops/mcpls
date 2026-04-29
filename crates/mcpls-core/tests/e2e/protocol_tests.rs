@@ -50,7 +50,7 @@ fn test_e2e_initialize_handshake() -> Result<()> {
 /// Test listing all available MCP tools.
 ///
 /// Validates that:
-/// - tools/list returns an array of 8 tools
+/// - tools/list returns an array of 16 tools
 /// - All expected tool names are present
 #[test]
 #[ignore = "Requires mcpls binary built"]
@@ -64,42 +64,30 @@ fn test_e2e_list_tools() -> Result<()> {
         .as_array()
         .unwrap_or_else(|| panic!("tools should be an array"));
 
-    assert_eq!(tools.len(), 8, "Should have exactly 8 tools");
+    assert_eq!(tools.len(), 16, "Should have exactly 16 tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    assert!(
-        tool_names.contains(&"get_hover"),
-        "Should have get_hover tool"
-    );
-    assert!(
-        tool_names.contains(&"get_definition"),
-        "Should have get_definition tool"
-    );
-    assert!(
-        tool_names.contains(&"get_references"),
-        "Should have get_references tool"
-    );
-    assert!(
-        tool_names.contains(&"get_diagnostics"),
-        "Should have get_diagnostics tool"
-    );
-    assert!(
-        tool_names.contains(&"rename_symbol"),
-        "Should have rename_symbol tool"
-    );
-    assert!(
-        tool_names.contains(&"get_completions"),
-        "Should have get_completions tool"
-    );
-    assert!(
-        tool_names.contains(&"get_document_symbols"),
-        "Should have get_document_symbols tool"
-    );
-    assert!(
-        tool_names.contains(&"format_document"),
-        "Should have format_document tool"
-    );
+    for expected in &[
+        "get_hover",
+        "get_definition",
+        "get_references",
+        "get_diagnostics",
+        "rename_symbol",
+        "get_completions",
+        "get_document_symbols",
+        "format_document",
+        "workspace_symbol_search",
+        "get_code_actions",
+        "prepare_call_hierarchy",
+        "get_incoming_calls",
+        "get_outgoing_calls",
+        "get_cached_diagnostics",
+        "get_server_logs",
+        "get_server_messages",
+    ] {
+        assert!(tool_names.contains(expected), "Should have {expected} tool");
+    }
 
     Ok(())
 }

@@ -2782,13 +2782,14 @@ mod tests {
         assert_eq!(extension_map.get("nu"), Some(&"nushell".to_string()));
         assert_eq!(extension_map.get("rs"), Some(&"rust".to_string()));
 
+        // serve() starts in protocol-only mode when no LSP servers are configured;
+        // it may return a transport error but must not return NoServersAvailable.
         let result = crate::serve(config).await;
-        assert!(result.is_err());
-
-        if let Err(crate::error::Error::NoServersAvailable(msg)) = result {
-            assert!(msg.contains("none configured"));
-        } else {
-            panic!("Expected NoServersAvailable error for empty server config");
+        if let Err(ref err) = result {
+            assert!(
+                !matches!(err, crate::error::Error::NoServersAvailable(_)),
+                "serve() must not return NoServersAvailable for empty lsp_servers config"
+            );
         }
     }
 
