@@ -149,6 +149,8 @@ jobs:
           shared-key: "ci"
       - name: Build docs
         run: cargo doc --no-deps --all-features
+      - name: Doc-tests
+        run: cargo test --doc --workspace --all-features
 
   security:
     name: Security Audit
