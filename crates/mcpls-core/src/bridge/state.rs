@@ -834,6 +834,7 @@ mod tests {
     // uri_to_path
     // ------------------------------------------------------------------
 
+    #[cfg(unix)]
     #[test]
     fn test_uri_to_path_file_scheme() {
         let uri: Uri = "file:///home/user/main.rs".parse().unwrap();

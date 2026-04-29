@@ -182,29 +182,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_make_uri_simple_path() {
-        let uri = make_uri(Path::new("/home/user/main.rs")).unwrap();
-        assert_eq!(uri, "lsp-diagnostics:///home/user/main.rs");
-    }
-
-    #[test]
-    fn test_make_uri_scheme_prefix() {
-        let uri = make_uri(Path::new("/tmp/file.rs")).unwrap();
-        assert!(uri.starts_with("lsp-diagnostics:///"));
-    }
-
-    #[test]
     fn test_make_uri_rejects_relative_path() {
         let result = make_uri(Path::new("relative/path.rs"));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_uri_simple() {
-        let path = PathBuf::from("/home/user/main.rs");
-        let uri = make_uri(&path).unwrap();
-        let recovered = parse_uri(&uri).unwrap();
-        assert_eq!(recovered, path);
     }
 
     #[test]
@@ -219,7 +199,31 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_make_uri_simple_path() {
+        let uri = make_uri(Path::new("/home/user/main.rs")).unwrap();
+        assert_eq!(uri, "lsp-diagnostics:///home/user/main.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_make_uri_scheme_prefix() {
+        let uri = make_uri(Path::new("/tmp/file.rs")).unwrap();
+        assert!(uri.starts_with("lsp-diagnostics:///"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_uri_simple() {
+        let path = PathBuf::from("/home/user/main.rs");
+        let uri = make_uri(&path).unwrap();
+        let recovered = parse_uri(&uri).unwrap();
+        assert_eq!(recovered, path);
+    }
+
     /// Round-trip: paths with spaces, unicode, `%`, `?`, `#`.
+    #[cfg(unix)]
     #[test]
     fn test_round_trip_special_chars() {
         let paths = [
@@ -244,6 +248,7 @@ mod tests {
     }
 
     /// Snapshot test: verify the on-wire form uses three slashes and percent-encoding.
+    #[cfg(unix)]
     #[test]
     fn test_wire_format_percent_encoded() {
         let path = Path::new("/home/user/my file.rs");
