@@ -139,7 +139,7 @@ impl ServerInitResult {
 
     /// Get the number of failures.
     #[must_use]
-    pub fn failure_count(&self) -> usize {
+    pub const fn failure_count(&self) -> usize {
         self.failures.len()
     }
 

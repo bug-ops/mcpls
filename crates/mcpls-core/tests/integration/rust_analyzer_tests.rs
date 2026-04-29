@@ -69,7 +69,8 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
 
     let client = server.client().clone();
 
-    let mut translator = Translator::new();
+    let extension_map = std::collections::HashMap::from([("rs".to_string(), "rust".to_string())]);
+    let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(vec![workspace_path]);
     translator.register_client("rust".to_string(), client);
     translator.register_server("rust".to_string(), server);

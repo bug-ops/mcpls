@@ -620,13 +620,13 @@ mod tests {
         };
 
         let sender = pending_requests.lock().await.remove(&error_response.id);
-        if let Some(sender) = sender {
-            if let Some(error) = error_response.error {
-                let _ = sender.send(Err(Error::LspServerError {
-                    code: error.code,
-                    message: error.message,
-                }));
-            }
+        if let Some(sender) = sender
+            && let Some(error) = error_response.error
+        {
+            let _ = sender.send(Err(Error::LspServerError {
+                code: error.code,
+                message: error.message,
+            }));
         }
 
         let result = response_rx.await.unwrap();
@@ -682,13 +682,13 @@ mod tests {
         };
 
         let sender = pending_requests.lock().await.remove(&error_response.id);
-        if let Some(sender) = sender {
-            if let Some(error) = error_response.error {
-                let _ = sender.send(Err(Error::LspServerError {
-                    code: error.code,
-                    message: error.message,
-                }));
-            }
+        if let Some(sender) = sender
+            && let Some(error) = error_response.error
+        {
+            let _ = sender.send(Err(Error::LspServerError {
+                code: error.code,
+                message: error.message,
+            }));
         }
 
         let result = response_rx.await.unwrap();

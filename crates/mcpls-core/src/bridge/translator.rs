@@ -441,10 +441,10 @@ impl Translator {
 
         // Check if path is within any workspace root
         for root in &self.workspace_roots {
-            if let Ok(canonical_root) = root.canonicalize() {
-                if canonical.starts_with(&canonical_root) {
-                    return Ok(canonical);
-                }
+            if let Ok(canonical_root) = root.canonicalize()
+                && canonical.starts_with(&canonical_root)
+            {
+                return Ok(canonical);
             }
         }
 
@@ -995,15 +995,14 @@ impl Translator {
         }
 
         // Validate kind filter
-        if let Some(ref kind) = kind_filter {
-            if !VALID_SYMBOL_KINDS
+        if let Some(ref kind) = kind_filter
+            && !VALID_SYMBOL_KINDS
                 .iter()
                 .any(|k| k.eq_ignore_ascii_case(kind))
-            {
-                return Err(Error::InvalidToolParams(format!(
-                    "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
-                )));
-            }
+        {
+            return Err(Error::InvalidToolParams(format!(
+                "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
+            )));
         }
 
         // Workspace search requires at least one LSP client
@@ -1075,15 +1074,14 @@ impl Translator {
         ];
 
         // Validate kind filter
-        if let Some(ref kind) = kind_filter {
-            if !VALID_ACTION_KINDS
+        if let Some(ref kind) = kind_filter
+            && !VALID_ACTION_KINDS
                 .iter()
                 .any(|k| k.eq_ignore_ascii_case(kind))
-            {
-                return Err(Error::InvalidToolParams(format!(
-                    "Invalid kind_filter: '{kind}'. Valid values: {VALID_ACTION_KINDS:?}"
-                )));
-            }
+        {
+            return Err(Error::InvalidToolParams(format!(
+                "Invalid kind_filter: '{kind}'. Valid values: {VALID_ACTION_KINDS:?}"
+            )));
         }
 
         // Validate range
