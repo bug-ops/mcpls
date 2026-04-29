@@ -203,7 +203,7 @@ jobs:
     needs: [detect-changes, fmt, clippy, build-tests, build]
     if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

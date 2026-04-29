@@ -212,15 +212,14 @@ impl DocumentTracker {
 /// not occur for valid absolute paths.
 #[must_use]
 pub fn path_to_uri(path: &Path) -> Uri {
-    // Convert path to file:// URI string and parse
-    let uri_string = if cfg!(windows) {
-        format!("file:///{}", path.display().to_string().replace('\\', "/"))
-    } else {
-        format!("file://{}", path.display())
-    };
-    // Path-to-URI conversion should always succeed for valid paths
+    // Use the `url` crate for correct platform-aware conversion.
+    // On Windows this handles the \\?\ extended prefix that canonicalize() adds.
     #[allow(clippy::expect_used)]
-    uri_string.parse().expect("failed to create URI from path")
+    Url::from_file_path(path)
+        .expect("failed to create URI from path")
+        .as_str()
+        .parse()
+        .expect("file URL must be a valid URI")
 }
 
 /// Convert an LSP `file://` URI to an absolute filesystem path.

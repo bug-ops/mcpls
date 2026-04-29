@@ -199,10 +199,12 @@ fn find_line(file: &Path, needle: &str) -> u32 {
 /// stored).  The readiness gate therefore uses hover-probe as the primary oracle.
 /// See M-r1 in the architect handoff for the follow-up to add `$/progress` capture.
 fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
+    // Windows CI runners are significantly slower than Linux/macOS.
+    let default_timeout: u64 = if cfg!(windows) { 120 } else { 60 };
     let timeout_secs: u64 = std::env::var("MCPLS_RA_INDEX_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map_or(60, |t| t.max(5));
+        .map_or(default_timeout, |t| t.max(5));
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let lib_path = lib_rs.to_string_lossy().into_owned();
@@ -638,18 +640,9 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
     );
     std::thread::sleep(Duration::from_secs(5));
 
-    // Cover the whole `let ca_var = 1` line so the range overlaps the diagnostic.
-    let ca_end_col = u32::try_from(
-        fs::read_to_string(&lib_rs)
-            .unwrap_or_default()
-            .lines()
-            .nth((ca_line as usize).saturating_sub(1))
-            .unwrap_or("")
-            .len(),
-    )
-    .unwrap_or(30)
-        + 1;
-
+    // rust-analyzer reports the missing-semicolon diagnostic at the closing `}`
+    // (one line below the statement), so the range must extend past ca_line to
+    // overlap the error and trigger the "add `;`" quickfix.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_inner;
     loop {
@@ -660,8 +653,8 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
                     "file_path": lib_rs.to_string_lossy(),
                     "start_line": ca_line,
                     "start_character": 1,
-                    "end_line": ca_line,
-                    "end_character": ca_end_col,
+                    "end_line": ca_line + 1,
+                    "end_character": 2,
                 }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
