@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP resources** — expose LSP diagnostics as subscribable MCP resources under the `lsp-diagnostics:///` URI scheme; clients can call `list_resources`, `read_resource`, `subscribe`, and `unsubscribe` (#115)
+- **Diagnostics push notifications** — background `diagnostics_pump` tasks relay `textDocument/publishDiagnostics` LSP notifications to subscribed MCP clients via `notifications/resources/updated`
+- **RFC-3986 URI codec** — `bridge::resources` module with percent-encoding via `url::Url::from_file_path`; empty-authority injection is rejected to prevent UNC-path attacks on Windows
+- **Subscription cap** — `ResourceSubscriptions` enforces a `MAX_SUBSCRIPTIONS = 1_000` limit per session to guard against memory exhaustion
+- **MCP tools** — `get_signature_help` (`textDocument/signatureHelp`), `go_to_implementation` (`textDocument/implementation`), `go_to_type_definition` (`textDocument/typeDefinition`), and `get_inlay_hints` (`textDocument/inlayHint`) tools exposing LSP 3.6/3.15/3.17 capabilities (#116)
+
 ### Changed
 
 - **LSP API** — Breaking change: `InboundMessage` is now non-exhaustive and includes a server-request variant for LSP server-to-client JSON-RPC requests. Downstream exhaustive matches must include a wildcard arm.

@@ -9,9 +9,11 @@ use lsp_types::{
     CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, CompletionParams,
     CompletionTriggerKind, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
     FormattingOptions, GotoDefinitionParams, Hover, HoverContents, HoverParams as LspHoverParams,
-    MarkedString, PartialResultParams, ReferenceContext, ReferenceParams,
-    RenameParams as LspRenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
-    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
+    InlayHintLabel, InlayHintParams, MarkedString, PartialResultParams, ReferenceContext,
+    ReferenceParams, RenameParams as LspRenameParams,
+    SignatureHelpParams as LspSignatureHelpParams, TextDocumentIdentifier,
+    TextDocumentPositionParams, WorkDoneProgressParams, WorkspaceEdit,
+    WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
@@ -417,6 +419,76 @@ pub struct ServerMessagesResult {
     pub messages: Vec<crate::bridge::notifications::ServerMessage>,
 }
 
+/// A single parameter in a signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureParameter {
+    /// Label of the parameter.
+    pub label: String,
+    /// Optional documentation for the parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+}
+
+/// A single signature overload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureInfo {
+    /// Full label of the signature.
+    pub label: String,
+    /// Optional documentation for the signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+    /// Parameters of the signature.
+    pub parameters: Vec<SignatureParameter>,
+}
+
+/// Result of a signature help request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureHelpResult {
+    /// Available signatures.
+    pub signatures: Vec<SignatureInfo>,
+    /// Index of the active signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_signature: Option<u32>,
+    /// Index of the active parameter within the active signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_parameter: Option<u32>,
+}
+
+/// Result of a go-to-implementation or go-to-type-definition request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocationsResult {
+    /// Locations found.
+    pub locations: Vec<Location>,
+}
+
+/// A single inlay hint entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlayHintEntry {
+    /// Position of the hint (1-based MCP).
+    pub position: Position2D,
+    /// Label text for the hint.
+    pub label: String,
+    /// Hint kind (1 = Type, 2 = Parameter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<u8>,
+    /// Whether to add a space before the hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding_left: Option<bool>,
+    /// Whether to add a space after the hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding_right: Option<bool>,
+    /// Tooltip text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<String>,
+}
+
+/// Result of an inlay hints request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlayHintsResult {
+    /// List of inlay hints.
+    pub hints: Vec<InlayHintEntry>,
+}
+
 /// Maximum allowed position value for validation.
 const MAX_POSITION_VALUE: u32 = 1_000_000;
 /// Maximum allowed range size in lines.
@@ -428,7 +500,7 @@ impl Translator {
     /// # Errors
     ///
     /// Returns `Error::PathOutsideWorkspace` if the path is outside all workspace roots.
-    fn validate_path(&self, path: &Path) -> Result<PathBuf> {
+    pub(crate) fn validate_path(&self, path: &Path) -> Result<PathBuf> {
         let canonical = path.canonicalize().map_err(|e| Error::FileIo {
             path: path.to_path_buf(),
             source: e,
@@ -1442,9 +1514,282 @@ impl Translator {
         let messages: Vec<_> = all_messages.iter().take(limit).cloned().collect();
         Ok(ServerMessagesResult { messages })
     }
+
+    /// Handle signature help request (`textDocument/signatureHelp`).
+    ///
+    /// Returns parameter signatures and documentation while typing a function call.
+    /// `context` is omitted (None) — the server infers trigger state from position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the file cannot be opened.
+    pub async fn handle_signature_help(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<SignatureHelpResult> {
+        let path = PathBuf::from(&file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
+        let lsp_position = mcp_to_lsp_position(line, character);
+
+        let params = LspSignatureHelpParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: lsp_position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            context: None,
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<lsp_types::SignatureHelp> = client
+            .request("textDocument/signatureHelp", params, timeout_duration)
+            .await?;
+
+        let result = match response {
+            Some(sig_help) => SignatureHelpResult {
+                signatures: sig_help
+                    .signatures
+                    .into_iter()
+                    .map(|sig| SignatureInfo {
+                        label: sig.label,
+                        documentation: sig.documentation.map(extract_documentation),
+                        parameters: sig
+                            .parameters
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|p| SignatureParameter {
+                                label: match p.label {
+                                    lsp_types::ParameterLabel::Simple(s) => s,
+                                    lsp_types::ParameterLabel::LabelOffsets([start, end]) => {
+                                        format!("[{start},{end}]")
+                                    }
+                                },
+                                documentation: p.documentation.map(extract_documentation),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                active_signature: sig_help.active_signature,
+                active_parameter: sig_help.active_parameter,
+            },
+            None => SignatureHelpResult {
+                signatures: vec![],
+                active_signature: None,
+                active_parameter: None,
+            },
+        };
+
+        Ok(result)
+    }
+
+    /// Handle go-to-implementation request (`textDocument/implementation`).
+    ///
+    /// Returns the locations of trait method or interface member implementations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the file cannot be opened.
+    pub async fn handle_implementation(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<LocationsResult> {
+        let path = PathBuf::from(&file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
+        let lsp_position = mcp_to_lsp_position(line, character);
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: lsp_position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<lsp_types::GotoDefinitionResponse> = client
+            .request("textDocument/implementation", params, timeout_duration)
+            .await?;
+
+        Ok(LocationsResult {
+            locations: goto_response_to_locations(response),
+        })
+    }
+
+    /// Handle go-to-type-definition request (`textDocument/typeDefinition`).
+    ///
+    /// Returns the type definition location of the expression at position. Distinct
+    /// from go-to-definition for variable bindings where definition and type differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the file cannot be opened.
+    pub async fn handle_type_definition(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<LocationsResult> {
+        let path = PathBuf::from(&file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
+        let lsp_position = mcp_to_lsp_position(line, character);
+
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: lsp_position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<lsp_types::GotoDefinitionResponse> = client
+            .request("textDocument/typeDefinition", params, timeout_duration)
+            .await?;
+
+        Ok(LocationsResult {
+            locations: goto_response_to_locations(response),
+        })
+    }
+
+    /// Handle inlay hints request (`textDocument/inlayHint`).
+    ///
+    /// Returns inferred type and parameter annotations the editor would render inline.
+    /// Output positions are in MCP 1-based form.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails or the file cannot be opened.
+    pub async fn handle_inlay_hints(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+    ) -> Result<InlayHintsResult> {
+        use crate::bridge::encoding::lsp_to_mcp_position;
+
+        let path = PathBuf::from(&file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &client)
+            .await?;
+
+        let lsp_start = mcp_to_lsp_position(start_line, start_character);
+        let lsp_end = mcp_to_lsp_position(end_line, end_character);
+
+        let params = InlayHintParams {
+            text_document: TextDocumentIdentifier { uri },
+            range: lsp_types::Range {
+                start: lsp_start,
+                end: lsp_end,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: Option<Vec<lsp_types::InlayHint>> = client
+            .request("textDocument/inlayHint", params, timeout_duration)
+            .await?;
+
+        let hints = response
+            .unwrap_or_default()
+            .into_iter()
+            .map(|hint| {
+                let (mcp_line, mcp_character) = lsp_to_mcp_position(hint.position);
+                let label = match hint.label {
+                    InlayHintLabel::String(s) => s,
+                    InlayHintLabel::LabelParts(parts) => parts
+                        .into_iter()
+                        .map(|p| p.value)
+                        .collect::<Vec<_>>()
+                        .concat(),
+                };
+                let tooltip = hint.tooltip.map(|t| match t {
+                    lsp_types::InlayHintTooltip::String(s) => s,
+                    lsp_types::InlayHintTooltip::MarkupContent(m) => m.value,
+                });
+                InlayHintEntry {
+                    position: Position2D {
+                        line: mcp_line,
+                        character: mcp_character,
+                    },
+                    label,
+                    kind: hint.kind.and_then(|k| {
+                        serde_json::to_value(k)
+                            .ok()
+                            .and_then(|v| v.as_i64())
+                            .and_then(|n| u8::try_from(n).ok())
+                    }),
+                    padding_left: hint.padding_left,
+                    padding_right: hint.padding_right,
+                    tooltip,
+                }
+            })
+            .collect();
+
+        Ok(InlayHintsResult { hints })
+    }
 }
 
 /// Extract hover contents as markdown string.
+/// Convert LSP `Documentation` to a plain string.
+fn extract_documentation(doc: lsp_types::Documentation) -> String {
+    match doc {
+        lsp_types::Documentation::String(s) => s,
+        lsp_types::Documentation::MarkupContent(m) => m.value,
+    }
+}
+
+/// Normalize a `GotoDefinitionResponse` into a flat list of MCP `Location` values.
+fn goto_response_to_locations(
+    response: Option<lsp_types::GotoDefinitionResponse>,
+) -> Vec<Location> {
+    let lsp_locs: Vec<lsp_types::Location> = match response {
+        Some(lsp_types::GotoDefinitionResponse::Scalar(loc)) => vec![loc],
+        Some(lsp_types::GotoDefinitionResponse::Array(locs)) => locs,
+        Some(lsp_types::GotoDefinitionResponse::Link(links)) => links
+            .into_iter()
+            .map(|link| lsp_types::Location {
+                uri: link.target_uri,
+                range: link.target_selection_range,
+            })
+            .collect(),
+        None => vec![],
+    };
+
+    lsp_locs
+        .into_iter()
+        .map(|loc| Location {
+            uri: loc.uri.to_string(),
+            range: normalize_range(loc.range),
+        })
+        .collect()
+}
+
 fn extract_hover_contents(contents: HoverContents) -> String {
     match contents {
         HoverContents::Scalar(marked_string) => marked_string_to_string(marked_string),

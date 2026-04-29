@@ -249,3 +249,69 @@ pub struct ServerMessagesParams {
 const fn default_message_limit() -> usize {
     20
 }
+
+/// Parameters for the `get_signature_help` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for getting signature help at a position in a file.")]
+pub struct SignatureHelpParams {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    pub file_path: String,
+    /// Line number (1-based).
+    #[schemars(description = "Line number (1-based).")]
+    pub line: u32,
+    /// Character/column number (1-based).
+    #[schemars(description = "Character/column number (1-based).")]
+    pub character: u32,
+}
+
+/// Parameters for the `go_to_implementation` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for navigating to implementations of a symbol.")]
+pub struct GoToImplementationParams {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    pub file_path: String,
+    /// Line number (1-based).
+    #[schemars(description = "Line number (1-based).")]
+    pub line: u32,
+    /// Character/column number (1-based).
+    #[schemars(description = "Character/column number (1-based).")]
+    pub character: u32,
+}
+
+/// Parameters for the `go_to_type_definition` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for navigating to the type definition of an expression.")]
+pub struct GoToTypeDefinitionParams {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    pub file_path: String,
+    /// Line number (1-based).
+    #[schemars(description = "Line number (1-based).")]
+    pub line: u32,
+    /// Character/column number (1-based).
+    #[schemars(description = "Character/column number (1-based).")]
+    pub character: u32,
+}
+
+/// Parameters for the `get_inlay_hints` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for getting inlay hints in a range.")]
+pub struct InlayHintsParams {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    pub file_path: String,
+    /// Start line (1-based).
+    #[schemars(description = "Start line (1-based).")]
+    pub start_line: u32,
+    /// Start character (1-based).
+    #[schemars(description = "Start character (1-based).")]
+    pub start_character: u32,
+    /// End line (1-based).
+    #[schemars(description = "End line (1-based).")]
+    pub end_line: u32,
+    /// End character (1-based).
+    #[schemars(description = "End character (1-based).")]
+    pub end_character: u32,
+}

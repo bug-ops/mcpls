@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use lsp_types::{DidOpenTextDocumentParams, TextDocumentItem, Uri};
+use url::Url;
 
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
@@ -153,6 +154,11 @@ impl DocumentTracker {
         self.documents.drain().map(|(_, state)| state).collect()
     }
 
+    /// Iterate over the filesystem paths of all currently open documents.
+    pub fn open_paths(&self) -> impl Iterator<Item = &Path> {
+        self.documents.keys().map(PathBuf::as_path)
+    }
+
     /// Ensure a document is open, opening it lazily if necessary.
     ///
     /// If the document is already open, returns its URI immediately.
@@ -199,6 +205,11 @@ impl DocumentTracker {
 }
 
 /// Convert a file path to a URI.
+///
+/// # Panics
+///
+/// Panics if the path cannot be represented as a `file://` URI. This should
+/// not occur for valid absolute paths.
 #[must_use]
 pub fn path_to_uri(path: &Path) -> Uri {
     // Convert path to file:// URI string and parse
@@ -210,6 +221,24 @@ pub fn path_to_uri(path: &Path) -> Uri {
     // Path-to-URI conversion should always succeed for valid paths
     #[allow(clippy::expect_used)]
     uri_string.parse().expect("failed to create URI from path")
+}
+
+/// Convert an LSP `file://` URI to an absolute filesystem path.
+///
+/// Returns `None` if the URI is not a valid `file://` URI, uses a non-file
+/// scheme, or contains percent-encoding that cannot map to a valid path.
+#[must_use]
+pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    let url = Url::parse(uri.as_str()).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    // Reject authority-bearing file URIs (e.g. `file://server/share`) to
+    // avoid UNC path confusion on Windows.
+    if !url.host_str().unwrap_or("").is_empty() {
+        return None;
+    }
+    url.to_file_path().ok()
 }
 
 /// Detect the language ID from a file path.
@@ -799,5 +828,73 @@ mod tests {
 
         // Lowercase .nu should not match uppercase "NU" in map
         assert_eq!(detect_language(Path::new("script.nu"), &map), "plaintext");
+    }
+
+    // ------------------------------------------------------------------
+    // uri_to_path
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_uri_to_path_file_scheme() {
+        let uri: Uri = "file:///home/user/main.rs".parse().unwrap();
+        let path = uri_to_path(&uri).unwrap();
+        assert_eq!(path, PathBuf::from("/home/user/main.rs"));
+    }
+
+    #[test]
+    fn test_uri_to_path_non_file_scheme_returns_none() {
+        let uri: Uri = "https://example.com/file.rs".parse().unwrap();
+        assert!(uri_to_path(&uri).is_none());
+    }
+
+    #[test]
+    fn test_uri_to_path_lsp_diagnostics_scheme_returns_none() {
+        // Custom scheme must not be decoded by uri_to_path.
+        let uri: Uri = "lsp-diagnostics:///home/user/main.rs".parse().unwrap();
+        assert!(uri_to_path(&uri).is_none());
+    }
+
+    #[test]
+    fn test_uri_to_path_with_authority_returns_none() {
+        // Authority-bearing file URIs must be rejected (UNC path defence).
+        // lsp_types::Uri may or may not accept this string; either way
+        // uri_to_path should return None.
+        let result = "file://server/share/path.rs"
+            .parse::<Uri>()
+            .ok()
+            .and_then(|u| uri_to_path(&u));
+        assert!(result.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // open_paths
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_open_paths_empty_tracker() {
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        assert_eq!(tracker.open_paths().count(), 0);
+    }
+
+    #[test]
+    fn test_open_paths_populated_tracker() {
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
+        tracker.open(PathBuf::from("/b.rs"), String::new()).unwrap();
+        let mut paths: Vec<_> = tracker.open_paths().collect();
+        paths.sort();
+        assert_eq!(paths, [Path::new("/a.rs"), Path::new("/b.rs")]);
+    }
+
+    #[test]
+    fn test_open_paths_after_close() {
+        let mut map = HashMap::new();
+        map.insert("rs".to_string(), "rust".to_string());
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
+        tracker.close(Path::new("/a.rs"));
+        assert_eq!(tracker.open_paths().count(), 0);
     }
 }

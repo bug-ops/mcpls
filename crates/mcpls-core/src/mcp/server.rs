@@ -6,18 +6,24 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    Implementation, ListResourcesResult, RawResource, ReadResourceRequestParams,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+    UnsubscribeRequestParams,
+};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
-    DocumentSymbolsParams, FormatDocumentParams, HoverParams, ReferencesParams, RenameParams,
-    ServerLogsParams, ServerMessagesParams, WorkspaceSymbolParams,
+    DocumentSymbolsParams, FormatDocumentParams, GoToImplementationParams,
+    GoToTypeDefinitionParams, HoverParams, InlayHintsParams, ReferencesParams, RenameParams,
+    ServerLogsParams, ServerMessagesParams, SignatureHelpParams, WorkspaceSymbolParams,
 };
-use crate::bridge::Translator;
+use crate::bridge::resources::{make_uri, parse_uri};
+use crate::bridge::{ResourceSubscriptions, Translator};
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -27,10 +33,13 @@ pub struct McplsServer {
 
 #[tool_router]
 impl McplsServer {
-    /// Create a new MCP server with the given translator.
+    /// Create a new MCP server with the given translator and subscriptions.
     #[must_use]
-    pub fn new(translator: Arc<Mutex<Translator>>) -> Self {
-        let context = Arc::new(HandlerContext::new(translator));
+    pub fn new(
+        translator: Arc<Mutex<Translator>>,
+        subscriptions: Arc<ResourceSubscriptions>,
+    ) -> Self {
+        let context = Arc::new(HandlerContext::new(translator, subscriptions));
         Self { context }
     }
 
@@ -418,17 +427,249 @@ impl McplsServer {
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
+
+    /// Get signature help at a position.
+    #[tool(
+        description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call."
+    )]
+    async fn get_signature_help(
+        &self,
+        Parameters(SignatureHelpParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<SignatureHelpParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_signature_help(file_path, line, character)
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Go to implementation locations.
+    #[tool(
+        description = "Implementation locations of trait method or interface member at position."
+    )]
+    async fn go_to_implementation(
+        &self,
+        Parameters(GoToImplementationParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<GoToImplementationParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_implementation(file_path, line, character)
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Go to type definition location.
+    #[tool(
+        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings."
+    )]
+    async fn go_to_type_definition(
+        &self,
+        Parameters(GoToTypeDefinitionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<GoToTypeDefinitionParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_type_definition(file_path, line, character)
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
+
+    /// Get inlay hints for a range.
+    #[tool(
+        description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline."
+    )]
+    async fn get_inlay_hints(
+        &self,
+        Parameters(InlayHintsParams {
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+        }): Parameters<InlayHintsParams>,
+    ) -> Result<String, McpError> {
+        let result = {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .handle_inlay_hints(
+                    file_path,
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                )
+                .await
+        };
+
+        match result {
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+        }
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for McplsServer {
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
+        // very large single-page responses that may exceed transport buffers).
+        let resources: Vec<_> = {
+            let translator = self.context.translator.lock().await;
+            translator
+                .document_tracker()
+                .open_paths()
+                .filter_map(|path| {
+                    let uri = make_uri(path)
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                "Skipping path in list_resources (make_uri failed): {}: {e}",
+                                path.display()
+                            );
+                        })
+                        .ok()?;
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let raw = RawResource::new(uri, name)
+                        .with_mime_type("application/json")
+                        .with_description("LSP diagnostics for this file");
+                    Some(rmcp::model::Annotated::new(raw, None))
+                })
+                .collect()
+        };
+
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let path =
+            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        // Enforce workspace-root containment — mirrors the guard in every LSP tool.
+        {
+            let translator = self.context.translator.lock().await;
+            translator
+                .validate_path(&path)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        }
+
+        let lsp_uri = crate::bridge::path_to_uri(&path);
+
+        // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
+        // in the response shape. Currently both return `{"diagnostics":null}` which is
+        // ambiguous for clients that need to know whether analysis has run yet.
+        let diagnostics = {
+            let translator = self.context.translator.lock().await;
+            translator
+                .notification_cache()
+                .get_diagnostics(lsp_uri.as_str())
+                .cloned()
+        };
+
+        let json = serde_json::to_string(&diagnostics)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
+
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            json,
+            request.uri,
+        )]))
+    }
+
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        _context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let path =
+            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        // Enforce workspace-root containment (same invariant as every LSP tool).
+        {
+            let translator = self.context.translator.lock().await;
+            translator
+                .validate_path(&path)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        }
+
+        // TODO(S3): If diagnostics are already cached for this URI, emit a synthetic
+        // notify_resource_updated so clients subscribing after initial workspace indexing
+        // don't have to wait for the next LSP push. Requires peer access from HandlerContext.
+        // Track as follow-up issue.
+        self.context
+            .subscriptions
+            .subscribe(request.uri)
+            .await
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        // Parse the URI for consistency with subscribe validation.
+        parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        self.context.subscriptions.unsubscribe(&request.uri).await;
+        Ok(())
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut implementation = Implementation::new("mcpls", env!("CARGO_PKG_VERSION"));
         implementation.title = Some("MCPLS - MCP to LSP Bridge".to_string());
         implementation.description = Some(env!("CARGO_PKG_DESCRIPTION").to_string());
         implementation.website_url = Some("https://github.com/bug-ops/mcpls".to_string());
 
-        let mut server_info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .build();
+        let mut server_info = ServerInfo::new(capabilities);
         server_info.server_info = implementation;
         server_info.instructions = Some(
             concat!(
@@ -450,8 +691,9 @@ mod tests {
     use super::*;
 
     fn create_test_server() -> McplsServer {
-        let translator = Translator::new();
-        McplsServer::new(Arc::new(Mutex::new(translator)))
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        McplsServer::new(translator, subscriptions)
     }
 
     #[tokio::test]
@@ -830,5 +1072,138 @@ mod tests {
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_signature_help_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(SignatureHelpParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
+        });
+
+        let result = server.get_signature_help(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_go_to_implementation_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(GoToImplementationParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
+        });
+
+        let result = server.go_to_implementation(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_go_to_type_definition_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(GoToTypeDefinitionParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
+        });
+
+        let result = server.go_to_type_definition(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_inlay_hints_tool_with_params() {
+        let server = create_test_server();
+        let params = Parameters(InlayHintsParams {
+            file_path: "/test/file.rs".to_string(),
+            start_line: 1,
+            start_character: 1,
+            end_line: 10,
+            end_character: 1,
+        });
+
+        let result = server.get_inlay_hints(params).await;
+        assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Resource handler tests (logic-level, avoiding rmcp::service::RequestContext
+    // which requires a live Peer with private fields)
+    // ------------------------------------------------------------------
+
+    /// `list_resources` returns an empty vec for a fresh translator with no open documents.
+    #[tokio::test]
+    async fn test_list_resources_returns_empty_when_no_open_documents() {
+        let server = create_test_server();
+        let empty = {
+            let translator = server.context.translator.lock().await;
+            translator.document_tracker().open_paths().count() == 0
+        };
+        assert!(empty);
+    }
+
+    /// `parse_uri` rejects `file://` scheme — ensures `read_resource` would return an error.
+    #[test]
+    fn test_read_resource_rejects_file_scheme() {
+        let result = parse_uri("file:///some/file.rs");
+        assert!(result.is_err());
+    }
+
+    /// `parse_uri` rejects `https://` scheme.
+    #[test]
+    fn test_subscribe_rejects_https_scheme() {
+        let result = parse_uri("https://evil.com/file.rs");
+        assert!(result.is_err());
+    }
+
+    /// `validate_path` rejects a non-existent path (canonicalize fails).
+    #[tokio::test]
+    async fn test_validate_path_rejects_nonexistent_path() {
+        use std::path::Path;
+
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let result = {
+            let t = translator.lock().await;
+            t.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"))
+        };
+        assert!(result.is_err());
+    }
+
+    /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
+    #[tokio::test]
+    async fn test_subscription_cap_enforced_in_handler_context() {
+        use crate::bridge::resources::MAX_SUBSCRIPTIONS;
+
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        for i in 0..MAX_SUBSCRIPTIONS {
+            subscriptions
+                .subscribe(format!("lsp-diagnostics:///file{i}.rs"))
+                .await
+                .unwrap();
+        }
+        let over = subscriptions
+            .subscribe("lsp-diagnostics:///overflow.rs".to_string())
+            .await;
+        assert!(over.is_err());
+    }
+
+    /// unsubscribing a URI that was never subscribed is a no-op (returns `false`, not an error).
+    #[tokio::test]
+    async fn test_unsubscribe_nonexistent_is_noop() {
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let removed = subscriptions
+            .unsubscribe("lsp-diagnostics:///nonexistent.rs")
+            .await;
+        assert!(!removed);
+    }
+
+    /// Server capabilities advertise resources support.
+    #[tokio::test]
+    async fn test_server_capabilities_include_resources() {
+        let server = create_test_server();
+        let info = server.get_info();
+        assert!(info.capabilities.resources.is_some());
     }
 }

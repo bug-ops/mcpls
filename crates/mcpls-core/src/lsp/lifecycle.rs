@@ -483,6 +483,112 @@ impl LspServer {
 
         result
     }
+
+    /// Spawn and initialize an LSP server with notification forwarding.
+    ///
+    /// Returns the server and a receiver for LSP notifications (diagnostics, logs,
+    /// messages). The channel capacity is 64; notifications beyond that are silently
+    /// dropped by the client's `try_send`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LspServer::spawn`].
+    async fn spawn_with_notifications(
+        config: ServerInitConfig,
+    ) -> Result<(Self, mpsc::Receiver<LspNotification>)> {
+        info!(
+            "Spawning LSP server (with notifications): {} {:?}",
+            config.server_config.command, config.server_config.args
+        );
+
+        let mut child = tokio::process::Command::new(&config.server_config.command)
+            .args(&config.server_config.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| Error::ServerSpawnFailed {
+                command: config.server_config.command.clone(),
+                source: e,
+            })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Transport("Failed to capture stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
+
+        let transport = LspTransport::new(stdin, stdout);
+        let (notification_tx, notification_rx) = mpsc::channel(64);
+        let client = LspClient::from_transport_with_notifications(
+            config.server_config.clone(),
+            transport,
+            notification_tx,
+        );
+
+        let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
+
+        info!("LSP server initialized successfully (with notifications)");
+
+        Ok((
+            Self {
+                client,
+                capabilities,
+                position_encoding,
+                _child: child,
+            },
+            notification_rx,
+        ))
+    }
+
+    /// Spawn multiple LSP servers with notification forwarding, collecting receivers.
+    ///
+    /// Works like [`LspServer::spawn_batch`] but each server gets a notification channel.
+    /// The returned map associates each `language_id` with its receiver.
+    pub async fn spawn_batch_with_notifications(
+        configs: &[ServerInitConfig],
+    ) -> (
+        ServerInitResult,
+        HashMap<String, mpsc::Receiver<LspNotification>>,
+    ) {
+        let mut result = ServerInitResult::new();
+        let mut receivers: HashMap<String, mpsc::Receiver<LspNotification>> = HashMap::new();
+
+        for config in configs {
+            let language_id = config.server_config.language_id.clone();
+            let command = config.server_config.command.clone();
+
+            match Self::spawn_with_notifications(config.clone()).await {
+                Ok((server, rx)) => {
+                    info!(
+                        "Successfully spawned LSP server (with notifications): {} ({})",
+                        language_id, command
+                    );
+                    receivers.insert(language_id.clone(), rx);
+                    result.add_server(language_id, server);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to spawn LSP server: {} ({}): {}",
+                        language_id,
+                        command,
+                        e
+                    );
+                    result.add_failure(ServerSpawnFailure {
+                        language_id,
+                        command,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        (result, receivers)
+    }
 }
 
 #[cfg(test)]
