@@ -842,10 +842,9 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
 ///
 /// `sc_get_diagnostics` opens `broken.rs`, which causes rust-analyzer to push
 /// `textDocument/publishDiagnostics` notifications.  Those arrive asynchronously.
-/// Windows CI runners are slower, so allow up to 60 s there.
 fn sc_get_cached_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let broken = workspace.join("src/broken.rs");
-    let timeout_secs: u64 = if cfg!(windows) { 60 } else { 15 };
+    let timeout_secs: u64 = 20;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let resp = client
