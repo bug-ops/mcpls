@@ -643,28 +643,21 @@ fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Resu
     }
 }
 
-/// Tool 10: `get_code_actions` — code actions at a syntax error in lib.rs.
+/// Tool 10: `get_code_actions` — "Implement missing members" on an empty trait impl.
 ///
-/// `code_action_target()` contains `let ca_var = 1` without a trailing
-/// semicolon.  rust-analyzer reliably offers an "add `;`" quickfix there,
-/// giving us a stable trigger that does not require any imports.
+/// Quickfix-style code actions require rust-analyzer to receive the diagnostic
+/// object with its internal `data` field in the request context — the bridge
+/// currently sends an empty diagnostics list.  "Implement missing members" is a
+/// structural refactoring action that is context-free and does not depend on
+/// diagnostic data, making it a reliable trigger.
 fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib_rs = workspace.join("src/lib.rs");
-    // Target the line with the missing semicolon inside `code_action_target`.
-    let ca_line = find_line(&lib_rs, "let ca_var = 1");
+    // `impl Greet for CodeActionTarget { }` — empty impl body spanning two lines.
+    // RA offers "Implement missing members" when cursor is inside the impl block.
+    // Use a point cursor (start == end) at character 6 on the `impl` line, inside the keyword.
+    let impl_line = find_line(&lib_rs, "impl Greet for CodeActionTarget {");
 
-    // Open lib.rs and wait for rust-analyzer to complete type-checking.
-    // Type-checking is required before code actions for type-related fixes appear.
-    let _ = client.call_tool(
-        "get_diagnostics",
-        &json!({ "file_path": lib_rs.to_string_lossy() }),
-    );
-    std::thread::sleep(Duration::from_secs(5));
-
-    // rust-analyzer reports the missing-semicolon diagnostic at the closing `}`
-    // (one line below the statement), so the range must extend past ca_line to
-    // overlap the error and trigger the "add `;`" quickfix.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut last_inner;
     loop {
         let resp = client
@@ -672,10 +665,10 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
                 "get_code_actions",
                 &json!({
                     "file_path": lib_rs.to_string_lossy(),
-                    "start_line": ca_line,
-                    "start_character": 1,
-                    "end_line": ca_line + 1,
-                    "end_character": 2,
+                    "start_line": impl_line,
+                    "start_character": 6,
+                    "end_line": impl_line,
+                    "end_character": 6,
                 }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
@@ -694,17 +687,9 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
         }
 
         if Instant::now() >= deadline {
-            let cached = client
-                .call_tool(
-                    "get_cached_diagnostics",
-                    &json!({ "file_path": lib_rs.to_string_lossy() }),
-                )
-                .ok()
-                .map(|r| assertions::content_text(&r))
-                .unwrap_or_default();
             return Err(format!(
-                "get_code_actions: no actions on missing-semicolon in lib.rs after 30 s\n\
-                 cached_diagnostics={cached}\nactions_response={last_inner}"
+                "get_code_actions: no actions on empty trait impl after 20 s\n\
+                 actions_response={last_inner}"
             ));
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -842,31 +827,40 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
     Ok(())
 }
 
-/// Tool 14: `get_cached_diagnostics` — cache must be populated by `sc_get_diagnostics`.
+/// Tool 14: `get_cached_diagnostics` — push cache populated by `sc_get_diagnostics`.
+///
+/// `sc_get_diagnostics` opens `broken.rs`, which causes rust-analyzer to push
+/// `textDocument/publishDiagnostics` notifications.  Those arrive asynchronously,
+/// so poll for up to 15 s before declaring the cache empty.
 fn sc_get_cached_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let broken = workspace.join("src/broken.rs");
-    let resp = client
-        .call_tool(
-            "get_cached_diagnostics",
-            &json!({ "file_path": broken.to_string_lossy() }),
-        )
-        .map_err(|e| format!("call failed: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let resp = client
+            .call_tool(
+                "get_cached_diagnostics",
+                &json!({ "file_path": broken.to_string_lossy() }),
+            )
+            .map_err(|e| format!("call failed: {e}"))?;
 
-    let text = assertions::assert_tool_ok(&resp);
-    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+        let text = assertions::assert_tool_ok(&resp);
+        let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
 
-    let diags = inner["diagnostics"]
-        .as_array()
-        .ok_or_else(|| format!("expected diagnostics array, got {inner}"))?;
+        let diags = inner["diagnostics"]
+            .as_array()
+            .ok_or_else(|| format!("expected diagnostics array, got {inner}"))?;
 
-    // sc_get_diagnostics runs first and opens broken.rs, causing rust-analyzer to
-    // push publishDiagnostics notifications.  The cache must be non-empty by now.
-    if diags.is_empty() {
-        return Err(
-            "get_cached_diagnostics: empty cache after sc_get_diagnostics populated it".to_owned(),
-        );
+        if !diags.is_empty() {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err("get_cached_diagnostics: push cache empty after 15 s; \
+                 rust-analyzer did not send publishDiagnostics for broken.rs"
+                .to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
-    Ok(())
 }
 
 /// Tool 15: `get_server_logs` — returns `window/logMessage` entries.

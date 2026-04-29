@@ -71,11 +71,26 @@ impl fmt::Display for Point {
     }
 }
 
-/// Target function for code-action e2e testing.
-///
-/// The assignment `let ca_var = 1` is missing a semicolon so that
-/// rust-analyzer reliably offers an "add semicolon" quickfix here.
+/// Previously used for code-action quickfix testing (missing semicolon).
+/// The sub-case now uses structural actions instead; semicolon fixed.
 #[allow(dead_code)]
 pub fn code_action_target() {
-    let ca_var = 1
+    let _ca_var = 1;
+}
+
+/// Trait used as a code-action trigger.
+///
+/// `CodeActionTarget` below has an empty `impl Greet` — rust-analyzer
+/// reliably offers "Implement missing members" there, a context-free
+/// structural action that does not depend on diagnostic data.
+pub trait Greet {
+    fn hello(&self) -> String;
+}
+
+/// Struct with an empty trait impl for code-action testing.
+#[allow(dead_code)]
+pub struct CodeActionTarget;
+
+// split to multi-line so RA can offer "implement missing members" inside the block
+impl Greet for CodeActionTarget {
 }

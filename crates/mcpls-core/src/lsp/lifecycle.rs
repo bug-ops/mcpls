@@ -290,7 +290,9 @@ impl LspServer {
                     Error::InvalidUri(format!("Invalid UTF-8 in path: {root_display}"))
                 })?;
                 let uri_str = if cfg!(windows) {
-                    format!("file:///{}", path_str.replace('\\', "/"))
+                    // Strip \\?\ extended-path prefix that canonicalize() adds on Windows.
+                    let stripped = path_str.strip_prefix(r"\\?\").unwrap_or(path_str);
+                    format!("file:///{}", stripped.replace('\\', "/"))
                 } else {
                     format!("file://{path_str}")
                 };
@@ -342,6 +344,22 @@ impl LspServer {
                         data_support: Some(true),
                         resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
                             properties: vec!["edit".to_string()],
+                        }),
+                        // Declare supported action kinds so the server returns
+                        // CodeAction objects (not just legacy Command objects).
+                        code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
+                            code_action_kind: lsp_types::CodeActionKindLiteralSupport {
+                                value_set: vec![
+                                    String::new(),
+                                    "quickfix".to_string(),
+                                    "refactor".to_string(),
+                                    "refactor.extract".to_string(),
+                                    "refactor.inline".to_string(),
+                                    "refactor.rewrite".to_string(),
+                                    "source".to_string(),
+                                    "source.organizeImports".to_string(),
+                                ],
+                            },
                         }),
                         ..Default::default()
                     }),

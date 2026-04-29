@@ -1212,7 +1212,7 @@ impl Translator {
             context: lsp_types::CodeActionContext {
                 diagnostics: context_diagnostics,
                 only,
-                trigger_kind: None,
+                trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
@@ -1222,7 +1222,6 @@ impl Translator {
         let response: Option<lsp_types::CodeActionResponse> = client
             .request("textDocument/codeAction", params, timeout_duration)
             .await?;
-
         let response_vec = response.unwrap_or_default();
         let mut actions = Vec::with_capacity(response_vec.len());
 
