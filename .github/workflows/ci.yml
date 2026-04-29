@@ -122,6 +122,8 @@ jobs:
     if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -160,7 +162,7 @@ jobs:
         with:
           name: nextest-archive
       - name: Run unit tests
-        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --lib
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --lib --bins
 
   test-integration:
     name: Test (integration)
@@ -178,7 +180,7 @@ jobs:
         with:
           name: nextest-archive
       - name: Run integration tests
-        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --tests
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --tests -E 'not test(e2e)'
 
   test-e2e:
     name: Test (e2e)
@@ -203,7 +205,7 @@ jobs:
       - name: Make binary executable
         run: chmod +x target/debug/mcpls
       - name: Run e2e tests
-        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored all -E 'test(e2e)'
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'test(e2e)'
 
   msrv:
     name: MSRV check (1.88)
