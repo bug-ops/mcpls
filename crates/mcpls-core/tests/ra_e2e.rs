@@ -838,19 +838,26 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
     Ok(())
 }
 
-/// Tool 14: `get_cached_diagnostics` — push cache populated by `sc_get_diagnostics`.
+/// Tool 14: `get_cached_diagnostics` — push cache populated during workspace indexing.
 ///
-/// `sc_get_diagnostics` opens `broken.rs`, which causes rust-analyzer to push
-/// `textDocument/publishDiagnostics` notifications.  Those arrive asynchronously.
+/// Uses `lib.rs` rather than `broken.rs`: lib.rs is opened via hover during
+/// `wait_until_ready` (no pull-diagnostic request), so rust-analyzer sends
+/// `publishDiagnostics` for it unconditionally during initial analysis.
+/// `broken.rs` is queried via the pull-based `textDocument/diagnostic` API in
+/// `sc_get_diagnostics`; newer RA versions skip push for files already served
+/// via pull, making `broken.rs` unreliable as a push-cache trigger.
+///
+/// lib.rs contains `let _x = undefined_variable;` (E0425) so it always has
+/// at least one error diagnostic pushed by RA after indexing.
 fn sc_get_cached_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
-    let broken = workspace.join("src/broken.rs");
+    let lib_rs = workspace.join("src/lib.rs");
     let timeout_secs: u64 = 20;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let resp = client
             .call_tool(
                 "get_cached_diagnostics",
-                &json!({ "file_path": broken.to_string_lossy() }),
+                &json!({ "file_path": lib_rs.to_string_lossy() }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
 
@@ -868,7 +875,7 @@ fn sc_get_cached_diagnostics(client: &mut McpClient, workspace: &Path) -> Result
         if Instant::now() >= deadline {
             return Err(format!(
                 "get_cached_diagnostics: push cache empty after {timeout_secs} s; \
-                 rust-analyzer did not send publishDiagnostics for broken.rs"
+                 rust-analyzer did not send publishDiagnostics for lib.rs"
             ));
         }
         std::thread::sleep(Duration::from_millis(500));
