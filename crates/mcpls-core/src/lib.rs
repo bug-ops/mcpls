@@ -147,7 +147,9 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         applicable_configs.len()
     );
 
-    if !applicable_configs.is_empty() {
+    if applicable_configs.is_empty() {
+        warn!("No applicable LSP servers configured — starting in protocol-only mode");
+    } else {
         // Spawn all servers with graceful degradation
         let result = LspServer::spawn_batch(&applicable_configs).await;
 
@@ -179,8 +181,6 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         }
 
         info!("Proceeding with {} LSP server(s)", server_count);
-    } else {
-        warn!("No applicable LSP servers configured — starting in protocol-only mode");
     }
 
     let translator = Arc::new(Mutex::new(translator));
