@@ -2,21 +2,29 @@
 applyTo: "crates/mcpls-core/src/config/**,deny.toml,Cargo.toml,crates/*/Cargo.toml"
 ---
 
-## Config and dependency review checklist
+## Configuration
 
-### deny.toml
+New `#[serde(default)]` fields must have a test that deserialises a config with the
+field omitted and asserts the default value. Both JSON and TOML paths should be covered
+— `#[serde(rename_all)]` applies uniformly, but TOML and JSON parsers can behave
+differently for edge cases like empty strings and null values.
 
-- When a new crate is introduced, verify its license appears in the `allow` list.
-  `cargo deny check licenses` runs in CI and will fail on first run if the license is
-  missing. Known gap: `CC0-1.0` (used by `notify`).
-- Check `cargo deny check advisories` output for any new RUSTSEC advisories in added
-  dependencies.
+Enum config options must include a round-trip test for every variant covering at least
+one serialisation format. A rename or typo in `#[serde(rename_all = "...")]` silently
+changes the on-disk format and breaks existing configs.
 
-### Config (`config/mod.rs`)
+## Dependencies
 
-- New `#[serde(default)]` fields on public config structs must have a test covering
-  the omitted-key case (TOML round-trip, not just JSON).
-- Enum config options must include serde round-trip tests for every variant, both JSON
-  and TOML, since `#[serde(rename_all)]` applies to both serializers independently.
-- LSP server discovery heuristics (file-pattern matching) must be case-insensitive on
-  the extension comparison — APFS and NTFS are case-insensitive filesystems.
+When a new crate is introduced, check that its license appears in the `deny.toml` allow
+list before merging. `cargo deny check licenses` fails fast in CI and blocks the entire
+pipeline. Add the license in the same PR that adds the crate.
+
+`cargo deny check advisories` must be clean. A RUSTSEC advisory in a transitive
+dependency is a blocker even when the vulnerable code path is not exercised by this
+project.
+
+## MSRV
+
+`rust-version` in `Cargo.toml` is the enforced minimum supported Rust version. Any
+stabilised API used in new code must have been available since that version. If a newer
+API is needed, bump `rust-version` and document the change in CHANGELOG.

@@ -3,56 +3,57 @@
 mcpls is a bridge between MCP (Model Context Protocol) and LSP (Language Server Protocol).
 AI clients speak MCP to mcpls; mcpls spawns and communicates with language servers over LSP.
 
-## Architecture
-
 ```
-AI Client ←→ [MCP/stdio] ←→ mcpls ←→ [LSP/stdio] ←→ rust-analyzer / tsgo / pyright / ...
+AI Client ←→ [MCP/stdio] ←→ mcpls ←→ [LSP/stdio] ←→ language server
 ```
 
-Key crates:
-- `mcpls-core/src/bridge/` — MCP→LSP translation, document state, diagnostics cache
-- `mcpls-core/src/lsp/` — LSP client, JSON-RPC 2.0 lifecycle, file watcher
-- `mcpls-core/src/mcp/` — MCP server, tool definitions and dispatch
-- `mcpls-core/src/config/` — TOML config, LSP server discovery heuristics
+Key crates: `mcpls-core/src/bridge/`, `lsp/`, `mcp/`, `config/`.
 
-## Code Review Priorities
+## Correctness
 
-### Correctness
+**Position encoding** — MCP is 1-based, LSP is 0-based. All line/column conversions must
+go through the dedicated encoding module. Direct arithmetic on position values outside
+that module is a bug.
 
-- **Position encoding**: MCP is 1-based, LSP is 0-based. All conversions must go through
-  `bridge/encoding.rs`. Flag any direct arithmetic on line/column values outside that module.
+**LSP JSON-RPC message classification** — four shapes exist:
+- `method` + `id` → server-to-client request (must be replied to)
+- `method` only → notification (fire-and-forget)
+- `id` + `result` or `error` → response
+- anything else → protocol error
 
-- **LSP protocol compliance**: Inbound JSON-RPC messages fall into four shapes:
-  `method`+`id` → server request, `method` only → notification,
-  `id`+(`result`|`error`) → response, anything else → protocol error.
-  Responses without `result` or `error` must not be silently treated as `null`.
+A message with `id` but no `method`, `result`, or `error` is invalid and must not be
+silently treated as a successful `null` response.
 
-- **Document versioning**: `textDocument/didOpen` version numbers must be strictly
-  monotone per document URI. After `didClose`/`didOpen` resync cycles, reset to 1
-  rather than saturating at `i32::MAX`.
+**Document version monotonicity** — `textDocument/didOpen` version numbers must strictly
+increase per URI across the document's lifetime. On counter overflow, reset to 1 rather
+than saturating — after `didClose`/`didOpen` the server treats the document as fresh
+regardless of the version number.
 
-- **Glob patterns**: `globset` matches against the full absolute path. Bare patterns
-  like `*.rs` only match filenames with no directory component. Patterns without a
-  leading `/` or `**/` prefix must be anchored with `**/` before passing to `GlobSetBuilder`.
+**Filesystem signature freshness** — when caching file state with `(mtime, size)`, stat
+and read must be bound to the same moment. A stat before the read creates a TOCTOU
+window: on filesystems with low mtime resolution a same-size rewrite within a single
+clock tick leaves the signature unchanged while content has changed.
 
-### Concurrency
+## Concurrency
 
-- **Lock scope**: `Arc<Mutex<Translator>>` must never be held across async LSP I/O
-  (notify calls, request round-trips). If a lock guard is held while awaiting a network
-  operation, flag it — this creates head-of-line blocking between request handlers and
-  the `notification_pump`.
+**Lock granularity** — a mutex that guards a large struct must not be held across async
+I/O. If a background task and a request handler share the same lock, and the request
+handler awaits a network round-trip while holding it, the background task stalls. When
+the background channel fills, the network response can no longer be delivered —
+head-of-line deadlock. Prefer fine-grained locks scoped to the data they protect.
 
-- **Channel semantics**: `std::sync::mpsc::SyncSender::send` blocks when the channel is
-  full; it does not drop. Use `try_send` when the intent is drop-on-full.
+**Channel drop-on-full semantics** — `std::sync::mpsc::SyncSender::send` blocks when
+the channel is full; it does not drop. Use `try_send` when the intent is to discard
+events under backpressure and never block the sender thread.
 
-### Dependencies
+## Dependencies
 
-- Check `deny.toml` allow list when new crates are introduced. Licenses not in the list
-  will fail `cargo deny check licenses` in CI. Common gap: `CC0-1.0` (used by `notify`).
+When a new crate is introduced, verify its license is in the `cargo deny` allow list.
+A missing license will fail `cargo deny check licenses` in CI on the first run.
 
 ## Style
 
-- All `pub` types, traits, functions, and methods must have `///` doc comments explaining
-  *what* and *why*, not just restating the name.
+- All `pub` items must have `///` doc comments explaining *what* and *why*.
 - No `unsafe` code — `deny(unsafe_code)` is enforced workspace-wide.
-- `#[non_exhaustive]` is required on any public enum that may gain variants in future releases.
+- Public enums that may gain variants must be marked `#[non_exhaustive]`, and breaking
+  additions must be documented under `### Changed` in CHANGELOG.

@@ -2,54 +2,79 @@
 applyTo: "crates/mcpls-core/src/bridge/**,crates/mcpls-core/src/lsp/**,crates/mcpls-core/src/lib.rs"
 ---
 
-## Bridge and LSP layer review checklist
+## Document state
 
-### Document state (`bridge/state.rs`)
+Lazy document opening must re-verify on-disk state on every access, not only on first
+open. Cache a filesystem signature (e.g. `mtime` + file size) alongside the document
+state and re-read the file when the signature changes. On mismatch, send `didClose`
+then `didOpen` with a bumped version before serving the request.
 
-- `ensure_open` stats the file on every call and compares `(mtime, size)` against the
-  cached `SyncSignature`. On mismatch it must send `didClose` then `didOpen` with a
-  bumped version before returning. Verify this resync path is exercised by a test.
-- Stat must happen on the same `File` handle as the subsequent read, or be re-done after
-  the read, to avoid TOCTOU: an atomic `rename(2)` between stat and `read_to_string` on
-  a coarse-mtime filesystem (ext4: 1 s, FAT32: 2 s) leaves the cached signature stale
-  permanently.
-- Version counter must reset to 1 on overflow, not saturate. `saturating_add(1)` at
-  `i32::MAX` sends the same version on every subsequent resync; rust-analyzer silently
-  discards non-monotone `didOpen` notifications.
+Stat and read must be bound to the same file handle to avoid TOCTOU. Performing a stat,
+then separately opening the file for reading, creates a window where an atomic replace
+(`rename`) can change the content without changing the signature.
 
-### Diagnostics pipeline (`bridge/translator.rs`, `bridge/notifications.rs`)
+Version numbers must remain strictly monotone per URI. On counter overflow, reset to 1
+— after `didClose`/`didOpen` the server treats the document as a fresh open regardless
+of the version value.
 
-- `DiagnosticsMode::Cached` returns an empty `Vec` for both "no errors" and "server
-  has not yet analysed this file". AI clients cannot distinguish these. Flag if callers
-  treat empty as "clean".
-- `merge_diagnostics` dedup key is `(range, severity, code)` when `code` is present,
-  falling back to a path-qualifier-stripped message otherwise. Doc comments that say
-  `(range, message, code)` are wrong — flag them.
-- `pull_diagnostics` has a 30 s timeout. In `Hybrid` mode it runs before the cache read.
-  The cache read is a synchronous hashmap lookup; it should not be blocked behind the
-  pull. Prefer `tokio::join!` for the two sources.
+## Diagnostics
 
-### Notification pump (`lib.rs`)
+When a feature can source results from multiple channels (e.g. pull request and push
+cache), the channels should be fetched concurrently rather than sequentially. Blocking
+a cheap synchronous lookup behind a slow network round-trip wastes time.
 
-- `notification_pump` must hold only a `NotificationCache` lock, never the full
-  `Translator` lock. Holding `Mutex<Translator>` across an LSP round-trip in a request
-  handler while the pump waits for the same lock causes head-of-line deadlock when the
-  notification channel fills.
+An empty result must be distinguishable from an absent result. Returning an empty
+collection for "server has not yet analysed this file" is indistinguishable from "no
+errors found" to callers. Either surface a cache-miss indicator or fall back to a
+live request on cache miss.
 
-### File watcher (`lsp/file_watcher.rs`)
+Deduplication keys should prefer structured fields (e.g. error code) over free-form
+message text. When a code is present, key on `(range, severity, code)`. Fall back to
+a normalised message only when no code exists. Document the actual key in the doc
+comment — mismatches between the comment and the implementation cause silent bugs.
 
-- `GlobPattern::String` patterns without a leading `/` or `**/` must be anchored with
-  `**/` before passing to `globset`. Bare `*.rs` does not match `/repo/src/lib.rs`.
-- `SyncSender::send` blocks when the channel is full. Use `try_send` with a warn log
-  when the documented intent is drop-on-full.
-- `NEVER_FORWARD_COMPONENTS` filtering should happen before the channel send, not after,
-  to avoid burning channel capacity on `target/` churn during `cargo build`.
-- `register()` overwrites duplicate registration IDs silently. LSP spec treats
-  re-registration as an error; at minimum log a warning.
+## Notification pump
 
-### LSP client (`lsp/client.rs`, `lsp/transport.rs`)
+A background notification pump must hold only the narrowest lock needed to write to
+the cache. It must not share a lock with request handlers that hold it across network
+I/O. If pump and handler compete for the same mutex, the handler's in-flight network
+response can be blocked from arriving — the system deadlocks until the request timeout
+fires.
 
-- Server-to-client requests (`method` + `id`) must receive a JSON-RPC response.
-  Unhandled methods should return error code `-32601` (Method Not Found), not be dropped.
-- `id`-only messages (no `method`, no `result`, no `error`) are protocol errors and must
-  not be treated as successful `null` responses.
+## File watcher
+
+Glob patterns from LSP registrations must be matched against full absolute paths.
+`globset` does not implicitly anchor bare patterns to any directory. A pattern like
+`*.rs` matches only a filename with no path component. Prepend `**/` to bare patterns
+before compiling them into a glob set. Example:
+
+```rust
+// wrong: "*.rs" won't match "/repo/src/lib.rs"
+// correct: "**/*.rs" matches any .rs file at any depth
+let anchored = if !pattern.starts_with('/') && !pattern.starts_with("**/") {
+    format!("**/{pattern}")
+} else {
+    pattern.to_owned()
+};
+```
+
+Event filtering (ignoring build artifacts, VCS directories, etc.) should happen before
+events enter a bounded channel, not after. Filtering after send wastes channel capacity
+and risks stalling the OS watcher thread if the channel fills.
+
+`SyncSender::send` blocks when the channel is full — it does not drop. Use `try_send`
+when the intent is to discard events under backpressure.
+
+Duplicate `registerCapability` IDs must be handled explicitly. The LSP spec treats
+re-registration as an error; silently overwriting the old registration loses the
+previous glob set without notice.
+
+## LSP client
+
+Server-to-client requests (messages with both `method` and `id`) must receive a
+JSON-RPC response. Unhandled methods must return error code `-32601` (Method Not Found)
+— dropping them silently causes the server to wait indefinitely for an acknowledgement.
+
+Response classification must require either `result` or `error` to be present. A
+message with only `id` and no `method`, `result`, or `error` is a protocol error and
+must not be coerced into a successful `null` response.

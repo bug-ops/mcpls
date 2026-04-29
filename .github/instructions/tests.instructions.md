@@ -2,32 +2,32 @@
 applyTo: "crates/mcpls-core/tests/**,crates/mcpls-core/src/**/tests.rs,crates/mcpls-core/src/**/*_tests.rs"
 ---
 
-## Test review checklist
+## Integration and e2e tests
 
-### Integration tests (`tests/integration/`)
+Tests that require an external binary (language server or the project binary itself)
+must be marked `#[ignore = "Requires <binary> in PATH"]`. Unmarked tests that shell out
+to external processes break CI on clean runners where those binaries are absent.
 
-- Tests requiring a live LSP binary (`rust-analyzer`, `tsgo`, etc.) must be marked
-  `#[ignore = "Requires <binary> in PATH"]`. Unmarked tests that shell out to LSP
-  binaries will break CI on clean runners.
-- `rust_analyzer_tests.rs` probes must verify the post-PR #103 diagnostic pipeline:
-  `get_diagnostics` should return errors for files with known type errors, and
-  `get_cached_diagnostics` should return the same set (non-empty) after a
-  `publishDiagnostics` notification has been received.
+Position values in assertions must use 1-based line and column numbers (MCP convention).
+Using 0-based values produces off-by-one failures that are difficult to diagnose because
+both the test and the production code look correct in isolation.
 
-### E2e tests (`tests/e2e/`)
+## Unit tests
 
-- Every e2e test spawns the mcpls binary. If the binary is not pre-built, the test
-  must be `#[ignore]`. Document the required build step in the ignore message.
-- Position values in e2e assertions must use 1-based line/column (MCP convention).
-  Using 0-based values will produce off-by-one failures that are hard to diagnose.
+New async code paths must have async unit tests using real temporary files and a mock
+client where network I/O is involved. A test that only verifies the underlying primitive
+(e.g. that a filesystem stat changes) does not cover the coordination logic that calls it.
 
-### Unit tests
+Glob matching tests must use absolute path strings as inputs. A test that passes a bare
+filename to a glob set will pass even when the production code fails on absolute paths,
+because `globset` anchoring behaviour differs between the two cases.
 
-- `ensure_open` resync path (signature mismatch → `didClose` + `didOpen`) must be
-  covered by an async test using a temp file and a mock `LspClient`. The stat-only
-  test (`test_stat_signature_changes_when_file_grows`) does not cover this path.
-- `FileWatcher::register` and `compute_changes` require unit tests. New glob
-  registrations must be verified to actually match the intended file paths using
-  absolute path strings — bare patterns like `*.rs` will not match.
-- `DiagnosticsMode` serde tests must cover all three variants in both JSON and TOML
-  deserialization, including the omitted-key default.
+New serialisable config types must have round-trip tests covering every variant in at
+least one format. For enums with `#[serde(rename_all)]`, also verify that the
+serialised string matches the documented on-disk value.
+
+## Coverage gaps to watch
+
+Any code path that involves both a filesystem operation and a subsequent network
+notification (open, close, resync) should have a test that exercises the full sequence
+with a mock network client, not just the filesystem part in isolation.

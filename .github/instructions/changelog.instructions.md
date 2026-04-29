@@ -2,13 +2,17 @@
 applyTo: "CHANGELOG.md"
 ---
 
-## CHANGELOG review checklist
+## Changelog format
 
-- Breaking changes to public APIs (new enum variants, removed fields, changed
-  signatures) must appear under `### Changed` with an explicit "Breaking change:"
-  prefix. A `### Fixed` entry alone is not sufficient.
-- New `#[non_exhaustive]` enums or structs must be mentioned: downstream crates
-  that match exhaustively need to add a wildcard arm.
-- Every entry must reference the PR or issue number in parentheses: `(#NNN)`.
-- Entries go under `## [Unreleased]` until a release PR assigns a version.
-  Do not add entries directly under a versioned section.
+Breaking changes to public APIs must appear under `### Changed` with an explicit
+"Breaking change:" prefix. A `### Fixed` entry alone is not sufficient — downstream
+users scanning the changelog for breakage will miss it.
+
+Additions of `#[non_exhaustive]` to existing public enums or structs are breaking
+changes for crates that match exhaustively. Document the required migration (add a
+wildcard arm, update struct initialisation) in the entry.
+
+Every entry must reference the PR or issue number: `(#NNN)`.
+
+New entries go under `## [Unreleased]`. Do not add entries directly under a versioned
+section — version assignment happens in the release PR.
