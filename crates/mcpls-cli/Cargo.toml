@@ -27,5 +27,9 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 
+[features]
+default = []
+transport-http = ["mcpls-core/transport-http"]
+
 [lints]
 workspace = true

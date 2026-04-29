@@ -31,6 +31,26 @@ pub struct Args {
     /// Output logs as JSON (for structured logging)
     #[arg(long, default_value = "false", env = "MCPLS_LOG_JSON")]
     pub log_json: bool,
+
+    /// Listen address for HTTP transport (e.g. 127.0.0.1:3000).
+    ///
+    /// When set, the MCP server binds this address and serves over Streamable
+    /// HTTP instead of stdio. Requires the `transport-http` feature.
+    #[cfg(feature = "transport-http")]
+    #[arg(long, value_name = "ADDR", env = "MCPLS_LISTEN")]
+    pub listen: Option<std::net::SocketAddr>,
+
+    /// URL path the MCP service is mounted at (default `/mcp`).
+    ///
+    /// Only meaningful when `--listen` is set.
+    #[cfg(feature = "transport-http")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "/mcp",
+        env = "MCPLS_HTTP_PATH"
+    )]
+    pub http_path: String,
 }
 
 #[cfg(test)]
@@ -159,5 +179,45 @@ mod tests {
         assert_eq!(args.config, Some(PathBuf::from("/path/to/config.toml")));
         assert_eq!(args.log_level, "warn");
         assert!(args.log_json);
+    }
+
+    #[cfg(feature = "transport-http")]
+    #[allow(clippy::unwrap_used)]
+    mod http_transport_tests {
+        use std::net::SocketAddr;
+
+        use super::*;
+
+        #[test]
+        fn test_listen_flag_parses_addr() {
+            let args = Args::parse_from(["mcpls", "--listen", "127.0.0.1:3000"]);
+            let expected: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+            assert_eq!(args.listen, Some(expected));
+        }
+
+        #[test]
+        fn test_listen_default_is_none() {
+            let args = Args::parse_from(["mcpls"]);
+            assert!(args.listen.is_none());
+        }
+
+        #[test]
+        fn test_http_path_default() {
+            let args = Args::parse_from(["mcpls"]);
+            assert_eq!(args.http_path, "/mcp");
+        }
+
+        #[test]
+        fn test_http_path_custom() {
+            let args = Args::parse_from(["mcpls", "--http-path", "/api/mcp"]);
+            assert_eq!(args.http_path, "/api/mcp");
+        }
+
+        #[test]
+        fn test_listen_ipv6() {
+            let args = Args::parse_from(["mcpls", "--listen", "[::1]:4000"]);
+            let expected: SocketAddr = "[::1]:4000".parse().unwrap();
+            assert_eq!(args.listen, Some(expected));
+        }
     }
 }

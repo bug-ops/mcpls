@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Streamable HTTP transport** — opt-in `transport-http` Cargo feature enables MCP 2025-11-25 Streamable HTTP transport; pass `--listen <addr>` (or set `MCPLS_LISTEN`) to bind a TCP port instead of using stdio; `--http-path` (default `/mcp`) controls the URL prefix (#122)
+
 - **MCP resources** — expose LSP diagnostics as subscribable MCP resources under the `lsp-diagnostics:///` URI scheme; clients can call `list_resources`, `read_resource`, `subscribe`, and `unsubscribe` (#115)
 - **Diagnostics push notifications** — background `diagnostics_pump` tasks relay `textDocument/publishDiagnostics` LSP notifications to subscribed MCP clients via `notifications/resources/updated`
 - **RFC-3986 URI codec** — `bridge::resources` module with percent-encoding via `url::Url::from_file_path`; empty-authority injection is rejected to prevent UNC-path attacks on Windows
