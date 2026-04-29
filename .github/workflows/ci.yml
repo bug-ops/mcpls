@@ -108,7 +108,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
       - name: Build and archive tests
-        run: cargo nextest archive --workspace --all-features --lib --bins --archive-file nextest-archive.tar.zst
+        run: cargo nextest archive --workspace --all-features --lib --bins --tests --archive-file nextest-archive.tar.zst
       - name: Upload test archive
         uses: actions/upload-artifact@v4
         with:
@@ -162,7 +162,7 @@ jobs:
         with:
           name: nextest-archive
       - name: Run unit tests
-        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --lib --bins
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . -E 'kind(lib) or kind(bin)'
 
   test-integration:
     name: Test (integration)
@@ -180,7 +180,7 @@ jobs:
         with:
           name: nextest-archive
       - name: Run integration tests
-        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --tests -E 'not test(e2e)'
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . -E 'kind(test) and not test(e2e)'
 
   test-e2e:
     name: Test (e2e)
@@ -205,7 +205,7 @@ jobs:
       - name: Make binary executable
         run: chmod +x target/debug/mcpls
       - name: Run e2e tests
-        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'test(e2e)'
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test) and test(e2e)'
 
   msrv:
     name: MSRV check (1.88)
