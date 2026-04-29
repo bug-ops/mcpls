@@ -268,8 +268,6 @@ jobs:
     # RUSTFLAGS reset: -C instrument-coverage conflicts with -D warnings from the
     # global env; linting is enforced by the dedicated clippy job.
     env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -278,9 +276,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          cache-targets: "false"
           shared-key: "coverage"
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - uses: taiki-e/install-action@caf4aedf2bfe5bfb679703b29290921f4711b2f3 # cargo-llvm-cov
       - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
       - name: Generate coverage
