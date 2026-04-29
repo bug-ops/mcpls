@@ -348,8 +348,8 @@ pub struct CodeActionsResult {
 pub struct CallHierarchyItemResult {
     /// Name of the symbol.
     pub name: String,
-    /// Kind of symbol.
-    pub kind: String,
+    /// LSP numeric symbol kind (e.g. 12 for Function).
+    pub kind: u32,
     /// More detail for this item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -1496,7 +1496,11 @@ fn convert_document_symbol(symbol: DocumentSymbol) -> Symbol {
 fn convert_call_hierarchy_item(item: CallHierarchyItem) -> CallHierarchyItemResult {
     CallHierarchyItemResult {
         name: item.name,
-        kind: format!("{:?}", item.kind),
+        kind: serde_json::to_value(item.kind)
+            .ok()
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0),
         detail: item.detail,
         uri: item.uri.to_string(),
         range: normalize_range(item.range),
@@ -2786,5 +2790,41 @@ mod tests {
         } else {
             panic!("Expected NoServersAvailable error for empty server config");
         }
+    }
+
+    #[test]
+    fn test_convert_call_hierarchy_item_kind_is_numeric() {
+        let item = lsp_types::CallHierarchyItem {
+            name: "my_fn".to_string(),
+            kind: lsp_types::SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: "file:///tmp/test.rs".parse().unwrap(),
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            selection_range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            data: None,
+        };
+        let result = convert_call_hierarchy_item(item);
+        // SymbolKind::FUNCTION is LSP integer 12
+        assert_eq!(result.kind, 12u32);
+        assert_eq!(result.name, "my_fn");
     }
 }
