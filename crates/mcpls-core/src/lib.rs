@@ -130,11 +130,31 @@ pub(crate) async fn diagnostics_pump(
                         t.notification_cache_mut()
                             .store_message(m.typ.into(), m.message);
                     }
-                    LspNotification::Other { .. } => {}
+                    LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
                 }
             }
         }
     }
+}
+
+/// Register initialized LSP servers with the translator and extract notification receivers.
+///
+/// Takes ownership of the `ServerInitResult`, extracts `notification_rx` from each server
+/// before registration, and returns a map of language-id to receiver for the pump tasks.
+fn register_servers(
+    mut result: lsp::ServerInitResult,
+    translator: &mut bridge::Translator,
+) -> std::collections::HashMap<String, tokio::sync::mpsc::Receiver<lsp::LspNotification>> {
+    let mut receivers = std::collections::HashMap::new();
+    for (lang, server) in &mut result.servers {
+        receivers.insert(lang.clone(), server.take_notification_rx());
+    }
+    for (language_id, server) in result.servers {
+        let client = server.client().clone();
+        translator.register_client(language_id.clone(), client);
+        translator.register_server(language_id.clone(), server);
+    }
+    receivers
 }
 
 /// Resolve workspace roots from config or current directory.
@@ -246,9 +266,8 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     if applicable_configs.is_empty() {
         warn!("No applicable LSP servers configured — starting in protocol-only mode");
     } else {
-        // Spawn all servers with graceful degradation and notification channels.
-        let (result, receivers) =
-            LspServer::spawn_batch_with_notifications(&applicable_configs).await;
+        // Spawn all servers with graceful degradation.
+        let result = LspServer::spawn_batch(&applicable_configs).await;
 
         // Handle the three possible outcomes.
         if result.all_failed() {
@@ -269,15 +288,9 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
             }
         }
 
-        // Register all successfully initialized servers.
+        // Register servers and extract their notification receivers.
         let server_count = result.server_count();
-        for (language_id, server) in result.servers {
-            let client = server.client().clone();
-            translator.register_client(language_id.clone(), client);
-            translator.register_server(language_id.clone(), server);
-        }
-
-        notification_receivers = receivers;
+        notification_receivers = register_servers(result, &mut translator);
         info!("Proceeding with {} LSP server(s)", server_count);
     }
 
