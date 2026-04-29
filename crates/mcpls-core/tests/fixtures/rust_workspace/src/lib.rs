@@ -94,3 +94,11 @@ pub struct CodeActionTarget;
 // split to multi-line so RA can offer "implement missing members" inside the block
 impl Greet for CodeActionTarget {
 }
+
+/// Stable target for LSP 3.17 sub-cases (signature help, type definition, inlay hints).
+#[allow(dead_code, clippy::let_underscore_untyped)]
+pub fn lsp317_target() {
+    let p = Point { x: 1.0, y: 2.0 };
+    let s = add(1, 2);
+    let _ = (p, s);
+}

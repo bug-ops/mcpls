@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **LSP server requests** — Handle server-to-client requests such as `client/registerCapability`, fixing tsgo timeouts.
 - **Integration tests** — Add `[workspace]` table to `tests/fixtures/rust_workspace/Cargo.toml` so cargo treats the fixture as a standalone workspace; fixes 8 rust-analyzer integration tests that failed with "Failed to load workspaces." (#118)
+- **e2e coverage** — Add ra_e2e sub-cases for `get_signature_help`, `go_to_implementation`, `go_to_type_definition`, `get_inlay_hints` (4 LSP 3.17 tools from #124 had no coverage); add `list_resources`, `read_resource`, `subscribe_resource`, `unsubscribe_resource` to `McpClient` and ra_e2e_suite (MCP resources path was entirely untested) (#129, #130)
 
 ## [0.3.6] - 2026-04-21
 
