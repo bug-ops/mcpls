@@ -2,32 +2,39 @@
 applyTo: "crates/mcpls-core/tests/**,crates/mcpls-core/src/**/tests.rs,crates/mcpls-core/src/**/*_tests.rs"
 ---
 
-## Integration and e2e tests
+## Test design
 
-Tests that require an external binary (language server or the project binary itself)
-must be marked `#[ignore = "Requires <binary> in PATH"]`. Unmarked tests that shell out
-to external processes break CI on clean runners where those binaries are absent.
+Tests for async code must use `#[tokio::test]` and exercise the actual async paths, not
+synchronous wrappers that bypass scheduler interactions. Concurrency bugs (lock
+contention, channel saturation) are only reachable through genuine async execution.
 
-Position values in assertions must use 1-based line and column numbers (MCP convention).
-Using 0-based values produces off-by-one failures that are difficult to diagnose because
-both the test and the production code look correct in isolation.
+Tests that require an external binary must be marked `#[ignore = "Requires <binary>
+in PATH"]`. CI runners do not have language server binaries; an unmarked test will fail
+on every clean run.
 
-## Unit tests
+## Correctness invariants to cover
 
-New async code paths must have async unit tests using real temporary files and a mock
-client where network I/O is involved. A test that only verifies the underlying primitive
-(e.g. that a filesystem stat changes) does not cover the coordination logic that calls it.
+Any code path that pairs a filesystem operation with a subsequent network notification
+(open, close, re-open after external edit) must have a test that exercises the full
+sequence using a mock network client and a real temporary file — not just the filesystem
+primitive in isolation.
 
-Glob matching tests must use absolute path strings as inputs. A test that passes a bare
-filename to a glob set will pass even when the production code fails on absolute paths,
-because `globset` anchoring behaviour differs between the two cases.
+Glob matching tests must use absolute path strings as input. Passing a bare filename
+to a glob set will pass even when the production code fails on absolute paths, because
+`globset` anchoring behaviour differs between the two cases.
 
-New serialisable config types must have round-trip tests covering every variant in at
-least one format. For enums with `#[serde(rename_all)]`, also verify that the
-serialised string matches the documented on-disk value.
+Round-trip tests for serialisable types must cover every variant, and must assert the
+serialised string value, not just that deserialisation succeeds. A `rename_all` typo
+produces a wrong on-disk format that round-trips correctly in isolation.
 
-## Coverage gaps to watch
+## Idiomatic test code
 
-Any code path that involves both a filesystem operation and a subsequent network
-notification (open, close, resync) should have a test that exercises the full sequence
-with a mock network client, not just the filesystem part in isolation.
+Prefer `assert_eq!` over `assert!(a == b)` — `assert_eq!` prints both values on
+failure, making diagnosis faster.
+
+Use `tempfile::tempdir()` for tests that need real filesystem paths. Hard-coded `/tmp`
+paths cause test interference when multiple test threads run in parallel.
+
+Prefer `#[tokio::test]` over `tokio::runtime::Runtime::block_on` in test bodies —
+`block_on` does not integrate with tokio's test utilities (`time::pause`,
+`time::advance`) needed for testing debounce and timeout logic.

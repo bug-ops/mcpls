@@ -2,26 +2,32 @@
 applyTo: ".github/workflows/**,deny.toml,.cargo/**"
 ---
 
-## Workflow correctness
+## Feature flag parity
 
-Feature flag sets in CI jobs must match the pre-commit commands documented in
-`CLAUDE.md` exactly. Divergence causes "passes locally, fails CI" failures that are
-hard to diagnose — the developer sees green locally and red in CI for the same code.
+Feature flag sets in CI jobs must match the pre-commit commands in `CLAUDE.md` exactly.
+Divergence causes "passes locally, fails CI" failures where neither side is obviously
+wrong.
 
 The rustdoc job must set `RUSTDOCFLAGS="-D warnings"`. Without it, broken intra-doc
-links and undocumented public items pass silently in CI while failing for downstream
-users who build with warnings-as-errors.
+links and missing `///` on public items pass silently in CI.
 
-Nightly toolchain is required only for `cargo fmt`. All other jobs must use stable.
-Pinning nightly globally causes unnecessary pipeline failures when nightly introduces
-a regression unrelated to this project.
+Nightly toolchain is required only for `cargo fmt`. All other jobs must use stable to
+avoid failures caused by nightly regressions unrelated to this project.
 
-## Dependency policy
+## Dependency and license policy
 
-New dependencies must have their license added to the `deny.toml` allow list in the
-same PR. Do not merge a PR that introduces a new crate without verifying that
-`cargo deny check licenses` passes. License checks fail fast and block the entire
-pipeline.
+New dependencies require a license check in the same PR. `cargo deny check licenses`
+fails fast and blocks the pipeline — do not merge before it passes.
 
 `cargo deny check advisories` must be clean. Suppress an advisory only with an explicit
-`ignore` entry and a comment explaining why the vulnerable code path is not reachable.
+`ignore` entry and a comment explaining why the vulnerable code path is unreachable.
+
+When a newer stable `std` API covers functionality provided by a dependency, suggest
+removing the dependency and bumping `rust-version` instead. Fewer dependencies reduce
+compile time and supply-chain risk. Document the MSRV bump in CHANGELOG.
+
+## MSRV tracking
+
+`rust-version` in `Cargo.toml` is the enforced minimum. The CI matrix must include a
+job that builds and tests on exactly that version to catch accidental use of newer APIs.
+Without such a job, MSRV guarantees are not verifiable.

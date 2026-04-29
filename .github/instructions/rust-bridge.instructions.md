@@ -2,79 +2,79 @@
 applyTo: "crates/mcpls-core/src/bridge/**,crates/mcpls-core/src/lsp/**,crates/mcpls-core/src/lib.rs"
 ---
 
+## Type safety
+
+Position types (line, column) must be distinct newtypes, not bare `u32`. The MCP
+convention (1-based) and the LSP convention (0-based) must be expressed in the type
+system so that passing an MCP position directly to an LSP call is a compile error.
+
+Protocol message variants must be an enum, not a string-matched dispatch. Matching on
+`"textDocument/hover"` strings is fragile; a closed enum of known methods makes
+unhandled cases visible at compile time and exhaustiveness-checked.
+
+`InboundMessage` and similar enums that may gain variants in future protocol versions
+must be `#[non_exhaustive]` so downstream crates are not broken by additions.
+
 ## Document state
 
-Lazy document opening must re-verify on-disk state on every access, not only on first
-open. Cache a filesystem signature (e.g. `mtime` + file size) alongside the document
-state and re-read the file when the signature changes. On mismatch, send `didClose`
-then `didOpen` with a bumped version before serving the request.
+Caching document content alongside a filesystem signature (`mtime` + size) prevents
+stale reads after external edits. On every access, stat the file and compare against
+the cached signature; re-read and re-notify the LSP server on mismatch.
 
-Stat and read must be bound to the same file handle to avoid TOCTOU. Performing a stat,
-then separately opening the file for reading, creates a window where an atomic replace
-(`rename`) can change the content without changing the signature.
+Stat and read must use the same file handle to close the TOCTOU window. Open the file
+once with `tokio::fs::File::open`, call `.metadata().await` on the handle, then read
+through the same handle. A separate `tokio::fs::metadata` call before `read_to_string`
+leaves a window where an atomic `rename` can change the file between the two calls.
 
-Version numbers must remain strictly monotone per URI. On counter overflow, reset to 1
-— after `didClose`/`didOpen` the server treats the document as a fresh open regardless
-of the version value.
+Document version numbers must be strictly monotone per URI. On overflow, reset to 1
+rather than saturating — after `didClose`/`didOpen` the server treats the document as
+fresh and the version value is irrelevant to continuity.
 
-## Diagnostics
+## Diagnostics pipeline
 
-When a feature can source results from multiple channels (e.g. pull request and push
-cache), the channels should be fetched concurrently rather than sequentially. Blocking
-a cheap synchronous lookup behind a slow network round-trip wastes time.
+When a feature draws from multiple independent sources (pull request + push cache),
+fetch them concurrently with `tokio::try_join!` or `tokio::join!`. Awaiting them
+sequentially serialises work that has no data dependency.
 
-An empty result must be distinguishable from an absent result. Returning an empty
-collection for "server has not yet analysed this file" is indistinguishable from "no
-errors found" to callers. Either surface a cache-miss indicator or fall back to a
-live request on cache miss.
+A cache miss must be distinguishable from an empty result. Returning `Vec::new()` for
+both "no errors" and "not yet analysed" is ambiguous to callers. Use an `Option<Vec>`
+or a dedicated status type to express the difference.
 
-Deduplication keys should prefer structured fields (e.g. error code) over free-form
-message text. When a code is present, key on `(range, severity, code)`. Fall back to
-a normalised message only when no code exists. Document the actual key in the doc
-comment — mismatches between the comment and the implementation cause silent bugs.
+Deduplication keys should prefer structured fields (error code) over free-form message
+text. When a code is present, key on `(range, severity, code)`. The doc comment must
+describe the actual key — a mismatch between the comment and the implementation causes
+silent behavioural bugs.
 
-## Notification pump
+## Concurrency and lock scope
 
-A background notification pump must hold only the narrowest lock needed to write to
-the cache. It must not share a lock with request handlers that hold it across network
-I/O. If pump and handler compete for the same mutex, the handler's in-flight network
-response can be blocked from arriving — the system deadlocks until the request timeout
-fires.
+Background notification pumps must hold only the narrowest lock needed (e.g. a
+`Mutex<Cache>`, not a `Mutex<WholeTranslator>`). A pump that shares a lock with request
+handlers will stall when a handler holds the lock across a long-running await, causing
+the notification channel to fill and the in-flight response to be undeliverable.
+
+Never hold a `MutexGuard` across an `.await`. Extract needed values before the await,
+or restructure so the guard is dropped before any I/O begins.
 
 ## File watcher
 
-Glob patterns from LSP registrations must be matched against full absolute paths.
-`globset` does not implicitly anchor bare patterns to any directory. A pattern like
-`*.rs` matches only a filename with no path component. Prepend `**/` to bare patterns
-before compiling them into a glob set. Example:
+Glob patterns from external registrations must be matched against full absolute paths.
+`globset` does not implicitly anchor bare patterns to a directory prefix — a pattern
+like `*.rs` only matches a bare filename. Prepend `**/` to patterns that lack a leading
+`/` or `**/` before compiling them into a `GlobSet`.
 
-```rust
-// wrong: "*.rs" won't match "/repo/src/lib.rs"
-// correct: "**/*.rs" matches any .rs file at any depth
-let anchored = if !pattern.starts_with('/') && !pattern.starts_with("**/") {
-    format!("**/{pattern}")
-} else {
-    pattern.to_owned()
-};
-```
+Noise filtering (build artifacts, VCS directories) must run before events enter any
+bounded channel, not after. Filtering post-send wastes channel capacity and can stall
+the OS watcher thread when the channel fills during high-churn builds.
 
-Event filtering (ignoring build artifacts, VCS directories, etc.) should happen before
-events enter a bounded channel, not after. Filtering after send wastes channel capacity
-and risks stalling the OS watcher thread if the channel fills.
-
-`SyncSender::send` blocks when the channel is full — it does not drop. Use `try_send`
-when the intent is to discard events under backpressure.
-
-Duplicate `registerCapability` IDs must be handled explicitly. The LSP spec treats
-re-registration as an error; silently overwriting the old registration loses the
-previous glob set without notice.
+Use `try_send` for the handoff from the OS watcher callback to the async processing
+loop. The watcher callback runs on a system thread; blocking it with `send` on a full
+channel stalls the OS-level event delivery.
 
 ## LSP client
 
-Server-to-client requests (messages with both `method` and `id`) must receive a
-JSON-RPC response. Unhandled methods must return error code `-32601` (Method Not Found)
-— dropping them silently causes the server to wait indefinitely for an acknowledgement.
+Server-to-client requests (messages with both `method` and `id`) require a JSON-RPC
+response. Unhandled methods must return error code `-32601` (Method Not Found). Dropping
+them silently causes the LSP server to wait indefinitely for an acknowledgement.
 
-Response classification must require either `result` or `error` to be present. A
-message with only `id` and no `method`, `result`, or `error` is a protocol error and
-must not be coerced into a successful `null` response.
+`id`-only messages (no `method`, `result`, or `error`) are protocol errors and must not
+be coerced into a successful `null` response.
