@@ -147,44 +147,41 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         applicable_configs.len()
     );
 
-    // Spawn all servers with graceful degradation
-    let result = LspServer::spawn_batch(&applicable_configs).await;
+    if !applicable_configs.is_empty() {
+        // Spawn all servers with graceful degradation
+        let result = LspServer::spawn_batch(&applicable_configs).await;
 
-    // Handle the three possible outcomes
-    if result.all_failed() {
-        return Err(Error::AllServersFailedToInit {
-            count: result.failure_count(),
-            failures: result.failures,
-        });
-    }
-
-    if result.partial_success() {
-        warn!(
-            "Partial server initialization: {} succeeded, {} failed",
-            result.server_count(),
-            result.failure_count()
-        );
-        for failure in &result.failures {
-            error!("Server initialization failed: {}", failure);
+        // Handle the three possible outcomes
+        if result.all_failed() {
+            return Err(Error::AllServersFailedToInit {
+                count: result.failure_count(),
+                failures: result.failures,
+            });
         }
-    }
 
-    // Check if at least one server successfully initialized
-    if !result.has_servers() {
-        return Err(Error::NoServersAvailable(
-            "none configured or all failed to initialize".to_string(),
-        ));
-    }
+        if result.partial_success() {
+            warn!(
+                "Partial server initialization: {} succeeded, {} failed",
+                result.server_count(),
+                result.failure_count()
+            );
+            for failure in &result.failures {
+                error!("Server initialization failed: {}", failure);
+            }
+        }
 
-    // Register all successfully initialized servers
-    let server_count = result.server_count();
-    for (language_id, server) in result.servers {
-        let client = server.client().clone();
-        translator.register_client(language_id.clone(), client);
-        translator.register_server(language_id.clone(), server);
-    }
+        // Register all successfully initialized servers
+        let server_count = result.server_count();
+        for (language_id, server) in result.servers {
+            let client = server.client().clone();
+            translator.register_client(language_id.clone(), client);
+            translator.register_server(language_id.clone(), server);
+        }
 
-    info!("Proceeding with {} LSP server(s)", server_count);
+        info!("Proceeding with {} LSP server(s)", server_count);
+    } else {
+        warn!("No applicable LSP servers configured — starting in protocol-only mode");
+    }
 
     let translator = Arc::new(Mutex::new(translator));
 
@@ -502,10 +499,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_serve_fails_with_empty_config() {
+        async fn test_serve_starts_with_empty_config() {
             use crate::config::WorkspaceConfig;
 
-            // Create a config with no servers
+            // Server starts in protocol-only mode when no LSP servers are configured.
+            // serve() blocks until the MCP transport closes, so it will error with a
+            // connection/transport error — not NoServersAvailable.
             let config = ServerConfig {
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
@@ -518,17 +517,13 @@ mod tests {
 
             let result = serve(config).await;
 
-            assert!(result.is_err());
-            let err = result.unwrap_err();
-
-            // Should return NoServersAvailable because no servers were configured
-            assert!(
-                matches!(err, Error::NoServersAvailable(_)),
-                "Expected NoServersAvailable error, got: {err:?}"
-            );
-
-            if let Error::NoServersAvailable(msg) = err {
-                assert!(msg.contains("none configured"));
+            // serve() may succeed or fail with a transport error, but must NOT
+            // return NoServersAvailable when the config simply has no servers.
+            if let Err(ref err) = result {
+                assert!(
+                    !matches!(err, Error::NoServersAvailable(_)),
+                    "serve() must not return NoServersAvailable for empty lsp_servers config"
+                );
             }
         }
     }
