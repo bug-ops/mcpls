@@ -360,6 +360,12 @@ pub struct CallHierarchyItemResult {
     /// Range of the symbol.
     pub range: Range,
     /// Selection range (identifier location).
+    ///
+    /// Serialized as `selectionRange` (camelCase) so that the value returned by
+    /// `prepare_call_hierarchy` round-trips correctly when the MCP client passes
+    /// it back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize
+    /// it as `lsp_types::CallHierarchyItem` (camelCase).
+    #[serde(rename = "selectionRange")]
     pub selection_range: Range,
     /// Opaque data to pass to incoming/outgoing calls.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -832,15 +838,50 @@ impl Translator {
         let changes = if let Some(edit) = response {
             let mut result_changes = Vec::new();
 
+            // Prefer the legacy `changes` map (HashMap<Uri, Vec<TextEdit>>).
             if let Some(changes_map) = edit.changes {
                 for (uri, edits) in changes_map {
                     result_changes.push(DocumentChanges {
                         uri: uri.to_string(),
                         edits: edits
                             .into_iter()
-                            .map(|edit| TextEdit {
-                                range: normalize_range(edit.range),
-                                new_text: edit.new_text,
+                            .map(|e| TextEdit {
+                                range: normalize_range(e.range),
+                                new_text: e.new_text,
+                            })
+                            .collect(),
+                    });
+                }
+            }
+
+            // Also handle `documentChanges` (array format returned by rust-analyzer).
+            if result_changes.is_empty() {
+                let text_doc_edits = match edit.document_changes {
+                    Some(lsp_types::DocumentChanges::Edits(edits)) => edits,
+                    Some(lsp_types::DocumentChanges::Operations(ops)) => ops
+                        .into_iter()
+                        .filter_map(|op| match op {
+                            lsp_types::DocumentChangeOperation::Edit(e) => Some(e),
+                            lsp_types::DocumentChangeOperation::Op(_) => None,
+                        })
+                        .collect(),
+                    None => vec![],
+                };
+                for tde in text_doc_edits {
+                    result_changes.push(DocumentChanges {
+                        uri: tde.text_document.uri.to_string(),
+                        edits: tde
+                            .edits
+                            .into_iter()
+                            .map(|one_of| match one_of {
+                                lsp_types::OneOf::Left(te) => TextEdit {
+                                    range: normalize_range(te.range),
+                                    new_text: te.new_text,
+                                },
+                                lsp_types::OneOf::Right(ate) => TextEdit {
+                                    range: normalize_range(ate.text_edit.range),
+                                    new_text: ate.text_edit.new_text,
+                                },
                             })
                             .collect(),
                     });
@@ -1135,57 +1176,13 @@ impl Translator {
         end_character: u32,
         kind_filter: Option<String>,
     ) -> Result<CodeActionsResult> {
-        const VALID_ACTION_KINDS: &[&str] = &[
-            "quickfix",
-            "refactor",
-            "refactor.extract",
-            "refactor.inline",
-            "refactor.rewrite",
-            "source",
-            "source.organizeImports",
-        ];
-
-        // Validate kind filter
-        if let Some(ref kind) = kind_filter
-            && !VALID_ACTION_KINDS
-                .iter()
-                .any(|k| k.eq_ignore_ascii_case(kind))
-        {
-            return Err(Error::InvalidToolParams(format!(
-                "Invalid kind_filter: '{kind}'. Valid values: {VALID_ACTION_KINDS:?}"
-            )));
-        }
-
-        // Validate range
-        if start_line < 1 || start_character < 1 || end_line < 1 || end_character < 1 {
-            return Err(Error::InvalidToolParams(
-                "Line and character positions must be >= 1".to_string(),
-            ));
-        }
-
-        // Validate position upper bounds
-        if start_line > MAX_POSITION_VALUE
-            || start_character > MAX_POSITION_VALUE
-            || end_line > MAX_POSITION_VALUE
-            || end_character > MAX_POSITION_VALUE
-        {
-            return Err(Error::InvalidToolParams(format!(
-                "Position values must be <= {MAX_POSITION_VALUE}"
-            )));
-        }
-
-        // Validate range size
-        if end_line.saturating_sub(start_line) > MAX_RANGE_LINES {
-            return Err(Error::InvalidToolParams(format!(
-                "Range size must be <= {MAX_RANGE_LINES} lines"
-            )));
-        }
-
-        if start_line > end_line || (start_line == end_line && start_character > end_character) {
-            return Err(Error::InvalidToolParams(
-                "Start position must be before or equal to end position".to_string(),
-            ));
-        }
+        validate_code_action_params(
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter.as_deref(),
+        )?;
 
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
@@ -1203,13 +1200,19 @@ impl Translator {
         // Build context with optional kind filter
         let only = kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k)]);
 
+        // Pass empty diagnostics context — rust-analyzer generates code actions
+        // based on cursor position and its internal analysis state, not on the
+        // passed diagnostics.  Passing stale cached diagnostics (which may lack
+        // the internal `data` field ra uses for fix mapping) suppresses results.
+        let context_diagnostics: Vec<lsp_types::Diagnostic> = vec![];
+
         let params = lsp_types::CodeActionParams {
             text_document: TextDocumentIdentifier { uri },
             range,
             context: lsp_types::CodeActionContext {
-                diagnostics: vec![],
+                diagnostics: context_diagnostics,
                 only,
-                trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
+                trigger_kind: None,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
@@ -1317,8 +1320,8 @@ impl Translator {
         &mut self,
         item: serde_json::Value,
     ) -> Result<IncomingCallsResult> {
-        let lsp_item: CallHierarchyItem = serde_json::from_value(item)
-            .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
+        // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
+        let lsp_item = mcp_item_to_lsp(item)?;
 
         // Parse and validate the URI
         let path = self.parse_file_uri(&lsp_item.uri)?;
@@ -1366,8 +1369,8 @@ impl Translator {
         &mut self,
         item: serde_json::Value,
     ) -> Result<OutgoingCallsResult> {
-        let lsp_item: CallHierarchyItem = serde_json::from_value(item)
-            .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
+        // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
+        let lsp_item = mcp_item_to_lsp(item)?;
 
         // Parse and validate the URI
         let path = self.parse_file_uri(&lsp_item.uri)?;
@@ -1811,6 +1814,117 @@ fn marked_string_to_string(marked: MarkedString) -> String {
 }
 
 /// Convert LSP range to MCP range (0-based to 1-based).
+/// Validate parameters for `handle_code_actions`.
+fn validate_code_action_params(
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    kind_filter: Option<&str>,
+) -> Result<()> {
+    const VALID_ACTION_KINDS: &[&str] = &[
+        "quickfix",
+        "refactor",
+        "refactor.extract",
+        "refactor.inline",
+        "refactor.rewrite",
+        "source",
+        "source.organizeImports",
+    ];
+
+    if let Some(kind) = kind_filter
+        && !VALID_ACTION_KINDS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(kind))
+    {
+        return Err(Error::InvalidToolParams(format!(
+            "Invalid kind_filter: '{kind}'. Valid values: {VALID_ACTION_KINDS:?}"
+        )));
+    }
+
+    if start_line < 1 || start_character < 1 || end_line < 1 || end_character < 1 {
+        return Err(Error::InvalidToolParams(
+            "Line and character positions must be >= 1".to_string(),
+        ));
+    }
+
+    if start_line > MAX_POSITION_VALUE
+        || start_character > MAX_POSITION_VALUE
+        || end_line > MAX_POSITION_VALUE
+        || end_character > MAX_POSITION_VALUE
+    {
+        return Err(Error::InvalidToolParams(format!(
+            "Position values must be <= {MAX_POSITION_VALUE}"
+        )));
+    }
+
+    if end_line.saturating_sub(start_line) > MAX_RANGE_LINES {
+        return Err(Error::InvalidToolParams(format!(
+            "Range size must be <= {MAX_RANGE_LINES} lines"
+        )));
+    }
+
+    if start_line > end_line || (start_line == end_line && start_character > end_character) {
+        return Err(Error::InvalidToolParams(
+            "Start position must be before or equal to end position".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Convert a `CallHierarchyItemResult` JSON (1-based MCP coordinates) into
+/// a `lsp_types::CallHierarchyItem` (0-based LSP coordinates).
+///
+/// MCP clients receive `CallHierarchyItemResult` from `prepare_call_hierarchy`
+/// and pass it back opaquely to `get_incoming_calls` / `get_outgoing_calls`.
+/// The bridge serialises ranges as 1-based; this function inverts that mapping
+/// before forwarding the item to the LSP server.
+fn mcp_item_to_lsp(item: serde_json::Value) -> Result<CallHierarchyItem> {
+    let mcp: CallHierarchyItemResult = serde_json::from_value(item)
+        .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
+
+    let uri = mcp.uri.parse::<lsp_types::Uri>().map_err(|e| {
+        Error::InvalidToolParams(format!("Invalid URI in call hierarchy item: {e}"))
+    })?;
+
+    let detail = mcp.detail;
+    let data = mcp.data;
+
+    // Round-trip via serde: `convert_call_hierarchy_item` stored the kind as a u32
+    // by serialising `SymbolKind`; we reverse this to reconstruct the same value.
+    let kind: lsp_types::SymbolKind = serde_json::from_value(serde_json::json!(mcp.kind))
+        .unwrap_or(lsp_types::SymbolKind::FUNCTION);
+
+    Ok(CallHierarchyItem {
+        name: mcp.name,
+        kind,
+        tags: None,
+        detail,
+        uri,
+        range: denormalize_range(&mcp.range),
+        selection_range: denormalize_range(&mcp.selection_range),
+        data,
+    })
+}
+
+/// Convert a 1-based MCP range back to a 0-based LSP range.
+///
+/// Used when MCP clients pass back a `CallHierarchyItemResult` that was
+/// previously returned by `prepare_call_hierarchy` (which stores 1-based coords).
+const fn denormalize_range(range: &Range) -> lsp_types::Range {
+    lsp_types::Range {
+        start: lsp_types::Position {
+            line: range.start.line.saturating_sub(1),
+            character: range.start.character.saturating_sub(1),
+        },
+        end: lsp_types::Position {
+            line: range.end.line.saturating_sub(1),
+            character: range.end.character.saturating_sub(1),
+        },
+    }
+}
+
 const fn normalize_range(range: lsp_types::Range) -> Range {
     Range {
         start: Position2D {

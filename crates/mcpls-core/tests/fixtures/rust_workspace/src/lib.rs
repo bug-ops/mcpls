@@ -43,3 +43,39 @@ pub fn has_warning() {
     let unused = 42;
     println!("Hello");
 }
+
+// --- e2e test surface: stable symbols used by ra_e2e test suite ---
+use std::fmt;
+
+/// Adds two integers.
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+/// Calls `add` — used for call hierarchy and reference tests.
+pub fn caller() -> i32 {
+    add(1, 2)
+}
+
+/// A simple point with two coordinates.
+pub struct Point {
+    /// X coordinate.
+    pub x: f64,
+    /// Y coordinate.
+    pub y: f64,
+}
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+/// Target function for code-action e2e testing.
+///
+/// The assignment `let ca_var = 1` is missing a semicolon so that
+/// rust-analyzer reliably offers an "add semicolon" quickfix here.
+#[allow(dead_code)]
+pub fn code_action_target() {
+    let ca_var = 1
+}

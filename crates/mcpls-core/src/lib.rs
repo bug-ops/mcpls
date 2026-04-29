@@ -230,7 +230,6 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     let mut translator = Translator::new().with_extensions(extension_map);
     translator.set_workspace_roots(workspace_roots.clone());
 
-    // Build configurations for batch spawning with heuristics filtering
     let applicable_configs: Vec<ServerInitConfig> = config
         .lsp_servers
         .iter()
@@ -251,6 +250,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
                 server_config: lsp_config.clone(),
                 workspace_roots: workspace_roots.clone(),
                 initialization_options: lsp_config.initialization_options.clone(),
+                notification_tx: None,
             })
         })
         .collect();

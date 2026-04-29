@@ -149,6 +149,7 @@ impl McpClient {
     /// - The request cannot be sent
     /// - The response cannot be read or parsed
     /// - The server returns an error response
+    #[allow(dead_code)]
     pub fn list_tools(&mut self) -> Result<Value> {
         let request = json!({
             "jsonrpc": "2.0",

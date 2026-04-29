@@ -6,7 +6,7 @@
 mod client;
 mod lifecycle;
 mod transport;
-mod types;
+pub(crate) mod types;
 
 pub use client::LspClient;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};

@@ -65,6 +65,13 @@ pub struct ServerInitConfig {
     pub workspace_roots: Vec<PathBuf>,
     /// Initialization options (server-specific JSON).
     pub initialization_options: Option<serde_json::Value>,
+    /// Optional channel for forwarding LSP notifications to the notification cache.
+    ///
+    /// When `Some`, the spawned LSP client sends every notification it receives
+    /// (publishDiagnostics, logMessage, showMessage, …) through this sender.
+    /// The caller is responsible for draining the corresponding receiver and
+    /// storing entries in [`crate::bridge::NotificationCache`].
+    pub notification_tx: Option<mpsc::Sender<LspNotification>>,
 }
 
 /// Result of attempting to spawn multiple LSP servers.
@@ -267,6 +274,7 @@ impl LspServer {
     /// Perform LSP initialization handshake.
     ///
     /// Sends initialize request and waits for response, then sends initialized notification.
+    #[allow(clippy::too_many_lines)]
     async fn initialize(
         client: &LspClient,
         config: &ServerInitConfig,
@@ -328,6 +336,14 @@ impl LspServer {
                     }),
                     references: Some(lsp_types::ReferenceClientCapabilities {
                         dynamic_registration: Some(false),
+                    }),
+                    code_action: Some(lsp_types::CodeActionClientCapabilities {
+                        dynamic_registration: Some(false),
+                        data_support: Some(true),
+                        resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
+                            properties: vec!["edit".to_string()],
+                        }),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -441,11 +457,13 @@ impl LspServer {
     ///         server_config: LspServerConfig::rust_analyzer(),
     ///         workspace_roots: vec![PathBuf::from("/workspace")],
     ///         initialization_options: None,
+    ///         notification_tx: None,
     ///     },
     ///     ServerInitConfig {
     ///         server_config: LspServerConfig::pyright(),
     ///         workspace_roots: vec![PathBuf::from("/workspace")],
     ///         initialization_options: None,
+    ///         notification_tx: None,
     ///     },
     /// ];
     ///
@@ -557,6 +575,7 @@ mod tests {
             server_config: LspServerConfig::rust_analyzer(),
             workspace_roots: vec![PathBuf::from("/tmp/workspace")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
+            notification_tx: None,
         };
 
         #[allow(clippy::redundant_clone)]
@@ -571,6 +590,7 @@ mod tests {
             server_config: LspServerConfig::pyright(),
             workspace_roots: vec![],
             initialization_options: None,
+            notification_tx: None,
         };
 
         let debug_str = format!("{config:?}");
@@ -608,6 +628,7 @@ mod tests {
             },
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
+            notification_tx: None,
         };
 
         assert!(config.initialization_options.is_some());
@@ -620,6 +641,7 @@ mod tests {
             server_config: LspServerConfig::typescript(),
             workspace_roots: vec![],
             initialization_options: None,
+            notification_tx: None,
         };
 
         assert!(config.workspace_roots.is_empty());
@@ -635,6 +657,7 @@ mod tests {
                 PathBuf::from("/workspace3"),
             ],
             initialization_options: None,
+            notification_tx: None,
         };
 
         assert_eq!(config.workspace_roots.len(), 3);
@@ -1031,6 +1054,7 @@ mod tests {
             },
             workspace_roots: vec![],
             initialization_options: None,
+            notification_tx: None,
         }];
 
         let result = LspServer::spawn_batch(&configs).await;
@@ -1063,6 +1087,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                notification_tx: None,
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
@@ -1077,6 +1102,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                notification_tx: None,
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
@@ -1091,6 +1117,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                notification_tx: None,
             },
         ];
 
@@ -1128,6 +1155,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                notification_tx: None,
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
@@ -1142,6 +1170,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                notification_tx: None,
             },
         ];
 
@@ -1172,6 +1201,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                notification_tx: None,
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
@@ -1186,6 +1216,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                notification_tx: None,
             },
         ];
 
