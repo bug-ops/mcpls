@@ -457,11 +457,13 @@ impl LspServer {
     ///         server_config: LspServerConfig::rust_analyzer(),
     ///         workspace_roots: vec![PathBuf::from("/workspace")],
     ///         initialization_options: None,
+    ///         notification_tx: None,
     ///     },
     ///     ServerInitConfig {
     ///         server_config: LspServerConfig::pyright(),
     ///         workspace_roots: vec![PathBuf::from("/workspace")],
     ///         initialization_options: None,
+    ///         notification_tx: None,
     ///     },
     /// ];
     ///
