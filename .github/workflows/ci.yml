@@ -86,11 +86,15 @@ jobs:
         run: cargo clippy --all-targets --all-features --workspace -- -D warnings
 
   build-tests:
-    name: Build Tests
+    name: Build Tests (${{ matrix.os }})
     needs: [detect-changes]
     if: needs.detect-changes.outputs.run-full-ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     env:
@@ -112,16 +116,20 @@ jobs:
       - name: Upload test archive
         uses: actions/upload-artifact@v4
         with:
-          name: nextest-archive
+          name: nextest-archive-${{ matrix.os }}
           path: nextest-archive.tar.zst
           retention-days: 1
 
   build:
-    name: Build Binary
+    name: Build Binary (${{ matrix.os }})
     needs: [detect-changes]
     if: needs.detect-changes.outputs.run-full-ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     env:
@@ -142,16 +150,20 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: mcpls-binary
-          path: target/debug/mcpls
+          name: mcpls-binary-${{ matrix.os }}
+          path: target/debug/mcpls${{ matrix.os == 'windows-latest' && '.exe' || '' }}
           retention-days: 1
 
   test:
-    name: Test (unit)
+    name: Test (unit) (${{ matrix.os }})
     needs: [detect-changes, fmt, clippy, build-tests]
     if: needs.detect-changes.outputs.run-full-ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     steps:
@@ -160,16 +172,20 @@ jobs:
       - name: Download test archive
         uses: actions/download-artifact@v4
         with:
-          name: nextest-archive
+          name: nextest-archive-${{ matrix.os }}
       - name: Run unit tests
         run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . -E 'kind(lib) or kind(bin)'
 
   test-integration:
-    name: Test (integration)
+    name: Test (integration) (${{ matrix.os }})
     needs: [detect-changes, fmt, clippy, build-tests]
     if: needs.detect-changes.outputs.run-full-ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     steps:
@@ -178,16 +194,20 @@ jobs:
       - name: Download test archive
         uses: actions/download-artifact@v4
         with:
-          name: nextest-archive
+          name: nextest-archive-${{ matrix.os }}
       - name: Run integration tests
         run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . -E 'kind(test) and not test(e2e)'
 
   test-e2e:
-    name: Test (e2e)
+    name: Test (e2e) (${{ matrix.os }})
     needs: [detect-changes, fmt, clippy, build-tests, build]
     if: needs.detect-changes.outputs.run-full-ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     steps:
@@ -196,13 +216,14 @@ jobs:
       - name: Download test archive
         uses: actions/download-artifact@v4
         with:
-          name: nextest-archive
+          name: nextest-archive-${{ matrix.os }}
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: mcpls-binary
+          name: mcpls-binary-${{ matrix.os }}
           path: target/debug/
       - name: Make binary executable
+        if: matrix.os != 'windows-latest'
         run: chmod +x target/debug/mcpls
       - name: Run e2e tests
         run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test) and test(e2e)'
