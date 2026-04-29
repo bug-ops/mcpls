@@ -11,6 +11,21 @@ use serde::{Deserialize, Serialize};
 /// Maximum number of log entries to store.
 const MAX_LOG_ENTRIES: usize = 100;
 
+/// Normalize a URI string to a stable cache key.
+///
+/// On Windows, URI comparisons must be case-insensitive: the filesystem is
+/// case-insensitive and different tools (e.g. rust-analyzer vs std) may
+/// produce drive letters in different cases (`C:` vs `c:`).
+/// Lowercasing the entire URI is safe for `file://` URIs because they have
+/// no case-sensitive query or fragment components.
+fn uri_cache_key(uri: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        std::borrow::Cow::Owned(uri.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(uri)
+    }
+}
+
 /// Maximum number of server messages to store.
 const MAX_SERVER_MESSAGES: usize = 50;
 
@@ -141,7 +156,8 @@ impl NotificationCache {
             version,
             diagnostics,
         };
-        self.diagnostics.insert(uri.to_string(), info);
+        self.diagnostics
+            .insert(uri_cache_key(uri.as_str()).into_owned(), info);
     }
 
     /// Store a log entry.
@@ -180,7 +196,7 @@ impl NotificationCache {
     #[inline]
     #[must_use]
     pub fn get_diagnostics(&self, uri: &str) -> Option<&DiagnosticInfo> {
-        self.diagnostics.get(uri)
+        self.diagnostics.get(uri_cache_key(uri).as_ref())
     }
 
     /// Get all stored log entries.
@@ -201,7 +217,7 @@ impl NotificationCache {
     ///
     /// Returns the cleared diagnostics if they existed.
     pub fn clear_diagnostics(&mut self, uri: &str) -> Option<DiagnosticInfo> {
-        self.diagnostics.remove(uri)
+        self.diagnostics.remove(uri_cache_key(uri).as_ref())
     }
 
     /// Clear all diagnostics.

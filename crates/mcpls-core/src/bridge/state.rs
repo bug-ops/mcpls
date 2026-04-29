@@ -212,13 +212,15 @@ impl DocumentTracker {
 /// not occur for valid absolute paths.
 #[must_use]
 pub fn path_to_uri(path: &Path) -> Uri {
-    // Convert path to file:// URI string and parse
     let uri_string = if cfg!(windows) {
-        format!("file:///{}", path.display().to_string().replace('\\', "/"))
+        let path_str = path.to_string_lossy();
+        // canonicalize() on Windows adds a \\?\ extended-path prefix.
+        // Strip it before building the URI — file:////?\C:/ is not valid.
+        let stripped = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
+        format!("file:///{}", stripped.replace('\\', "/"))
     } else {
         format!("file://{}", path.display())
     };
-    // Path-to-URI conversion should always succeed for valid paths
     #[allow(clippy::expect_used)]
     uri_string.parse().expect("failed to create URI from path")
 }

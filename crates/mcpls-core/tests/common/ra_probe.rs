@@ -29,17 +29,30 @@ pub fn resolve_rust_analyzer() -> Resolution {
         return Resolution::Found(PathBuf::from(p));
     }
 
-    // Probe PATH by attempting to run rust-analyzer --version.
-    match std::process::Command::new("rust-analyzer")
+    // Probe PATH: if rust-analyzer --version succeeds, resolve the full path.
+    if std::process::Command::new("rust-analyzer")
         .arg("--version")
         .output()
+        .is_ok_and(|o| o.status.success())
+        && let Some(p) = find_in_path("rust-analyzer")
     {
-        Ok(out) if out.status.success() => {
-            // Resolve full path via `which`-equivalent: find the binary in PATH.
-            find_in_path("rust-analyzer").map_or(Resolution::Missing, Resolution::Found)
-        }
-        _ => Resolution::Missing,
+        return Resolution::Found(p);
     }
+
+    // Fallback: ask rustup where it installed the component.
+    // This covers Windows CI where rustup toolchain bin dirs are not in PATH.
+    if let Some(path) = std::process::Command::new("rustup")
+        .args(["which", "rust-analyzer"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|p| !p.is_empty())
+    {
+        return Resolution::Found(PathBuf::from(path));
+    }
+
+    Resolution::Missing
 }
 
 /// Find a binary in PATH, returning its absolute path.
