@@ -11,12 +11,12 @@
 )]
 
 use std::sync::{Arc, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::Translator;
 use mcpls_core::config::LspServerConfig;
-use mcpls_core::lsp::{LspServer, ServerInitConfig};
-use tokio::sync::Mutex;
+use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 
 use crate::common::test_utils::{rust_analyzer_available, rust_workspace_path};
@@ -41,8 +41,12 @@ fn init_tracing() {
 /// 1. Spawns rust-analyzer process
 /// 2. Initializes the LSP server
 /// 3. Creates and configures a Translator
-/// 4. Returns the translator wrapped in Arc<Mutex>
-async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
+/// 4. Returns the translator wrapped in `Arc<Mutex>` and a notification receiver
+///
+/// Extract the notification receiver before registering the server (which
+/// consumes `LspServer`), then pass it to `wait_for_indexing_ready` to block
+/// until rust-analyzer signals it has finished its first analysis pass.
+async fn setup_rust_analyzer() -> (Arc<Mutex<Translator>>, mpsc::Receiver<LspNotification>) {
     init_tracing();
     let workspace_path = rust_workspace_path();
 
@@ -63,9 +67,12 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         initialization_options: None,
     };
 
-    let server = LspServer::spawn(server_init_config)
+    let mut server = LspServer::spawn(server_init_config)
         .await
         .expect("Failed to spawn rust-analyzer");
+
+    // Extract before register_server consumes the LspServer.
+    let notification_rx = std::mem::replace(&mut server.notification_rx, mpsc::channel(1).1);
 
     let client = server.client().clone();
 
@@ -75,7 +82,42 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
     translator.register_client("rust".to_string(), client);
     translator.register_server("rust".to_string(), server);
 
-    Arc::new(Mutex::new(translator))
+    (Arc::new(Mutex::new(translator)), notification_rx)
+}
+
+/// Poll the notification channel until rust-analyzer signals it has finished
+/// indexing, or the timeout elapses.
+///
+/// Readiness is defined as receiving either:
+/// - A `textDocument/publishDiagnostics` notification (primary signal), or
+/// - A `$/progress` notification with `value.kind == "end"` (secondary signal).
+///
+/// Both indicate rust-analyzer has completed at least its first analysis pass.
+async fn wait_for_indexing_ready(
+    notification_rx: &mut mpsc::Receiver<LspNotification>,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("Timed out waiting for rust-analyzer readiness");
+            return;
+        }
+        let msg = match tokio::time::timeout(remaining, notification_rx.recv()).await {
+            Ok(None) | Err(_) => return,
+            Ok(Some(msg)) => msg,
+        };
+        match msg {
+            LspNotification::PublishDiagnostics(_) => return,
+            LspNotification::Progress { ref value, .. }
+                if value.get("kind").and_then(|k| k.as_str()) == Some("end") =>
+            {
+                return;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test]
@@ -86,12 +128,12 @@ async fn test_hover_on_std_vec() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let file_path = workspace_path.join("src/lib.rs");
 
     // Give rust-analyzer time to index the workspace
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Hover over "String" in User struct (line 20)
     // The line is: `pub name: String,`
@@ -132,11 +174,11 @@ async fn test_hover_on_u64_type() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let file_path = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Hover over "u64" in User struct (line 19)
     // The line is: `pub id: u64,`
@@ -173,11 +215,11 @@ async fn test_definition_user_struct() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Go to definition of User in types.rs (line 9, owner: User)
     // The line is: `pub owner: User,`
@@ -218,11 +260,11 @@ async fn test_definition_across_files() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Go to definition of Repository in functions.rs (line 3, use statement)
     // The line is: `use crate::types::Repository;`
@@ -259,11 +301,11 @@ async fn test_references_create_repo_function() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Find references to create_repo function (line 7, function name)
     // The line is: `pub fn create_repo(name: &str) -> Repository {`
@@ -303,11 +345,11 @@ async fn test_references_user_struct() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Find references to User struct (line 18, struct name)
     // The line is: `pub struct User {`
@@ -344,12 +386,12 @@ async fn test_diagnostics_with_error() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
     // Give rust-analyzer extra time to analyze and generate diagnostics
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Get diagnostics from lib.rs (has intentional error on line 37)
     let result = timeout(
@@ -388,11 +430,11 @@ async fn test_diagnostics_no_errors() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Get diagnostics from types.rs (should have no errors)
     let result = timeout(
@@ -433,11 +475,11 @@ async fn test_document_symbols() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Get document symbols from lib.rs
     let result = timeout(
@@ -490,11 +532,11 @@ async fn test_document_symbols_types_file() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Get document symbols from types.rs
     let result = timeout(
@@ -536,11 +578,11 @@ async fn test_completions_basic() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Get completions in functions.rs
     // Position after "repo." on line 23 (repo.get_owner().name)
@@ -577,11 +619,11 @@ async fn test_format_document() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Request document formatting
     let result = timeout(
@@ -620,7 +662,7 @@ async fn test_timeout_handling() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, _notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
@@ -646,9 +688,7 @@ async fn test_invalid_file_path() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (translator, _notification_rx) = setup_rust_analyzer().await;
 
     // Try to get hover on non-existent file
     let result = translator
@@ -669,11 +709,11 @@ async fn test_out_of_bounds_position() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Try to get hover at an extremely large line number
     let result = timeout(
@@ -704,10 +744,10 @@ async fn test_workspace_symbol_search_basic() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
 
     // Give rust-analyzer time to index the workspace
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Search for "User" struct
     let result = timeout(
@@ -750,9 +790,9 @@ async fn test_workspace_symbol_search_with_kind_filter() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Search for symbols and filter by Struct kind
     let result = timeout(
@@ -789,9 +829,9 @@ async fn test_workspace_symbol_search_max_results() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Search with very low limit
     let result = timeout(
@@ -823,9 +863,9 @@ async fn test_workspace_symbol_search_function() {
         return;
     }
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, mut notification_rx) = setup_rust_analyzer().await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&mut notification_rx, Duration::from_secs(30)).await;
 
     // Search for function symbols
     let result = timeout(

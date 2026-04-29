@@ -90,18 +90,21 @@ pub enum LspNotification {
     /// textDocument/publishDiagnostics
     PublishDiagnostics(PublishDiagnosticsParams),
     /// window/logMessage
-    #[allow(dead_code)] // Used in Phase 4
     LogMessage(LogMessageParams),
     /// window/showMessage
-    #[allow(dead_code)] // Used in Phase 4
     ShowMessage(ShowMessageParams),
+    /// $/progress
+    Progress {
+        /// Progress token (string or number).
+        token: serde_json::Value,
+        /// Progress value.
+        value: serde_json::Value,
+    },
     /// Unknown or unhandled notification
     Other {
         /// Method name.
-        #[allow(dead_code)] // Used in Phase 4
         method: Cow<'static, str>,
         /// Optional parameters.
-        #[allow(dead_code)] // Used in Phase 4
         params: Option<serde_json::Value>,
     },
 }
@@ -167,6 +170,17 @@ impl LspNotification {
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
                     params: None,
+                }
+            }
+            "$/progress" => {
+                if let Some(ref p) = params {
+                    let token = p.get("token").cloned().unwrap_or(Value::Null);
+                    let value = p.get("value").cloned().unwrap_or(Value::Null);
+                    return Self::Progress { token, value };
+                }
+                Self::Other {
+                    method: Cow::Owned(method.to_string()),
+                    params,
                 }
             }
             _ => Self::Other {
