@@ -1002,8 +1002,9 @@ fn sc_go_to_implementation(client: &mut McpClient, workspace: &Path) -> Result<(
     .expect("column fits u32");
 
     let impl_line = find_line(&lib, "impl Greet for CodeActionTarget {");
-    // Convert to 0-based for LSP range comparison.
-    let expected_lsp_line = impl_line - 1;
+    // The bridge normalizes ranges to 1-based MCP via `normalize_range`,
+    // so the response line equals the 1-based source line directly.
+    let expected_mcp_line = impl_line;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1036,11 +1037,11 @@ fn sc_go_to_implementation(client: &mut McpClient, workspace: &Path) -> Result<(
                 ));
             }
             let has_impl_line = locs.iter().any(|l| {
-                l["range"]["start"]["line"].as_u64() == Some(u64::from(expected_lsp_line))
+                l["range"]["start"]["line"].as_u64() == Some(u64::from(expected_mcp_line))
             });
             if !has_impl_line {
                 return Err(format!(
-                    "go_to_implementation: impl line {expected_lsp_line} not in locations: {locs:?}"
+                    "go_to_implementation: impl line {expected_mcp_line} not in locations: {locs:?}"
                 ));
             }
             return Ok(());
@@ -1074,7 +1075,9 @@ fn sc_go_to_type_definition(client: &mut McpClient, workspace: &Path) -> Result<
     .expect("column fits u32");
 
     let struct_line = find_line(&lib, "pub struct Point {");
-    let expected_lsp_line = struct_line - 1;
+    // The bridge normalizes ranges to 1-based MCP via `normalize_range`,
+    // so the response line equals the 1-based source line directly.
+    let expected_mcp_line = struct_line;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1105,9 +1108,9 @@ fn sc_go_to_type_definition(client: &mut McpClient, workspace: &Path) -> Result<
                 ));
             }
             let got_line = locs[0]["range"]["start"]["line"].as_u64();
-            if got_line != Some(u64::from(expected_lsp_line)) {
+            if got_line != Some(u64::from(expected_mcp_line)) {
                 return Err(format!(
-                    "go_to_type_definition: expected line {expected_lsp_line}, got {got_line:?}"
+                    "go_to_type_definition: expected line {expected_mcp_line}, got {got_line:?}"
                 ));
             }
             return Ok(());
