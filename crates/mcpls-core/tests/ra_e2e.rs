@@ -908,6 +908,378 @@ fn sc_get_server_logs(client: &mut McpClient, _workspace: &Path) -> Result<(), S
     Ok(())
 }
 
+/// Resolve the `lsp-diagnostics` URI for `lib.rs` by querying `resources/list`.
+///
+/// Avoids drift from `make_uri`'s encoding rules on macOS `/private/var/...`
+/// canonicalised paths or Windows UNC.
+fn lib_rs_uri(client: &mut McpClient) -> Result<String, String> {
+    let resp = client
+        .list_resources()
+        .map_err(|e| format!("list_resources: {e}"))?;
+    let resources = resp["result"]["resources"]
+        .as_array()
+        .ok_or_else(|| format!("expected resources array, got {resp}"))?;
+    resources
+        .iter()
+        .filter_map(|r| r["uri"].as_str())
+        .find(|u| u.ends_with("/src/lib.rs"))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no lib.rs URI in resources list: {resources:?}"))
+}
+
+/// Tool 17: `get_signature_help` — signature of `add` inside its call site.
+fn sc_get_signature_help(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let line = find_line(&lib, "let s = add(");
+    let content = fs::read_to_string(&lib).map_err(|e| format!("read lib.rs: {e}"))?;
+    let source_line = content
+        .lines()
+        .nth(usize::try_from(line - 1).expect("line fits usize"))
+        .unwrap_or("");
+    // Place cursor just after the opening paren (1-based; line is ASCII).
+    let character = u32::try_from(
+        source_line
+            .find('(')
+            .ok_or_else(|| format!("no '(' on line {line}: {source_line}"))?
+            + 2,
+    )
+    .expect("column fits u32");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = client
+            .call_tool(
+                "get_signature_help",
+                &json!({
+                    "file_path": lib.to_string_lossy(),
+                    "line": line,
+                    "character": character,
+                }),
+            )
+            .map_err(|e| format!("call failed: {e}"))?;
+
+        let text = assertions::assert_tool_ok(&resp);
+        let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+        if let Some(sigs) = inner["signatures"].as_array()
+            && !sigs.is_empty()
+        {
+            let label = sigs[0]["label"].as_str().unwrap_or("");
+            if !label.contains("add") {
+                return Err(format!("signature label missing 'add': {label}"));
+            }
+            if !label.contains("i32") {
+                return Err(format!("signature label missing 'i32': {label}"));
+            }
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "get_signature_help: no signatures after 10 s; response={inner}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Tool 18: `go_to_implementation` — implementations of trait `Greet`.
+fn sc_go_to_implementation(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let line = find_line(&lib, "pub trait Greet {");
+    let content = fs::read_to_string(&lib).map_err(|e| format!("read lib.rs: {e}"))?;
+    let source_line = content
+        .lines()
+        .nth(usize::try_from(line - 1).expect("line fits usize"))
+        .unwrap_or("");
+    // Cursor on the trait name "Greet" (1-based; ASCII line).
+    let character = u32::try_from(
+        source_line
+            .find("Greet")
+            .ok_or_else(|| format!("'Greet' not found on line {line}: {source_line}"))?
+            + 1,
+    )
+    .expect("column fits u32");
+
+    let impl_line = find_line(&lib, "impl Greet for CodeActionTarget {");
+    // The bridge normalizes ranges to 1-based MCP via `normalize_range`,
+    // so the response line equals the 1-based source line directly.
+    let expected_mcp_line = impl_line;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = client
+            .call_tool(
+                "go_to_implementation",
+                &json!({
+                    "file_path": lib.to_string_lossy(),
+                    "line": line,
+                    "character": character,
+                }),
+            )
+            .map_err(|e| format!("call failed: {e}"))?;
+
+        let text = assertions::assert_tool_ok(&resp);
+        let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+        let locs = inner["locations"]
+            .as_array()
+            .or_else(|| inner.as_array())
+            .filter(|a| !a.is_empty());
+
+        if let Some(locs) = locs {
+            let has_lib_rs = locs
+                .iter()
+                .any(|l| l["uri"].as_str().unwrap_or("").ends_with("/src/lib.rs"));
+            if !has_lib_rs {
+                return Err(format!(
+                    "go_to_implementation: no location in lib.rs: {locs:?}"
+                ));
+            }
+            let has_impl_line = locs.iter().any(|l| {
+                l["range"]["start"]["line"].as_u64() == Some(u64::from(expected_mcp_line))
+            });
+            if !has_impl_line {
+                return Err(format!(
+                    "go_to_implementation: impl line {expected_mcp_line} not in locations: {locs:?}"
+                ));
+            }
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "go_to_implementation: empty locations after 10 s; response={inner}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Tool 19: `go_to_type_definition` — type definition of `p` (a `Point`).
+fn sc_go_to_type_definition(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let line = find_line(&lib, "let p = Point {");
+    let content = fs::read_to_string(&lib).map_err(|e| format!("read lib.rs: {e}"))?;
+    let source_line = content
+        .lines()
+        .nth(usize::try_from(line - 1).expect("line fits usize"))
+        .unwrap_or("");
+    // Cursor on identifier `p` (1-based; ASCII line).
+    let character = u32::try_from(
+        source_line
+            .find(" p ")
+            .ok_or_else(|| format!("' p ' not found on line {line}: {source_line}"))?
+            + 2,
+    )
+    .expect("column fits u32");
+
+    let struct_line = find_line(&lib, "pub struct Point {");
+    // The bridge normalizes ranges to 1-based MCP via `normalize_range`,
+    // so the response line equals the 1-based source line directly.
+    let expected_mcp_line = struct_line;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = client
+            .call_tool(
+                "go_to_type_definition",
+                &json!({
+                    "file_path": lib.to_string_lossy(),
+                    "line": line,
+                    "character": character,
+                }),
+            )
+            .map_err(|e| format!("call failed: {e}"))?;
+
+        let text = assertions::assert_tool_ok(&resp);
+        let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+        let locs = inner["locations"]
+            .as_array()
+            .or_else(|| inner.as_array())
+            .filter(|a| !a.is_empty());
+
+        if let Some(locs) = locs {
+            let uri = locs[0]["uri"].as_str().unwrap_or("");
+            if !uri.ends_with("/src/lib.rs") {
+                return Err(format!(
+                    "go_to_type_definition: URI does not end with '/src/lib.rs': {uri}"
+                ));
+            }
+            let got_line = locs[0]["range"]["start"]["line"].as_u64();
+            if got_line != Some(u64::from(expected_mcp_line)) {
+                return Err(format!(
+                    "go_to_type_definition: expected line {expected_mcp_line}, got {got_line:?}"
+                ));
+            }
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "go_to_type_definition: empty locations after 10 s; response={inner}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Tool 20: `get_inlay_hints` — type hints in `lsp317_target`.
+fn sc_get_inlay_hints(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let start_line = find_line(&lib, "pub fn lsp317_target(");
+    let end_line = find_line(&lib, "let _ = (p, s);") + 1;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = client
+            .call_tool(
+                "get_inlay_hints",
+                &json!({
+                    "file_path": lib.to_string_lossy(),
+                    "start_line": start_line,
+                    "start_character": 1,
+                    "end_line": end_line,
+                    "end_character": 1,
+                }),
+            )
+            .map_err(|e| format!("call failed: {e}"))?;
+
+        let text = assertions::assert_tool_ok(&resp);
+        let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+        let hints_arr = inner["hints"].as_array().or_else(|| inner.as_array());
+        if let Some(hints) = hints_arr
+            && !hints.is_empty()
+        {
+            let serialized = serde_json::to_string(&inner["hints"])
+                .unwrap_or_else(|_| serde_json::to_string(&inner).unwrap_or_default());
+            if !serialized.contains("Point") && !serialized.contains("i32") {
+                return Err(format!(
+                    "get_inlay_hints: no 'Point' or 'i32' hint found; hints={serialized}"
+                ));
+            }
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "get_inlay_hints: no hints after 10 s; response={inner}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Resource sub-case 1: `list_resources` — at least one lib.rs resource exposed.
+///
+/// Precondition: `sc_get_hover` and earlier sub-cases have triggered didOpen for
+/// lib.rs — this sub-case must remain after them in the registry.
+fn sc_list_resources(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
+    let resp = client
+        .list_resources()
+        .map_err(|e| format!("call failed: {e}"))?;
+
+    let resources = resp["result"]["resources"]
+        .as_array()
+        .ok_or_else(|| format!("expected resources array, got {resp}"))?;
+
+    if resources.is_empty() {
+        return Err("list_resources: empty resources array".to_owned());
+    }
+
+    for r in resources {
+        let uri = r["uri"].as_str().unwrap_or("");
+        if !uri.starts_with("lsp-diagnostics:///") {
+            return Err(format!(
+                "list_resources: URI does not start with 'lsp-diagnostics:///': {uri}"
+            ));
+        }
+    }
+
+    let has_lib_rs = resources
+        .iter()
+        .any(|r| r["uri"].as_str().unwrap_or("").ends_with("/src/lib.rs"));
+    if !has_lib_rs {
+        return Err(format!(
+            "list_resources: no URI ending with '/src/lib.rs': {resources:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Resource sub-case 2: `read_resource` — reads diagnostics for lib.rs.
+fn sc_read_resource(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
+    let uri = lib_rs_uri(client)?;
+    let resp = client
+        .read_resource(&uri)
+        .map_err(|e| format!("call failed: {e}"))?;
+
+    let contents = resp["result"]["contents"]
+        .as_array()
+        .ok_or_else(|| format!("expected contents array, got {resp}"))?;
+
+    if contents.is_empty() {
+        return Err("read_resource: empty contents array".to_owned());
+    }
+    if contents[0]["uri"].as_str() != Some(&uri) {
+        return Err(format!(
+            "read_resource: contents[0].uri mismatch; expected {uri}, got {}",
+            contents[0]["uri"]
+        ));
+    }
+    let text = contents[0]["text"].as_str().ok_or_else(|| {
+        format!(
+            "read_resource: contents[0].text is not a string: {}",
+            contents[0]
+        )
+    })?;
+    serde_json::from_str::<Value>(text)
+        .map_err(|e| format!("read_resource: contents[0].text is not valid JSON: {e}"))?;
+
+    Ok(())
+}
+
+/// Resource sub-case 3: subscribe and unsubscribe lib.rs resource.
+fn sc_subscribe_unsubscribe_resource(
+    client: &mut McpClient,
+    _workspace: &Path,
+) -> Result<(), String> {
+    let uri = lib_rs_uri(client)?;
+
+    let sub_resp = client
+        .subscribe_resource(&uri)
+        .map_err(|e| format!("subscribe call failed: {e}"))?;
+    if sub_resp.get("error").is_some() {
+        return Err(format!("subscribe returned error: {sub_resp}"));
+    }
+    // result field must be present (null for success)
+    if sub_resp.get("result").is_none() {
+        return Err(format!(
+            "subscribe: no 'result' field in response: {sub_resp}"
+        ));
+    }
+
+    let unsub_resp = client
+        .unsubscribe_resource(&uri)
+        .map_err(|e| format!("unsubscribe call failed: {e}"))?;
+    if unsub_resp.get("error").is_some() {
+        return Err(format!("unsubscribe returned error: {unsub_resp}"));
+    }
+    if unsub_resp.get("result").is_none() {
+        return Err(format!(
+            "unsubscribe: no 'result' field in response: {unsub_resp}"
+        ));
+    }
+
+    // TODO(critic): add negative case with "file:///tmp/x.rs" (wrong scheme) once error envelope shape confirmed
+    // TODO(critic): assert idempotent unsubscribe — second unsubscribe of same URI returns Ok
+
+    Ok(())
+}
+
 /// Tool 16: `get_server_messages` — readiness gate already exercised this tool.
 fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
     let resp = client
@@ -985,6 +1357,13 @@ fn ra_e2e_suite() {
         sub_case!(sc_get_cached_diagnostics),
         sub_case!(sc_get_server_logs),
         sub_case!(sc_get_server_messages),
+        sub_case!(sc_get_signature_help),
+        sub_case!(sc_go_to_implementation),
+        sub_case!(sc_go_to_type_definition),
+        sub_case!(sc_get_inlay_hints),
+        sub_case!(sc_list_resources),
+        sub_case!(sc_read_resource),
+        sub_case!(sc_subscribe_unsubscribe_resource),
     ];
 
     let filter = std::env::var("MCPLS_RA_FILTER").ok();

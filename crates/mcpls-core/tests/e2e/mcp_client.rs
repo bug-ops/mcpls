@@ -190,6 +190,70 @@ impl McpClient {
         self.send_request(&request)
     }
 
+    /// List MCP resources (`resources/list`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server returns an error.
+    #[allow(dead_code)]
+    pub fn list_resources(&mut self) -> Result<Value> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "resources/list",
+            "params": {}
+        });
+        self.send_request(&request)
+    }
+
+    /// Read an MCP resource by URI (`resources/read`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server returns an error.
+    #[allow(dead_code)]
+    pub fn read_resource(&mut self, uri: &str) -> Result<Value> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "resources/read",
+            "params": { "uri": uri }
+        });
+        self.send_request(&request)
+    }
+
+    /// Subscribe to a resource (`resources/subscribe`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server returns an error.
+    #[allow(dead_code)]
+    pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "resources/subscribe",
+            "params": { "uri": uri }
+        });
+        self.send_request(&request)
+    }
+
+    /// Unsubscribe from a resource (`resources/unsubscribe`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server returns an error.
+    #[allow(dead_code)]
+    pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "resources/unsubscribe",
+            "params": { "uri": uri }
+        });
+        self.send_request(&request)
+    }
+
     /// Send a raw JSON-RPC request and return the response.
     ///
     /// # Errors
