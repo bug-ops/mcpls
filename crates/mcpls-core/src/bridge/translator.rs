@@ -571,17 +571,36 @@ impl Translator {
     /// Get a cloned LSP client for a file path based on language detection.
     fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
         let language_id = detect_language(path, &self.extension_map);
-        self.lsp_clients.get(&language_id).cloned().ok_or_else(|| {
-            // A configured+applicable language whose server has not registered
-            // yet is still initializing (e.g. a large Unity solution loading via
-            // OmniSharp); tell the caller to wait and retry rather than implying
-            // no server is configured at all.
-            if self.expected_languages.contains(&language_id) {
-                Error::ServerInitializing(language_id)
-            } else {
-                Error::NoServerForLanguage(language_id)
-            }
-        })
+        if let Some(client) = self.lsp_clients.get(&language_id) {
+            return Ok(client.clone());
+        }
+
+        let server_language_id = Self::server_language_id_for_document(&language_id);
+        if let Some(server_language_id) = server_language_id
+            && let Some(client) = self.lsp_clients.get(server_language_id)
+        {
+            return Ok(client.clone());
+        }
+
+        // A configured+applicable language whose server has not registered
+        // yet is still initializing (e.g. a large Unity solution loading via
+        // OmniSharp); tell the caller to wait and retry rather than implying
+        // no server is configured at all.
+        if self.expected_languages.contains(&language_id)
+            || server_language_id.is_some_and(|id| self.expected_languages.contains(id))
+        {
+            Err(Error::ServerInitializing(language_id))
+        } else {
+            Err(Error::NoServerForLanguage(language_id))
+        }
+    }
+
+    fn server_language_id_for_document(language_id: &str) -> Option<&'static str> {
+        match language_id {
+            "javascriptreact" => Some("javascript"),
+            "typescriptreact" => Some("typescript"),
+            _ => None,
+        }
     }
 
     /// Parse and validate a file URI, returning the validated path.
@@ -3310,6 +3329,51 @@ mod tests {
         } else {
             panic!("Expected NoServerForLanguage(plaintext) error");
         }
+    }
+
+    #[test]
+    fn test_get_client_for_file_routes_tsx_to_typescript_server() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("component.tsx");
+        fs::write(&test_file, "export const Component = () => <div />").unwrap();
+
+        let mut extension_map = HashMap::new();
+        extension_map.insert("tsx".to_string(), "typescriptreact".to_string());
+
+        let mut translator = Translator::new().with_extensions(extension_map);
+        translator.register_client(
+            "typescript".to_string(),
+            LspClient::new(crate::config::LspServerConfig::typescript()),
+        );
+
+        let client = translator.get_client_for_file(&test_file).unwrap();
+        assert_eq!(client.language_id(), "typescript");
+    }
+
+    #[test]
+    fn test_get_client_for_file_routes_jsx_to_javascript_server() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("component.jsx");
+        fs::write(&test_file, "export const Component = () => <div />").unwrap();
+
+        let mut extension_map = HashMap::new();
+        extension_map.insert("jsx".to_string(), "javascriptreact".to_string());
+
+        let javascript_config = crate::config::LspServerConfig {
+            language_id: "javascript".to_string(),
+            command: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: HashMap::new(),
+            file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
+            initialization_options: None,
+            timeout_seconds: 30,
+            heuristics: None,
+        };
+        let mut translator = Translator::new().with_extensions(extension_map);
+        translator.register_client("javascript".to_string(), LspClient::new(javascript_config));
+
+        let client = translator.get_client_for_file(&test_file).unwrap();
+        assert_eq!(client.language_id(), "javascript");
     }
 
     #[tokio::test]
