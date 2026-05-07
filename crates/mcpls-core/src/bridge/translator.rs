@@ -116,6 +116,30 @@ impl Default for Translator {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticRequestParams {
+    text_document: TextDocumentIdentifier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_result_id: Option<String>,
+    #[serde(flatten)]
+    work_done_progress_params: WorkDoneProgressParams,
+    #[serde(flatten)]
+    partial_result_params: PartialResultParams,
+}
+
+fn diagnostic_request_params(text_document: TextDocumentIdentifier) -> DiagnosticRequestParams {
+    DiagnosticRequestParams {
+        text_document,
+        identifier: None,
+        previous_result_id: None,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    }
+}
+
 /// Position in a document (1-based for MCP).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position2D {
@@ -750,13 +774,7 @@ impl Translator {
             .ensure_open(&validated_path, &client)
             .await?;
 
-        let params = lsp_types::DocumentDiagnosticParams {
-            text_document: TextDocumentIdentifier { uri },
-            identifier: None,
-            previous_result_id: None,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
+        let params = diagnostic_request_params(TextDocumentIdentifier { uri });
 
         let timeout_duration = Duration::from_secs(30);
         let response: lsp_types::DocumentDiagnosticReportResult = client
@@ -2072,6 +2090,17 @@ mod tests {
         // and a real LSP server process. The actual registration functionality is
         // tested in integration tests (see rust_analyzer_tests.rs).
         // This test verifies the data structure is properly initialized.
+    }
+
+    #[test]
+    fn test_diagnostic_request_params_omit_optional_null_fields() {
+        let uri = "file:///test.ts".parse().unwrap();
+        let params = diagnostic_request_params(TextDocumentIdentifier { uri });
+        let value = serde_json::to_value(params).unwrap();
+
+        assert_eq!(value["textDocument"]["uri"], "file:///test.ts");
+        assert!(value.get("identifier").is_none());
+        assert!(value.get("previousResultId").is_none());
     }
 
     #[test]
