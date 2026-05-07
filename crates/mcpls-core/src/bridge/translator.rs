@@ -3244,6 +3244,40 @@ mod tests {
     }
 
     #[test]
+    fn test_get_client_for_file_prefers_exact_react_server() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("component.tsx");
+        fs::write(&test_file, "export const Component = () => <div />").unwrap();
+
+        let mut extension_map = HashMap::new();
+        extension_map.insert("tsx".to_string(), "typescriptreact".to_string());
+
+        let typescript_react_config = crate::config::LspServerConfig {
+            language_id: "typescriptreact".to_string(),
+            command: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: HashMap::new(),
+            file_patterns: vec!["**/*.tsx".to_string()],
+            initialization_options: None,
+            timeout_seconds: 30,
+            heuristics: None,
+        };
+
+        let mut translator = Translator::new().with_extensions(extension_map);
+        translator.register_client(
+            "typescript".to_string(),
+            LspClient::new(crate::config::LspServerConfig::typescript()),
+        );
+        translator.register_client(
+            "typescriptreact".to_string(),
+            LspClient::new(typescript_react_config),
+        );
+
+        let client = translator.get_client_for_file(&test_file).unwrap();
+        assert_eq!(client.language_id(), "typescriptreact");
+    }
+
+    #[test]
     fn test_get_client_for_file_routes_jsx_to_javascript_server() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("component.jsx");
