@@ -142,6 +142,15 @@ fn extract_extension_from_pattern(pattern: &str) -> Option<String> {
     }
 }
 
+fn language_id_for_pattern_extension(server_language_id: &str, extension: &str) -> String {
+    match (server_language_id, extension) {
+        ("javascript", "jsx") => "javascriptreact",
+        ("typescript", "tsx") => "typescriptreact",
+        _ => server_language_id,
+    }
+    .to_string()
+}
+
 fn default_position_encodings() -> Vec<String> {
     vec!["utf-8".to_string(), "utf-16".to_string()]
 }
@@ -295,7 +304,8 @@ impl ServerConfig {
         for server in &self.lsp_servers {
             for pattern in &server.file_patterns {
                 if let Some(ext) = extract_extension_from_pattern(pattern) {
-                    map.insert(ext, server.language_id.clone());
+                    let language_id = language_id_for_pattern_extension(&server.language_id, &ext);
+                    map.insert(ext, language_id);
                 }
             }
         }
@@ -743,6 +753,48 @@ mod tests {
         let map = config.build_effective_extension_map();
         assert_eq!(map.get("c"), Some(&"cpp".to_string()));
         assert_eq!(map.get("h"), Some(&"cpp".to_string()));
+    }
+
+    #[test]
+    fn test_build_effective_extension_map_derives_tsx_language_id() {
+        let config = ServerConfig {
+            workspace: WorkspaceConfig::default(),
+            lsp_servers: vec![LspServerConfig {
+                language_id: "typescript".to_string(),
+                command: "tsgo".to_string(),
+                args: vec!["--lsp".to_string(), "--stdio".to_string()],
+                env: HashMap::new(),
+                file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+            }],
+        };
+
+        let map = config.build_effective_extension_map();
+        assert_eq!(map.get("ts"), Some(&"typescript".to_string()));
+        assert_eq!(map.get("tsx"), Some(&"typescriptreact".to_string()));
+    }
+
+    #[test]
+    fn test_build_effective_extension_map_derives_jsx_language_id() {
+        let config = ServerConfig {
+            workspace: WorkspaceConfig::default(),
+            lsp_servers: vec![LspServerConfig {
+                language_id: "javascript".to_string(),
+                command: "typescript-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+                env: HashMap::new(),
+                file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+            }],
+        };
+
+        let map = config.build_effective_extension_map();
+        assert_eq!(map.get("js"), Some(&"javascript".to_string()));
+        assert_eq!(map.get("jsx"), Some(&"javascriptreact".to_string()));
     }
 
     #[test]
