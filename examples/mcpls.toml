@@ -17,7 +17,9 @@ position_encodings = ["utf-8", "utf-16"]
 #              (e.g. rust-analyzer's flycheck/cargo-check output).
 #   "cached" — only the cache populated from `publishDiagnostics`. Cheap
 #              but empty for files the LSP server has not analysed yet.
-#   "hybrid" — pull + cached, deduplicating on (range, message, code).
+#   "hybrid" — pull + cached, deduplicating on (range, severity, code)
+#              when `code` is present, otherwise on (range, severity,
+#              normalized message).
 # diagnostics_mode = "hybrid"
 
 # Language extension mappings (optional)

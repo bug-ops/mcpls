@@ -944,6 +944,7 @@ async fn test_ensure_open_resyncs_after_external_edit() {
     let server_init_config = ServerInitConfig {
         server_config: lsp_config,
         workspace_roots: vec![workspace_path.clone()],
+        notification_tx: None,
         initialization_options: None,
     };
 
@@ -1065,6 +1066,7 @@ async fn test_lsp_server_installs_watcher_registration() {
     let _server = LspServer::spawn(ServerInitConfig {
         server_config: lsp_config,
         workspace_roots: vec![workspace_path],
+        notification_tx: None,
         initialization_options: None,
     })
     .await
@@ -1125,6 +1127,7 @@ async fn test_notification_cache_populates_from_publish_diagnostics() {
     let mut server = LspServer::spawn(ServerInitConfig {
         server_config: lsp_config,
         workspace_roots: vec![workspace_path.clone()],
+        notification_tx: None,
         initialization_options: None,
     })
     .await
@@ -1132,9 +1135,7 @@ async fn test_notification_cache_populates_from_publish_diagnostics() {
 
     // Take the receiver and run a small pump that drains into the cache —
     // mirroring the production wiring from `mcpls_core::serve`.
-    let notification_rx = server
-        .take_notification_receiver()
-        .expect("notification rx present after spawn");
+    let notification_rx = server.take_notification_rx();
 
     let extension_map = {
         let mut m = HashMap::new();
@@ -1148,23 +1149,22 @@ async fn test_notification_cache_populates_from_publish_diagnostics() {
     let translator = Arc::new(Mutex::new(translator));
 
     {
-        let translator = Arc::clone(&translator);
+        let cache = translator.lock().await.notification_cache_handle();
         let mut rx = notification_rx;
         tokio::spawn(async move {
             use mcpls_core::bridge::MessageType;
             use mcpls_core::lsp::LspNotification;
             while let Some(note) = rx.recv().await {
-                let mut guard = translator.lock().await;
-                let cache = guard.notification_cache_mut();
+                let mut guard = cache.lock().expect("cache mutex poisoned");
                 match note {
                     LspNotification::PublishDiagnostics(p) => {
-                        cache.store_diagnostics(&p.uri, p.version, p.diagnostics);
+                        guard.store_diagnostics(&p.uri, p.version, p.diagnostics);
                     }
-                    LspNotification::LogMessage(p) => cache.store_log(p.typ.into(), p.message),
+                    LspNotification::LogMessage(p) => guard.store_log(p.typ.into(), p.message),
                     LspNotification::ShowMessage(p) => {
-                        cache.store_message(MessageType::from(p.typ), p.message);
+                        guard.store_message(MessageType::from(p.typ), p.message);
                     }
-                    LspNotification::Other { .. } => {}
+                    LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
                 }
                 drop(guard);
             }

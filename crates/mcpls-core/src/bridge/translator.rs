@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
@@ -35,7 +36,13 @@ pub struct Translator {
     /// Document state tracker.
     document_tracker: DocumentTracker,
     /// Notification cache for LSP server notifications.
-    notification_cache: NotificationCache,
+    ///
+    /// Held behind its own `Arc<Mutex>` so that the notification pump task can
+    /// write `publishDiagnostics` etc. without contending with the translator
+    /// lock — `handle_diagnostics` keeps the translator locked across a 30 s
+    /// pull, and the pump must remain free to drain the channel during that
+    /// window or the LSP transport back-pressures and the pull deadlocks.
+    notification_cache: Arc<Mutex<NotificationCache>>,
     /// Allowed workspace roots for path validation.
     workspace_roots: Vec<PathBuf>,
     /// Custom file extension to language ID mappings.
@@ -52,7 +59,7 @@ impl Translator {
             lsp_clients: HashMap::new(),
             lsp_servers: HashMap::new(),
             document_tracker: DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
-            notification_cache: NotificationCache::new(),
+            notification_cache: Arc::new(Mutex::new(NotificationCache::new())),
             workspace_roots: vec![],
             extension_map: HashMap::new(),
             diagnostics_mode: DiagnosticsMode::default(),
@@ -102,15 +109,27 @@ impl Translator {
         &mut self.document_tracker
     }
 
-    /// Get the notification cache.
-    #[must_use]
-    pub const fn notification_cache(&self) -> &NotificationCache {
-        &self.notification_cache
+    /// Acquire a read/write guard on the notification cache.
+    ///
+    /// Holds an internal `Arc<Mutex>`; callers should drop the guard quickly
+    /// because the notification pump and other request handlers compete for
+    /// the same lock. Never await while holding the guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache mutex is poisoned (i.e. another thread panicked
+    /// while holding the lock). Process-wide poisoning is unrecoverable here.
+    pub fn notification_cache_mut(&self) -> MutexGuard<'_, NotificationCache> {
+        #[allow(clippy::expect_used)]
+        self.notification_cache
+            .lock()
+            .expect("notification cache mutex poisoned")
     }
 
-    /// Get a mutable reference to the notification cache.
-    pub const fn notification_cache_mut(&mut self) -> &mut NotificationCache {
-        &mut self.notification_cache
+    /// Cheap clone of the cache handle for use by the notification pump.
+    #[must_use]
+    pub fn notification_cache_handle(&self) -> Arc<Mutex<NotificationCache>> {
+        Arc::clone(&self.notification_cache)
     }
 
     // TODO: These methods will be implemented in Phase 3-5
@@ -757,11 +776,16 @@ impl Translator {
     ///   `publishDiagnostics`. Cheap; empty for files the LSP server has not
     ///   analysed.
     /// - [`DiagnosticsMode::Hybrid`] does pull + cached, deduplicating by
-    ///   `(range, message, code)`.
+    ///   `(range, severity, code)` when a code is present, and otherwise by
+    ///   `(range, severity, normalized message)`.
     ///
     /// # Errors
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the notification cache mutex is poisoned.
     pub async fn handle_diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
@@ -780,7 +804,12 @@ impl Translator {
         };
 
         let cached = if matches!(mode, DiagnosticsMode::Cached | DiagnosticsMode::Hybrid) {
-            cached_diagnostics(&self.notification_cache, &uri)
+            #[allow(clippy::expect_used)]
+            let guard = self
+                .notification_cache
+                .lock()
+                .expect("notification cache mutex poisoned");
+            cached_diagnostics(&guard, &uri)
         } else {
             Vec::new()
         };
@@ -1407,6 +1436,10 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the path is invalid or outside workspace boundaries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the notification cache mutex is poisoned.
     pub fn handle_cached_diagnostics(&mut self, file_path: &str) -> Result<DiagnosticsResult> {
         let path = PathBuf::from(file_path);
         let validated_path = self.validate_path(&path)?;
@@ -1415,8 +1448,13 @@ impl Translator {
         // rust-analyzer stores in publishDiagnostics notifications.
         let uri = path_to_uri(&validated_path);
 
+        #[allow(clippy::expect_used)]
+        let guard = self
+            .notification_cache
+            .lock()
+            .expect("notification cache mutex poisoned");
         Ok(DiagnosticsResult {
-            diagnostics: cached_diagnostics(&self.notification_cache, &uri),
+            diagnostics: cached_diagnostics(&guard, &uri),
         })
     }
 
@@ -1425,6 +1463,10 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the `min_level` parameter is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the notification cache mutex is poisoned.
     pub fn handle_server_logs(
         &mut self,
         limit: usize,
@@ -1449,7 +1491,14 @@ impl Translator {
             None
         };
 
-        let all_logs = self.notification_cache.get_logs();
+        let all_logs: Vec<_> = {
+            #[allow(clippy::expect_used)]
+            let guard = self
+                .notification_cache
+                .lock()
+                .expect("notification cache mutex poisoned");
+            guard.get_logs().iter().cloned().collect()
+        };
 
         let logs: Vec<_> = all_logs
             .iter()
@@ -1473,9 +1522,19 @@ impl Translator {
     /// # Errors
     ///
     /// This method does not return errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the notification cache mutex is poisoned.
     pub fn handle_server_messages(&mut self, limit: usize) -> Result<ServerMessagesResult> {
-        let all_messages = self.notification_cache.get_messages();
-        let messages: Vec<_> = all_messages.iter().take(limit).cloned().collect();
+        let messages: Vec<_> = {
+            #[allow(clippy::expect_used)]
+            let guard = self
+                .notification_cache
+                .lock()
+                .expect("notification cache mutex poisoned");
+            guard.get_messages().iter().take(limit).cloned().collect()
+        };
         Ok(ServerMessagesResult { messages })
     }
 

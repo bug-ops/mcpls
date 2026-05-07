@@ -25,6 +25,8 @@ use lsp_types::{
 };
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::sync::mpsc::TrySendError;
+
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -51,14 +53,21 @@ const RAW_EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// burning CPU on `target/` rewrites etc. Match by exact component name.
 const NEVER_FORWARD_COMPONENTS: &[&str] = &[".git", "target", "node_modules", ".cache"];
 
-/// A single watcher registration.
+/// One entry per `FileSystemWatcher` inside an LSP registration. Per-glob
+/// `WatchKind` is preserved here so that a registration like
+/// `[ {globs:[*.rs], kind:Change}, {globs:[Cargo.toml], kind:Create|Delete} ]`
+/// matches each glob against only the kinds the server actually asked for.
+#[derive(Debug)]
+struct GlobBucket {
+    globs: GlobSet,
+    kinds: WatchKind,
+}
+
+/// A single watcher registration. May hold many [`GlobBucket`]s when the
+/// `Registration` includes multiple `FileSystemWatcher`s with differing kinds.
 #[derive(Debug)]
 struct WatcherRegistration {
-    /// The compiled glob set from the registration's `watchers` array.
-    globs: GlobSet,
-    /// Bitfield of LSP watch kinds we should forward. Default is all three
-    /// (Create | Change | Delete = 7).
-    kinds: WatchKind,
+    buckets: Vec<GlobBucket>,
 }
 
 /// Manages dynamic `workspace/didChangeWatchedFiles` registrations and a
@@ -90,10 +99,12 @@ impl FileWatcher {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying `notify` watcher cannot be created
-    /// or if any workspace root cannot be watched. Failure here should be
-    /// non-fatal at the caller (the `bridge` already covers per-file freshness
-    /// via stat-on-access); callers should log and continue.
+    /// Returns an error if the underlying `notify` watcher cannot be created,
+    /// or if `workspace_roots` is non-empty but every root failed to register
+    /// with `notify::watch`. Individual root failures are logged but do not
+    /// fail the spawn as long as at least one root is being watched. Failure
+    /// here should be non-fatal at the caller (the `bridge` already covers
+    /// per-file freshness via stat-on-access); callers should log and continue.
     pub fn spawn(workspace_roots: Vec<PathBuf>, lsp_client: LspClient) -> Result<Self> {
         // Canonicalize roots so glob matching against canonical event paths
         // works even when the original path goes through symlinks (notably
@@ -107,18 +118,34 @@ impl FileWatcher {
         let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel(RAW_EVENT_CHANNEL_CAPACITY);
 
         let mut watcher = notify::recommended_watcher(move |event| {
-            // Notify uses a blocking std mpsc; drop on full to avoid blocking
-            // the OS notify thread.
-            if let Err(e) = raw_tx.send(event) {
-                warn!("file watcher: dropping event, channel closed: {e}");
+            // Notify invokes this callback from its own delivery thread(s);
+            // never block here. Drop on full to avoid stalling filesystem
+            // event delivery under heavy churn (e.g. `target/` rebuilds).
+            match raw_tx.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    debug!("file watcher: dropping event, channel full");
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    warn!("file watcher: dropping event, channel closed");
+                }
             }
         })
         .map_err(|e| Error::Transport(format!("notify::recommended_watcher: {e}")))?;
 
+        let mut watched_root_count = 0usize;
         for root in &workspace_roots {
-            if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
-                warn!("file watcher: failed to watch {}: {e}", root.display());
+            match watcher.watch(root, RecursiveMode::Recursive) {
+                Ok(()) => watched_root_count += 1,
+                Err(e) => {
+                    warn!("file watcher: failed to watch {}: {e}", root.display());
+                }
             }
+        }
+        if !workspace_roots.is_empty() && watched_root_count == 0 {
+            return Err(Error::Transport(
+                "file watcher: failed to watch any workspace root".to_string(),
+            ));
         }
 
         let inner = Arc::new(Mutex::new(FileWatcherInner {
@@ -170,14 +197,15 @@ impl FileWatcher {
             guard.workspace_roots.clone()
         };
 
-        let mut builder = GlobSetBuilder::new();
-        let mut combined_kinds: WatchKind = WatchKind::empty();
-
+        let mut buckets: Vec<GlobBucket> = Vec::with_capacity(opts.watchers.len());
         for fs_watcher in &opts.watchers {
+            let mut builder = GlobSetBuilder::new();
+            let mut compiled = 0usize;
             for glob_str in resolve_pattern(&fs_watcher.glob_pattern, &workspace_roots) {
                 match Glob::new(&glob_str) {
                     Ok(glob) => {
                         builder.add(glob);
+                        compiled += 1;
                     }
                     Err(e) => {
                         warn!(
@@ -186,30 +214,27 @@ impl FileWatcher {
                     }
                 }
             }
-            combined_kinds |= fs_watcher
+            if compiled == 0 {
+                continue;
+            }
+            let globs = builder
+                .build()
+                .map_err(|e| Error::LspProtocolError(format!("globset build failed: {e}")))?;
+            let kinds = fs_watcher
                 .kind
                 .unwrap_or(WatchKind::Create | WatchKind::Change | WatchKind::Delete);
+            buckets.push(GlobBucket { globs, kinds });
         }
 
-        let globs = builder
-            .build()
-            .map_err(|e| Error::LspProtocolError(format!("globset build failed: {e}")))?;
-
-        let watcher_count = opts.watchers.len();
+        let bucket_count = buckets.len();
         {
             let mut guard = self.inner.lock().await;
-            guard.registrations.insert(
-                id.clone(),
-                WatcherRegistration {
-                    globs,
-                    kinds: combined_kinds,
-                },
-            );
+            guard
+                .registrations
+                .insert(id.clone(), WatcherRegistration { buckets });
         }
 
-        debug!(
-            "file watcher: registered {id} ({watcher_count} watchers, kinds={combined_kinds:?})"
-        );
+        debug!("file watcher: registered {id} ({bucket_count} buckets)");
         Ok(())
     }
 
@@ -233,17 +258,25 @@ impl FileWatcher {
 
 /// Resolve an LSP glob pattern into one or more `globset`-compatible pattern
 /// strings. Relative patterns are anchored to their base URI by prepending
-/// the absolute path; bare string patterns are accepted as-is and are
-/// effectively matched anywhere under the workspace.
+/// the absolute path. Bare string patterns are anchored to the entire workspace
+/// with a `**/` prefix when they don't already start with one (or with `/`),
+/// because `globset` matches the *full path* — a bare `*.rs` would never match
+/// `/repo/src/lib.rs`, only filenames at the root.
 fn resolve_pattern(pattern: &GlobPattern, workspace_roots: &[PathBuf]) -> Vec<String> {
     match pattern {
-        GlobPattern::String(s) => {
-            // Absolute patterns are used directly; bare patterns are anchored
-            // at every workspace root with `**/` already implicit in
-            // patterns like `**/*.rs`.
-            vec![s.clone()]
-        }
+        GlobPattern::String(s) => vec![anchor_bare_pattern(s)],
         GlobPattern::Relative(rel) => relative_pattern_to_globs(rel, workspace_roots),
+    }
+}
+
+/// Anchor a bare LSP glob with `**/` so it matches anywhere under the
+/// workspace. Already-absolute patterns and patterns that already start with
+/// `**/` are returned unchanged.
+fn anchor_bare_pattern(pattern: &str) -> String {
+    if pattern.starts_with('/') || pattern.starts_with("**/") {
+        pattern.to_string()
+    } else {
+        format!("**/{pattern}")
     }
 }
 
@@ -425,9 +458,11 @@ fn compute_changes(
 ) -> Vec<FileEvent> {
     let mut changes: Vec<FileEvent> = Vec::new();
     for (path, typ) in pending {
-        let matched = registrations
-            .values()
-            .any(|r| registration_accepts(r, typ) && r.globs.is_match(&path));
+        let matched = registrations.values().any(|r| {
+            r.buckets
+                .iter()
+                .any(|b| bucket_accepts(b, typ) && b.globs.is_match(&path))
+        });
         if !matched {
             continue;
         }
@@ -439,13 +474,13 @@ fn compute_changes(
     changes
 }
 
-/// Whether the registration accepted change kind `typ`. The kind bitmask in
-/// LSP defaults to all three types when unset.
-fn registration_accepts(registration: &WatcherRegistration, typ: FileChangeType) -> bool {
-    let want = if registration.kinds.is_empty() {
+/// Whether the bucket accepts change kind `typ`. The kind bitmask in LSP
+/// defaults to all three types when unset.
+fn bucket_accepts(bucket: &GlobBucket, typ: FileChangeType) -> bool {
+    let want = if bucket.kinds.is_empty() {
         WatchKind::Create | WatchKind::Change | WatchKind::Delete
     } else {
-        registration.kinds
+        bucket.kinds
     };
     match typ {
         FileChangeType::CREATED => want.contains(WatchKind::Create),
@@ -533,24 +568,86 @@ mod tests {
     }
 
     #[test]
-    fn test_registration_accepts_default_kind() {
-        let reg = WatcherRegistration {
+    fn test_bucket_accepts_default_kind() {
+        let bucket = GlobBucket {
             globs: GlobSetBuilder::new().build().unwrap(),
             kinds: WatchKind::empty(),
         };
-        assert!(registration_accepts(&reg, FileChangeType::CREATED));
-        assert!(registration_accepts(&reg, FileChangeType::CHANGED));
-        assert!(registration_accepts(&reg, FileChangeType::DELETED));
+        assert!(bucket_accepts(&bucket, FileChangeType::CREATED));
+        assert!(bucket_accepts(&bucket, FileChangeType::CHANGED));
+        assert!(bucket_accepts(&bucket, FileChangeType::DELETED));
     }
 
     #[test]
-    fn test_registration_accepts_explicit_kind() {
-        let reg = WatcherRegistration {
+    fn test_bucket_accepts_explicit_kind() {
+        let bucket = GlobBucket {
             globs: GlobSetBuilder::new().build().unwrap(),
             kinds: WatchKind::Change,
         };
-        assert!(!registration_accepts(&reg, FileChangeType::CREATED));
-        assert!(registration_accepts(&reg, FileChangeType::CHANGED));
-        assert!(!registration_accepts(&reg, FileChangeType::DELETED));
+        assert!(!bucket_accepts(&bucket, FileChangeType::CREATED));
+        assert!(bucket_accepts(&bucket, FileChangeType::CHANGED));
+        assert!(!bucket_accepts(&bucket, FileChangeType::DELETED));
+    }
+
+    #[test]
+    fn test_anchor_bare_pattern_anchors_extension_globs() {
+        assert_eq!(anchor_bare_pattern("*.rs"), "**/*.rs");
+        assert_eq!(anchor_bare_pattern("Cargo.toml"), "**/Cargo.toml");
+    }
+
+    #[test]
+    fn test_anchor_bare_pattern_preserves_already_anchored() {
+        assert_eq!(anchor_bare_pattern("**/*.rs"), "**/*.rs");
+        assert_eq!(anchor_bare_pattern("/repo/src/*.rs"), "/repo/src/*.rs");
+    }
+
+    #[test]
+    fn test_compute_changes_respects_per_bucket_kind() {
+        let mut create_only = GlobSetBuilder::new();
+        create_only.add(Glob::new("**/Cargo.toml").unwrap());
+        let mut change_only = GlobSetBuilder::new();
+        change_only.add(Glob::new("**/*.rs").unwrap());
+
+        let mut regs = HashMap::new();
+        regs.insert(
+            "1".to_string(),
+            WatcherRegistration {
+                buckets: vec![
+                    GlobBucket {
+                        globs: create_only.build().unwrap(),
+                        kinds: WatchKind::Create,
+                    },
+                    GlobBucket {
+                        globs: change_only.build().unwrap(),
+                        kinds: WatchKind::Change,
+                    },
+                ],
+            },
+        );
+
+        // .rs CHANGED → matches change_only bucket
+        let changes = compute_changes(
+            &regs,
+            vec![(PathBuf::from("/repo/src/lib.rs"), FileChangeType::CHANGED)],
+        );
+        assert_eq!(changes.len(), 1);
+
+        // .rs CREATED → globs match change_only but kinds reject; create_only
+        // kinds accept but globs don't. No match overall.
+        let changes = compute_changes(
+            &regs,
+            vec![(PathBuf::from("/repo/src/lib.rs"), FileChangeType::CREATED)],
+        );
+        assert!(
+            changes.is_empty(),
+            "create on a *.rs file must not match a Change-only bucket"
+        );
+
+        // Cargo.toml CREATED → matches create_only bucket
+        let changes = compute_changes(
+            &regs,
+            vec![(PathBuf::from("/repo/Cargo.toml"), FileChangeType::CREATED)],
+        );
+        assert_eq!(changes.len(), 1);
     }
 }

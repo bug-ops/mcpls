@@ -32,6 +32,9 @@ use crate::lsp::types::{JsonRpcError, LspNotification};
 /// JSON-RPC error code returned for server-to-client requests we do not handle.
 const METHOD_NOT_FOUND: i32 = -32601;
 
+/// JSON-RPC error code returned when params for a known method fail to deserialize.
+const INVALID_PARAMS: i32 = -32602;
+
 /// Channel capacity for inbound server-to-client requests.
 const SERVER_REQUEST_CHANNEL_CAPACITY: usize = 32;
 
@@ -684,7 +687,7 @@ fn parse_params<T: serde::de::DeserializeOwned>(
 ) -> std::result::Result<T, JsonRpcError> {
     let value = params.unwrap_or(serde_json::Value::Null);
     serde_json::from_value(value).map_err(|e| JsonRpcError {
-        code: METHOD_NOT_FOUND,
+        code: INVALID_PARAMS,
         message: format!("invalid params: {e}"),
         data: None,
     })
@@ -879,7 +882,6 @@ mod tests {
             file_watcher: None,
             request_dispatcher: None,
             child: mock_child,
-
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -970,7 +972,6 @@ mod tests {
             file_watcher: None,
             request_dispatcher: None,
             child: mock_child1,
-
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1021,7 +1022,6 @@ mod tests {
             file_watcher: None,
             request_dispatcher: None,
             child: mock_child,
-
         };
 
         result.add_server("rust".to_string(), server);
@@ -1086,7 +1086,6 @@ mod tests {
                 file_watcher: None,
                 request_dispatcher: None,
                 child: mock_child,
-
             };
 
             result.add_server(config.language_id, server);
@@ -1138,7 +1137,6 @@ mod tests {
             file_watcher: None,
             request_dispatcher: None,
             child: mock_child1,
-
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1179,7 +1177,6 @@ mod tests {
             file_watcher: None,
             request_dispatcher: None,
             child: mock_child2,
-
         };
 
         result.add_server("rust".to_string(), server2);

@@ -235,20 +235,26 @@ impl DocumentTracker {
     /// - The `didClose`/`didOpen` notification fails to send
     /// - Resource limits are exceeded
     pub async fn ensure_open(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
-        let signature = stat_signature(path).await?;
+        let signature_before = stat_signature(path).await?;
 
         if let Some(state) = self.documents.get(path)
-            && state.synced_signature == signature
+            && state.synced_signature == signature_before
         {
             return Ok(state.uri.clone());
         }
 
+        // Read then re-stat so the signature describes the bytes actually read.
+        // This closes a TOCTOU window where the file is replaced between the
+        // pre-read stat and the read itself, and also catches same-size
+        // rewrites within a coarse-mtime tick: stat→read→stat will see at
+        // least the post-read mtime advance once we yield back from the read.
         let content = tokio::fs::read_to_string(path)
             .await
             .map_err(|e| Error::FileIo {
                 path: path.to_path_buf(),
                 source: e,
             })?;
+        let signature = stat_signature(path).await?;
 
         if let Some(existing) = self.documents.get(path) {
             let close_params = DidCloseTextDocumentParams {
@@ -259,32 +265,40 @@ impl DocumentTracker {
             lsp_client
                 .notify("textDocument/didClose", close_params)
                 .await?;
-            // Bump the version on resync so the server sees the reopened
-            // document as a strictly newer state.
-            let new_version = existing.version.saturating_add(1);
+            // After didClose+didOpen the server treats this as a fresh open,
+            // so resetting on i32::MAX is safe and avoids permanently sending
+            // duplicate version numbers (which rust-analyzer silently drops).
+            let new_version = if existing.version == i32::MAX {
+                1
+            } else {
+                existing.version + 1
+            };
             let language_id = existing.language_id.clone();
             let uri = existing.uri.clone();
+            // Send didOpen first; only commit tracker state on success so a
+            // failed notify leaves the next call to retry rather than
+            // short-circuiting on a matching but unsent signature.
+            send_did_open(lsp_client, &uri, &language_id, new_version, content.clone()).await?;
             if let Some(state) = self.documents.get_mut(path) {
                 state.version = new_version;
-                state.content.clone_from(&content);
+                state.content = content;
                 state.synced_signature = signature;
             }
-            send_did_open(lsp_client, &uri, &language_id, new_version, content).await?;
             return Ok(uri);
         }
 
         let uri = self.open(path.to_path_buf(), content.clone())?;
-        // Record the signature now that the document is tracked; if the file
-        // is replaced before the next access, the next ensure_open will see a
-        // mismatch and re-sync.
-        self.set_synced_signature(path, signature);
         let language_id = self
             .documents
             .get(path)
             .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?
             .language_id
             .clone();
+        // Send didOpen before recording the signature. On failure the
+        // document stays in the tracker with `SyncSignature::UNKNOWN`, so the
+        // next ensure_open observes a mismatch and retries the sync.
         send_did_open(lsp_client, &uri, &language_id, 1, content).await?;
+        self.set_synced_signature(path, signature);
         Ok(uri)
     }
 }
