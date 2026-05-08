@@ -212,17 +212,44 @@ impl DocumentTracker {
 /// not occur for valid absolute paths.
 #[must_use]
 pub fn path_to_uri(path: &Path) -> Uri {
-    let uri_string = if cfg!(windows) {
-        let path_str = path.to_string_lossy();
-        // canonicalize() on Windows adds a \\?\ extended-path prefix.
-        // Strip it before building the URI — file:////?\C:/ is not valid.
-        let stripped = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
-        format!("file:///{}", stripped.replace('\\', "/"))
-    } else {
-        format!("file://{}", path.display())
-    };
+    let uri_string = file_uri_string(path);
+    let uri_string = encode_rfc3986_path_chars(&uri_string);
     #[allow(clippy::expect_used)]
     uri_string.parse().expect("failed to create URI from path")
+}
+
+#[cfg(not(windows))]
+fn file_uri_string(path: &Path) -> String {
+    #[allow(clippy::expect_used)]
+    let file_url = Url::from_file_path(path).expect("failed to create file URI from path");
+    file_url.into()
+}
+
+#[cfg(windows)]
+fn file_uri_string(path: &Path) -> String {
+    match Url::from_file_path(path) {
+        Ok(file_url) => file_url.into(),
+        Err(()) if path.has_root() => windows_rooted_path_to_file_uri(path),
+        Err(()) => panic!("failed to create file URI from path"),
+    }
+}
+
+#[cfg(windows)]
+fn windows_rooted_path_to_file_uri(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+    let stripped = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
+    format!("file:///{}", stripped.replace('\\', "/"))
+}
+
+fn encode_rfc3986_path_chars(uri: &str) -> String {
+    let path_start = url::Position::BeforePath as usize;
+    let (prefix, path) = uri.split_at(path_start);
+    let encoded_path = path
+        .replace('[', "%5B")
+        .replace(']', "%5D")
+        .replace('^', "%5E")
+        .replace('|', "%7C");
+    format!("{prefix}{encoded_path}")
 }
 
 /// Convert an LSP `file://` URI to an absolute filesystem path.
@@ -634,6 +661,28 @@ mod tests {
         let uri = path_to_uri(path);
         assert!(uri.as_str().starts_with("file://"));
         assert!(uri.as_str().contains("project-test"));
+    }
+
+    #[test]
+    fn test_path_to_uri_percent_encodes_reserved_chars() {
+        #[cfg(windows)]
+        let path = Path::new(r"C:\home\user\routes\api\[...]^|.ts");
+        #[cfg(not(windows))]
+        let path = Path::new("/home/user/routes/api/[...]^|.ts");
+
+        let uri = path_to_uri(path);
+
+        #[cfg(windows)]
+        let expected = "file:///C:/home/user/routes/api/%5B...%5D%5E%7C.ts";
+        #[cfg(not(windows))]
+        let expected = "file:///home/user/routes/api/%5B...%5D%5E%7C.ts";
+
+        assert_eq!(uri.as_str(), expected);
+        assert_eq!(
+            uri_to_path(&uri).as_deref(),
+            Some(path),
+            "encoded file URI should round-trip to the original path"
+        );
     }
 
     #[test]
