@@ -170,7 +170,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
       - name: Download test archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextest-archive-${{ matrix.os }}
       - name: Run unit tests
@@ -192,7 +192,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
       - name: Download test archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextest-archive-${{ matrix.os }}
       - name: Run integration tests
@@ -214,11 +214,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
       - name: Download test archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextest-archive-${{ matrix.os }}
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mcpls-binary-${{ matrix.os }}
           path: target/debug/
