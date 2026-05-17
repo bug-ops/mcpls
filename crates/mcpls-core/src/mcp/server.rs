@@ -604,7 +604,7 @@ impl ServerHandler for McplsServer {
         let diagnostics = {
             let translator = self.context.translator.lock().await;
             translator
-                .notification_cache()
+                .notification_cache_mut()
                 .get_diagnostics(lsp_uri.as_str())
                 .cloned()
         };
