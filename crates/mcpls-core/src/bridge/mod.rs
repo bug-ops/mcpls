@@ -14,7 +14,7 @@ pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
 pub use resources::ResourceSubscriptions;
-pub use state::{DocumentState, DocumentTracker, path_to_uri, uri_to_path};
+pub use state::{DocumentState, DocumentTracker, SyncSignature, path_to_uri, uri_to_path};
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,

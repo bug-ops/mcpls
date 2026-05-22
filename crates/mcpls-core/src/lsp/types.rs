@@ -76,7 +76,12 @@ pub enum RequestId {
 pub enum InboundMessage {
     /// Response to a request.
     Response(JsonRpcResponse),
-    /// Request from server to client.
+    /// Server-to-client request.
+    ///
+    /// LSP servers may send requests back to the client (e.g.
+    /// `client/registerCapability`, `workspace/configuration`,
+    /// `window/workDoneProgress/create`). The client must respond with a
+    /// matching id, otherwise the server will block waiting.
     Request(JsonRpcRequest),
     /// Notification from server.
     Notification(JsonRpcNotification),
