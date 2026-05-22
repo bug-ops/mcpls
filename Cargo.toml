@@ -29,7 +29,7 @@ lsp-types = "0.97"
 mcpls-core = { path = "crates/mcpls-core", version = "0.3.6" }
 notify = "8.0"
 predicates = "3.1"
-rmcp = "1.6.0"
+rmcp = "1.7.0"
 rstest = "0.26"
 schemars = "1.2"
 serde = "1.0"
