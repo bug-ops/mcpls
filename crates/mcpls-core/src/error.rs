@@ -43,6 +43,8 @@ pub enum Error {
         code: i32,
         /// Error message from the server.
         message: String,
+        /// Optional additional data from the JSON-RPC error object.
+        data: Option<serde_json::Value>,
     },
 
     /// MCP server error.
@@ -211,6 +213,7 @@ mod tests {
         let err = Error::LspServerError {
             code: -32600,
             message: "Invalid request".to_string(),
+            data: None,
         };
         assert_eq!(
             err.to_string(),

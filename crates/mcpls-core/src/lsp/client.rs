@@ -22,6 +22,15 @@ use crate::lsp::types::{
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
 
+/// LSP error code returned when the server cancels a request and wants the client to retry.
+const SERVER_CANCELLED_CODE: i32 = -32802;
+
+/// Maximum number of retry attempts for server-cancelled requests.
+const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
+
+/// Initial backoff delay for server-cancelled retries (milliseconds).
+const SERVER_CANCELLED_INITIAL_DELAY_MS: u64 = 500;
+
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
 
@@ -174,6 +183,10 @@ impl LspClient {
 
     /// Send request and wait for response with timeout.
     ///
+    /// Automatically retries up to 3 times when the server returns error code
+    /// -32802 (`ServerCancelled`) with `data.retriggerRequest == true`, using
+    /// exponential backoff starting at 500 ms.
+    ///
     /// # Type Parameters
     ///
     /// * `P` - The type of the request parameters (must be serializable)
@@ -196,35 +209,86 @@ impl LspClient {
         P: Serialize,
         R: DeserializeOwned,
     {
-        let id = RequestId::Number(self.request_counter.fetch_add(1, Ordering::SeqCst));
         let params_value = serde_json::to_value(params)?;
+        let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
 
-        let (response_tx, response_rx) = oneshot::channel();
+        for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
+            if attempt > 0 {
+                debug!(
+                    "Retrying {} after ServerCancelled (attempt {}/{}), backoff={}ms",
+                    method, attempt, SERVER_CANCELLED_MAX_RETRIES, delay_ms
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms *= 2;
+            }
 
-        let request = JsonRpcRequest {
-            jsonrpc: JSONRPC_VERSION.to_string(),
-            id: id.clone(),
-            method: method.to_string(),
-            params: Some(params_value),
-        };
+            let id = RequestId::Number(self.request_counter.fetch_add(1, Ordering::SeqCst));
+            let (response_tx, response_rx) = oneshot::channel();
+            let request = JsonRpcRequest {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: id.clone(),
+                method: method.to_string(),
+                params: Some(params_value.clone()),
+            };
 
-        debug!("Sending request: {} (id={:?})", method, id);
+            debug!("Sending request: {} (id={:?})", method, id);
 
-        self.command_tx
-            .send(ClientCommand::SendRequest {
-                request,
-                response_tx,
-            })
-            .await
-            .map_err(|_| Error::ServerTerminated)?;
+            self.command_tx
+                .send(ClientCommand::SendRequest {
+                    request,
+                    response_tx,
+                })
+                .await
+                .map_err(|_| Error::ServerTerminated)?;
 
-        let result_value = timeout(timeout_duration, response_rx)
-            .await
-            .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?
-            .map_err(|_| Error::ServerTerminated)??;
+            let outcome = timeout(timeout_duration, response_rx)
+                .await
+                .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?
+                .map_err(|_| Error::ServerTerminated)?;
 
-        serde_json::from_value(result_value)
-            .map_err(|e| Error::LspProtocolError(format!("Failed to deserialize response: {e}")))
+            match outcome {
+                Ok(result_value) => {
+                    return serde_json::from_value(result_value).map_err(|e| {
+                        Error::LspProtocolError(format!("Failed to deserialize response: {e}"))
+                    });
+                }
+                Err(Error::LspServerError {
+                    code,
+                    ref message,
+                    ref data,
+                }) if code == SERVER_CANCELLED_CODE && Self::should_retrigger(data.as_ref()) => {
+                    warn!(
+                        "ServerCancelled (-32802) on '{}', will retry: {}",
+                        method, message
+                    );
+                    if attempt == SERVER_CANCELLED_MAX_RETRIES {
+                        return Err(Error::LspServerError {
+                            code,
+                            message: message.clone(),
+                            data: data.clone(),
+                        });
+                    }
+                    // continue loop for next attempt
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(Error::ServerTerminated)
+    }
+
+    /// Returns true when the error data from a `ServerCancelled` (-32802) response
+    /// indicates the server wants the client to retrigger the request.
+    ///
+    /// Per the LSP specification, `data.retriggerRequest == true` is the signal.
+    /// When `data` is absent (older servers), we default to retrying anyway because
+    /// code -32802 is exclusively used for this purpose.
+    fn should_retrigger(data: Option<&Value>) -> bool {
+        data.is_none_or(|v| {
+            v.get("retriggerRequest")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
     }
 
     /// Send notification (fire-and-forget, no response expected).
@@ -360,6 +424,7 @@ impl LspClient {
                                     let _ = sender.send(Err(Error::LspServerError {
                                         code: error.code,
                                         message: error.message,
+                                        data: error.data,
                                     }));
                                 } else if let Some(result) = response.result {
                                     let _ = sender.send(Ok(result));
@@ -630,13 +695,14 @@ mod tests {
             let _ = sender.send(Err(Error::LspServerError {
                 code: error.code,
                 message: error.message,
+                data: error.data,
             }));
         }
 
         let result = response_rx.await.unwrap();
         assert!(result.is_err(), "Should receive error");
 
-        if let Err(Error::LspServerError { code, message }) = result {
+        if let Err(Error::LspServerError { code, message, .. }) = result {
             assert_eq!(code, -32601);
             assert_eq!(message, "Method not found");
         } else {
@@ -692,13 +758,14 @@ mod tests {
             let _ = sender.send(Err(Error::LspServerError {
                 code: error.code,
                 message: error.message,
+                data: error.data,
             }));
         }
 
         let result = response_rx.await.unwrap();
         assert!(result.is_err());
 
-        if let Err(Error::LspServerError { code, message }) = result {
+        if let Err(Error::LspServerError { code, message, .. }) = result {
             assert_eq!(code, -32700);
             assert_eq!(
                 message.len(),
