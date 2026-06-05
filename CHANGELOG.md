@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Initialize handshake timeout** — the LSP `initialize` request now honors the per-server `timeout_seconds` configuration instead of a hardcoded 30 s, so servers that need longer to load on large projects are no longer killed mid-initialization. (#172)
+
 - **ServerCancelled retry** — `LspClient::request()` now retries up to 3 times with exponential backoff (500 ms → 1 s → 2 s) when an LSP server returns error code -32802 with `data.retriggerRequest: true`, instead of propagating the error immediately to the MCP caller (#128)
 - **Integration test readiness gate** — Replaced `publishDiagnostics`-based readiness signal with hover-probe polling (3 consecutive successful hover responses required), matching the ra_e2e approach; fixes 3 of 5 integration tests that failed consistently in isolation after PR #123 (#127)
 - **LSP server requests** — Handle server-to-client requests such as `client/registerCapability`, fixing tsgo timeouts.

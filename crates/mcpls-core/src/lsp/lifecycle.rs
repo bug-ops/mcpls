@@ -382,8 +382,15 @@ impl LspServer {
             ..Default::default()
         };
 
+        // Use the server's configured timeout for the initialize handshake too,
+        // not a hardcoded 30s: large solutions (e.g. a 130-project Unity .sln via
+        // OmniSharp) take minutes to respond to `initialize`.
         let result: InitializeResult = client
-            .request("initialize", params, Duration::from_secs(30))
+            .request(
+                "initialize",
+                params,
+                Duration::from_secs(config.server_config.timeout_seconds),
+            )
             .await
             .map_err(|e| Error::LspInitFailed {
                 message: format!("Initialize request failed: {e}"),
