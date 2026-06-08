@@ -417,7 +417,13 @@ fn spawn_lsp_servers_background(
         let server_count = result.server_count();
         let notification_receivers = {
             let mut t = translator.lock().await;
-            register_servers(result, &mut t)
+            let receivers = register_servers(result, &mut t);
+            // Background initialization has completed; stop reporting "still
+            // initializing" (especially for languages whose server failed to
+            // spawn on partial success, which would otherwise return
+            // ServerInitializing forever instead of NoServerForLanguage).
+            t.clear_expected_languages();
+            receivers
         };
         info!("Proceeding with {} LSP server(s)", server_count);
 
