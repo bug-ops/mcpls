@@ -66,7 +66,7 @@ pub enum Error {
 
     /// LSP server for the language is configured but still initializing.
     #[error(
-        "LSP server for language '{0}' is still initializing (large project load in progress); wait a few seconds and retry the request"
+        "LSP server for language '{0}' is still initializing (large project load in progress); wait and retry the request (this may take a few minutes on large projects)"
     )]
     ServerInitializing(String),
 

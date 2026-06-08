@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::error::{Error, Result};
 use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
@@ -111,7 +111,10 @@ impl LspTransport {
             // (or other non-object) JSON-RPC message. Skip it and read the next
             // framed message instead of killing the whole message loop.
             if !value.is_object() {
-                warn!("Skipping non-object LSP message: {}", value);
+                // Some servers (notably OmniSharp) emit a burst of these during
+                // startup; log at debug to avoid flooding the logs for what is a
+                // recoverable, expected condition.
+                debug!("Skipping non-object LSP message: {}", value);
                 continue;
             }
 

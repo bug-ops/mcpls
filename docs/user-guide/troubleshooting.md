@@ -233,7 +233,7 @@ mcpls --log-level debug
 roots = ["/Users/username/current-project"]
 ```
 
-**Note**: `timeout_seconds` also bounds the initial `initialize` handshake, so raising it (Solution 1) is what helps a server that needs minutes to load a large solution. While a configured server is still initializing, tool calls for that language return a "server is still initializing - wait a few seconds and retry" message rather than a hard "no server configured" error.
+**Note**: `timeout_seconds` also bounds the initial `initialize` handshake, so raising it (Solution 1) is what helps a server that needs minutes to load a large solution. While a configured server is still initializing, tool calls for that language return a "server is still initializing - wait and retry" message (loading a large solution may take a few minutes) rather than a hard "no server configured" error.
 
 ### "rust-analyzer indexing takes forever"
 
