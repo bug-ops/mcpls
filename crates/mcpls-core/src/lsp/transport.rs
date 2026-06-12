@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::error::{Error, Result};
 use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
@@ -84,27 +84,42 @@ impl LspTransport {
     /// - JSON parsing fails
     /// - Message format is invalid
     pub async fn receive(&mut self) -> Result<InboundMessage> {
-        let headers = self.read_headers().await?;
+        loop {
+            let headers = self.read_headers().await?;
 
-        let content_length = headers
-            .get("content-length")
-            .ok_or_else(|| Error::LspProtocolError("Missing Content-Length header".to_string()))?
-            .parse::<usize>()
-            .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
+            let content_length = headers
+                .get("content-length")
+                .ok_or_else(|| {
+                    Error::LspProtocolError("Missing Content-Length header".to_string())
+                })?
+                .parse::<usize>()
+                .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
 
-        if content_length > MAX_CONTENT_LENGTH {
-            return Err(Error::LspProtocolError(format!(
-                "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
-            )));
+            if content_length > MAX_CONTENT_LENGTH {
+                return Err(Error::LspProtocolError(format!(
+                    "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
+                )));
+            }
+
+            let content = self.read_content(content_length).await?;
+
+            trace!("Received LSP message: {}", content);
+
+            let value: Value = serde_json::from_str(&content)?;
+
+            // Some servers (notably OmniSharp) occasionally emit a bare `null`
+            // (or other non-object) JSON-RPC message. Skip it and read the next
+            // framed message instead of killing the whole message loop.
+            if !value.is_object() {
+                // Some servers (notably OmniSharp) emit a burst of these during
+                // startup; log at debug to avoid flooding the logs for what is a
+                // recoverable, expected condition.
+                debug!("Skipping non-object LSP message: {}", value);
+                continue;
+            }
+
+            return parse_inbound_message(value);
         }
-
-        let content = self.read_content(content_length).await?;
-
-        trace!("Received LSP message: {}", content);
-
-        let value: Value = serde_json::from_str(&content)?;
-
-        parse_inbound_message(value)
     }
 
     /// Read headers until blank line.

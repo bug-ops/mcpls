@@ -234,7 +234,10 @@ Glob pattern syntax:
 **Type**: Integer
 **Default**: `30`
 
-Timeout in seconds for LSP server operations.
+Timeout in seconds for LSP server operations, including the initial `initialize`
+handshake. Servers that load a large project before answering `initialize`
+(e.g. OmniSharp on a big Unity/C# solution) need this raised - the default 30 s
+can otherwise cut the server off mid-initialization.
 
 ```toml
 [[lsp_servers]]

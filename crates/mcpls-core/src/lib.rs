@@ -311,40 +311,21 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         applicable_configs.len()
     );
 
-    // notification_receivers collects per-language mpsc receivers used by the pump tasks.
-    let mut notification_receivers = std::collections::HashMap::new();
+    // Mark applicable languages as "expected" so a tool call that arrives while
+    // its server is still initializing gets a clear "still initializing" error
+    // (instead of "no server configured"), telling the caller to wait and retry.
+    let expected_languages: std::collections::HashSet<String> = applicable_configs
+        .iter()
+        .map(|c| c.server_config.language_id.clone())
+        .collect();
+    translator.set_expected_languages(expected_languages);
 
-    if applicable_configs.is_empty() {
-        warn!("No applicable LSP servers configured — starting in protocol-only mode");
-    } else {
-        // Spawn all servers with graceful degradation.
-        let result = LspServer::spawn_batch(&applicable_configs).await;
-
-        // Handle the three possible outcomes.
-        if result.all_failed() {
-            return Err(Error::AllServersFailedToInit {
-                count: result.failure_count(),
-                failures: result.failures,
-            });
-        }
-
-        if result.partial_success() {
-            warn!(
-                "Partial server initialization: {} succeeded, {} failed",
-                result.server_count(),
-                result.failure_count()
-            );
-            for failure in &result.failures {
-                error!("Server initialization failed: {}", failure);
-            }
-        }
-
-        // Register servers and extract their notification receivers.
-        let server_count = result.server_count();
-        notification_receivers = register_servers(result, &mut translator);
-        info!("Proceeding with {} LSP server(s)", server_count);
-    }
-
+    // Shared state, built BEFORE LSP initialization so the MCP server can answer
+    // `initialize` immediately. LSP servers (which can take minutes to initialize
+    // on a large solution, e.g. a 130-project Unity .sln via OmniSharp) are spawned
+    // in a background task and registered into this shared translator once ready.
+    // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
+    // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
     let translator = Arc::new(Mutex::new(translator));
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
@@ -352,19 +333,21 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     // Cancellation for pump tasks: send `true` to request shutdown.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let mut pumps: JoinSet<()> = JoinSet::new();
 
-    // Phase A: start pump tasks before MCP serve so no notifications are dropped
-    // while the transport is being established.
-    for (lang, rx) in notification_receivers {
-        pumps.spawn(diagnostics_pump(
-            lang,
-            rx,
+    if applicable_configs.is_empty() {
+        warn!("No applicable LSP servers configured — starting in protocol-only mode");
+    } else {
+        info!(
+            "Spawning {} LSP server(s) in the background...",
+            applicable_configs.len()
+        );
+        spawn_lsp_servers_background(
+            applicable_configs,
             Arc::clone(&translator),
             Arc::clone(&subscriptions),
             Arc::clone(&peer_cell),
             cancel_rx.clone(),
-        ));
+        );
     }
 
     info!("Starting MCP server with rmcp...");
@@ -380,12 +363,84 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Transport::Http(cfg) => run_http(mcp_server, cfg).await,
     };
 
-    // Signal pump tasks to exit and wait for them.
+    // Signal background pump tasks to exit.
     let _ = cancel_tx.send(true);
-    while pumps.join_next().await.is_some() {}
 
     info!("MCPLS server shutting down");
     result
+}
+
+/// Spawn the applicable LSP servers in a background task and register them into
+/// the shared `translator` once ready.
+///
+/// This intentionally does NOT block the caller: `serve_with` starts the MCP
+/// server immediately so its `initialize` handshake returns before slow language
+/// servers (e.g. `OmniSharp` on a large Unity solution, which can take minutes to
+/// load) finish initializing. Tool calls that arrive before a server has
+/// registered return a `ServerInitializing` error telling the caller to wait and
+/// retry. If every server fails, the "expected languages" set is cleared so those
+/// calls fall back to a plain "no server configured" error instead.
+fn spawn_lsp_servers_background(
+    applicable_configs: Vec<ServerInitConfig>,
+    translator: Arc<Mutex<Translator>>,
+    subscriptions: Arc<ResourceSubscriptions>,
+    peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let result = LspServer::spawn_batch(&applicable_configs).await;
+
+        if result.all_failed() {
+            error!(
+                "All {} configured LSP server(s) failed to initialize",
+                result.failure_count()
+            );
+            for failure in &result.failures {
+                error!("Server initialization failed: {}", failure);
+            }
+            // No server will register; stop reporting "still initializing".
+            translator.lock().await.clear_expected_languages();
+            return;
+        }
+
+        if result.partial_success() {
+            warn!(
+                "Partial server initialization: {} succeeded, {} failed",
+                result.server_count(),
+                result.failure_count()
+            );
+            for failure in &result.failures {
+                error!("Server initialization failed: {}", failure);
+            }
+        }
+
+        let server_count = result.server_count();
+        let notification_receivers = {
+            let mut t = translator.lock().await;
+            let receivers = register_servers(result, &mut t);
+            // Background initialization has completed; stop reporting "still
+            // initializing" (especially for languages whose server failed to
+            // spawn on partial success, which would otherwise return
+            // ServerInitializing forever instead of NoServerForLanguage).
+            t.clear_expected_languages();
+            receivers
+        };
+        info!("Proceeding with {} LSP server(s)", server_count);
+
+        // Start diagnostics pump tasks now that servers are registered.
+        let mut pumps: JoinSet<()> = JoinSet::new();
+        for (lang, rx) in notification_receivers {
+            pumps.spawn(diagnostics_pump(
+                lang,
+                rx,
+                Arc::clone(&translator),
+                Arc::clone(&subscriptions),
+                Arc::clone(&peer_cell),
+                cancel_rx.clone(),
+            ));
+        }
+        while pumps.join_next().await.is_some() {}
+    });
 }
 
 #[cfg(test)]
@@ -644,10 +699,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_serve_fails_with_no_servers_available() {
+        async fn test_serve_degrades_when_all_servers_fail_to_spawn() {
             use crate::config::{LspServerConfig, WorkspaceConfig};
 
-            // Create a config with an invalid server (guaranteed to fail)
+            // A configured server whose command cannot spawn used to make serve()
+            // fail synchronously with NoServersAvailable / AllServersFailedToInit.
+            // LSP initialization now runs in a background task so the MCP
+            // `initialize` handshake is never blocked, which means the spawn
+            // failure is handled in the background instead: serve() starts the MCP
+            // server in degraded mode (mirroring `test_serve_starts_with_empty_config`)
+            // rather than failing fast. Any error it surfaces must therefore be a
+            // transport/MCP error from the closed test connection, NOT a fail-fast
+            // server-availability error.
             let config = ServerConfig {
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
@@ -667,18 +730,25 @@ mod tests {
                 }],
             };
 
-            let result = serve(config).await;
+            // serve() proceeds to run the MCP server and blocks on the stdio
+            // transport until EOF; bound it so the test can't hang if stdin stays
+            // open (e.g. under multi-threaded `cargo test`, where several serve()
+            // tests share the process stdin).
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(2), serve(config)).await;
 
-            assert!(result.is_err());
-            let err = result.unwrap_err();
-
-            // The serve function should now return NoServersAvailable error
-            // because all servers failed, but has_servers() returned false
-            assert!(
-                matches!(err, Error::NoServersAvailable(_))
-                    || matches!(err, Error::AllServersFailedToInit { .. }),
-                "Expected NoServersAvailable or AllServersFailedToInit error, got: {err:?}"
-            );
+            match outcome {
+                // Still serving after the deadline => it did not fail fast. Good.
+                Err(_elapsed) => {}
+                // Transport closed cleanly. Also fine.
+                Ok(Ok(())) => {}
+                // It returned an error: it must not be a fail-fast availability error.
+                Ok(Err(err)) => assert!(
+                    !matches!(err, Error::NoServersAvailable(_))
+                        && !matches!(err, Error::AllServersFailedToInit { .. }),
+                    "serve() must not fail fast now that LSP init is backgrounded; got: {err:?}"
+                ),
+            }
         }
 
         #[tokio::test]

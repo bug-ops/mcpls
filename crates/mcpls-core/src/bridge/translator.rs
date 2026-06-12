@@ -1,6 +1,6 @@
 //! MCP to LSP translation layer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lsp_types::{
@@ -39,6 +39,10 @@ pub struct Translator {
     workspace_roots: Vec<PathBuf>,
     /// Custom file extension to language ID mappings.
     extension_map: HashMap<String, String>,
+    /// Languages that are configured + applicable but whose LSP server may not
+    /// have finished initializing yet (background init). Used to return a clear
+    /// "still initializing" error instead of "no server configured".
+    expected_languages: HashSet<String>,
 }
 
 impl Translator {
@@ -52,12 +56,24 @@ impl Translator {
             notification_cache: NotificationCache::new(),
             workspace_roots: vec![],
             extension_map: HashMap::new(),
+            expected_languages: HashSet::new(),
         }
     }
 
     /// Set the workspace roots for path validation.
     pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
         self.workspace_roots = roots;
+    }
+
+    /// Mark the set of languages whose LSP servers are expected (configured +
+    /// applicable) but may still be initializing in the background.
+    pub fn set_expected_languages(&mut self, languages: HashSet<String>) {
+        self.expected_languages = languages;
+    }
+
+    /// Clear the expected-languages set (e.g. after background init failed).
+    pub fn clear_expected_languages(&mut self) {
+        self.expected_languages.clear();
     }
 
     /// Configure custom file extension mappings.
@@ -555,10 +571,17 @@ impl Translator {
     /// Get a cloned LSP client for a file path based on language detection.
     fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
         let language_id = detect_language(path, &self.extension_map);
-        self.lsp_clients
-            .get(&language_id)
-            .cloned()
-            .ok_or(Error::NoServerForLanguage(language_id))
+        self.lsp_clients.get(&language_id).cloned().ok_or_else(|| {
+            // A configured+applicable language whose server has not registered
+            // yet is still initializing (e.g. a large Unity solution loading via
+            // OmniSharp); tell the caller to wait and retry rather than implying
+            // no server is configured at all.
+            if self.expected_languages.contains(&language_id) {
+                Error::ServerInitializing(language_id)
+            } else {
+                Error::NoServerForLanguage(language_id)
+            }
+        })
     }
 
     /// Parse and validate a file URI, returning the validated path.
@@ -1135,13 +1158,17 @@ impl Translator {
             )));
         }
 
-        // Workspace search requires at least one LSP client
-        let client = self
-            .lsp_clients
-            .values()
-            .next()
-            .cloned()
-            .ok_or(Error::NoServerConfigured)?;
+        // Workspace search requires at least one LSP client. If none are
+        // registered yet but a configured server is still initializing, tell the
+        // caller to wait and retry rather than implying nothing is configured.
+        let client = self.lsp_clients.values().next().cloned().ok_or_else(|| {
+            self.expected_languages
+                .iter()
+                .next()
+                .map_or(Error::NoServerConfigured, |lang| {
+                    Error::ServerInitializing(lang.clone())
+                })
+        })?;
 
         let params = LspWorkspaceSymbolParams {
             query,
@@ -2090,6 +2117,53 @@ mod tests {
         // and a real LSP server process. The actual registration functionality is
         // tested in integration tests (see rust_analyzer_tests.rs).
         // This test verifies the data structure is properly initialized.
+    }
+
+    #[test]
+    fn test_get_client_for_file_server_initializing_when_expected() {
+        // A configured/applicable language whose LSP client has not registered
+        // yet (large solution still loading via OmniSharp) must surface
+        // ServerInitializing — "wait and retry" — not NoServerForLanguage.
+        let mut translator = Translator::new();
+        let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
+        let lang = detect_language(&path, &translator.extension_map);
+
+        let mut expected = HashSet::new();
+        expected.insert(lang.clone());
+        translator.set_expected_languages(expected);
+
+        let err = translator.get_client_for_file(&path).unwrap_err();
+        assert!(matches!(err, Error::ServerInitializing(ref l) if *l == lang));
+    }
+
+    #[test]
+    fn test_get_client_for_file_no_server_when_not_expected() {
+        // When the language is not in the expected set (no server configured for
+        // it at all), the error stays NoServerForLanguage.
+        let translator = Translator::new();
+        let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
+        let lang = detect_language(&path, &translator.extension_map);
+
+        let err = translator.get_client_for_file(&path).unwrap_err();
+        assert!(matches!(err, Error::NoServerForLanguage(ref l) if *l == lang));
+    }
+
+    #[test]
+    fn test_clear_expected_languages_reverts_to_no_server() {
+        // After initialization fails the expected set is cleared; subsequent
+        // lookups must fall back to NoServerForLanguage rather than keep
+        // implying the server is still on its way.
+        let mut translator = Translator::new();
+        let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
+        let lang = detect_language(&path, &translator.extension_map);
+
+        let mut expected = HashSet::new();
+        expected.insert(lang);
+        translator.set_expected_languages(expected);
+        translator.clear_expected_languages();
+
+        let err = translator.get_client_for_file(&path).unwrap_err();
+        assert!(matches!(err, Error::NoServerForLanguage(_)));
     }
 
     #[test]
