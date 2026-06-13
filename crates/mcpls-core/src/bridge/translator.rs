@@ -103,11 +103,6 @@ impl Translator {
     pub const fn notification_cache_mut(&mut self) -> &mut NotificationCache {
         &mut self.notification_cache
     }
-
-    // TODO: These methods will be implemented in Phase 3-5
-    // Initialize and shutdown are now handled by LspServer in lifecycle.rs
-
-    // Future implementation will use LspServer instead of LspClient directly
 }
 
 impl Default for Translator {
