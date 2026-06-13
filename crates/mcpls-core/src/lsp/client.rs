@@ -617,6 +617,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_should_retrigger_defaults_to_true_without_data() {
+        assert!(LspClient::should_retrigger(None));
+    }
+
+    #[test]
+    fn test_should_retrigger_uses_retrigger_request_false() {
+        let data = serde_json::json!({ "retriggerRequest": false });
+        assert!(!LspClient::should_retrigger(Some(&data)));
+    }
+
+    #[test]
+    fn test_should_retrigger_uses_retrigger_request_true() {
+        let data = serde_json::json!({ "retriggerRequest": true });
+        assert!(LspClient::should_retrigger(Some(&data)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_server_cancelled_retry_exhaustion_returns_error() {
+        let config = LspServerConfig::rust_analyzer();
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        let client = LspClient {
+            config,
+            state: Arc::new(Mutex::new(crate::lsp::ServerState::Initializing)),
+            request_counter: Arc::new(AtomicI64::new(1)),
+            command_tx,
+            receiver_task: None,
+        };
+
+        let handle = tokio::spawn(async move {
+            client
+                .request::<_, Value>(
+                    "textDocument/hover",
+                    serde_json::json!({}),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+
+        let backoffs = [
+            Duration::ZERO,
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ];
+
+        for (attempt, backoff) in backoffs.into_iter().enumerate() {
+            tokio::time::advance(backoff).await;
+            let Some(command) = command_rx.recv().await else {
+                panic!("request command");
+            };
+            match command {
+                ClientCommand::SendRequest { response_tx, .. } => {
+                    assert!(
+                        response_tx
+                            .send(Err(Error::LspServerError {
+                                code: SERVER_CANCELLED_CODE,
+                                message: format!("cancelled attempt {attempt}"),
+                                data: Some(serde_json::json!({ "retriggerRequest": true })),
+                            }))
+                            .is_ok(),
+                        "request receiver should still be alive"
+                    );
+                }
+                ClientCommand::SendNotification { .. } | ClientCommand::Shutdown => {
+                    panic!("expected request command")
+                }
+            }
+        }
+
+        let result = handle.await.unwrap();
+        match result {
+            Err(Error::LspServerError {
+                code,
+                message,
+                data,
+            }) => {
+                assert_eq!(code, SERVER_CANCELLED_CODE);
+                assert_eq!(message, "cancelled attempt 3");
+                assert_eq!(data, Some(serde_json::json!({ "retriggerRequest": true })));
+            }
+            other => panic!("expected retry exhaustion ServerCancelled error, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_null_response_handling() {
         use crate::lsp::types::{JsonRpcResponse, RequestId};
