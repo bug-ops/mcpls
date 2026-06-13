@@ -116,6 +116,7 @@ impl Default for Translator {
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DiagnosticRequestParams {
@@ -130,6 +131,7 @@ pub(crate) struct DiagnosticRequestParams {
     partial_result_params: PartialResultParams,
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn diagnostic_request_params(
     text_document: TextDocumentIdentifier,
 ) -> DiagnosticRequestParams {
@@ -143,6 +145,7 @@ pub(crate) fn diagnostic_request_params(
 }
 
 /// State needed to issue a diagnostics request without holding the translator lock.
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct PreparedDiagnosticsRequest {
     /// LSP client for the target file's language.
     pub(crate) client: LspClient,
