@@ -2944,6 +2944,67 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_cached_diagnostics_preserves_distinct_messages_with_same_code() {
+        let mut translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let canonical_path = test_file.canonicalize().unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        let range = lsp_types::Range {
+            start: lsp_types::Position {
+                line: 0,
+                character: 0,
+            },
+            end: lsp_types::Position {
+                line: 0,
+                character: 5,
+            },
+        };
+        let diagnostics = vec![
+            lsp_types::Diagnostic {
+                range,
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "first type mismatch".to_string(),
+                code: Some(lsp_types::NumberOrString::String("E0308".to_string())),
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+            lsp_types::Diagnostic {
+                range,
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "second type mismatch".to_string(),
+                code: Some(lsp_types::NumberOrString::String("E0308".to_string())),
+                source: None,
+                code_description: None,
+                related_information: None,
+                tags: None,
+                data: None,
+            },
+        ];
+
+        translator
+            .notification_cache_mut()
+            .store_diagnostics(&uri, Some(1), diagnostics);
+
+        let result = translator.handle_cached_diagnostics(test_file.to_str().unwrap());
+        assert!(result.is_ok());
+        let diags = result.unwrap();
+
+        assert_eq!(diags.diagnostics.len(), 2);
+        assert_eq!(diags.diagnostics[0].message, "first type mismatch");
+        assert_eq!(diags.diagnostics[1].message, "second type mismatch");
+    }
+
+    #[test]
     fn test_handle_cached_diagnostics_invalid_path() {
         let mut translator = Translator::new();
         let result = translator.handle_cached_diagnostics("/nonexistent/path/file.rs");
