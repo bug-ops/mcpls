@@ -45,7 +45,13 @@ impl McplsServer {
 
     /// Get hover information at a position in a file.
     #[tool(
-        description = "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols."
+        description = "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols.",
+        annotations(
+            title = "Get Hover",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_hover(
         &self,
@@ -69,7 +75,13 @@ impl McplsServer {
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = "Definition location of symbol at position. Returns file path, line, and character where declared."
+        description = "Definition location of symbol at position. Returns file path, line, and character where declared.",
+        annotations(
+            title = "Get Definition",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_definition(
         &self,
@@ -95,7 +107,13 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = "All references to symbol at position. Returns locations across workspace where symbol is used."
+        description = "All references to symbol at position. Returns locations across workspace where symbol is used.",
+        annotations(
+            title = "Get References",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_references(
         &self,
@@ -122,7 +140,13 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location."
+        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location.",
+        annotations(
+            title = "Get Diagnostics",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_diagnostics(
         &self,
@@ -142,7 +166,13 @@ impl McplsServer {
 
     /// Rename a symbol across the workspace.
     #[tool(
-        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used."
+        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used.",
+        annotations(
+            title = "Rename Symbol",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn rename_symbol(
         &self,
@@ -169,7 +199,13 @@ impl McplsServer {
 
     /// Get code completion suggestions.
     #[tool(
-        description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets."
+        description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets.",
+        annotations(
+            title = "Get Completions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_completions(
         &self,
@@ -196,7 +232,13 @@ impl McplsServer {
 
     /// Get all symbols in a document.
     #[tool(
-        description = "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations."
+        description = "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations.",
+        annotations(
+            title = "Get Document Symbols",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_document_symbols(
         &self,
@@ -216,7 +258,13 @@ impl McplsServer {
 
     /// Format a document according to language server rules.
     #[tool(
-        description = "Format document with language-specific rules. Returns text edits for indentation, spacing, and style."
+        description = "Format document with language-specific rules. Returns text edits for indentation, spacing, and style.",
+        annotations(
+            title = "Format Document",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn format_document(
         &self,
@@ -242,7 +290,13 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = "Search workspace symbols by name. Supports partial matching and fuzzy search."
+        description = "Search workspace symbols by name. Supports partial matching and fuzzy search.",
+        annotations(
+            title = "Search Workspace Symbols",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn workspace_symbol_search(
         &self,
@@ -268,7 +322,13 @@ impl McplsServer {
 
     /// Get code actions for a range.
     #[tool(
-        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits."
+        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits.",
+        annotations(
+            title = "Get Code Actions",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn get_code_actions(
         &self,
@@ -304,7 +364,13 @@ impl McplsServer {
 
     /// Prepare call hierarchy at a position.
     #[tool(
-        description = "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis."
+        description = "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis.",
+        annotations(
+            title = "Prepare Call Hierarchy",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn prepare_call_hierarchy(
         &self,
@@ -330,7 +396,13 @@ impl McplsServer {
 
     /// Get incoming calls (callers).
     #[tool(
-        description = "Functions calling the specified item. Takes call hierarchy item, returns all callers."
+        description = "Functions calling the specified item. Takes call hierarchy item, returns all callers.",
+        annotations(
+            title = "Get Incoming Calls",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_incoming_calls(
         &self,
@@ -350,7 +422,13 @@ impl McplsServer {
 
     /// Get outgoing calls (callees).
     #[tool(
-        description = "Functions called by the specified item. Takes call hierarchy item, returns all callees."
+        description = "Functions called by the specified item. Takes call hierarchy item, returns all callees.",
+        annotations(
+            title = "Get Outgoing Calls",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_outgoing_calls(
         &self,
@@ -370,7 +448,13 @@ impl McplsServer {
 
     /// Get cached diagnostics for a file.
     #[tool(
-        description = "Cached diagnostics from server notifications. Faster than get_diagnostics, no new analysis."
+        description = "Cached diagnostics from server notifications. Faster than get_diagnostics, no new analysis.",
+        annotations(
+            title = "Get Cached Diagnostics",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_cached_diagnostics(
         &self,
@@ -390,7 +474,13 @@ impl McplsServer {
 
     /// Get recent LSP server log messages.
     #[tool(
-        description = "Recent server log messages. Filter by level (error, warning, info, debug) for debugging."
+        description = "Recent server log messages. Filter by level (error, warning, info, debug) for debugging.",
+        annotations(
+            title = "Get Server Logs",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_server_logs(
         &self,
@@ -410,7 +500,13 @@ impl McplsServer {
 
     /// Get recent LSP server messages.
     #[tool(
-        description = "Recent server messages (showMessage notifications). User-facing prompts and status updates."
+        description = "Recent server messages (showMessage notifications). User-facing prompts and status updates.",
+        annotations(
+            title = "Get Server Messages",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_server_messages(
         &self,
@@ -430,7 +526,13 @@ impl McplsServer {
 
     /// Get signature help at a position.
     #[tool(
-        description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call."
+        description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call.",
+        annotations(
+            title = "Get Signature Help",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_signature_help(
         &self,
@@ -456,7 +558,13 @@ impl McplsServer {
 
     /// Go to implementation locations.
     #[tool(
-        description = "Implementation locations of trait method or interface member at position."
+        description = "Implementation locations of trait method or interface member at position.",
+        annotations(
+            title = "Go To Implementation",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn go_to_implementation(
         &self,
@@ -482,7 +590,13 @@ impl McplsServer {
 
     /// Go to type definition location.
     #[tool(
-        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings."
+        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings.",
+        annotations(
+            title = "Go To Type Definition",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn go_to_type_definition(
         &self,
@@ -508,7 +622,13 @@ impl McplsServer {
 
     /// Get inlay hints for a range.
     #[tool(
-        description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline."
+        description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline.",
+        annotations(
+            title = "Get Inlay Hints",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_inlay_hints(
         &self,
@@ -696,6 +816,35 @@ mod tests {
         McplsServer::new(translator, subscriptions)
     }
 
+    fn assert_tool_annotations(
+        tool: rmcp::model::Tool,
+        title: &str,
+        read_only: bool,
+        destructive: bool,
+        idempotent: bool,
+    ) {
+        let name = tool.name.to_string();
+        let annotations = tool
+            .annotations
+            .unwrap_or_else(|| panic!("{name} should have annotations"));
+        assert_eq!(annotations.title.as_deref(), Some(title), "{name} title");
+        assert_eq!(
+            annotations.read_only_hint,
+            Some(read_only),
+            "{name} read_only_hint"
+        );
+        assert_eq!(
+            annotations.destructive_hint,
+            Some(destructive),
+            "{name} destructive_hint"
+        );
+        assert_eq!(
+            annotations.idempotent_hint,
+            Some(idempotent),
+            "{name} idempotent_hint"
+        );
+    }
+
     #[tokio::test]
     async fn test_server_info() {
         let server = create_test_server();
@@ -704,6 +853,85 @@ mod tests {
         assert!(info.capabilities.tools.is_some());
         assert_eq!(info.server_info.name, "mcpls");
         assert!(info.instructions.is_some());
+    }
+
+    #[test]
+    fn test_tool_annotations_cover_all_tools() {
+        let read_only_tools = [
+            (McplsServer::get_hover_tool_attr(), "Get Hover"),
+            (McplsServer::get_definition_tool_attr(), "Get Definition"),
+            (McplsServer::get_references_tool_attr(), "Get References"),
+            (McplsServer::get_diagnostics_tool_attr(), "Get Diagnostics"),
+            (McplsServer::get_completions_tool_attr(), "Get Completions"),
+            (
+                McplsServer::get_document_symbols_tool_attr(),
+                "Get Document Symbols",
+            ),
+            (
+                McplsServer::workspace_symbol_search_tool_attr(),
+                "Search Workspace Symbols",
+            ),
+            (
+                McplsServer::prepare_call_hierarchy_tool_attr(),
+                "Prepare Call Hierarchy",
+            ),
+            (
+                McplsServer::get_incoming_calls_tool_attr(),
+                "Get Incoming Calls",
+            ),
+            (
+                McplsServer::get_outgoing_calls_tool_attr(),
+                "Get Outgoing Calls",
+            ),
+            (
+                McplsServer::get_cached_diagnostics_tool_attr(),
+                "Get Cached Diagnostics",
+            ),
+            (McplsServer::get_server_logs_tool_attr(), "Get Server Logs"),
+            (
+                McplsServer::get_server_messages_tool_attr(),
+                "Get Server Messages",
+            ),
+            (
+                McplsServer::get_signature_help_tool_attr(),
+                "Get Signature Help",
+            ),
+            (
+                McplsServer::go_to_implementation_tool_attr(),
+                "Go To Implementation",
+            ),
+            (
+                McplsServer::go_to_type_definition_tool_attr(),
+                "Go To Type Definition",
+            ),
+            (McplsServer::get_inlay_hints_tool_attr(), "Get Inlay Hints"),
+        ];
+
+        for (tool, title) in read_only_tools {
+            assert_tool_annotations(tool, title, true, false, true);
+        }
+
+        assert_tool_annotations(
+            McplsServer::rename_symbol_tool_attr(),
+            "Rename Symbol",
+            false,
+            true,
+            false,
+        );
+        assert_tool_annotations(
+            McplsServer::format_document_tool_attr(),
+            "Format Document",
+            false,
+            false,
+            true,
+        );
+        assert_tool_annotations(
+            McplsServer::get_code_actions_tool_attr(),
+            "Get Code Actions",
+            false,
+            true,
+            false,
+        );
     }
 
     #[tokio::test]
