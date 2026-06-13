@@ -23,7 +23,99 @@ use super::tools::{
     ServerLogsParams, ServerMessagesParams, SignatureHelpParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
-use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::bridge::{
+    Diagnostic, DiagnosticSeverity, DiagnosticsResult, LogLevel, NotificationCache, Position2D,
+    Range, ResourceSubscriptions, ServerLogsResult, ServerMessagesResult, Translator,
+};
+use crate::error::Result as McplsResult;
+
+fn normalize_lsp_range(range: lsp_types::Range) -> Range {
+    Range {
+        start: Position2D {
+            line: range.start.line + 1,
+            character: range.start.character + 1,
+        },
+        end: Position2D {
+            line: range.end.line + 1,
+            character: range.end.character + 1,
+        },
+    }
+}
+
+fn cached_diagnostics_from_cache(cache: &NotificationCache, uri: &str) -> DiagnosticsResult {
+    let diagnostics = cache
+        .get_diagnostics(uri)
+        .map_or_else(Vec::new, |diag_info| {
+            diag_info
+                .diagnostics
+                .iter()
+                .map(|diag| Diagnostic {
+                    range: normalize_lsp_range(diag.range),
+                    severity: match diag.severity {
+                        Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+                        Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+                        Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                            DiagnosticSeverity::Information
+                        }
+                        Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+                        _ => DiagnosticSeverity::Information,
+                    },
+                    message: diag.message.clone(),
+                    code: diag.code.as_ref().map(|c| match c {
+                        lsp_types::NumberOrString::Number(n) => n.to_string(),
+                        lsp_types::NumberOrString::String(s) => s.clone(),
+                    }),
+                })
+                .collect()
+        });
+
+    DiagnosticsResult { diagnostics }
+}
+
+fn server_logs_from_cache(
+    cache: &NotificationCache,
+    limit: usize,
+    min_level: Option<String>,
+) -> McplsResult<ServerLogsResult> {
+    let min_level_filter = if let Some(level_str) = min_level {
+        let level = match level_str.to_lowercase().as_str() {
+            "error" => LogLevel::Error,
+            "warning" => LogLevel::Warning,
+            "info" => LogLevel::Info,
+            "debug" => LogLevel::Debug,
+            _ => {
+                return Err(crate::Error::InvalidToolParams(format!(
+                    "Invalid min_level: '{level_str}'. Valid values: error, warning, info, debug"
+                )));
+            }
+        };
+        Some(level)
+    } else {
+        None
+    };
+
+    let logs = cache
+        .get_logs()
+        .iter()
+        .filter(|log| {
+            min_level_filter.is_none_or(|min| match min {
+                LogLevel::Error => matches!(log.level, LogLevel::Error),
+                LogLevel::Warning => matches!(log.level, LogLevel::Error | LogLevel::Warning),
+                LogLevel::Info => !matches!(log.level, LogLevel::Debug),
+                LogLevel::Debug => true,
+            })
+        })
+        .take(limit)
+        .cloned()
+        .collect();
+
+    Ok(ServerLogsResult { logs })
+}
+
+fn server_messages_from_cache(cache: &NotificationCache, limit: usize) -> ServerMessagesResult {
+    let messages = cache.get_messages().iter().take(limit).cloned().collect();
+    ServerMessagesResult { messages }
+}
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -37,9 +129,14 @@ impl McplsServer {
     #[must_use]
     pub fn new(
         translator: Arc<Mutex<Translator>>,
+        notification_cache: Arc<Mutex<NotificationCache>>,
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
-        let context = Arc::new(HandlerContext::new(translator, subscriptions));
+        let context = Arc::new(HandlerContext::new(
+            translator,
+            notification_cache,
+            subscriptions,
+        ));
         Self { context }
     }
 
@@ -376,16 +473,22 @@ impl McplsServer {
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_cached_diagnostics(&file_path)
+        let uri = {
+            let translator = self.context.translator.lock().await;
+            let path = std::path::PathBuf::from(&file_path);
+            let validated_path = translator
+                .validate_path(&path)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            crate::bridge::path_to_uri(&validated_path).to_string()
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        let result = {
+            let cache = self.context.notification_cache.lock().await;
+            cached_diagnostics_from_cache(&cache, &uri)
+        };
+
+        serde_json::to_string(&result)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))
     }
 
     /// Get recent LSP server log messages.
@@ -397,8 +500,8 @@ impl McplsServer {
         Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_server_logs(limit, min_level)
+            let cache = self.context.notification_cache.lock().await;
+            server_logs_from_cache(&cache, limit, min_level)
         };
 
         match result {
@@ -417,15 +520,12 @@ impl McplsServer {
         Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_server_messages(limit)
+            let cache = self.context.notification_cache.lock().await;
+            server_messages_from_cache(&cache, limit)
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        serde_json::to_string(&result)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))
     }
 
     /// Get signature help at a position.
@@ -602,11 +702,8 @@ impl ServerHandler for McplsServer {
         // in the response shape. Currently both return `{"diagnostics":null}` which is
         // ambiguous for clients that need to know whether analysis has run yet.
         let diagnostics = {
-            let translator = self.context.translator.lock().await;
-            translator
-                .notification_cache()
-                .get_diagnostics(lsp_uri.as_str())
-                .cloned()
+            let cache = self.context.notification_cache.lock().await;
+            cache.get_diagnostics(lsp_uri.as_str()).cloned()
         };
 
         let json = serde_json::to_string(&diagnostics)
@@ -692,8 +789,9 @@ mod tests {
 
     fn create_test_server() -> McplsServer {
         let translator = Arc::new(Mutex::new(Translator::new()));
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        McplsServer::new(translator, subscriptions)
+        McplsServer::new(translator, notification_cache, subscriptions)
     }
 
     #[tokio::test]
