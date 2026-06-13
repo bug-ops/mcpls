@@ -156,15 +156,27 @@ pub(crate) async fn diagnostics_pump(
 fn register_servers(
     mut result: lsp::ServerInitResult,
     translator: &mut bridge::Translator,
+    configs: &[lsp::ServerInitConfig],
 ) -> std::collections::HashMap<String, tokio::sync::mpsc::Receiver<lsp::LspNotification>> {
+    let configs_by_key: std::collections::HashMap<_, _> = configs
+        .iter()
+        .map(|config| (config.server_config.server_key(), &config.server_config))
+        .collect();
     let mut receivers = std::collections::HashMap::new();
-    for (lang, server) in &mut result.servers {
-        receivers.insert(lang.clone(), server.take_notification_rx());
+    for (server_key, server) in &mut result.servers {
+        receivers.insert(server_key.clone(), server.take_notification_rx());
     }
-    for (language_id, server) in result.servers {
+    for (server_key, server) in result.servers {
         let client = server.client().clone();
-        translator.register_client(language_id.clone(), client);
-        translator.register_server(language_id.clone(), server);
+        translator.register_client(server_key.clone(), client);
+        if let Some(config) = configs_by_key.get(&server_key) {
+            translator.register_tool_routes(
+                &config.language_id,
+                &server_key,
+                config.normalized_handles(),
+            );
+        }
+        translator.register_server(server_key, server);
     }
     receivers
 }
@@ -341,7 +353,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
         // Register servers and extract their notification receivers.
         let server_count = result.server_count();
-        notification_receivers = register_servers(result, &mut translator);
+        notification_receivers = register_servers(result, &mut translator, &applicable_configs);
         info!("Proceeding with {} LSP server(s)", server_count);
     }
 
@@ -656,6 +668,7 @@ mod tests {
                     heuristics_max_depth: 10,
                 },
                 lsp_servers: vec![LspServerConfig {
+                    name: None,
                     language_id: "rust".to_string(),
                     command: "nonexistent-command-that-will-fail-12345".to_string(),
                     args: vec![],
@@ -664,6 +677,7 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    handles: vec![],
                 }],
             };
 

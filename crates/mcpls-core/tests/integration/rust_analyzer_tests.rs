@@ -48,6 +48,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
     let workspace_path = rust_workspace_path();
 
     let lsp_config = LspServerConfig {
+        name: None,
         language_id: "rust".to_string(),
         command: "rust-analyzer".to_string(),
         args: vec![],
@@ -56,6 +57,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         initialization_options: None,
         timeout_seconds: 30,
         heuristics: None,
+        handles: vec![],
     };
 
     let server_init_config = ServerInitConfig {

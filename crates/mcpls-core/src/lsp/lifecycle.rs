@@ -99,7 +99,7 @@ pub struct ServerInitConfig {
 /// ```
 #[derive(Debug)]
 pub struct ServerInitResult {
-    /// Successfully initialized servers (`language_id` -> server).
+    /// Successfully initialized servers (`server_key` -> server).
     pub servers: HashMap<String, LspServer>,
     /// Failures that occurred during spawn attempts.
     pub failures: Vec<ServerSpawnFailure>,
@@ -154,9 +154,9 @@ impl ServerInitResult {
 
     /// Add a successful server.
     ///
-    /// If a server with the same `language_id` already exists, it will be replaced.
-    pub fn add_server(&mut self, language_id: String, server: LspServer) {
-        self.servers.insert(language_id, server);
+    /// If a server with the same key already exists, it will be replaced.
+    pub fn add_server(&mut self, server_key: String, server: LspServer) {
+        self.servers.insert(server_key, server);
     }
 
     /// Add a failure.
@@ -504,6 +504,7 @@ impl LspServer {
 
         for config in configs {
             let language_id = config.server_config.language_id.clone();
+            let server_key = config.server_config.server_key();
             let command = config.server_config.command.clone();
 
             match Self::spawn(config.clone()).await {
@@ -512,7 +513,7 @@ impl LspServer {
                         "Successfully spawned LSP server: {} ({})",
                         language_id, command
                     );
-                    result.add_server(language_id, server);
+                    result.add_server(server_key, server);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -638,6 +639,7 @@ mod tests {
 
         let config = ServerInitConfig {
             server_config: LspServerConfig {
+                name: None,
                 language_id: "python".to_string(),
                 command: "pyright-langserver".to_string(),
                 args: vec!["--stdio".to_string()],
@@ -646,6 +648,7 @@ mod tests {
                 initialization_options: Some(init_opts.clone()),
                 timeout_seconds: 10,
                 heuristics: None,
+                handles: vec![],
             },
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
@@ -1064,6 +1067,7 @@ mod tests {
     async fn test_spawn_batch_single_invalid_config() {
         let configs = vec![ServerInitConfig {
             server_config: LspServerConfig {
+                name: None,
                 language_id: "rust".to_string(),
                 command: "nonexistent-command-12345".to_string(),
                 args: vec![],
@@ -1072,6 +1076,7 @@ mod tests {
                 initialization_options: None,
                 timeout_seconds: 10,
                 heuristics: None,
+                handles: vec![],
             },
             workspace_roots: vec![],
             initialization_options: None,
@@ -1097,6 +1102,7 @@ mod tests {
         let configs = vec![
             ServerInitConfig {
                 server_config: LspServerConfig {
+                    name: None,
                     language_id: "rust".to_string(),
                     command: "nonexistent-rust-analyzer".to_string(),
                     args: vec![],
@@ -1105,6 +1111,7 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    handles: vec![],
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1112,6 +1119,7 @@ mod tests {
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
+                    name: None,
                     language_id: "python".to_string(),
                     command: "nonexistent-pyright".to_string(),
                     args: vec![],
@@ -1120,6 +1128,7 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    handles: vec![],
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1127,6 +1136,7 @@ mod tests {
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
+                    name: None,
                     language_id: "typescript".to_string(),
                     command: "nonexistent-tsserver".to_string(),
                     args: vec![],
@@ -1135,6 +1145,7 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    handles: vec![],
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1165,6 +1176,7 @@ mod tests {
         let configs = vec![
             ServerInitConfig {
                 server_config: LspServerConfig {
+                    name: None,
                     language_id: "lang1".to_string(),
                     command: "cmd1-nonexistent".to_string(),
                     args: vec![],
@@ -1173,6 +1185,7 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    handles: vec![],
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1180,6 +1193,7 @@ mod tests {
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
+                    name: None,
                     language_id: "lang2".to_string(),
                     command: "cmd2-nonexistent".to_string(),
                     args: vec![],
@@ -1188,6 +1202,7 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    handles: vec![],
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1211,6 +1226,7 @@ mod tests {
         let configs = vec![
             ServerInitConfig {
                 server_config: LspServerConfig {
+                    name: None,
                     language_id: "test1".to_string(),
                     command: "nonexistent-test1".to_string(),
                     args: vec![],
@@ -1219,6 +1235,7 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    handles: vec![],
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1226,6 +1243,7 @@ mod tests {
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
+                    name: None,
                     language_id: "test2".to_string(),
                     command: "nonexistent-test2".to_string(),
                     args: vec![],
@@ -1234,6 +1252,7 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    handles: vec![],
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
