@@ -128,16 +128,22 @@ impl McplsServer {
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        let prepared = {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_diagnostics(file_path).await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            translator.prepare_diagnostics_request(file_path).await
         }
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let timeout_duration = tokio::time::Duration::from_secs(30);
+        let response: lsp_types::DocumentDiagnosticReportResult = prepared
+            .client
+            .request("textDocument/diagnostic", prepared.params, timeout_duration)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let result = Translator::diagnostics_result_from_lsp_response(response);
+        serde_json::to_string(&result)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))
     }
 
     /// Rename a symbol across the workspace.

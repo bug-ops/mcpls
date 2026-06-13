@@ -116,9 +116,10 @@ impl Default for Translator {
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DiagnosticRequestParams {
+pub(crate) struct DiagnosticRequestParams {
     text_document: TextDocumentIdentifier,
     #[serde(skip_serializing_if = "Option::is_none")]
     identifier: Option<String>,
@@ -130,7 +131,10 @@ struct DiagnosticRequestParams {
     partial_result_params: PartialResultParams,
 }
 
-fn diagnostic_request_params(text_document: TextDocumentIdentifier) -> DiagnosticRequestParams {
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn diagnostic_request_params(
+    text_document: TextDocumentIdentifier,
+) -> DiagnosticRequestParams {
     DiagnosticRequestParams {
         text_document,
         identifier: None,
@@ -138,6 +142,15 @@ fn diagnostic_request_params(text_document: TextDocumentIdentifier) -> Diagnosti
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: PartialResultParams::default(),
     }
+}
+
+/// State needed to issue a diagnostics request without holding the translator lock.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct PreparedDiagnosticsRequest {
+    /// LSP client for the target file's language.
+    pub(crate) client: LspClient,
+    /// Serialized-safe LSP diagnostics request params.
+    pub(crate) params: DiagnosticRequestParams,
 }
 
 /// Position in a document (1-based for MCP).
@@ -766,6 +779,28 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult> {
+        let PreparedDiagnosticsRequest { client, params } =
+            self.prepare_diagnostics_request(file_path).await?;
+
+        let timeout_duration = Duration::from_secs(30);
+        let response: lsp_types::DocumentDiagnosticReportResult = client
+            .request("textDocument/diagnostic", params, timeout_duration)
+            .await?;
+
+        Ok(Self::diagnostics_result_from_lsp_response(response))
+    }
+
+    /// Prepare a diagnostics request while holding translator state only for
+    /// path validation, client lookup, and lazy document open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid, no client is registered for the
+    /// file type, or the file cannot be opened.
+    pub(crate) async fn prepare_diagnostics_request(
+        &mut self,
+        file_path: String,
+    ) -> Result<PreparedDiagnosticsRequest> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
@@ -774,13 +809,17 @@ impl Translator {
             .ensure_open(&validated_path, &client)
             .await?;
 
-        let params = diagnostic_request_params(TextDocumentIdentifier { uri });
+        Ok(PreparedDiagnosticsRequest {
+            client,
+            params: diagnostic_request_params(TextDocumentIdentifier { uri }),
+        })
+    }
 
-        let timeout_duration = Duration::from_secs(30);
-        let response: lsp_types::DocumentDiagnosticReportResult = client
-            .request("textDocument/diagnostic", params, timeout_duration)
-            .await?;
-
+    /// Convert an LSP diagnostics response to mcpls' stable MCP response shape.
+    #[must_use]
+    pub(crate) fn diagnostics_result_from_lsp_response(
+        response: lsp_types::DocumentDiagnosticReportResult,
+    ) -> DiagnosticsResult {
         let diagnostics = match response {
             lsp_types::DocumentDiagnosticReportResult::Report(report) => match report {
                 lsp_types::DocumentDiagnosticReport::Full(full) => {
@@ -791,7 +830,7 @@ impl Translator {
             lsp_types::DocumentDiagnosticReportResult::Partial(_) => vec![],
         };
 
-        let result = DiagnosticsResult {
+        DiagnosticsResult {
             diagnostics: diagnostics
                 .into_iter()
                 .map(|diag| Diagnostic {
@@ -812,9 +851,7 @@ impl Translator {
                     }),
                 })
                 .collect(),
-        };
-
-        Ok(result)
+        }
     }
 
     /// Handle rename request.
@@ -2101,6 +2138,51 @@ mod tests {
         assert_eq!(value["textDocument"]["uri"], "file:///test.ts");
         assert!(value.get("identifier").is_none());
         assert!(value.get("previousResultId").is_none());
+    }
+
+    #[test]
+    fn test_diagnostics_result_from_lsp_response_preserves_mcp_shape() {
+        let response = lsp_types::DocumentDiagnosticReportResult::Report(
+            lsp_types::DocumentDiagnosticReport::Full(
+                lsp_types::RelatedFullDocumentDiagnosticReport {
+                    related_documents: None,
+                    full_document_diagnostic_report: lsp_types::FullDocumentDiagnosticReport {
+                        result_id: Some("rust-analyzer".to_string()),
+                        items: vec![lsp_types::Diagnostic {
+                            range: lsp_types::Range {
+                                start: lsp_types::Position {
+                                    line: 2,
+                                    character: 4,
+                                },
+                                end: lsp_types::Position {
+                                    line: 2,
+                                    character: 9,
+                                },
+                            },
+                            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                            code: Some(lsp_types::NumberOrString::String("E0308".to_string())),
+                            source: Some("rust-analyzer".to_string()),
+                            message: "mismatched types".to_string(),
+                            related_information: None,
+                            tags: None,
+                            data: None,
+                            code_description: None,
+                        }],
+                    },
+                },
+            ),
+        );
+
+        let result = Translator::diagnostics_result_from_lsp_response(response);
+        let value = serde_json::to_value(&result).unwrap();
+
+        assert!(value.get("diagnostics").is_some());
+        assert!(value.get("items").is_none());
+        assert_eq!(value["diagnostics"][0]["message"], "mismatched types");
+        assert_eq!(value["diagnostics"][0]["code"], "E0308");
+        assert_eq!(value["diagnostics"][0]["severity"], "error");
+        assert_eq!(value["diagnostics"][0]["range"]["start"]["line"], 3);
+        assert_eq!(value["diagnostics"][0]["range"]["start"]["character"], 5);
     }
 
     #[test]
