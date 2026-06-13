@@ -30,7 +30,7 @@ use crate::bridge::{
 };
 use crate::error::Result as McplsResult;
 
-fn normalize_lsp_range(range: lsp_types::Range) -> Range {
+const fn normalize_lsp_range(range: lsp_types::Range) -> Range {
     Range {
         start: Position2D {
             line: range.start.line + 1,
