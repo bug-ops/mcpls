@@ -29,7 +29,7 @@ use crate::bridge::{
 };
 use crate::error::Result as McplsResult;
 
-fn normalize_lsp_range(range: lsp_types::Range) -> Range {
+const fn normalize_lsp_range(range: lsp_types::Range) -> Range {
     Range {
         start: Position2D {
             line: range.start.line + 1,
@@ -473,14 +473,14 @@ impl McplsServer {
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let uri = {
+        let validated_path = {
             let translator = self.context.translator.lock().await;
             let path = std::path::PathBuf::from(&file_path);
-            let validated_path = translator
+            translator
                 .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-            crate::bridge::path_to_uri(&validated_path).to_string()
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?
         };
+        let uri = crate::bridge::path_to_uri(&validated_path).to_string();
 
         let result = {
             let cache = self.context.notification_cache.lock().await;
