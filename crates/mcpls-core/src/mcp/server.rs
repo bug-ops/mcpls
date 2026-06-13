@@ -12,6 +12,7 @@ use rmcp::model::{
     UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
@@ -23,7 +24,107 @@ use super::tools::{
     ServerLogsParams, ServerMessagesParams, SignatureHelpParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
-use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::bridge::{
+    Diagnostic, DiagnosticSeverity, DiagnosticsResult, LogLevel, NotificationCache, Position2D,
+    Range, ResourceSubscriptions, ServerLogsResult, ServerMessagesResult, Translator,
+};
+use crate::error::Result as McplsResult;
+
+const fn normalize_lsp_range(range: lsp_types::Range) -> Range {
+    Range {
+        start: Position2D {
+            line: range.start.line + 1,
+            character: range.start.character + 1,
+        },
+        end: Position2D {
+            line: range.end.line + 1,
+            character: range.end.character + 1,
+        },
+    }
+}
+
+fn cached_diagnostics_from_cache(cache: &NotificationCache, uri: &str) -> DiagnosticsResult {
+    let diagnostics = cache
+        .get_diagnostics(uri)
+        .map_or_else(Vec::new, |diag_info| {
+            diag_info
+                .diagnostics
+                .iter()
+                .map(|diag| Diagnostic {
+                    range: normalize_lsp_range(diag.range),
+                    severity: match diag.severity {
+                        Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+                        Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+                        Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                            DiagnosticSeverity::Information
+                        }
+                        Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+                        _ => DiagnosticSeverity::Information,
+                    },
+                    message: diag.message.clone(),
+                    code: diag.code.as_ref().map(|c| match c {
+                        lsp_types::NumberOrString::Number(n) => n.to_string(),
+                        lsp_types::NumberOrString::String(s) => s.clone(),
+                    }),
+                })
+                .collect()
+        });
+
+    DiagnosticsResult { diagnostics }
+}
+
+fn server_logs_from_cache(
+    cache: &NotificationCache,
+    limit: usize,
+    min_level: Option<String>,
+) -> McplsResult<ServerLogsResult> {
+    let min_level_filter = if let Some(level_str) = min_level {
+        let level = match level_str.to_lowercase().as_str() {
+            "error" => LogLevel::Error,
+            "warning" => LogLevel::Warning,
+            "info" => LogLevel::Info,
+            "debug" => LogLevel::Debug,
+            _ => {
+                return Err(crate::Error::InvalidToolParams(format!(
+                    "Invalid min_level: '{level_str}'. Valid values: error, warning, info, debug"
+                )));
+            }
+        };
+        Some(level)
+    } else {
+        None
+    };
+
+    let logs = cache
+        .get_logs()
+        .iter()
+        .filter(|log| {
+            min_level_filter.is_none_or(|min| match min {
+                LogLevel::Error => matches!(log.level, LogLevel::Error),
+                LogLevel::Warning => matches!(log.level, LogLevel::Error | LogLevel::Warning),
+                LogLevel::Info => !matches!(log.level, LogLevel::Debug),
+                LogLevel::Debug => true,
+            })
+        })
+        .take(limit)
+        .cloned()
+        .collect();
+
+    Ok(ServerLogsResult { logs })
+}
+
+fn server_messages_from_cache(cache: &NotificationCache, limit: usize) -> ServerMessagesResult {
+    let messages = cache.get_messages().iter().take(limit).cloned().collect();
+    ServerMessagesResult { messages }
+}
+
+fn serialize_tool_result<T: Serialize>(result: McplsResult<T>) -> Result<String, McpError> {
+    match result {
+        Ok(value) => serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+        Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+    }
+}
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -36,10 +137,15 @@ impl McplsServer {
     /// Create a new MCP server with the given translator and subscriptions.
     #[must_use]
     pub fn new(
-        translator: Arc<Mutex<Translator>>,
+        translator: Arc<Translator>,
+        notification_cache: Arc<Mutex<NotificationCache>>,
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
-        let context = Arc::new(HandlerContext::new(translator, subscriptions));
+        let context = Arc::new(HandlerContext::new(
+            translator,
+            notification_cache,
+            subscriptions,
+        ));
         Self { context }
     }
 
@@ -55,16 +161,12 @@ impl McplsServer {
             character,
         }): Parameters<HoverParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_hover(file_path, line, character).await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        serialize_tool_result(
+            self.context
+                .translator
+                .handle_hover(file_path, line, character)
+                .await,
+        )
     }
 
     /// Get the definition location of a symbol.
@@ -79,18 +181,12 @@ impl McplsServer {
             character,
         }): Parameters<DefinitionParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_definition(file_path, line, character)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Find all references to a symbol.
@@ -106,18 +202,12 @@ impl McplsServer {
             include_declaration,
         }): Parameters<ReferencesParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_references(file_path, line, character, include_declaration)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Get diagnostics for a file.
@@ -128,16 +218,7 @@ impl McplsServer {
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_diagnostics(file_path).await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        serialize_tool_result(self.context.translator.handle_diagnostics(file_path).await)
     }
 
     /// Rename a symbol across the workspace.
@@ -153,18 +234,12 @@ impl McplsServer {
             new_name,
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_rename(file_path, line, character, new_name)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Get code completion suggestions.
@@ -180,18 +255,12 @@ impl McplsServer {
             trigger,
         }): Parameters<CompletionsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_completions(file_path, line, character, trigger)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Get all symbols in a document.
@@ -202,16 +271,12 @@ impl McplsServer {
         &self,
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_document_symbols(file_path).await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        serialize_tool_result(
+            self.context
+                .translator
+                .handle_document_symbols(file_path)
+                .await,
+        )
     }
 
     /// Format a document according to language server rules.
@@ -226,18 +291,12 @@ impl McplsServer {
             insert_spaces,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_format_document(file_path, tab_size, insert_spaces)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Search for symbols across the workspace.
@@ -252,18 +311,12 @@ impl McplsServer {
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_workspace_symbol(query, kind_filter, limit)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Get code actions for a range.
@@ -281,9 +334,9 @@ impl McplsServer {
             kind_filter,
         }): Parameters<CodeActionsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_code_actions(
                     file_path,
                     start_line,
@@ -292,14 +345,8 @@ impl McplsServer {
                     end_character,
                     kind_filter,
                 )
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Prepare call hierarchy at a position.
@@ -314,18 +361,12 @@ impl McplsServer {
             character,
         }): Parameters<CallHierarchyPrepareParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_call_hierarchy_prepare(file_path, line, character)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Get incoming calls (callers).
@@ -336,16 +377,7 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_incoming_calls(item).await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        serialize_tool_result(self.context.translator.handle_incoming_calls(item).await)
     }
 
     /// Get outgoing calls (callees).
@@ -356,16 +388,7 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_outgoing_calls(item).await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        serialize_tool_result(self.context.translator.handle_outgoing_calls(item).await)
     }
 
     /// Get cached diagnostics for a file.
@@ -376,16 +399,23 @@ impl McplsServer {
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_cached_diagnostics(&file_path)
+        let uri = {
+            let path = std::path::PathBuf::from(&file_path);
+            let validated_path = self
+                .context
+                .translator
+                .validate_path(&path)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            crate::bridge::path_to_uri(&validated_path).to_string()
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        let result = {
+            let cache = self.context.notification_cache.lock().await;
+            cached_diagnostics_from_cache(&cache, &uri)
+        };
+
+        serde_json::to_string(&result)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))
     }
 
     /// Get recent LSP server log messages.
@@ -397,8 +427,8 @@ impl McplsServer {
         Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_server_logs(limit, min_level)
+            let cache = self.context.notification_cache.lock().await;
+            server_logs_from_cache(&cache, limit, min_level)
         };
 
         match result {
@@ -417,15 +447,12 @@ impl McplsServer {
         Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_server_messages(limit)
+            let cache = self.context.notification_cache.lock().await;
+            server_messages_from_cache(&cache, limit)
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        serde_json::to_string(&result)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))
     }
 
     /// Get signature help at a position.
@@ -440,18 +467,12 @@ impl McplsServer {
             character,
         }): Parameters<SignatureHelpParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_signature_help(file_path, line, character)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Go to implementation locations.
@@ -466,18 +487,12 @@ impl McplsServer {
             character,
         }): Parameters<GoToImplementationParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_implementation(file_path, line, character)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Go to type definition location.
@@ -492,18 +507,12 @@ impl McplsServer {
             character,
         }): Parameters<GoToTypeDefinitionParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_type_definition(file_path, line, character)
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 
     /// Get inlay hints for a range.
@@ -520,9 +529,9 @@ impl McplsServer {
             end_character,
         }): Parameters<InlayHintsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+        serialize_tool_result(
+            self.context
+                .translator
                 .handle_inlay_hints(
                     file_path,
                     start_line,
@@ -530,14 +539,8 @@ impl McplsServer {
                     end_line,
                     end_character,
                 )
-                .await
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+                .await,
+        )
     }
 }
 
@@ -551,9 +554,8 @@ impl ServerHandler for McplsServer {
         // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
         // very large single-page responses that may exceed transport buffers).
         let resources: Vec<_> = {
-            let translator = self.context.translator.lock().await;
-            translator
-                .document_tracker()
+            let document_tracker = self.context.translator.document_tracker().lock().await;
+            document_tracker
                 .open_paths()
                 .filter_map(|path| {
                     let uri = make_uri(path)
@@ -589,12 +591,10 @@ impl ServerHandler for McplsServer {
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // Enforce workspace-root containment — mirrors the guard in every LSP tool.
-        {
-            let translator = self.context.translator.lock().await;
-            translator
-                .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
+        self.context
+            .translator
+            .validate_path(&path)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let lsp_uri = crate::bridge::path_to_uri(&path);
 
@@ -602,11 +602,8 @@ impl ServerHandler for McplsServer {
         // in the response shape. Currently both return `{"diagnostics":null}` which is
         // ambiguous for clients that need to know whether analysis has run yet.
         let diagnostics = {
-            let translator = self.context.translator.lock().await;
-            translator
-                .notification_cache()
-                .get_diagnostics(lsp_uri.as_str())
-                .cloned()
+            let cache = self.context.notification_cache.lock().await;
+            cache.get_diagnostics(lsp_uri.as_str()).cloned()
         };
 
         let json = serde_json::to_string(&diagnostics)
@@ -627,12 +624,10 @@ impl ServerHandler for McplsServer {
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // Enforce workspace-root containment (same invariant as every LSP tool).
-        {
-            let translator = self.context.translator.lock().await;
-            translator
-                .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
+        self.context
+            .translator
+            .validate_path(&path)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // TODO(S3): If diagnostics are already cached for this URI, emit a synthetic
         // notify_resource_updated so clients subscribing after initial workspace indexing
@@ -691,9 +686,10 @@ mod tests {
     use super::*;
 
     fn create_test_server() -> McplsServer {
-        let translator = Arc::new(Mutex::new(Translator::new()));
+        let translator = Arc::new(Translator::new());
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        McplsServer::new(translator, subscriptions)
+        McplsServer::new(translator, notification_cache, subscriptions)
     }
 
     #[tokio::test]
@@ -1138,8 +1134,8 @@ mod tests {
     async fn test_list_resources_returns_empty_when_no_open_documents() {
         let server = create_test_server();
         let empty = {
-            let translator = server.context.translator.lock().await;
-            translator.document_tracker().open_paths().count() == 0
+            let document_tracker = server.context.translator.document_tracker().lock().await;
+            document_tracker.open_paths().count() == 0
         };
         assert!(empty);
     }
@@ -1163,11 +1159,8 @@ mod tests {
     async fn test_validate_path_rejects_nonexistent_path() {
         use std::path::Path;
 
-        let translator = Arc::new(Mutex::new(Translator::new()));
-        let result = {
-            let t = translator.lock().await;
-            t.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"))
-        };
+        let translator = Translator::new();
+        let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
         assert!(result.is_err());
     }
 

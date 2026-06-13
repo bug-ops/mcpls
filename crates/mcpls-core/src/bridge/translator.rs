@@ -16,6 +16,7 @@ use lsp_types::{
     WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 use super::state::{ResourceLimits, detect_language, path_to_uri};
@@ -32,7 +33,7 @@ pub struct Translator {
     /// LSP servers indexed by language ID (held for lifetime management).
     lsp_servers: HashMap<String, LspServer>,
     /// Document state tracker.
-    document_tracker: DocumentTracker,
+    document_tracker: Mutex<DocumentTracker>,
     /// Notification cache for LSP server notifications.
     notification_cache: NotificationCache,
     /// Allowed workspace roots for path validation.
@@ -48,7 +49,10 @@ impl Translator {
         Self {
             lsp_clients: HashMap::new(),
             lsp_servers: HashMap::new(),
-            document_tracker: DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
+            document_tracker: Mutex::new(DocumentTracker::new(
+                ResourceLimits::default(),
+                HashMap::new(),
+            )),
             notification_cache: NotificationCache::new(),
             workspace_roots: vec![],
             extension_map: HashMap::new(),
@@ -66,7 +70,7 @@ impl Translator {
     /// to use the same mappings for language detection.
     #[must_use]
     pub fn with_extensions(mut self, extension_map: HashMap<String, String>) -> Self {
-        self.document_tracker =
+        *self.document_tracker.get_mut() =
             DocumentTracker::new(ResourceLimits::default(), extension_map.clone());
         self.extension_map = extension_map;
         self
@@ -84,13 +88,13 @@ impl Translator {
 
     /// Get the document tracker.
     #[must_use]
-    pub const fn document_tracker(&self) -> &DocumentTracker {
+    pub const fn document_tracker(&self) -> &Mutex<DocumentTracker> {
         &self.document_tracker
     }
 
     /// Get a mutable reference to the document tracker.
-    pub const fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
-        &mut self.document_tracker
+    pub fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
+        self.document_tracker.get_mut()
     }
 
     /// Get the notification cache.
@@ -605,7 +609,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_hover(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -615,6 +619,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -653,7 +659,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -663,6 +669,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -713,7 +721,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_references(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -724,6 +732,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -765,12 +775,14 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
-    pub async fn handle_diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult> {
+    pub async fn handle_diagnostics(&self, file_path: String) -> Result<DiagnosticsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
 
@@ -823,7 +835,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_rename(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -834,6 +846,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -919,7 +933,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_completions(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -930,6 +944,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -984,7 +1000,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_document_symbols(
-        &mut self,
+        &self,
         file_path: String,
     ) -> Result<DocumentSymbolsResult> {
         let path = PathBuf::from(&file_path);
@@ -992,6 +1008,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
 
@@ -1032,7 +1050,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_format_document(
-        &mut self,
+        &self,
         file_path: String,
         tab_size: u32,
         insert_spaces: bool,
@@ -1042,6 +1060,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
 
@@ -1081,7 +1101,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or no server is configured.
     pub async fn handle_workspace_symbol(
-        &mut self,
+        &self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
@@ -1185,7 +1205,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_code_actions(
-        &mut self,
+        &self,
         file_path: String,
         start_line: u32,
         start_character: u32,
@@ -1206,6 +1226,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
 
@@ -1273,7 +1295,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_call_hierarchy_prepare(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -1296,6 +1318,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -1333,7 +1357,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the item is invalid.
     pub async fn handle_incoming_calls(
-        &mut self,
+        &self,
         item: serde_json::Value,
     ) -> Result<IncomingCallsResult> {
         // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
@@ -1382,7 +1406,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the item is invalid.
     pub async fn handle_outgoing_calls(
-        &mut self,
+        &self,
         item: serde_json::Value,
     ) -> Result<OutgoingCallsResult> {
         // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
@@ -1542,7 +1566,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_signature_help(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -1552,6 +1576,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -1615,7 +1641,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_implementation(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -1625,6 +1651,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -1657,7 +1685,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_type_definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -1667,6 +1695,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
@@ -1699,7 +1729,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_inlay_hints(
-        &mut self,
+        &self,
         file_path: String,
         start_line: u32,
         start_character: u32,
@@ -1713,6 +1743,8 @@ impl Translator {
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
+            .lock()
+            .await
             .ensure_open(&validated_path, &client)
             .await?;
 
@@ -2198,7 +2230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_workspace_symbol_no_server() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
@@ -2207,7 +2239,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_code_actions_invalid_kind() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_code_actions(
                 "/tmp/test.rs".to_string(),
@@ -2225,7 +2257,7 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_quickfix() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2249,7 +2281,7 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_refactor() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2272,7 +2304,7 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_refactor_extract() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2295,7 +2327,7 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_source() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2316,7 +2348,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_code_actions_invalid_range_zero() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_code_actions("/tmp/test.rs".to_string(), 0, 1, 1, 10, None)
             .await;
@@ -2325,7 +2357,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_code_actions_invalid_range_order() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_code_actions("/tmp/test.rs".to_string(), 10, 5, 5, 1, None)
             .await;
@@ -2336,7 +2368,7 @@ mod tests {
     async fn test_handle_code_actions_empty_range() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2568,7 +2600,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_call_hierarchy_prepare_invalid_position_zero() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 0, 1)
             .await;
@@ -2582,7 +2614,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_call_hierarchy_prepare_invalid_position_too_large() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1_000_001, 1)
             .await;
@@ -2596,7 +2628,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_incoming_calls_invalid_json() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator.handle_incoming_calls(invalid_item).await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
@@ -2604,7 +2636,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_outgoing_calls_invalid_json() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator.handle_outgoing_calls(invalid_item).await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
