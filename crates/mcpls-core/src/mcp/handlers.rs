@@ -17,6 +17,11 @@ use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
 /// tasks in `lib.rs`, which own their own `Arc<OnceCell<Peer<RoleServer>>>`.
 pub struct HandlerContext {
     /// Translator for converting MCP calls to LSP requests.
+    ///
+    /// This is intentionally not wrapped in a request-wide `Mutex` or `RwLock`.
+    /// Runtime mutation is scoped inside `Translator` to narrower locks such as
+    /// the document tracker, so concurrent tool calls do not serialize on the
+    /// whole bridge state.
     pub translator: Arc<Translator>,
     /// Shared cache for diagnostics, logs, and server messages.
     pub notification_cache: Arc<Mutex<NotificationCache>>,
@@ -53,5 +58,17 @@ mod tests {
         let context = HandlerContext::new(translator, notification_cache, subscriptions);
         assert!(Arc::strong_count(&context.translator) == 1);
         assert!(Arc::strong_count(&context.notification_cache) == 1);
+    }
+
+    #[test]
+    fn test_translator_context_has_no_outer_lock() {
+        fn assert_arc_translator(_: &Arc<Translator>) {}
+
+        let translator = Arc::new(Translator::new());
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let context = HandlerContext::new(translator, notification_cache, subscriptions);
+
+        assert_arc_translator(&context.translator);
     }
 }
