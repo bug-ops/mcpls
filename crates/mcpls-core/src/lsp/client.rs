@@ -659,21 +659,28 @@ mod tests {
         let backoffs = [
             Duration::ZERO,
             Duration::from_millis(500),
-            Duration::from_millis(1_000),
-            Duration::from_millis(2_000),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
         ];
 
         for (attempt, backoff) in backoffs.into_iter().enumerate() {
             tokio::time::advance(backoff).await;
-            let command = command_rx.recv().await.expect("request command");
+            let Some(command) = command_rx.recv().await else {
+                panic!("request command");
+            };
             match command {
-                ClientCommand::SendRequest { response_tx, .. } => response_tx
-                    .send(Err(Error::LspServerError {
-                        code: SERVER_CANCELLED_CODE,
-                        message: format!("cancelled attempt {attempt}"),
-                        data: Some(serde_json::json!({ "retriggerRequest": true })),
-                    }))
-                    .expect("request receiver should still be alive"),
+                ClientCommand::SendRequest { response_tx, .. } => {
+                    assert!(
+                        response_tx
+                            .send(Err(Error::LspServerError {
+                                code: SERVER_CANCELLED_CODE,
+                                message: format!("cancelled attempt {attempt}"),
+                                data: Some(serde_json::json!({ "retriggerRequest": true })),
+                            }))
+                            .is_ok(),
+                        "request receiver should still be alive"
+                    );
+                }
                 ClientCommand::SendNotification { .. } | ClientCommand::Shutdown => {
                     panic!("expected request command")
                 }
