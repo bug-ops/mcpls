@@ -4,8 +4,12 @@
 //! The actual tool implementations use the `#[tool]` macro from rmcp
 //! and are defined in the `server` module.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
+use rmcp::task_manager::OperationProcessor;
 use tokio::sync::Mutex;
 
 use crate::bridge::{ResourceSubscriptions, Translator};
@@ -18,6 +22,10 @@ use crate::bridge::{ResourceSubscriptions, Translator};
 pub struct HandlerContext {
     /// Translator for converting MCP calls to LSP requests.
     pub translator: Arc<Mutex<Translator>>,
+    /// Processor for MCP task-augmented tool calls.
+    pub task_processor: Arc<Mutex<OperationProcessor>>,
+    /// Monotonic task ID source.
+    pub task_counter: Arc<AtomicU64>,
     /// Set of resource URIs the MCP client has subscribed to.
     pub subscriptions: Arc<ResourceSubscriptions>,
 }
@@ -25,14 +33,22 @@ pub struct HandlerContext {
 impl HandlerContext {
     /// Create a new handler context.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
         Self {
             translator,
+            task_processor: Arc::new(Mutex::new(OperationProcessor::new())),
+            task_counter: Arc::new(AtomicU64::new(1)),
             subscriptions,
         }
+    }
+
+    /// Generate a new server-side task identifier.
+    pub fn next_task_id(&self) -> String {
+        let id = self.task_counter.fetch_add(1, Ordering::Relaxed);
+        format!("mcpls-task-{id}")
     }
 }
 
@@ -47,5 +63,8 @@ mod tests {
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let context = HandlerContext::new(translator, subscriptions);
         assert!(Arc::strong_count(&context.translator) == 1);
+        assert!(Arc::strong_count(&context.task_processor) == 1);
+        assert_eq!(context.next_task_id(), "mcpls-task-1");
+        assert_eq!(context.next_task_id(), "mcpls-task-2");
     }
 }

@@ -7,9 +7,15 @@ use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Implementation, ListResourcesResult, RawResource, ReadResourceRequestParams,
+    CallToolRequestParams, CancelTaskParams, CancelTaskResult, CreateTaskResult, GetTaskInfoParams,
+    GetTaskPayloadResult, GetTaskResult, GetTaskResultParams, Implementation, ListResourcesResult,
+    ListTasksResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
     ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    Task, TaskStatus, TasksCapability, UnsubscribeRequestParams,
+};
+use rmcp::service::RequestContext;
+use rmcp::task_manager::{
+    OperationDescriptor, OperationMessage, ToolCallTaskResult, current_timestamp,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
@@ -24,6 +30,33 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, Translator};
+
+const TASK_TIMEOUT_MS: u64 = 300_000;
+const TASK_POLL_INTERVAL_MS: u64 = 500;
+
+fn task_from_descriptor(
+    descriptor: &OperationDescriptor,
+    status: TaskStatus,
+    status_message: Option<String>,
+) -> Task {
+    let timestamp = current_timestamp();
+    let mut task = Task::new(
+        descriptor.operation_id.clone(),
+        status,
+        timestamp.clone(),
+        timestamp,
+    )
+    .with_ttl(TASK_TIMEOUT_MS)
+    .with_poll_interval(TASK_POLL_INTERVAL_MS);
+
+    if let Some(message) = status_message {
+        task = task.with_status_message(message);
+    } else {
+        task = task.with_status_message(descriptor.name.clone());
+    }
+
+    task
+}
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -95,7 +128,8 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = "All references to symbol at position. Returns locations across workspace where symbol is used."
+        description = "All references to symbol at position. Returns locations across workspace where symbol is used.",
+        execution(task_support = "optional")
     )]
     async fn get_references(
         &self,
@@ -122,7 +156,8 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location."
+        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location.",
+        execution(task_support = "optional")
     )]
     async fn get_diagnostics(
         &self,
@@ -142,7 +177,8 @@ impl McplsServer {
 
     /// Rename a symbol across the workspace.
     #[tool(
-        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used."
+        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used.",
+        execution(task_support = "optional")
     )]
     async fn rename_symbol(
         &self,
@@ -169,7 +205,8 @@ impl McplsServer {
 
     /// Get code completion suggestions.
     #[tool(
-        description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets."
+        description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets.",
+        execution(task_support = "optional")
     )]
     async fn get_completions(
         &self,
@@ -242,7 +279,8 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = "Search workspace symbols by name. Supports partial matching and fuzzy search."
+        description = "Search workspace symbols by name. Supports partial matching and fuzzy search.",
+        execution(task_support = "optional")
     )]
     async fn workspace_symbol_search(
         &self,
@@ -543,6 +581,37 @@ impl McplsServer {
 
 #[tool_handler]
 impl ServerHandler for McplsServer {
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CreateTaskResult, McpError> {
+        let task_id = self.context.next_task_id();
+        let task_name = request.name.to_string();
+        let descriptor = OperationDescriptor::new(task_id.clone(), task_name.clone()).with_ttl(300);
+        let task = task_from_descriptor(&descriptor, TaskStatus::Working, None);
+
+        let server = self.clone();
+        let task_id_for_result = task_id.clone();
+        let future = Box::pin(async move {
+            let result = server.call_tool(request, context).await;
+            Ok(
+                Box::new(ToolCallTaskResult::new(task_id_for_result, result))
+                    as Box<dyn rmcp::task_manager::OperationResultTransport>,
+            )
+        });
+
+        let message = OperationMessage::new(descriptor, future);
+        self.context
+            .task_processor
+            .lock()
+            .await
+            .submit_operation(message)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CreateTaskResult::new(task))
+    }
+
     async fn list_resources(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -668,6 +737,7 @@ impl ServerHandler for McplsServer {
             .enable_tools()
             .enable_resources()
             .enable_resources_subscribe()
+            .enable_tasks_with(TasksCapability::server_default())
             .build();
         let mut server_info = ServerInfo::new(capabilities);
         server_info.server_info = implementation;
@@ -683,12 +753,157 @@ impl ServerHandler for McplsServer {
 
         server_info
     }
+
+    async fn list_tasks(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListTasksResult, McpError> {
+        let tasks = {
+            let mut processor = self.context.task_processor.lock().await;
+            processor.check_timeouts();
+
+            let running_ids = processor.list_running();
+            let mut tasks = Vec::new();
+            for task_id in running_ids {
+                if let Some(descriptor) = processor.task_descriptor(&task_id) {
+                    tasks.push(task_from_descriptor(descriptor, TaskStatus::Working, None));
+                }
+            }
+
+            tasks.extend(processor.peek_completed().iter().map(|result| {
+                let (status, message) = match &result.result {
+                    Ok(_) => (TaskStatus::Completed, Some("Task completed".to_string())),
+                    Err(err) if err.to_string().contains("cancelled") => {
+                        (TaskStatus::Cancelled, Some(err.to_string()))
+                    }
+                    Err(err) => (TaskStatus::Failed, Some(err.to_string())),
+                };
+                task_from_descriptor(&result.descriptor, status, message)
+            }));
+
+            tasks
+        };
+
+        Ok(ListTasksResult::new(tasks))
+    }
+
+    async fn get_task_info(
+        &self,
+        request: GetTaskInfoParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        let task = {
+            let mut processor = self.context.task_processor.lock().await;
+            processor.check_timeouts();
+
+            let running_ids = processor.list_running();
+            if running_ids.iter().any(|id| id == &request.task_id)
+                && let Some(descriptor) = processor.task_descriptor(&request.task_id)
+            {
+                Some(task_from_descriptor(descriptor, TaskStatus::Working, None))
+            } else if let Some(result) = processor
+                .peek_completed()
+                .iter()
+                .find(|result| result.descriptor.operation_id == request.task_id)
+            {
+                let (status, message) = match &result.result {
+                    Ok(_) => (TaskStatus::Completed, Some("Task completed".to_string())),
+                    Err(err) if err.to_string().contains("cancelled") => {
+                        (TaskStatus::Cancelled, Some(err.to_string()))
+                    }
+                    Err(err) => (TaskStatus::Failed, Some(err.to_string())),
+                };
+                Some(task_from_descriptor(&result.descriptor, status, message))
+            } else {
+                None
+            }
+        };
+
+        task.map(|task| GetTaskResult { meta: None, task })
+            .ok_or_else(|| McpError::invalid_params("Unknown task id", None))
+    }
+
+    async fn get_task_result(
+        &self,
+        request: GetTaskResultParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskPayloadResult, McpError> {
+        let task_result = {
+            let mut processor = self.context.task_processor.lock().await;
+            processor.check_timeouts();
+
+            if processor
+                .list_running()
+                .iter()
+                .any(|task_id| task_id == &request.task_id)
+            {
+                return Err(McpError::invalid_params("Task is still running", None));
+            }
+
+            processor
+                .take_completed_result(&request.task_id)
+                .ok_or_else(|| McpError::invalid_params("Unknown task id", None))?
+        };
+
+        let payload = task_result
+            .result
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let tool_result = payload
+            .as_any()
+            .downcast_ref::<ToolCallTaskResult>()
+            .ok_or_else(|| McpError::internal_error("Unexpected task result type", None))?;
+
+        match &tool_result.result {
+            Ok(call_result) => {
+                let value = serde_json::to_value(call_result).map_err(|e| {
+                    McpError::internal_error(format!("Serialization error: {e}"), None)
+                })?;
+                Ok(GetTaskPayloadResult::new(value))
+            }
+            Err(err) => Err(McpError::internal_error(err.to_string(), None)),
+        }
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CancelTaskResult, McpError> {
+        let descriptor = {
+            let mut processor = self.context.task_processor.lock().await;
+            processor.check_timeouts();
+
+            let descriptor = processor
+                .task_descriptor(&request.task_id)
+                .cloned()
+                .ok_or_else(|| McpError::invalid_params("Unknown task id", None))?;
+
+            if !processor.cancel_task(&request.task_id) {
+                return Err(McpError::invalid_params("Task is not running", None));
+            }
+
+            drop(processor);
+            descriptor
+        };
+
+        Ok(CancelTaskResult {
+            meta: None,
+            task: task_from_descriptor(
+                &descriptor,
+                TaskStatus::Cancelled,
+                Some("Task cancelled".to_string()),
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use rmcp::model::TaskSupport;
 
     fn create_test_server() -> McplsServer {
         let translator = Arc::new(Mutex::new(Translator::new()));
@@ -702,6 +917,7 @@ mod tests {
         let info = server.get_info();
 
         assert!(info.capabilities.tools.is_some());
+        assert!(info.capabilities.tasks.is_some());
         assert_eq!(info.server_info.name, "mcpls");
         assert!(info.instructions.is_some());
     }
@@ -1205,5 +1421,29 @@ mod tests {
         let server = create_test_server();
         let info = server.get_info();
         assert!(info.capabilities.resources.is_some());
+    }
+
+    /// Long-running LSP tools advertise optional MCP task execution.
+    #[tokio::test]
+    async fn test_long_running_tools_advertise_optional_task_support() {
+        let tools = McplsServer::tool_router().list_all();
+
+        for tool_name in [
+            "get_references",
+            "get_diagnostics",
+            "rename_symbol",
+            "get_completions",
+            "workspace_symbol_search",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap_or_else(|| panic!("missing tool {tool_name}"));
+            let execution = tool
+                .execution
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing execution metadata for {tool_name}"));
+            assert_eq!(execution.task_support, Some(TaskSupport::Optional));
+        }
     }
 }
