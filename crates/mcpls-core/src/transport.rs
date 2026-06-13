@@ -107,8 +107,8 @@ pub(crate) async fn run_stdio(
 /// serves until `Ctrl-C` or `SIGTERM` is received.
 ///
 /// Each HTTP session receives its own `McplsServer` clone. The shared
-/// `Arc<Mutex<Translator>>` inside is the same across all sessions, so LSP
-/// state is still global per process.
+/// `Arc<Translator>` inside is the same across all sessions, so LSP state is
+/// still global per process.
 ///
 /// # Note
 ///
@@ -253,7 +253,7 @@ mod tests {
             use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
             use crate::mcp::McplsServer;
 
-            let translator = Arc::new(Mutex::new(Translator::new()));
+            let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let subs = Arc::new(ResourceSubscriptions::new());
             let server = McplsServer::new(translator, notification_cache, subs);
@@ -295,7 +295,7 @@ mod tests {
             let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = occupied.local_addr().unwrap();
 
-            let translator = Arc::new(Mutex::new(Translator::new()));
+            let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let subs = Arc::new(ResourceSubscriptions::new());
             let server = McplsServer::new(translator, notification_cache, subs);

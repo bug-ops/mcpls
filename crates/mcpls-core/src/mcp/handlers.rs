@@ -17,7 +17,7 @@ use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
 /// tasks in `lib.rs`, which own their own `Arc<OnceCell<Peer<RoleServer>>>`.
 pub struct HandlerContext {
     /// Translator for converting MCP calls to LSP requests.
-    pub translator: Arc<Mutex<Translator>>,
+    pub translator: Arc<Translator>,
     /// Shared cache for diagnostics, logs, and server messages.
     pub notification_cache: Arc<Mutex<NotificationCache>>,
     /// Set of resource URIs the MCP client has subscribed to.
@@ -28,7 +28,7 @@ impl HandlerContext {
     /// Create a new handler context.
     #[must_use]
     pub const fn new(
-        translator: Arc<Mutex<Translator>>,
+        translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn test_handler_context_creation() {
-        let translator = Arc::new(Mutex::new(Translator::new()));
+        let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let context = HandlerContext::new(translator, notification_cache, subscriptions);

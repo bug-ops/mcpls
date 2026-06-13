@@ -338,7 +338,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         info!("Proceeding with {} LSP server(s)", server_count);
     }
 
-    let translator = Arc::new(Mutex::new(translator));
+    let translator = Arc::new(translator);
     let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).

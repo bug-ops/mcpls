@@ -8,10 +8,10 @@ use crate::common::test_utils::{
     config_fixture_path, rust_analyzer_available, rust_workspace_path,
 };
 
-#[test]
-fn test_translator_creation() {
+#[tokio::test]
+async fn test_translator_creation() {
     let translator = Translator::new();
-    assert!(translator.document_tracker().is_empty());
+    assert!(translator.document_tracker().lock().await.is_empty());
 }
 
 #[test]
