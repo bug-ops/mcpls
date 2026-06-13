@@ -710,10 +710,9 @@ mod tests {
     #[test]
     fn test_get_diagnostics_tool_has_output_schema() {
         let tool = McplsServer::get_diagnostics_tool_attr();
-        let schema = tool
-            .output_schema
-            .as_ref()
-            .expect("get_diagnostics should declare an output schema");
+        let Some(schema) = tool.output_schema.as_ref() else {
+            panic!("get_diagnostics should declare an output schema");
+        };
         let schema_json = serde_json::to_string(schema).unwrap();
 
         assert!(schema_json.contains("diagnostics"));
@@ -729,10 +728,9 @@ mod tests {
         .into_call_tool_result()
         .unwrap();
 
-        let structured = result
-            .structured_content
-            .as_ref()
-            .expect("diagnostics result should include structured content");
+        let Some(structured) = result.structured_content.as_ref() else {
+            panic!("diagnostics result should include structured content");
+        };
         assert_eq!(structured["diagnostics"].as_array().unwrap().len(), 0);
 
         let text = result.content[0].as_text().unwrap();
