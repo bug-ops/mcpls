@@ -141,7 +141,7 @@ fn diagnostic_request_params(text_document: TextDocumentIdentifier) -> Diagnosti
 }
 
 /// Position in a document (1-based for MCP).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Position2D {
     /// Line number (1-based).
     pub line: u32,
@@ -150,7 +150,7 @@ pub struct Position2D {
 }
 
 /// Range in a document (1-based for MCP).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Range {
     /// Start position.
     pub start: Position2D,
@@ -191,7 +191,7 @@ pub struct ReferencesResult {
 }
 
 /// Diagnostic severity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticSeverity {
     /// Error diagnostic.
@@ -205,7 +205,7 @@ pub enum DiagnosticSeverity {
 }
 
 /// A single diagnostic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Diagnostic {
     /// Range where the diagnostic applies.
     pub range: Range,
@@ -218,7 +218,7 @@ pub struct Diagnostic {
 }
 
 /// Result of a diagnostics request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiagnosticsResult {
     /// List of diagnostics for the document.
     pub diagnostics: Vec<Diagnostic>,
