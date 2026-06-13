@@ -3,13 +3,14 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Implementation, ListResourcesResult, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    Implementation, ListResourcesResult, PaginatedRequestParams, RawResource,
+    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
@@ -24,6 +25,8 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, Translator};
+
+const LIST_RESOURCES_PAGE_SIZE: usize = 100;
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -541,43 +544,87 @@ impl McplsServer {
     }
 }
 
+fn parse_resource_cursor(cursor: Option<String>, total: usize) -> Result<usize, McpError> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+
+    let offset = cursor.parse::<usize>().map_err(|_| {
+        McpError::invalid_params(format!("Invalid list_resources cursor: {cursor}"), None)
+    })?;
+
+    if offset > total {
+        return Err(McpError::invalid_params(
+            format!("list_resources cursor {offset} is past {total} resources"),
+            None,
+        ));
+    }
+
+    Ok(offset)
+}
+
+fn resource_for_path(path: &Path) -> Option<Resource> {
+    let uri = make_uri(path)
+        .inspect_err(|e| {
+            tracing::warn!(
+                "Skipping path in list_resources (make_uri failed): {}: {e}",
+                path.display()
+            );
+        })
+        .ok()?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let raw = RawResource::new(uri, name)
+        .with_mime_type("application/json")
+        .with_description("LSP diagnostics for this file");
+    Some(rmcp::model::Annotated::new(raw, None))
+}
+
+fn list_resources_page(
+    mut paths: Vec<PathBuf>,
+    cursor: Option<String>,
+    page_size: usize,
+) -> Result<ListResourcesResult, McpError> {
+    paths.sort();
+
+    let total = paths.len();
+    let start = parse_resource_cursor(cursor, total)?;
+    let page_size = page_size.max(1);
+    let end = start.saturating_add(page_size).min(total);
+    let resources = paths[start..end]
+        .iter()
+        .filter_map(|path| resource_for_path(path))
+        .collect();
+    let next_cursor = (end < total).then(|| end.to_string());
+
+    Ok(ListResourcesResult {
+        meta: None,
+        next_cursor,
+        resources,
+    })
+}
+
 #[tool_handler]
 impl ServerHandler for McplsServer {
     async fn list_resources(
         &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
-        // very large single-page responses that may exceed transport buffers).
-        let resources: Vec<_> = {
+        let paths = {
             let translator = self.context.translator.lock().await;
             translator
                 .document_tracker()
                 .open_paths()
-                .filter_map(|path| {
-                    let uri = make_uri(path)
-                        .inspect_err(|e| {
-                            tracing::warn!(
-                                "Skipping path in list_resources (make_uri failed): {}: {e}",
-                                path.display()
-                            );
-                        })
-                        .ok()?;
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let raw = RawResource::new(uri, name)
-                        .with_mime_type("application/json")
-                        .with_description("LSP diagnostics for this file");
-                    Some(rmcp::model::Annotated::new(raw, None))
-                })
+                .map(Path::to_path_buf)
                 .collect()
         };
+        let cursor = request.and_then(|params| params.cursor);
 
-        Ok(ListResourcesResult::with_all_items(resources))
+        list_resources_page(paths, cursor, LIST_RESOURCES_PAGE_SIZE)
     }
 
     async fn read_resource(
@@ -1142,6 +1189,56 @@ mod tests {
             translator.document_tracker().open_paths().count() == 0
         };
         assert!(empty);
+    }
+
+    #[test]
+    fn test_list_resources_page_returns_sorted_first_page_with_cursor() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_c = temp_dir.path().join("c.rs");
+        let file_a = temp_dir.path().join("a.rs");
+        let file_b = temp_dir.path().join("b.rs");
+
+        let result = list_resources_page(vec![file_c, file_a, file_b], None, 2).unwrap();
+
+        assert_eq!(result.resources.len(), 2);
+        assert_eq!(result.resources[0].name, "a.rs");
+        assert_eq!(result.resources[1].name, "b.rs");
+        assert_eq!(result.next_cursor.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_list_resources_page_uses_cursor_for_next_page() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_c = temp_dir.path().join("c.rs");
+        let file_a = temp_dir.path().join("a.rs");
+        let file_b = temp_dir.path().join("b.rs");
+
+        let result =
+            list_resources_page(vec![file_c, file_a, file_b], Some("2".to_string()), 2).unwrap();
+
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.resources[0].name, "c.rs");
+        assert!(result.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_list_resources_page_rejects_invalid_cursor() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lib.rs");
+
+        let result = list_resources_page(vec![file_path], Some("not-a-number".to_string()), 2);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_resources_page_rejects_cursor_past_end() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lib.rs");
+
+        let result = list_resources_page(vec![file_path], Some("2".to_string()), 2);
+
+        assert!(result.is_err());
     }
 
     /// `parse_uri` rejects `file://` scheme — ensures `read_resource` would return an error.
