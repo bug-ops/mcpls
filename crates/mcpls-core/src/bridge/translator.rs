@@ -27,10 +27,12 @@ use crate::lsp::{LspClient, LspServer};
 /// Translator handles MCP tool calls by converting them to LSP requests.
 #[derive(Debug)]
 pub struct Translator {
-    /// LSP clients indexed by language ID.
+    /// LSP clients indexed by server key.
     lsp_clients: HashMap<String, LspClient>,
-    /// LSP servers indexed by language ID (held for lifetime management).
+    /// LSP servers indexed by server key (held for lifetime management).
     lsp_servers: HashMap<String, LspServer>,
+    /// Tool routes indexed by `(language_id, tool_handle)`.
+    tool_routes: HashMap<(String, String), String>,
     /// Document state tracker.
     document_tracker: DocumentTracker,
     /// Notification cache for LSP server notifications.
@@ -48,6 +50,7 @@ impl Translator {
         Self {
             lsp_clients: HashMap::new(),
             lsp_servers: HashMap::new(),
+            tool_routes: HashMap::new(),
             document_tracker: DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
             notification_cache: NotificationCache::new(),
             workspace_roots: vec![],
@@ -72,14 +75,28 @@ impl Translator {
         self
     }
 
-    /// Register an LSP client for a language.
-    pub fn register_client(&mut self, language_id: String, client: LspClient) {
-        self.lsp_clients.insert(language_id, client);
+    /// Register an LSP client for a server key.
+    pub fn register_client(&mut self, server_key: String, client: LspClient) {
+        self.lsp_clients.insert(server_key, client);
     }
 
-    /// Register an LSP server for a language.
-    pub fn register_server(&mut self, language_id: String, server: LspServer) {
-        self.lsp_servers.insert(language_id, server);
+    /// Register an LSP server for a server key.
+    pub fn register_server(&mut self, server_key: String, server: LspServer) {
+        self.lsp_servers.insert(server_key, server);
+    }
+
+    /// Register tool routes for a language/server pair.
+    pub fn register_tool_routes<I, S>(&mut self, language_id: &str, server_key: &str, handles: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for handle in handles {
+            self.tool_routes.insert(
+                (language_id.to_string(), handle.into()),
+                server_key.to_string(),
+            );
+        }
     }
 
     /// Get the document tracker.
@@ -552,13 +569,44 @@ impl Translator {
         Err(Error::PathOutsideWorkspace(path.to_path_buf()))
     }
 
-    /// Get a cloned LSP client for a file path based on language detection.
-    fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
+    /// Get a cloned LSP client for a file path and tool based on configured routes.
+    fn get_client_for_file_and_tool(&self, path: &Path, tool: &str) -> Result<LspClient> {
         let language_id = detect_language(path, &self.extension_map);
+        let server_key = self
+            .tool_routes
+            .get(&(language_id.clone(), tool.to_string()))
+            .unwrap_or(&language_id);
         self.lsp_clients
-            .get(&language_id)
+            .get(server_key)
             .cloned()
             .ok_or(Error::NoServerForLanguage(language_id))
+    }
+
+    /// Get a cloned LSP client for workspace-scoped tools.
+    fn get_client_for_workspace_tool(&self, tool: &str) -> Result<LspClient> {
+        let mut routed_server_keys =
+            self.tool_routes
+                .iter()
+                .filter_map(|((_, handle), server_key)| {
+                    if handle == tool {
+                        Some(server_key)
+                    } else {
+                        None
+                    }
+                });
+
+        if let Some(server_key) = routed_server_keys.next()
+            && routed_server_keys.all(|other| other == server_key)
+            && let Some(client) = self.lsp_clients.get(server_key)
+        {
+            return Ok(client.clone());
+        }
+
+        self.lsp_clients
+            .values()
+            .next()
+            .cloned()
+            .ok_or(Error::NoServerConfigured)
     }
 
     /// Parse and validate a file URI, returning the validated path.
@@ -612,7 +660,7 @@ impl Translator {
     ) -> Result<HoverResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "hover")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -660,7 +708,7 @@ impl Translator {
     ) -> Result<DefinitionResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "definition")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -721,7 +769,7 @@ impl Translator {
     ) -> Result<ReferencesResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "references")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -768,7 +816,7 @@ impl Translator {
     pub async fn handle_diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "diagnostics")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -831,7 +879,7 @@ impl Translator {
     ) -> Result<RenameResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "rename")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -927,7 +975,7 @@ impl Translator {
     ) -> Result<CompletionsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "completions")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -989,7 +1037,7 @@ impl Translator {
     ) -> Result<DocumentSymbolsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "document_symbols")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -1039,7 +1087,7 @@ impl Translator {
     ) -> Result<FormatDocumentResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "format_document")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -1135,13 +1183,7 @@ impl Translator {
             )));
         }
 
-        // Workspace search requires at least one LSP client
-        let client = self
-            .lsp_clients
-            .values()
-            .next()
-            .cloned()
-            .ok_or(Error::NoServerConfigured)?;
+        let client = self.get_client_for_workspace_tool("workspace_symbols")?;
 
         let params = LspWorkspaceSymbolParams {
             query,
@@ -1203,7 +1245,7 @@ impl Translator {
 
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "code_actions")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -1293,7 +1335,8 @@ impl Translator {
 
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client =
+            self.get_client_for_file_and_tool(&validated_path, "call_hierarchy_prepare")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -1341,7 +1384,7 @@ impl Translator {
 
         // Parse and validate the URI
         let path = self.parse_file_uri(&lsp_item.uri)?;
-        let client = self.get_client_for_file(&path)?;
+        let client = self.get_client_for_file_and_tool(&path, "call_hierarchy_incoming")?;
 
         let params = CallHierarchyIncomingCallsParams {
             item: lsp_item,
@@ -1390,7 +1433,7 @@ impl Translator {
 
         // Parse and validate the URI
         let path = self.parse_file_uri(&lsp_item.uri)?;
-        let client = self.get_client_for_file(&path)?;
+        let client = self.get_client_for_file_and_tool(&path, "call_hierarchy_outgoing")?;
 
         let params = CallHierarchyOutgoingCallsParams {
             item: lsp_item,
@@ -1549,7 +1592,7 @@ impl Translator {
     ) -> Result<SignatureHelpResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "signature_help")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -1622,7 +1665,7 @@ impl Translator {
     ) -> Result<LocationsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "implementation")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -1664,7 +1707,7 @@ impl Translator {
     ) -> Result<LocationsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "type_definition")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -1710,7 +1753,7 @@ impl Translator {
 
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let client = self.get_client_for_file_and_tool(&validated_path, "inlay_hints")?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &client)
@@ -2054,10 +2097,26 @@ fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
 mod tests {
     use std::fs;
 
+    use crate::config::LspServerConfig;
     use tempfile::TempDir;
     use url::Url;
 
     use super::*;
+
+    fn test_lsp_client(server_key: &str, language_id: &str) -> LspClient {
+        LspClient::new(LspServerConfig {
+            name: Some(server_key.to_string()),
+            language_id: language_id.to_string(),
+            command: "test-lsp".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            file_patterns: vec![],
+            initialization_options: None,
+            timeout_seconds: 30,
+            heuristics: None,
+            handles: vec![],
+        })
+    }
 
     #[test]
     fn test_translator_new() {
@@ -3197,7 +3256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_client_for_file_uses_custom_extension() {
+    fn test_get_client_for_file_and_tool_uses_custom_extension() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("script.nu");
         fs::write(&test_file, "echo hello").unwrap();
@@ -3207,7 +3266,7 @@ mod tests {
 
         let translator = Translator::new().with_extensions(extension_map);
 
-        let result = translator.get_client_for_file(&test_file);
+        let result = translator.get_client_for_file_and_tool(&test_file, "hover");
 
         assert!(result.is_err());
         if let Err(Error::NoServerForLanguage(lang)) = result {
@@ -3218,7 +3277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_client_for_file_falls_back_to_default() {
+    fn test_get_client_for_file_and_tool_falls_back_to_default() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("unknown.xyz");
         fs::write(&test_file, "content").unwrap();
@@ -3228,7 +3287,7 @@ mod tests {
 
         let translator = Translator::new().with_extensions(extension_map);
 
-        let result = translator.get_client_for_file(&test_file);
+        let result = translator.get_client_for_file_and_tool(&test_file, "hover");
 
         assert!(result.is_err());
         if let Err(Error::NoServerForLanguage(lang)) = result {
@@ -3236,6 +3295,21 @@ mod tests {
         } else {
             panic!("Expected NoServerForLanguage(plaintext) error");
         }
+    }
+
+    #[test]
+    fn test_get_client_for_workspace_tool_uses_unique_route() {
+        let mut translator = Translator::new();
+        translator.register_client("pyright".to_string(), test_lsp_client("pyright", "pyright"));
+        translator.register_client("pylsp".to_string(), test_lsp_client("pylsp", "pylsp"));
+        translator.register_tool_routes("python", "pyright", ["workspace_symbols"]);
+        translator.register_tool_routes("python", "pylsp", ["diagnostics"]);
+
+        let client = translator
+            .get_client_for_workspace_tool("workspace_symbols")
+            .unwrap();
+
+        assert_eq!(client.language_id(), "pyright");
     }
 
     #[tokio::test]

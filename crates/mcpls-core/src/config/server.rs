@@ -146,6 +146,12 @@ impl ServerHeuristics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LspServerConfig {
+    /// Stable server name used for explicit tool routing.
+    ///
+    /// Defaults to `language_id` when omitted.
+    #[serde(default)]
+    pub name: Option<String>,
+
     /// Language identifier (e.g., "rust", "python", "typescript").
     pub language_id: String,
 
@@ -176,6 +182,12 @@ pub struct LspServerConfig {
     /// If not specified, the server will always attempt to spawn.
     #[serde(default)]
     pub heuristics: Option<ServerHeuristics>,
+
+    /// Tool handles this server should receive for its language.
+    ///
+    /// Empty means all supported tools for the language.
+    #[serde(default)]
+    pub handles: Vec<String>,
 }
 
 const fn default_timeout() -> u64 {
@@ -183,6 +195,84 @@ const fn default_timeout() -> u64 {
 }
 
 impl LspServerConfig {
+    /// Server key used internally for routing and lifetime management.
+    #[must_use]
+    pub fn server_key(&self) -> String {
+        self.name
+            .as_ref()
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.language_id.clone())
+    }
+
+    /// Normalize a user-facing tool handle into the internal routing key.
+    #[must_use]
+    pub fn normalize_handle(handle: &str) -> Option<&'static str> {
+        match handle {
+            "hover" | "get_hover" => Some("hover"),
+            "definition" | "get_definition" | "go_to_definition" => Some("definition"),
+            "references" | "get_references" | "find_references" => Some("references"),
+            "diagnostics" | "get_diagnostics" => Some("diagnostics"),
+            "cached_diagnostics" | "get_cached_diagnostics" => Some("cached_diagnostics"),
+            "completions" | "get_completions" => Some("completions"),
+            "document_symbols" | "get_document_symbols" => Some("document_symbols"),
+            "workspace_symbols" | "workspace_symbol_search" => Some("workspace_symbols"),
+            "format" | "format_document" => Some("format_document"),
+            "code_actions" | "get_code_actions" => Some("code_actions"),
+            "rename" | "rename_symbol" => Some("rename"),
+            "signature_help" | "get_signature_help" => Some("signature_help"),
+            "implementation" | "go_to_implementation" => Some("implementation"),
+            "type_definition" | "go_to_type_definition" => Some("type_definition"),
+            "inlay_hints" | "get_inlay_hints" => Some("inlay_hints"),
+            "call_hierarchy_prepare" | "prepare_call_hierarchy" => Some("call_hierarchy_prepare"),
+            "call_hierarchy_incoming" | "incoming_calls" | "get_incoming_calls" => {
+                Some("call_hierarchy_incoming")
+            }
+            "call_hierarchy_outgoing" | "outgoing_calls" | "get_outgoing_calls" => {
+                Some("call_hierarchy_outgoing")
+            }
+            _ => None,
+        }
+    }
+
+    /// Normalized handles for this server.
+    #[must_use]
+    pub fn normalized_handles(&self) -> Vec<&'static str> {
+        if self.handles.is_empty() {
+            return Self::all_handles();
+        }
+
+        self.handles
+            .iter()
+            .filter_map(|handle| Self::normalize_handle(handle))
+            .collect()
+    }
+
+    /// All routeable tool handles.
+    #[must_use]
+    pub fn all_handles() -> Vec<&'static str> {
+        vec![
+            "hover",
+            "definition",
+            "references",
+            "diagnostics",
+            "cached_diagnostics",
+            "completions",
+            "document_symbols",
+            "workspace_symbols",
+            "format_document",
+            "code_actions",
+            "rename",
+            "signature_help",
+            "implementation",
+            "type_definition",
+            "inlay_hints",
+            "call_hierarchy_prepare",
+            "call_hierarchy_incoming",
+            "call_hierarchy_outgoing",
+        ]
+    }
+
     /// Check if this server should be spawned for the given workspace.
     ///
     /// Uses recursive marker search to detect nested projects.
@@ -202,6 +292,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn rust_analyzer() -> Self {
         Self {
+            name: None,
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
             args: vec![],
@@ -213,6 +304,7 @@ impl LspServerConfig {
                 "Cargo.toml",
                 "rust-toolchain.toml",
             ])),
+            handles: vec![],
         }
     }
 
@@ -220,6 +312,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn pyright() -> Self {
         Self {
+            name: None,
             language_id: "python".to_string(),
             command: "pyright-langserver".to_string(),
             args: vec!["--stdio".to_string()],
@@ -233,6 +326,7 @@ impl LspServerConfig {
                 "requirements.txt",
                 "pyrightconfig.json",
             ])),
+            handles: vec![],
         }
     }
 
@@ -240,6 +334,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn typescript() -> Self {
         Self {
+            name: None,
             language_id: "typescript".to_string(),
             command: "typescript-language-server".to_string(),
             args: vec!["--stdio".to_string()],
@@ -252,6 +347,7 @@ impl LspServerConfig {
                 "tsconfig.json",
                 "jsconfig.json",
             ])),
+            handles: vec![],
         }
     }
 
@@ -259,6 +355,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn gopls() -> Self {
         Self {
+            name: None,
             language_id: "go".to_string(),
             command: "gopls".to_string(),
             args: vec!["serve".to_string()],
@@ -267,6 +364,7 @@ impl LspServerConfig {
             initialization_options: None,
             timeout_seconds: default_timeout(),
             heuristics: Some(ServerHeuristics::with_markers(["go.mod", "go.sum"])),
+            handles: vec![],
         }
     }
 
@@ -274,6 +372,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn clangd() -> Self {
         Self {
+            name: None,
             language_id: "cpp".to_string(),
             command: "clangd".to_string(),
             args: vec![],
@@ -292,6 +391,7 @@ impl LspServerConfig {
                 "Makefile",
                 ".clangd",
             ])),
+            handles: vec![],
         }
     }
 
@@ -299,6 +399,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn zls() -> Self {
         Self {
+            name: None,
             language_id: "zig".to_string(),
             command: "zls".to_string(),
             args: vec![],
@@ -310,6 +411,7 @@ impl LspServerConfig {
                 "build.zig",
                 "build.zig.zon",
             ])),
+            handles: vec![],
         }
     }
 }
@@ -371,6 +473,7 @@ mod tests {
         env.insert("RUST_LOG".to_string(), "debug".to_string());
 
         let config = LspServerConfig {
+            name: None,
             language_id: "custom".to_string(),
             command: "custom-lsp".to_string(),
             args: vec!["--flag".to_string()],
@@ -379,6 +482,7 @@ mod tests {
             initialization_options: Some(serde_json::json!({"key": "value"})),
             timeout_seconds: 60,
             heuristics: None,
+            handles: vec![],
         };
 
         assert_eq!(config.language_id, "custom");
@@ -477,6 +581,7 @@ mod tests {
     #[test]
     fn test_should_spawn_without_heuristics() {
         let config = LspServerConfig {
+            name: None,
             language_id: "test".to_string(),
             command: "test-lsp".to_string(),
             args: vec![],
@@ -485,6 +590,7 @@ mod tests {
             initialization_options: None,
             timeout_seconds: 30,
             heuristics: None,
+            handles: vec![],
         };
 
         let tmp = TempDir::new().unwrap();

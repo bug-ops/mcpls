@@ -390,10 +390,18 @@ impl ServerConfig {
 
     /// Validate the configuration.
     fn validate(&self) -> Result<()> {
+        let mut routes: HashMap<(String, &'static str), String> = HashMap::new();
+
         for server in &self.lsp_servers {
+            let server_key = server.server_key();
             if server.language_id.is_empty() {
                 return Err(Error::InvalidConfig(
                     "language_id cannot be empty".to_string(),
+                ));
+            }
+            if server_key.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "server name cannot be empty".to_string(),
                 ));
             }
             if server.command.is_empty() {
@@ -401,6 +409,22 @@ impl ServerConfig {
                     "command cannot be empty for language '{}'",
                     server.language_id
                 )));
+            }
+            for handle in &server.handles {
+                if LspServerConfig::normalize_handle(handle).is_none() {
+                    return Err(Error::InvalidConfig(format!(
+                        "unknown tool handle '{handle}' for server '{server_key}'"
+                    )));
+                }
+            }
+            for handle in server.normalized_handles() {
+                let route = (server.language_id.clone(), handle);
+                if let Some(existing) = routes.insert(route, server_key.clone()) {
+                    return Err(Error::InvalidConfig(format!(
+                        "tool handle '{handle}' for language '{}' is claimed by both '{}' and '{}'",
+                        server.language_id, existing, server_key
+                    )));
+                }
             }
         }
         Ok(())
@@ -584,6 +608,62 @@ mod tests {
     }
 
     #[test]
+    fn test_load_named_servers_with_split_handles() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("routing.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            name = "pyright"
+            language_id = "python"
+            command = "pyright-langserver"
+            args = ["--stdio"]
+            handles = ["hover", "definition", "references"]
+
+            [[lsp_servers]]
+            name = "pylsp"
+            language_id = "python"
+            command = "pylsp"
+            handles = ["diagnostics", "cached_diagnostics"]
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.lsp_servers.len(), 2);
+        assert_eq!(config.lsp_servers[0].server_key(), "pyright");
+        assert_eq!(
+            config.lsp_servers[1].normalized_handles(),
+            vec!["diagnostics", "cached_diagnostics"]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_tool_routes_are_rejected() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("routing-conflict.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            name = "pyright"
+            language_id = "python"
+            command = "pyright-langserver"
+            handles = ["diagnostics"]
+
+            [[lsp_servers]]
+            name = "pylsp"
+            language_id = "python"
+            command = "pylsp"
+            handles = ["get_diagnostics"]
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(matches!(result, Err(Error::InvalidConfig(msg)) if msg.contains("diagnostics")));
+    }
+
+    #[test]
     fn test_deny_unknown_fields() {
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("unknown.toml");
@@ -729,6 +809,7 @@ mod tests {
         let config = ServerConfig {
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
+                name: None,
                 language_id: "cpp".to_string(),
                 command: "clangd".to_string(),
                 args: vec![],
@@ -737,6 +818,7 @@ mod tests {
                 initialization_options: None,
                 timeout_seconds: 30,
                 heuristics: None,
+                handles: vec![],
             }],
         };
 
@@ -750,6 +832,7 @@ mod tests {
         let config = ServerConfig {
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
+                name: None,
                 language_id: "cpp".to_string(),
                 command: "clangd".to_string(),
                 args: vec![],
@@ -758,6 +841,7 @@ mod tests {
                 initialization_options: None,
                 timeout_seconds: 30,
                 heuristics: None,
+                handles: vec![],
             }],
         };
 
