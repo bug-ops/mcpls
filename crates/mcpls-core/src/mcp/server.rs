@@ -3,7 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -541,6 +541,43 @@ impl McplsServer {
     }
 }
 
+impl McplsServer {
+    async fn resource_diagnostics_json(&self, path: &Path) -> Result<String, McpError> {
+        // Enforce workspace-root containment — mirrors the guard in every LSP tool.
+        {
+            let translator = self.context.translator.lock().await;
+            translator
+                .validate_path(path)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        }
+
+        let lsp_uri = crate::bridge::path_to_uri(path);
+        let diagnostics = {
+            let translator = self.context.translator.lock().await;
+            translator
+                .notification_cache()
+                .get_diagnostics(lsp_uri.as_str())
+                .cloned()
+        };
+
+        let payload = match diagnostics {
+            Some(info) => serde_json::json!({
+                "tracked": true,
+                "uri": info.uri,
+                "version": info.version,
+                "diagnostics": info.diagnostics,
+            }),
+            None => serde_json::json!({
+                "tracked": false,
+                "diagnostics": null,
+            }),
+        };
+
+        serde_json::to_string(&payload)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for McplsServer {
     async fn list_resources(
@@ -588,29 +625,7 @@ impl ServerHandler for McplsServer {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Enforce workspace-root containment — mirrors the guard in every LSP tool.
-        {
-            let translator = self.context.translator.lock().await;
-            translator
-                .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
-
-        let lsp_uri = crate::bridge::path_to_uri(&path);
-
-        // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
-        // in the response shape. Currently both return `{"diagnostics":null}` which is
-        // ambiguous for clients that need to know whether analysis has run yet.
-        let diagnostics = {
-            let translator = self.context.translator.lock().await;
-            translator
-                .notification_cache()
-                .get_diagnostics(lsp_uri.as_str())
-                .cloned()
-        };
-
-        let json = serde_json::to_string(&diagnostics)
-            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
+        let json = self.resource_diagnostics_json(&path).await?;
 
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             json,
@@ -1149,6 +1164,85 @@ mod tests {
     fn test_read_resource_rejects_file_scheme() {
         let result = parse_uri("file:///some/file.rs");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_resource_payload_marks_untracked_file() {
+        let server = create_test_server();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lib.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let json = server.resource_diagnostics_json(&file_path).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(payload["tracked"], false);
+        assert!(payload["diagnostics"].is_null());
+        assert!(payload.get("uri").is_none());
+        assert!(payload.get("version").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_resource_payload_marks_tracked_clean_file() {
+        let server = create_test_server();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lib.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+        let uri = crate::bridge::path_to_uri(&file_path);
+
+        {
+            let mut translator = server.context.translator.lock().await;
+            translator
+                .notification_cache_mut()
+                .store_diagnostics(&uri, Some(7), Vec::new());
+        }
+
+        let json = server.resource_diagnostics_json(&file_path).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(payload["tracked"], true);
+        assert_eq!(payload["uri"], uri.as_str());
+        assert_eq!(payload["version"], 7);
+        assert_eq!(payload["diagnostics"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_resource_payload_preserves_tracked_diagnostics() {
+        let server = create_test_server();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lib.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+        let uri = crate::bridge::path_to_uri(&file_path);
+
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 0),
+                lsp_types::Position::new(0, 1),
+            ),
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: Some("rust-analyzer".to_string()),
+            message: "expected expression".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+
+        {
+            let mut translator = server.context.translator.lock().await;
+            translator
+                .notification_cache_mut()
+                .store_diagnostics(&uri, Some(3), vec![diagnostic]);
+        }
+
+        let json = server.resource_diagnostics_json(&file_path).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(payload["tracked"], true);
+        assert_eq!(payload["version"], 3);
+        assert_eq!(payload["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["diagnostics"][0]["message"], "expected expression");
     }
 
     /// `parse_uri` rejects `https://` scheme.
