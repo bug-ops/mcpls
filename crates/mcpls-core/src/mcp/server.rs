@@ -8,8 +8,8 @@ use std::sync::Arc;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     Implementation, ListResourcesResult, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    ReadResourceResult, ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities,
+    ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
@@ -41,6 +41,21 @@ impl McplsServer {
     ) -> Self {
         let context = Arc::new(HandlerContext::new(translator, subscriptions));
         Self { context }
+    }
+
+    async fn has_cached_diagnostics_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, McpError> {
+        let lsp_uri = crate::bridge::path_to_uri(path);
+        let translator = self.context.translator.lock().await;
+        translator
+            .validate_path(path)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(translator
+            .notification_cache()
+            .get_diagnostics(lsp_uri.as_str())
+            .is_some())
     }
 
     /// Get hover information at a position in a file.
@@ -621,28 +636,26 @@ impl ServerHandler for McplsServer {
     async fn subscribe(
         &self,
         request: SubscribeRequestParams,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Enforce workspace-root containment (same invariant as every LSP tool).
-        {
-            let translator = self.context.translator.lock().await;
-            translator
-                .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
-
-        // TODO(S3): If diagnostics are already cached for this URI, emit a synthetic
-        // notify_resource_updated so clients subscribing after initial workspace indexing
-        // don't have to wait for the next LSP push. Requires peer access from HandlerContext.
-        // Track as follow-up issue.
-        self.context
+        let has_cached_diagnostics = self.has_cached_diagnostics_for_path(&path).await?;
+        let inserted = self
+            .context
             .subscriptions
-            .subscribe(request.uri)
+            .subscribe(request.uri.clone())
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
+
+        if inserted && has_cached_diagnostics {
+            context
+                .peer
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(request.uri))
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
 
         Ok(())
     }
@@ -1169,6 +1182,67 @@ mod tests {
             t.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"))
         };
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_replay_check_detects_cached_diagnostics() {
+        let server = create_test_server();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn main() {}").unwrap();
+        let canonical_path = test_file.canonicalize().unwrap();
+        let lsp_uri = crate::bridge::path_to_uri(&canonical_path);
+
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 2,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: Some(lsp_types::NumberOrString::String("E0001".to_string())),
+            code_description: None,
+            source: Some("test".to_string()),
+            message: "cached diagnostic".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+
+        {
+            let mut translator = server.context.translator.lock().await;
+            translator.notification_cache_mut().store_diagnostics(
+                &lsp_uri,
+                Some(1),
+                vec![diagnostic],
+            );
+        }
+
+        let has_cached = server
+            .has_cached_diagnostics_for_path(&canonical_path)
+            .await
+            .unwrap();
+        assert!(has_cached);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_replay_check_returns_false_without_cached_diagnostics() {
+        let server = create_test_server();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn main() {}").unwrap();
+        let canonical_path = test_file.canonicalize().unwrap();
+
+        let has_cached = server
+            .has_cached_diagnostics_for_path(&canonical_path)
+            .await
+            .unwrap();
+        assert!(!has_cached);
     }
 
     /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
