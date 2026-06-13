@@ -201,7 +201,7 @@ async fn test_hover_on_u64_type() {
         translator.lock().await.handle_hover(
             file_path.to_string_lossy().to_string(),
             19,
-            17, // Position on "u64"
+            13, // Position on "u64"
         ),
     )
     .await;
