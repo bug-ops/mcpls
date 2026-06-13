@@ -11,7 +11,9 @@ use rmcp::model::{
     ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
     UnsubscribeRequestParams,
 };
-use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{
+    ErrorData as McpError, Json, RoleServer, ServerHandler, tool, tool_handler, tool_router,
+};
 use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
@@ -23,7 +25,7 @@ use super::tools::{
     ServerLogsParams, ServerMessagesParams, SignatureHelpParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
-use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::bridge::{DiagnosticsResult, ResourceSubscriptions, Translator};
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -127,15 +129,14 @@ impl McplsServer {
     async fn get_diagnostics(
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
-    ) -> Result<String, McpError> {
+    ) -> Result<Json<DiagnosticsResult>, McpError> {
         let result = {
             let mut translator = self.context.translator.lock().await;
             translator.handle_diagnostics(file_path).await
         };
 
         match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+            Ok(value) => Ok(Json(value)),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
@@ -704,6 +705,39 @@ mod tests {
         assert!(info.capabilities.tools.is_some());
         assert_eq!(info.server_info.name, "mcpls");
         assert!(info.instructions.is_some());
+    }
+
+    #[test]
+    fn test_get_diagnostics_tool_has_output_schema() {
+        let tool = McplsServer::get_diagnostics_tool_attr();
+        let schema = tool
+            .output_schema
+            .as_ref()
+            .expect("get_diagnostics should declare an output schema");
+        let schema_json = serde_json::to_string(schema).unwrap();
+
+        assert!(schema_json.contains("diagnostics"));
+    }
+
+    #[test]
+    fn test_diagnostics_result_converts_to_structured_content() {
+        use rmcp::handler::server::tool::IntoCallToolResult;
+
+        let result = Json(DiagnosticsResult {
+            diagnostics: Vec::new(),
+        })
+        .into_call_tool_result()
+        .unwrap();
+
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("diagnostics result should include structured content");
+        assert_eq!(structured["diagnostics"].as_array().unwrap().len(), 0);
+
+        let text = result.content[0].as_text().unwrap();
+        let content_json: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        assert_eq!(&content_json, structured);
     }
 
     #[tokio::test]
