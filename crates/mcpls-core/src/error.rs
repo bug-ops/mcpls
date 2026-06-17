@@ -27,7 +27,12 @@ impl std::fmt::Display for ServerSpawnFailure {
 }
 
 /// The main error type for mcpls-core operations.
+///
+/// This enum is `#[non_exhaustive]`: downstream crates that match on it must
+/// include a wildcard arm. New variants (such as [`Error::ServerInitializing`])
+/// can then be added without further breaking changes.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// LSP server failed to initialize.
     #[error("LSP server initialization failed: {message}")]
@@ -58,6 +63,12 @@ pub enum Error {
     /// No LSP server configured for the given language.
     #[error("no LSP server configured for language: {0}")]
     NoServerForLanguage(String),
+
+    /// LSP server for the language is configured but still initializing.
+    #[error(
+        "LSP server for language '{0}' is still initializing (large project load in progress); wait and retry the request (this may take a few minutes on large projects)"
+    )]
+    ServerInitializing(String),
 
     /// No LSP server is currently configured.
     #[error("no LSP server configured")]

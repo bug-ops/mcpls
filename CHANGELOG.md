@@ -16,12 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RFC-3986 URI codec** — `bridge::resources` module with percent-encoding via `url::Url::from_file_path`; empty-authority injection is rejected to prevent UNC-path attacks on Windows
 - **Subscription cap** — `ResourceSubscriptions` enforces a `MAX_SUBSCRIPTIONS = 1_000` limit per session to guard against memory exhaustion
 - **MCP tools** — `get_signature_help` (`textDocument/signatureHelp`), `go_to_implementation` (`textDocument/implementation`), `go_to_type_definition` (`textDocument/typeDefinition`), and `get_inlay_hints` (`textDocument/inlayHint`) tools exposing LSP 3.6/3.15/3.17 capabilities (#116)
+- **Non-blocking startup for slow LSP servers** — `serve_with` spawns LSP initialization in a background task and starts the MCP server immediately, so the MCP `initialize` handshake no longer waits for the language server to finish loading. Large solutions that take a long time to load (e.g. OmniSharp on a ~130-project Unity solution, ~86 s) no longer trip the MCP client's initialize timeout. (#172)
+- **`ServerInitializing` error** — a request for a configured language whose server is still loading returns a dedicated "still initializing, wait and retry" error instead of the misleading "no LSP server configured for language". (#172)
 
 ### Changed
 
 - **LSP API** — Breaking change: `InboundMessage` is now non-exhaustive and includes a server-request variant for LSP server-to-client JSON-RPC requests. Downstream exhaustive matches must include a wildcard arm.
+- **Error API** — Breaking change: `Error` is now `#[non_exhaustive]` and gains a `ServerInitializing(String)` variant. Downstream exhaustive matches must include a wildcard arm. (#172)
 
 ### Fixed
+
+- **Initialize handshake timeout** — the LSP `initialize` request now honors the per-server `timeout_seconds` configuration instead of a hardcoded 30 s, so servers that need longer to load on large projects are no longer killed mid-initialization. (#172)
+- **Startup `null` messages** — the LSP receive loop skips bare `null`/non-object JSON-RPC messages (emitted by OmniSharp during startup) and keeps reading, instead of treating them as a fatal protocol error that drops the connection. (#172)
+- **Partial-success expected languages** — the "expected languages" set is cleared once background initialization completes, so a language whose server failed to spawn (when others succeeded) falls back to `NoServerForLanguage` instead of reporting `ServerInitializing` forever. (#172)
 
 - **ServerCancelled retry** — `LspClient::request()` now retries up to 3 times with exponential backoff (500 ms → 1 s → 2 s) when an LSP server returns error code -32802 with `data.retriggerRequest: true`, instead of propagating the error immediately to the MCP caller (#128)
 - **Integration test readiness gate** — Replaced `publishDiagnostics`-based readiness signal with hover-probe polling (3 consecutive successful hover responses required), matching the ra_e2e approach; fixes 3 of 5 integration tests that failed consistently in isolation after PR #123 (#127)
