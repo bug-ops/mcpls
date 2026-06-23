@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete reference for all 16 MCP tools provided by mcpls.
+Complete reference for all 20 MCP tools provided by mcpls.
 
 ## Overview
 
@@ -23,7 +23,7 @@ mcpls exposes semantic code intelligence from Language Server Protocol (LSP) ser
 
 | Tool | LSP Method | Description |
 |------|------------|-------------|
-| [get_diagnostics](#get_diagnostics) | `textDocument/publishDiagnostics` | Compiler errors and warnings |
+| [get_diagnostics](#get_diagnostics) | `textDocument/diagnostic` | Pull-based compiler errors and warnings |
 | [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications |
 | [format_document](#format_document) | `textDocument/formatting` | Document formatting |
 
@@ -41,6 +41,15 @@ mcpls exposes semantic code intelligence from Language Server Protocol (LSP) ser
 | [prepare_call_hierarchy](#prepare_call_hierarchy) | `textDocument/prepareCallHierarchy` | Prepare call hierarchy at position |
 | [get_incoming_calls](#get_incoming_calls) | `callHierarchy/incomingCalls` | Functions that call the target |
 | [get_outgoing_calls](#get_outgoing_calls) | `callHierarchy/outgoingCalls` | Functions called by the target |
+
+### Navigation Tools
+
+| Tool | LSP Method | Description |
+|------|------------|-------------|
+| [get_signature_help](#get_signature_help) | `textDocument/signatureHelp` | Parameter signatures at a call site |
+| [go_to_implementation](#go_to_implementation) | `textDocument/implementation` | Jump to trait/interface implementations |
+| [go_to_type_definition](#go_to_type_definition) | `textDocument/typeDefinition` | Jump to the type definition of a value |
+| [get_inlay_hints](#get_inlay_hints) | `textDocument/inlayHint` | Inline type and parameter hints for a range |
 
 ### Server Monitoring Tools
 
@@ -890,6 +899,180 @@ Get recent show messages from LSP servers.
 
 - Contains user-facing messages from LSP servers
 - Useful for tracking server status and important notifications
+
+---
+
+## get_signature_help
+
+Get parameter signature information at a call site.
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.rs",
+  "line": 10,
+  "character": 20
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `line` | integer | Yes | Line number (1-based) |
+| `character` | integer | Yes | Character position (1-based, UTF-8) |
+
+### Returns
+
+Signature help with active parameter highlighted:
+
+```json
+{
+  "signatures": [
+    {
+      "label": "fn process(input: &str, timeout: u32) -> Result<Output>",
+      "documentation": "Process the input string.",
+      "parameters": [
+        { "label": "input: &str" },
+        { "label": "timeout: u32" }
+      ],
+      "activeParameter": 1
+    }
+  ],
+  "activeSignature": 0,
+  "activeParameter": 1
+}
+```
+
+### Notes
+
+- Useful when the cursor is inside a function call's argument list
+- Returns `null` if no signature information is available
+
+---
+
+## go_to_implementation
+
+Jump to all implementations of a trait, interface, or abstract method.
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.rs",
+  "line": 10,
+  "character": 5
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `line` | integer | Yes | Line number (1-based) |
+| `character` | integer | Yes | Character position (1-based, UTF-8) |
+
+### Returns
+
+Array of locations where the symbol is implemented:
+
+```json
+[
+  {
+    "uri": "file:///src/handlers/api_handler.rs",
+    "range": {
+      "start": { "line": 12, "character": 0 },
+      "end": { "line": 12, "character": 28 }
+    }
+  }
+]
+```
+
+### Example Use Cases
+
+```
+User: Show me all implementations of the Handler trait
+Claude: [Uses go_to_implementation] Found 3 implementations:
+        - src/handlers/api_handler.rs:12
+        - src/handlers/db_handler.rs:8
+        - src/handlers/file_handler.rs:5
+```
+
+---
+
+## go_to_type_definition
+
+Jump to the type definition of the value under the cursor (e.g. follow a typedef or type alias to its definition).
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.rs",
+  "line": 10,
+  "character": 5
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `line` | integer | Yes | Line number (1-based) |
+| `character` | integer | Yes | Character position (1-based, UTF-8) |
+
+### Returns
+
+Array of type definition locations (same shape as [get_definition](#get_definition)).
+
+### Notes
+
+- Differs from `get_definition`: navigates to the *type* of an expression, not the expression itself
+- Useful for following type aliases, `impl Trait` return types, or generic bounds
+
+---
+
+## get_inlay_hints
+
+Get inline type and parameter hints for a range in a document.
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.rs",
+  "start_line": 1,
+  "end_line": 50
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `start_line` | integer | Yes | First line of range (1-based) |
+| `end_line` | integer | Yes | Last line of range (1-based, inclusive) |
+
+### Returns
+
+Array of inlay hints with positions and labels:
+
+```json
+[
+  {
+    "position": { "line": 5, "character": 12 },
+    "label": ": Vec<String>",
+    "kind": "type"
+  },
+  {
+    "position": { "line": 8, "character": 24 },
+    "label": "timeout:",
+    "kind": "parameter"
+  }
+]
+```
+
+### Notes
+
+- Inlay hints show inferred types, parameter names, and other implicit information
+- Request only the lines visible to the AI agent to keep response size manageable
 
 ---
 

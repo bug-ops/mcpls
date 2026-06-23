@@ -317,6 +317,27 @@ export MCPLS_LOG_JSON=true
 mcpls
 ```
 
+### `MCPLS_LISTEN` (transport-http feature)
+
+Bind address for Streamable HTTP transport. When set, mcpls binds this address
+instead of using stdio.
+
+```bash
+export MCPLS_LISTEN=127.0.0.1:3000
+mcpls
+```
+
+### `MCPLS_HTTP_PATH` (transport-http feature)
+
+URL prefix the MCP service is mounted at.
+
+**Default**: `/mcp`
+
+```bash
+export MCPLS_HTTP_PATH=/api/mcp
+mcpls
+```
+
 ## Complete Examples
 
 ### Rust Project (Zero Config)
@@ -491,6 +512,10 @@ mcpls --log-level debug
 
 # Enable JSON logging
 mcpls --log-json
+
+# HTTP transport (requires transport-http feature)
+mcpls --listen 127.0.0.1:3000
+mcpls --listen 127.0.0.1:3000 --http-path /api/mcp
 
 # Show version
 mcpls --version

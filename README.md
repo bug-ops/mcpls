@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/mcpls-core?label=mcpls-core)](https://docs.rs/mcpls-core)
 [![CI](https://img.shields.io/github/actions/workflow/status/bug-ops/mcpls/ci.yml?branch=main)](https://github.com/bug-ops/mcpls/actions)
 [![codecov](https://codecov.io/gh/bug-ops/mcpls/graph/badge.svg?token=FQEDLNF2GS)](https://codecov.io/gh/bug-ops/mcpls)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](https://blog.rust-lang.org/2025/05/15/Rust-1.88.0.html)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
 **Stop treating code as text. Give your AI agent a compiler's understanding.**
@@ -322,7 +322,7 @@ cargo nextest run        # Test
 cargo run -- --log-level debug  # Run locally
 ```
 
-**Requirements:** Rust 1.85+ (Edition 2024)
+**Requirements:** Rust 1.88+ (Edition 2024)
 
 ## Contributing
 

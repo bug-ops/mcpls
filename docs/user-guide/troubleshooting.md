@@ -42,10 +42,10 @@ which mcpls
 
 **Solution**:
 ```bash
-# Update to Rust 1.85 or later
+# Update to Rust 1.88 or later
 rustup update stable
 rustc --version
-# Should output: rustc 1.85.0 or higher
+# Should output: rustc 1.88.0 or higher
 ```
 
 **Problem**: Missing build dependencies
@@ -83,8 +83,8 @@ cargo install --path crates/mcpls-cli
 **Checklist**:
 1. Verify mcpls is installed: `mcpls --version`
 2. Check MCP configuration file exists
-   - macOS/Linux: `~/.claude/mcp.json`
-   - Windows: `%APPDATA%\Claude\mcp.json`
+   - macOS/Linux: `~/.claude/claude_desktop_config.json`
+   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 3. Verify JSON syntax is valid (no trailing commas)
 4. Restart Claude Code completely (quit and reopen)
 5. Check Claude Code logs for errors
@@ -689,13 +689,18 @@ inotifywait -m ~/.config/mcpls/mcpls.toml
 
 ### Network debugging
 
-If using TCP transport (future feature):
+If using HTTP transport (`--listen` flag, requires `transport-http` feature):
 ```bash
-# Monitor network traffic
-tcpdump -i lo0 -A port 8080
+# Start with HTTP transport
+mcpls --listen 127.0.0.1:3000
 
-# Test with netcat
-nc localhost 8080
+# Monitor network traffic
+tcpdump -i lo0 -A port 3000
+
+# Test MCP over HTTP with curl
+curl -X POST http://127.0.0.1:3000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}'
 ```
 
 ---
