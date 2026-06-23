@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-06-23
+
 ### Added
 
 - **Streamable HTTP transport** — opt-in `transport-http` Cargo feature enables MCP 2025-11-25 Streamable HTTP transport; pass `--listen <addr>` (or set `MCPLS_LISTEN`) to bind a TCP port instead of using stdio; `--http-path` (default `/mcp`) controls the URL prefix (#122)
@@ -517,7 +519,8 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/bug-ops/mcpls/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/bug-ops/mcpls/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/bug-ops/mcpls/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/bug-ops/mcpls/compare/v0.3.3...v0.3.4
