@@ -34,7 +34,6 @@ cargo install --path crates/mcpls-cli
 
 ```bash
 mcpls --version
-# Should output: mcpls 0.1.0
 ```
 
 ## Quick Start with Claude Code
@@ -43,8 +42,8 @@ mcpls --version
 
 Add mcpls to your Claude Code MCP configuration file:
 
-**macOS/Linux**: `~/.claude/mcp.json`
-**Windows**: `%APPDATA%\Claude\mcp.json`
+**macOS/Linux**: `~/.claude/claude_desktop_config.json`
+**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
@@ -65,15 +64,14 @@ After adding the configuration, restart Claude Code to load mcpls.
 
 Ask Claude: "What tools are available?"
 
-You should see 8 mcpls tools:
-- get_hover
-- get_definition
-- get_references
-- get_diagnostics
-- rename_symbol
-- get_completions
-- get_document_symbols
-- format_document
+You should see 20 mcpls tools, including:
+- get_hover, get_definition, get_references, get_completions
+- get_diagnostics, get_cached_diagnostics
+- get_document_symbols, workspace_symbol_search
+- rename_symbol, format_document, get_code_actions
+- get_signature_help, go_to_implementation, go_to_type_definition, get_inlay_hints
+- prepare_call_hierarchy, get_incoming_calls, get_outgoing_calls
+- get_server_logs, get_server_messages
 
 ### 4. Try It Out
 

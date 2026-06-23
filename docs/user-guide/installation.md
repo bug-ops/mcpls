@@ -4,7 +4,7 @@ Complete installation guide for mcpls - the universal MCP to LSP bridge.
 
 ## Prerequisites
 
-- Rust 1.85 or later (for building from source)
+- Rust 1.88 or later (for building from source)
 - At least one Language Server installed (see [Language Server Setup](#language-server-setup))
 
 ## Installation Methods
@@ -21,7 +21,6 @@ Verify installation:
 
 ```bash
 mcpls --version
-# Should output: mcpls 0.1.0
 ```
 
 ### Method 2: Pre-Built Binaries from GitHub Releases
@@ -32,10 +31,10 @@ Download pre-built binaries for your platform from [GitHub Releases](https://git
 
 ```bash
 # Download latest release
-curl -LO https://github.com/bug-ops/mcpls/releases/latest/download/mcpls-v0.1.0-linux-x86_64.tar.gz
+curl -LO https://github.com/bug-ops/mcpls/releases/latest/download/mcpls-linux-x86_64.tar.gz
 
 # Extract archive
-tar xzf mcpls-v0.1.0-linux-x86_64.tar.gz
+tar xzf mcpls-linux-x86_64.tar.gz
 
 # Move to system path
 sudo mv mcpls /usr/local/bin/
@@ -48,10 +47,10 @@ mcpls --version
 
 ```bash
 # Download latest release
-curl -LO https://github.com/bug-ops/mcpls/releases/latest/download/mcpls-v0.1.0-macos-x86_64.tar.gz
+curl -LO https://github.com/bug-ops/mcpls/releases/latest/download/mcpls-macos-x86_64.tar.gz
 
 # Extract archive
-tar xzf mcpls-v0.1.0-macos-x86_64.tar.gz
+tar xzf mcpls-macos-x86_64.tar.gz
 
 # Move to system path
 sudo mv mcpls /usr/local/bin/
@@ -64,10 +63,10 @@ mcpls --version
 
 ```bash
 # Download latest release
-curl -LO https://github.com/bug-ops/mcpls/releases/latest/download/mcpls-v0.1.0-macos-aarch64.tar.gz
+curl -LO https://github.com/bug-ops/mcpls/releases/latest/download/mcpls-macos-aarch64.tar.gz
 
 # Extract archive
-tar xzf mcpls-v0.1.0-macos-aarch64.tar.gz
+tar xzf mcpls-macos-aarch64.tar.gz
 
 # Move to system path
 sudo mv mcpls /usr/local/bin/
@@ -78,7 +77,7 @@ mcpls --version
 
 #### Windows (x86_64)
 
-1. Download `mcpls-v0.1.0-windows-x86_64.zip` from [GitHub Releases](https://github.com/bug-ops/mcpls/releases)
+1. Download `mcpls-windows-x86_64.zip` from [GitHub Releases](https://github.com/bug-ops/mcpls/releases)
 2. Extract the archive to a directory
 3. Add the directory to your PATH environment variable
 4. Open a new terminal and verify:
@@ -97,7 +96,7 @@ git clone https://github.com/bug-ops/mcpls
 cd mcpls
 
 # Build and install
-cargo install --path crates/mcpls
+cargo install --path crates/mcpls-cli
 
 # Verify installation
 mcpls --version
@@ -461,7 +460,7 @@ Expected output should be a JSON response with `"method":"initialize"` result.
 
 **Solution:**
 ```bash
-# Update Rust to 1.85+
+# Update Rust to 1.88+
 rustup update stable
 rustup default stable
 
