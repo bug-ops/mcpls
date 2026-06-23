@@ -19,9 +19,10 @@ cargo install mcpls
 ## Usage
 
 ```bash
-mcpls                           # Run with defaults
-mcpls --log-level debug         # Verbose output
-mcpls --config ./mcpls.toml     # Custom config
+mcpls                                      # stdio transport (default)
+mcpls --log-level debug                    # verbose output
+mcpls --config ./mcpls.toml               # custom config
+mcpls --listen 127.0.0.1:3000             # HTTP transport (transport-http feature)
 ```
 
 ## Configuration
@@ -39,11 +40,13 @@ See the main [README](../../README.md) for configuration examples and custom ext
 
 ## Options
 
-| Flag | Description |
-|------|-------------|
-| `-c, --config <PATH>` | Configuration file path |
-| `-l, --log-level <LEVEL>` | trace, debug, info, warn, error |
-| `--log-json` | JSON-formatted logs for tooling |
+| Flag | Env | Description |
+|------|-----|-------------|
+| `-c, --config <PATH>` | `MCPLS_CONFIG` | Configuration file path |
+| `-l, --log-level <LEVEL>` | `MCPLS_LOG` | trace, debug, info, warn, error (default: info) |
+| `--log-json` | `MCPLS_LOG_JSON` | JSON-formatted logs for tooling |
+| `--listen <ADDR>` | `MCPLS_LISTEN` | Bind address for HTTP transport (`transport-http` feature) |
+| `--http-path <PATH>` | `MCPLS_HTTP_PATH` | URL prefix for HTTP transport (default: `/mcp`) |
 
 ## Claude Code Integration
 

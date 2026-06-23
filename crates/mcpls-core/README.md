@@ -13,7 +13,9 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 - **Protocol translation** — Converts MCP tool calls to LSP requests and back
 - **Position encoding** — Handles MCP's 1-based positions ↔ LSP's 0-based coordinates
 - **LSP lifecycle** — Manages language server processes (spawn, initialize, shutdown)
+- **Non-blocking startup** — MCP server accepts connections immediately; LSP initialization runs in the background
 - **Document tracking** — Lazy-loads files, maintains synchronization state
+- **Diagnostics cache** — Caches push-based `publishDiagnostics` notifications for fast polling via MCP
 - **Configuration** — Parses TOML configs, discovers LSP servers, manages language extension mappings
 - **Custom extension mapping** — Configurable file extension-to-language ID mappings with sensible defaults
 - **Graceful degradation** — Continues with available servers, even if some fail to initialize
@@ -25,7 +27,7 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 
 ```toml
 [dependencies]
-mcpls-core = "0.3.1"
+mcpls-core = "0.3.7"
 ```
 
 ## Architecture
@@ -49,14 +51,13 @@ flowchart LR
 ## Usage
 
 ```rust
-use mcpls_core::config::Config;
-use mcpls_core::mcp::McplsServer;
+use mcpls_core::{ServerConfig, Transport};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Config::load()?;
-    let server = McplsServer::new(config);
-    server.run().await
+    let config = ServerConfig::load()?;
+    mcpls_core::serve_with(config, Transport::Stdio).await?;
+    Ok(())
 }
 ```
 
