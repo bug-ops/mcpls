@@ -279,6 +279,18 @@ impl McpClient {
             anyhow::bail!("MCP error: {error:?}");
         }
 
+        // rmcp 1.8.0+: deserialization failures return isError=true inside a successful
+        // tools/call result instead of a JSON-RPC error (PR #894).
+        if response
+            .get("result")
+            .and_then(|r| r.get("isError"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let content = response["result"]["content"].to_string();
+            anyhow::bail!("MCP tool error (isError=true): {content}");
+        }
+
         Ok(response)
     }
 
