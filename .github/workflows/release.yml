@@ -92,6 +92,9 @@ jobs:
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@30b5ca8b54e1dcffd9548bc87ede1531310fdc67 # cargo-bins/cargo-binstall main
 
+      - name: Install Rust target stdlib
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
         run: cargo binstall --no-confirm cross
