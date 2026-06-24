@@ -28,7 +28,7 @@ jobs:
 
       - name: Create Release
         id: create_release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # softprops/action-gh-release v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # softprops/action-gh-release v2
         with:
           draft: false
           prerelease: false
@@ -144,7 +144,7 @@ jobs:
         shell: cmd
 
       - name: Upload release archive
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # softprops/action-gh-release v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # softprops/action-gh-release v2
         with:
           files: |
             mcpls-${{ matrix.target }}.*
@@ -200,7 +200,7 @@ jobs:
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Update release with installation instructions
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # softprops/action-gh-release v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # softprops/action-gh-release v2
         with:
           append_body: true
           body: |
