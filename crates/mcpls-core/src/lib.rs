@@ -42,6 +42,7 @@ pub mod transport;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bridge::resources::make_uri;
 use bridge::{ResourceSubscriptions, Translator};
@@ -50,7 +51,7 @@ pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
 use rmcp::model::ResourceUpdatedNotificationParam;
 use tokio::sync::{Mutex, OnceCell};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 #[cfg(feature = "transport-http")]
 pub use transport::HttpConfig;
@@ -334,21 +335,22 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // Cancellation for pump tasks: send `true` to request shutdown.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    if applicable_configs.is_empty() {
+    let lsp_init_handle = if applicable_configs.is_empty() {
         warn!("No applicable LSP servers configured — starting in protocol-only mode");
+        None
     } else {
         info!(
             "Spawning {} LSP server(s) in the background...",
             applicable_configs.len()
         );
-        spawn_lsp_servers_background(
+        Some(spawn_lsp_servers_background(
             applicable_configs,
             Arc::clone(&translator),
             Arc::clone(&subscriptions),
             Arc::clone(&peer_cell),
             cancel_rx.clone(),
-        );
-    }
+        ))
+    };
 
     info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new(Arc::clone(&translator), Arc::clone(&subscriptions));
@@ -365,6 +367,13 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     // Signal background pump tasks to exit.
     let _ = cancel_tx.send(true);
+    if let Some(handle) = lsp_init_handle {
+        match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => error!("Background LSP initialization task failed: {err}"),
+            Err(_) => warn!("Timed out waiting for background LSP initialization task to stop"),
+        }
+    }
 
     info!("MCPLS server shutting down");
     result
@@ -386,7 +395,7 @@ fn spawn_lsp_servers_background(
     subscriptions: Arc<ResourceSubscriptions>,
     peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let result = LspServer::spawn_batch(&applicable_configs).await;
 
@@ -440,7 +449,7 @@ fn spawn_lsp_servers_background(
             ));
         }
         while pumps.join_next().await.is_some() {}
-    });
+    })
 }
 
 #[cfg(test)]
@@ -777,6 +786,48 @@ mod tests {
                     !matches!(err, Error::NoServersAvailable(_)),
                     "serve() must not return NoServersAvailable for empty lsp_servers config"
                 );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_background_lsp_init_handle_completes_when_spawn_fails() {
+            use std::collections::HashMap;
+
+            use crate::config::LspServerConfig;
+
+            let translator = Arc::new(Mutex::new(Translator::new()));
+            let subscriptions = Arc::new(ResourceSubscriptions::new());
+            let peer_cell = Arc::new(OnceCell::new());
+            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+            let handle = spawn_lsp_servers_background(
+                vec![ServerInitConfig {
+                    server_config: LspServerConfig {
+                        language_id: "rust".to_string(),
+                        command: "nonexistent-command-that-will-fail-12345".to_string(),
+                        args: vec![],
+                        env: HashMap::new(),
+                        file_patterns: vec!["**/*.rs".to_string()],
+                        initialization_options: None,
+                        timeout_seconds: 1,
+                        heuristics: None,
+                    },
+                    workspace_roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    initialization_options: None,
+                    notification_tx: None,
+                }],
+                translator,
+                subscriptions,
+                peer_cell,
+                cancel_rx,
+            );
+
+            match tokio::time::timeout(Duration::from_secs(2), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => panic!("background LSP init task panicked: {err}"),
+                Err(err) => {
+                    panic!("background LSP init task did not complete after spawn failure: {err}")
+                }
             }
         }
     }
