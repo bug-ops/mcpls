@@ -242,14 +242,15 @@ fn windows_rooted_path_to_file_uri(path: &Path) -> String {
 }
 
 fn encode_rfc3986_path_chars(uri: &str) -> String {
-    let path_start = url::Position::BeforePath as usize;
-    let (prefix, path) = uri.split_at(path_start);
-    let encoded_path = path
+    #[allow(clippy::expect_used)]
+    let url = Url::parse(uri).expect("encode called with invalid URI");
+    let prefix = url[..url::Position::BeforePath].to_owned();
+    let encoded = url[url::Position::BeforePath..]
         .replace('[', "%5B")
         .replace(']', "%5D")
         .replace('^', "%5E")
         .replace('|', "%7C");
-    format!("{prefix}{encoded_path}")
+    format!("{prefix}{encoded}")
 }
 
 /// Convert an LSP `file://` URI to an absolute filesystem path.
@@ -683,6 +684,24 @@ mod tests {
             Some(path),
             "encoded file URI should round-trip to the original path"
         );
+    }
+
+    #[test]
+    fn test_path_to_uri_percent_encodes_reserved_chars_in_short_path() {
+        // Regression: reserved chars near the URI start must still be encoded.
+        #[cfg(windows)]
+        let path = Path::new(r"C:\[a].ts");
+        #[cfg(not(windows))]
+        let path = Path::new("/[a].ts");
+
+        let uri = path_to_uri(path);
+
+        assert!(
+            uri.as_str().ends_with("%5Ba%5D.ts"),
+            "short path should percent-encode reserved chars, got {}",
+            uri.as_str()
+        );
+        assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
     }
 
     #[test]
