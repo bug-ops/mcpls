@@ -367,6 +367,19 @@ python.analysis.typeCheckingMode = "basic"
 python.analysis.autoSearchPaths = true
 ```
 
+To use [ty](https://docs.astral.sh/ty/) instead of the default Pyright server:
+
+```toml
+[[lsp_servers]]
+language_id = "python"
+command = "ty"
+args = ["server"]
+file_patterns = ["**/*.py", "**/*.pyi"]
+
+[lsp_servers.heuristics]
+project_markers = ["pyproject.toml", "ty.toml"]
+```
+
 ### TypeScript/JavaScript Project
 
 ```toml

@@ -66,9 +66,14 @@ rustup component add rust-analyzer
 # Or: brew install rust-analyzer (macOS)
 ```
 
-**Python (pyright):**
+**Python (pyright, built-in default):**
 ```bash
 npm install -g pyright
+```
+
+**Python ([ty](https://docs.astral.sh/ty/), with custom configuration):**
+```bash
+uv tool install ty@latest
 ```
 
 **TypeScript:**
@@ -261,7 +266,7 @@ mcpls works with any LSP 3.17 compliant server. Battle-tested with:
 | Language | Server | Notes |
 |----------|--------|-------|
 | Rust | rust-analyzer | Zero-config, built-in support |
-| Python | pyright | Full type inference |
+| Python | pyright (default), ty | Full type inference |
 | TypeScript/JS | typescript-language-server | JSX/TSX support |
 | Go | gopls | Modules and workspaces |
 | C/C++ | clangd | compile_commands.json |
