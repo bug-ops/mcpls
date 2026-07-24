@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **RUSTSEC-2026-0204** — bump transitive `crossbeam-epoch` dependency (pulled in via `ignore`) from 0.9.18 to 0.9.20 to resolve an invalid pointer dereference in `fmt::Pointer` impls for `Atomic`/`Shared`
+
 ## [0.3.7] - 2026-06-23
 
 ### Added
