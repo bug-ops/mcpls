@@ -1302,8 +1302,14 @@ mod tests {
     }
 
     /// Backdates or forwards a file's mtime for deterministic disk-sync tests.
+    ///
+    /// Opened with `write(true)` rather than [`std::fs::File::open`]: on
+    /// Windows, `set_modified` needs a handle with write access, and a
+    /// read-only handle fails with `PermissionDenied` (Unix's
+    /// `utimensat`-based implementation has no such requirement, which is
+    /// why a read-only handle works there).
     fn set_mtime(path: &Path, time: SystemTime) {
-        let file = std::fs::File::open(path).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();
     }
 
