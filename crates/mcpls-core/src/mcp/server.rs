@@ -1252,25 +1252,43 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Regression test for `read_resource`'s canonical-path fix: a path with
-    /// non-canonical segments (`..`) must resolve, via `validate_path_against_roots`,
-    /// to the same URI as its canonical form -- matching what `diagnostics_pump`
-    /// stores from LSP notifications. Building `lsp_uri` from the raw path (the
-    /// pre-fix behavior) would produce a mismatched cache key and always miss.
+    /// Regression test for `read_resource`'s canonical-path fix: a path reached
+    /// through a symlink must resolve, via `validate_path_against_roots`, to the
+    /// same URI as its canonical (symlink-resolved) form -- matching what
+    /// `diagnostics_pump` stores from LSP notifications. Building `lsp_uri` from
+    /// the raw (symlinked) path (the pre-fix behavior) would produce a
+    /// mismatched cache key and always miss.
+    ///
+    /// Uses a real symlink rather than `..` segments: `path_to_uri` re-parses
+    /// the URI string through `url::Url::parse` (for RFC 3986 char encoding),
+    /// which normalizes away `..` segments regardless of platform -- so a path
+    /// differing only by `..` produces the same URI as its canonical form with
+    /// or without the fix. Only an actual symlink resolution (which happens in
+    /// `canonicalize()`, not in URI string normalization) creates a real
+    /// raw-vs-canonical difference. Unix-only: creating symlinks on Windows CI
+    /// runners typically requires elevated privileges / Developer Mode.
     #[test]
+    #[cfg(unix)]
     fn test_read_resource_canonical_path_matches_pump_cache_key() {
         use std::fs;
+        use std::os::unix::fs::symlink;
 
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let subdir = temp_dir.path().join("sub");
-        fs::create_dir(&subdir).unwrap();
-        let test_file = subdir.join("test.rs");
+        // Canonicalize the base up front so any symlink-iness already present
+        // in the OS temp directory itself (e.g. macOS's `/tmp` -> `/private/tmp`)
+        // doesn't leak into the comparison -- the only symlink under test is
+        // `link_dir`.
+        let base = temp_dir.path().canonicalize().unwrap();
+        let real_dir = base.join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let test_file = real_dir.join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        // Textually distinct from `test_file`, but canonicalizes to the same path.
-        let noncanonical = subdir.join("..").join("sub").join("test.rs");
+        let link_dir = base.join("link");
+        symlink(&real_dir, &link_dir).unwrap();
+        let noncanonical = link_dir.join("test.rs");
         assert_ne!(noncanonical, test_file);
 
         let validated = validate_path_against_roots(&noncanonical, &[]).unwrap();
