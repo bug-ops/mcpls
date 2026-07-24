@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`DocumentState` API** — Breaking change: `DocumentState` gains a `disk: Option<DiskSync>` field tracking the filesystem snapshot behind the resync mechanism above; existing struct-literal construction must add this field. Acceptable pre-1.0.
+- **`DocumentState` API** — Breaking change: `DocumentState` gains a `disk: Option<DiskSync>` field tracking the filesystem snapshot behind the resync mechanism above; existing struct-literal construction must add this field. Acceptable pre-1.0. (#102)
 - **`rmcp` 2.2.0** — Breaking change upstream: bump `rmcp` from 1.8.0 to 2.2.0 to align with the MCP 2025-11-25 spec. `rmcp::model::RawResource` and the `Annotated<RawResource>` wrapper were merged into a single flat `rmcp::model::Resource` struct; `McplsServer::list_resources` updated accordingly.
 
 ### Fixed

@@ -300,11 +300,14 @@ impl DocumentTracker {
     /// maintainer sees sync errors from a new server.
     ///
     /// Two cases fall outside this mechanism entirely:
-    /// - A tool that restores a file with an mtime identical to the last
-    ///   observed one and an unchanged size (e.g. `tar x`, `rsync -a`, `cp
-    ///   -p`) can still be missed while that mtime is within the racy
-    ///   detection window; closing this would require hashing content on
-    ///   every access.
+    /// - A tool that restores a file with an mtime and size identical to the
+    ///   last ones observed (e.g. `tar x`, `rsync -a`, `cp -p`) is
+    ///   indistinguishable from "unchanged" by this mechanism, however long
+    ///   ago that snapshot was taken -- not just within the racy detection
+    ///   window. Once a snapshot is `mtime_settled`, restoring its exact
+    ///   `(mtime, size)` retakes the fast path forever, since no later call
+    ///   re-reads content to notice the mismatch. Closing this would require
+    ///   hashing content on every access.
     /// - `workspace_symbol_search` is served from the LSP server's own
     ///   index and is unaffected by this per-document mechanism for files
     ///   mcpls has never opened.
