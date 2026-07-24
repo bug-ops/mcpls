@@ -679,10 +679,14 @@ impl ServerHandler for McplsServer {
         };
 
         if has_cached_diagnostics {
-            let _ = context
+            let uri = request.uri.clone();
+            if let Err(e) = context
                 .peer
                 .notify_resource_updated(ResourceUpdatedNotificationParam::new(request.uri))
-                .await;
+                .await
+            {
+                tracing::warn!("Failed to replay cached diagnostics for {uri}: {e}");
+            }
         }
 
         Ok(())
