@@ -34,6 +34,11 @@ jobs:
           # For push/schedule: github.sha resolves to the pushed commit.
           # Safe because this job has no access to secrets.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # actions/checkout v7 refuses fork checkouts in pull_request_target
+          # workflows by default ("pwn request" guard). Opting in is safe here
+          # per the threat model documented above: no secrets, permissions
+          # scoped to security-events:write + contents:read only.
+          allow-unsafe-pr-checkout: true
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4

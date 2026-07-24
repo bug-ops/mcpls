@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CodeQL fork PR checkout** — `actions/checkout@v7` refuses to check out a fork PR's head SHA in `pull_request_target` workflows unless explicitly opted in; set `allow-unsafe-pr-checkout: true` on the CodeQL workflow's checkout step, which was failing every fork-originated PR since the checkout v6 → v7 bump. Safe here because the job carries no secrets and permissions are scoped to `security-events: write` + `contents: read` only.
+
 ### Changed
 
 - **`rmcp` 2.2.0** — Breaking change upstream: bump `rmcp` from 1.8.0 to 2.2.0 to align with the MCP 2025-11-25 spec. `rmcp::model::RawResource` and the `Annotated<RawResource>` wrapper were merged into a single flat `rmcp::model::Resource` struct; `McplsServer::list_resources` updated accordingly.
