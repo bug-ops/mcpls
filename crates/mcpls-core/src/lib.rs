@@ -118,9 +118,6 @@ pub(crate) async fn diagnostics_pump(
                         let Some(path) = bridge::uri_to_path(&p.uri) else { continue };
                         let Ok(mcp_uri) = make_uri(&path) else { continue };
 
-                        // TODO(critic-S3): on subscribe, replay cached diagnostics once
-                        // so clients that subscribe after the first PublishDiagnostics
-                        // do not have to wait for the next LSP push.
                         if !subs.contains(&mcp_uri).await {
                             continue;
                         }

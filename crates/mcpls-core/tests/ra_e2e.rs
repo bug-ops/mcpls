@@ -98,6 +98,13 @@ fn stage_workspace() -> TempDir {
     let fmt_dst = tmp.path().join("src/bad_format.rs");
     fs::copy(&fmt_src, &fmt_dst).expect("failed to copy bad_format.rs");
 
+    // Copy untouched.rs into src/ — NOT added to lib.rs and never opened by any
+    // sub-case, so rust-analyzer never runs diagnostics on it (unlike bad_format.rs,
+    // which gets diagnosed as a detached file once opened via format_document).
+    let untouched_src = fixture_dir.join("extras/untouched.rs");
+    let untouched_dst = tmp.path().join("src/untouched.rs");
+    fs::copy(&untouched_src, &untouched_dst).expect("failed to copy untouched.rs");
+
     tmp
 }
 
@@ -908,11 +915,11 @@ fn sc_get_server_logs(client: &mut McpClient, _workspace: &Path) -> Result<(), S
     Ok(())
 }
 
-/// Resolve the `lsp-diagnostics` URI for `lib.rs` by querying `resources/list`.
+/// Resolve a resource URI ending with `suffix` by querying `resources/list`.
 ///
 /// Avoids drift from `make_uri`'s encoding rules on macOS `/private/var/...`
 /// canonicalised paths or Windows UNC.
-fn lib_rs_uri(client: &mut McpClient) -> Result<String, String> {
+fn resource_uri_ending_with(client: &mut McpClient, suffix: &str) -> Result<String, String> {
     let resp = client
         .list_resources()
         .map_err(|e| format!("list_resources: {e}"))?;
@@ -922,9 +929,14 @@ fn lib_rs_uri(client: &mut McpClient) -> Result<String, String> {
     resources
         .iter()
         .filter_map(|r| r["uri"].as_str())
-        .find(|u| u.ends_with("/src/lib.rs"))
+        .find(|u| u.ends_with(suffix))
         .map(str::to_owned)
-        .ok_or_else(|| format!("no lib.rs URI in resources list: {resources:?}"))
+        .ok_or_else(|| format!("no URI ending with '{suffix}' in resources list: {resources:?}"))
+}
+
+/// Resolve the `lsp-diagnostics` URI for `lib.rs` by querying `resources/list`.
+fn lib_rs_uri(client: &mut McpClient) -> Result<String, String> {
+    resource_uri_ending_with(client, "/src/lib.rs")
 }
 
 /// Tool 17: `get_signature_help` — signature of `add` inside its call site.
@@ -1242,7 +1254,11 @@ fn sc_read_resource(client: &mut McpClient, _workspace: &Path) -> Result<(), Str
     Ok(())
 }
 
-/// Resource sub-case 3: subscribe and unsubscribe lib.rs resource.
+/// Resource sub-case 3: subscribing to lib.rs replays its already-cached diagnostics
+/// immediately (issue #131), then subscribe/unsubscribe still round-trip cleanly.
+///
+/// Precondition: `sc_get_cached_diagnostics` has already run, so lib.rs has an entry
+/// in the push-diagnostics cache — this sub-case must remain after it in the registry.
 fn sc_subscribe_unsubscribe_resource(
     client: &mut McpClient,
     _workspace: &Path,
@@ -1262,6 +1278,21 @@ fn sc_subscribe_unsubscribe_resource(
         ));
     }
 
+    // #131: diagnostics are already cached for lib.rs (sc_get_cached_diagnostics ran
+    // earlier), so subscribe must replay them immediately via a
+    // notifications/resources/updated push instead of waiting for the next LSP update.
+    let replayed = client
+        .take_notifications()
+        .into_iter()
+        .any(|n| n["method"] == "notifications/resources/updated" && n["params"]["uri"] == uri);
+    if !replayed {
+        return Err(
+            "subscribe: expected an immediate notifications/resources/updated replay for \
+             lib.rs (diagnostics already cached), got none"
+                .to_owned(),
+        );
+    }
+
     let unsub_resp = client
         .unsubscribe_resource(&uri)
         .map_err(|e| format!("unsubscribe call failed: {e}"))?;
@@ -1276,6 +1307,59 @@ fn sc_subscribe_unsubscribe_resource(
 
     // TODO(critic): add negative case with "file:///tmp/x.rs" (wrong scheme) once error envelope shape confirmed
     // TODO(critic): assert idempotent unsubscribe — second unsubscribe of same URI returns Ok
+
+    Ok(())
+}
+
+/// Resource sub-case 4 (negative): subscribing to a resource with no cached diagnostics
+/// yet must not produce a spurious `notifications/resources/updated` push (issue #131).
+///
+/// `untouched.rs` is never opened by any sub-case and not part of the crate's module
+/// tree, so rust-analyzer never runs diagnostics on it — unlike `bad_format.rs`, which
+/// modern rust-analyzer diagnoses as a detached file once `sc_format_document` opens
+/// it via `didOpen`, even outside the module tree. Its URI is derived from lib.rs's
+/// (same directory, sibling filename) rather than via `resources/list`, since
+/// `untouched.rs` is never opened and therefore never appears there.
+fn sc_subscribe_no_replay_without_cached_diagnostics(
+    client: &mut McpClient,
+    _workspace: &Path,
+) -> Result<(), String> {
+    let lib_uri = lib_rs_uri(client)?;
+    let uri = lib_uri.replace("lib.rs", "untouched.rs");
+    if uri == lib_uri {
+        return Err(format!("failed to derive sibling URI from {lib_uri}"));
+    }
+
+    // Drain any notifications left over from earlier sub-cases before subscribing,
+    // so this check only observes what subscribe() itself produces.
+    client.take_notifications();
+
+    let sub_resp = client
+        .subscribe_resource(&uri)
+        .map_err(|e| format!("subscribe call failed: {e}"))?;
+    if sub_resp.get("error").is_some() {
+        return Err(format!("subscribe returned error: {sub_resp}"));
+    }
+    if sub_resp.get("result").is_none() {
+        return Err(format!(
+            "subscribe: no 'result' field in response: {sub_resp}"
+        ));
+    }
+
+    let spurious = client
+        .take_notifications()
+        .into_iter()
+        .any(|n| n["method"] == "notifications/resources/updated" && n["params"]["uri"] == uri);
+    if spurious {
+        return Err(format!(
+            "subscribe: got an unexpected notifications/resources/updated replay for \
+             {uri} which has no cached diagnostics"
+        ));
+    }
+
+    client
+        .unsubscribe_resource(&uri)
+        .map_err(|e| format!("unsubscribe call failed: {e}"))?;
 
     Ok(())
 }
@@ -1364,6 +1448,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_list_resources),
         sub_case!(sc_read_resource),
         sub_case!(sc_subscribe_unsubscribe_resource),
+        sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
     ];
 
     let filter = std::env::var("MCPLS_RA_FILTER").ok();

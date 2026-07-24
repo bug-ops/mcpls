@@ -29,6 +29,9 @@ pub struct McpClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     request_id: i64,
+    /// Server-pushed notifications (no matching request `id`) collected while
+    /// waiting for a request/response round-trip. Drained via `take_notifications`.
+    pending_notifications: Vec<Value>,
 }
 
 impl McpClient {
@@ -103,7 +106,19 @@ impl McpClient {
             stdin,
             stdout: BufReader::new(stdout),
             request_id: 0,
+            pending_notifications: Vec::new(),
         })
+    }
+
+    /// Drain and return server-pushed notifications collected so far (e.g.
+    /// `notifications/resources/updated`).
+    ///
+    /// Notifications have no JSON-RPC `id` and may arrive interleaved with
+    /// request/response traffic on the same stdout stream; `send_request` queues
+    /// them here instead of misinterpreting them as the response it is waiting for.
+    #[allow(dead_code)]
+    pub fn take_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.pending_notifications)
     }
 
     /// Send MCP initialize request.
@@ -256,6 +271,10 @@ impl McpClient {
 
     /// Send a raw JSON-RPC request and return the response.
     ///
+    /// The server may push notifications (e.g. `notifications/resources/updated`)
+    /// on the same stdout stream before writing the response; those are queued into
+    /// `pending_notifications` rather than being mistaken for the response.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -267,13 +286,22 @@ impl McpClient {
         writeln!(self.stdin, "{request_str}")?;
         self.stdin.flush()?;
 
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .context("failed to read response from mcpls")?;
+        let expected_id = request.get("id").cloned();
 
-        let response: Value =
-            serde_json::from_str(&line).context("failed to parse JSON-RPC response")?;
+        let response = loop {
+            let mut line = String::new();
+            self.stdout
+                .read_line(&mut line)
+                .context("failed to read response from mcpls")?;
+
+            let value: Value =
+                serde_json::from_str(&line).context("failed to parse JSON-RPC message")?;
+
+            if value.get("id") == expected_id.as_ref() {
+                break value;
+            }
+            self.pending_notifications.push(value);
+        };
 
         if let Some(error) = response.get("error") {
             anyhow::bail!("MCP error: {error:?}");

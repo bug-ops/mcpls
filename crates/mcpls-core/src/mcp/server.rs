@@ -9,8 +9,8 @@ use std::sync::Arc;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource,
-    ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
+    SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
@@ -639,10 +639,14 @@ impl ServerHandler for McplsServer {
         )]))
     }
 
+    /// When cached diagnostics exist, the replay notification is flushed to the client
+    /// before this call returns its own response; this is legal per JSON-RPC/MCP, which
+    /// permits notifications to interleave with in-flight requests, so a conformant
+    /// client must demultiplex by request `id` rather than assume response-before-notification ordering.
     async fn subscribe(
         &self,
         request: SubscribeRequestParams,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
@@ -653,15 +657,33 @@ impl ServerHandler for McplsServer {
         validate_path_against_roots(&path, &self.context.workspace_roots)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // TODO(S3): If diagnostics are already cached for this URI, emit a synthetic
-        // notify_resource_updated so clients subscribing after initial workspace indexing
-        // don't have to wait for the next LSP push. Requires peer access from HandlerContext.
-        // Track as follow-up issue.
+        // Record the subscription *before* checking the cache. This closes the race where
+        // a PublishDiagnostics notification lands between the cache check and the
+        // subscription being recorded: if diagnostics arrive before this point, the check
+        // below catches them; if they arrive after, `diagnostics_pump`'s own
+        // `subs.contains` check already sees this URI as subscribed and delivers the
+        // update through the normal push path.
         self.context
             .subscriptions
-            .subscribe(request.uri)
+            .subscribe(request.uri.clone())
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let has_cached_diagnostics = {
+            let translator = self.context.translator.lock().await;
+            let lsp_uri = crate::bridge::path_to_uri(&path);
+            translator
+                .notification_cache()
+                .get_diagnostics(lsp_uri.as_str())
+                .is_some()
+        };
+
+        if has_cached_diagnostics {
+            let _ = context
+                .peer
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(request.uri))
+                .await;
+        }
 
         Ok(())
     }
