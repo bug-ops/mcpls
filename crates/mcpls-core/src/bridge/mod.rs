@@ -15,6 +15,7 @@ pub use notifications::{
 };
 pub use resources::ResourceSubscriptions;
 pub use state::{DocumentState, DocumentTracker, path_to_uri, uri_to_path};
+pub(crate) use translator::validate_path_against_roots;
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,

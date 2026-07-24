@@ -44,7 +44,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bridge::resources::make_uri;
-use bridge::{ResourceSubscriptions, Translator};
+use bridge::{NotificationCache, ResourceSubscriptions, Translator};
 pub use config::ServerConfig;
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
@@ -72,14 +72,19 @@ use transport::run_stdio;
 /// - The cancellation watch fires (or the sender is dropped).
 /// - `notify_resource_updated` returns an error (peer disconnect / transport closed).
 ///
-/// # Note on lock contention (TODO critic-S4)
-/// All cache writes acquire `Arc<Mutex<Translator>>`, which is the same lock used
-/// by every MCP tool call. Splitting `NotificationCache` into its own `Arc<RwLock>`
-/// would eliminate this contention. Tracked as a P2 follow-up.
+/// # Lock independence
+/// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock independent
+/// of `Arc<Mutex<Translator>>`. MCP tool calls that hold the translator lock
+/// across an in-flight LSP round-trip (e.g. `textDocument/diagnostic`) never
+/// block this pump, so a `publishDiagnostics` notification arriving mid-request
+/// is cached immediately instead of being silently dropped: the LSP transport
+/// forwards notifications via `mpsc::Sender::try_send`, which drops on a full
+/// channel rather than blocking, so a pump stalled on the translator lock
+/// previously lost notifications under sustained push traffic.
 pub(crate) async fn diagnostics_pump(
     _lang: String,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
-    translator: Arc<Mutex<Translator>>,
+    notification_cache: Arc<Mutex<NotificationCache>>,
     subs: Arc<ResourceSubscriptions>,
     peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -99,9 +104,8 @@ pub(crate) async fn diagnostics_pump(
                     LspNotification::PublishDiagnostics(p) => {
                         // Always cache unconditionally.
                         {
-                            let mut t = translator.lock().await;
-                            t.notification_cache_mut()
-                                .store_diagnostics(&p.uri, p.version, p.diagnostics);
+                            let mut cache = notification_cache.lock().await;
+                            cache.store_diagnostics(&p.uri, p.version, p.diagnostics);
                         }
 
                         // Fast path: skip URI construction when nothing is subscribed.
@@ -133,14 +137,12 @@ pub(crate) async fn diagnostics_pump(
                         }
                     }
                     LspNotification::LogMessage(m) => {
-                        let mut t = translator.lock().await;
-                        t.notification_cache_mut()
-                            .store_log(m.typ.into(), m.message);
+                        let mut cache = notification_cache.lock().await;
+                        cache.store_log(m.typ.into(), m.message);
                     }
                     LspNotification::ShowMessage(m) => {
-                        let mut t = translator.lock().await;
-                        t.notification_cache_mut()
-                            .store_message(m.typ.into(), m.message);
+                        let mut cache = notification_cache.lock().await;
+                        cache.store_message(m.typ.into(), m.message);
                     }
                     LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
                 }
@@ -326,7 +328,16 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // in a background task and registered into this shared translator once ready.
     // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
     // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
+    // Fixed for the server's lifetime: shared as a lock-free snapshot so
+    // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
+    // validate a path without locking `translator` below.
+    let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
+
     let translator = Arc::new(Mutex::new(translator));
+    // Independent of `translator`: the pump only ever locks this, so it never
+    // contends with a request handler holding the translator lock across an
+    // in-flight LSP round-trip.
+    let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
     let peer_cell = Arc::new(OnceCell::new());
@@ -344,6 +355,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         spawn_lsp_servers_background(
             applicable_configs,
             Arc::clone(&translator),
+            Arc::clone(&notification_cache),
             Arc::clone(&subscriptions),
             Arc::clone(&peer_cell),
             cancel_rx.clone(),
@@ -351,7 +363,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     }
 
     info!("Starting MCP server with rmcp...");
-    let mcp_server = mcp::McplsServer::new(Arc::clone(&translator), Arc::clone(&subscriptions));
+    let mcp_server = mcp::McplsServer::new(
+        Arc::clone(&translator),
+        Arc::clone(&notification_cache),
+        Arc::clone(&workspace_roots_snapshot),
+        Arc::clone(&subscriptions),
+    );
     info!("MCPLS server initialized successfully");
 
     let result = match transport {
@@ -383,6 +400,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
     translator: Arc<Mutex<Translator>>,
+    notification_cache: Arc<Mutex<NotificationCache>>,
     subscriptions: Arc<ResourceSubscriptions>,
     peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -433,7 +451,7 @@ fn spawn_lsp_servers_background(
             pumps.spawn(diagnostics_pump(
                 lang,
                 rx,
-                Arc::clone(&translator),
+                Arc::clone(&notification_cache),
                 Arc::clone(&subscriptions),
                 Arc::clone(&peer_cell),
                 cancel_rx.clone(),
@@ -792,8 +810,8 @@ mod tests {
 
         use super::*;
 
-        fn make_translator() -> Arc<Mutex<Translator>> {
-            Arc::new(Mutex::new(Translator::new()))
+        fn make_cache() -> Arc<Mutex<NotificationCache>> {
+            Arc::new(Mutex::new(NotificationCache::new()))
         }
 
         fn make_subs() -> Arc<ResourceSubscriptions> {
@@ -809,7 +827,7 @@ mod tests {
         /// `PublishDiagnostics` is cached even when the peer is not yet connected.
         #[tokio::test]
         async fn test_pump_caches_before_peer_set() {
-            let translator = make_translator();
+            let cache = make_cache();
             let subs = make_subs();
             let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
@@ -817,11 +835,11 @@ mod tests {
             // which makes the pump exit before processing any messages.
             let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-            let t = Arc::clone(&translator);
+            let c = Arc::clone(&cache);
             tokio::spawn(diagnostics_pump(
                 "rust".to_string(),
                 rx,
-                t,
+                c,
                 Arc::clone(&subs),
                 Arc::clone(&peer_cell),
                 cancel_rx,
@@ -844,11 +862,8 @@ mod tests {
                 loop {
                     tokio::task::yield_now().await;
                     let found = {
-                        let guard = translator.lock().await;
-                        guard
-                            .notification_cache()
-                            .get_diagnostics(uri.as_str())
-                            .is_some()
+                        let guard = cache.lock().await;
+                        guard.get_diagnostics(uri.as_str()).is_some()
                     };
                     if found {
                         return true;
@@ -864,7 +879,7 @@ mod tests {
         /// Pump exits cleanly when the cancel watch sends `true`.
         #[tokio::test]
         async fn test_pump_exits_on_cancel() {
-            let translator = make_translator();
+            let cache = make_cache();
             let subs = make_subs();
             let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
@@ -873,7 +888,7 @@ mod tests {
             let handle = tokio::spawn(diagnostics_pump(
                 "rust".to_string(),
                 rx,
-                translator,
+                cache,
                 subs,
                 peer_cell,
                 cancel_rx,
@@ -890,7 +905,7 @@ mod tests {
         /// Pump exits when the cancel sender is dropped (Err branch).
         #[tokio::test]
         async fn test_pump_exits_when_cancel_sender_dropped() {
-            let translator = make_translator();
+            let cache = make_cache();
             let subs = make_subs();
             let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
@@ -899,7 +914,7 @@ mod tests {
             let handle = tokio::spawn(diagnostics_pump(
                 "rust".to_string(),
                 rx,
-                translator,
+                cache,
                 subs,
                 peer_cell,
                 cancel_rx,
@@ -910,6 +925,71 @@ mod tests {
                 .await
                 .expect("pump did not exit within timeout")
                 .unwrap();
+        }
+
+        /// Regression test for #104: the pump must cache a notification promptly
+        /// even while another task holds the translator lock for far longer than
+        /// any acceptable pump latency. Before the `NotificationCache` split, the
+        /// pump locked `Arc<Mutex<Translator>>` to cache diagnostics, so it would
+        /// have stalled here until the holder released the lock.
+        #[tokio::test]
+        async fn test_pump_makes_progress_while_translator_lock_held() {
+            let translator = Arc::new(Mutex::new(Translator::new()));
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            // Simulate a slow in-flight MCP request (e.g. `pull_diagnostics`)
+            // holding the translator lock across an LSP round-trip.
+            let lock_acquired = Arc::new(tokio::sync::Notify::new());
+            let notify = Arc::clone(&lock_acquired);
+            let holder = tokio::spawn(async move {
+                let _guard = translator.lock().await;
+                notify.notify_one();
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            });
+            lock_acquired.notified().await;
+
+            tokio::spawn(diagnostics_pump(
+                "rust".to_string(),
+                rx,
+                Arc::clone(&cache),
+                subs,
+                peer_cell,
+                cancel_rx,
+            ));
+
+            let uri: Uri = "file:///test/locked.rs".parse().unwrap();
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            // Well within the 2 s translator lock hold: a translator-locking
+            // pump would still be blocked at this point.
+            tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                loop {
+                    {
+                        let guard = cache.lock().await;
+                        if guard.get_diagnostics(uri.as_str()).is_some() {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("pump stalled behind translator lock");
+
+            holder.await.unwrap();
         }
     }
 }

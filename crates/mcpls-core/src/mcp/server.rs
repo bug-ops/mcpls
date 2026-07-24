@@ -3,6 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -23,7 +24,9 @@ use super::tools::{
     ServerLogsParams, ServerMessagesParams, SignatureHelpParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
-use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::bridge::{
+    NotificationCache, ResourceSubscriptions, Translator, validate_path_against_roots,
+};
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -33,13 +36,21 @@ pub struct McplsServer {
 
 #[tool_router]
 impl McplsServer {
-    /// Create a new MCP server with the given translator and subscriptions.
+    /// Create a new MCP server with the given translator, notification cache,
+    /// workspace roots, and subscriptions.
     #[must_use]
     pub fn new(
         translator: Arc<Mutex<Translator>>,
+        notification_cache: Arc<Mutex<NotificationCache>>,
+        workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
-        let context = Arc::new(HandlerContext::new(translator, subscriptions));
+        let context = Arc::new(HandlerContext::new(
+            translator,
+            notification_cache,
+            workspace_roots,
+            subscriptions,
+        ));
         Self { context }
     }
 
@@ -377,8 +388,8 @@ impl McplsServer {
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_cached_diagnostics(&file_path)
+            let cache = self.context.notification_cache.lock().await;
+            Translator::handle_cached_diagnostics(&self.context.workspace_roots, &file_path, &cache)
         };
 
         match result {
@@ -397,8 +408,8 @@ impl McplsServer {
         Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_server_logs(limit, min_level)
+            let cache = self.context.notification_cache.lock().await;
+            Translator::handle_server_logs(&cache, limit, min_level)
         };
 
         match result {
@@ -417,8 +428,8 @@ impl McplsServer {
         Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_server_messages(limit)
+            let cache = self.context.notification_cache.lock().await;
+            Translator::handle_server_messages(&cache, limit)
         };
 
         match result {
@@ -590,12 +601,11 @@ impl ServerHandler for McplsServer {
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // Enforce workspace-root containment — mirrors the guard in every LSP tool.
-        {
-            let translator = self.context.translator.lock().await;
-            translator
-                .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
+        // Validated against a lock-free snapshot of workspace_roots (fixed at
+        // startup) so this cache-only read never waits on the translator lock,
+        // which may be held elsewhere across a slow in-flight LSP round-trip.
+        validate_path_against_roots(&path, &self.context.workspace_roots)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         let lsp_uri = crate::bridge::path_to_uri(&path);
 
@@ -603,11 +613,8 @@ impl ServerHandler for McplsServer {
         // in the response shape. Currently both return `{"diagnostics":null}` which is
         // ambiguous for clients that need to know whether analysis has run yet.
         let diagnostics = {
-            let translator = self.context.translator.lock().await;
-            translator
-                .notification_cache()
-                .get_diagnostics(lsp_uri.as_str())
-                .cloned()
+            let cache = self.context.notification_cache.lock().await;
+            cache.get_diagnostics(lsp_uri.as_str()).cloned()
         };
 
         let json = serde_json::to_string(&diagnostics)
@@ -628,12 +635,10 @@ impl ServerHandler for McplsServer {
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // Enforce workspace-root containment (same invariant as every LSP tool).
-        {
-            let translator = self.context.translator.lock().await;
-            translator
-                .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
+        // Validated against a lock-free snapshot of workspace_roots so subscribing
+        // never waits on the translator lock (see `read_resource`).
+        validate_path_against_roots(&path, &self.context.workspace_roots)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // TODO(S3): If diagnostics are already cached for this URI, emit a synthetic
         // notify_resource_updated so clients subscribing after initial workspace indexing
@@ -693,8 +698,15 @@ mod tests {
 
     fn create_test_server() -> McplsServer {
         let translator = Arc::new(Mutex::new(Translator::new()));
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        McplsServer::new(translator, subscriptions)
+        McplsServer::new(
+            translator,
+            notification_cache,
+            workspace_roots,
+            subscriptions,
+        )
     }
 
     #[tokio::test]

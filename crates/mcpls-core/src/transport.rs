@@ -246,16 +246,19 @@ mod tests {
         /// Verifies `run_http` binds successfully and accepts TCP connections.
         #[tokio::test]
         async fn test_run_http_binds() {
+            use std::path::PathBuf;
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{ResourceSubscriptions, Translator};
+            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
             use crate::mcp::McplsServer;
 
             let translator = Arc::new(Mutex::new(Translator::new()));
+            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server = McplsServer::new(translator, subs);
+            let server = McplsServer::new(translator, notification_cache, workspace_roots, subs);
 
             // Bind port 0 so the OS assigns a free port.
             let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -283,11 +286,12 @@ mod tests {
         /// Verifies `run_http` returns an error when the bind address is already in use.
         #[tokio::test]
         async fn test_run_http_bind_error() {
+            use std::path::PathBuf;
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{ResourceSubscriptions, Translator};
+            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
             use crate::mcp::McplsServer;
 
             // Hold a listener to make the port unavailable.
@@ -295,8 +299,10 @@ mod tests {
             let addr = occupied.local_addr().unwrap();
 
             let translator = Arc::new(Mutex::new(Translator::new()));
+            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server = McplsServer::new(translator, subs);
+            let server = McplsServer::new(translator, notification_cache, workspace_roots, subs);
 
             let cfg = HttpConfig {
                 bind: addr,
