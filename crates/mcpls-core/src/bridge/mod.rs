@@ -16,6 +16,7 @@ pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
 pub use resources::ResourceSubscriptions;
+pub(crate) use state::try_path_to_uri;
 pub use state::{DocumentState, DocumentTracker, path_to_uri, uri_to_path};
 pub(crate) use translator::validate_path_against_roots;
 pub use translator::{

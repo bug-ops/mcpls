@@ -727,25 +727,32 @@ impl Decision {
 /// not occur for valid absolute paths.
 #[must_use]
 pub fn path_to_uri(path: &Path) -> Uri {
-    let uri_string = file_uri_string(path);
-    let uri_string = encode_rfc3986_path_chars(&uri_string);
     #[allow(clippy::expect_used)]
-    uri_string.parse().expect("failed to create URI from path")
+    try_path_to_uri(path).expect("failed to create URI from path")
+}
+
+/// Convert a file path to a URI, returning `None` if the path cannot be
+/// represented as a `file://` URI.
+///
+/// Prefer this over [`path_to_uri`] on paths that come from configuration,
+/// where a bad value should surface as an error rather than a panic.
+#[must_use]
+pub fn try_path_to_uri(path: &Path) -> Option<Uri> {
+    let uri_string = encode_rfc3986_path_chars(&file_uri_string(path)?);
+    uri_string.parse().ok()
 }
 
 #[cfg(not(windows))]
-fn file_uri_string(path: &Path) -> String {
-    #[allow(clippy::expect_used)]
-    let file_url = Url::from_file_path(path).expect("failed to create file URI from path");
-    file_url.into()
+fn file_uri_string(path: &Path) -> Option<String> {
+    Url::from_file_path(path).ok().map(Into::into)
 }
 
 #[cfg(windows)]
-fn file_uri_string(path: &Path) -> String {
+fn file_uri_string(path: &Path) -> Option<String> {
     match Url::from_file_path(path) {
-        Ok(file_url) => file_url.into(),
-        Err(()) if path.has_root() => windows_rooted_path_to_file_uri(path),
-        Err(()) => panic!("failed to create file URI from path"),
+        Ok(file_url) => Some(file_url.into()),
+        Err(()) if path.has_root() => Some(windows_rooted_path_to_file_uri(path)),
+        Err(()) => None,
     }
 }
 
@@ -1201,6 +1208,11 @@ mod tests {
             Some(path),
             "encoded file URI should round-trip to the original path"
         );
+    }
+
+    #[test]
+    fn test_try_path_to_uri_returns_none_for_relative_path() {
+        assert_eq!(try_path_to_uri(Path::new("relative/file.ts")), None);
     }
 
     #[test]

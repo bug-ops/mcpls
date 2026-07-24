@@ -8,19 +8,19 @@
 //! 5. Graceful shutdown sequence
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::str::FromStr;
 
 use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
-    InitializedParams, PositionEncodingKind, ServerCapabilities, Uri, WorkspaceFolder,
+    InitializedParams, PositionEncodingKind, ServerCapabilities, WorkspaceFolder,
 };
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::{debug, info};
 
+use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::LspClient;
@@ -284,31 +284,7 @@ impl LspServer {
         let workspace_folders: Vec<WorkspaceFolder> = config
             .workspace_roots
             .iter()
-            .map(|root| {
-                let path_str = root.to_str().ok_or_else(|| {
-                    let root_display = root.display();
-                    Error::InvalidUri(format!("Invalid UTF-8 in path: {root_display}"))
-                })?;
-                let uri_str = if cfg!(windows) {
-                    // Strip \\?\ extended-path prefix that canonicalize() adds on Windows.
-                    let stripped = path_str.strip_prefix(r"\\?\").unwrap_or(path_str);
-                    format!("file:///{}", stripped.replace('\\', "/"))
-                } else {
-                    format!("file://{path_str}")
-                };
-                let uri = Uri::from_str(&uri_str).map_err(|_| {
-                    let root_display = root.display();
-                    Error::InvalidUri(format!("Invalid workspace root: {root_display}"))
-                })?;
-                Ok(WorkspaceFolder {
-                    uri,
-                    name: root
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("workspace")
-                        .to_string(),
-                })
-            })
+            .map(|root| workspace_folder(root))
             .collect::<Result<Vec<_>>>()?;
 
         let params = InitializeParams {
@@ -543,6 +519,26 @@ impl LspServer {
     }
 }
 
+/// Build the `workspace/workspaceFolders` entry for one configured root.
+///
+/// Reserved characters have to be percent-encoded here: an unencoded `#`
+/// would truncate the path into a URI fragment, and `[` / `]` are rejected
+/// outright by `Uri`.
+fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
+    let uri = try_path_to_uri(root).ok_or_else(|| {
+        let root_display = root.display();
+        Error::InvalidUri(format!("Invalid workspace root: {root_display}"))
+    })?;
+    Ok(WorkspaceFolder {
+        uri,
+        name: root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace")
+            .to_string(),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -564,6 +560,52 @@ mod tests {
     fn test_server_state_initializing() {
         assert!(!ServerState::Initializing.is_ready());
         assert!(!ServerState::Initializing.can_accept_requests());
+    }
+
+    #[test]
+    fn test_workspace_folder_encodes_fragment_char() {
+        // An unencoded `#` parses as a fragment, silently handing the server
+        // the parent directory as its root.
+        #[cfg(windows)]
+        let (root, expected) = (
+            Path::new(r"C:\home\me\dev\#work"),
+            "file:///C:/home/me/dev/%23work",
+        );
+        #[cfg(not(windows))]
+        let (root, expected) = (
+            Path::new("/home/me/dev/#work"),
+            "file:///home/me/dev/%23work",
+        );
+
+        let folder = workspace_folder(root).unwrap();
+
+        assert_eq!(folder.uri.as_str(), expected);
+        assert_eq!(folder.name, "#work");
+    }
+
+    #[test]
+    fn test_workspace_folder_encodes_bracket_chars() {
+        #[cfg(windows)]
+        let (root, expected) = (
+            Path::new(r"C:\home\me\dev\[env]"),
+            "file:///C:/home/me/dev/%5Benv%5D",
+        );
+        #[cfg(not(windows))]
+        let (root, expected) = (
+            Path::new("/home/me/dev/[env]"),
+            "file:///home/me/dev/%5Benv%5D",
+        );
+
+        let folder = workspace_folder(root).unwrap();
+
+        assert_eq!(folder.uri.as_str(), expected);
+        assert_eq!(folder.name, "[env]");
+    }
+
+    #[test]
+    fn test_workspace_folder_rejects_relative_root() {
+        let err = workspace_folder(Path::new("relative/root")).unwrap_err();
+        assert!(matches!(err, Error::InvalidUri(_)), "got {err:?}");
     }
 
     #[test]

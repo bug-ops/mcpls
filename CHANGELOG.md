@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`path_to_uri` produced invalid `file://` URIs for paths containing RFC 3986 reserved characters** — filesystem paths containing `[`, `]`, `^`, or `|` (e.g. Next.js dynamic route files like `[...slug].ts`) were embedded in LSP `file://` URIs unencoded; these characters are now percent-encoded (`%5B`, `%5D`, `%5E`, `%7C`), and `uri_to_path` decodes them back to the original path on the return trip. (#151)
 - **RUSTSEC-2026-0204** — bump transitive `crossbeam-epoch` dependency (pulled in via `ignore`) from 0.9.18 to 0.9.20 to resolve an invalid pointer dereference in `fmt::Pointer` impls for `Atomic`/`Shared`
 - **TSX/JSX diagnostics** — Preserve `typescriptreact`/`javascriptreact` language IDs when deriving mappings from TypeScript/JavaScript server `file_patterns`, fixing JSX parse errors when one server handles both plain and React extensions. (#148)
+- **Workspace root URIs** — Build `initialize` workspace folder URIs with the shared `bridge::path_to_uri` encoder instead of splicing raw paths, so a root containing `#` no longer truncates to its parent directory and roots containing `[`/`]` no longer fail initialization. (#221)
 
 ## [0.3.7] - 2026-06-23
 
