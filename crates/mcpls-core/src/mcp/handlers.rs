@@ -46,6 +46,6 @@ mod tests {
         let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let context = HandlerContext::new(translator, subscriptions);
-        assert!(Arc::strong_count(&context.translator) == 1);
+        assert_eq!(Arc::strong_count(&context.translator), 1);
     }
 }
