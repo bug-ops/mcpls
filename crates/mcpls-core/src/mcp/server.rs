@@ -654,7 +654,7 @@ impl ServerHandler for McplsServer {
         // Enforce workspace-root containment (same invariant as every LSP tool).
         // Validated against a lock-free snapshot of workspace_roots so subscribing
         // never waits on the translator lock (see `read_resource`).
-        validate_path_against_roots(&path, &self.context.workspace_roots)
+        let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // Record the subscription *before* checking the cache. This closes the race where
@@ -669,13 +669,12 @@ impl ServerHandler for McplsServer {
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
 
+        // Build the URI from the canonicalized path, matching `read_resource` and
+        // what `diagnostics_pump` stores from LSP notifications.
+        let lsp_uri = crate::bridge::path_to_uri(&validated_path);
         let has_cached_diagnostics = {
-            let translator = self.context.translator.lock().await;
-            let lsp_uri = crate::bridge::path_to_uri(&path);
-            translator
-                .notification_cache()
-                .get_diagnostics(lsp_uri.as_str())
-                .is_some()
+            let cache = self.context.notification_cache.lock().await;
+            cache.get_diagnostics(lsp_uri.as_str()).is_some()
         };
 
         if has_cached_diagnostics {
