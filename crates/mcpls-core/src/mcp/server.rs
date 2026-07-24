@@ -657,6 +657,14 @@ impl ServerHandler for McplsServer {
         let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
+        // Track and reply under the canonical resource URI, not the client's raw
+        // `request.uri`: `diagnostics_pump` derives `mcp_uri` from the canonical LSP
+        // path (see below), so a subscription keyed by a non-canonical but equivalent
+        // URI (symlink, macOS /var vs /private/var, ...) would never match its
+        // `subs.contains` check and silently stop receiving pushes.
+        let canonical_uri =
+            make_uri(&validated_path).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
         // Record the subscription *before* checking the cache. This closes the race where
         // a PublishDiagnostics notification lands between the cache check and the
         // subscription being recorded: if diagnostics arrive before this point, the check
@@ -665,7 +673,7 @@ impl ServerHandler for McplsServer {
         // update through the normal push path.
         self.context
             .subscriptions
-            .subscribe(request.uri.clone())
+            .subscribe(canonical_uri.clone())
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
 
@@ -677,15 +685,15 @@ impl ServerHandler for McplsServer {
             cache.get_diagnostics(lsp_uri.as_str()).is_some()
         };
 
-        if has_cached_diagnostics {
-            let uri = request.uri.clone();
-            if let Err(e) = context
+        if has_cached_diagnostics
+            && let Err(e) = context
                 .peer
-                .notify_resource_updated(ResourceUpdatedNotificationParam::new(request.uri))
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(
+                    canonical_uri.clone(),
+                ))
                 .await
-            {
-                tracing::warn!("Failed to replay cached diagnostics for {uri}: {e}");
-            }
+        {
+            tracing::warn!("Failed to replay cached diagnostics for {canonical_uri}: {e}");
         }
 
         Ok(())
@@ -697,8 +705,18 @@ impl ServerHandler for McplsServer {
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         // Parse the URI for consistency with subscribe validation.
-        parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        self.context.subscriptions.unsubscribe(&request.uri).await;
+        let path =
+            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        // Remove under the same canonical URI `subscribe` recorded under. Best-effort
+        // fall back to the raw URI if canonicalization fails (e.g. the file was
+        // deleted since subscribing) so unsubscribing a stale entry never errors.
+        let key = validate_path_against_roots(&path, &self.context.workspace_roots)
+            .ok()
+            .and_then(|validated_path| make_uri(&validated_path).ok())
+            .unwrap_or_else(|| request.uri.clone());
+
+        self.context.subscriptions.unsubscribe(&key).await;
         Ok(())
     }
 
