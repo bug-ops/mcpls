@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stale document tracker on external file changes** — `DocumentTracker::ensure_open` now stats the file on every call and resyncs the LSP server via a single full-replacement `textDocument/didChange` when the on-disk content changed. Previously a file was only ever read once per session, so external edits (git checkout/stash, formatters, the MCP host's own Edit/Write tools) went unnoticed by mcpls and produced stale hover/diagnostics/completion results until the process restarted. (#102)
 - **CodeQL fork PR checkout** — `actions/checkout@v7` refuses to check out a fork PR's head SHA in `pull_request_target` workflows unless explicitly opted in; set `allow-unsafe-pr-checkout: true` on the CodeQL workflow's checkout step, which was failing every fork-originated PR since the checkout v6 → v7 bump. Safe here because the job carries no secrets and permissions are scoped to `security-events: write` + `contents: read` only.
 
 ### Changed
 
+- **`DocumentState` API** — Breaking change: `DocumentState` gains a `disk: Option<DiskSync>` field tracking the filesystem snapshot behind the resync mechanism above; existing struct-literal construction must add this field. Acceptable pre-1.0.
 - **`rmcp` 2.2.0** — Breaking change upstream: bump `rmcp` from 1.8.0 to 2.2.0 to align with the MCP 2025-11-25 spec. `rmcp::model::RawResource` and the `Annotated<RawResource>` wrapper were merged into a single flat `rmcp::model::Resource` struct; `McplsServer::list_resources` updated accordingly.
 
 ### Fixed

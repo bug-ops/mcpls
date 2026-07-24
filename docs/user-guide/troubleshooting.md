@@ -7,6 +7,7 @@ Common issues and solutions when using mcpls.
 - [Installation Issues](#installation-issues)
 - [Claude Code Integration](#claude-code-integration)
 - [LSP Server Issues](#lsp-server-issues)
+  - [External file changes](#external-file-changes)
 - [Configuration Issues](#configuration-issues)
 - [Performance Issues](#performance-issues)
 - [Common Error Messages](#common-error-messages)
@@ -307,6 +308,19 @@ npm update -g pyright
 ```
 
 4. Report bug to language server maintainers if reproducible
+
+---
+
+### External file changes
+
+**Behavior**: mcpls detects when an open file changes on disk outside of its own tool calls — `git checkout`/`stash`, a formatter, or an external editor — and automatically resynchronizes the language server, so hover/diagnostics/completion results reflect the new content on the next tool call. No restart is needed for this common case.
+
+**Two cases are not covered**:
+
+- A tool that restores a file with an *identical* size and an mtime equal to the last one mcpls observed (e.g. `tar x`, `rsync -a`, `cp -p`) can still be missed if it happens within a short window after the file was last read. Detecting this reliably would require hashing file content on every tool call, which mcpls does not do for performance reasons. **Workaround**: touch the file (`touch <file>`) or make a trivial edit to force a size or timestamp change, or restart mcpls.
+- `workspace_symbol_search` is served from the language server's own workspace-wide index rather than from a single tracked document, so it stays unaffected by (and unhelped by) this mechanism for files mcpls has never opened. Re-run the language server's own indexing if its results seem stale.
+
+**Diagnostics semantics**: because a resync never closes and reopens the document, `get_cached_diagnostics` keeps returning the last-known diagnostics for the file until the language server finishes re-analyzing it and publishes fresh ones — there is no transient window where diagnostics appear empty.
 
 ---
 

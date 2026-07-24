@@ -4,12 +4,92 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
-use lsp_types::{DidOpenTextDocumentParams, TextDocumentItem, Uri};
+use lsp_types::{
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, TextDocumentContentChangeEvent,
+    TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
+};
+use tokio::fs;
+use tokio::time::Instant;
 use url::Url;
 
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
+
+/// Debounce window for re-reading a file's content when its mtime is not yet
+/// [`mtime_settled`]. The stat itself is never debounced -- only this
+/// (comparatively expensive) content re-read is rate-limited, so a burst of
+/// calls against a genuinely changed file still resyncs on the first stat
+/// that observes the new `(mtime, size)`.
+///
+/// This only bounds the *stable-but-unsettled* case: the same `(mtime,
+/// size)` observed repeatedly while that mtime is still within
+/// [`MTIME_GRANULARITY`] of "now". A file whose `(mtime, size)` changes on
+/// every stat is never debounced at all -- each such call already disagrees
+/// with the cached snapshot, so it always takes the immediate re-read path
+/// regardless of how recently the last one happened.
+const DISK_CHECK_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Filesystem mtime granularity margin: covers FAT/exFAT (2s) and is a safe
+/// superset of HFS+/ext3/APFS (1s or finer). An mtime observed more recently
+/// than this cannot be trusted to distinguish "unchanged" from "rewritten
+/// within the same tick", so such entries are re-verified by content compare
+/// instead of by stat alone -- this is what closes the racy-rewrite gap.
+const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
+
+/// Returns whether `mtime` is old enough, relative to `read_at`, that a write
+/// landing after `read_at` could not have preserved it.
+///
+/// `read_at` must be captured *before* the filesystem is stat'd (not after any
+/// subsequent read), otherwise a write racing the read itself could produce a
+/// new mtime that still appears "settled" against a later timestamp.
+fn mtime_settled(mtime: Option<SystemTime>, read_at: SystemTime) -> bool {
+    mtime.is_some_and(|m| {
+        m.checked_add(MTIME_GRANULARITY)
+            .is_some_and(|t| t <= read_at)
+    })
+}
+
+/// A snapshot of a document's on-disk filesystem state, captured the last
+/// time its content was actually read and compared.
+///
+/// [`DocumentTracker::ensure_open`] stats the file on every call; when the
+/// stat matches this snapshot and [`Self::mtime_settled`] holds, the cached
+/// content is trusted without touching the file's bytes again. This is what
+/// keeps the common "file unchanged" path cheap while still detecting
+/// external edits (git checkout/stash, formatters, the MCP host's own
+/// edits) made outside mcpls.
+#[derive(Debug, Clone, Copy)]
+pub struct DiskSync {
+    /// Last observed modification time, or `None` if the filesystem or
+    /// platform does not report one (in which case the entry is never
+    /// treated as settled, forcing a content re-read outside the debounce
+    /// window).
+    pub mtime: Option<SystemTime>,
+    /// Last observed file size in bytes.
+    pub size: u64,
+    /// Whether `mtime` was already old enough, relative to when it was
+    /// observed, that a same-tick rewrite could not have preserved it.
+    pub mtime_settled: bool,
+    /// When the file's content was last actually re-read and compared.
+    ///
+    /// Used only to debounce the content re-read on a racy (not-yet-settled)
+    /// entry; deliberately excluded from equality so two otherwise-identical
+    /// snapshots don't compare unequal merely because they were checked at
+    /// different instants.
+    pub content_checked_at: Instant,
+}
+
+impl PartialEq for DiskSync {
+    fn eq(&self, other: &Self) -> bool {
+        self.mtime == other.mtime
+            && self.size == other.size
+            && self.mtime_settled == other.mtime_settled
+    }
+}
+
+impl Eq for DiskSync {}
 
 /// State of a single document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +102,20 @@ pub struct DocumentState {
     pub version: i32,
     /// Document content.
     pub content: String,
+    /// Filesystem snapshot as of the last time `content` was read from disk.
+    ///
+    /// `None` means the content's on-disk provenance is unknown (it came from
+    /// an in-memory `open`/`update` call, not a verified disk read), so
+    /// `ensure_open` must always re-verify by content compare rather than
+    /// trusting a stat match.
+    ///
+    /// `DiskSync`'s hand-written `PartialEq` excludes `content_checked_at`
+    /// (see that field's doc comment), and that exclusion propagates here:
+    /// two `DocumentState`s can compare equal via this struct's derived
+    /// `PartialEq`/`Eq` despite having been disk-verified at different
+    /// instants. This is intentional -- `content_checked_at` is a debounce
+    /// timer, not part of a document's logical state.
+    pub disk: Option<DiskSync>,
 }
 
 /// Resource limits for document tracking.
@@ -106,14 +200,7 @@ impl DocumentTracker {
             });
         }
 
-        // Check file size limit
-        let size = content.len() as u64;
-        if self.limits.max_file_size > 0 && size > self.limits.max_file_size {
-            return Err(Error::FileSizeLimitExceeded {
-                size,
-                max: self.limits.max_file_size,
-            });
-        }
+        self.check_file_size(content.len() as u64)?;
 
         let uri = path_to_uri(&path);
         let language_id = detect_language(&path, &self.extension_map);
@@ -123,6 +210,7 @@ impl DocumentTracker {
             language_id,
             version: 1,
             content,
+            disk: None,
         };
 
         self.documents.insert(path, state);
@@ -131,14 +219,39 @@ impl DocumentTracker {
 
     /// Update a document's content and increment its version.
     ///
-    /// Returns `None` if the document is not open.
+    /// Returns `None` if the document is not open. The updated content has no
+    /// known disk provenance, so the next `ensure_open` call on this path
+    /// will always re-verify by content compare rather than trusting a stat.
     pub fn update(&mut self, path: &Path, content: String) -> Option<i32> {
         if let Some(state) = self.documents.get_mut(path) {
             state.version += 1;
             state.content = content;
+            state.disk = None;
             Some(state.version)
         } else {
             None
+        }
+    }
+
+    /// Returns an error if `size` exceeds the configured file size limit.
+    const fn check_file_size(&self, size: u64) -> Result<()> {
+        if self.limits.max_file_size > 0 && size > self.limits.max_file_size {
+            return Err(Error::FileSizeLimitExceeded {
+                size,
+                max: self.limits.max_file_size,
+            });
+        }
+        Ok(())
+    }
+
+    /// Sets the disk snapshot for an already-tracked document.
+    ///
+    /// A no-op if the path is no longer tracked; every call site holds the
+    /// tracker lock for the whole `ensure_open` call, so this should not
+    /// happen in practice, but it avoids an `unwrap`/`expect` on the lookup.
+    fn set_disk(&mut self, path: &Path, snap: DiskSync) {
+        if let Some(st) = self.documents.get_mut(path) {
+            st.disk = Some(snap);
         }
     }
 
@@ -159,36 +272,95 @@ impl DocumentTracker {
         self.documents.keys().map(PathBuf::as_path)
     }
 
-    /// Ensure a document is open, opening it lazily if necessary.
+    /// Ensure a document is open, opening it lazily if necessary, and
+    /// resynchronize it with the LSP server if the file changed on disk
+    /// since it was last read.
     ///
-    /// If the document is already open, returns its URI immediately.
-    /// Otherwise, reads the file from disk, opens it in the tracker,
-    /// and sends a `didOpen` notification to the LSP server.
+    /// If the document is not yet tracked, this reads it from disk, opens it
+    /// in the tracker, and sends a `didOpen` notification.
+    ///
+    /// If the document is already tracked, this stats the file on every call
+    /// (a cheap syscall, never debounced) to detect external changes -- `git
+    /// checkout`/`stash`, formatters, or edits made by the MCP host itself
+    /// outside mcpls. When the file changed, mcpls sends a single
+    /// full-replacement `textDocument/didChange` notification (a
+    /// `TextDocumentContentChangeEvent` with `range: None`, which per the LSP
+    /// spec means "this is the entire new document content") and updates the
+    /// cached content and version. The document is never closed and reopened,
+    /// so `get_cached_diagnostics` keeps serving the last-known diagnostics
+    /// until the server re-publishes after the change -- there is no
+    /// transient empty window.
+    ///
+    /// mcpls does not consult the server's negotiated `TextDocumentSyncKind`
+    /// when doing this: `LspClient` has no access to `ServerCapabilities` at
+    /// this layer. A server that strictly enforces `Incremental` sync could
+    /// in principle reject a full-replacement change; this is believed to be
+    /// low risk in practice (rust-analyzer, pyright, tsserver, gopls and
+    /// clangd all accept it), but is the first place to look if a future
+    /// maintainer sees sync errors from a new server.
+    ///
+    /// Two cases fall outside this mechanism entirely:
+    /// - A tool that restores a file with an mtime identical to the last
+    ///   observed one and an unchanged size (e.g. `tar x`, `rsync -a`, `cp
+    ///   -p`) can still be missed while that mtime is within the racy
+    ///   detection window; closing this would require hashing content on
+    ///   every access.
+    /// - `workspace_symbol_search` is served from the LSP server's own
+    ///   index and is unaffected by this per-document mechanism for files
+    ///   mcpls has never opened.
+    ///
+    /// # Concurrency
+    ///
+    /// This entire call must run under the document tracker's lock: it
+    /// assumes no other caller can observe or mutate state for the same path
+    /// concurrently, or duplicate `didOpen`/`didChange` notifications could
+    /// be sent for the same document.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The file cannot be read from disk
-    /// - The `didOpen` notification fails to send
+    /// - The file cannot be stat'd or read from disk
+    /// - The `didOpen`/`didChange` notification fails to send
     /// - Resource limits are exceeded
     pub async fn ensure_open(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
-        if let Some(state) = self.documents.get(path) {
-            return Ok(state.uri.clone());
+        if self.documents.contains_key(path) {
+            self.resync(path, lsp_client).await
+        } else {
+            self.first_open(path, lsp_client).await
         }
+    }
 
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| Error::FileIo {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
+    /// Reads a not-yet-tracked file from disk, opens it, and notifies the
+    /// LSP server via `didOpen`.
+    async fn first_open(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
+        let read_at = SystemTime::now();
+        let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        self.check_file_size(meta.len())?;
+        let mtime = meta.modified().ok();
+
+        let content = fs::read_to_string(path).await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
 
         let uri = self.open(path.to_path_buf(), content.clone())?;
+        self.set_disk(
+            path,
+            DiskSync {
+                mtime,
+                size: meta.len(),
+                mtime_settled: mtime_settled(mtime, read_at),
+                content_checked_at: Instant::now(),
+            },
+        );
+
         let state = self
             .documents
             .get(path)
             .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?;
-
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
@@ -198,7 +370,99 @@ impl DocumentTracker {
             },
         };
 
-        lsp_client.notify("textDocument/didOpen", params).await?;
+        if let Err(err) = lsp_client.notify("textDocument/didOpen", params).await {
+            // The server never learned about this document. Because resync
+            // only ever sends `didChange` (never another `didOpen`), leaving
+            // this entry tracked would permanently desync the server from
+            // the tracker. Undo the insert so the next call retries the
+            // whole first-open path from scratch.
+            self.documents.remove(path);
+            return Err(err);
+        }
+
+        Ok(uri)
+    }
+
+    /// Verifies an already-tracked document against disk and resynchronizes
+    /// the LSP server via `didChange` if the content changed.
+    async fn resync(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
+        let read_at = SystemTime::now();
+        let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let mtime = meta.modified().ok();
+        let size = meta.len();
+
+        let (uri, needs_verify) = {
+            let Some(st) = self.documents.get(path) else {
+                return Err(Error::DocumentNotFound(path.to_path_buf()));
+            };
+            let stat_matches = st.disk.is_some_and(|d| d.mtime == mtime && d.size == size);
+            let fast_path = match st.disk {
+                Some(d) if stat_matches && d.mtime_settled => true,
+                Some(d) if stat_matches && d.content_checked_at.elapsed() < DISK_CHECK_DEBOUNCE => {
+                    true
+                }
+                _ => false,
+            };
+            (st.uri.clone(), !fast_path)
+        };
+        if !needs_verify {
+            return Ok(uri);
+        }
+
+        self.check_file_size(size)?;
+        let fresh = fs::read_to_string(path).await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        self.check_file_size(fresh.len() as u64)?;
+        let snap = DiskSync {
+            mtime,
+            size,
+            mtime_settled: mtime_settled(mtime, read_at),
+            content_checked_at: Instant::now(),
+        };
+
+        let (unchanged, next_version) = {
+            let Some(st) = self.documents.get(path) else {
+                return Err(Error::DocumentNotFound(path.to_path_buf()));
+            };
+            (fresh == st.content, st.version.saturating_add(1))
+        };
+        if unchanged {
+            self.set_disk(path, snap);
+            return Ok(uri);
+        }
+
+        lsp_client
+            .notify(
+                "textDocument/didChange",
+                DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version: next_version,
+                    },
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: fresh.clone(),
+                    }],
+                },
+            )
+            .await?;
+
+        // Unreachable under the `&mut self` lock held for this whole call
+        // (see "Concurrency" above), but `Err` here -- rather than silently
+        // discarding the didChange notification's state update -- matches
+        // the convention of the two earlier guards in this function.
+        let Some(st) = self.documents.get_mut(path) else {
+            return Err(Error::DocumentNotFound(path.to_path_buf()));
+        };
+        st.version = next_version;
+        st.content = fresh;
+        st.disk = Some(snap);
 
         Ok(uri)
     }
@@ -430,6 +694,7 @@ mod tests {
             language_id: "rust".to_string(),
             version: 5,
             content: "fn main() {}".to_string(),
+            disk: None,
         };
 
         #[allow(clippy::redundant_clone)]
@@ -967,5 +1232,414 @@ mod tests {
         tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
         tracker.close(Path::new("/a.rs"));
         assert_eq!(tracker.open_paths().count(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // ensure_open resync (issue #102)
+    // ------------------------------------------------------------------
+
+    use std::process::Stdio;
+
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+    use crate::config::LspServerConfig;
+    use crate::lsp::LspTransport;
+
+    /// Holds both fake-transport child processes alive for a test.
+    ///
+    /// The read-half's stdin is deliberately never written to, so its `cat`
+    /// process never sees EOF on input, never exits, and its stdout (which
+    /// backs the transport's `receive()`) never closes -- `receive()` pends
+    /// forever instead of observing EOF and tearing down the client's
+    /// message loop. Using `echo` here instead would exit immediately and
+    /// break every subsequent `notify()` call.
+    ///
+    /// `write_stdout` is the write-half's own stdout: since `cat` echoes
+    /// whatever mcpls writes to its stdin, reading this back is how a test
+    /// observes the actual framed JSON-RPC bytes sent to the "server".
+    struct FakeServer {
+        _write_half: Child,
+        _read_half: Child,
+        _read_half_stdin: ChildStdin,
+        write_stdout: ChildStdout,
+    }
+
+    /// Builds an `LspClient` backed by two `cat` child processes so
+    /// `notify()` succeeds without a real language server.
+    fn fake_lsp_client() -> (LspClient, FakeServer) {
+        let mut write_half = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let write_stdin = write_half.stdin.take().unwrap();
+        let write_stdout = write_half.stdout.take().unwrap();
+
+        let mut read_half = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let read_stdout = read_half.stdout.take().unwrap();
+        let read_stdin = read_half.stdin.take().unwrap();
+
+        let transport = LspTransport::new(write_stdin, read_stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+        (
+            client,
+            FakeServer {
+                _write_half: write_half,
+                _read_half: read_half,
+                _read_half_stdin: read_stdin,
+                write_stdout,
+            },
+        )
+    }
+
+    /// Backdates or forwards a file's mtime for deterministic disk-sync tests.
+    fn set_mtime(path: &Path, time: SystemTime) {
+        let file = std::fs::File::open(path).unwrap();
+        file.set_modified(time).unwrap();
+    }
+
+    fn settled_past() -> SystemTime {
+        SystemTime::now() - Duration::from_secs(10)
+    }
+
+    /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
+    ///
+    /// `reader` must be reused across calls (not recreated per message):
+    /// a fresh `BufReader` would silently drop any bytes of a later message
+    /// it over-read into its internal buffer while parsing an earlier one.
+    async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> serde_json::Value {
+        let mut content_length = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some((key, value)) = line.trim_end().split_once(':')
+                && key.trim().eq_ignore_ascii_case("content-length")
+            {
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut buf = vec![0u8; content_length.unwrap()];
+        reader.read_exact(&mut buf).await.unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    #[test]
+    fn test_mtime_settled_boundary() {
+        let read_at = SystemTime::now();
+        assert!(!mtime_settled(None, read_at), "no mtime is never settled");
+        assert!(
+            mtime_settled(Some(read_at - Duration::from_secs(3)), read_at),
+            "3s older than read_at is past the 2s granularity margin"
+        );
+        assert!(
+            !mtime_settled(Some(read_at - Duration::from_secs(1)), read_at),
+            "1s older than read_at is within the 2s granularity margin"
+        );
+        assert!(
+            !mtime_settled(Some(read_at + Duration::from_secs(10)), read_at),
+            "an mtime after read_at is never settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_open_unchanged_file_is_fast_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+
+        let uri1 = tracker.ensure_open(&path, &client).await.unwrap();
+        assert_eq!(tracker.get(&path).unwrap().version, 1);
+
+        let uri2 = tracker.ensure_open(&path, &client).await.unwrap();
+        assert_eq!(uri1, uri2);
+        assert_eq!(tracker.get(&path).unwrap().version, 1);
+        assert_eq!(tracker.get(&path).unwrap().content, "fn main() {}");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_open_resyncs_on_size_change() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+
+        std::fs::write(&path, "fn main() { println!(\"hi\"); }").unwrap();
+        set_mtime(&path, settled_past());
+
+        tracker.ensure_open(&path, &client).await.unwrap();
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.version, 2);
+        assert_eq!(state.content, "fn main() { println!(\"hi\"); }");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ensure_open_regression_102_103_racy_same_size_rewrite() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "AAAA").unwrap();
+        // Leave the mtime at "now" (racy) rather than backdating it.
+
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Same-length rewrite with the mtime forced back to the recorded
+        // value -- exactly the same-tick rewrite issue #102/#103 missed.
+        std::fs::write(&path, "BBBB").unwrap();
+        set_mtime(&path, original_mtime);
+
+        tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
+
+        tracker.ensure_open(&path, &client).await.unwrap();
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(
+            state.version, 2,
+            "must resync despite identical (mtime, size)"
+        );
+        assert_eq!(state.content, "BBBB");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ensure_open_regression_102_103_settled_mtime_is_the_documented_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "AAAA").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Same-length rewrite restoring an already-settled mtime: this is
+        // the documented residual limitation (e.g. `tar x`, `rsync -a`),
+        // not a bug -- it is out of reach without hashing on every access.
+        std::fs::write(&path, "BBBB").unwrap();
+        set_mtime(&path, original_mtime);
+
+        tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
+
+        tracker.ensure_open(&path, &client).await.unwrap();
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.version, 1, "documented limitation: fast path taken");
+        assert_eq!(state.content, "AAAA");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ensure_open_stat_is_never_debounced() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "AAAA").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+
+        // Different-size rewrite with no time advance at all: must resync
+        // immediately, proving the debounce never gates the stat itself.
+        std::fs::write(&path, "BBBBBBBB").unwrap();
+        tracker.ensure_open(&path, &client).await.unwrap();
+
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.version, 2);
+        assert_eq!(state.content, "BBBBBBBB");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ensure_open_debounce_gates_reread_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "AAAA").unwrap();
+        // Racy: leave the mtime at "now".
+
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        std::fs::write(&path, "BBBB").unwrap(); // same size
+        set_mtime(&path, original_mtime); // stat matches, entry stays racy
+
+        // Inside the debounce window: the re-read is gated, cache wins.
+        tracker.ensure_open(&path, &client).await.unwrap();
+        assert_eq!(tracker.get(&path).unwrap().version, 1);
+
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tracker.ensure_open(&path, &client).await.unwrap();
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.version, 2);
+        assert_eq!(state.content, "BBBB");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_open_deleted_file_errors_state_untouched() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+
+        let result = tracker.ensure_open(&path, &client).await;
+        assert!(matches!(result, Err(Error::FileIo { .. })));
+        assert!(tracker.is_open(&path));
+        assert_eq!(tracker.get(&path).unwrap().version, 1);
+        assert_eq!(tracker.get(&path).unwrap().content, "fn main() {}");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_open_grows_past_limit_errors_state_intact() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "small").unwrap();
+        set_mtime(&path, settled_past());
+
+        let limits = ResourceLimits {
+            max_documents: 10,
+            max_file_size: 10,
+        };
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(limits, HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+
+        std::fs::write(&path, "x".repeat(100)).unwrap();
+
+        let result = tracker.ensure_open(&path, &client).await;
+        assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
+        assert_eq!(tracker.get(&path).unwrap().content, "small");
+        assert_eq!(tracker.get(&path).unwrap().version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_open_resync_at_document_capacity() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "AAAA").unwrap();
+        set_mtime(&path, settled_past());
+
+        let limits = ResourceLimits {
+            max_documents: 1,
+            max_file_size: 0,
+        };
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(limits, HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+        assert_eq!(tracker.len(), 1);
+
+        std::fs::write(&path, "BBBBBBBB").unwrap();
+        let result = tracker.ensure_open(&path, &client).await;
+        assert!(
+            result.is_ok(),
+            "resync must not re-run the doc-count check on an already-tracked path"
+        );
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.get(&path).unwrap().version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_update_clears_disk_provenance() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+        assert!(tracker.get(&path).unwrap().disk.is_some());
+
+        tracker.update(&path, "fn main() { updated(); }".to_string());
+        assert!(
+            tracker.get(&path).unwrap().disk.is_none(),
+            "update() must clear disk provenance so the next ensure_open re-verifies by content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_open_self_heals_when_did_open_notify_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+
+        let (client, _server) = fake_lsp_client();
+        // A clone shares the same command channel. Shutting down the
+        // original (which owns the receiver task) blocks until the
+        // background message loop has fully exited and dropped that
+        // channel's receiver -- so the clone's next `notify()` fails
+        // deterministically, with no race against process teardown.
+        let notify_will_fail = client.clone();
+        client.shutdown().await.unwrap();
+
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let result = tracker.ensure_open(&path, &notify_will_fail).await;
+
+        assert!(result.is_err(), "notify failure must propagate as an error");
+        assert!(
+            !tracker.is_open(&path),
+            "a failed didOpen must not leave the document tracked, or the server \
+             and tracker would stay permanently desynced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resync_sends_didchange_with_full_replacement_over_the_wire() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, mut server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &client).await.unwrap();
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
+        std::fs::write(&path, "fn main() { println!(\"hi\"); }").unwrap();
+        set_mtime(&path, settled_past());
+        tracker.ensure_open(&path, &client).await.unwrap();
+
+        let changed = read_framed_message(&mut wire).await;
+        assert_eq!(changed["method"], "textDocument/didChange");
+        let params = &changed["params"];
+        assert_eq!(params["textDocument"]["version"], 2);
+        let change = &params["contentChanges"][0];
+        assert!(
+            change.get("range").is_none(),
+            "range must be omitted, not null, for a full-replacement change"
+        );
+        assert!(
+            change.get("rangeLength").is_none(),
+            "rangeLength must be omitted, not null, for a full-replacement change"
+        );
+        assert_eq!(change["text"], "fn main() { println!(\"hi\"); }");
     }
 }
