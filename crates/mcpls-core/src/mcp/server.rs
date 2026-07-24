@@ -15,7 +15,7 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
-use super::handlers::HandlerContext;
+use super::handlers::BridgeContext;
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
@@ -31,7 +31,7 @@ use crate::bridge::{
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
 pub struct McplsServer {
-    context: Arc<HandlerContext>,
+    context: Arc<BridgeContext>,
 }
 
 #[tool_router]
@@ -40,12 +40,12 @@ impl McplsServer {
     /// workspace roots, and subscriptions.
     #[must_use]
     pub fn new(
-        translator: Arc<Mutex<Translator>>,
+        translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
-        let context = Arc::new(HandlerContext::new(
+        let context = Arc::new(BridgeContext::new(
             translator,
             notification_cache,
             workspace_roots,
@@ -67,8 +67,10 @@ impl McplsServer {
         }): Parameters<HoverParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_hover(file_path, line, character).await
+            self.context
+                .translator
+                .handle_hover(file_path, line, character)
+                .await
         };
 
         match result {
@@ -91,8 +93,8 @@ impl McplsServer {
         }): Parameters<DefinitionParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_definition(file_path, line, character)
                 .await
         };
@@ -118,8 +120,8 @@ impl McplsServer {
         }): Parameters<ReferencesParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_references(file_path, line, character, include_declaration)
                 .await
         };
@@ -139,10 +141,7 @@ impl McplsServer {
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_diagnostics(file_path).await
-        };
+        let result = { self.context.translator.handle_diagnostics(file_path).await };
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -165,8 +164,8 @@ impl McplsServer {
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_rename(file_path, line, character, new_name)
                 .await
         };
@@ -192,8 +191,8 @@ impl McplsServer {
         }): Parameters<CompletionsParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_completions(file_path, line, character, trigger)
                 .await
         };
@@ -214,8 +213,10 @@ impl McplsServer {
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_document_symbols(file_path).await
+            self.context
+                .translator
+                .handle_document_symbols(file_path)
+                .await
         };
 
         match result {
@@ -238,8 +239,8 @@ impl McplsServer {
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_format_document(file_path, tab_size, insert_spaces)
                 .await
         };
@@ -264,8 +265,8 @@ impl McplsServer {
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_workspace_symbol(query, kind_filter, limit)
                 .await
         };
@@ -293,8 +294,8 @@ impl McplsServer {
         }): Parameters<CodeActionsParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_code_actions(
                     file_path,
                     start_line,
@@ -326,8 +327,8 @@ impl McplsServer {
         }): Parameters<CallHierarchyPrepareParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_call_hierarchy_prepare(file_path, line, character)
                 .await
         };
@@ -347,10 +348,7 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_incoming_calls(item).await
-        };
+        let result = { self.context.translator.handle_incoming_calls(item).await };
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -367,10 +365,7 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_outgoing_calls(item).await
-        };
+        let result = { self.context.translator.handle_outgoing_calls(item).await };
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -462,8 +457,8 @@ impl McplsServer {
         }): Parameters<SignatureHelpParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_signature_help(file_path, line, character)
                 .await
         };
@@ -488,8 +483,8 @@ impl McplsServer {
         }): Parameters<GoToImplementationParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_implementation(file_path, line, character)
                 .await
         };
@@ -514,8 +509,8 @@ impl McplsServer {
         }): Parameters<GoToTypeDefinitionParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_type_definition(file_path, line, character)
                 .await
         };
@@ -542,8 +537,8 @@ impl McplsServer {
         }): Parameters<InlayHintsParams>,
     ) -> Result<String, McpError> {
         let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
+            self.context
+                .translator
                 .handle_inlay_hints(
                     file_path,
                     start_line,
@@ -571,33 +566,30 @@ impl ServerHandler for McplsServer {
     ) -> Result<ListResourcesResult, McpError> {
         // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
         // very large single-page responses that may exceed transport buffers).
-        let resources: Vec<_> = {
-            let translator = self.context.translator.lock().await;
-            translator
-                .document_tracker()
-                .open_paths()
-                .filter_map(|path| {
-                    let uri = make_uri(path)
-                        .inspect_err(|e| {
-                            tracing::warn!(
-                                "Skipping path in list_resources (make_uri failed): {}: {e}",
-                                path.display()
-                            );
-                        })
-                        .ok()?;
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    Some(
-                        Resource::new(uri, name)
-                            .with_mime_type("application/json")
-                            .with_description("LSP diagnostics for this file"),
-                    )
-                })
-                .collect()
-        };
+        let open_paths = self.context.translator.open_document_paths().await;
+        let resources: Vec<_> = open_paths
+            .iter()
+            .filter_map(|path| {
+                let uri = make_uri(path)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            "Skipping path in list_resources (make_uri failed): {}: {e}",
+                            path.display()
+                        );
+                    })
+                    .ok()?;
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                Some(
+                    Resource::new(uri, name)
+                        .with_mime_type("application/json")
+                        .with_description("LSP diagnostics for this file"),
+                )
+            })
+            .collect();
 
         Ok(ListResourcesResult::with_all_items(resources))
     }
@@ -612,8 +604,7 @@ impl ServerHandler for McplsServer {
 
         // Enforce workspace-root containment — mirrors the guard in every LSP tool.
         // Validated against a lock-free snapshot of workspace_roots (fixed at
-        // startup) so this cache-only read never waits on the translator lock,
-        // which may be held elsewhere across a slow in-flight LSP round-trip.
+        // startup) so this cache-only read never needs to touch `translator` at all.
         let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
@@ -653,7 +644,7 @@ impl ServerHandler for McplsServer {
 
         // Enforce workspace-root containment (same invariant as every LSP tool).
         // Validated against a lock-free snapshot of workspace_roots so subscribing
-        // never waits on the translator lock (see `read_resource`).
+        // never needs to touch `translator` at all (see `read_resource`).
         let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
@@ -753,7 +744,7 @@ mod tests {
     use super::*;
 
     fn create_test_server() -> McplsServer {
-        let translator = Arc::new(Mutex::new(Translator::new()));
+        let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subscriptions = Arc::new(ResourceSubscriptions::new());
@@ -1274,10 +1265,12 @@ mod tests {
     #[tokio::test]
     async fn test_list_resources_returns_empty_when_no_open_documents() {
         let server = create_test_server();
-        let empty = {
-            let translator = server.context.translator.lock().await;
-            translator.document_tracker().open_paths().count() == 0
-        };
+        let empty = server
+            .context
+            .translator
+            .open_document_paths()
+            .await
+            .is_empty();
         assert!(empty);
     }
 
@@ -1351,11 +1344,8 @@ mod tests {
     async fn test_validate_path_rejects_nonexistent_path() {
         use std::path::Path;
 
-        let translator = Arc::new(Mutex::new(Translator::new()));
-        let result = {
-            let t = translator.lock().await;
-            t.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"))
-        };
+        let translator = Translator::new();
+        let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
         assert!(result.is_err());
     }
 

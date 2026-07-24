@@ -13,34 +13,39 @@ use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
 
 /// Shared context for all tool handlers.
 ///
-/// Holds the translator and subscription state. The MCP peer handle is not
-/// stored here because resource-update notifications are sent by the pump
-/// tasks in `lib.rs`, which own their own `Arc<OnceCell<Peer<RoleServer>>>`.
-pub struct HandlerContext {
+/// Holds the translator and subscription state. `Translator` uses interior
+/// mutability (each field locks independently, only for the short section
+/// that touches it) so it is shared as a plain `Arc` with no outer lock —
+/// this is what lets concurrent tool calls run their LSP round trips without
+/// serializing behind a single mutex.
+///
+/// The MCP peer handle is not stored here because resource-update
+/// notifications are sent by the pump tasks in `lib.rs`, which own their own
+/// `Arc<OnceCell<Peer<RoleServer>>>`.
+pub struct BridgeContext {
     /// Translator for converting MCP calls to LSP requests.
-    pub translator: Arc<Mutex<Translator>>,
+    pub translator: Arc<Translator>,
     /// Cache of pushed LSP notifications (diagnostics, logs, messages).
     ///
-    /// Locked independently of `translator` so the `diagnostics_pump` task
-    /// never contends with a tool call holding the translator lock across an
-    /// in-flight LSP round-trip.
+    /// Locked independently of `translator`, which itself holds no outer
+    /// lock, so the `diagnostics_pump` task never contends with a tool call
+    /// running an in-flight LSP round-trip.
     pub notification_cache: Arc<Mutex<NotificationCache>>,
     /// Workspace roots, fixed at startup and immutable thereafter.
     ///
     /// Shared as a lock-free snapshot so cache-only handlers (e.g.
     /// `get_cached_diagnostics`, `read_resource`) can validate a path without
-    /// locking `translator`, which may be held elsewhere across a slow
-    /// in-flight LSP round-trip.
+    /// locking anything.
     pub workspace_roots: Arc<[PathBuf]>,
     /// Set of resource URIs the MCP client has subscribed to.
     pub subscriptions: Arc<ResourceSubscriptions>,
 }
 
-impl HandlerContext {
-    /// Create a new handler context.
+impl BridgeContext {
+    /// Create a new bridge context.
     #[must_use]
     pub const fn new(
-        translator: Arc<Mutex<Translator>>,
+        translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
@@ -60,12 +65,12 @@ mod tests {
     use crate::bridge::Translator;
 
     #[test]
-    fn test_handler_context_creation() {
-        let translator = Arc::new(Mutex::new(Translator::new()));
+    fn test_bridge_context_creation() {
+        let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let context = HandlerContext::new(
+        let context = BridgeContext::new(
             translator,
             notification_cache,
             workspace_roots,

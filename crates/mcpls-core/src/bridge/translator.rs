@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
@@ -16,6 +17,7 @@ use lsp_types::{
     WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Duration;
 
 use super::state::{ResourceLimits, detect_language, path_to_uri};
@@ -24,23 +26,52 @@ use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer};
 
+/// Lock a `std::sync::Mutex`, recovering the guard if a previous holder
+/// panicked while holding it.
+///
+/// Every lock guarded this way protects a short, synchronous, panic-free
+/// critical section (a `HashMap`/`HashSet` lookup or insert), so poisoning
+/// can only happen if an unrelated bug already panicked; refusing to unwind
+/// the whole process a second time over stale poisoning is preferable to
+/// deadlocking future calls.
+fn lock_std<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Translator handles MCP tool calls by converting them to LSP requests.
+///
+/// All fields use interior mutability so `Translator` can be shared via a
+/// plain `Arc<Translator>` with no outer lock: every LSP tool call would
+/// otherwise serialize behind a single mutex for its entire round trip
+/// (including the LSP request timeout), which is the root cause fixed here.
+/// Each field is locked independently and only for the short, synchronous
+/// section that touches it. In particular, the actual LSP request/response
+/// round trip (`client.request(...)`) always runs with no lock held.
+///
+/// The `document_tracker` lock is the one exception worth calling out: it is
+/// still a single lock shared across all languages and paths, and
+/// `prepare_document`'s call into `ensure_open` holds it across that
+/// document's disk I/O and `textDocument/didOpen` notify — see the
+/// `TODO(critic-S2)` there for why that is bounded and out of scope here.
 #[derive(Debug)]
 pub struct Translator {
-    /// LSP clients indexed by language ID.
-    lsp_clients: HashMap<String, LspClient>,
+    /// LSP clients indexed by language ID. Locked only for the map
+    /// lookup/insert itself, never across an LSP request.
+    lsp_clients: Arc<StdMutex<HashMap<String, LspClient>>>,
     /// LSP servers indexed by language ID (held for lifetime management).
-    lsp_servers: HashMap<String, LspServer>,
-    /// Document state tracker.
-    document_tracker: DocumentTracker,
-    /// Allowed workspace roots for path validation.
-    workspace_roots: Vec<PathBuf>,
-    /// Custom file extension to language ID mappings.
-    extension_map: HashMap<String, String>,
+    lsp_servers: Arc<StdMutex<HashMap<String, LspServer>>>,
+    /// Document state tracker. Locked only for `ensure_open`.
+    document_tracker: Arc<AsyncMutex<DocumentTracker>>,
+    /// Allowed workspace roots for path validation. Read-only after `serve()`
+    /// setup, so no lock is needed.
+    workspace_roots: Arc<Vec<PathBuf>>,
+    /// Custom file extension to language ID mappings. Read-only after
+    /// `serve()` setup, so no lock is needed.
+    extension_map: Arc<HashMap<String, String>>,
     /// Languages that are configured + applicable but whose LSP server may not
     /// have finished initializing yet (background init). Used to return a clear
     /// "still initializing" error instead of "no server configured".
-    expected_languages: HashSet<String>,
+    expected_languages: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl Translator {
@@ -48,62 +79,84 @@ impl Translator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            lsp_clients: HashMap::new(),
-            lsp_servers: HashMap::new(),
-            document_tracker: DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
-            workspace_roots: vec![],
-            extension_map: HashMap::new(),
-            expected_languages: HashSet::new(),
+            lsp_clients: Arc::new(StdMutex::new(HashMap::new())),
+            lsp_servers: Arc::new(StdMutex::new(HashMap::new())),
+            document_tracker: Arc::new(AsyncMutex::new(DocumentTracker::new(
+                ResourceLimits::default(),
+                HashMap::new(),
+            ))),
+            workspace_roots: Arc::new(Vec::new()),
+            extension_map: Arc::new(HashMap::new()),
+            expected_languages: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
     /// Set the workspace roots for path validation.
+    ///
+    /// Only called during single-owner setup, before the translator is
+    /// shared, so this replaces the `Arc` wholesale rather than locking.
     pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
-        self.workspace_roots = roots;
+        self.workspace_roots = Arc::new(roots);
     }
 
     /// Mark the set of languages whose LSP servers are expected (configured +
     /// applicable) but may still be initializing in the background.
-    pub fn set_expected_languages(&mut self, languages: HashSet<String>) {
-        self.expected_languages = languages;
+    pub fn set_expected_languages(&self, languages: HashSet<String>) {
+        *lock_std(&self.expected_languages) = languages;
     }
 
     /// Clear the expected-languages set (e.g. after background init failed).
-    pub fn clear_expected_languages(&mut self) {
-        self.expected_languages.clear();
+    pub fn clear_expected_languages(&self) {
+        lock_std(&self.expected_languages).clear();
     }
 
     /// Configure custom file extension mappings.
     ///
     /// This method sets the extension map and updates the document tracker
     /// to use the same mappings for language detection.
+    ///
+    /// Only called during single-owner setup, before the translator is
+    /// shared, so this replaces the `Arc`-wrapped fields wholesale.
     #[must_use]
     pub fn with_extensions(mut self, extension_map: HashMap<String, String>) -> Self {
-        self.document_tracker =
-            DocumentTracker::new(ResourceLimits::default(), extension_map.clone());
-        self.extension_map = extension_map;
+        self.document_tracker = Arc::new(AsyncMutex::new(DocumentTracker::new(
+            ResourceLimits::default(),
+            extension_map.clone(),
+        )));
+        self.extension_map = Arc::new(extension_map);
         self
     }
 
     /// Register an LSP client for a language.
-    pub fn register_client(&mut self, language_id: String, client: LspClient) {
-        self.lsp_clients.insert(language_id, client);
+    // TODO(critic-M1): currently only called once from `register_servers`
+    // during background init, so this can't race a restart. If server
+    // restart/supervision is ever added, the corresponding language's
+    // `document_tracker` state must also be reset here — otherwise
+    // `ensure_open` believes documents are already open on the new process
+    // and sends `didChange` instead of `didOpen`, desyncing the server.
+    pub fn register_client(&self, language_id: String, client: LspClient) {
+        lock_std(&self.lsp_clients).insert(language_id, client);
     }
 
     /// Register an LSP server for a language.
-    pub fn register_server(&mut self, language_id: String, server: LspServer) {
-        self.lsp_servers.insert(language_id, server);
+    pub fn register_server(&self, language_id: String, server: LspServer) {
+        lock_std(&self.lsp_servers).insert(language_id, server);
     }
 
-    /// Get the document tracker.
+    /// Snapshot of currently open document paths, used for MCP resource listing.
+    pub async fn open_document_paths(&self) -> Vec<PathBuf> {
+        self.document_tracker
+            .lock()
+            .await
+            .open_paths()
+            .map(Path::to_path_buf)
+            .collect()
+    }
+
+    /// Whether a document is currently tracked as open.
     #[must_use]
-    pub const fn document_tracker(&self) -> &DocumentTracker {
-        &self.document_tracker
-    }
-
-    /// Get a mutable reference to the document tracker.
-    pub const fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
-        &mut self.document_tracker
+    pub async fn is_document_open(&self, path: &Path) -> bool {
+        self.document_tracker.lock().await.is_open(path)
     }
 
     // TODO: These methods will be implemented in Phase 3-5
@@ -570,25 +623,32 @@ impl Translator {
     }
 
     /// Get a cloned LSP client for a file path based on language detection.
+    ///
+    /// Locks `lsp_clients` (and, on the not-found path, `expected_languages`)
+    /// only for the map lookup itself — both guards are dropped before this
+    /// method returns.
     fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
         let language_id = detect_language(path, &self.extension_map);
-        if let Some(client) = self.lsp_clients.get(&language_id) {
-            return Ok(client.clone());
-        }
-
         let server_language_id = Self::server_language_id_for_document(&language_id);
-        if let Some(server_language_id) = server_language_id
-            && let Some(client) = self.lsp_clients.get(server_language_id)
-        {
-            return Ok(client.clone());
+
+        let found = {
+            let clients = lock_std(&self.lsp_clients);
+            clients
+                .get(&language_id)
+                .or_else(|| server_language_id.and_then(|id| clients.get(id)))
+                .cloned()
+        };
+        if let Some(client) = found {
+            return Ok(client);
         }
 
         // A configured+applicable language whose server has not registered
         // yet is still initializing (e.g. a large Unity solution loading via
         // OmniSharp); tell the caller to wait and retry rather than implying
         // no server is configured at all.
-        if self.expected_languages.contains(&language_id)
-            || server_language_id.is_some_and(|id| self.expected_languages.contains(id))
+        let expected = lock_std(&self.expected_languages);
+        if expected.contains(&language_id)
+            || server_language_id.is_some_and(|id| expected.contains(id))
         {
             Err(Error::ServerInitializing(language_id))
         } else {
@@ -602,6 +662,39 @@ impl Translator {
             "typescriptreact" => Some("typescript"),
             _ => None,
         }
+    }
+
+    /// Resolve the LSP client and ensure the document is open.
+    ///
+    /// This is the "prepare" phase shared by every LSP-round-trip handler:
+    /// it validates the path, selects the client, and locks the document
+    /// tracker only for `ensure_open`. The returned client and URI are owned
+    /// values, so the caller can issue the actual LSP request (the "execute"
+    /// phase) without holding any lock across the network round trip — that
+    /// is the lock this function's callers care about, and it is always
+    /// released before this function returns.
+    ///
+    /// The `document_tracker` lock itself, however, is held across
+    /// `ensure_open`'s own awaits (a `stat`, optionally a re-read of the
+    /// file, and the `textDocument/didOpen` notify), and that lock is
+    /// shared by every language and every path. In the common case this is
+    /// bounded by the 250ms disk-check debounce, but it is not per-path.
+    // TODO(critic-S2): scope this lock per path (e.g. a keyed mutex) so a
+    // wedged language server's `notify(...)` — a bounded-channel send with
+    // no timeout — can't stall `ensure_open` for unrelated files/languages.
+    // Preserve the anti-duplicate-`didOpen` invariant documented on
+    // `ensure_open` if this changes.
+    async fn prepare_document(&self, file_path: &str) -> Result<(LspClient, lsp_types::Uri)> {
+        let path = PathBuf::from(file_path);
+        let validated_path = self.validate_path(&path)?;
+        let client = self.get_client_for_file(&validated_path)?;
+        let uri = self
+            .document_tracker
+            .lock()
+            .await
+            .ensure_open(&validated_path, &client)
+            .await?;
+        Ok((client, uri))
     }
 
     /// Parse and validate a file URI, returning the validated path.
@@ -648,18 +741,12 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_hover(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<HoverResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspHoverParams {
@@ -696,18 +783,12 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<DefinitionResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = GotoDefinitionParams {
@@ -756,19 +837,13 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_references(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = ReferenceParams {
@@ -808,14 +883,8 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
-    pub async fn handle_diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+    pub async fn handle_diagnostics(&self, file_path: String) -> Result<DiagnosticsResult> {
+        let (client, uri) = self.prepare_document(&file_path).await?;
 
         let params = diagnostic_request_params(TextDocumentIdentifier { uri });
 
@@ -866,19 +935,13 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_rename(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
         new_name: String,
     ) -> Result<RenameResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspRenameParams {
@@ -962,19 +1025,13 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_completions(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
         trigger: Option<String>,
     ) -> Result<CompletionsResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
@@ -1027,16 +1084,10 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_document_symbols(
-        &mut self,
+        &self,
         file_path: String,
     ) -> Result<DocumentSymbolsResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
 
         let params = DocumentSymbolParams {
             text_document: TextDocumentIdentifier { uri },
@@ -1075,18 +1126,12 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_format_document(
-        &mut self,
+        &self,
         file_path: String,
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
 
         let params = DocumentFormattingParams {
             text_document: TextDocumentIdentifier { uri },
@@ -1124,7 +1169,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or no server is configured.
     pub async fn handle_workspace_symbol(
-        &mut self,
+        &self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
@@ -1181,8 +1226,9 @@ impl Translator {
         // Workspace search requires at least one LSP client. If none are
         // registered yet but a configured server is still initializing, tell the
         // caller to wait and retry rather than implying nothing is configured.
-        let client = self.lsp_clients.values().next().cloned().ok_or_else(|| {
-            self.expected_languages
+        let found_client = lock_std(&self.lsp_clients).values().next().cloned();
+        let client = found_client.ok_or_else(|| {
+            lock_std(&self.expected_languages)
                 .iter()
                 .next()
                 .map_or(Error::NoServerConfigured, |lang| {
@@ -1232,7 +1278,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_code_actions(
-        &mut self,
+        &self,
         file_path: String,
         start_line: u32,
         start_character: u32,
@@ -1248,13 +1294,7 @@ impl Translator {
             kind_filter.as_deref(),
         )?;
 
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
 
         let range = lsp_types::Range {
             start: mcp_to_lsp_position(start_line, start_character),
@@ -1320,7 +1360,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_call_hierarchy_prepare(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -1338,13 +1378,7 @@ impl Translator {
             )));
         }
 
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspCallHierarchyPrepareParams {
@@ -1380,7 +1414,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the item is invalid.
     pub async fn handle_incoming_calls(
-        &mut self,
+        &self,
         item: serde_json::Value,
     ) -> Result<IncomingCallsResult> {
         // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
@@ -1429,7 +1463,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the item is invalid.
     pub async fn handle_outgoing_calls(
-        &mut self,
+        &self,
         item: serde_json::Value,
     ) -> Result<OutgoingCallsResult> {
         // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
@@ -1599,18 +1633,12 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_signature_help(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<SignatureHelpResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspSignatureHelpParams {
@@ -1672,18 +1700,12 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_implementation(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = GotoDefinitionParams {
@@ -1714,18 +1736,12 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_type_definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = GotoDefinitionParams {
@@ -1756,7 +1772,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_inlay_hints(
-        &mut self,
+        &self,
         file_path: String,
         start_line: u32,
         start_character: u32,
@@ -1765,13 +1781,7 @@ impl Translator {
     ) -> Result<InlayHintsResult> {
         use crate::bridge::encoding::lsp_to_mcp_position;
 
-        let path = PathBuf::from(&file_path);
-        let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
-        let uri = self
-            .document_tracker
-            .ensure_open(&validated_path, &client)
-            .await?;
+        let (client, uri) = self.prepare_document(&file_path).await?;
 
         let lsp_start = mcp_to_lsp_position(start_line, start_character);
         let lsp_end = mcp_to_lsp_position(end_line, end_character);
@@ -2107,7 +2117,7 @@ fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::fs;
 
@@ -2120,8 +2130,8 @@ mod tests {
     fn test_translator_new() {
         let translator = Translator::new();
         assert_eq!(translator.workspace_roots.len(), 0);
-        assert_eq!(translator.lsp_clients.len(), 0);
-        assert_eq!(translator.lsp_servers.len(), 0);
+        assert_eq!(lock_std(&translator.lsp_clients).len(), 0);
+        assert_eq!(lock_std(&translator.lsp_servers).len(), 0);
     }
 
     #[test]
@@ -2129,7 +2139,7 @@ mod tests {
         let mut translator = Translator::new();
         let roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
         translator.set_workspace_roots(roots.clone());
-        assert_eq!(translator.workspace_roots, roots);
+        assert_eq!(*translator.workspace_roots, roots);
     }
 
     #[test]
@@ -2137,7 +2147,7 @@ mod tests {
         let translator = Translator::new();
 
         // Initial state: no servers registered
-        assert_eq!(translator.lsp_servers.len(), 0);
+        assert_eq!(lock_std(&translator.lsp_servers).len(), 0);
 
         // The register_server method exists and is callable
         // Full integration testing with real LspServer is done in integration tests
@@ -2154,7 +2164,7 @@ mod tests {
         // A configured/applicable language whose LSP client has not registered
         // yet (large solution still loading via OmniSharp) must surface
         // ServerInitializing — "wait and retry" — not NoServerForLanguage.
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
         let lang = detect_language(&path, &translator.extension_map);
 
@@ -2183,7 +2193,7 @@ mod tests {
         // After initialization fails the expected set is cleared; subsequent
         // lookups must fall back to NoServerForLanguage rather than keep
         // implying the server is still on its way.
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
         let lang = detect_language(&path, &translator.extension_map);
 
@@ -2302,7 +2312,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_workspace_symbol_no_server() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
@@ -2311,7 +2321,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_code_actions_invalid_kind() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_code_actions(
                 "/tmp/test.rs".to_string(),
@@ -2329,7 +2339,7 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_quickfix() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2353,7 +2363,7 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_refactor() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2376,7 +2386,7 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_refactor_extract() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2399,7 +2409,7 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_source() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2420,7 +2430,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_code_actions_invalid_range_zero() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_code_actions("/tmp/test.rs".to_string(), 0, 1, 1, 10, None)
             .await;
@@ -2429,7 +2439,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_code_actions_invalid_range_order() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_code_actions("/tmp/test.rs".to_string(), 10, 5, 5, 1, None)
             .await;
@@ -2440,7 +2450,7 @@ mod tests {
     async fn test_handle_code_actions_empty_range() {
         use tempfile::TempDir;
 
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2672,7 +2682,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_call_hierarchy_prepare_invalid_position_zero() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 0, 1)
             .await;
@@ -2686,7 +2696,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_call_hierarchy_prepare_invalid_position_too_large() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let result = translator
             .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1_000_001, 1)
             .await;
@@ -2700,7 +2710,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_incoming_calls_invalid_json() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator.handle_incoming_calls(invalid_item).await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
@@ -2708,7 +2718,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_outgoing_calls_invalid_json() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator.handle_outgoing_calls(invalid_item).await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
@@ -3290,7 +3300,7 @@ mod tests {
         let mut extension_map = HashMap::new();
         extension_map.insert("tsx".to_string(), "typescriptreact".to_string());
 
-        let mut translator = Translator::new().with_extensions(extension_map);
+        let translator = Translator::new().with_extensions(extension_map);
         translator.register_client(
             "typescript".to_string(),
             LspClient::new(crate::config::LspServerConfig::typescript()),
@@ -3320,7 +3330,7 @@ mod tests {
             heuristics: None,
         };
 
-        let mut translator = Translator::new().with_extensions(extension_map);
+        let translator = Translator::new().with_extensions(extension_map);
         translator.register_client(
             "typescript".to_string(),
             LspClient::new(crate::config::LspServerConfig::typescript()),
@@ -3353,7 +3363,7 @@ mod tests {
             timeout_seconds: 30,
             heuristics: None,
         };
-        let mut translator = Translator::new().with_extensions(extension_map);
+        let translator = Translator::new().with_extensions(extension_map);
         translator.register_client("javascript".to_string(), LspClient::new(javascript_config));
 
         let client = translator.get_client_for_file(&test_file).unwrap();
@@ -3434,5 +3444,239 @@ mod tests {
         // SymbolKind::FUNCTION is LSP integer 12
         assert_eq!(result.kind, 12u32);
         assert_eq!(result.name, "my_fn");
+    }
+
+    // ------------------------------------------------------------------
+    // Lock-latency regression tests (#108, #159)
+    // ------------------------------------------------------------------
+    //
+    // These use two `cat` child processes as a fake LSP transport, the same
+    // technique as `bridge::state::tests::fake_lsp_client` (duplicated here
+    // since that helper is private to its own test module): `cat` on the
+    // "write" half echoes back whatever mcpls sends it, letting a test read
+    // outbound requests/notifications off `write_stdout`; `cat` on the "read"
+    // half relays whatever a test writes to `read_half_stdin` back to the
+    // client as if it came from a real server, letting a test fabricate
+    // responses with controlled timing.
+
+    use std::process::Stdio;
+
+    use serde_json::Value as JsonValue;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+    use tokio::time::timeout;
+
+    use crate::config::LspServerConfig;
+    use crate::lsp::LspTransport;
+
+    struct FakeServer {
+        _write_half: Child,
+        _read_half: Child,
+        read_half_stdin: ChildStdin,
+        write_stdout: ChildStdout,
+    }
+
+    fn fake_lsp_client() -> (LspClient, FakeServer) {
+        let mut write_half = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let write_stdin = write_half.stdin.take().unwrap();
+        let write_stdout = write_half.stdout.take().unwrap();
+
+        let mut read_half = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let read_stdout = read_half.stdout.take().unwrap();
+        let read_stdin = read_half.stdin.take().unwrap();
+
+        let transport = LspTransport::new(write_stdin, read_stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+        (
+            client,
+            FakeServer {
+                _write_half: write_half,
+                _read_half: read_half,
+                read_half_stdin: read_stdin,
+                write_stdout,
+            },
+        )
+    }
+
+    /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
+    ///
+    /// `reader` must be reused across calls, not recreated per message: a
+    /// fresh `BufReader` would silently drop any bytes of a later message it
+    /// over-read into its internal buffer while parsing an earlier one.
+    async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> JsonValue {
+        let mut content_length = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some((key, value)) = line.trim_end().split_once(':')
+                && key.trim().eq_ignore_ascii_case("content-length")
+            {
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut buf = vec![0u8; content_length.unwrap()];
+        reader.read_exact(&mut buf).await.unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    /// Writes a framed JSON-RPC success response, as a real LSP server would.
+    async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: JsonValue) {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        });
+        let content = serde_json::to_string(&message).unwrap();
+        let header = format!("Content-Length: {}\r\n\r\n", content.len());
+        stdin.write_all(header.as_bytes()).await.unwrap();
+        stdin.write_all(content.as_bytes()).await.unwrap();
+        stdin.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_handlers_on_different_files_do_not_serialize() {
+        // Before the fix, Translator was shared as Arc<Mutex<Translator>>, so
+        // handling one LSP request held that lock across the `.await` on the
+        // response -- blocking every other tool call, even for a completely
+        // different file and language server, until the first request
+        // completed or timed out (up to 30s). With interior mutability, a
+        // concurrent call for a different file must complete without waiting
+        // on an unrelated in-flight request.
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("aa".to_string(), "lang_a".to_string());
+        extensions.insert("bb".to_string(), "lang_b".to_string());
+
+        let mut translator = Translator::new().with_extensions(extensions);
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client_a, mut server_a) = fake_lsp_client();
+        let (client_b, mut server_b) = fake_lsp_client();
+        translator.register_client("lang_a".to_string(), client_a);
+        translator.register_client("lang_b".to_string(), client_b);
+
+        let path_a = dir.path().join("file.aa");
+        let path_b = dir.path().join("file.bb");
+        fs::write(&path_a, "content a").unwrap();
+        fs::write(&path_b, "content b").unwrap();
+
+        let translator = Arc::new(translator);
+
+        // `server_a` is never given a response, simulating a slow server. If
+        // any translator-held lock still spanned the LSP round trip, this
+        // task blocking forever would also block the "fast" call below.
+        let slow = {
+            let translator = Arc::clone(&translator);
+            let path = path_a.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_hover(path, 1, 1).await })
+        };
+
+        // Wait for the slow task to actually reach its LSP request (i.e. the
+        // request bytes were written to the wire) before treating it as
+        // "in-flight", so the test doesn't race the spawned task's startup.
+        let mut wire_a = BufReader::new(&mut server_a.write_stdout);
+        let opened_a = read_framed_message(&mut wire_a).await;
+        assert_eq!(opened_a["method"], "textDocument/didOpen");
+        let hover_request_a = read_framed_message(&mut wire_a).await;
+        assert_eq!(hover_request_a["method"], "textDocument/hover");
+
+        // The fast path: a concurrent call for a different file/server.
+        let fast = {
+            let translator = Arc::clone(&translator);
+            let path = path_b.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_hover(path, 1, 1).await })
+        };
+
+        let mut wire_b = BufReader::new(&mut server_b.write_stdout);
+        let opened_b = read_framed_message(&mut wire_b).await;
+        assert_eq!(opened_b["method"], "textDocument/didOpen");
+        let hover_request_b = read_framed_message(&mut wire_b).await;
+        assert_eq!(hover_request_b["method"], "textDocument/hover");
+        write_response(
+            &mut server_b.read_half_stdin,
+            &hover_request_b["id"],
+            JsonValue::Null,
+        )
+        .await;
+
+        let fast_result = timeout(Duration::from_secs(2), fast)
+            .await
+            .expect("fast call must not be blocked by the slow in-flight request")
+            .unwrap();
+        assert!(fast_result.is_ok());
+
+        assert!(
+            !slow.is_finished(),
+            "slow call should still be waiting on its (never-sent) response"
+        );
+        slow.abort();
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_ensure_open_same_path_sends_single_did_open() {
+        // Regression test: `ensure_open` must run entirely under the
+        // document_tracker lock so concurrent handler calls for the SAME path
+        // can't both observe "not open yet" and both send didOpen.
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("aa".to_string(), "lang_a".to_string());
+
+        let mut translator = Translator::new().with_extensions(extensions);
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client, mut server) = fake_lsp_client();
+        translator.register_client("lang_a".to_string(), client);
+
+        let path = dir.path().join("file.aa");
+        fs::write(&path, "content").unwrap();
+
+        let concurrent_calls = 4;
+
+        let translator = Arc::new(translator);
+        let path_str = path.to_string_lossy().to_string();
+
+        let handles: Vec<_> = (0..concurrent_calls)
+            .map(|_| {
+                let translator = Arc::clone(&translator);
+                let path_str = path_str.clone();
+                tokio::spawn(async move { translator.handle_hover(path_str, 1, 1).await })
+            })
+            .collect();
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
+        for _ in 0..concurrent_calls {
+            let request = read_framed_message(&mut wire).await;
+            assert_eq!(
+                request["method"], "textDocument/hover",
+                "no second didOpen must appear ahead of the hover requests"
+            );
+            write_response(&mut server.read_half_stdin, &request["id"], JsonValue::Null).await;
+        }
+
+        for handle in handles {
+            let result = timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("handler call should not hang")
+                .unwrap();
+            assert!(result.is_ok());
+        }
     }
 }

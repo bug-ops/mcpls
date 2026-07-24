@@ -74,13 +74,14 @@ use transport::run_stdio;
 ///
 /// # Lock independence
 /// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock independent
-/// of `Arc<Mutex<Translator>>`. MCP tool calls that hold the translator lock
-/// across an in-flight LSP round-trip (e.g. `textDocument/diagnostic`) never
-/// block this pump, so a `publishDiagnostics` notification arriving mid-request
-/// is cached immediately instead of being silently dropped: the LSP transport
-/// forwards notifications via `mpsc::Sender::try_send`, which drops on a full
-/// channel rather than blocking, so a pump stalled on the translator lock
-/// previously lost notifications under sustained push traffic.
+/// of `translator` (itself lock-free — `Arc<Translator>`, with per-field interior
+/// mutability). MCP tool calls that hold a field lock across an in-flight LSP
+/// round-trip (e.g. `textDocument/diagnostic`) never block this pump, so a
+/// `publishDiagnostics` notification arriving mid-request is cached immediately
+/// instead of being silently dropped: the LSP transport forwards notifications
+/// via `mpsc::Sender::try_send`, which drops on a full channel rather than
+/// blocking, so a pump stalled on a lock previously lost notifications under
+/// sustained push traffic.
 pub(crate) async fn diagnostics_pump(
     _lang: String,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
@@ -154,7 +155,7 @@ pub(crate) async fn diagnostics_pump(
 /// before registration, and returns a map of language-id to receiver for the pump tasks.
 fn register_servers(
     mut result: lsp::ServerInitResult,
-    translator: &mut bridge::Translator,
+    translator: &bridge::Translator,
 ) -> std::collections::HashMap<String, tokio::sync::mpsc::Receiver<lsp::LspNotification>> {
     let mut receivers = std::collections::HashMap::new();
     for (lang, server) in &mut result.servers {
@@ -330,10 +331,10 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // validate a path without locking `translator` below.
     let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
 
-    let translator = Arc::new(Mutex::new(translator));
-    // Independent of `translator`: the pump only ever locks this, so it never
-    // contends with a request handler holding the translator lock across an
-    // in-flight LSP round-trip.
+    let translator = Arc::new(translator);
+    // Independent of `translator`, which itself holds no outer lock: the pump
+    // only ever locks this cache, so it never contends with a request handler
+    // running an in-flight LSP round-trip.
     let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
@@ -396,7 +397,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 /// calls fall back to a plain "no server configured" error instead.
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
-    translator: Arc<Mutex<Translator>>,
+    translator: Arc<Translator>,
     notification_cache: Arc<Mutex<NotificationCache>>,
     subscriptions: Arc<ResourceSubscriptions>,
     peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
@@ -414,7 +415,7 @@ fn spawn_lsp_servers_background(
                 error!("Server initialization failed: {}", failure);
             }
             // No server will register; stop reporting "still initializing".
-            translator.lock().await.clear_expected_languages();
+            translator.clear_expected_languages();
             return;
         }
 
@@ -430,16 +431,12 @@ fn spawn_lsp_servers_background(
         }
 
         let server_count = result.server_count();
-        let notification_receivers = {
-            let mut t = translator.lock().await;
-            let receivers = register_servers(result, &mut t);
-            // Background initialization has completed; stop reporting "still
-            // initializing" (especially for languages whose server failed to
-            // spawn on partial success, which would otherwise return
-            // ServerInitializing forever instead of NoServerForLanguage).
-            t.clear_expected_languages();
-            receivers
-        };
+        let notification_receivers = register_servers(result, &translator);
+        // Background initialization has completed; stop reporting "still
+        // initializing" (especially for languages whose server failed to
+        // spawn on partial success, which would otherwise return
+        // ServerInitializing forever instead of NoServerForLanguage).
+        translator.clear_expected_languages();
         info!("Proceeding with {} LSP server(s)", server_count);
 
         // Start diagnostics pump tasks now that servers are registered.
