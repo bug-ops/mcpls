@@ -387,10 +387,20 @@ impl McplsServer {
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let cache = self.context.notification_cache.lock().await;
-            Translator::handle_cached_diagnostics(&self.context.workspace_roots, &file_path, &cache)
-        };
+        let result =
+            match Translator::cached_diagnostics_uri(&self.context.workspace_roots, &file_path) {
+                Ok(uri) => {
+                    // Lock only long enough for the map lookup + clone: no
+                    // canonicalize() or Vec mapping while `notification_cache`
+                    // is held, since `diagnostics_pump` needs the same lock.
+                    let diag_info = {
+                        let cache = self.context.notification_cache.lock().await;
+                        cache.get_diagnostics(&uri).cloned()
+                    };
+                    Ok(Translator::diagnostics_from_cache_entry(diag_info.as_ref()))
+                }
+                Err(e) => Err(e),
+            };
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -604,10 +614,13 @@ impl ServerHandler for McplsServer {
         // Validated against a lock-free snapshot of workspace_roots (fixed at
         // startup) so this cache-only read never waits on the translator lock,
         // which may be held elsewhere across a slow in-flight LSP round-trip.
-        validate_path_against_roots(&path, &self.context.workspace_roots)
+        let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        let lsp_uri = crate::bridge::path_to_uri(&path);
+        // Build the URI from the canonicalized path (not the raw input path):
+        // it must match what `diagnostics_pump` stores from LSP notifications,
+        // which are always keyed by the canonical form.
+        let lsp_uri = crate::bridge::path_to_uri(&validated_path);
 
         // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
         // in the response shape. Currently both return `{"diagnostics":null}` which is
@@ -928,6 +941,74 @@ mod tests {
         assert!(parsed.get("diagnostics").is_some());
     }
 
+    /// `get_cached_diagnostics` end-to-end: a cache entry stored under the
+    /// canonical URI (as `diagnostics_pump` would store it) must be found when
+    /// requested via a textually non-canonical path -- proving `cached_diagnostics_uri`
+    /// still canonicalizes correctly after the lock-scope split, and that
+    /// `diagnostics_from_cache_entry` correctly maps a populated entry through
+    /// the actual tool call (not just the unit-level helpers directly).
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_finds_entry_via_noncanonical_path() {
+        use std::fs;
+
+        use tempfile::TempDir;
+        use url::Url;
+
+        let server = create_test_server();
+
+        let temp_dir = TempDir::new().unwrap();
+        let subdir = temp_dir.path().join("sub");
+        fs::create_dir(&subdir).unwrap();
+        let test_file = subdir.join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let canonical_path = test_file.canonicalize().unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: None,
+            message: "cached error".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+        {
+            let mut cache = server.context.notification_cache.lock().await;
+            cache.store_diagnostics(&uri, Some(1), vec![diagnostic]);
+        }
+
+        // Textually distinct from `test_file`, but canonicalizes to the same path.
+        let noncanonical = subdir.join("..").join("sub").join("test.rs");
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: noncanonical.to_str().unwrap().to_string(),
+        });
+
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].get("message").unwrap(), "cached error");
+    }
+
     #[tokio::test]
     async fn test_cached_diagnostics_tool_nonexistent_file() {
         let server = create_test_server();
@@ -1169,6 +1250,39 @@ mod tests {
     fn test_subscribe_rejects_https_scheme() {
         let result = parse_uri("https://evil.com/file.rs");
         assert!(result.is_err());
+    }
+
+    /// Regression test for `read_resource`'s canonical-path fix: a path with
+    /// non-canonical segments (`..`) must resolve, via `validate_path_against_roots`,
+    /// to the same URI as its canonical form -- matching what `diagnostics_pump`
+    /// stores from LSP notifications. Building `lsp_uri` from the raw path (the
+    /// pre-fix behavior) would produce a mismatched cache key and always miss.
+    #[test]
+    fn test_read_resource_canonical_path_matches_pump_cache_key() {
+        use std::fs;
+
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let subdir = temp_dir.path().join("sub");
+        fs::create_dir(&subdir).unwrap();
+        let test_file = subdir.join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        // Textually distinct from `test_file`, but canonicalizes to the same path.
+        let noncanonical = subdir.join("..").join("sub").join("test.rs");
+        assert_ne!(noncanonical, test_file);
+
+        let validated = validate_path_against_roots(&noncanonical, &[]).unwrap();
+        assert_eq!(validated, test_file.canonicalize().unwrap());
+
+        let uri_from_raw_path = crate::bridge::path_to_uri(&noncanonical);
+        let uri_from_validated_path = crate::bridge::path_to_uri(&validated);
+        assert_ne!(
+            uri_from_raw_path, uri_from_validated_path,
+            "raw and canonical paths must differ here, otherwise this test can't \
+             detect a regression back to keying off the raw path"
+        );
     }
 
     /// `validate_path` rejects a non-existent path (canonicalize fails).

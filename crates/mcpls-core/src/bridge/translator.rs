@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 
 use super::state::{ResourceLimits, detect_language, path_to_uri};
-use super::{DocumentTracker, NotificationCache};
+use super::{DiagnosticInfo, DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer};
@@ -1472,58 +1472,60 @@ impl Translator {
         Ok(OutgoingCallsResult { calls })
     }
 
-    /// Handle cached diagnostics request.
+    /// Resolve the LSP-side cache key (URI string) for a cached-diagnostics lookup.
     ///
-    /// Associated function rather than a method: it reads the caller-supplied
-    /// `workspace_roots` and `cache` instead of `self`, so callers that only
-    /// need a cached read (e.g. the `get_cached_diagnostics` MCP tool) never
-    /// need to lock `Arc<Mutex<Translator>>`, which may be held elsewhere
-    /// across a slow in-flight LSP round-trip.
+    /// Split out from the cache read itself so callers (e.g. the
+    /// `get_cached_diagnostics` MCP tool) can do the path `canonicalize()` and
+    /// workspace-boundary check *before* taking the `NotificationCache` lock —
+    /// that lock is also needed by `diagnostics_pump` to store incoming
+    /// notifications, so nothing that isn't a plain map lookup should run
+    /// while it's held.
     ///
     /// # Errors
     ///
     /// Returns an error if the path is invalid or outside workspace boundaries.
-    pub fn handle_cached_diagnostics(
-        workspace_roots: &[PathBuf],
-        file_path: &str,
-        cache: &NotificationCache,
-    ) -> Result<DiagnosticsResult> {
+    pub fn cached_diagnostics_uri(workspace_roots: &[PathBuf], file_path: &str) -> Result<String> {
         let path = PathBuf::from(file_path);
         let validated_path = validate_path_against_roots(&path, workspace_roots)?;
 
         // Use path_to_uri (strips \\?\ on Windows) so the key matches what
         // rust-analyzer stores in publishDiagnostics notifications.
-        let uri = path_to_uri(&validated_path).to_string();
+        Ok(path_to_uri(&validated_path).to_string())
+    }
 
-        let diagnostics = cache
-            .get_diagnostics(&uri)
-            .map_or_else(Vec::new, |diag_info| {
-                diag_info
-                    .diagnostics
-                    .iter()
-                    .map(|diag| Diagnostic {
-                        range: normalize_range(diag.range),
-                        severity: match diag.severity {
-                            Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                            Some(lsp_types::DiagnosticSeverity::WARNING) => {
-                                DiagnosticSeverity::Warning
-                            }
-                            Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
-                                DiagnosticSeverity::Information
-                            }
-                            Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
-                            _ => DiagnosticSeverity::Information,
-                        },
-                        message: diag.message.clone(),
-                        code: diag.code.as_ref().map(|c| match c {
-                            lsp_types::NumberOrString::Number(n) => n.to_string(),
-                            lsp_types::NumberOrString::String(s) => s.clone(),
-                        }),
-                    })
-                    .collect()
-            });
+    /// Convert a cached diagnostics entry into the MCP-facing result shape.
+    ///
+    /// Takes an already-cloned `Option<&DiagnosticInfo>` (out of the
+    /// `NotificationCache` lock) rather than the cache itself, so this
+    /// mapping — which is not a bounded operation for a large diagnostics set
+    /// — never runs while the cache is locked.
+    #[must_use]
+    pub fn diagnostics_from_cache_entry(diag_info: Option<&DiagnosticInfo>) -> DiagnosticsResult {
+        let diagnostics = diag_info.map_or_else(Vec::new, |diag_info| {
+            diag_info
+                .diagnostics
+                .iter()
+                .map(|diag| Diagnostic {
+                    range: normalize_range(diag.range),
+                    severity: match diag.severity {
+                        Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+                        Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+                        Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
+                            DiagnosticSeverity::Information
+                        }
+                        Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+                        _ => DiagnosticSeverity::Information,
+                    },
+                    message: diag.message.clone(),
+                    code: diag.code.as_ref().map(|c| match c {
+                        lsp_types::NumberOrString::Number(n) => n.to_string(),
+                        lsp_types::NumberOrString::String(s) => s.clone(),
+                    }),
+                })
+                .collect()
+        });
 
-        Ok(DiagnosticsResult { diagnostics })
+        DiagnosticsResult { diagnostics }
     }
 
     /// Handle server logs request.
@@ -2741,10 +2743,10 @@ mod tests {
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result =
-            Translator::handle_cached_diagnostics(&[], test_file.to_str().unwrap(), &cache);
-        assert!(result.is_ok());
-        let diags = result.unwrap();
+        let cache_key =
+            Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
+        let diag_info = cache.get_diagnostics(&cache_key).cloned();
+        let diags = Translator::diagnostics_from_cache_entry(diag_info.as_ref());
         assert_eq!(diags.diagnostics.len(), 0);
     }
 
@@ -2852,10 +2854,10 @@ mod tests {
 
         cache.store_diagnostics(&uri, Some(1), vec![diagnostic]);
 
-        let result =
-            Translator::handle_cached_diagnostics(&[], test_file.to_str().unwrap(), &cache);
-        assert!(result.is_ok());
-        let diags = result.unwrap();
+        let cache_key =
+            Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
+        let diag_info = cache.get_diagnostics(&cache_key).cloned();
+        let diags = Translator::diagnostics_from_cache_entry(diag_info.as_ref());
         assert_eq!(diags.diagnostics.len(), 1);
         assert_eq!(diags.diagnostics[0].message, "test error");
         assert_eq!(diags.diagnostics[0].code, Some("E001".to_string()));
@@ -2966,10 +2968,10 @@ mod tests {
 
         cache.store_diagnostics(&uri, Some(1), diagnostics);
 
-        let result =
-            Translator::handle_cached_diagnostics(&[], test_file.to_str().unwrap(), &cache);
-        assert!(result.is_ok());
-        let diags = result.unwrap();
+        let cache_key =
+            Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
+        let diag_info = cache.get_diagnostics(&cache_key).cloned();
+        let diags = Translator::diagnostics_from_cache_entry(diag_info.as_ref());
         assert_eq!(diags.diagnostics.len(), 4);
         assert!(matches!(
             diags.diagnostics[0].severity,
@@ -3025,19 +3027,17 @@ mod tests {
 
         cache.store_diagnostics(&uri, Some(1), vec![diagnostic]);
 
-        let result =
-            Translator::handle_cached_diagnostics(&[], test_file.to_str().unwrap(), &cache);
-        assert!(result.is_ok());
-        let diags = result.unwrap();
+        let cache_key =
+            Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
+        let diag_info = cache.get_diagnostics(&cache_key).cloned();
+        let diags = Translator::diagnostics_from_cache_entry(diag_info.as_ref());
         assert_eq!(diags.diagnostics.len(), 1);
         assert_eq!(diags.diagnostics[0].code, Some("42".to_string()));
     }
 
     #[test]
     fn test_handle_cached_diagnostics_invalid_path() {
-        let cache = NotificationCache::new();
-        let result =
-            Translator::handle_cached_diagnostics(&[], "/nonexistent/path/file.rs", &cache);
+        let result = Translator::cached_diagnostics_uri(&[], "/nonexistent/path/file.rs");
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }
 
@@ -3207,7 +3207,6 @@ mod tests {
 
     #[test]
     fn test_handle_cached_diagnostics_path_outside_workspace() {
-        let cache = NotificationCache::new();
         let temp_dir1 = TempDir::new().unwrap();
         let temp_dir2 = TempDir::new().unwrap();
 
@@ -3216,11 +3215,8 @@ mod tests {
         let test_file = temp_dir2.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result = Translator::handle_cached_diagnostics(
-            &workspace_roots,
-            test_file.to_str().unwrap(),
-            &cache,
-        );
+        let result =
+            Translator::cached_diagnostics_uri(&workspace_roots, test_file.to_str().unwrap());
         assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
     }
 
