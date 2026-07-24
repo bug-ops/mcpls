@@ -201,7 +201,7 @@ async fn test_hover_on_u64_type() {
         translator.lock().await.handle_hover(
             file_path.to_string_lossy().to_string(),
             19,
-            17, // Position on "u64"
+            13, // Position on "u64"
         ),
     )
     .await;
@@ -242,7 +242,7 @@ async fn test_definition_user_struct() {
         translator.lock().await.handle_definition(
             types_file.to_string_lossy().to_string(),
             9,
-            20, // Position on "User"
+            16, // Position on "User"
         ),
     )
     .await;
@@ -605,7 +605,7 @@ async fn test_completions_basic() {
         translator.lock().await.handle_completions(
             functions_file.to_string_lossy().to_string(),
             23,
-            10, // Position after "repo."
+            11, // Position after "repo."
             None,
         ),
     )
@@ -614,14 +614,17 @@ async fn test_completions_basic() {
     assert!(result.is_ok(), "Should not timeout");
     let completions_result = result.unwrap();
 
-    // Completions might not always be available depending on timing
-    if completions_result.is_ok() {
-        let completions_json = completions_result.unwrap();
+    // Completions might not always be available depending on timing, so only assert
+    // on content when the call actually succeeded.
+    if let Ok(completions_json) = completions_result {
         let completions_str = serde_json::to_string(&completions_json).unwrap();
-
-        // If we got completions, they should include Repository fields/methods
-        // This is a soft check since completion can be timing-sensitive
-        println!("Completions: {}", completions_str);
+        assert!(
+            completions_str.contains("get_owner")
+                || completions_str.contains("name")
+                || completions_str.contains("stars"),
+            "Completions should include Repository fields/methods, got: {}",
+            completions_str
+        );
     }
 }
 
