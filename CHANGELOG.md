@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`rmcp` 2.2.0** — Breaking change upstream: bump `rmcp` from 1.8.0 to 2.2.0 to align with the MCP 2025-11-25 spec. `rmcp::model::RawResource` and the `Annotated<RawResource>` wrapper were merged into a single flat `rmcp::model::Resource` struct; `McplsServer::list_resources` updated accordingly.
+
 ### Fixed
 
 - **RUSTSEC-2026-0204** — bump transitive `crossbeam-epoch` dependency (pulled in via `ignore`) from 0.9.18 to 0.9.20 to resolve an invalid pointer dereference in `fmt::Pointer` impls for `Atomic`/`Shared`

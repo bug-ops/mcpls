@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Implementation, ListResourcesResult, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+    Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource,
+    ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
     UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -569,10 +569,11 @@ impl ServerHandler for McplsServer {
                         .and_then(|n| n.to_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    let raw = RawResource::new(uri, name)
-                        .with_mime_type("application/json")
-                        .with_description("LSP diagnostics for this file");
-                    Some(rmcp::model::Annotated::new(raw, None))
+                    Some(
+                        Resource::new(uri, name)
+                            .with_mime_type("application/json")
+                            .with_description("LSP diagnostics for this file"),
+                    )
                 })
                 .collect()
         };
