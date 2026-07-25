@@ -17,6 +17,7 @@ use lsp_types::{
     WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 use super::state::{ResourceLimits, detect_language, path_to_uri};
@@ -217,7 +218,7 @@ fn diagnostic_request_params(text_document: TextDocumentIdentifier) -> Diagnosti
 }
 
 /// Position in a document (1-based for MCP).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position2D {
     /// Line number (1-based).
     pub line: u32,
@@ -226,7 +227,7 @@ pub struct Position2D {
 }
 
 /// Range in a document (1-based for MCP).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
     /// Start position.
     pub start: Position2D,
@@ -267,7 +268,7 @@ pub struct ReferencesResult {
 }
 
 /// Diagnostic severity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticSeverity {
     /// Error diagnostic.
@@ -281,7 +282,7 @@ pub enum DiagnosticSeverity {
 }
 
 /// A single diagnostic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     /// Range where the diagnostic applies.
     pub range: Range,
@@ -925,55 +926,76 @@ impl Translator {
 
     /// Handle diagnostics request.
     ///
+    /// Merges the LSP pull-model response (`textDocument/diagnostic`) with
+    /// whatever is already cached from `textDocument/publishDiagnostics` push
+    /// notifications for the same file, so this returns the same diagnostics
+    /// `get_cached_diagnostics` would for the file at the same point in time
+    /// (see #244 — rust-analyzer's pull endpoint omits flycheck/clippy-sourced
+    /// diagnostics, and empirically also some native ones, that are only ever
+    /// delivered via the push path). If the pull request itself fails (e.g. a
+    /// push-only server answering `-32601`, or a timeout), a non-empty cache
+    /// entry is returned as a cache-only result instead of propagating the
+    /// error, since the cache is not required to be fresher than the pull
+    /// response to be useful here.
+    ///
+    /// The cache is read only after the pull request settles (success or
+    /// failure) and held only for the lookup itself — never across the LSP
+    /// round-trip — matching the lock-ordering discipline documented on
+    /// `cached_diagnostics_uri`. Like `get_cached_diagnostics`, the cache is
+    /// treated as eventually consistent: a cached entry may reflect a
+    /// slightly older document version than the fresh pull result if an edit
+    /// landed inside the server's flycheck debounce window.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
-    pub async fn handle_diagnostics(&self, file_path: String) -> Result<DiagnosticsResult> {
+    /// Returns an error if the LSP pull request fails and the cache holds no
+    /// diagnostics for the file either, or if the file cannot be opened.
+    pub async fn handle_diagnostics(
+        &self,
+        file_path: String,
+        notification_cache: &Mutex<NotificationCache>,
+    ) -> Result<DiagnosticsResult> {
         let (client, uri) = self
             .prepare_document(&file_path, ToolKind::Diagnostics)
             .await?;
 
-        let params = diagnostic_request_params(TextDocumentIdentifier { uri });
+        let params = diagnostic_request_params(TextDocumentIdentifier { uri: uri.clone() });
 
         let timeout_duration = Duration::from_secs(30);
-        let response: lsp_types::DocumentDiagnosticReportResult = client
+        let pull_response: Result<lsp_types::DocumentDiagnosticReportResult> = client
             .request("textDocument/diagnostic", params, timeout_duration)
-            .await?;
+            .await;
 
-        let diagnostics = match response {
-            lsp_types::DocumentDiagnosticReportResult::Report(report) => match report {
-                lsp_types::DocumentDiagnosticReport::Full(full) => {
-                    full.full_document_diagnostic_report.items
-                }
-                lsp_types::DocumentDiagnosticReport::Unchanged(_) => vec![],
-            },
-            lsp_types::DocumentDiagnosticReportResult::Partial(_) => vec![],
+        let diag_info = {
+            let cache = notification_cache.lock().await;
+            cache.get_diagnostics(uri.as_str()).cloned()
         };
 
-        let result = DiagnosticsResult {
-            diagnostics: diagnostics
-                .into_iter()
-                .map(|diag| Diagnostic {
-                    range: normalize_range(diag.range),
-                    severity: match diag.severity {
-                        Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                        Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
-                        Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
-                            DiagnosticSeverity::Information
+        match pull_response {
+            Ok(response) => {
+                let items = match response {
+                    lsp_types::DocumentDiagnosticReportResult::Report(report) => match report {
+                        lsp_types::DocumentDiagnosticReport::Full(full) => {
+                            full.full_document_diagnostic_report.items
                         }
-                        Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
-                        _ => DiagnosticSeverity::Information,
+                        lsp_types::DocumentDiagnosticReport::Unchanged(_) => vec![],
                     },
-                    message: diag.message,
-                    code: diag.code.map(|c| match c {
-                        lsp_types::NumberOrString::Number(n) => n.to_string(),
-                        lsp_types::NumberOrString::String(s) => s,
-                    }),
-                })
-                .collect(),
-        };
-
-        Ok(result)
+                    lsp_types::DocumentDiagnosticReportResult::Partial(_) => vec![],
+                };
+                let pull = DiagnosticsResult {
+                    diagnostics: items.iter().map(diagnostic_to_mcp).collect(),
+                };
+                Ok(Self::merge_diagnostics(pull, diag_info.as_ref()))
+            }
+            Err(e) => {
+                let cache_only = Self::diagnostics_from_cache_entry(diag_info.as_ref());
+                if cache_only.diagnostics.is_empty() {
+                    Err(e)
+                } else {
+                    Ok(cache_only)
+                }
+            }
+        }
     }
 
     /// Handle rename request.
@@ -1605,27 +1627,89 @@ impl Translator {
             diag_info
                 .diagnostics
                 .iter()
-                .map(|diag| Diagnostic {
-                    range: normalize_range(diag.range),
-                    severity: match diag.severity {
-                        Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                        Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
-                        Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
-                            DiagnosticSeverity::Information
-                        }
-                        Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
-                        _ => DiagnosticSeverity::Information,
-                    },
-                    message: diag.message.clone(),
-                    code: diag.code.as_ref().map(|c| match c {
-                        lsp_types::NumberOrString::Number(n) => n.to_string(),
-                        lsp_types::NumberOrString::String(s) => s.clone(),
-                    }),
-                })
+                .map(diagnostic_to_mcp)
                 .collect()
         });
 
         DiagnosticsResult { diagnostics }
+    }
+
+    /// Merge push-model diagnostics from the notification cache into a
+    /// pull-model (`textDocument/diagnostic`) result.
+    ///
+    /// rust-analyzer's pull endpoint omits diagnostics that are only ever
+    /// delivered via `textDocument/publishDiagnostics` push notifications —
+    /// not just flycheck/clippy lints, but empirically (verified against a
+    /// live rust-analyzer 1.97.1 session, see #244) some native diagnostics
+    /// too. Those are cached separately in `NotificationCache`.
+    ///
+    /// Where the *same* logical problem is reported through both paths, the
+    /// two representations were observed to differ in both `range` and
+    /// rendered `message`. Captured example, a "not all trait items
+    /// implemented" (E0046) error for one `impl` block: pull reported range
+    /// `(96,7)-(96,12)` (the trait name) with message "not all trait items
+    /// implemented, missing: `fn hello`"; the push notification for the same
+    /// error reported range `(95,1)-(95,32)` (the impl block) with message
+    /// "not all trait items implemented, missing: `hello`\nmissing `hello`
+    /// in implementation" — same `code`/`severity`, adjacent but distinct
+    /// ranges, different message text. Exact field equality never dedups
+    /// cases like that.
+    ///
+    /// Given that, a cache entry is treated as a duplicate of a pull entry
+    /// when both carry a `code`, the `(severity, code)` pair matches, *and*
+    /// the two ranges are either overlapping or start within
+    /// `DUPLICATE_RANGE_PROXIMITY_LINES` lines of each other — close
+    /// enough to be the same underlying model divergence, not two distinct
+    /// occurrences of the same error class (e.g. two unrelated `E0308`
+    /// mismatches at different call sites in one file, one caught only
+    /// natively and one only by flycheck). Diagnostics with no `code` fall
+    /// back to full-field equality, since there is no cheaper stable
+    /// identity available for them.
+    ///
+    /// Output is sorted by `(start.line, start.character)` so merged
+    /// cache-only entries don't land out of document order after the
+    /// pull-model ones.
+    #[must_use]
+    pub fn merge_diagnostics(
+        mut pull: DiagnosticsResult,
+        diag_info: Option<&DiagnosticInfo>,
+    ) -> DiagnosticsResult {
+        /// Start-line distance within which same-code, same-severity
+        /// diagnostics from the two models are still considered the same
+        /// underlying problem. Derived from the captured E0046 case above
+        /// (1 line apart); wide enough to absorb span drift between
+        /// rust-analyzer's own spans and rustc's, narrow enough that two
+        /// genuinely distinct same-code errors elsewhere in a file are not
+        /// collapsed into one.
+        const DUPLICATE_RANGE_PROXIMITY_LINES: u32 = 3;
+
+        fn position_le(a: &Position2D, b: &Position2D) -> bool {
+            (a.line, a.character) <= (b.line, b.character)
+        }
+
+        fn ranges_close(a: &Range, b: &Range) -> bool {
+            let overlaps = position_le(&a.start, &b.end) && position_le(&b.start, &a.end);
+            overlaps || a.start.line.abs_diff(b.start.line) <= DUPLICATE_RANGE_PROXIMITY_LINES
+        }
+
+        fn is_duplicate(pull: &[Diagnostic], candidate: &Diagnostic) -> bool {
+            pull.iter().any(|p| match (&candidate.code, &p.code) {
+                (Some(c), Some(pc)) if c == pc && p.severity == candidate.severity => {
+                    ranges_close(&p.range, &candidate.range)
+                }
+                _ => p == candidate,
+            })
+        }
+
+        let cached = Self::diagnostics_from_cache_entry(diag_info).diagnostics;
+        let new_diagnostics: Vec<_> = cached
+            .into_iter()
+            .filter(|c| !is_duplicate(&pull.diagnostics, c))
+            .collect();
+        pull.diagnostics.extend(new_diagnostics);
+        pull.diagnostics
+            .sort_by_key(|d| (d.range.start.line, d.range.start.character));
+        pull
     }
 
     /// Handle server logs request.
@@ -2091,6 +2175,30 @@ const fn normalize_range(range: lsp_types::Range) -> Range {
             line: range.end.line + 1,
             character: range.end.character + 1,
         },
+    }
+}
+
+/// Convert an LSP diagnostic into the MCP-facing `Diagnostic` shape.
+///
+/// Shared by both the pull-model (`handle_diagnostics`) and cache-derived
+/// (`diagnostics_from_cache_entry`) diagnostic paths, so their output never
+/// diverges in formatting — `merge_diagnostics`'s dedup logic depends on
+/// both sides mapping severity/code identically.
+fn diagnostic_to_mcp(diag: &lsp_types::Diagnostic) -> Diagnostic {
+    Diagnostic {
+        range: normalize_range(diag.range),
+        severity: match diag.severity {
+            Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+            Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+            Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+            // INFORMATION and None (no severity reported) both fall here.
+            _ => DiagnosticSeverity::Information,
+        },
+        message: diag.message.clone(),
+        code: diag.code.as_ref().map(|c| match c {
+            lsp_types::NumberOrString::Number(n) => n.to_string(),
+            lsp_types::NumberOrString::String(s) => s.clone(),
+        }),
     }
 }
 
@@ -3138,6 +3246,299 @@ mod tests {
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }
 
+    /// Builds an LSP-side diagnostic for `merge_diagnostics` cache fixtures.
+    fn lsp_diag(
+        line: u32,
+        end_character: u32,
+        severity: lsp_types::DiagnosticSeverity,
+        message: &str,
+        code: Option<&str>,
+    ) -> lsp_types::Diagnostic {
+        lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position { line, character: 0 },
+                end: lsp_types::Position {
+                    line,
+                    character: end_character,
+                },
+            },
+            severity: Some(severity),
+            message: message.to_string(),
+            code: code.map(|c| lsp_types::NumberOrString::String(c.to_string())),
+            source: None,
+            code_description: None,
+            related_information: None,
+            tags: None,
+            data: None,
+        }
+    }
+
+    fn diag_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticInfo {
+        DiagnosticInfo {
+            uri: "file:///test.rs".parse().unwrap(),
+            version: Some(1),
+            diagnostics,
+        }
+    }
+
+    #[test]
+    fn test_merge_diagnostics_cache_only_appends_to_empty_pull() {
+        let pull = DiagnosticsResult {
+            diagnostics: vec![],
+        };
+        let cache = diag_info(vec![lsp_diag(
+            0,
+            10,
+            lsp_types::DiagnosticSeverity::WARNING,
+            "unused import: `std::fmt`",
+            None,
+        )]);
+
+        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+
+        assert_eq!(merged.diagnostics.len(), 1);
+        assert_eq!(merged.diagnostics[0].message, "unused import: `std::fmt`");
+        assert!(matches!(
+            merged.diagnostics[0].severity,
+            DiagnosticSeverity::Warning
+        ));
+    }
+
+    #[test]
+    fn test_merge_diagnostics_exact_duplicate_not_repeated() {
+        // Same range/severity/message/code as the cache entry below, expressed
+        // in the 1-based MCP shape `diagnostics_from_cache_entry` would produce.
+        let pull_diag = Diagnostic {
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 11,
+                },
+            },
+            severity: DiagnosticSeverity::Error,
+            message: "mismatched types".to_string(),
+            code: Some("E0308".to_string()),
+        };
+        let pull = DiagnosticsResult {
+            diagnostics: vec![pull_diag.clone()],
+        };
+        let cache = diag_info(vec![lsp_diag(
+            0,
+            10,
+            lsp_types::DiagnosticSeverity::ERROR,
+            "mismatched types",
+            Some("E0308"),
+        )]);
+
+        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+
+        assert_eq!(merged.diagnostics.len(), 1);
+        assert_eq!(merged.diagnostics[0], pull_diag);
+    }
+
+    #[test]
+    fn test_merge_diagnostics_no_cache_entry_returns_pull_unchanged() {
+        let pull_diag = Diagnostic {
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 5,
+                },
+            },
+            severity: DiagnosticSeverity::Error,
+            message: "syntax error".to_string(),
+            code: None,
+        };
+        let pull = DiagnosticsResult {
+            diagnostics: vec![pull_diag.clone()],
+        };
+
+        let merged = Translator::merge_diagnostics(pull, None);
+
+        assert_eq!(merged.diagnostics, vec![pull_diag]);
+    }
+
+    #[test]
+    fn test_merge_diagnostics_multiple_distinct_cache_entries_all_appear() {
+        let pull = DiagnosticsResult {
+            diagnostics: vec![],
+        };
+        let cache = diag_info(vec![
+            lsp_diag(
+                0,
+                10,
+                lsp_types::DiagnosticSeverity::WARNING,
+                "unused import: `std::fmt`",
+                None,
+            ),
+            lsp_diag(
+                5,
+                8,
+                lsp_types::DiagnosticSeverity::WARNING,
+                "function `helper` is never used",
+                None,
+            ),
+        ]);
+
+        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+
+        assert_eq!(merged.diagnostics.len(), 2);
+        assert!(
+            merged
+                .diagnostics
+                .iter()
+                .any(|d| d.message == "unused import: `std::fmt`")
+        );
+        assert!(
+            merged
+                .diagnostics
+                .iter()
+                .any(|d| d.message == "function `helper` is never used")
+        );
+    }
+
+    #[test]
+    fn test_merge_diagnostics_same_range_different_message_not_deduped() {
+        let pull_diag = Diagnostic {
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 11,
+                },
+            },
+            severity: DiagnosticSeverity::Error,
+            message: "mismatched types".to_string(),
+            code: None,
+        };
+        let pull = DiagnosticsResult {
+            diagnostics: vec![pull_diag],
+        };
+        // Same range and severity as the pull diagnostic, but a different
+        // message — must be treated as a distinct diagnostic, not a duplicate.
+        let cache = diag_info(vec![lsp_diag(
+            0,
+            10,
+            lsp_types::DiagnosticSeverity::ERROR,
+            "expected `i32`, found `&str`",
+            None,
+        )]);
+
+        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+
+        assert_eq!(merged.diagnostics.len(), 2);
+    }
+
+    /// Pins a cross-model duplicate shape verified empirically against a live
+    /// rust-analyzer 1.97.1 session (#244): the pull and push diagnostics for
+    /// the *same* "not all trait items implemented" (E0046) error had
+    /// different ranges (trait name vs. impl block) and different messages
+    /// (terse vs. rustc's full rendering), but shared `code` and `severity`.
+    /// Exact-field dedup would report this twice; the `(severity, code)`
+    /// fingerprint must collapse it to one entry.
+    #[test]
+    fn test_merge_diagnostics_same_code_different_range_and_message_deduped() {
+        let pull_diag = Diagnostic {
+            range: Range {
+                start: Position2D {
+                    line: 96,
+                    character: 7,
+                },
+                end: Position2D {
+                    line: 96,
+                    character: 12,
+                },
+            },
+            severity: DiagnosticSeverity::Error,
+            message: "not all trait items implemented, missing: `fn hello`".to_string(),
+            code: Some("E0046".to_string()),
+        };
+        let pull = DiagnosticsResult {
+            diagnostics: vec![pull_diag.clone()],
+        };
+        // Same code and severity, but a different range and a longer,
+        // differently-worded message -- the rustc-rendered push side of the
+        // same underlying error.
+        let cache = diag_info(vec![lsp_diag(
+            94,
+            31,
+            lsp_types::DiagnosticSeverity::ERROR,
+            "not all trait items implemented, missing: `hello`\nmissing `hello` in implementation",
+            Some("E0046"),
+        )]);
+
+        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+
+        assert_eq!(merged.diagnostics.len(), 1);
+        assert_eq!(merged.diagnostics[0], pull_diag);
+    }
+
+    /// Regression: `merge_diagnostics`'s `(severity, code)` fingerprint alone
+    /// is coarser than full-field equality and cannot tell apart two
+    /// genuinely distinct diagnostics that happen to share `code` and
+    /// `severity` -- e.g. two separate `E0308` mismatched-type errors at
+    /// different locations in the same file, one caught only by native
+    /// (pull) analysis and a second, unrelated one caught only by
+    /// flycheck/cargo check (cache), such as an error inside macro-expanded
+    /// code the native pass did not evaluate. This previously caused the
+    /// cache-only entry to be silently dropped -- reproducing #244's exact
+    /// failure mode, just relocated from "no merge" to "over-eager dedup".
+    ///
+    /// The range-proximity check on `is_duplicate` (see `merge_diagnostics`)
+    /// closes this: these two diagnostics are 45 lines apart, far outside
+    /// `DUPLICATE_RANGE_PROXIMITY_LINES`, so both must survive the merge.
+    #[test]
+    fn test_merge_diagnostics_same_code_distinct_diagnostics_at_different_locations_both_kept() {
+        let pull_diag = Diagnostic {
+            range: Range {
+                start: Position2D {
+                    line: 5,
+                    character: 9,
+                },
+                end: Position2D {
+                    line: 5,
+                    character: 20,
+                },
+            },
+            severity: DiagnosticSeverity::Error,
+            message: "mismatched types: expected `i32`, found `&str`".to_string(),
+            code: Some("E0308".to_string()),
+        };
+        let pull = DiagnosticsResult {
+            diagnostics: vec![pull_diag.clone()],
+        };
+        // A second, unrelated E0308 at a completely different location with
+        // a completely different message -- a real, distinct diagnostic,
+        // not a duplicate of pull_diag.
+        let cache = diag_info(vec![lsp_diag(
+            49,
+            22,
+            lsp_types::DiagnosticSeverity::ERROR,
+            "mismatched types: expected `String`, found `Vec<u8>`",
+            Some("E0308"),
+        )]);
+
+        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+
+        assert_eq!(merged.diagnostics.len(), 2);
+        assert_eq!(merged.diagnostics[0], pull_diag);
+        assert_eq!(
+            merged.diagnostics[1].message,
+            "mismatched types: expected `String`, found `Vec<u8>`"
+        );
+    }
+
     #[test]
     fn test_handle_server_logs_no_filter() {
         use crate::bridge::notifications::LogLevel;
@@ -3663,6 +4064,29 @@ mod tests {
         stdin.flush().await.unwrap();
     }
 
+    /// Writes a framed JSON-RPC error response, e.g. to simulate a push-only
+    /// server answering `textDocument/diagnostic` with method-not-found.
+    async fn write_error_response(
+        stdin: &mut ChildStdin,
+        id: &JsonValue,
+        code: i64,
+        message: &str,
+    ) {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        });
+        let content = serde_json::to_string(&response).unwrap();
+        let header = format!("Content-Length: {}\r\n\r\n", content.len());
+        stdin.write_all(header.as_bytes()).await.unwrap();
+        stdin.write_all(content.as_bytes()).await.unwrap();
+        stdin.flush().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_concurrent_handlers_on_different_files_do_not_serialize() {
         // Before the fix, Translator was shared as Arc<Mutex<Translator>>, so
@@ -3906,7 +4330,12 @@ mod tests {
         // by the diagnostic request on pylsp's wire, never pyright's.
         let diagnostics = {
             let translator = Arc::clone(&translator);
-            tokio::spawn(async move { translator.handle_diagnostics(path_str).await })
+            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+            tokio::spawn(async move {
+                translator
+                    .handle_diagnostics(path_str, &notification_cache)
+                    .await
+            })
         };
         let mut wire_pylsp = BufReader::new(&mut server_pylsp.write_stdout);
         let opened = read_framed_message(&mut wire_pylsp).await;
@@ -3916,5 +4345,148 @@ mod tests {
         // Routing is proven by the request landing on pylsp's wire; abort
         // rather than crafting a well-formed DocumentDiagnosticReportResult.
         diagnostics.abort();
+    }
+
+    /// S1 regression (#244): a push-only server (or one that times out)
+    /// answering `textDocument/diagnostic` with an LSP error must not
+    /// discard diagnostics `handle_diagnostics` already knows about from the
+    /// cache -- it should return the cache-only result instead of `Err`.
+    #[tokio::test]
+    async fn test_handle_diagnostics_pull_error_falls_back_to_nonempty_cache() {
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("rs".to_string(), "rust".to_string());
+
+        let mut translator =
+            Translator::new()
+                .with_extensions(extensions)
+                .with_router(ToolRouter::catch_all([(
+                    ServerId::from("rust"),
+                    "rust".to_string(),
+                )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client, mut server) = fake_lsp_client();
+        translator.register_client("rust".to_string(), client);
+
+        let path = dir.path().join("lib.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        // Prime the cache under the exact URI handle_diagnostics will look
+        // up (path_to_uri over the canonicalized path, same as
+        // document_tracker uses to open the document).
+        let canonical = path.canonicalize().unwrap();
+        let uri = path_to_uri(&canonical);
+        let notification_cache = Mutex::new(NotificationCache::new());
+        {
+            let mut cache = notification_cache.lock().await;
+            cache.store_diagnostics(
+                &uri,
+                Some(1),
+                vec![lsp_diag(
+                    0,
+                    4,
+                    lsp_types::DiagnosticSeverity::WARNING,
+                    "unused import: `std::fmt`",
+                    None,
+                )],
+            );
+        }
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_diagnostics(path_str, &notification_cache)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let diag_request = read_framed_message(&mut wire).await;
+        assert_eq!(diag_request["method"], "textDocument/diagnostic");
+        write_error_response(
+            &mut server.read_half_stdin,
+            &diag_request["id"],
+            -32601,
+            "method not found",
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap();
+
+        let diagnostics = result.expect("cache-only fallback should succeed despite pull error");
+        assert_eq!(diagnostics.diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics.diagnostics[0].message,
+            "unused import: `std::fmt`"
+        );
+    }
+
+    /// S1 counterpart: when the cache is also empty, the pull error must
+    /// still propagate -- there is nothing to fall back to.
+    #[tokio::test]
+    async fn test_handle_diagnostics_pull_error_and_empty_cache_propagates_error() {
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("rs".to_string(), "rust".to_string());
+
+        let mut translator =
+            Translator::new()
+                .with_extensions(extensions)
+                .with_router(ToolRouter::catch_all([(
+                    ServerId::from("rust"),
+                    "rust".to_string(),
+                )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client, mut server) = fake_lsp_client();
+        translator.register_client("rust".to_string(), client);
+
+        let path = dir.path().join("lib.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let notification_cache = Mutex::new(NotificationCache::new());
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_diagnostics(path_str, &notification_cache)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let diag_request = read_framed_message(&mut wire).await;
+        assert_eq!(diag_request["method"], "textDocument/diagnostic");
+        write_error_response(
+            &mut server.read_half_stdin,
+            &diag_request["id"],
+            -32601,
+            "method not found",
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap();
+
+        assert!(
+            result.is_err(),
+            "pull error with no cache data must propagate, got {result:?}"
+        );
     }
 }

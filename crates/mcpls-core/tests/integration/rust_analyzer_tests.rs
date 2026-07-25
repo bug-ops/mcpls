@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-use mcpls_core::bridge::Translator;
+use mcpls_core::bridge::{NotificationCache, Translator};
 use mcpls_core::config::{LspServerConfig, ServerId, ToolRouter};
 use mcpls_core::lsp::{LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
@@ -414,13 +414,16 @@ async fn test_diagnostics_with_error() {
     // Give rust-analyzer extra time to analyze and generate diagnostics
     wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
-    // Get diagnostics from lib.rs (has intentional error on line 37)
+    // Get diagnostics from lib.rs (has intentional error on line 37). No
+    // push notifications are captured in this harness, so the cache is
+    // empty and handle_diagnostics falls back to the pull-only result.
+    let notification_cache = Mutex::new(NotificationCache::new());
     let result = timeout(
         Duration::from_secs(10),
         translator
             .lock()
             .await
-            .handle_diagnostics(lib_file.to_string_lossy().to_string()),
+            .handle_diagnostics(lib_file.to_string_lossy().to_string(), &notification_cache),
     )
     .await;
 
@@ -458,12 +461,13 @@ async fn test_diagnostics_no_errors() {
     wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Get diagnostics from types.rs (should have no errors)
+    let notification_cache = Mutex::new(NotificationCache::new());
     let result = timeout(
         Duration::from_secs(10),
-        translator
-            .lock()
-            .await
-            .handle_diagnostics(types_file.to_string_lossy().to_string()),
+        translator.lock().await.handle_diagnostics(
+            types_file.to_string_lossy().to_string(),
+            &notification_cache,
+        ),
     )
     .await;
 

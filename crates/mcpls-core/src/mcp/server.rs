@@ -141,7 +141,14 @@ impl McplsServer {
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = { self.context.translator.handle_diagnostics(file_path).await };
+        // Merging push-model (flycheck/clippy) diagnostics into the pull
+        // result, including the pull-error-but-cache-has-data fallback, is
+        // handled inside handle_diagnostics itself -- see its doc comment.
+        let result = self
+            .context
+            .translator
+            .handle_diagnostics(file_path, &self.context.notification_cache)
+            .await;
 
         match result {
             Ok(value) => serde_json::to_string(&value)
