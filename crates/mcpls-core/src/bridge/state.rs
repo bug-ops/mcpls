@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 
 use lsp_types::{
@@ -12,9 +13,11 @@ use lsp_types::{
 };
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
 
+use super::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
@@ -147,10 +150,20 @@ impl Default for ResourceLimits {
 }
 
 /// Tracks document state across the workspace.
+///
+/// Every method takes `&self`: the document map and the per-path locks used
+/// by [`Self::ensure_open`] are both interior-mutable, so a single tracker
+/// can be shared behind a plain `Arc<DocumentTracker>` with no outer lock.
+/// See [`Self::ensure_open`] for the concurrency contract this maintains.
 #[derive(Debug)]
 pub struct DocumentTracker {
-    /// Open documents by file path.
-    documents: HashMap<PathBuf, DocumentState>,
+    /// Open documents by file path. Locked only for the short, synchronous
+    /// section that touches it — never held across an `await`.
+    documents: StdMutex<HashMap<PathBuf, DocumentState>>,
+    /// Per-path locks serializing [`Self::ensure_open`] calls for the same
+    /// path, so calls for different paths never wait on each other. See
+    /// `lock_path` for how entries are created and evicted.
+    path_locks: StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
     /// Resource limits for tracking.
     limits: ResourceLimits,
     /// Custom file extension to language ID mappings.
@@ -162,7 +175,8 @@ impl DocumentTracker {
     #[must_use]
     pub fn new(limits: ResourceLimits, extension_map: HashMap<String, String>) -> Self {
         Self {
-            documents: HashMap::new(),
+            documents: StdMutex::new(HashMap::new()),
+            path_locks: StdMutex::new(HashMap::new()),
             limits,
             extension_map,
         }
@@ -171,25 +185,25 @@ impl DocumentTracker {
     /// Check if a document is currently open.
     #[must_use]
     pub fn is_open(&self, path: &Path) -> bool {
-        self.documents.contains_key(path)
+        lock_std(&self.documents).contains_key(path)
     }
 
-    /// Get the state of an open document.
+    /// Get a clone of the state of an open document.
     #[must_use]
-    pub fn get(&self, path: &Path) -> Option<&DocumentState> {
-        self.documents.get(path)
+    pub fn get(&self, path: &Path) -> Option<DocumentState> {
+        lock_std(&self.documents).get(path).cloned()
     }
 
     /// Get the number of open documents.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.documents.len()
+        lock_std(&self.documents).len()
     }
 
     /// Check if there are no open documents.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.documents.is_empty()
+        lock_std(&self.documents).is_empty()
     }
 
     /// Open a document and track its state.
@@ -201,15 +215,7 @@ impl DocumentTracker {
     /// Returns an error if:
     /// - Document limit is exceeded
     /// - File size limit is exceeded
-    pub fn open(&mut self, path: PathBuf, content: String) -> Result<Uri> {
-        // Check document limit
-        if self.limits.max_documents > 0 && self.documents.len() >= self.limits.max_documents {
-            return Err(Error::DocumentLimitExceeded {
-                current: self.documents.len(),
-                max: self.limits.max_documents,
-            });
-        }
-
+    pub fn open(&self, path: PathBuf, content: String) -> Result<Uri> {
         self.check_file_size(content.len() as u64)?;
 
         let uri = path_to_uri(&path);
@@ -224,7 +230,19 @@ impl DocumentTracker {
             synced: HashMap::new(),
         };
 
-        self.documents.insert(path, state);
+        // Check document limit and insert under a single lock acquisition so
+        // two concurrent `open` calls for different new paths can't both
+        // pass the check and jointly exceed the limit by one. Dropped
+        // explicitly right after the insert rather than at function return.
+        let mut documents = lock_std(&self.documents);
+        if self.limits.max_documents > 0 && documents.len() >= self.limits.max_documents {
+            return Err(Error::DocumentLimitExceeded {
+                current: documents.len(),
+                max: self.limits.max_documents,
+            });
+        }
+        documents.insert(path, state);
+        drop(documents);
         Ok(uri)
     }
 
@@ -233,8 +251,9 @@ impl DocumentTracker {
     /// Returns `None` if the document is not open. The updated content has no
     /// known disk provenance, so the next `ensure_open` call on this path
     /// will always re-verify by content compare rather than trusting a stat.
-    pub fn update(&mut self, path: &Path, content: String) -> Option<i32> {
-        if let Some(state) = self.documents.get_mut(path) {
+    pub fn update(&self, path: &Path, content: String) -> Option<i32> {
+        let mut documents = lock_std(&self.documents);
+        if let Some(state) = documents.get_mut(path) {
             state.version += 1;
             state.content = content;
             state.disk = None;
@@ -257,11 +276,12 @@ impl DocumentTracker {
 
     /// Sets the disk snapshot for an already-tracked document.
     ///
-    /// A no-op if the path is no longer tracked; every call site holds the
-    /// tracker lock for the whole `ensure_open` call, so this should not
-    /// happen in practice, but it avoids an `unwrap`/`expect` on the lookup.
-    fn set_disk(&mut self, path: &Path, snap: DiskSync) {
-        if let Some(st) = self.documents.get_mut(path) {
+    /// A no-op if the path is no longer tracked; every call site runs under
+    /// the per-path lock for the whole `ensure_open` call, so this should
+    /// not happen in practice, but it avoids an `unwrap`/`expect` on the
+    /// lookup.
+    fn set_disk(&self, path: &Path, snap: DiskSync) {
+        if let Some(st) = lock_std(&self.documents).get_mut(path) {
             st.disk = Some(snap);
         }
     }
@@ -269,18 +289,52 @@ impl DocumentTracker {
     /// Close a document and remove it from tracking.
     ///
     /// Returns the document state if it was open.
-    pub fn close(&mut self, path: &Path) -> Option<DocumentState> {
-        self.documents.remove(path)
+    pub fn close(&self, path: &Path) -> Option<DocumentState> {
+        lock_std(&self.documents).remove(path)
     }
 
     /// Close all documents.
-    pub fn close_all(&mut self) -> Vec<DocumentState> {
-        self.documents.drain().map(|(_, state)| state).collect()
+    pub fn close_all(&self) -> Vec<DocumentState> {
+        lock_std(&self.documents)
+            .drain()
+            .map(|(_, state)| state)
+            .collect()
     }
 
-    /// Iterate over the filesystem paths of all currently open documents.
-    pub fn open_paths(&self) -> impl Iterator<Item = &Path> {
-        self.documents.keys().map(PathBuf::as_path)
+    /// Snapshot of the filesystem paths of all currently open documents.
+    pub fn open_paths(&self) -> Vec<PathBuf> {
+        lock_std(&self.documents).keys().cloned().collect()
+    }
+
+    /// Acquire the per-path lock used by [`Self::ensure_open`], creating its
+    /// entry on first use.
+    ///
+    /// The map of per-path locks (`path_locks`) is itself locked only for
+    /// the map lookup/insert/remove — never across an `await` — so acquiring
+    /// one path's lock never blocks a concurrent acquisition for a different
+    /// path. Awaiting the returned path's own lock is what actually
+    /// serializes calls for the same path.
+    ///
+    /// The returned guard evicts its `path_locks` entry when dropped, but
+    /// only if no other caller is concurrently waiting on it (see
+    /// [`PathLockGuard`]'s `Drop` impl) — otherwise the map would grow by
+    /// one entry per distinct path ever opened, for the lifetime of the
+    /// process.
+    async fn lock_path(&self, path: &Path) -> PathLockGuard<'_> {
+        let arc = {
+            let mut locks = lock_std(&self.path_locks);
+            locks
+                .entry(path.to_path_buf())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let guard = Arc::clone(&arc).lock_owned().await;
+        PathLockGuard {
+            path_locks: &self.path_locks,
+            path: path.to_path_buf(),
+            arc,
+            guard: Some(guard),
+        }
     }
 
     /// Ensure a document is open *for `server`*, opening it lazily if
@@ -337,10 +391,13 @@ impl DocumentTracker {
     ///
     /// # Concurrency
     ///
-    /// This entire call must run under the document tracker's lock: it
-    /// assumes no other caller can observe or mutate state for the same path
-    /// concurrently, or duplicate `didOpen`/`didChange` notifications could
-    /// be sent for the same document.
+    /// Calls for the *same* `path` are serialized against each other (via
+    /// `lock_path`), so no two such calls can observe or mutate that
+    /// path's state concurrently -- this is what prevents duplicate
+    /// `didOpen`/`didChange` notifications for the same document. Calls for
+    /// *different* paths run fully concurrently: neither the per-path lock
+    /// nor the short, synchronous locks used to touch the shared document
+    /// map are ever held across this call's disk I/O or LSP notify.
     ///
     /// # Errors
     ///
@@ -349,11 +406,12 @@ impl DocumentTracker {
     /// - The `didOpen`/`didChange` notification fails to send
     /// - Resource limits are exceeded
     pub async fn ensure_open(
-        &mut self,
+        &self,
         path: &Path,
         server: &ServerId,
         lsp_client: &LspClient,
     ) -> Result<Uri> {
+        let _path_guard = self.lock_path(path).await;
         let decision = self.disk_phase(path).await?;
         self.sync_phase(path, server, lsp_client, decision).await
     }
@@ -362,8 +420,8 @@ impl DocumentTracker {
     /// should be at, reading from disk only when necessary. Never sends any
     /// LSP notification and never returns early in a way that would skip the
     /// per-server sync phase -- see `ensure_open`'s docs.
-    async fn disk_phase(&mut self, path: &Path) -> Result<Decision> {
-        if !self.documents.contains_key(path) {
+    async fn disk_phase(&self, path: &Path) -> Result<Decision> {
+        if !lock_std(&self.documents).contains_key(path) {
             return self.disk_phase_new(path).await;
         }
 
@@ -375,19 +433,25 @@ impl DocumentTracker {
         let mtime = meta.modified().ok();
         let size = meta.len();
 
-        let (uri, current_version, fast_path) = {
-            let Some(st) = self.documents.get(path) else {
-                return Err(Error::DocumentNotFound(path.to_path_buf()));
-            };
-            let stat_matches = st.disk.is_some_and(|d| d.mtime == mtime && d.size == size);
-            let fast_path = match st.disk {
-                Some(d) if stat_matches && d.mtime_settled => true,
-                Some(d) if stat_matches && d.content_checked_at.elapsed() < DISK_CHECK_DEBOUNCE => {
-                    true
-                }
-                _ => false,
-            };
-            (st.uri.clone(), st.version, fast_path)
+        // `.map(...)` extracts an owned tuple from the lookup in a single
+        // statement, so the lock releases immediately rather than staying
+        // held while `fast_path` is computed.
+        let Some((uri, current_version, fast_path)) =
+            lock_std(&self.documents).get(path).map(|st| {
+                let stat_matches = st.disk.is_some_and(|d| d.mtime == mtime && d.size == size);
+                let fast_path = match st.disk {
+                    Some(d) if stat_matches && d.mtime_settled => true,
+                    Some(d)
+                        if stat_matches && d.content_checked_at.elapsed() < DISK_CHECK_DEBOUNCE =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                (st.uri.clone(), st.version, fast_path)
+            })
+        else {
+            return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
         if fast_path {
             return Ok(Decision::unchanged(uri, current_version));
@@ -401,11 +465,11 @@ impl DocumentTracker {
             content_checked_at: Instant::now(),
         };
 
-        let unchanged = {
-            let Some(st) = self.documents.get(path) else {
-                return Err(Error::DocumentNotFound(path.to_path_buf()));
-            };
-            fresh == st.content
+        let Some(unchanged) = lock_std(&self.documents)
+            .get(path)
+            .map(|st| fresh == st.content)
+        else {
+            return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
 
         if unchanged {
@@ -424,7 +488,7 @@ impl DocumentTracker {
     /// Reads a not-yet-tracked file from disk and opens it in the tracker at
     /// version 1. No server has synced it yet, so the sync phase always
     /// sends `didOpen` regardless of which server calls next.
-    async fn disk_phase_new(&mut self, path: &Path) -> Result<Decision> {
+    async fn disk_phase_new(&self, path: &Path) -> Result<Decision> {
         let read_at = SystemTime::now();
         let (content, mtime, size) = self.read_to_string_checked(path).await?;
 
@@ -480,7 +544,7 @@ impl DocumentTracker {
     /// or nothing to `server` depending on its last-synced version, and
     /// commits the outcome only after the notification succeeds.
     async fn sync_phase(
-        &mut self,
+        &self,
         path: &Path,
         server: &ServerId,
         lsp_client: &LspClient,
@@ -496,28 +560,27 @@ impl DocumentTracker {
         // Cheap check first: the common case (an already-synced document,
         // which is most tool calls against a file already open elsewhere)
         // must not pay for cloning the full document content only to
-        // discard it on the `up_to_date` return below.
-        let (up_to_date, is_first_open) = {
-            let Some(st) = self.documents.get(path) else {
-                return Err(Error::DocumentNotFound(path.to_path_buf()));
-            };
-            let synced_version = st.synced.get(server).copied();
-            (
-                synced_version.is_some_and(|v| v >= target_version),
-                synced_version.is_none(),
-            )
+        // discard it on the `up_to_date` return below. `.map(...)` extracts
+        // an owned value from the lookup so the lock is released at the end
+        // of this statement rather than held across the checks that follow.
+        let Some(synced_version) = lock_std(&self.documents)
+            .get(path)
+            .map(|st| st.synced.get(server).copied())
+        else {
+            return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
+        let up_to_date = synced_version.is_some_and(|v| v >= target_version);
+        let is_first_open = synced_version.is_none();
 
         if up_to_date {
             return Ok(uri);
         }
 
-        let (language_id, text) = {
-            let Some(st) = self.documents.get(path) else {
-                return Err(Error::DocumentNotFound(path.to_path_buf()));
-            };
+        let Some((language_id, text)) = lock_std(&self.documents).get(path).map(|st| {
             let text = fresh_content.clone().unwrap_or_else(|| st.content.clone());
             (st.language_id.clone(), text)
+        }) else {
+            return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
 
         let notify_result = if is_first_open {
@@ -561,17 +624,24 @@ impl DocumentTracker {
             // another server already synced successfully, the path stays
             // tracked for that server's sake; this server's `synced` entry
             // simply stays absent/stale, so its own next call retries.
-            let first_ever_sync = self
-                .documents
+            // Two short lock scopes rather than one held across the
+            // conditional `remove`: safe because `ensure_open`'s per-path
+            // lock already serializes every caller for this path, so
+            // nothing else can observe or mutate its `synced` map between
+            // them.
+            let first_ever_sync = lock_std(&self.documents)
                 .get(path)
                 .is_some_and(|st| st.synced.is_empty());
             if is_first_open && first_ever_sync {
-                self.documents.remove(path);
+                lock_std(&self.documents).remove(path);
             }
             return Err(err);
         }
 
-        let Some(st) = self.documents.get_mut(path) else {
+        // Dropped explicitly right after the commit, rather than staying
+        // alive (unused) until the function returns.
+        let mut documents = lock_std(&self.documents);
+        let Some(st) = documents.get_mut(path) else {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
         if let Some(fresh) = fresh_content {
@@ -580,8 +650,48 @@ impl DocumentTracker {
             st.disk = snap;
         }
         st.synced.insert(server.clone(), target_version);
+        drop(documents);
 
         Ok(uri)
+    }
+}
+
+/// RAII guard for the per-path lock acquired by
+/// [`DocumentTracker::lock_path`].
+///
+/// Holds an `OwnedMutexGuard` on the path's `Arc<AsyncMutex<()>>>` for as
+/// long as the guard is alive, serializing `ensure_open` calls for that
+/// path. On drop, evicts the `path_locks` map entry if (and only if) no
+/// other caller holds a clone of the same `Arc` -- see the `Drop` impl for
+/// why that check is race-free.
+struct PathLockGuard<'a> {
+    path_locks: &'a StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+    path: PathBuf,
+    arc: Arc<AsyncMutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for PathLockGuard<'_> {
+    fn drop(&mut self) {
+        // Unlock first so a task waiting on `arc.lock_owned()` can proceed
+        // as soon as possible, rather than also waiting on `path_locks`.
+        self.guard.take();
+
+        let mut locks = lock_std(self.path_locks);
+        // Checked only after `self.guard` -- and the extra internal `Arc`
+        // clone it held -- was already dropped above, so what's left here is:
+        // this task's own `self.arc`, the map's entry, and one more
+        // reference for every *other* task that has already looked up this
+        // same entry in `lock_path` (each holds its own clone continuously
+        // from before that lookup until its own `Drop` runs this same check)
+        // but hasn't finished dropping yet. A `strong_count` of 2 means no
+        // such task exists, so it's safe to evict; any later caller just
+        // creates a fresh entry. Leaving it forever would instead grow this
+        // map by one entry per distinct path ever opened, for the process's
+        // lifetime.
+        if Arc::strong_count(&self.arc) <= 2 {
+            locks.remove(&self.path);
+        }
     }
 }
 
@@ -713,7 +823,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/file.rs");
 
         assert!(!tracker.is_open(&path));
@@ -745,7 +855,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(limits, map);
+        let tracker = DocumentTracker::new(limits, map);
 
         // First two documents should succeed
         tracker
@@ -769,7 +879,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(limits, map);
+        let tracker = DocumentTracker::new(limits, map);
 
         // Small file should succeed
         tracker
@@ -808,7 +918,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(limits, map);
+        let tracker = DocumentTracker::new(limits, map);
 
         // Should allow many documents when limit is 0
         for i in 0..200 {
@@ -850,7 +960,7 @@ mod tests {
     #[test]
     fn test_update_nonexistent_document() {
         let map = HashMap::new();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/nonexistent.rs");
 
         let version = tracker.update(&path, "new content".to_string());
@@ -863,7 +973,7 @@ mod tests {
     #[test]
     fn test_close_nonexistent_document() {
         let map = HashMap::new();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/nonexistent.rs");
 
         let state = tracker.close(&path);
@@ -878,7 +988,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
 
         tracker
             .open(PathBuf::from("/test/file1.rs"), "content1".to_string())
@@ -915,7 +1025,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/versioned.rs");
 
         tracker.open(path.clone(), "v1".to_string()).unwrap();
@@ -1116,7 +1226,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path1 = PathBuf::from("/test/file1.rs");
         let path2 = PathBuf::from("/test/file2.rs");
 
@@ -1142,7 +1252,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/empty.rs");
 
         tracker.open(path.clone(), String::new()).unwrap();
@@ -1155,7 +1265,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/unicode.rs");
         let content = "fn テスト() { println!(\"こんにちは\"); }";
 
@@ -1172,7 +1282,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(limits, map);
+        let tracker = DocumentTracker::new(limits, map);
 
         for i in 0..5 {
             tracker
@@ -1198,7 +1308,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(limits, map);
+        let tracker = DocumentTracker::new(limits, map);
 
         let exact_size_content = "x".repeat(100);
         tracker
@@ -1260,7 +1370,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("nu".to_string(), "nushell".to_string());
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
 
         let path = PathBuf::from("/test/script.nu");
         tracker
@@ -1276,7 +1386,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/main.rs");
         tracker
             .open(path.clone(), "fn main() {}".to_string())
@@ -1351,29 +1461,29 @@ mod tests {
     #[test]
     fn test_open_paths_empty_tracker() {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        assert_eq!(tracker.open_paths().count(), 0);
+        assert_eq!(tracker.open_paths().len(), 0);
     }
 
     #[test]
     fn test_open_paths_populated_tracker() {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
         tracker.open(PathBuf::from("/b.rs"), String::new()).unwrap();
-        let mut paths: Vec<_> = tracker.open_paths().collect();
+        let mut paths = tracker.open_paths();
         paths.sort();
-        assert_eq!(paths, [Path::new("/a.rs"), Path::new("/b.rs")]);
+        assert_eq!(paths, [PathBuf::from("/a.rs"), PathBuf::from("/b.rs")]);
     }
 
     #[test]
     fn test_open_paths_after_close() {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), map);
+        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
         tracker.close(Path::new("/a.rs"));
-        assert_eq!(tracker.open_paths().count(), 0);
+        assert_eq!(tracker.open_paths().len(), 0);
     }
 
     // ------------------------------------------------------------------
@@ -1510,7 +1620,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
         let uri1 = tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
@@ -1535,7 +1645,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1561,7 +1671,7 @@ mod tests {
         // Leave the mtime at "now" (racy) rather than backdating it.
 
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1595,7 +1705,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1627,7 +1737,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1654,7 +1764,7 @@ mod tests {
         // Racy: leave the mtime at "now".
 
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1689,7 +1799,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1718,7 +1828,7 @@ mod tests {
             max_file_size: 10,
         };
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(limits, HashMap::new());
+        let tracker = DocumentTracker::new(limits, HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1746,7 +1856,7 @@ mod tests {
             max_file_size: 0,
         };
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(limits, HashMap::new());
+        let tracker = DocumentTracker::new(limits, HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1773,7 +1883,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let (client, _server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1802,7 +1912,7 @@ mod tests {
         let notify_will_fail = client.clone();
         client.shutdown().await.unwrap();
 
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let result = tracker
             .ensure_open(&path, &ServerId::from("rust"), &notify_will_fail)
             .await;
@@ -1823,7 +1933,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let (client, mut server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
@@ -1869,7 +1979,7 @@ mod tests {
 
         let (client_a, mut server_a) = fake_lsp_client();
         let (client_b, mut server_b) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
         let id_a = ServerId::from("server-a");
         let id_b = ServerId::from("server-b");
@@ -1902,7 +2012,7 @@ mod tests {
 
         let (client_a, _server_a) = fake_lsp_client();
         let (client_b, mut server_b) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
         tracker
             .ensure_open(&path, &ServerId::from("server-a"), &client_a)
@@ -1936,7 +2046,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let (client, mut server) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let id = ServerId::from("rust");
 
         tracker.ensure_open(&path, &id, &client).await.unwrap();
@@ -1964,7 +2074,7 @@ mod tests {
 
         let (client_a, _server_a) = fake_lsp_client();
         let (client_b, _server_b) = fake_lsp_client();
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let id_a = ServerId::from("server-a");
         let id_b = ServerId::from("server-b");
 
@@ -2003,5 +2113,179 @@ mod tests {
         );
         assert_eq!(tracker.get(&path).unwrap().synced.get(&id_a), Some(&2));
         assert_eq!(tracker.get(&path).unwrap().synced.get(&id_b), Some(&1));
+    }
+
+    // ------------------------------------------------------------------
+    // ensure_open concurrency (issue #227)
+    // ------------------------------------------------------------------
+
+    /// Regression for #227: `ensure_open` for one path must not block
+    /// `ensure_open` for an unrelated path, even while the first call is
+    /// stuck inside its own disk I/O.
+    ///
+    /// Simulated with a FIFO rather than a timing assumption: opening it for
+    /// read blocks deterministically until a writer connects, so path A's
+    /// `ensure_open` is guaranteed to still be in progress when path B's
+    /// runs. Under the old design (a single lock spanning all of
+    /// `ensure_open`, including disk I/O), path B would hang until path A's
+    /// FIFO is unblocked below; the per-path lock added here must let it
+    /// through immediately instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ensure_open_different_paths_do_not_serialize() {
+        let dir = TempDir::new().unwrap();
+        let path_a = dir.path().join("a.rs");
+        let path_b = dir.path().join("b.rs");
+
+        std::fs::write(&path_b, "fn b() {}").unwrap();
+        set_mtime(&path_b, settled_past());
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path_a)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let (client_a, _server_a) = fake_lsp_client();
+        let (client_b, _server_b) = fake_lsp_client();
+        let tracker = Arc::new(DocumentTracker::new(
+            ResourceLimits::default(),
+            HashMap::new(),
+        ));
+
+        // Spawned so it can genuinely block on the FIFO's open() while the
+        // rest of this test proceeds concurrently on the same runtime.
+        let tracker_for_a = Arc::clone(&tracker);
+        let path_a_for_task = path_a.clone();
+        let handle_a = tokio::spawn(async move {
+            tracker_for_a
+                .ensure_open(&path_a_for_task, &ServerId::from("server-a"), &client_a)
+                .await
+        });
+
+        // Give the spawned task a chance to actually reach the FIFO's
+        // blocking open() before racing it against path B below.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A `timeout` error here means path B is blocked by path A's stuck
+        // ensure_open -- the exact regression #227 fixes.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tracker.ensure_open(&path_b, &ServerId::from("server-b"), &client_b),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Unblock A: opening the FIFO for writing lets its open() proceed,
+        // and closing the write end (at the end of this call) delivers EOF
+        // to the read it's waiting to finish.
+        let path_a_writer = path_a.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(path_a_writer, "fn a() {}").unwrap();
+        })
+        .await
+        .unwrap();
+
+        handle_a.await.unwrap().unwrap();
+        assert_eq!(tracker.get(&path_a).unwrap().content, "fn a() {}");
+    }
+
+    /// Regression for #227: N concurrent `ensure_open` calls for the same
+    /// path and the same server must still collapse into exactly one
+    /// `didOpen` -- the per-path lock introduced to let different paths run
+    /// concurrently must not weaken the existing same-path serialization
+    /// that prevents duplicate opens.
+    #[tokio::test]
+    async fn test_ensure_open_concurrent_same_path_single_didopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, mut server) = fake_lsp_client();
+        let tracker = Arc::new(DocumentTracker::new(
+            ResourceLimits::default(),
+            HashMap::new(),
+        ));
+        let id = ServerId::from("rust");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let tracker = Arc::clone(&tracker);
+            let client = client.clone();
+            let path = path.clone();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                tracker.ensure_open(&path, &id, &client).await
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
+        // No further notification should have been queued -- proves the 8
+        // concurrent callers collapsed into exactly one `didOpen`.
+        let extra =
+            tokio::time::timeout(Duration::from_millis(200), read_framed_message(&mut wire)).await;
+        assert!(
+            extra.is_err(),
+            "expected no additional notification after the single didOpen"
+        );
+
+        assert_eq!(tracker.get(&path).unwrap().synced.get(&id), Some(&1));
+        assert_eq!(tracker.get(&path).unwrap().version, 1);
+    }
+
+    /// Regression for #227: `lock_path`'s guard must evict its `path_locks`
+    /// entry once no caller is left waiting on it, or the map grows by one
+    /// entry per distinct path ever opened for the lifetime of the process.
+    /// Exercises three concurrent distinct paths (not just the two used in
+    /// `test_ensure_open_different_paths_do_not_serialize`) to rule out an
+    /// eviction bug that only manifests with more than two live entries.
+    #[tokio::test]
+    async fn test_ensure_open_path_locks_evicted_after_completion() {
+        let dir = TempDir::new().unwrap();
+        let paths: Vec<_> = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|name| dir.path().join(name))
+            .collect();
+        for path in &paths {
+            std::fs::write(path, "fn f() {}").unwrap();
+            set_mtime(path, settled_past());
+        }
+
+        let tracker = Arc::new(DocumentTracker::new(
+            ResourceLimits::default(),
+            HashMap::new(),
+        ));
+        let id = ServerId::from("rust");
+
+        let mut handles = Vec::new();
+        let mut servers = Vec::new();
+        for path in paths.clone() {
+            let tracker = Arc::clone(&tracker);
+            let (client, server) = fake_lsp_client();
+            servers.push(server);
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                tracker.ensure_open(&path, &id, &client).await
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+        drop(servers);
+
+        assert!(
+            lock_std(&tracker.path_locks).is_empty(),
+            "path_locks must be fully evicted once every ensure_open call \
+             for every path has completed, otherwise the map grows \
+             unbounded for the lifetime of the process"
+        );
     }
 }

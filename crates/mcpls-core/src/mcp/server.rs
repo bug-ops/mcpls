@@ -566,7 +566,7 @@ impl ServerHandler for McplsServer {
     ) -> Result<ListResourcesResult, McpError> {
         // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
         // very large single-page responses that may exceed transport buffers).
-        let open_paths = self.context.translator.open_document_paths().await;
+        let open_paths = self.context.translator.open_document_paths();
         let resources: Vec<_> = open_paths
             .iter()
             .filter_map(|path| {
@@ -1265,12 +1265,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_resources_returns_empty_when_no_open_documents() {
         let server = create_test_server();
-        let empty = server
-            .context
-            .translator
-            .open_document_paths()
-            .await
-            .is_empty();
+        let empty = server.context.translator.open_document_paths().is_empty();
         assert!(empty);
     }
 

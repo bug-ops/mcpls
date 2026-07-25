@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
@@ -17,27 +17,14 @@ use lsp_types::{
     WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Duration;
 
 use super::state::{ResourceLimits, detect_language, path_to_uri};
-use super::{DiagnosticInfo, DocumentTracker, NotificationCache};
+use super::{DiagnosticInfo, DocumentTracker, NotificationCache, lock_std};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::config::{ServerId, ToolKind, ToolRouter, base_language_id};
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer};
-
-/// Lock a `std::sync::Mutex`, recovering the guard if a previous holder
-/// panicked while holding it.
-///
-/// Every lock guarded this way protects a short, synchronous, panic-free
-/// critical section (a `HashMap`/`HashSet` lookup or insert), so poisoning
-/// can only happen if an unrelated bug already panicked; refusing to unwind
-/// the whole process a second time over stale poisoning is preferable to
-/// deadlocking future calls.
-fn lock_std<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 ///
@@ -49,11 +36,11 @@ fn lock_std<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
 /// section that touches it. In particular, the actual LSP request/response
 /// round trip (`client.request(...)`) always runs with no lock held.
 ///
-/// The `document_tracker` lock is the one exception worth calling out: it is
-/// still a single lock shared across all languages and paths, and
-/// `prepare_document`'s call into `ensure_open` holds it across that
-/// document's disk I/O and `textDocument/didOpen` notify — see the
-/// `TODO(critic-S2)` there for why that is bounded and out of scope here.
+/// `document_tracker` is no exception: `DocumentTracker` locks its own state
+/// per-path internally (see its docs), so `prepare_document`'s call into
+/// `ensure_open` never holds a lock shared across unrelated paths or
+/// languages while it does that document's disk I/O and
+/// `textDocument/didOpen`/`didChange` notify.
 #[derive(Debug)]
 pub struct Translator {
     /// LSP clients indexed by routing identity. Locked only for the map
@@ -61,8 +48,8 @@ pub struct Translator {
     lsp_clients: Arc<StdMutex<HashMap<ServerId, LspClient>>>,
     /// LSP servers indexed by routing identity (held for lifetime management).
     lsp_servers: Arc<StdMutex<HashMap<ServerId, LspServer>>>,
-    /// Document state tracker. Locked only for `ensure_open`.
-    document_tracker: Arc<AsyncMutex<DocumentTracker>>,
+    /// Document state tracker. Locks its own state internally, per path.
+    document_tracker: Arc<DocumentTracker>,
     /// Allowed workspace roots for path validation. Read-only after `serve()`
     /// setup, so no lock is needed.
     workspace_roots: Arc<Vec<PathBuf>>,
@@ -90,10 +77,10 @@ impl Translator {
         Self {
             lsp_clients: Arc::new(StdMutex::new(HashMap::new())),
             lsp_servers: Arc::new(StdMutex::new(HashMap::new())),
-            document_tracker: Arc::new(AsyncMutex::new(DocumentTracker::new(
+            document_tracker: Arc::new(DocumentTracker::new(
                 ResourceLimits::default(),
                 HashMap::new(),
-            ))),
+            )),
             workspace_roots: Arc::new(Vec::new()),
             extension_map: Arc::new(HashMap::new()),
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
@@ -157,10 +144,10 @@ impl Translator {
     /// shared, so this replaces the `Arc`-wrapped fields wholesale.
     #[must_use]
     pub fn with_extensions(mut self, extension_map: HashMap<String, String>) -> Self {
-        self.document_tracker = Arc::new(AsyncMutex::new(DocumentTracker::new(
+        self.document_tracker = Arc::new(DocumentTracker::new(
             ResourceLimits::default(),
             extension_map.clone(),
-        )));
+        ));
         self.extension_map = Arc::new(extension_map);
         self
     }
@@ -182,19 +169,15 @@ impl Translator {
     }
 
     /// Snapshot of currently open document paths, used for MCP resource listing.
-    pub async fn open_document_paths(&self) -> Vec<PathBuf> {
-        self.document_tracker
-            .lock()
-            .await
-            .open_paths()
-            .map(Path::to_path_buf)
-            .collect()
+    #[must_use]
+    pub fn open_document_paths(&self) -> Vec<PathBuf> {
+        self.document_tracker.open_paths()
     }
 
     /// Whether a document is currently tracked as open.
     #[must_use]
-    pub async fn is_document_open(&self, path: &Path) -> bool {
-        self.document_tracker.lock().await.is_open(path)
+    pub fn is_document_open(&self, path: &Path) -> bool {
+        self.document_tracker.is_open(path)
     }
 
     // TODO: These methods will be implemented in Phase 3-5
@@ -727,23 +710,19 @@ impl Translator {
     ///
     /// This is the "prepare" phase shared by every LSP-round-trip handler:
     /// it validates the path, selects the client via [`Self::get_client_for_file`],
-    /// and locks the document tracker only for `ensure_open`. The returned
-    /// client and URI are owned values, so the caller can issue the actual
-    /// LSP request (the "execute" phase) without holding any lock across the
-    /// network round trip — that is the lock this function's callers care
-    /// about, and it is always released before this function returns.
+    /// and calls `ensure_open`, which locks the document tracker's state only
+    /// for the given path. The returned client and URI are owned values, so
+    /// the caller can issue the actual LSP request (the "execute" phase)
+    /// without holding any lock across the network round trip.
     ///
-    /// The `document_tracker` lock itself, however, is held across
     /// `ensure_open`'s own awaits (a `stat`, optionally a re-read of the
-    /// file, and the `textDocument/didOpen`/`didChange` notify), and that
-    /// lock is shared by every language and every path. In the common case
-    /// this is bounded by the 250ms disk-check debounce, but it is not
-    /// per-path.
-    // TODO(critic-S2): scope this lock per path (e.g. a keyed mutex) so a
-    // wedged language server's `notify(...)` — a bounded-channel send with
-    // no timeout — can't stall `ensure_open` for unrelated files/languages.
-    // Preserve the anti-duplicate-`didOpen` invariant documented on
-    // `ensure_open` if this changes.
+    /// file, and the `textDocument/didOpen`/`didChange` notify) run under a
+    /// lock scoped to `validated_path` alone — see [`DocumentTracker::ensure_open`]
+    /// — so a slow or wedged language server cannot stall `prepare_document`
+    /// calls for unrelated files. (Per-tool routing, #228, means the same
+    /// file can be routed to more than one server; a wedged server-A notify
+    /// still holds this path's lock and can therefore delay a healthy
+    /// server-B call for that *same* file.)
     async fn prepare_document(
         &self,
         file_path: &str,
@@ -754,8 +733,6 @@ impl Translator {
         let (server_id, client) = self.get_client_for_file(&validated_path, tool)?;
         let uri = self
             .document_tracker
-            .lock()
-            .await
             .ensure_open(&validated_path, &server_id, &client)
             .await?;
         Ok((client, uri))
@@ -3773,9 +3750,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_ensure_open_same_path_sends_single_did_open() {
-        // Regression test: `ensure_open` must run entirely under the
-        // document_tracker lock so concurrent handler calls for the SAME path
-        // can't both observe "not open yet" and both send didOpen.
+        // Regression test: concurrent handler calls for the SAME path must
+        // serialize on that path's `ensure_open` lock (see `DocumentTracker::lock_path`)
+        // so they can't both observe "not open yet" and both send didOpen.
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
         extensions.insert("aa".to_string(), "lang_a".to_string());

@@ -3,6 +3,8 @@
 //! This module handles the bidirectional conversion between
 //! MCP tool calls and LSP requests/responses.
 
+use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
+
 mod encoding;
 mod notifications;
 pub mod resources;
@@ -21,3 +23,16 @@ pub use translator::{
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     Location, Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit, Translator,
 };
+
+/// Lock a `std::sync::Mutex`, recovering the guard if a previous holder
+/// panicked while holding it.
+///
+/// Every lock guarded this way protects a short, synchronous, panic-free
+/// critical section (a `HashMap`/`HashSet` lookup or insert), so poisoning
+/// can only happen if an unrelated bug already panicked; refusing to unwind
+/// the whole process a second time over stale poisoning is preferable to
+/// deadlocking future calls. Shared by `translator` and `state` so both
+/// modules lock their interior `HashMap`/`HashSet` fields the same way.
+pub(crate) fn lock_std<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}

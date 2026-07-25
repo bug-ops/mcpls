@@ -8,10 +8,10 @@ use crate::common::test_utils::{
     config_fixture_path, rust_analyzer_available, rust_workspace_path,
 };
 
-#[tokio::test]
-async fn test_translator_creation() {
+#[test]
+fn test_translator_creation() {
     let translator = Translator::new();
-    assert!(translator.open_document_paths().await.is_empty());
+    assert!(translator.open_document_paths().is_empty());
 }
 
 #[test]
@@ -65,13 +65,13 @@ fn test_workspace_roots_configuration() {
     translator.set_workspace_roots(roots);
 }
 
-#[tokio::test]
-async fn test_document_tracker_lazy_opening() {
+#[test]
+fn test_document_tracker_lazy_opening() {
     let translator = Translator::new();
 
     let test_file = rust_workspace_path().join("src/lib.rs");
     assert!(
-        !translator.is_document_open(&test_file).await,
+        !translator.is_document_open(&test_file),
         "Document should not be open initially"
     );
 }
