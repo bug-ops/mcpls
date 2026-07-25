@@ -73,15 +73,17 @@ use transport::run_stdio;
 /// - `notify_resource_updated` returns an error (peer disconnect / transport closed).
 ///
 /// # Lock independence
-/// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock independent
-/// of `translator` (itself lock-free — `Arc<Translator>`, with per-field interior
-/// mutability). MCP tool calls that hold a field lock across an in-flight LSP
-/// round-trip (e.g. `textDocument/diagnostic`) never block this pump, so a
-/// `publishDiagnostics` notification arriving mid-request is cached immediately
-/// instead of being silently dropped: the LSP transport forwards notifications
-/// via `mpsc::Sender::try_send`, which drops on a full channel rather than
-/// blocking, so a pump stalled on a lock previously lost notifications under
-/// sustained push traffic.
+/// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock entirely
+/// separate from `translator`'s own internal locks (`Arc<Translator>` has no
+/// outer mutex; each field manages its own short-lived, independent lock).
+/// Neither an in-flight LSP round-trip (e.g. `textDocument/diagnostic`) nor
+/// any other translator-side work holds the notification-cache lock, so this
+/// pump is never blocked by tool-call activity: a `publishDiagnostics`
+/// notification arriving mid-request is cached immediately instead of being
+/// silently dropped. This matters because the LSP transport forwards
+/// notifications via `mpsc::Sender::try_send`, which drops on a full channel
+/// rather than blocking — a pump stalled behind someone else's lock would
+/// previously lose notifications under sustained push traffic.
 pub(crate) async fn diagnostics_pump(
     _lang: String,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
