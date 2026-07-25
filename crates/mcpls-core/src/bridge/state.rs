@@ -11,6 +11,7 @@ use lsp_types::{
     TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
 };
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::time::Instant;
 use url::Url;
 
@@ -392,12 +393,7 @@ impl DocumentTracker {
             return Ok(Decision::unchanged(uri, current_version));
         }
 
-        self.check_file_size(size)?;
-        let fresh = fs::read_to_string(path).await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        self.check_file_size(fresh.len() as u64)?;
+        let (fresh, ..) = self.read_to_string_checked(path).await?;
         let snap = DiskSync {
             mtime,
             size,
@@ -430,30 +426,54 @@ impl DocumentTracker {
     /// sends `didOpen` regardless of which server calls next.
     async fn disk_phase_new(&mut self, path: &Path) -> Result<Decision> {
         let read_at = SystemTime::now();
-        let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        self.check_file_size(meta.len())?;
-        let mtime = meta.modified().ok();
-
-        let content = fs::read_to_string(path).await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+        let (content, mtime, size) = self.read_to_string_checked(path).await?;
 
         let uri = self.open(path.to_path_buf(), content)?;
         self.set_disk(
             path,
             DiskSync {
                 mtime,
-                size: meta.len(),
+                size,
                 mtime_settled: mtime_settled(mtime, read_at),
                 content_checked_at: Instant::now(),
             },
         );
 
         Ok(Decision::unchanged(uri, 1))
+    }
+
+    /// Reads `path` through a single open file handle, checking its size
+    /// against [`Self::check_file_size`] using that same handle's metadata
+    /// rather than a separately-stat'd size. Reading and size-checking
+    /// through one handle closes the TOCTOU window where an atomic replace
+    /// (e.g. a concurrent `rename`) between an earlier `metadata()` call and
+    /// a path-based read could let an oversized file bypass the pre-read
+    /// size gate.
+    ///
+    /// Returns the content along with the handle's own mtime and size, so
+    /// callers can build a [`DiskSync`] snapshot consistent with what was
+    /// actually read.
+    async fn read_to_string_checked(
+        &self,
+        path: &Path,
+    ) -> Result<(String, Option<SystemTime>, u64)> {
+        let mut file = fs::File::open(path).await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let meta = file.metadata().await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        self.check_file_size(meta.len())?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .await
+            .map_err(|e| Error::FileIo {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+        Ok((content, meta.modified().ok(), meta.len()))
     }
 
     /// Per-server sync phase of `ensure_open`: sends `didOpen`, `didChange`,
