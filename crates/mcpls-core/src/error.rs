@@ -5,9 +5,13 @@
 
 use std::path::PathBuf;
 
+use crate::config::{ServerId, ToolKind};
+
 /// Details of a single server spawn failure.
 #[derive(Debug, Clone)]
 pub struct ServerSpawnFailure {
+    /// Routing identity of the failed server.
+    pub server_id: ServerId,
     /// Language ID of the failed server.
     pub language_id: String,
     /// Command that was attempted.
@@ -20,8 +24,8 @@ impl std::fmt::Display for ServerSpawnFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} ({}): {}",
-            self.language_id, self.command, self.message
+            "{} [{}] ({}): {}",
+            self.server_id, self.language_id, self.command, self.message
         )
     }
 }
@@ -64,11 +68,26 @@ pub enum Error {
     #[error("no LSP server configured for language: {0}")]
     NoServerForLanguage(String),
 
+    /// A server is configured for the language, but no server claims this
+    /// specific tool (either no server lists it in `handles` and there is no
+    /// catch-all, or the server that claimed it failed to spawn with no live
+    /// catch-all to rebind to).
+    #[error("no server handles tool '{tool}' for language '{language_id}'")]
+    NoServerForTool {
+        /// Language ID the request was for.
+        language_id: String,
+        /// Tool that no server claims.
+        tool: ToolKind,
+    },
+
     /// LSP server for the language is configured but still initializing.
     #[error(
-        "LSP server for language '{0}' is still initializing (large project load in progress); wait and retry the request (this may take a few minutes on large projects)"
+        "LSP server '{server_id}' is still initializing (large project load in progress); wait and retry the request (this may take a few minutes on large projects)"
     )]
-    ServerInitializing(String),
+    ServerInitializing {
+        /// Routing identity of the server that has not yet registered.
+        server_id: ServerId,
+    },
 
     /// No LSP server is currently configured.
     #[error("no LSP server configured")]
@@ -325,19 +344,21 @@ mod tests {
     #[test]
     fn test_server_spawn_failure_display() {
         let failure = ServerSpawnFailure {
+            server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
             message: "No such file or directory".to_string(),
         };
         assert_eq!(
             failure.to_string(),
-            "rust (rust-analyzer): No such file or directory"
+            "rust [rust] (rust-analyzer): No such file or directory"
         );
     }
 
     #[test]
     fn test_server_spawn_failure_debug() {
         let failure = ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "command not found".to_string(),
@@ -351,6 +372,7 @@ mod tests {
     #[test]
     fn test_server_spawn_failure_clone() {
         let failure = ServerSpawnFailure {
+            server_id: ServerId::from("typescript"),
             language_id: "typescript".to_string(),
             command: "tsserver".to_string(),
             message: "failed to start".to_string(),
@@ -390,11 +412,13 @@ mod tests {
     fn test_error_all_servers_failed_with_failures() {
         let failures = vec![
             ServerSpawnFailure {
+                server_id: ServerId::from("rust"),
                 language_id: "rust".to_string(),
                 command: "rust-analyzer".to_string(),
                 message: "not found".to_string(),
             },
             ServerSpawnFailure {
+                server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
                 message: "permission denied".to_string(),
@@ -410,6 +434,7 @@ mod tests {
     #[test]
     fn test_error_partial_server_init_with_failures() {
         let failures = vec![ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "not found".to_string(),

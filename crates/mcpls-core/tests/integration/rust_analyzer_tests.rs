@@ -15,7 +15,7 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::Translator;
-use mcpls_core::config::LspServerConfig;
+use mcpls_core::config::{LspServerConfig, ServerId, ToolRouter};
 use mcpls_core::lsp::{LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -56,6 +56,8 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         initialization_options: None,
         timeout_seconds: 30,
         heuristics: None,
+        name: None,
+        handles: None,
     };
 
     let server_init_config = ServerInitConfig {
@@ -72,7 +74,12 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
     let client = server.client().clone();
 
     let extension_map = std::collections::HashMap::from([("rs".to_string(), "rust".to_string())]);
-    let mut translator = Translator::new().with_extensions(extension_map);
+    let mut translator = Translator::new()
+        .with_extensions(extension_map)
+        .with_router(ToolRouter::catch_all([(
+            ServerId::from("rust"),
+            "rust".to_string(),
+        )]));
     translator.set_workspace_roots(vec![workspace_path]);
     translator.register_client("rust".to_string(), client);
     translator.register_server("rust".to_string(), server);

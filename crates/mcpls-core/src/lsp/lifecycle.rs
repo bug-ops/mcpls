@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::{debug, info};
 
-use crate::config::LspServerConfig;
+use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
@@ -99,8 +99,8 @@ pub struct ServerInitConfig {
 /// ```
 #[derive(Debug)]
 pub struct ServerInitResult {
-    /// Successfully initialized servers (`language_id` -> server).
-    pub servers: HashMap<String, LspServer>,
+    /// Successfully initialized servers, keyed by routing identity.
+    pub servers: HashMap<ServerId, LspServer>,
     /// Failures that occurred during spawn attempts.
     pub failures: Vec<ServerSpawnFailure>,
 }
@@ -154,9 +154,9 @@ impl ServerInitResult {
 
     /// Add a successful server.
     ///
-    /// If a server with the same `language_id` already exists, it will be replaced.
-    pub fn add_server(&mut self, language_id: String, server: LspServer) {
-        self.servers.insert(language_id, server);
+    /// If a server with the same [`ServerId`] already exists, it will be replaced.
+    pub fn add_server(&mut self, id: impl Into<ServerId>, server: LspServer) {
+        self.servers.insert(id.into(), server);
     }
 
     /// Add a failure.
@@ -510,6 +510,7 @@ impl LspServer {
         let mut result = ServerInitResult::new();
 
         for config in configs {
+            let server_id = config.server_config.id();
             let language_id = config.server_config.language_id.clone();
             let command = config.server_config.command.clone();
 
@@ -517,18 +518,19 @@ impl LspServer {
                 Ok(server) => {
                     info!(
                         "Successfully spawned LSP server: {} ({})",
-                        language_id, command
+                        server_id, command
                     );
-                    result.add_server(language_id, server);
+                    result.add_server(server_id, server);
                 }
                 Err(e) => {
                     tracing::error!(
                         "Failed to spawn LSP server: {} ({}): {}",
-                        language_id,
+                        server_id,
                         command,
                         e
                     );
                     result.add_failure(ServerSpawnFailure {
+                        server_id,
                         language_id,
                         command,
                         message: e.to_string(),
@@ -653,6 +655,8 @@ mod tests {
                 initialization_options: Some(init_opts.clone()),
                 timeout_seconds: 10,
                 heuristics: None,
+                name: None,
+                handles: None,
             },
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
@@ -761,12 +765,14 @@ mod tests {
         let mut result = ServerInitResult::new();
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
             message: "not found".to_string(),
         });
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "permission denied".to_string(),
@@ -869,6 +875,7 @@ mod tests {
         result.add_server("rust".to_string(), server);
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "not found".to_string(),
@@ -1024,6 +1031,7 @@ mod tests {
         let mut result = ServerInitResult::new();
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
             message: "not found".to_string(),
@@ -1038,12 +1046,14 @@ mod tests {
         let mut result = ServerInitResult::new();
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "not found".to_string(),
         });
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("typescript"),
             language_id: "typescript".to_string(),
             command: "tsserver".to_string(),
             message: "command not found".to_string(),
@@ -1079,6 +1089,8 @@ mod tests {
                 initialization_options: None,
                 timeout_seconds: 10,
                 heuristics: None,
+                name: None,
+                handles: None,
             },
             workspace_roots: vec![],
             initialization_options: None,
@@ -1112,6 +1124,8 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1127,6 +1141,8 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1142,6 +1158,8 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1180,6 +1198,8 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1195,6 +1215,8 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1226,6 +1248,8 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1241,6 +1265,8 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1253,5 +1279,100 @@ mod tests {
         assert_eq!(result.failure_count(), 2);
         assert_eq!(result.failures[0].language_id, "test1");
         assert_eq!(result.failures[1].language_id, "test2");
+    }
+
+    /// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so
+    /// it can be registered without a real language server. Mirrors the
+    /// pattern already used by this module's other `LspServer`-literal
+    /// tests (e.g. `test_server_init_result_partial_success`).
+    fn fake_lsp_server() -> LspServer {
+        let mock_child = tokio::process::Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mock_stdin = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+        let mock_stdout = tokio::process::Command::new("echo")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
+        let (_, mock_notification_rx) = mpsc::channel(1);
+        LspServer {
+            client,
+            capabilities: lsp_types::ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            notification_rx: mock_notification_rx,
+            _child: mock_child,
+        }
+    }
+
+    /// #174 §8/S2 regression: `register_servers`'s diagnostics-cache flags
+    /// must be computed from the *rebound* router, not the pre-rebind view.
+    /// Sets up a `python` config where a narrow "diagnostics-only" server
+    /// (`pyright-diag`) is configured but never actually registers (as if
+    /// it failed to spawn), leaving only a catch-all (`pylsp`) live. Before
+    /// the fix, computing the flags from the pre-rebind router would resolve
+    /// `Diagnostics` to the dead `pyright-diag` for every survivor, so
+    /// `pylsp` would be flagged `false` and the diagnostics cache would go
+    /// silently dark for `python` despite a live server being available.
+    #[tokio::test]
+    async fn test_register_servers_computes_diagnostics_flags_from_rebound_router() {
+        use crate::bridge::Translator;
+        use crate::config::{ServerId, ToolKind, ToolRouter};
+
+        let pylsp_id = ServerId::from("pylsp");
+        let configs = vec![
+            LspServerConfig {
+                language_id: "python".to_string(),
+                command: "pyright-langserver".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+                name: Some("pyright-diag".to_string()),
+                handles: Some(vec![ToolKind::Diagnostics]),
+            },
+            LspServerConfig {
+                language_id: "python".to_string(),
+                command: "pylsp".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+                name: Some("pylsp".to_string()),
+                handles: None,
+            },
+        ];
+        let router = ToolRouter::from_configs(&configs).unwrap();
+        let translator = Translator::new().with_router(router);
+
+        // Only pylsp actually registers; pyright-diag never spawned.
+        let mut result = ServerInitResult::new();
+        result.add_server(pylsp_id.clone(), fake_lsp_server());
+
+        let registered = crate::register_servers(result, &translator);
+
+        assert_eq!(
+            registered.diagnostics_flags.get(&pylsp_id),
+            Some(&true),
+            "pylsp must inherit the diagnostics route once pyright-diag is \
+             known dead, and the flag must reflect that post-rebind state"
+        );
     }
 }

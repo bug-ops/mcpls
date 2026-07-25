@@ -40,12 +40,14 @@ pub mod lsp;
 pub mod mcp;
 pub mod transport;
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use bridge::resources::make_uri;
 use bridge::{NotificationCache, ResourceSubscriptions, Translator};
 pub use config::ServerConfig;
+use config::{ServerId, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
 use rmcp::model::ResourceUpdatedNotificationParam;
@@ -85,12 +87,13 @@ use transport::run_stdio;
 /// rather than blocking — a pump stalled behind someone else's lock would
 /// previously lose notifications under sustained push traffic.
 pub(crate) async fn diagnostics_pump(
-    _lang: String,
+    _server_id: String,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
     notification_cache: Arc<Mutex<NotificationCache>>,
     subs: Arc<ResourceSubscriptions>,
     peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    caches_diagnostics: bool,
 ) {
     loop {
         tokio::select! {
@@ -105,7 +108,17 @@ pub(crate) async fn diagnostics_pump(
                 let Some(notif) = msg else { break };
                 match notif {
                     LspNotification::PublishDiagnostics(p) => {
-                        // Always cache unconditionally.
+                        // Only the server the router resolves `Diagnostics` to for
+                        // this notification's language caches (and notifies
+                        // subscribers of) it -- see #174 §8. A server that was
+                        // never the diagnostics route, or lost it without a live
+                        // catch-all to rebind to, is not the authoritative source
+                        // for this language's diagnostics; skip publishing so it
+                        // doesn't overwrite (or spuriously notify about) another
+                        // server's cache entry.
+                        if !caches_diagnostics {
+                            continue;
+                        }
                         {
                             let mut cache = notification_cache.lock().await;
                             cache.store_diagnostics(&p.uri, p.version, p.diagnostics);
@@ -151,24 +164,60 @@ pub(crate) async fn diagnostics_pump(
     }
 }
 
-/// Register initialized LSP servers with the translator and extract notification receivers.
+/// Result of [`register_servers`]: everything the caller needs to start the
+/// per-server diagnostics pump tasks.
+pub(crate) struct RegisteredServers {
+    /// Notification receivers extracted from each server before registration.
+    pub(crate) receivers: HashMap<ServerId, tokio::sync::mpsc::Receiver<lsp::LspNotification>>,
+    /// Whether each server is the one the (rebound) router resolves
+    /// `ToolKind::Diagnostics` to for its language -- see #174 §8. Computed
+    /// here, right after the rebind, so it always reflects the post-rebind
+    /// router rather than a stale pre-rebind view.
+    pub(crate) diagnostics_flags: HashMap<ServerId, bool>,
+}
+
+/// Register initialized LSP servers with the translator, rebind the router to
+/// the set that actually registered, and extract notification receivers.
 ///
-/// Takes ownership of the `ServerInitResult`, extracts `notification_rx` from each server
-/// before registration, and returns a map of language-id to receiver for the pump tasks.
-fn register_servers(
+/// Takes ownership of the `ServerInitResult`, extracts `notification_rx` from
+/// each server before registration. Registration itself is a sequence of
+/// short, independently-locked map inserts (see `Translator`'s field docs),
+/// so no external synchronization is required here; the rebind that follows
+/// relies only on all of *this* function's inserts having completed, which
+/// the sequential code below guarantees.
+pub(crate) fn register_servers(
     mut result: lsp::ServerInitResult,
     translator: &bridge::Translator,
-) -> std::collections::HashMap<String, tokio::sync::mpsc::Receiver<lsp::LspNotification>> {
-    let mut receivers = std::collections::HashMap::new();
-    for (lang, server) in &mut result.servers {
-        receivers.insert(lang.clone(), server.take_notification_rx());
+) -> RegisteredServers {
+    let mut receivers = HashMap::new();
+    for (id, server) in &mut result.servers {
+        receivers.insert(id.clone(), server.take_notification_rx());
     }
-    for (language_id, server) in result.servers {
+
+    let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
+
+    let mut language_by_id = HashMap::new();
+    for (id, server) in result.servers {
         let client = server.client().clone();
-        translator.register_client(language_id.clone(), client);
-        translator.register_server(language_id.clone(), server);
+        language_by_id.insert(id.clone(), client.language_id().to_string());
+        translator.register_client(id.clone(), client);
+        translator.register_server(id, server);
     }
-    receivers
+
+    translator.rebind_router(&registered);
+
+    let diagnostics_flags = language_by_id
+        .into_iter()
+        .map(|(id, language)| {
+            let is_diagnostics_server = translator.is_diagnostics_route(&language, &id);
+            (id, is_diagnostics_server)
+        })
+        .collect();
+
+    RegisteredServers {
+        receivers,
+        diagnostics_flags,
+    }
 }
 
 /// Resolve workspace roots from config or current directory.
@@ -248,7 +297,10 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 /// Returns an error if:
 /// - All LSP servers fail to initialize
 /// - The MCP server or transport fails to start
-/// - Configuration is invalid
+/// - Configuration is invalid, including two applicable `[[lsp_servers]]`
+///   entries whose per-tool routing is ambiguous in this workspace (shared
+///   routing identity, two catch-alls, or the same tool claimed by both) --
+///   see `config::ToolRouter::from_configs`
 ///
 /// # DNS rebinding protection (HTTP transport)
 ///
@@ -280,9 +332,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
-    let mut translator = Translator::new().with_extensions(extension_map);
-    translator.set_workspace_roots(workspace_roots.clone());
-
     let applicable_configs: Vec<ServerInitConfig> = config
         .lsp_servers
         .iter()
@@ -313,14 +362,25 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         applicable_configs.len()
     );
 
-    // Mark applicable languages as "expected" so a tool call that arrives while
+    // Built over the applicable (post-heuristics) configs only: this is where
+    // #174's workspace-scoped routing rules (duplicate ServerId, conflicting
+    // `handles` claims) are enforced -- a startup error naming the
+    // conflicting `[[lsp_servers]]` entries, not a silent drop.
+    let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
+
+    let mut translator = Translator::new()
+        .with_extensions(extension_map)
+        .with_router(router);
+    translator.set_workspace_roots(workspace_roots.clone());
+
+    // Mark applicable servers as "expected" so a tool call that arrives while
     // its server is still initializing gets a clear "still initializing" error
     // (instead of "no server configured"), telling the caller to wait and retry.
-    let expected_languages: std::collections::HashSet<String> = applicable_configs
+    let expected_servers: HashSet<ServerId> = applicable_configs
         .iter()
-        .map(|c| c.server_config.language_id.clone())
+        .map(|c| c.server_config.id())
         .collect();
-    translator.set_expected_languages(expected_languages);
+    translator.set_expected_servers(expected_servers);
 
     // Shared state, built BEFORE LSP initialization so the MCP server can answer
     // `initialize` immediately. LSP servers (which can take minutes to initialize
@@ -395,7 +455,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 /// servers (e.g. `OmniSharp` on a large Unity solution, which can take minutes to
 /// load) finish initializing. Tool calls that arrive before a server has
 /// registered return a `ServerInitializing` error telling the caller to wait and
-/// retry. If every server fails, the "expected languages" set is cleared so those
+/// retry. If every server fails, the "expected servers" set is cleared so those
 /// calls fall back to a plain "no server configured" error instead.
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
@@ -416,8 +476,14 @@ fn spawn_lsp_servers_background(
             for failure in &result.failures {
                 error!("Server initialization failed: {}", failure);
             }
-            // No server will register; stop reporting "still initializing".
-            translator.clear_expected_languages();
+            // No server will register: rebind against an empty registered
+            // set so every route drops (one rule, no special case -- see
+            // `ToolRouter::rebind_to_registered`), then stop reporting
+            // "still initializing". This path returns before
+            // `register_servers` ever runs, so it needs its own rebind call;
+            // skipping it would leave every route pointed at a dead server.
+            translator.rebind_router(&HashSet::new());
+            translator.clear_expected_servers();
             return;
         }
 
@@ -433,24 +499,30 @@ fn spawn_lsp_servers_background(
         }
 
         let server_count = result.server_count();
-        let notification_receivers = register_servers(result, &translator);
+        let registered = register_servers(result, &translator);
         // Background initialization has completed; stop reporting "still
-        // initializing" (especially for languages whose server failed to
-        // spawn on partial success, which would otherwise return
-        // ServerInitializing forever instead of NoServerForLanguage).
-        translator.clear_expected_languages();
+        // initializing" (especially for servers that failed to spawn on
+        // partial success, which would otherwise return ServerInitializing
+        // forever instead of NoServerForLanguage/Tool).
+        translator.clear_expected_servers();
         info!("Proceeding with {} LSP server(s)", server_count);
 
         // Start diagnostics pump tasks now that servers are registered.
         let mut pumps: JoinSet<()> = JoinSet::new();
-        for (lang, rx) in notification_receivers {
+        for (id, rx) in registered.receivers {
+            let caches_diagnostics = registered
+                .diagnostics_flags
+                .get(&id)
+                .copied()
+                .unwrap_or(false);
             pumps.spawn(diagnostics_pump(
-                lang,
+                id.to_string(),
                 rx,
                 Arc::clone(&notification_cache),
                 Arc::clone(&subscriptions),
                 Arc::clone(&peer_cell),
                 cancel_rx.clone(),
+                caches_diagnostics,
             ));
         }
         while pumps.join_next().await.is_some() {}
@@ -589,11 +661,13 @@ mod tests {
         fn test_all_servers_failed_error_handling() {
             let mut result = ServerInitResult::new();
             result.add_failure(ServerSpawnFailure {
+                server_id: ServerId::from("rust"),
                 language_id: "rust".to_string(),
                 command: "rust-analyzer".to_string(),
                 message: "not found".to_string(),
             });
             result.add_failure(ServerSpawnFailure {
+                server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
                 message: "not found".to_string(),
@@ -612,6 +686,7 @@ mod tests {
             // Simulate one success and one failure
             result.servers = HashMap::new(); // Would have a real server in production
             result.add_failure(ServerSpawnFailure {
+                server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
                 message: "not found".to_string(),
@@ -638,11 +713,13 @@ mod tests {
         fn test_all_servers_failed_to_init_error() {
             let failures = vec![
                 ServerSpawnFailure {
+                    server_id: ServerId::from("rust"),
                     language_id: "rust".to_string(),
                     command: "rust-analyzer".to_string(),
                     message: "command not found".to_string(),
                 },
                 ServerSpawnFailure {
+                    server_id: ServerId::from("python"),
                     language_id: "python".to_string(),
                     command: "pyright".to_string(),
                     message: "permission denied".to_string(),
@@ -680,6 +757,7 @@ mod tests {
         #[test]
         fn test_server_spawn_failure_display() {
             let failure = ServerSpawnFailure {
+                server_id: ServerId::from("typescript"),
                 language_id: "typescript".to_string(),
                 command: "tsserver".to_string(),
                 message: "executable not found in PATH".to_string(),
@@ -702,6 +780,7 @@ mod tests {
 
             // Add a failure
             result.add_failure(ServerSpawnFailure {
+                server_id: ServerId::from("go"),
                 language_id: "go".to_string(),
                 command: "gopls".to_string(),
                 message: "error".to_string(),
@@ -741,6 +820,8 @@ mod tests {
                     initialization_options: None,
                     timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 }],
             };
 
@@ -839,6 +920,7 @@ mod tests {
                 Arc::clone(&subs),
                 Arc::clone(&peer_cell),
                 cancel_rx,
+                true,
             ));
 
             let uri: Uri = "file:///test/main.rs".parse().unwrap();
@@ -888,6 +970,7 @@ mod tests {
                 subs,
                 peer_cell,
                 cancel_rx,
+                true,
             ));
 
             cancel_tx.send(true).unwrap();
@@ -914,6 +997,7 @@ mod tests {
                 subs,
                 peer_cell,
                 cancel_rx,
+                true,
             ));
 
             drop(cancel_tx); // triggers Err in cancel_rx.changed()
@@ -955,6 +1039,7 @@ mod tests {
                 subs,
                 peer_cell,
                 cancel_rx,
+                true,
             ));
 
             let uri: Uri = "file:///test/locked.rs".parse().unwrap();

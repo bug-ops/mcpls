@@ -6,6 +6,8 @@ use std::path::Path;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
+use super::routing::{ServerId, ToolKind};
+
 /// Default max depth for recursive marker search.
 pub const DEFAULT_HEURISTICS_MAX_DEPTH: usize = 10;
 
@@ -176,6 +178,24 @@ pub struct LspServerConfig {
     /// If not specified, the server will always attempt to spawn.
     #[serde(default)]
     pub heuristics: Option<ServerHeuristics>,
+
+    /// Human-readable server identity used as the routing key.
+    ///
+    /// Defaults to `language_id` when omitted (see [`Self::id`]). Must be
+    /// unique across all applicable servers in a workspace, regardless of
+    /// language: this is what lets two servers share one `language_id`
+    /// (e.g. pyright and pylsp both for `python`) without one silently
+    /// overwriting the other in the maps keyed by [`ServerId`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Tools this server handles.
+    ///
+    /// `None` means this server is a catch-all: it serves every tool not
+    /// explicitly claimed by another server for the same language.
+    /// `Some(list)` restricts the server to exactly those tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handles: Option<Vec<ToolKind>>,
 }
 
 const fn default_timeout() -> u64 {
@@ -198,6 +218,18 @@ impl LspServerConfig {
             .is_none_or(|h| h.is_applicable_recursive(workspace_root, max_depth))
     }
 
+    /// The routing identity of this server: `name` if set, otherwise `language_id`.
+    ///
+    /// This is the key used across `Translator`'s client/server maps, so two
+    /// servers for the same language must set distinct `name`s or they
+    /// collide (see `ToolRouter::from_configs` for the enforcement).
+    #[must_use]
+    pub fn id(&self) -> ServerId {
+        self.name
+            .clone()
+            .map_or_else(|| ServerId::from(self.language_id.clone()), ServerId::from)
+    }
+
     /// Create a default configuration for rust-analyzer.
     #[must_use]
     pub fn rust_analyzer() -> Self {
@@ -213,6 +245,8 @@ impl LspServerConfig {
                 "Cargo.toml",
                 "rust-toolchain.toml",
             ])),
+            name: None,
+            handles: None,
         }
     }
 
@@ -233,6 +267,8 @@ impl LspServerConfig {
                 "requirements.txt",
                 "pyrightconfig.json",
             ])),
+            name: None,
+            handles: None,
         }
     }
 
@@ -252,6 +288,8 @@ impl LspServerConfig {
                 "tsconfig.json",
                 "jsconfig.json",
             ])),
+            name: None,
+            handles: None,
         }
     }
 
@@ -267,6 +305,8 @@ impl LspServerConfig {
             initialization_options: None,
             timeout_seconds: default_timeout(),
             heuristics: Some(ServerHeuristics::with_markers(["go.mod", "go.sum"])),
+            name: None,
+            handles: None,
         }
     }
 
@@ -292,6 +332,8 @@ impl LspServerConfig {
                 "Makefile",
                 ".clangd",
             ])),
+            name: None,
+            handles: None,
         }
     }
 
@@ -310,6 +352,8 @@ impl LspServerConfig {
                 "build.zig",
                 "build.zig.zon",
             ])),
+            name: None,
+            handles: None,
         }
     }
 }
@@ -379,6 +423,8 @@ mod tests {
             initialization_options: Some(serde_json::json!({"key": "value"})),
             timeout_seconds: 60,
             heuristics: None,
+            name: None,
+            handles: None,
         };
 
         assert_eq!(config.language_id, "custom");
@@ -485,6 +531,8 @@ mod tests {
             initialization_options: None,
             timeout_seconds: 30,
             heuristics: None,
+            name: None,
+            handles: None,
         };
 
         let tmp = TempDir::new().unwrap();

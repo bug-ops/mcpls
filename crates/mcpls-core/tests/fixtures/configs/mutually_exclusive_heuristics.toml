@@ -1,0 +1,25 @@
+# Two servers for one language whose `heuristics.project_markers` never
+# both match in the same workspace (#174 §5 / S3 regression). This must load
+# and start successfully: the workspace-scoped duplicate-ServerId /
+# duplicate-catch-all rules only apply to servers that are *both* applicable
+# in a given workspace, and at most one of these ever is.
+[workspace]
+roots = []
+
+[[lsp_servers]]
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+file_patterns = ["**/*.py"]
+
+[lsp_servers.heuristics]
+project_markers = ["pyrightconfig.json"]
+
+[[lsp_servers]]
+language_id = "python"
+command = "pylsp"
+args = []
+file_patterns = ["**/*.py"]
+
+[lsp_servers.heuristics]
+project_markers = ["setup.cfg"]

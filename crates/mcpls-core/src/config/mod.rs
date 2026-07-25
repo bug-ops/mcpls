@@ -3,11 +3,15 @@
 //! This module provides configuration structures for MCPLS,
 //! including LSP server definitions and workspace settings.
 
+mod language;
+mod routing;
 mod server;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub use language::{base_language_id, react_variant_language_id};
+pub use routing::{ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, ServerHeuristics};
 
@@ -143,12 +147,9 @@ fn extract_extension_from_pattern(pattern: &str) -> Option<String> {
 }
 
 fn language_id_for_pattern_extension(server_language_id: &str, extension: &str) -> String {
-    match (server_language_id, extension) {
-        ("javascript", "jsx") => "javascriptreact",
-        ("typescript", "tsx") => "typescriptreact",
-        _ => server_language_id,
-    }
-    .to_string()
+    react_variant_language_id(server_language_id, extension)
+        .unwrap_or(server_language_id)
+        .to_string()
 }
 
 fn default_position_encodings() -> Vec<String> {
@@ -399,7 +400,17 @@ impl ServerConfig {
     }
 
     /// Validate the configuration.
+    ///
+    /// This covers only workspace-*independent* rules — checks that hold
+    /// regardless of which servers end up applicable in a given workspace.
+    /// Workspace-scoped routing rules (duplicate `ServerId`, conflicting
+    /// `handles` claims across applicable servers) are enforced later, by
+    /// `ToolRouter::from_configs` over the post-heuristics config subset in
+    /// `serve_with` — see that function's module docs for why the split
+    /// exists (two servers for one language with mutually exclusive
+    /// `heuristics` is a legitimate config that must still load here).
     fn validate(&self) -> Result<()> {
+        let mut seen_names: HashMap<&str, &str> = HashMap::new();
         for server in &self.lsp_servers {
             if server.language_id.is_empty() {
                 return Err(Error::InvalidConfig(
@@ -411,6 +422,46 @@ impl ServerConfig {
                     "command cannot be empty for language '{}'",
                     server.language_id
                 )));
+            }
+            if let Some(name) = &server.name {
+                if name.is_empty() {
+                    return Err(Error::InvalidConfig(format!(
+                        "name cannot be empty for language '{}' (omit `name` to default to \
+                         the language id)",
+                        server.language_id
+                    )));
+                }
+                if let Some(prev_language) = seen_names.insert(name.as_str(), &server.language_id) {
+                    // Not a hard error here: whether this is actually ambiguous
+                    // depends on which of these servers end up applicable in a
+                    // given workspace, which this function cannot know. The
+                    // workspace-scoped check in `ToolRouter::from_configs` is
+                    // authoritative.
+                    tracing::warn!(
+                        "duplicate explicit server name '{name}' in config (language ids: \
+                         '{prev_language}', '{}'); this is only an error if both entries are \
+                         applicable in the same workspace",
+                        server.language_id
+                    );
+                }
+            }
+            if let Some(handles) = &server.handles {
+                if handles.is_empty() {
+                    return Err(Error::InvalidConfig(format!(
+                        "handles cannot be empty for language '{}' (omit `handles` for a \
+                         catch-all server)",
+                        server.language_id
+                    )));
+                }
+                let mut seen_tools = HashSet::new();
+                for tool in handles {
+                    if !seen_tools.insert(*tool) {
+                        return Err(Error::InvalidConfig(format!(
+                            "duplicate tool '{tool}' in `handles` for language '{}'",
+                            server.language_id
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -556,6 +607,106 @@ mod tests {
         } else {
             panic!("Expected InvalidConfig error");
         }
+    }
+
+    #[test]
+    fn test_validate_empty_name() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            name = ""
+            language_id = "python"
+            command = "pyright-langserver"
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_err());
+
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("name cannot be empty"));
+        } else {
+            panic!("Expected InvalidConfig error");
+        }
+    }
+
+    #[test]
+    fn test_validate_empty_handles() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = "python"
+            command = "pylsp"
+            handles = []
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_err());
+
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("handles cannot be empty"));
+        } else {
+            panic!("Expected InvalidConfig error");
+        }
+    }
+
+    #[test]
+    fn test_validate_duplicate_tool_in_handles() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = "python"
+            command = "pylsp"
+            handles = ["diagnostics", "diagnostics"]
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_err());
+
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("duplicate tool"));
+            assert!(msg.contains("diagnostics"));
+        } else {
+            panic!("Expected InvalidConfig error");
+        }
+    }
+
+    #[test]
+    fn test_validate_duplicate_name_warns_but_loads() {
+        // Duplicate explicit `name` is only an error if both entries end up
+        // applicable in the same workspace (enforced later by
+        // `ToolRouter::from_configs`, see routing.rs); at load time it must
+        // still succeed.
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            name = "dup"
+            language_id = "python"
+            command = "pyright-langserver"
+
+            [[lsp_servers]]
+            name = "dup"
+            language_id = "typescript"
+            command = "typescript-language-server"
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "duplicate name must only warn at load time");
     }
 
     #[test]
@@ -747,6 +898,8 @@ mod tests {
                 initialization_options: None,
                 timeout_seconds: 30,
                 heuristics: None,
+                name: None,
+                handles: None,
             }],
         };
 
@@ -768,6 +921,8 @@ mod tests {
                 initialization_options: None,
                 timeout_seconds: 30,
                 heuristics: None,
+                name: None,
+                handles: None,
             }],
         };
 
@@ -789,6 +944,8 @@ mod tests {
                 initialization_options: None,
                 timeout_seconds: 30,
                 heuristics: None,
+                name: None,
+                handles: None,
             }],
         };
 
@@ -810,6 +967,8 @@ mod tests {
                 initialization_options: None,
                 timeout_seconds: 30,
                 heuristics: None,
+                name: None,
+                handles: None,
             }],
         };
 

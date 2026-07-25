@@ -23,6 +23,7 @@ use tokio::time::Duration;
 use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DiagnosticInfo, DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
+use crate::config::{ServerId, ToolKind, ToolRouter, base_language_id};
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer};
 
@@ -55,11 +56,11 @@ fn lock_std<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
 /// `TODO(critic-S2)` there for why that is bounded and out of scope here.
 #[derive(Debug)]
 pub struct Translator {
-    /// LSP clients indexed by language ID. Locked only for the map
+    /// LSP clients indexed by routing identity. Locked only for the map
     /// lookup/insert itself, never across an LSP request.
-    lsp_clients: Arc<StdMutex<HashMap<String, LspClient>>>,
-    /// LSP servers indexed by language ID (held for lifetime management).
-    lsp_servers: Arc<StdMutex<HashMap<String, LspServer>>>,
+    lsp_clients: Arc<StdMutex<HashMap<ServerId, LspClient>>>,
+    /// LSP servers indexed by routing identity (held for lifetime management).
+    lsp_servers: Arc<StdMutex<HashMap<ServerId, LspServer>>>,
     /// Document state tracker. Locked only for `ensure_open`.
     document_tracker: Arc<AsyncMutex<DocumentTracker>>,
     /// Allowed workspace roots for path validation. Read-only after `serve()`
@@ -68,14 +69,22 @@ pub struct Translator {
     /// Custom file extension to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
     extension_map: Arc<HashMap<String, String>>,
-    /// Languages that are configured + applicable but whose LSP server may not
-    /// have finished initializing yet (background init). Used to return a clear
-    /// "still initializing" error instead of "no server configured".
-    expected_languages: Arc<StdMutex<HashSet<String>>>,
+    /// Servers that are configured + applicable but may not have finished
+    /// initializing yet (background init). Used to return a clear "still
+    /// initializing" error instead of "no server configured".
+    expected_servers: Arc<StdMutex<HashSet<ServerId>>>,
+    /// Per-tool routing table: resolves `(language, tool)` to a `ServerId`.
+    /// Locked independently so `rebind_router` (called from a background
+    /// task once registration completes) never contends with an in-flight
+    /// LSP round trip.
+    router: Arc<StdMutex<ToolRouter>>,
 }
 
 impl Translator {
     /// Create a new translator.
+    ///
+    /// Starts with an empty router: nothing is routable until [`Self::with_router`]
+    /// installs one, which matches having no servers registered.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -87,7 +96,8 @@ impl Translator {
             ))),
             workspace_roots: Arc::new(Vec::new()),
             extension_map: Arc::new(HashMap::new()),
-            expected_languages: Arc::new(StdMutex::new(HashSet::new())),
+            expected_servers: Arc::new(StdMutex::new(HashSet::new())),
+            router: Arc::new(StdMutex::new(ToolRouter::default())),
         }
     }
 
@@ -99,15 +109,43 @@ impl Translator {
         self.workspace_roots = Arc::new(roots);
     }
 
-    /// Mark the set of languages whose LSP servers are expected (configured +
-    /// applicable) but may still be initializing in the background.
-    pub fn set_expected_languages(&self, languages: HashSet<String>) {
-        *lock_std(&self.expected_languages) = languages;
+    /// Mark the set of servers that are expected (configured + applicable)
+    /// but may still be initializing in the background.
+    pub fn set_expected_servers(&self, servers: HashSet<ServerId>) {
+        *lock_std(&self.expected_servers) = servers;
     }
 
-    /// Clear the expected-languages set (e.g. after background init failed).
-    pub fn clear_expected_languages(&self) {
-        lock_std(&self.expected_languages).clear();
+    /// Clear the expected-servers set (e.g. after background init failed).
+    pub fn clear_expected_servers(&self) {
+        lock_std(&self.expected_servers).clear();
+    }
+
+    /// Install the per-tool routing table built from the applicable configs.
+    ///
+    /// Only called during single-owner setup, before the translator is
+    /// shared, so this replaces the `Arc`-wrapped router wholesale.
+    #[must_use]
+    pub fn with_router(mut self, router: ToolRouter) -> Self {
+        self.router = Arc::new(StdMutex::new(router));
+        self
+    }
+
+    /// Rebind the routing table to the set of servers that actually
+    /// registered, dropping or redirecting routes to servers that failed to
+    /// spawn. See `ToolRouter::rebind_to_registered` for the full semantics.
+    pub fn rebind_router(&self, registered: &HashSet<ServerId>) {
+        lock_std(&self.router).rebind_to_registered(registered);
+    }
+
+    /// Whether `id` is the server the router currently resolves
+    /// `ToolKind::Diagnostics` to for `language_id`.
+    ///
+    /// Purpose-built for `register_servers`, which needs this to compute the
+    /// diagnostics-cache filter passed into each pump task, without exposing
+    /// the router's lock guard outside this module.
+    #[must_use]
+    pub fn is_diagnostics_route(&self, language_id: &str, id: &ServerId) -> bool {
+        lock_std(&self.router).resolve(language_id, ToolKind::Diagnostics) == Some(id)
     }
 
     /// Configure custom file extension mappings.
@@ -127,20 +165,20 @@ impl Translator {
         self
     }
 
-    /// Register an LSP client for a language.
+    /// Register an LSP client under its routing identity.
     // TODO(critic-M1): currently only called once from `register_servers`
     // during background init, so this can't race a restart. If server
-    // restart/supervision is ever added, the corresponding language's
+    // restart/supervision is ever added, the corresponding server's
     // `document_tracker` state must also be reset here — otherwise
     // `ensure_open` believes documents are already open on the new process
     // and sends `didChange` instead of `didOpen`, desyncing the server.
-    pub fn register_client(&self, language_id: String, client: LspClient) {
-        lock_std(&self.lsp_clients).insert(language_id, client);
+    pub fn register_client(&self, id: impl Into<ServerId>, client: LspClient) {
+        lock_std(&self.lsp_clients).insert(id.into(), client);
     }
 
-    /// Register an LSP server for a language.
-    pub fn register_server(&self, language_id: String, server: LspServer) {
-        lock_std(&self.lsp_servers).insert(language_id, server);
+    /// Register an LSP server under its routing identity.
+    pub fn register_server(&self, id: impl Into<ServerId>, server: LspServer) {
+        lock_std(&self.lsp_servers).insert(id.into(), server);
     }
 
     /// Snapshot of currently open document paths, used for MCP resource listing.
@@ -622,77 +660,103 @@ impl Translator {
         validate_path_against_roots(path, &self.workspace_roots)
     }
 
-    /// Get a cloned LSP client for a file path based on language detection.
+    /// Resolve the server that should handle `tool` for the file at `path`,
+    /// returning both its routing identity and a cloned client.
     ///
-    /// Locks `lsp_clients` (and, on the not-found path, `expected_languages`)
-    /// only for the map lookup itself — both guards are dropped before this
-    /// method returns.
-    fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
-        let language_id = detect_language(path, &self.extension_map);
-        let server_language_id = Self::server_language_id_for_document(&language_id);
+    /// Tries the file's detected language first, then (if that has no route)
+    /// its React base language (`.tsx` falling back from `typescriptreact` to
+    /// `typescript`, and similarly for `.jsx`) -- in that order, so an
+    /// explicit `typescriptreact` server still wins over the `typescript`
+    /// fallback when both are configured.
+    ///
+    /// Locks `router`, `lsp_clients`, and (on the not-yet-registered path)
+    /// `expected_servers` only for their respective lookups — every guard is
+    /// dropped before this method returns.
+    fn get_client_for_file(&self, path: &Path, tool: ToolKind) -> Result<(ServerId, LspClient)> {
+        let language = detect_language(path, &self.extension_map);
+        let mut candidates: Vec<&str> = vec![language.as_str()];
+        if let Some(base) = base_language_id(&language) {
+            candidates.push(base);
+        }
 
-        let found = {
-            let clients = lock_std(&self.lsp_clients);
-            clients
-                .get(&language_id)
-                .or_else(|| server_language_id.and_then(|id| clients.get(id)))
-                .cloned()
+        for lang in &candidates {
+            let resolved = lock_std(&self.router).resolve(lang, tool).cloned();
+            let Some(id) = resolved else { continue };
+
+            let found = lock_std(&self.lsp_clients).get(&id).cloned();
+            if let Some(client) = found {
+                return Ok((id, client));
+            }
+            // A route naming a server that is still initializing (e.g. a
+            // large Unity solution loading via OmniSharp) -- tell the caller
+            // to wait and retry rather than implying no server is configured.
+            if lock_std(&self.expected_servers).contains(&id) {
+                return Err(Error::ServerInitializing { server_id: id });
+            }
+            // Unreachable once registration has rebound the router
+            // (`Translator::rebind_router`) -- a route can only name a
+            // registered server after that point. Logged rather than
+            // `debug_assert!`-panicked: this method is reachable by any
+            // library consumer calling `with_router` without registering
+            // matching clients, not just internal misuse.
+            tracing::error!(
+                "router route names server '{id}' for tool '{tool}' that is neither \
+                 registered nor expected"
+            );
+            return Err(Error::NoServerForTool {
+                language_id: (*lang).to_string(),
+                tool,
+            });
+        }
+
+        let has_language = {
+            let router = lock_std(&self.router);
+            candidates.iter().any(|lang| router.has_language(lang))
         };
-        if let Some(client) = found {
-            return Ok(client);
-        }
-
-        // A configured+applicable language whose server has not registered
-        // yet is still initializing (e.g. a large Unity solution loading via
-        // OmniSharp); tell the caller to wait and retry rather than implying
-        // no server is configured at all.
-        let expected = lock_std(&self.expected_languages);
-        if expected.contains(&language_id)
-            || server_language_id.is_some_and(|id| expected.contains(id))
-        {
-            Err(Error::ServerInitializing(language_id))
+        if has_language {
+            Err(Error::NoServerForTool {
+                language_id: language,
+                tool,
+            })
         } else {
-            Err(Error::NoServerForLanguage(language_id))
-        }
-    }
-
-    fn server_language_id_for_document(language_id: &str) -> Option<&'static str> {
-        match language_id {
-            "javascriptreact" => Some("javascript"),
-            "typescriptreact" => Some("typescript"),
-            _ => None,
+            Err(Error::NoServerForLanguage(language))
         }
     }
 
     /// Resolve the LSP client and ensure the document is open.
     ///
     /// This is the "prepare" phase shared by every LSP-round-trip handler:
-    /// it validates the path, selects the client, and locks the document
-    /// tracker only for `ensure_open`. The returned client and URI are owned
-    /// values, so the caller can issue the actual LSP request (the "execute"
-    /// phase) without holding any lock across the network round trip — that
-    /// is the lock this function's callers care about, and it is always
-    /// released before this function returns.
+    /// it validates the path, selects the client via [`Self::get_client_for_file`],
+    /// and locks the document tracker only for `ensure_open`. The returned
+    /// client and URI are owned values, so the caller can issue the actual
+    /// LSP request (the "execute" phase) without holding any lock across the
+    /// network round trip — that is the lock this function's callers care
+    /// about, and it is always released before this function returns.
     ///
     /// The `document_tracker` lock itself, however, is held across
     /// `ensure_open`'s own awaits (a `stat`, optionally a re-read of the
-    /// file, and the `textDocument/didOpen` notify), and that lock is
-    /// shared by every language and every path. In the common case this is
-    /// bounded by the 250ms disk-check debounce, but it is not per-path.
+    /// file, and the `textDocument/didOpen`/`didChange` notify), and that
+    /// lock is shared by every language and every path. In the common case
+    /// this is bounded by the 250ms disk-check debounce, but it is not
+    /// per-path.
     // TODO(critic-S2): scope this lock per path (e.g. a keyed mutex) so a
     // wedged language server's `notify(...)` — a bounded-channel send with
     // no timeout — can't stall `ensure_open` for unrelated files/languages.
     // Preserve the anti-duplicate-`didOpen` invariant documented on
     // `ensure_open` if this changes.
-    async fn prepare_document(&self, file_path: &str) -> Result<(LspClient, lsp_types::Uri)> {
+    async fn prepare_document(
+        &self,
+        file_path: &str,
+        tool: ToolKind,
+    ) -> Result<(LspClient, lsp_types::Uri)> {
         let path = PathBuf::from(file_path);
         let validated_path = self.validate_path(&path)?;
-        let client = self.get_client_for_file(&validated_path)?;
+        let (server_id, client) = self.get_client_for_file(&validated_path, tool)?;
         let uri = self
             .document_tracker
             .lock()
             .await
-            .ensure_open(&validated_path, &client)
+            .ensure_open(&validated_path, &server_id, &client)
             .await?;
         Ok((client, uri))
     }
@@ -746,7 +810,7 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<HoverResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self.prepare_document(&file_path, ToolKind::Hover).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspHoverParams {
@@ -788,7 +852,9 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<DefinitionResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::Definition)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = GotoDefinitionParams {
@@ -843,7 +909,9 @@ impl Translator {
         character: u32,
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::References)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = ReferenceParams {
@@ -884,7 +952,9 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails or the file cannot be opened.
     pub async fn handle_diagnostics(&self, file_path: String) -> Result<DiagnosticsResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::Diagnostics)
+            .await?;
 
         let params = diagnostic_request_params(TextDocumentIdentifier { uri });
 
@@ -941,7 +1011,7 @@ impl Translator {
         character: u32,
         new_name: String,
     ) -> Result<RenameResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self.prepare_document(&file_path, ToolKind::Rename).await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspRenameParams {
@@ -1031,7 +1101,9 @@ impl Translator {
         character: u32,
         trigger: Option<String>,
     ) -> Result<CompletionsResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::Completions)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
@@ -1087,7 +1159,9 @@ impl Translator {
         &self,
         file_path: String,
     ) -> Result<DocumentSymbolsResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::DocumentSymbols)
+            .await?;
 
         let params = DocumentSymbolParams {
             text_document: TextDocumentIdentifier { uri },
@@ -1131,7 +1205,9 @@ impl Translator {
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::FormatDocument)
+            .await?;
 
         let params = DocumentFormattingParams {
             text_document: TextDocumentIdentifier { uri },
@@ -1223,17 +1299,21 @@ impl Translator {
             )));
         }
 
-        // Workspace search requires at least one LSP client. If none are
-        // registered yet but a configured server is still initializing, tell the
-        // caller to wait and retry rather than implying nothing is configured.
-        let found_client = lock_std(&self.lsp_clients).values().next().cloned();
-        let client = found_client.ok_or_else(|| {
-            lock_std(&self.expected_languages)
-                .iter()
-                .next()
-                .map_or(Error::NoServerConfigured, |lang| {
-                    Error::ServerInitializing(lang.clone())
-                })
+        // Workspace search has no document, so it resolves via `resolve_any`
+        // rather than a per-language route. If the resolved server is not
+        // registered yet but is expected, tell the caller to wait and retry
+        // rather than implying nothing is configured.
+        let server_id = lock_std(&self.router)
+            .resolve_any(ToolKind::WorkspaceSymbols)
+            .cloned()
+            .ok_or(Error::NoServerConfigured)?;
+        let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
+        let client = client.ok_or_else(|| {
+            if lock_std(&self.expected_servers).contains(&server_id) {
+                Error::ServerInitializing { server_id }
+            } else {
+                Error::NoServerConfigured
+            }
         })?;
 
         let params = LspWorkspaceSymbolParams {
@@ -1294,7 +1374,9 @@ impl Translator {
             kind_filter.as_deref(),
         )?;
 
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::CodeActions)
+            .await?;
 
         let range = lsp_types::Range {
             start: mcp_to_lsp_position(start_line, start_character),
@@ -1378,7 +1460,9 @@ impl Translator {
             )));
         }
 
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::CallHierarchy)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspCallHierarchyPrepareParams {
@@ -1420,9 +1504,13 @@ impl Translator {
         // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
         let lsp_item = mcp_item_to_lsp(item)?;
 
-        // Parse and validate the URI
+        // Parse and validate the URI. Resolved with the same ToolKind as
+        // `handle_call_hierarchy_prepare` -- the opaque item this call
+        // receives is only meaningful to the server that produced it, and
+        // that server is guaranteed to be the same one `prepare` synced the
+        // document to since both resolve via the same (language, tool) route.
         let path = self.parse_file_uri(&lsp_item.uri)?;
-        let client = self.get_client_for_file(&path)?;
+        let (_server_id, client) = self.get_client_for_file(&path, ToolKind::CallHierarchy)?;
 
         let params = CallHierarchyIncomingCallsParams {
             item: lsp_item,
@@ -1469,9 +1557,10 @@ impl Translator {
         // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
         let lsp_item = mcp_item_to_lsp(item)?;
 
-        // Parse and validate the URI
+        // Parse and validate the URI. Same ToolKind/route as `prepare` and
+        // `handle_incoming_calls` -- see that function's comment.
         let path = self.parse_file_uri(&lsp_item.uri)?;
-        let client = self.get_client_for_file(&path)?;
+        let (_server_id, client) = self.get_client_for_file(&path, ToolKind::CallHierarchy)?;
 
         let params = CallHierarchyOutgoingCallsParams {
             item: lsp_item,
@@ -1638,7 +1727,9 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<SignatureHelpResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::SignatureHelp)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspSignatureHelpParams {
@@ -1705,7 +1796,9 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::Implementation)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = GotoDefinitionParams {
@@ -1741,7 +1834,9 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::TypeDefinition)
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = GotoDefinitionParams {
@@ -1781,7 +1876,9 @@ impl Translator {
     ) -> Result<InlayHintsResult> {
         use crate::bridge::encoding::lsp_to_mcp_position;
 
-        let (client, uri) = self.prepare_document(&file_path).await?;
+        let (client, uri) = self
+            .prepare_document(&file_path, ToolKind::InlayHints)
+            .await?;
 
         let lsp_start = mcp_to_lsp_position(start_line, start_character);
         let lsp_end = mcp_to_lsp_position(end_line, end_character);
@@ -2164,45 +2261,58 @@ mod tests {
         // A configured/applicable language whose LSP client has not registered
         // yet (large solution still loading via OmniSharp) must surface
         // ServerInitializing — "wait and retry" — not NoServerForLanguage.
-        let translator = Translator::new();
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &translator.extension_map);
+        let lang = detect_language(&path, &HashMap::new());
+        let id = ServerId::from(lang.clone());
 
+        let translator = Translator::new().with_router(ToolRouter::catch_all([(id.clone(), lang)]));
         let mut expected = HashSet::new();
-        expected.insert(lang.clone());
-        translator.set_expected_languages(expected);
+        expected.insert(id.clone());
+        translator.set_expected_servers(expected);
 
-        let err = translator.get_client_for_file(&path).unwrap_err();
-        assert!(matches!(err, Error::ServerInitializing(ref l) if *l == lang));
+        let err = translator
+            .get_client_for_file(&path, ToolKind::Hover)
+            .unwrap_err();
+        assert!(matches!(err, Error::ServerInitializing { server_id } if server_id == id));
     }
 
     #[test]
     fn test_get_client_for_file_no_server_when_not_expected() {
-        // When the language is not in the expected set (no server configured for
-        // it at all), the error stays NoServerForLanguage.
+        // When no route is configured for the language at all, the error
+        // stays NoServerForLanguage.
         let translator = Translator::new();
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
         let lang = detect_language(&path, &translator.extension_map);
 
-        let err = translator.get_client_for_file(&path).unwrap_err();
+        let err = translator
+            .get_client_for_file(&path, ToolKind::Hover)
+            .unwrap_err();
         assert!(matches!(err, Error::NoServerForLanguage(ref l) if *l == lang));
     }
 
     #[test]
-    fn test_clear_expected_languages_reverts_to_no_server() {
-        // After initialization fails the expected set is cleared; subsequent
-        // lookups must fall back to NoServerForLanguage rather than keep
-        // implying the server is still on its way.
-        let translator = Translator::new();
+    fn test_clear_expected_servers_reverts_to_no_server_after_all_routes_dropped() {
+        // Mirrors the real `serve_with` flow: `rebind_router` (called from
+        // `register_servers`/the all-failed path) drops routes to servers
+        // that never registered, then `clear_expected_servers` runs under
+        // the same lock. Subsequent lookups must fall back to
+        // NoServerForLanguage rather than keep implying the server is still
+        // on its way.
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &translator.extension_map);
+        let lang = detect_language(&path, &HashMap::new());
+        let id = ServerId::from(lang.clone());
 
+        let translator = Translator::new().with_router(ToolRouter::catch_all([(id.clone(), lang)]));
         let mut expected = HashSet::new();
-        expected.insert(lang);
-        translator.set_expected_languages(expected);
-        translator.clear_expected_languages();
+        expected.insert(id);
+        translator.set_expected_servers(expected);
 
-        let err = translator.get_client_for_file(&path).unwrap_err();
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        let err = translator
+            .get_client_for_file(&path, ToolKind::Hover)
+            .unwrap_err();
         assert!(matches!(err, Error::NoServerForLanguage(_)));
     }
 
@@ -3260,7 +3370,7 @@ mod tests {
 
         let translator = Translator::new().with_extensions(extension_map);
 
-        let result = translator.get_client_for_file(&test_file);
+        let result = translator.get_client_for_file(&test_file, ToolKind::Hover);
 
         assert!(result.is_err());
         if let Err(Error::NoServerForLanguage(lang)) = result {
@@ -3281,7 +3391,7 @@ mod tests {
 
         let translator = Translator::new().with_extensions(extension_map);
 
-        let result = translator.get_client_for_file(&test_file);
+        let result = translator.get_client_for_file(&test_file, ToolKind::Hover);
 
         assert!(result.is_err());
         if let Err(Error::NoServerForLanguage(lang)) = result {
@@ -3300,13 +3410,20 @@ mod tests {
         let mut extension_map = HashMap::new();
         extension_map.insert("tsx".to_string(), "typescriptreact".to_string());
 
-        let translator = Translator::new().with_extensions(extension_map);
+        let translator = Translator::new()
+            .with_extensions(extension_map)
+            .with_router(ToolRouter::catch_all([(
+                ServerId::from("typescript"),
+                "typescript".to_string(),
+            )]));
         translator.register_client(
             "typescript".to_string(),
             LspClient::new(crate::config::LspServerConfig::typescript()),
         );
 
-        let client = translator.get_client_for_file(&test_file).unwrap();
+        let (_id, client) = translator
+            .get_client_for_file(&test_file, ToolKind::Hover)
+            .unwrap();
         assert_eq!(client.language_id(), "typescript");
     }
 
@@ -3328,9 +3445,19 @@ mod tests {
             initialization_options: None,
             timeout_seconds: 30,
             heuristics: None,
+            name: None,
+            handles: None,
         };
 
-        let translator = Translator::new().with_extensions(extension_map);
+        let translator = Translator::new()
+            .with_extensions(extension_map)
+            .with_router(ToolRouter::catch_all([
+                (ServerId::from("typescript"), "typescript".to_string()),
+                (
+                    ServerId::from("typescriptreact"),
+                    "typescriptreact".to_string(),
+                ),
+            ]));
         translator.register_client(
             "typescript".to_string(),
             LspClient::new(crate::config::LspServerConfig::typescript()),
@@ -3340,7 +3467,9 @@ mod tests {
             LspClient::new(typescript_react_config),
         );
 
-        let client = translator.get_client_for_file(&test_file).unwrap();
+        let (_id, client) = translator
+            .get_client_for_file(&test_file, ToolKind::Hover)
+            .unwrap();
         assert_eq!(client.language_id(), "typescriptreact");
     }
 
@@ -3362,11 +3491,20 @@ mod tests {
             initialization_options: None,
             timeout_seconds: 30,
             heuristics: None,
+            name: None,
+            handles: None,
         };
-        let translator = Translator::new().with_extensions(extension_map);
+        let translator = Translator::new()
+            .with_extensions(extension_map)
+            .with_router(ToolRouter::catch_all([(
+                ServerId::from("javascript"),
+                "javascript".to_string(),
+            )]));
         translator.register_client("javascript".to_string(), LspClient::new(javascript_config));
 
-        let client = translator.get_client_for_file(&test_file).unwrap();
+        let (_id, client) = translator
+            .get_client_for_file(&test_file, ToolKind::Hover)
+            .unwrap();
         assert_eq!(client.language_id(), "javascript");
     }
 
@@ -3562,7 +3700,13 @@ mod tests {
         extensions.insert("aa".to_string(), "lang_a".to_string());
         extensions.insert("bb".to_string(), "lang_b".to_string());
 
-        let mut translator = Translator::new().with_extensions(extensions);
+        let mut translator =
+            Translator::new()
+                .with_extensions(extensions)
+                .with_router(ToolRouter::catch_all([
+                    (ServerId::from("lang_a"), "lang_a".to_string()),
+                    (ServerId::from("lang_b"), "lang_b".to_string()),
+                ]));
         translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
 
         let (client_a, mut server_a) = fake_lsp_client();
@@ -3636,7 +3780,13 @@ mod tests {
         let mut extensions = HashMap::new();
         extensions.insert("aa".to_string(), "lang_a".to_string());
 
-        let mut translator = Translator::new().with_extensions(extensions);
+        let mut translator =
+            Translator::new()
+                .with_extensions(extensions)
+                .with_router(ToolRouter::catch_all([(
+                    ServerId::from("lang_a"),
+                    "lang_a".to_string(),
+                )]));
         translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
 
         let (client, mut server) = fake_lsp_client();
@@ -3678,5 +3828,116 @@ mod tests {
                 .unwrap();
             assert!(result.is_ok());
         }
+    }
+
+    /// #174 §12's own headline dispatch scenario: "pyright/pylsp fixture --
+    /// hover -> pyright, diagnostics -> pylsp, rename (unclaimed) ->
+    /// `NoServerForTool`", exercised through `Translator`'s public handlers
+    /// end to end rather than through `ToolRouter`'s unit tests alone.
+    #[tokio::test]
+    async fn test_dispatch_routes_hover_and_diagnostics_to_different_servers() {
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("py".to_string(), "python".to_string());
+
+        let pyright_id = ServerId::from("pyright");
+        let pylsp_id = ServerId::from("pylsp");
+        let configs = vec![
+            LspServerConfig {
+                language_id: "python".to_string(),
+                command: "pyright-langserver".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+                name: Some("pyright".to_string()),
+                handles: Some(vec![ToolKind::Hover]),
+            },
+            LspServerConfig {
+                language_id: "python".to_string(),
+                command: "pylsp".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+                name: Some("pylsp".to_string()),
+                handles: Some(vec![ToolKind::Diagnostics]),
+            },
+        ];
+        let router = ToolRouter::from_configs(&configs).unwrap();
+
+        let mut translator = Translator::new()
+            .with_extensions(extensions)
+            .with_router(router);
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client_pyright, mut server_pyright) = fake_lsp_client();
+        let (client_pylsp, mut server_pylsp) = fake_lsp_client();
+        translator.register_client(pyright_id, client_pyright);
+        translator.register_client(pylsp_id, client_pylsp);
+
+        let path = dir.path().join("main.py");
+        fs::write(&path, "x = 1").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let translator = Arc::new(translator);
+
+        // rename is claimed by neither server -> NoServerForTool, checked
+        // first so it can't be masked by either server's wire state.
+        let rename_result = translator
+            .handle_rename(path_str.clone(), 1, 1, "renamed".to_string())
+            .await;
+        assert!(
+            matches!(
+                rename_result,
+                Err(Error::NoServerForTool {
+                    tool: ToolKind::Rename,
+                    ..
+                })
+            ),
+            "expected NoServerForTool for rename, got {rename_result:?}"
+        );
+
+        // hover must route to pyright: didOpen + hover request on its wire.
+        let hover = {
+            let translator = Arc::clone(&translator);
+            let path_str = path_str.clone();
+            tokio::spawn(async move { translator.handle_hover(path_str, 1, 1).await })
+        };
+        let mut wire_pyright = BufReader::new(&mut server_pyright.write_stdout);
+        let opened = read_framed_message(&mut wire_pyright).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let hover_request = read_framed_message(&mut wire_pyright).await;
+        assert_eq!(hover_request["method"], "textDocument/hover");
+        write_response(
+            &mut server_pyright.read_half_stdin,
+            &hover_request["id"],
+            JsonValue::Null,
+        )
+        .await;
+        hover
+            .await
+            .unwrap()
+            .expect("hover routed to pyright must succeed");
+
+        // diagnostics must route to pylsp, independently of pyright: its own
+        // didOpen (a second server's first sync of the same path) followed
+        // by the diagnostic request on pylsp's wire, never pyright's.
+        let diagnostics = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move { translator.handle_diagnostics(path_str).await })
+        };
+        let mut wire_pylsp = BufReader::new(&mut server_pylsp.write_stdout);
+        let opened = read_framed_message(&mut wire_pylsp).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let diag_request = read_framed_message(&mut wire_pylsp).await;
+        assert_eq!(diag_request["method"], "textDocument/diagnostic");
+        // Routing is proven by the request landing on pylsp's wire; abort
+        // rather than crafting a well-formed DocumentDiagnosticReportResult.
+        diagnostics.abort();
     }
 }

@@ -282,6 +282,81 @@ PYTHONPATH = "/custom/path"
 VIRTUAL_ENV = "/path/to/venv"
 ```
 
+### `name`
+
+**Type**: String
+**Default**: the server's `language_id`
+
+Explicit routing identity for this server. Two servers may share one
+`language_id` (e.g. two Python servers), but each must have a distinct
+identity — set `name` on at least one of them so they don't collide.
+
+```toml
+[[lsp_servers]]
+name = "pyright"
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[[lsp_servers]]
+name = "pylsp"
+language_id = "python"
+command = "pylsp"
+handles = ["diagnostics"]
+```
+
+### `handles`
+
+**Type**: Array of tool names
+**Default**: unset (catch-all — serves every tool no other server for this language explicitly claims)
+
+Restricts a server to exactly the listed routing values. Valid values:
+`hover`, `definition`, `type_definition`, `implementation`, `references`,
+`diagnostics`, `rename`, `completions`, `signature_help`,
+`document_symbols`, `workspace_symbols`, `format_document`, `code_actions`,
+`call_hierarchy`, `inlay_hints`. These are routing identifiers, not MCP tool
+names — several MCP tools map to a shorter routing value:
+
+| `handles` value | MCP tool(s) it governs |
+|---|---|
+| `rename` | `rename_symbol` |
+| `workspace_symbols` | `workspace_symbol_search` |
+| `implementation` | `go_to_implementation` |
+| `type_definition` | `go_to_type_definition` |
+| `call_hierarchy` | `prepare_call_hierarchy`, `get_incoming_calls`, `get_outgoing_calls` (one route: the item `prepare_call_hierarchy` returns is only meaningful to the server that produced it) |
+| `diagnostics` | `get_diagnostics` (pull) **and** `get_cached_diagnostics` (the push-notification cache is filtered by the same route, so both are always served by the same server) |
+
+Every other value matches its MCP tool name directly (`hover` → `hover`, etc.).
+
+At most one server per language may omit `handles` (the catch-all). A tool
+may be claimed by only one server per language. In the example above,
+`pylsp` handles only diagnostics; `pyright` (the catch-all) handles
+everything else for `python`, including `hover`, `definition`, etc.
+
+**Ambiguous configs fail at startup, not silently.** If two servers for one
+language are *both applicable in the same workspace* (see
+`heuristics` below) and either share a routing identity, both omit
+`handles`, or both claim the same tool, mcpls refuses to start and prints an
+error naming the conflicting `[[lsp_servers]]` entries. A config with
+mutually exclusive `heuristics.project_markers` — where only one of the two
+servers is ever applicable in a given workspace — is not ambiguous and
+starts normally.
+
+**If the server a tool is routed to fails to spawn**, that tool's requests
+move to the language's catch-all server, if one is running; otherwise they
+report no server available for that tool rather than silently falling back
+to a server that explicitly declined it via `handles`.
+
+**Exception: `workspace_symbol_search`.** This tool has no document, so it
+has no language to route on. It resolves, across all configured servers, to
+the first one that explicitly claims `workspace_symbols`, else the first
+catch-all, else — only as a last resort, and only if neither of those exist
+— the first live server at all, even one that declined `workspace_symbols`
+via `handles`. This last-resort step is intentional (workspace search is
+better served imperfectly than not at all) but means `handles` is not an
+absolute guarantee for this one tool the way it is for every
+document-scoped tool above.
+
 ## Environment Variables
 
 ### `MCPLS_CONFIG`
@@ -378,6 +453,26 @@ file_patterns = ["**/*.py", "**/*.pyi"]
 
 [lsp_servers.heuristics]
 project_markers = ["pyproject.toml", "ty.toml"]
+```
+
+To run pyright for everything except diagnostics, and a second server
+(`pylsp`) for diagnostics only:
+
+```toml
+[[lsp_servers]]
+name = "pyright"
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+file_patterns = ["**/*.py"]
+
+[[lsp_servers]]
+name = "pylsp"
+language_id = "python"
+command = "pylsp"
+args = []
+file_patterns = ["**/*.py"]
+handles = ["diagnostics"]
 ```
 
 ### TypeScript/JavaScript Project

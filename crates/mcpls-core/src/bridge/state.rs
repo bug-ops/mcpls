@@ -14,6 +14,7 @@ use tokio::fs;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
 
@@ -116,6 +117,14 @@ pub struct DocumentState {
     /// instants. This is intentional -- `content_checked_at` is a debounce
     /// timer, not part of a document's logical state.
     pub disk: Option<DiskSync>,
+    /// Last document version pushed to each server via `didOpen`/`didChange`.
+    ///
+    /// A single document can be synced to multiple servers (e.g. hover
+    /// routed to one server, diagnostics to another for the same language),
+    /// each needing its own `didOpen`/`didChange` history -- a server absent
+    /// from this map has never seen the document and must receive
+    /// `didOpen`, not `didChange`, on its next `ensure_open` call.
+    pub synced: HashMap<ServerId, i32>,
 }
 
 /// Resource limits for document tracking.
@@ -211,6 +220,7 @@ impl DocumentTracker {
             version: 1,
             content,
             disk: None,
+            synced: HashMap::new(),
         };
 
         self.documents.insert(path, state);
@@ -272,42 +282,54 @@ impl DocumentTracker {
         self.documents.keys().map(PathBuf::as_path)
     }
 
-    /// Ensure a document is open, opening it lazily if necessary, and
-    /// resynchronize it with the LSP server if the file changed on disk
-    /// since it was last read.
+    /// Ensure a document is open *for `server`*, opening it lazily if
+    /// necessary, and resynchronize it with disk and with `server` if either
+    /// has fallen behind.
     ///
-    /// If the document is not yet tracked, this reads it from disk, opens it
-    /// in the tracker, and sends a `didOpen` notification.
+    /// A single path can be synced to several servers independently (e.g.
+    /// hover routed to one server, diagnostics to another, for the same
+    /// language) -- this call syncs only the one server it is for. Internally
+    /// it runs in two phases:
     ///
-    /// If the document is already tracked, this stats the file on every call
-    /// (a cheap syscall, never debounced) to detect external changes -- `git
-    /// checkout`/`stash`, formatters, or edits made by the MCP host itself
-    /// outside mcpls. When the file changed, mcpls sends a single
-    /// full-replacement `textDocument/didChange` notification (a
-    /// `TextDocumentContentChangeEvent` with `range: None`, which per the LSP
-    /// spec means "this is the entire new document content") and updates the
-    /// cached content and version. The document is never closed and reopened,
+    /// **Disk phase**: stats the file on every call (a cheap syscall, never
+    /// debounced) to detect external changes -- `git checkout`/`stash`,
+    /// formatters, or edits made by the MCP host itself outside mcpls -- and
+    /// re-reads its content when the stat indicates a possible change (see
+    /// `DiskSync` for the settled/debounce rules). This phase never skips
+    /// the *per-server* sync check below, even when it takes a fast path
+    /// that skips the disk read: a second server that has never seen this
+    /// document must still receive `didOpen` even if the file has not
+    /// changed since a first server was opened on it.
+    ///
+    /// **Sync phase**: compares `server`'s last-synced version (tracked in
+    /// [`DocumentState::synced`]) against the version decided by the disk
+    /// phase, and sends exactly one of `didOpen` (server has never seen this
+    /// document), `didChange` (server is behind), or nothing (server is
+    /// already caught up). A `didChange` is always a single full-replacement
+    /// notification (a `TextDocumentContentChangeEvent` with `range: None`,
+    /// which per the LSP spec means "this is the entire new document
+    /// content"); mcpls does not consult the server's negotiated
+    /// `TextDocumentSyncKind` (`LspClient` has no access to
+    /// `ServerCapabilities` at this layer) -- full-replacement is accepted in
+    /// practice by rust-analyzer, pyright, tsserver, gopls and clangd, but is
+    /// the first place to look if a future maintainer sees sync errors from
+    /// a new server. The document is never closed and reopened on a change,
     /// so `get_cached_diagnostics` keeps serving the last-known diagnostics
-    /// until the server re-publishes after the change -- there is no
-    /// transient empty window.
+    /// until the server re-publishes -- there is no transient empty window.
     ///
-    /// mcpls does not consult the server's negotiated `TextDocumentSyncKind`
-    /// when doing this: `LspClient` has no access to `ServerCapabilities` at
-    /// this layer. A server that strictly enforces `Incremental` sync could
-    /// in principle reject a full-replacement change; this is believed to be
-    /// low risk in practice (rust-analyzer, pyright, tsserver, gopls and
-    /// clangd all accept it), but is the first place to look if a future
-    /// maintainer sees sync errors from a new server.
+    /// `st.version`/`st.content`/`st.disk`/`synced[server]` are all committed
+    /// only after the notification succeeds. A server that is never asked
+    /// again never catches up to a later edit -- which is correct, since a
+    /// server that is never asked never needs the content.
     ///
-    /// Two cases fall outside this mechanism entirely:
+    /// Two cases fall outside the disk-change-detection mechanism entirely:
     /// - A tool that restores a file with an mtime and size identical to the
     ///   last ones observed (e.g. `tar x`, `rsync -a`, `cp -p`) is
-    ///   indistinguishable from "unchanged" by this mechanism, however long
-    ///   ago that snapshot was taken -- not just within the racy detection
-    ///   window. Once a snapshot is `mtime_settled`, restoring its exact
-    ///   `(mtime, size)` retakes the fast path forever, since no later call
-    ///   re-reads content to notice the mismatch. Closing this would require
-    ///   hashing content on every access.
+    ///   indistinguishable from "unchanged", however long ago that snapshot
+    ///   was taken -- not just within the racy detection window. Once a
+    ///   snapshot is `mtime_settled`, restoring its exact `(mtime, size)`
+    ///   retakes the fast path forever. Closing this would require hashing
+    ///   content on every access.
     /// - `workspace_symbol_search` is served from the LSP server's own
     ///   index and is unaffected by this per-document mechanism for files
     ///   mcpls has never opened.
@@ -325,70 +347,25 @@ impl DocumentTracker {
     /// - The file cannot be stat'd or read from disk
     /// - The `didOpen`/`didChange` notification fails to send
     /// - Resource limits are exceeded
-    pub async fn ensure_open(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
-        if self.documents.contains_key(path) {
-            self.resync(path, lsp_client).await
-        } else {
-            self.first_open(path, lsp_client).await
-        }
+    pub async fn ensure_open(
+        &mut self,
+        path: &Path,
+        server: &ServerId,
+        lsp_client: &LspClient,
+    ) -> Result<Uri> {
+        let decision = self.disk_phase(path).await?;
+        self.sync_phase(path, server, lsp_client, decision).await
     }
 
-    /// Reads a not-yet-tracked file from disk, opens it, and notifies the
-    /// LSP server via `didOpen`.
-    async fn first_open(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
-        let read_at = SystemTime::now();
-        let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        self.check_file_size(meta.len())?;
-        let mtime = meta.modified().ok();
-
-        let content = fs::read_to_string(path).await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-
-        let uri = self.open(path.to_path_buf(), content.clone())?;
-        self.set_disk(
-            path,
-            DiskSync {
-                mtime,
-                size: meta.len(),
-                mtime_settled: mtime_settled(mtime, read_at),
-                content_checked_at: Instant::now(),
-            },
-        );
-
-        let state = self
-            .documents
-            .get(path)
-            .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?;
-        let params = DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: uri.clone(),
-                language_id: state.language_id.clone(),
-                version: state.version,
-                text: content,
-            },
-        };
-
-        if let Err(err) = lsp_client.notify("textDocument/didOpen", params).await {
-            // The server never learned about this document. Because resync
-            // only ever sends `didChange` (never another `didOpen`), leaving
-            // this entry tracked would permanently desync the server from
-            // the tracker. Undo the insert so the next call retries the
-            // whole first-open path from scratch.
-            self.documents.remove(path);
-            return Err(err);
+    /// Disk-verification phase of `ensure_open`: decides the version `path`
+    /// should be at, reading from disk only when necessary. Never sends any
+    /// LSP notification and never returns early in a way that would skip the
+    /// per-server sync phase -- see `ensure_open`'s docs.
+    async fn disk_phase(&mut self, path: &Path) -> Result<Decision> {
+        if !self.documents.contains_key(path) {
+            return self.disk_phase_new(path).await;
         }
 
-        Ok(uri)
-    }
-
-    /// Verifies an already-tracked document against disk and resynchronizes
-    /// the LSP server via `didChange` if the content changed.
-    async fn resync(&mut self, path: &Path, lsp_client: &LspClient) -> Result<Uri> {
         let read_at = SystemTime::now();
         let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
             path: path.to_path_buf(),
@@ -397,7 +374,7 @@ impl DocumentTracker {
         let mtime = meta.modified().ok();
         let size = meta.len();
 
-        let (uri, needs_verify) = {
+        let (uri, current_version, fast_path) = {
             let Some(st) = self.documents.get(path) else {
                 return Err(Error::DocumentNotFound(path.to_path_buf()));
             };
@@ -409,10 +386,10 @@ impl DocumentTracker {
                 }
                 _ => false,
             };
-            (st.uri.clone(), !fast_path)
+            (st.uri.clone(), st.version, fast_path)
         };
-        if !needs_verify {
-            return Ok(uri);
+        if fast_path {
+            return Ok(Decision::unchanged(uri, current_version));
         }
 
         self.check_file_size(size)?;
@@ -428,46 +405,187 @@ impl DocumentTracker {
             content_checked_at: Instant::now(),
         };
 
-        let (unchanged, next_version) = {
+        let unchanged = {
             let Some(st) = self.documents.get(path) else {
                 return Err(Error::DocumentNotFound(path.to_path_buf()));
             };
-            (fresh == st.content, st.version.saturating_add(1))
+            fresh == st.content
         };
+
         if unchanged {
             self.set_disk(path, snap);
+            return Ok(Decision::unchanged(uri, current_version));
+        }
+
+        Ok(Decision {
+            uri,
+            target_version: current_version.saturating_add(1),
+            fresh_content: Some(fresh),
+            snap: Some(snap),
+        })
+    }
+
+    /// Reads a not-yet-tracked file from disk and opens it in the tracker at
+    /// version 1. No server has synced it yet, so the sync phase always
+    /// sends `didOpen` regardless of which server calls next.
+    async fn disk_phase_new(&mut self, path: &Path) -> Result<Decision> {
+        let read_at = SystemTime::now();
+        let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        self.check_file_size(meta.len())?;
+        let mtime = meta.modified().ok();
+
+        let content = fs::read_to_string(path).await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+        let uri = self.open(path.to_path_buf(), content)?;
+        self.set_disk(
+            path,
+            DiskSync {
+                mtime,
+                size: meta.len(),
+                mtime_settled: mtime_settled(mtime, read_at),
+                content_checked_at: Instant::now(),
+            },
+        );
+
+        Ok(Decision::unchanged(uri, 1))
+    }
+
+    /// Per-server sync phase of `ensure_open`: sends `didOpen`, `didChange`,
+    /// or nothing to `server` depending on its last-synced version, and
+    /// commits the outcome only after the notification succeeds.
+    async fn sync_phase(
+        &mut self,
+        path: &Path,
+        server: &ServerId,
+        lsp_client: &LspClient,
+        decision: Decision,
+    ) -> Result<Uri> {
+        let Decision {
+            uri,
+            target_version,
+            fresh_content,
+            snap,
+        } = decision;
+
+        // Cheap check first: the common case (an already-synced document,
+        // which is most tool calls against a file already open elsewhere)
+        // must not pay for cloning the full document content only to
+        // discard it on the `up_to_date` return below.
+        let (up_to_date, is_first_open) = {
+            let Some(st) = self.documents.get(path) else {
+                return Err(Error::DocumentNotFound(path.to_path_buf()));
+            };
+            let synced_version = st.synced.get(server).copied();
+            (
+                synced_version.is_some_and(|v| v >= target_version),
+                synced_version.is_none(),
+            )
+        };
+
+        if up_to_date {
             return Ok(uri);
         }
 
-        lsp_client
-            .notify(
-                "textDocument/didChange",
-                DidChangeTextDocumentParams {
-                    text_document: VersionedTextDocumentIdentifier {
-                        uri: uri.clone(),
-                        version: next_version,
-                    },
-                    content_changes: vec![TextDocumentContentChangeEvent {
-                        range: None,
-                        range_length: None,
-                        text: fresh.clone(),
-                    }],
-                },
-            )
-            .await?;
+        let (language_id, text) = {
+            let Some(st) = self.documents.get(path) else {
+                return Err(Error::DocumentNotFound(path.to_path_buf()));
+            };
+            let text = fresh_content.clone().unwrap_or_else(|| st.content.clone());
+            (st.language_id.clone(), text)
+        };
 
-        // Unreachable under the `&mut self` lock held for this whole call
-        // (see "Concurrency" above), but `Err` here -- rather than silently
-        // discarding the didChange notification's state update -- matches
-        // the convention of the two earlier guards in this function.
+        let notify_result = if is_first_open {
+            lsp_client
+                .notify(
+                    "textDocument/didOpen",
+                    DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem {
+                            uri: uri.clone(),
+                            language_id,
+                            version: target_version,
+                            text,
+                        },
+                    },
+                )
+                .await
+        } else {
+            lsp_client
+                .notify(
+                    "textDocument/didChange",
+                    DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier {
+                            uri: uri.clone(),
+                            version: target_version,
+                        },
+                        content_changes: vec![TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text,
+                        }],
+                    },
+                )
+                .await
+        };
+
+        if let Err(err) = notify_result {
+            // The server never learned about this document. If no server at
+            // all has synced this path yet, leaving it tracked would
+            // permanently desync every future server from the tracker, so
+            // undo the insert and let the next call retry from scratch. If
+            // another server already synced successfully, the path stays
+            // tracked for that server's sake; this server's `synced` entry
+            // simply stays absent/stale, so its own next call retries.
+            let first_ever_sync = self
+                .documents
+                .get(path)
+                .is_some_and(|st| st.synced.is_empty());
+            if is_first_open && first_ever_sync {
+                self.documents.remove(path);
+            }
+            return Err(err);
+        }
+
         let Some(st) = self.documents.get_mut(path) else {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
-        st.version = next_version;
-        st.content = fresh;
-        st.disk = Some(snap);
+        if let Some(fresh) = fresh_content {
+            st.version = target_version;
+            st.content = fresh;
+            st.disk = snap;
+        }
+        st.synced.insert(server.clone(), target_version);
 
         Ok(uri)
+    }
+}
+
+/// Outcome of `DocumentTracker::disk_phase`: the version `ensure_open`'s
+/// caller should end up synced to, and -- only when this call detected an
+/// as-yet-uncommitted content change -- the content and disk snapshot to
+/// commit alongside it.
+struct Decision {
+    uri: Uri,
+    target_version: i32,
+    fresh_content: Option<String>,
+    snap: Option<DiskSync>,
+}
+
+impl Decision {
+    /// A decision where nothing changed on disk this call: `target_version`
+    /// is already what's committed in `DocumentState`.
+    const fn unchanged(uri: Uri, target_version: i32) -> Self {
+        Self {
+            uri,
+            target_version,
+            fresh_content: None,
+            snap: None,
+        }
     }
 }
 
@@ -698,6 +816,7 @@ mod tests {
             version: 5,
             content: "fn main() {}".to_string(),
             disk: None,
+            synced: HashMap::new(),
         };
 
         #[allow(clippy::redundant_clone)]
@@ -1373,10 +1492,16 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
-        let uri1 = tracker.ensure_open(&path, &client).await.unwrap();
+        let uri1 = tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         assert_eq!(tracker.get(&path).unwrap().version, 1);
 
-        let uri2 = tracker.ensure_open(&path, &client).await.unwrap();
+        let uri2 = tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         assert_eq!(uri1, uri2);
         assert_eq!(tracker.get(&path).unwrap().version, 1);
         assert_eq!(tracker.get(&path).unwrap().content, "fn main() {}");
@@ -1391,12 +1516,18 @@ mod tests {
 
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
 
         std::fs::write(&path, "fn main() { println!(\"hi\"); }").unwrap();
         set_mtime(&path, settled_past());
 
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         let state = tracker.get(&path).unwrap();
         assert_eq!(state.version, 2);
         assert_eq!(state.content, "fn main() { println!(\"hi\"); }");
@@ -1411,7 +1542,10 @@ mod tests {
 
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         // Same-length rewrite with the mtime forced back to the recorded
@@ -1421,7 +1555,10 @@ mod tests {
 
         tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
 
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         let state = tracker.get(&path).unwrap();
         assert_eq!(
             state.version, 2,
@@ -1439,7 +1576,10 @@ mod tests {
 
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         // Same-length rewrite restoring an already-settled mtime: this is
@@ -1450,7 +1590,10 @@ mod tests {
 
         tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
 
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         let state = tracker.get(&path).unwrap();
         assert_eq!(state.version, 1, "documented limitation: fast path taken");
         assert_eq!(state.content, "AAAA");
@@ -1465,12 +1608,18 @@ mod tests {
 
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
 
         // Different-size rewrite with no time advance at all: must resync
         // immediately, proving the debounce never gates the stat itself.
         std::fs::write(&path, "BBBBBBBB").unwrap();
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
 
         let state = tracker.get(&path).unwrap();
         assert_eq!(state.version, 2);
@@ -1486,18 +1635,27 @@ mod tests {
 
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         std::fs::write(&path, "BBBB").unwrap(); // same size
         set_mtime(&path, original_mtime); // stat matches, entry stays racy
 
         // Inside the debounce window: the re-read is gated, cache wins.
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         assert_eq!(tracker.get(&path).unwrap().version, 1);
 
         tokio::time::advance(Duration::from_millis(300)).await;
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         let state = tracker.get(&path).unwrap();
         assert_eq!(state.version, 2);
         assert_eq!(state.content, "BBBB");
@@ -1512,11 +1670,16 @@ mod tests {
 
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
 
         std::fs::remove_file(&path).unwrap();
 
-        let result = tracker.ensure_open(&path, &client).await;
+        let result = tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await;
         assert!(matches!(result, Err(Error::FileIo { .. })));
         assert!(tracker.is_open(&path));
         assert_eq!(tracker.get(&path).unwrap().version, 1);
@@ -1536,11 +1699,16 @@ mod tests {
         };
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(limits, HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
 
         std::fs::write(&path, "x".repeat(100)).unwrap();
 
-        let result = tracker.ensure_open(&path, &client).await;
+        let result = tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await;
         assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
         assert_eq!(tracker.get(&path).unwrap().content, "small");
         assert_eq!(tracker.get(&path).unwrap().version, 1);
@@ -1559,11 +1727,16 @@ mod tests {
         };
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(limits, HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         assert_eq!(tracker.len(), 1);
 
         std::fs::write(&path, "BBBBBBBB").unwrap();
-        let result = tracker.ensure_open(&path, &client).await;
+        let result = tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await;
         assert!(
             result.is_ok(),
             "resync must not re-run the doc-count check on an already-tracked path"
@@ -1581,7 +1754,10 @@ mod tests {
 
         let (client, _server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
         assert!(tracker.get(&path).unwrap().disk.is_some());
 
         tracker.update(&path, "fn main() { updated(); }".to_string());
@@ -1607,7 +1783,9 @@ mod tests {
         client.shutdown().await.unwrap();
 
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        let result = tracker.ensure_open(&path, &notify_will_fail).await;
+        let result = tracker
+            .ensure_open(&path, &ServerId::from("rust"), &notify_will_fail)
+            .await;
 
         assert!(result.is_err(), "notify failure must propagate as an error");
         assert!(
@@ -1626,7 +1804,10 @@ mod tests {
 
         let (client, mut server) = fake_lsp_client();
         let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
 
         let mut wire = BufReader::new(&mut server.write_stdout);
         let opened = read_framed_message(&mut wire).await;
@@ -1634,7 +1815,10 @@ mod tests {
 
         std::fs::write(&path, "fn main() { println!(\"hi\"); }").unwrap();
         set_mtime(&path, settled_past());
-        tracker.ensure_open(&path, &client).await.unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
 
         let changed = read_framed_message(&mut wire).await;
         assert_eq!(changed["method"], "textDocument/didChange");
@@ -1650,5 +1834,154 @@ mod tests {
             "rangeLength must be omitted, not null, for a full-replacement change"
         );
         assert_eq!(change["text"], "fn main() { println!(\"hi\"); }");
+    }
+
+    /// Regression for #174 §7.1: a second server must receive `didOpen` even
+    /// when the file has not changed since a first server was opened on it --
+    /// the disk-phase fast path only skips the disk read, never the
+    /// per-server sync decision. Exercises the settled-mtime fast path.
+    #[tokio::test]
+    async fn test_ensure_open_second_server_gets_didopen_no_disk_change() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client_a, mut server_a) = fake_lsp_client();
+        let (client_b, mut server_b) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+
+        let id_a = ServerId::from("server-a");
+        let id_b = ServerId::from("server-b");
+
+        tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
+        let mut wire_a = BufReader::new(&mut server_a.write_stdout);
+        let opened_a = read_framed_message(&mut wire_a).await;
+        assert_eq!(opened_a["method"], "textDocument/didOpen");
+
+        // No disk change between calls: server B's ensure_open must still
+        // take the disk-phase fast path (settled mtime) but still send B its
+        // own didOpen.
+        tracker.ensure_open(&path, &id_b, &client_b).await.unwrap();
+        let mut wire_b = BufReader::new(&mut server_b.write_stdout);
+        let opened_b = read_framed_message(&mut wire_b).await;
+        assert_eq!(opened_b["method"], "textDocument/didOpen");
+        assert_eq!(opened_b["params"]["textDocument"]["version"], 1);
+        assert_eq!(opened_b["params"]["textDocument"]["text"], "fn main() {}");
+    }
+
+    /// Same as above but through the unchanged-content re-read path (racy,
+    /// unsettled mtime past the debounce window, forcing a real content
+    /// compare) rather than the settled-mtime fast path.
+    #[tokio::test(start_paused = true)]
+    async fn test_ensure_open_second_server_gets_didopen_unchanged_content_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        // Leave mtime racy (unsettled) rather than backdating it.
+
+        let (client_a, _server_a) = fake_lsp_client();
+        let (client_b, mut server_b) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+
+        tracker
+            .ensure_open(&path, &ServerId::from("server-a"), &client_a)
+            .await
+            .unwrap();
+
+        // Past the debounce window: server B's call must genuinely re-read
+        // and compare content rather than taking either fast-path leg.
+        tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
+
+        tracker
+            .ensure_open(&path, &ServerId::from("server-b"), &client_b)
+            .await
+            .unwrap();
+        let mut wire_b = BufReader::new(&mut server_b.write_stdout);
+        let opened_b = read_framed_message(&mut wire_b).await;
+        assert_eq!(opened_b["method"], "textDocument/didOpen");
+    }
+
+    /// Regression for #174 §6.2/§12: `prepare_call_hierarchy` and
+    /// `incoming_calls`/`outgoing_calls` must resolve to the same server, since
+    /// only `prepare` calls `ensure_open` -- pinned here at the tracker level
+    /// by asserting a second `ensure_open` for the same server is a no-op
+    /// once synced, so a caller that reuses the same `ServerId` for both
+    /// calls never double-opens.
+    #[tokio::test]
+    async fn test_ensure_open_same_server_twice_sends_nothing_second_time() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, mut server) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let id = ServerId::from("rust");
+
+        tracker.ensure_open(&path, &id, &client).await.unwrap();
+        tracker.ensure_open(&path, &id, &client).await.unwrap();
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        assert_eq!(
+            tracker.get(&path).unwrap().synced.get(&id),
+            Some(&1),
+            "second call for the same server must not re-open or re-change"
+        );
+    }
+
+    /// Regression for #174 §7.2/S6: a failing `didChange` for one server must
+    /// leave that server's `synced` entry untouched (self-heals on retry)
+    /// without disturbing another server that already synced successfully.
+    #[tokio::test]
+    async fn test_sync_phase_failed_didchange_does_not_disturb_other_server() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client_a, _server_a) = fake_lsp_client();
+        let (client_b, _server_b) = fake_lsp_client();
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let id_a = ServerId::from("server-a");
+        let id_b = ServerId::from("server-b");
+
+        tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
+        tracker.ensure_open(&path, &id_b, &client_b).await.unwrap();
+
+        // Shut down B's client so its next notify fails, then change the file
+        // so both servers have version 2 to catch up to.
+        let client_b_will_fail = client_b.clone();
+        client_b.shutdown().await.unwrap();
+
+        std::fs::write(&path, "fn main() { updated(); }").unwrap();
+        set_mtime(&path, settled_past());
+
+        let result = tracker.ensure_open(&path, &id_b, &client_b_will_fail).await;
+        assert!(result.is_err(), "B's didChange must fail and propagate");
+
+        // No commit happens before a successful notify: content, version and
+        // both servers' `synced` entries all stay exactly as they were
+        // before this call, so the next attempt retries from the same
+        // starting point rather than drifting the tracker out of sync with
+        // what was actually acknowledged over the wire.
+        assert!(tracker.is_open(&path));
+        assert_eq!(tracker.get(&path).unwrap().content, "fn main() {}");
+        assert_eq!(tracker.get(&path).unwrap().version, 1);
+        assert_eq!(tracker.get(&path).unwrap().synced.get(&id_a), Some(&1));
+        assert_eq!(tracker.get(&path).unwrap().synced.get(&id_b), Some(&1));
+
+        // A's next call must independently detect the disk change (B's
+        // failure did not consume it) and successfully advance both the
+        // shared content/version and its own synced entry.
+        tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
+        assert_eq!(
+            tracker.get(&path).unwrap().content,
+            "fn main() { updated(); }"
+        );
+        assert_eq!(tracker.get(&path).unwrap().synced.get(&id_a), Some(&2));
+        assert_eq!(tracker.get(&path).unwrap().synced.get(&id_b), Some(&1));
     }
 }

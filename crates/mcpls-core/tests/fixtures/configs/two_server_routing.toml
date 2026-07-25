@@ -1,0 +1,19 @@
+# Two servers sharing one language, each handling a different subset of
+# tools via explicit `name`/`handles` (#174). pyright serves everything
+# except diagnostics (a catch-all with diagnostics carved out to pylsp);
+# pylsp is scoped to diagnostics only.
+[workspace]
+roots = []
+
+[[lsp_servers]]
+name = "pyright"
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+file_patterns = ["**/*.py"]
+
+[[lsp_servers]]
+name = "pylsp"
+language_id = "python"
+command = "pylsp"
+handles = ["diagnostics"]
