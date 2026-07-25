@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use bridge::resources::make_uri;
 use bridge::{NotificationCache, ResourceSubscriptions, Translator};
-pub use config::ServerConfig;
+pub use config::{ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};

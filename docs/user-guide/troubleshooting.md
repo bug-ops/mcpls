@@ -353,6 +353,13 @@ mkdir -p ~/.config/mcpls
 cp mcpls.toml ~/.config/mcpls/
 ```
 
+**Solution 4**: If `mcpls.toml` is in the current directory, it is ignored by
+default and a warning is logged (`mcpls --log-level warn` shows it). Opt in
+explicitly:
+```bash
+mcpls --trust-project-config
+```
+
 ### "Invalid configuration: missing field"
 
 **Problem**: TOML syntax error or missing required field

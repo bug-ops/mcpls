@@ -212,6 +212,7 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MCPLS_CONFIG` | Path to configuration file | Auto-detected |
+| `MCPLS_TRUST_PROJECT_CONFIG` | Load a `./mcpls.toml` found in the current directory | `false` |
 | `MCPLS_LOG` | Log level (trace, debug, info, warn, error) | `info` |
 | `MCPLS_LOG_JSON` | Output logs as JSON | `false` |
 
@@ -222,6 +223,13 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 | Linux | `~/.config/mcpls/mcpls.toml` |
 | macOS | `~/.config/mcpls/mcpls.toml` or `~/Library/Application Support/mcpls/` |
 | Windows | `%APPDATA%\mcpls\mcpls.toml` |
+
+> [!WARNING]
+> A `./mcpls.toml` in the current directory is **not** loaded automatically: it
+> can control which command mcpls spawns as an LSP server, so running mcpls
+> against an untrusted checkout must not execute commands from that checkout
+> without explicit consent. Pass `--trust-project-config` (or set
+> `MCPLS_TRUST_PROJECT_CONFIG=true`) only for repositories you trust.
 
 </details>
 

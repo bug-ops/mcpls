@@ -90,7 +90,8 @@ mcpls works zero-config for Rust projects (uses rust-analyzer by default). For o
 mcpls searches for configuration in:
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
-3. `./mcpls.toml` (current directory)
+3. `./mcpls.toml` (current directory) — requires `--trust-project-config` (see
+   [Configuration Reference](configuration.md#trusting-a-project-local-config))
 4. `~/.config/mcpls/mcpls.toml`
 
 ### Example Configuration

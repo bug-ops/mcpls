@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use mcpls_core::ProjectConfigTrust;
 
 mod args;
 mod logging;
@@ -25,7 +26,12 @@ async fn main() -> Result<()> {
         mcpls_core::ServerConfig::load_from(config_path)
             .with_context(|| format!("failed to load config from {}", config_path.display()))?
     } else {
-        mcpls_core::ServerConfig::load().context("failed to load configuration")?
+        let trust = if args.trust_project_config {
+            ProjectConfigTrust::Trusted
+        } else {
+            ProjectConfigTrust::Untrusted
+        };
+        mcpls_core::ServerConfig::load_with_trust(trust).context("failed to load configuration")?
     };
 
     tracing::debug!(

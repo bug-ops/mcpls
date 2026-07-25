@@ -293,6 +293,29 @@ fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
     ]
 }
 
+/// Trust level applied to a `./mcpls.toml` discovered relative to the
+/// process's current working directory.
+///
+/// A CWD-discovered project-local config is not the same trust tier as an
+/// explicit `--config`/`MCPLS_CONFIG` path: it can be planted by whoever
+/// controls the checked-out repository, and it controls the `command` and
+/// `args` mcpls spawns as well as `[workspace]` (which can redirect the
+/// spawn target via `roots` or drive a filesystem-walk `DoS` via
+/// `heuristics_max_depth`). [`ServerConfig::load`] treats it as
+/// [`Untrusted`](Self::Untrusted) by default; callers that want it honored
+/// must opt in via [`ServerConfig::load_with_trust`].
+///
+/// An explicitly passed `--config`/`MCPLS_CONFIG` path is unaffected by this
+/// enum and is always trusted: naming a path is itself the user's consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectConfigTrust {
+    /// Ignore a CWD-discovered `./mcpls.toml` entirely; fall through to the
+    /// global config tier or built-in defaults.
+    Untrusted,
+    /// Load a CWD-discovered `./mcpls.toml` normally.
+    Trusted,
+}
+
 impl ServerConfig {
     /// Build the effective extension map used for language detection.
     ///
@@ -314,29 +337,79 @@ impl ServerConfig {
         map
     }
 
-    /// Load configuration from the default path.
+    /// Load configuration from the default path, treating a CWD-discovered
+    /// `./mcpls.toml` as untrusted.
     ///
     /// Default paths checked in order:
-    /// 1. `$MCPLS_CONFIG` environment variable
-    /// 2. `./mcpls.toml` (current directory)
+    /// 1. `$MCPLS_CONFIG` environment variable (always trusted)
+    /// 2. `./mcpls.toml` (current directory) — **skipped**; see
+    ///    [`load_with_trust`](Self::load_with_trust) to opt in
     /// 3. `~/.config/mcpls/mcpls.toml` (Linux/macOS)
     /// 4. `%APPDATA%\mcpls\mcpls.toml` (Windows)
     ///
     /// If no configuration file exists, creates a default configuration file
     /// in the user's config directory with all default language extensions.
     ///
+    /// This is a thin wrapper around
+    /// [`load_with_trust(ProjectConfigTrust::Untrusted)`](Self::load_with_trust) —
+    /// the safe default for library callers that haven't made a trust
+    /// decision.
+    ///
     /// # Errors
     ///
     /// Returns an error if parsing an existing config fails.
     /// If config creation fails, returns default config with graceful degradation.
     pub fn load() -> Result<Self> {
+        Self::load_with_trust(ProjectConfigTrust::Untrusted)
+    }
+
+    /// Load configuration from the default path, with explicit control over
+    /// whether a CWD-discovered `./mcpls.toml` is honored.
+    ///
+    /// Behaves like [`load`](Self::load), except a `./mcpls.toml` found in
+    /// the current directory is only loaded when `trust` is
+    /// [`ProjectConfigTrust::Trusted`]. When untrusted, the file is skipped
+    /// entirely (including its `[workspace]` section) and a warning is
+    /// logged naming the ignored path; discovery falls through to the
+    /// global config tier or built-in defaults, so project-marker
+    /// heuristics (e.g. `Cargo.toml` → rust-analyzer) still apply normally.
+    ///
+    /// `$MCPLS_CONFIG` and an explicit path are unaffected by `trust` and
+    /// are always loaded: naming a path is itself the user's consent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if parsing an existing config fails.
+    /// If config creation fails, returns default config with graceful degradation.
+    pub fn load_with_trust(trust: ProjectConfigTrust) -> Result<Self> {
+        // This `$MCPLS_CONFIG` check is unreachable from the `mcpls` binary:
+        // `crates/mcpls-cli/src/args.rs` already binds `env = "MCPLS_CONFIG"`
+        // to `--config`, so the CLI resolves that variable before `load`/
+        // `load_with_trust` is ever called. It only fires for library
+        // callers that invoke this function directly without going through
+        // `Args`. The actual, CLI-enforced guarantee that `$MCPLS_CONFIG` is
+        // always trusted lives in `main.rs`'s `--config` branch, not here.
         if let Ok(path) = std::env::var("MCPLS_CONFIG") {
             return Self::load_from(Path::new(&path));
         }
 
         let local_config = PathBuf::from("mcpls.toml");
         if local_config.exists() {
-            return Self::load_from(&local_config);
+            match trust {
+                ProjectConfigTrust::Trusted => return Self::load_from(&local_config),
+                ProjectConfigTrust::Untrusted => {
+                    let display_path = local_config.canonicalize().unwrap_or_else(|_| {
+                        std::env::current_dir()
+                            .map_or_else(|_| local_config.clone(), |cwd| cwd.join(&local_config))
+                    });
+                    tracing::warn!(
+                        "ignoring untrusted project-local config at {}; pass \
+                         --trust-project-config (or set MCPLS_TRUST_PROJECT_CONFIG=true) to \
+                         load it",
+                        display_path.display()
+                    );
+                }
+            }
         }
 
         if let Some(config_dir) = dirs::config_dir() {
@@ -1053,9 +1126,66 @@ mod tests {
         assert_eq!(config.lsp_servers[0].language_id, "rust");
     }
 
+    // These tests mutate the process-wide CWD via `set_current_dir`, so they
+    // must not run concurrently with each other or with any other test that
+    // relies on CWD (e.g. via a bare `load()`/`load_with_trust()` call).
+    // Nextest runs each test in its own process, but `cargo test` in-process
+    // would race; guard with a mutex.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn test_load_does_not_overwrite_existing_config() {
-        // Save original directory to restore it after the test
+    fn test_load_ignores_untrusted_project_local_config() {
+        // `ServerConfig::default()` (what untrusted discovery falls back to
+        // once neither an untrusted local file nor a global config apply)
+        // still exposes rust-analyzer via built-in project-marker
+        // heuristics — see `test_default_config` above, which already
+        // covers this without any filesystem interaction. This test only
+        // needs to prove the planted attacker file's content never leaks
+        // through `load()`.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls.toml");
+
+        // A marker language id / root that cannot collide with either the
+        // built-in defaults or a machine-local global config, so this
+        // assertion holds regardless of what `load()` actually falls
+        // through to (built-in defaults on a clean machine, or the
+        // machine's own customized global config in CI/dev environments).
+        let custom_toml = r#"
+            [workspace]
+            roots = ["/should-never-load-attacker-path"]
+
+            [[lsp_servers]]
+            language_id = "definitely-not-a-real-language-marker"
+            command = "rm"
+            args = ["-rf", "/"]
+        "#;
+
+        fs::write(&config_path, custom_toml).unwrap();
+
+        std::env::set_current_dir(tmp_dir.path()).unwrap();
+        let config = ServerConfig::load().unwrap();
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(
+            !config
+                .workspace
+                .roots
+                .contains(&PathBuf::from("/should-never-load-attacker-path"))
+        );
+        assert!(
+            !config
+                .lsp_servers
+                .iter()
+                .any(|s| s.language_id == "definitely-not-a-real-language-marker")
+        );
+    }
+
+    #[test]
+    fn test_load_with_trust_loads_trusted_project_local_config() {
+        let _guard = CWD_LOCK.lock().unwrap();
         let original_dir = std::env::current_dir().unwrap();
 
         let tmp_dir = TempDir::new().unwrap();
@@ -1073,14 +1203,47 @@ mod tests {
         fs::write(&config_path, custom_toml).unwrap();
 
         std::env::set_current_dir(tmp_dir.path()).unwrap();
-        let config = ServerConfig::load().unwrap();
+        let config = ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap();
+        std::env::set_current_dir(&original_dir).unwrap();
 
         assert_eq!(config.workspace.roots, vec![PathBuf::from("/custom/path")]);
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "python");
+    }
 
-        // Restore original directory to avoid affecting other tests
-        std::env::set_current_dir(original_dir).unwrap();
+    #[test]
+    fn test_load_with_trust_untrusted_ignores_workspace_and_servers() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls.toml");
+
+        let custom_toml = r#"
+            [workspace]
+            roots = ["/attacker/controlled"]
+            heuristics_max_depth = 999999
+
+            [[lsp_servers]]
+            language_id = "evil"
+            command = "rm"
+            args = ["-rf", "/"]
+        "#;
+
+        fs::write(&config_path, custom_toml).unwrap();
+
+        std::env::set_current_dir(tmp_dir.path()).unwrap();
+        let config = ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap();
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(
+            !config
+                .workspace
+                .roots
+                .contains(&PathBuf::from("/attacker/controlled"))
+        );
+        assert_ne!(config.workspace.heuristics_max_depth, 999_999);
+        assert!(!config.lsp_servers.iter().any(|s| s.language_id == "evil"));
     }
 
     #[test]

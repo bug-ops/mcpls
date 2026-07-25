@@ -17,10 +17,22 @@ pub struct Args {
     ///
     /// If not specified, searches for mcpls.toml in:
     /// 1. `$MCPLS_CONFIG` environment variable
-    /// 2. Current directory
+    /// 2. Current directory (only loaded with `--trust-project-config`)
     /// 3. ~/.config/mcpls/mcpls.toml
     #[arg(short, long, value_name = "FILE", env = "MCPLS_CONFIG")]
     pub config: Option<PathBuf>,
+
+    /// Trust and load a `mcpls.toml` found in the current directory.
+    ///
+    /// A project-local config discovered this way (as opposed to one passed
+    /// explicitly via `--config`/`MCPLS_CONFIG`) can control the LSP server
+    /// `command`/`args` mcpls spawns, so it is ignored by default to avoid
+    /// arbitrary code execution when running mcpls against an untrusted
+    /// checkout. Pass this flag only for repositories you trust. Via
+    /// `MCPLS_TRUST_PROJECT_CONFIG`, only the literal values `true`/`false`
+    /// are accepted; any other value is a parse error at startup.
+    #[arg(long, env = "MCPLS_TRUST_PROJECT_CONFIG")]
+    pub trust_project_config: bool,
 
     /// Logging level
     ///
@@ -63,6 +75,18 @@ mod tests {
         assert!(args.config.is_none());
         assert_eq!(args.log_level, "info");
         assert!(!args.log_json);
+    }
+
+    #[test]
+    fn test_trust_project_config_default_false() {
+        let args = Args::parse_from(["mcpls"]);
+        assert!(!args.trust_project_config);
+    }
+
+    #[test]
+    fn test_trust_project_config_flag() {
+        let args = Args::parse_from(["mcpls", "--trust-project-config"]);
+        assert!(args.trust_project_config);
     }
 
     #[test]

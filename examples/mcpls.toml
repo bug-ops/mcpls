@@ -1,5 +1,8 @@
 # Example MCPLS configuration file
-# Copy to ~/.config/mcpls/mcpls.toml or specify with --config flag
+# Copy to ~/.config/mcpls/mcpls.toml or specify with --config flag.
+# If placed as ./mcpls.toml in a project directory instead, mcpls ignores it
+# unless you pass --trust-project-config (or set MCPLS_TRUST_PROJECT_CONFIG=true) —
+# see docs/user-guide/configuration.md#trusting-a-project-local-config.
 
 # Workspace settings
 [workspace]

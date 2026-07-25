@@ -294,7 +294,8 @@ mcpls searches for configuration files in the following order:
 
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
-3. `./mcpls.toml` (current directory)
+3. `./mcpls.toml` (current directory) — requires `--trust-project-config` (see
+   [Configuration Reference](configuration.md#trusting-a-project-local-config))
 4. `~/.config/mcpls/mcpls.toml` (user config directory)
 
 ### Minimal Configuration

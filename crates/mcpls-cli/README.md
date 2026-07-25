@@ -28,8 +28,14 @@ mcpls --listen 127.0.0.1:3000             # HTTP transport (transport-http featu
 ## Configuration
 
 > [!NOTE]
-> Configuration auto-discovery order: `$MCPLS_CONFIG` → `./mcpls.toml` → platform config dir
+> Configuration auto-discovery order: `$MCPLS_CONFIG` → `./mcpls.toml` (requires
+> `--trust-project-config`) → platform config dir
 > Auto-creates default config with 30 language mappings on first run.
+
+> [!WARNING]
+> A `./mcpls.toml` in the current directory is ignored by default, since it can
+> control which command mcpls spawns as an LSP server. Pass `--trust-project-config`
+> (or set `MCPLS_TRUST_PROJECT_CONFIG=true`) only for repositories you trust.
 
 Create or edit `mcpls.toml` in the appropriate location:
 - **Linux/macOS:** `~/.config/mcpls/mcpls.toml`
@@ -43,6 +49,7 @@ See the main [README](../../README.md) for configuration examples and custom ext
 | Flag | Env | Description |
 |------|-----|-------------|
 | `-c, --config <PATH>` | `MCPLS_CONFIG` | Configuration file path |
+| `--trust-project-config` | `MCPLS_TRUST_PROJECT_CONFIG` | Load a `./mcpls.toml` found in the current directory |
 | `-l, --log-level <LEVEL>` | `MCPLS_LOG` | trace, debug, info, warn, error (default: info) |
 | `--log-json` | `MCPLS_LOG_JSON` | JSON-formatted logs for tooling |
 | `--listen <ADDR>` | `MCPLS_LISTEN` | Bind address for HTTP transport (`transport-http` feature) |

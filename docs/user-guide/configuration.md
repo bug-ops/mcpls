@@ -8,8 +8,46 @@ mcpls uses TOML format for configuration. The file can be placed in several loca
 
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
-3. `./mcpls.toml` (current directory)
+3. `./mcpls.toml` (current directory) — **only loaded with `--trust-project-config`** (or
+   `MCPLS_TRUST_PROJECT_CONFIG=true`); see [Trusting a Project-Local Config](#trusting-a-project-local-config)
 4. `~/.config/mcpls/mcpls.toml` (user config directory)
+
+### Trusting a Project-Local Config
+
+A `mcpls.toml` discovered in the current directory controls which command mcpls
+spawns as an LSP server (and other workspace settings), so mcpls does not load it
+automatically. Running `mcpls` inside an untrusted checkout must not execute
+commands from that checkout without explicit consent.
+
+To load a project-local `mcpls.toml`, opt in explicitly:
+
+```bash
+mcpls --trust-project-config
+# or
+MCPLS_TRUST_PROJECT_CONFIG=true mcpls
+```
+
+Without this flag, a `./mcpls.toml` in the current directory is ignored (a warning
+is logged naming the ignored path) and mcpls falls through to the user config
+directory or built-in defaults — including built-in project-marker heuristics, so
+e.g. a `Cargo.toml` in the workspace still spawns rust-analyzer. An explicit
+`--config <path>` or `$MCPLS_CONFIG` is always trusted, since naming a path is
+itself the user's consent.
+
+> [!WARNING]
+> `--trust-project-config` (and `MCPLS_TRUST_PROJECT_CONFIG=true`) is a **global**
+> trust grant for the whole mcpls process — it is not scoped to a single project.
+> Prefer setting it on a per-project MCP client config entry (the `args`/`env` for
+> that project's `mcpls` server registration) rather than in your shell profile or
+> a user-global MCP client config, so it doesn't silently apply the next time
+> mcpls is launched against a different, untrusted checkout.
+>
+> `$MCPLS_CONFIG` is a second, by-design door past this gate: it is always
+> trusted regardless of this flag, including when set to a relative path. A
+> repository's own `.envrc` (or similar) exporting `MCPLS_CONFIG=./mcpls.toml`
+> would make direnv-style tooling load it automatically — not a bug (an
+> explicitly named path is consent, per the design above), but worth knowing if
+> you audit a checkout for auto-executing config before running mcpls in it.
 
 ## Configuration Structure
 
