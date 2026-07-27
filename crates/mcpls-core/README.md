@@ -27,7 +27,7 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 
 ```toml
 [dependencies]
-mcpls-core = "0.3.7"
+mcpls-core = "0.3"
 ```
 
 ## Architecture
@@ -43,7 +43,7 @@ flowchart LR
 
 | Module | Responsibility |
 |--------|----------------|
-| `mcp/` | MCP server implementation with rmcp, 16 tool handlers |
+| `mcp/` | MCP server implementation with rmcp, 20 tool handlers |
 | `bridge/` | Position encoding, document state, notification cache, request translation |
 | `lsp/` | JSON-RPC 2.0 client, process management, notification handling, protocol types |
 | `config/` | TOML parsing, server discovery, workspace configuration |

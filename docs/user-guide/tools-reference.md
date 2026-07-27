@@ -23,8 +23,8 @@ mcpls exposes semantic code intelligence from Language Server Protocol (LSP) ser
 
 | Tool | LSP Method | Description |
 |------|------------|-------------|
-| [get_diagnostics](#get_diagnostics) | `textDocument/diagnostic` | Pull-based compiler errors and warnings |
-| [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications |
+| [get_diagnostics](#get_diagnostics) | `textDocument/diagnostic` + push notifications | Compiler errors, warnings, and hints (merged from pull and push) |
+| [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications only |
 | [format_document](#format_document) | `textDocument/formatting` | Document formatting |
 
 ### Refactoring Tools
@@ -251,7 +251,7 @@ Claude: [Uses get_references] The User struct is referenced in 23 locations
 
 ## get_diagnostics
 
-Get compiler errors, warnings, and hints for a file.
+Get compiler errors, warnings, and hints for a file, including diagnostics from background analysis tools.
 
 ### Parameters
 
@@ -287,7 +287,7 @@ Array of diagnostic messages:
     },
     "severity": 2,
     "message": "unused variable: `x`",
-    "source": "rustc"
+    "source": "clippy"
   }
 ]
 ```
@@ -318,9 +318,11 @@ Claude: [Uses get_diagnostics] Found 1 warning:
 
 ### Notes
 
-- Diagnostics are updated automatically by the LSP server
-- May include linter warnings (clippy for Rust, pylint for Python)
+- Returns diagnostics from both LSP pull requests and push notifications from background analysis tools
+- Includes diagnostics from tools like clippy (Rust), pylint (Python), and other linters configured in your LSP server
+- Diagnostics are automatically deduplicated by severity, code, and proximity to avoid duplicates across sources
 - Empty array if no issues found
+- If the LSP server is unavailable but diagnostics have been cached from previous push notifications, those cached diagnostics are returned
 
 ---
 
@@ -785,7 +787,7 @@ Claude: [Uses get_outgoing_calls] The function calls:
 
 ## get_cached_diagnostics
 
-Get diagnostics from LSP server push notifications (cached).
+Get diagnostics from LSP server push notifications (cached), without making a new pull request.
 
 ### Parameters
 
@@ -816,9 +818,10 @@ Get diagnostics from LSP server push notifications (cached).
 
 ### Notes
 
-- Returns diagnostics pushed by LSP server via `textDocument/publishDiagnostics`
-- More efficient than `get_diagnostics` as it uses cached data
-- May be empty if file hasn't been analyzed yet
+- Returns only diagnostics pushed by the LSP server via `textDocument/publishDiagnostics`, without making a new pull request
+- Filtered by the same routing rules as `get_diagnostics`, so both tools use the same server when routed explicitly
+- Returns empty array if the file hasn't been analyzed yet or no push notifications have been received
+- Useful when you want fast, cached-only results without waiting for a fresh pull request
 
 ---
 

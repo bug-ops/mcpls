@@ -137,6 +137,10 @@ Claude: [get_references] Found 4 matches:
 | `get_completions` | Context-aware suggestions that respect types and scope |
 | `get_document_symbols` | Structured outline — functions, types, constants, imports |
 | `workspace_symbol_search` | Find symbols by name across the entire workspace |
+| `get_signature_help` | Parameter info and active signature while typing a call |
+| `go_to_implementation` | Jump to implementations of a trait method or interface member |
+| `go_to_type_definition` | Jump to the type definition of an expression, distinct from `get_definition` for variable bindings |
+| `get_inlay_hints` | Inferred type/parameter annotations an editor would render inline |
 
 </details>
 
