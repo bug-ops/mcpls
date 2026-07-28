@@ -738,34 +738,38 @@ pub fn path_to_uri(path: &Path) -> Uri {
 /// where a bad value should surface as an error rather than a panic.
 #[must_use]
 pub fn try_path_to_uri(path: &Path) -> Option<Uri> {
-    let uri_string = encode_rfc3986_path_chars(&file_uri_string(path)?);
+    let uri_string = encode_rfc3986_path_chars(&file_url(path)?);
     uri_string.parse().ok()
 }
 
 #[cfg(not(windows))]
-fn file_uri_string(path: &Path) -> Option<String> {
-    Url::from_file_path(path).ok().map(Into::into)
+fn file_url(path: &Path) -> Option<Url> {
+    Url::from_file_path(path).ok()
 }
 
 #[cfg(windows)]
-fn file_uri_string(path: &Path) -> Option<String> {
+fn file_url(path: &Path) -> Option<Url> {
     match Url::from_file_path(path) {
-        Ok(file_url) => Some(file_url.into()),
-        Err(()) if path.has_root() => Some(windows_rooted_path_to_file_uri(path)),
+        Ok(file_url) => Some(file_url),
+        Err(()) if path.has_root() => windows_rooted_path_to_file_url(path),
         Err(()) => None,
     }
 }
 
 #[cfg(windows)]
-fn windows_rooted_path_to_file_uri(path: &Path) -> String {
+fn windows_rooted_path_to_file_url(path: &Path) -> Option<Url> {
     let path_str = path.to_string_lossy();
     let stripped = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
-    format!("file:///{}", stripped.replace('\\', "/"))
+    let mut file_url = Url::parse("file:///").ok()?;
+    file_url.path_segments_mut().ok()?.clear().extend(
+        stripped
+            .split(['\\', '/'])
+            .filter(|segment| !segment.is_empty()),
+    );
+    Some(file_url)
 }
 
-fn encode_rfc3986_path_chars(uri: &str) -> String {
-    #[allow(clippy::expect_used)]
-    let url = Url::parse(uri).expect("encode called with invalid URI");
+fn encode_rfc3986_path_chars(url: &Url) -> String {
     let prefix = url[..url::Position::BeforePath].to_owned();
     let encoded = url[url::Position::BeforePath..]
         .replace('[', "%5B")
@@ -1213,6 +1217,14 @@ mod tests {
     #[test]
     fn test_try_path_to_uri_returns_none_for_relative_path() {
         assert_eq!(try_path_to_uri(Path::new("relative/file.ts")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_try_path_to_uri_encodes_synthetic_windows_root() {
+        let uri = try_path_to_uri(Path::new("/home/user/#work %23")).unwrap();
+
+        assert_eq!(uri.as_str(), "file:///home/user/%23work%20%2523");
     }
 
     #[test]
