@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResult, Resource,
-    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
-    SubscribeRequestParams, UnsubscribeRequestParams,
+    Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
@@ -605,7 +605,7 @@ impl ServerHandler for McplsServer {
         &self,
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
@@ -631,10 +631,7 @@ impl ServerHandler for McplsServer {
         let json = serde_json::to_string(&diagnostics)
             .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
 
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            json,
-            request.uri,
-        )]))
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into())
     }
 
     /// When cached diagnostics exist, the replay notification is flushed to the client
