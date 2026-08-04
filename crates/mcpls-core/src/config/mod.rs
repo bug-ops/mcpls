@@ -1189,7 +1189,18 @@ mod tests {
 
     impl Drop for CwdGuard {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original_dir);
+            let restored = std::env::set_current_dir(&self.original_dir);
+            // A failure here during an already-unwinding panic must not
+            // panic again (double panic aborts the process, losing the
+            // original failure's message). On the normal path, though,
+            // silently swallowing this would leave the process cwd wrong
+            // for every subsequent test with no diagnostic — panic loudly
+            // instead, since that's exactly the failure mode this guard
+            // exists to prevent.
+            if !std::thread::panicking() {
+                #[allow(clippy::expect_used)]
+                restored.expect("CwdGuard failed to restore original working directory");
+            }
         }
     }
 
