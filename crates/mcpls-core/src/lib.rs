@@ -41,6 +41,7 @@ pub mod transport;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bridge::resources::make_uri;
 use bridge::{NotificationCache, ResourceSubscriptions, Translator};
@@ -51,7 +52,7 @@ use lsp::{LspNotification, LspServer, ServerInitConfig};
 use lsp_types::Uri;
 use rmcp::model::ResourceUpdatedNotificationParam;
 use tokio::sync::{Mutex, OnceCell};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 #[cfg(feature = "transport-http")]
 pub use transport::HttpConfig;
@@ -535,14 +536,15 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // Cancellation for pump tasks: send `true` to request shutdown.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    if applicable_configs.is_empty() {
+    let lsp_init_handle = if applicable_configs.is_empty() {
         warn!("No applicable LSP servers configured — starting in protocol-only mode");
+        None
     } else {
         info!(
             "Spawning {} LSP server(s) in the background...",
             applicable_configs.len()
         );
-        spawn_lsp_servers_background(
+        Some(spawn_lsp_servers_background(
             applicable_configs,
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
@@ -550,8 +552,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             Arc::clone(&peer_cell),
             cancel_rx.clone(),
             Arc::clone(&workspace_roots_snapshot),
-        );
-    }
+        ))
+    };
 
     info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new(
@@ -572,11 +574,21 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Transport::Http(cfg) => run_http(mcp_server, cfg).await,
     };
 
-    shutdown(&cancel_tx, &translator).await;
+    shutdown(&cancel_tx, &translator, lsp_init_handle).await;
 
     info!("MCPLS server shutting down");
     result
 }
+
+/// Bounds how long [`shutdown`] waits for the background LSP init task
+/// (see [`spawn_lsp_servers_background`]) to finish after cancellation is
+/// signaled. Deliberately shorter than [`Translator`]'s own per-server
+/// shutdown timeout: by the time `shutdown_servers` returns, every
+/// registered server's notification channel has closed, so the init task's
+/// diagnostics pumps should already be draining. This bound only matters
+/// for the rarer case where the init task is still mid-`initialize` (never
+/// registered anything for `shutdown_servers` to act on).
+const LSP_INIT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Post-transport shutdown sequence, run once the transport future
 /// (`run_stdio`/`run_http`) returns — whether that's because of a
@@ -585,13 +597,32 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 /// Signals background pump tasks to exit, then gracefully shuts down every
 /// LSP server registered on `translator` (see
 /// [`Translator::shutdown_servers`] for what "gracefully" bounds and falls
-/// back to). Extracted from [`serve_with`] so this sequence is exercised
-/// directly in tests without needing a full stdio/HTTP transport round trip.
-async fn shutdown(cancel_tx: &tokio::sync::watch::Sender<bool>, translator: &Translator) {
+/// back to). Finally, if the background LSP init task (see
+/// [`spawn_lsp_servers_background`]) is still running, awaits its
+/// `JoinHandle` with a bounded timeout: this surfaces a panic in that task
+/// (previously dropped silently, see #196) and gives its diagnostics pump
+/// tasks a chance to finish draining before `serve_with` returns.
+/// Extracted from [`serve_with`] so this sequence is exercised directly in
+/// tests without needing a full stdio/HTTP transport round trip.
+async fn shutdown(
+    cancel_tx: &tokio::sync::watch::Sender<bool>,
+    translator: &Translator,
+    lsp_init_handle: Option<JoinHandle<()>>,
+) {
     let _ = cancel_tx.send(true);
 
     info!("Shutting down LSP servers...");
     translator.shutdown_servers().await;
+
+    if let Some(handle) = lsp_init_handle {
+        match tokio::time::timeout(LSP_INIT_TASK_SHUTDOWN_TIMEOUT, handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => error!("Background LSP initialization task failed: {err}"),
+            Err(_) => {
+                warn!("Timed out waiting for background LSP initialization task to stop");
+            }
+        }
+    }
 }
 
 /// Spawn the applicable LSP servers in a background task and register them into
@@ -604,6 +635,11 @@ async fn shutdown(cancel_tx: &tokio::sync::watch::Sender<bool>, translator: &Tra
 /// registered return a `ServerInitializing` error telling the caller to wait and
 /// retry. If every server fails, the "expected servers" set is cleared so those
 /// calls fall back to a plain "no server configured" error instead.
+///
+/// Returns the task's `JoinHandle` so [`shutdown`] can await it: previously
+/// this handle was dropped, silently swallowing panics from
+/// `LspServer::spawn_batch`, `register_servers`, or a diagnostics pump task
+/// (see #196).
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
     translator: Arc<Translator>,
@@ -612,7 +648,7 @@ fn spawn_lsp_servers_background(
     peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     workspace_roots: Arc<[PathBuf]>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
             .iter()
@@ -695,7 +731,7 @@ fn spawn_lsp_servers_background(
             ));
         }
         while pumps.join_next().await.is_some() {}
-    });
+    })
 }
 
 #[cfg(test)]
@@ -1162,7 +1198,7 @@ mod tests {
 
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                super::super::shutdown(&cancel_tx, &translator),
+                super::super::shutdown(&cancel_tx, &translator, None),
             )
             .await;
 
@@ -1178,6 +1214,58 @@ mod tests {
             assert!(
                 *cancel_rx.borrow(),
                 "shutdown must signal background pump tasks to exit"
+            );
+        }
+
+        /// #196: `shutdown` must await the background LSP init task's
+        /// `JoinHandle` (rather than leaving it detached) so a panic inside
+        /// it surfaces as an `error!` log instead of being silently dropped.
+        #[tokio::test]
+        async fn test_shutdown_awaits_background_init_task() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let translator = Translator::new();
+            let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+
+            let completed = Arc::new(AtomicBool::new(false));
+            let completed_clone = Arc::clone(&completed);
+            let handle = tokio::spawn(async move {
+                completed_clone.store(true, Ordering::SeqCst);
+            });
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::super::shutdown(&cancel_tx, &translator, Some(handle)),
+            )
+            .await;
+
+            assert!(result.is_ok(), "shutdown must not hang on a live handle");
+            assert!(
+                completed.load(Ordering::SeqCst),
+                "shutdown must await the background init task before returning"
+            );
+        }
+
+        /// #196: a panicking background init task must not hang or crash
+        /// `shutdown` — the panic is caught by the `JoinHandle` and logged.
+        #[tokio::test]
+        async fn test_shutdown_logs_panicking_background_init_task() {
+            let translator = Translator::new();
+            let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+
+            let handle = tokio::spawn(async {
+                panic!("simulated background LSP init panic");
+            });
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::super::shutdown(&cancel_tx, &translator, Some(handle)),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "shutdown must not hang or propagate a panic from the background init task"
             );
         }
     }
