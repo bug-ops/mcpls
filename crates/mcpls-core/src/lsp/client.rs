@@ -214,8 +214,9 @@ impl LspClient {
     ///
     /// The configured value is clamped to the range from 1 second to
     /// [`MAX_TIMEOUT_SECONDS`]. [`ServerConfig::load_from`] rejects
-    /// `request_timeout_seconds` that is `0` or above
-    /// [`MAX_TIMEOUT_SECONDS`] at load time for TOML-sourced configs, but
+    /// `request_timeout_seconds` that is `0` or greater than
+    /// [`MAX_TIMEOUT_SECONDS`] at load time for TOML-sourced configs (a
+    /// value equal to [`MAX_TIMEOUT_SECONDS`] itself is accepted), but
     /// [`crate::serve`] accepts a caller-built `ServerConfig` without going
     /// through that validation (unless the caller opts in via
     /// [`ServerConfig::validate`]), so this clamp is the last line of defense

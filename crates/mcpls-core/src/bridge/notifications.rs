@@ -23,19 +23,19 @@ const MAX_LOG_ENTRIES: usize = 100;
 /// Eviction only triggers once this global total is reached; it then targets
 /// whichever server most exceeds its fair share of
 /// `MAX_DIAGNOSTIC_ENTRIES / diagnostics_route_count` (see
-/// [`NotificationCache::set_diagnostics_route_count`]), falling back to the
-/// writer's own oldest entry when every server is within its share. A noisy
-/// server can therefore only evict its own entries, never a server that is
-/// exceeding its fair share less than it is -- with one narrow exception:
-/// if the writer itself has no entries yet and every existing server is
-/// already within its own share, the largest of those in-share servers is
-/// evicted from instead, since otherwise there would be nothing to evict
-/// and the aggregate cap could be exceeded (see the private
-/// `server_to_evict_from` for that fallback). Outside that edge case, a
-/// server within its fair share is never touched (#266). A single active
-/// server can still use the full budget when other registered servers are
-/// idle (#276) instead of being capped at a static equal split regardless
-/// of how much of it they actually use.
+/// [`NotificationCache::set_diagnostics_route_count`]). If no server exceeds
+/// its share, eviction falls back to the writer's own oldest entry instead
+/// -- even if the writer is itself within its share -- since it is the one
+/// whose new entry needs room; a narrower fallback further evicts from the
+/// largest other in-share server only if the writer itself has no entries
+/// yet (its very first write) and every existing server is already within
+/// its own share, since otherwise there would be nothing to evict and the
+/// aggregate cap could be exceeded (see the private `server_to_evict_from`
+/// for both fallbacks). A quieter, non-writer server that is within its fair
+/// share is otherwise never touched (#266). A single active server can
+/// still use the full budget when other registered servers are idle (#276)
+/// instead of being capped at a static equal split regardless of how much
+/// of it they actually use.
 const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 
 /// Normalize a URI string to a stable cache key.
@@ -290,12 +290,14 @@ impl NotificationCache {
     /// genuinely new URI only evicts an existing entry once the *aggregate*
     /// across every server reaches `MAX_DIAGNOSTIC_ENTRIES`, and then only
     /// the least-recently-written entry of whichever server most exceeds its
-    /// fair share -- with one narrow exception documented on
-    /// `server_to_evict_from`, this is never an entry belonging to a server
-    /// that still has room in its fair share. This lets a single active
-    /// server use the full aggregate budget while other registered servers
-    /// are idle, instead of being capped at a static equal split regardless
-    /// of how much of it they actually use.
+    /// fair share, or -- per the fallbacks documented on
+    /// `server_to_evict_from` -- the writer's own oldest entry when no
+    /// server exceeds its share. A quieter, non-writer server that is within
+    /// its fair share is never touched, outside the narrow edge case also
+    /// documented there. This lets a single active server use the full
+    /// aggregate budget while other registered servers are idle, instead of
+    /// being capped at a static equal split regardless of how much of it
+    /// they actually use.
     ///
     /// # Examples
     ///
