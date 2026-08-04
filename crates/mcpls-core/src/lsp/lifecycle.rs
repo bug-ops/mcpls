@@ -105,6 +105,20 @@ pub struct ServerInitConfig {
     pub workspace_roots: Vec<PathBuf>,
     /// Initialization options (server-specific JSON).
     pub initialization_options: Option<serde_json::Value>,
+    /// Position encoding preference order from
+    /// [`crate::config::WorkspaceConfig::position_encodings`].
+    ///
+    /// Sent as `capabilities.general.positionEncodings` during [`LspServer::spawn`]'s
+    /// `initialize` handshake, in the configured order. Values that don't parse
+    /// as a valid [`PositionEncodingKind`] are skipped with a warning rather than
+    /// failing the handshake: `serve`/`serve_with` validate the top-level
+    /// `ServerConfig` via [`crate::config::ServerConfig::validate`] before this
+    /// is ever built, but `LspServer::spawn`/`spawn_batch` are `pub` and
+    /// reachable directly by a library embedder bypassing that validation
+    /// entirely (same reasoning as the `initialize` timeout clamp below), so
+    /// this can't assume the value was already checked. If nothing parses,
+    /// falls back to `config::default_position_encodings()`'s default.
+    pub position_encodings: Vec<String>,
     /// Optional channel for forwarding LSP notifications to the notification cache.
     ///
     /// When `Some`, the spawned LSP client sends every notification it receives
@@ -394,10 +408,9 @@ impl LspServer {
             initialization_options: config.initialization_options.clone(),
             capabilities: ClientCapabilities {
                 general: Some(GeneralClientCapabilities {
-                    position_encodings: Some(vec![
-                        PositionEncodingKind::UTF8,
-                        PositionEncodingKind::UTF16,
-                    ]),
+                    position_encodings: Some(resolve_position_encodings(
+                        &config.position_encodings,
+                    )),
                     ..Default::default()
                 }),
                 text_document: Some(lsp_types::TextDocumentClientCapabilities {
@@ -618,12 +631,14 @@ impl LspServer {
     ///         server_config: LspServerConfig::rust_analyzer(),
     ///         workspace_roots: vec![PathBuf::from("/workspace")],
     ///         initialization_options: None,
+    ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
     ///         notification_tx: None,
     ///     },
     ///     ServerInitConfig {
     ///         server_config: LspServerConfig::pyright(),
     ///         workspace_roots: vec![PathBuf::from("/workspace")],
     ///         initialization_options: None,
+    ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
     ///         notification_tx: None,
     ///     },
     /// ];
@@ -673,6 +688,36 @@ impl LspServer {
         }
 
         result
+    }
+}
+
+/// Convert configured position-encoding strings into the ordered
+/// [`PositionEncodingKind`] list offered during the `initialize` handshake.
+///
+/// Values that don't parse are skipped with a warning instead of failing the
+/// handshake (see [`ServerInitConfig::position_encodings`] for why this can't
+/// assume [`crate::config::ServerConfig::validate`] already ran). Falls back
+/// to `config::default_position_encodings()` -- the same default used when
+/// nothing is configured at all -- if no configured value parses.
+fn resolve_position_encodings(configured: &[String]) -> Vec<PositionEncodingKind> {
+    let encodings: Vec<PositionEncodingKind> = configured
+        .iter()
+        .filter_map(|value| {
+            let kind = crate::config::parse_position_encoding(value);
+            if kind.is_none() {
+                warn!("ignoring invalid configured position encoding '{value}'");
+            }
+            kind
+        })
+        .collect();
+
+    if encodings.is_empty() {
+        crate::config::default_position_encodings()
+            .iter()
+            .filter_map(|value| crate::config::parse_position_encoding(value))
+            .collect()
+    } else {
+        encodings
     }
 }
 
@@ -782,6 +827,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_resolve_position_encodings_preserves_configured_order() {
+        let result = resolve_position_encodings(&["utf-32".to_string(), "utf-8".to_string()]);
+        assert_eq!(
+            result,
+            vec![PositionEncodingKind::UTF32, PositionEncodingKind::UTF8]
+        );
+    }
+
+    #[test]
+    fn test_resolve_position_encodings_skips_invalid_and_keeps_valid() {
+        let result = resolve_position_encodings(&["utf-7".to_string(), "utf-16".to_string()]);
+        assert_eq!(result, vec![PositionEncodingKind::UTF16]);
+    }
+
+    #[test]
+    fn test_resolve_position_encodings_falls_back_when_all_invalid() {
+        let result = resolve_position_encodings(&["utf-7".to_string(), "bogus".to_string()]);
+        assert_eq!(
+            result,
+            vec![PositionEncodingKind::UTF8, PositionEncodingKind::UTF16]
+        );
+    }
+
+    #[test]
+    fn test_resolve_position_encodings_falls_back_when_empty() {
+        let result = resolve_position_encodings(&[]);
+        assert_eq!(
+            result,
+            vec![PositionEncodingKind::UTF8, PositionEncodingKind::UTF16]
+        );
+    }
+
+    #[test]
     fn test_server_state_ready() {
         assert!(ServerState::Ready.is_ready());
         assert!(ServerState::Ready.can_accept_requests());
@@ -884,6 +962,7 @@ mod tests {
             server_config: LspServerConfig::rust_analyzer(),
             workspace_roots: vec![PathBuf::from("/tmp/workspace")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
         };
 
@@ -899,6 +978,7 @@ mod tests {
             server_config: LspServerConfig::pyright(),
             workspace_roots: vec![],
             initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
         };
 
@@ -940,6 +1020,7 @@ mod tests {
             },
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
         };
 
@@ -953,6 +1034,7 @@ mod tests {
             server_config: LspServerConfig::typescript(),
             workspace_roots: vec![],
             initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
         };
 
@@ -969,6 +1051,7 @@ mod tests {
                 PathBuf::from("/workspace3"),
             ],
             initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
         };
 
@@ -1423,6 +1506,7 @@ mod tests {
             },
             workspace_roots: vec![],
             initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
             notification_tx: None,
         }];
 
@@ -1459,6 +1543,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
             },
             ServerInitConfig {
@@ -1477,6 +1562,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
             },
             ServerInitConfig {
@@ -1495,6 +1581,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
             },
         ];
@@ -1536,6 +1623,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
             },
             ServerInitConfig {
@@ -1554,6 +1642,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
             },
         ];
@@ -1567,6 +1656,136 @@ mod tests {
 
         assert_eq!(result.failures[1].language_id, "lang2");
         assert_eq!(result.failures[1].command, "cmd2-nonexistent");
+    }
+
+    /// Wire-level regression test for #287: proves the *configured*
+    /// `position_encodings` (not the old hardcoded `[UTF8, UTF16]`) actually
+    /// reaches `capabilities.general.positionEncodings` in the `initialize`
+    /// request body, by capturing the real bytes `LspServer::initialize`
+    /// writes over a piped `cat` subprocess standing in for the LSP server.
+    /// Mirrors the `fake_lsp_client`/`FakeServer` pattern in
+    /// `client.rs::tests::retry_behavior`.
+    mod initialize_wire {
+        use std::process::Stdio;
+
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+        use super::*;
+        use crate::lsp::client::LspClient;
+
+        struct FakeServer {
+            _write_half: Child,
+            _read_half: Child,
+            read_half_stdin: ChildStdin,
+            write_stdout: ChildStdout,
+        }
+
+        fn fake_lsp_client() -> (LspClient, FakeServer) {
+            let mut write_half = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let write_stdin = write_half.stdin.take().unwrap();
+            let write_stdout = write_half.stdout.take().unwrap();
+
+            let mut read_half = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let read_stdout = read_half.stdout.take().unwrap();
+            let read_stdin = read_half.stdin.take().unwrap();
+
+            let transport = LspTransport::new(write_stdin, read_stdout);
+            let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+            (
+                client,
+                FakeServer {
+                    _write_half: write_half,
+                    _read_half: read_half,
+                    read_half_stdin: read_stdin,
+                    write_stdout,
+                },
+            )
+        }
+
+        /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
+        async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> Value {
+            let mut content_length = None;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((key, value)) = line.trim_end().split_once(':')
+                    && key.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut buf = vec![0u8; content_length.unwrap()];
+            reader.read_exact(&mut buf).await.unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        }
+
+        /// Writes a framed JSON-RPC success response.
+        async fn write_success_response(stdin: &mut ChildStdin, id: &Value, result: Value) {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            });
+            let content = serde_json::to_string(&response).unwrap();
+            let header = format!("Content-Length: {}\r\n\r\n", content.len());
+            stdin.write_all(header.as_bytes()).await.unwrap();
+            stdin.write_all(content.as_bytes()).await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_initialize_sends_configured_position_encodings() {
+            let (client, mut server) = fake_lsp_client();
+
+            let config = ServerInitConfig {
+                server_config: LspServerConfig::rust_analyzer(),
+                workspace_roots: vec![],
+                initialization_options: None,
+                position_encodings: vec!["utf-32".to_string(), "utf-8".to_string()],
+                notification_tx: None,
+            };
+
+            let init_task =
+                tokio::spawn(async move { LspServer::initialize(&client, &config).await });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+
+            assert_eq!(request["method"], "initialize");
+            assert_eq!(
+                request["params"]["capabilities"]["general"]["positionEncodings"],
+                serde_json::json!(["utf-32", "utf-8"]),
+                "initialize request must carry the configured encoding order, not the \
+                 hardcoded [UTF8, UTF16] default"
+            );
+
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                serde_json::json!({ "capabilities": {} }),
+            )
+            .await;
+
+            // The response written above must let `initialize` complete successfully.
+            init_task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1588,6 +1807,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
             },
             ServerInitConfig {
@@ -1606,6 +1826,7 @@ mod tests {
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                 notification_tx: None,
             },
         ];

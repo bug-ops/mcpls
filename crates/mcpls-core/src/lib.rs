@@ -479,6 +479,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
                 server_config: lsp_config.clone(),
                 workspace_roots: workspace_roots.clone(),
                 initialization_options: lsp_config.initialization_options.clone(),
+                position_encodings: config.workspace.position_encodings.clone(),
                 notification_tx: None,
             })
         })

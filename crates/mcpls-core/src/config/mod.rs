@@ -64,8 +64,14 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub roots: Vec<PathBuf>,
 
-    /// Position encoding preference order.
-    /// Valid values: "utf-8", "utf-16", "utf-32"
+    /// Position encoding preference order, offered to each spawned LSP
+    /// server as `capabilities.general.positionEncodings` during the
+    /// `initialize` handshake (see [`crate::lsp::LspServer::spawn`]), in the
+    /// order configured here.
+    ///
+    /// Valid values: `"utf-8"`, `"utf-16"`, `"utf-32"`. Must be non-empty;
+    /// [`ServerConfig::validate`] rejects an empty list or an unrecognized
+    /// value.
     #[serde(default = "default_position_encodings")]
     pub position_encodings: Vec<String>,
 
@@ -166,8 +172,26 @@ fn language_id_for_pattern_extension(server_language_id: &str, extension: &str) 
         .to_string()
 }
 
-fn default_position_encodings() -> Vec<String> {
+pub(crate) fn default_position_encodings() -> Vec<String> {
     vec!["utf-8".to_string(), "utf-16".to_string()]
+}
+
+/// Parse a configured position-encoding string into an [`lsp_types::PositionEncodingKind`].
+///
+/// Recognizes the three values the LSP spec defines for
+/// `PositionEncodingKind`: `"utf-8"`, `"utf-16"`, `"utf-32"`. Returns `None`
+/// for anything else, letting the caller decide how to handle an invalid
+/// value (see [`ServerConfig::validate`], which rejects it at load time, and
+/// [`crate::lsp::LspServer::spawn`], which falls back to a default rather
+/// than failing the handshake for a config built without going through
+/// `validate`).
+pub(crate) fn parse_position_encoding(value: &str) -> Option<lsp_types::PositionEncodingKind> {
+    match value {
+        "utf-8" => Some(lsp_types::PositionEncodingKind::UTF8),
+        "utf-16" => Some(lsp_types::PositionEncodingKind::UTF16),
+        "utf-32" => Some(lsp_types::PositionEncodingKind::UTF32),
+        _ => None,
+    }
 }
 
 /// Build default language extension mappings.
@@ -534,6 +558,20 @@ impl ServerConfig {
     /// assert!(config.validate().is_ok());
     /// ```
     pub fn validate(&self) -> Result<()> {
+        if self.workspace.position_encodings.is_empty() {
+            return Err(Error::InvalidConfig(
+                "workspace.position_encodings cannot be empty".to_string(),
+            ));
+        }
+        for encoding in &self.workspace.position_encodings {
+            if parse_position_encoding(encoding).is_none() {
+                return Err(Error::InvalidConfig(format!(
+                    "invalid workspace.position_encodings value '{encoding}'; expected one of \
+                     \"utf-8\", \"utf-16\", \"utf-32\""
+                )));
+            }
+        }
+
         let mut seen_names: HashMap<&str, &str> = HashMap::new();
         for server in &self.lsp_servers {
             if server.language_id.is_empty() {
@@ -993,6 +1031,63 @@ mod tests {
         } else {
             panic!("Expected InvalidConfig error");
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_position_encodings() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r"
+            [workspace]
+            position_encodings = []
+        ";
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert_eq!(msg, "workspace.position_encodings cannot be empty");
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_unrecognized_position_encoding() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [workspace]
+            position_encodings = ["utf-8", "utf-7"]
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("invalid workspace.position_encodings value 'utf-7'"));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_position_encoding_maps_valid_values_and_rejects_unknown() {
+        assert_eq!(
+            parse_position_encoding("utf-8"),
+            Some(lsp_types::PositionEncodingKind::UTF8)
+        );
+        assert_eq!(
+            parse_position_encoding("utf-16"),
+            Some(lsp_types::PositionEncodingKind::UTF16)
+        );
+        assert_eq!(
+            parse_position_encoding("utf-32"),
+            Some(lsp_types::PositionEncodingKind::UTF32)
+        );
+        assert_eq!(parse_position_encoding("utf-7"), None);
     }
 
     #[test]

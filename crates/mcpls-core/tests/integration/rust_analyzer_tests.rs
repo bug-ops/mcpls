@@ -65,6 +65,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         server_config: lsp_config,
         workspace_roots: vec![workspace_path.clone()],
         initialization_options: None,
+        position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
         notification_tx: None,
     };
 

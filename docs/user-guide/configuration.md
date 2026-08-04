@@ -104,14 +104,14 @@ roots = []
 **Default**: `["utf-8", "utf-16"]`
 **Options**: `"utf-8"`, `"utf-16"`, `"utf-32"`
 
-Preferred position encodings for LSP communication.
+Preferred position encodings for LSP communication, offered to each spawned server during the `initialize` handshake in the listed order.
 
 ```toml
 [workspace]
 position_encodings = ["utf-8", "utf-16", "utf-32"]
 ```
 
-Most language servers use UTF-16 encoding. mcpls automatically converts between MCP (UTF-8) and LSP encodings.
+This is a preference, not a restriction: per the LSP spec, UTF-16 is a mandatory fallback encoding, so a server may still reply with UTF-16 even if it's omitted from this list. Most language servers negotiate UTF-16 by default.
 
 ### `workspace.language_extensions`
 
