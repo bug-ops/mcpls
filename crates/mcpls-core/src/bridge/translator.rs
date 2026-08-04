@@ -1781,54 +1781,7 @@ impl Translator {
         kind_filter: Option<String>,
         limit: u32,
     ) -> Result<WorkspaceSymbolResult> {
-        const MAX_QUERY_LENGTH: usize = 1000;
-        const VALID_SYMBOL_KINDS: &[&str] = &[
-            "File",
-            "Module",
-            "Namespace",
-            "Package",
-            "Class",
-            "Method",
-            "Property",
-            "Field",
-            "Constructor",
-            "Enum",
-            "Interface",
-            "Function",
-            "Variable",
-            "Constant",
-            "String",
-            "Number",
-            "Boolean",
-            "Array",
-            "Object",
-            "Key",
-            "Null",
-            "EnumMember",
-            "Struct",
-            "Event",
-            "Operator",
-            "TypeParameter",
-        ];
-
-        // Validate query length
-        if query.len() > MAX_QUERY_LENGTH {
-            return Err(Error::InvalidToolParams(format!(
-                "Query too long: {} chars (max {MAX_QUERY_LENGTH})",
-                query.len()
-            )));
-        }
-
-        // Validate kind filter
-        if let Some(ref kind) = kind_filter
-            && !VALID_SYMBOL_KINDS
-                .iter()
-                .any(|k| k.eq_ignore_ascii_case(kind))
-        {
-            return Err(Error::InvalidToolParams(format!(
-                "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
-            )));
-        }
+        validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
 
         // Workspace search has no document, so it resolves via `resolve_any`
         // rather than a per-language route. If the resolved server is not
@@ -2737,6 +2690,58 @@ fn validate_code_action_params(
         return Err(Error::InvalidToolParams(
             "Start position must be before or equal to end position".to_string(),
         ));
+    }
+
+    Ok(())
+}
+
+/// Validate parameters for `handle_workspace_symbol`.
+fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
+    const MAX_QUERY_LENGTH: usize = 1000;
+    const VALID_SYMBOL_KINDS: &[&str] = &[
+        "File",
+        "Module",
+        "Namespace",
+        "Package",
+        "Class",
+        "Method",
+        "Property",
+        "Field",
+        "Constructor",
+        "Enum",
+        "Interface",
+        "Function",
+        "Variable",
+        "Constant",
+        "String",
+        "Number",
+        "Boolean",
+        "Array",
+        "Object",
+        "Key",
+        "Null",
+        "EnumMember",
+        "Struct",
+        "Event",
+        "Operator",
+        "TypeParameter",
+    ];
+
+    if query.len() > MAX_QUERY_LENGTH {
+        return Err(Error::InvalidToolParams(format!(
+            "Query too long: {} chars (max {MAX_QUERY_LENGTH})",
+            query.len()
+        )));
+    }
+
+    if let Some(kind) = kind_filter
+        && !VALID_SYMBOL_KINDS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(kind))
+    {
+        return Err(Error::InvalidToolParams(format!(
+            "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
+        )));
     }
 
     Ok(())
