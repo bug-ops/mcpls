@@ -48,16 +48,64 @@ pub use config::{ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
+use lsp_types::Uri;
 use rmcp::model::ResourceUpdatedNotificationParam;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 #[cfg(feature = "transport-http")]
 pub use transport::HttpConfig;
 pub use transport::Transport;
 #[cfg(feature = "transport-http")]
 use transport::run_http;
 use transport::run_stdio;
+
+/// Whether `uri` falls within one of `workspace_roots`.
+///
+/// Used to reject diagnostics for out-of-workspace URIs before caching them:
+/// a misbehaving or compromised LSP server could otherwise publish
+/// diagnostics for an unbounded number of fabricated (often non-existent)
+/// URIs, defeating `MAX_DIAGNOSTIC_ENTRIES`'s FIFO cap by flushing every
+/// legitimate entry out of the cache before it (see #234). Deliberately does
+/// not canonicalize -- this runs per incoming notification, and LSP servers
+/// report already-resolved canonical paths, so a prefix check is enough to
+/// reject URIs a legitimate server would never publish for, without a
+/// filesystem syscall on every diagnostic.
+///
+/// # Preconditions
+///
+/// `workspace_roots` must itself already be canonical, or every diagnostic
+/// silently fails to match and gets dropped (a raw `[[lsp_servers]]`-derived
+/// or relative root will never `starts_with`-match a canonical LSP path).
+/// `serve_with` guarantees this by passing `workspace_roots_snapshot`, which
+/// is built via [`canonicalize_workspace_roots`] -- see that function's docs.
+///
+/// An empty `workspace_roots` (no workspace configured) allows any URI,
+/// matching `validate_path_against_roots`'s "no roots = no restriction"
+/// behavior.
+fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &[PathBuf]) -> bool {
+    if workspace_roots.is_empty() {
+        return true;
+    }
+    let Some(path) = bridge::uri_to_path(uri) else {
+        return false;
+    };
+    workspace_roots.iter().any(|root| path.starts_with(root))
+}
+
+/// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
+/// `serve_with` run, factored out of `diagnostics_pump`'s parameter list to
+/// keep it under clippy's argument-count lint. `Clone` is cheap (`Arc`
+/// clones only).
+#[derive(Clone)]
+pub(crate) struct PumpShared {
+    pub(crate) notification_cache: Arc<Mutex<NotificationCache>>,
+    pub(crate) subs: Arc<ResourceSubscriptions>,
+    pub(crate) peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
+    /// Used to reject diagnostics for out-of-workspace URIs; see
+    /// `diagnostic_path_in_workspace`.
+    pub(crate) workspace_roots: Arc<[PathBuf]>,
+}
 
 /// Background task that drains LSP notifications, writes them to the cache,
 /// and forwards `resources/updated` to the MCP peer when subscribed.
@@ -87,12 +135,16 @@ use transport::run_stdio;
 pub(crate) async fn diagnostics_pump(
     _server_id: String,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
-    notification_cache: Arc<Mutex<NotificationCache>>,
-    subs: Arc<ResourceSubscriptions>,
-    peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     caches_diagnostics: bool,
+    shared: PumpShared,
 ) {
+    let PumpShared {
+        notification_cache,
+        subs,
+        peer_cell,
+        workspace_roots,
+    } = shared;
     loop {
         tokio::select! {
             // Exit when cancellation is requested or the sender is dropped.
@@ -115,6 +167,13 @@ pub(crate) async fn diagnostics_pump(
                         // doesn't overwrite (or spuriously notify about) another
                         // server's cache entry.
                         if !caches_diagnostics {
+                            continue;
+                        }
+                        if !diagnostic_path_in_workspace(&p.uri, &workspace_roots) {
+                            debug!(
+                                "dropping diagnostics for out-of-workspace URI: {}",
+                                p.uri.as_str()
+                            );
                             continue;
                         }
                         {
@@ -280,6 +339,21 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
+/// Canonicalize each workspace root, falling back to the original path for
+/// any root that fails to canonicalize (e.g. deleted after startup).
+///
+/// `resolve_workspace_roots` returns config-provided roots unmodified
+/// (relative paths, symlinks kept as-is); this normalizes them so a plain
+/// prefix comparison against an already-resolved LSP path (see
+/// `diagnostic_path_in_workspace`) works without a filesystem syscall on
+/// that hot per-notification path.
+fn canonicalize_workspace_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .collect()
+}
+
 /// Start the MCPLS server with the given configuration over stdio.
 ///
 /// This is the backward-compatible entry point. It is equivalent to calling
@@ -417,7 +491,21 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // Fixed for the server's lifetime: shared as a lock-free snapshot so
     // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
     // validate a path without locking `translator` below.
-    let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
+    //
+    // Canonicalized once here rather than left as-is: `resolve_workspace_roots`
+    // returns config-provided roots unmodified (relative paths, symlinks kept),
+    // but `diagnostic_path_in_workspace` (fed by this snapshot) does a plain
+    // prefix check with no filesystem I/O on its hot per-notification path --
+    // that only matches correctly if both sides are already in the same
+    // (canonical) form, and LSP servers report already-resolved canonical
+    // paths. Comparing an un-canonicalized root against a canonical path would
+    // silently drop every diagnostic for a workspace configured with a
+    // relative or symlinked root. Falls back to the original root if
+    // canonicalization fails (e.g. deleted between startup and this point);
+    // `validate_path_against_roots`'s own per-call canonicalize is unaffected
+    // either way, since canonicalizing an already-canonical path is a no-op.
+    let workspace_roots_snapshot: Arc<[PathBuf]> =
+        Arc::from(canonicalize_workspace_roots(&workspace_roots));
 
     let translator = Arc::new(translator);
     let subscriptions = Arc::new(ResourceSubscriptions::new());
@@ -441,6 +529,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             Arc::clone(&subscriptions),
             Arc::clone(&peer_cell),
             cancel_rx.clone(),
+            Arc::clone(&workspace_roots_snapshot),
         );
     }
 
@@ -487,6 +576,7 @@ fn spawn_lsp_servers_background(
     subscriptions: Arc<ResourceSubscriptions>,
     peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    workspace_roots: Arc<[PathBuf]>,
 ) {
     tokio::spawn(async move {
         let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
@@ -535,6 +625,12 @@ fn spawn_lsp_servers_background(
         info!("Proceeding with {} LSP server(s)", server_count);
 
         // Start diagnostics pump tasks now that servers are registered.
+        let pump_shared = PumpShared {
+            notification_cache,
+            subs: subscriptions,
+            peer_cell,
+            workspace_roots,
+        };
         let mut pumps: JoinSet<()> = JoinSet::new();
         for (id, rx) in registered.receivers {
             let caches_diagnostics = registered
@@ -545,11 +641,9 @@ fn spawn_lsp_servers_background(
             pumps.spawn(diagnostics_pump(
                 id.to_string(),
                 rx,
-                Arc::clone(&notification_cache),
-                Arc::clone(&subscriptions),
-                Arc::clone(&peer_cell),
                 cancel_rx.clone(),
                 caches_diagnostics,
+                pump_shared.clone(),
             ));
         }
         while pumps.join_next().await.is_some() {}
@@ -560,6 +654,62 @@ fn spawn_lsp_servers_background(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_diagnostic_path_in_workspace_empty_roots_allows_any_uri() {
+        let uri: Uri = "file:///anywhere/at/all.rs".parse().unwrap();
+        assert!(diagnostic_path_in_workspace(&uri, &[]));
+    }
+
+    #[test]
+    fn test_diagnostic_path_in_workspace_accepts_uri_under_root() {
+        let root = PathBuf::from("/workspace/project");
+        let uri: Uri = "file:///workspace/project/src/main.rs".parse().unwrap();
+        assert!(diagnostic_path_in_workspace(&uri, &[root]));
+    }
+
+    #[test]
+    fn test_diagnostic_path_in_workspace_rejects_uri_outside_roots() {
+        let root = PathBuf::from("/workspace/project");
+        let uri: Uri = "file:///etc/passwd".parse().unwrap();
+        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+    }
+
+    #[test]
+    fn test_diagnostic_path_in_workspace_rejects_non_file_uri() {
+        let root = PathBuf::from("/workspace/project");
+        let uri: Uri = "untitled:Untitled-1".parse().unwrap();
+        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+    }
+
+    #[test]
+    fn test_canonicalize_workspace_roots_falls_back_on_nonexistent_path() {
+        let missing = PathBuf::from("/definitely/does/not/exist/anywhere");
+        let result = canonicalize_workspace_roots(std::slice::from_ref(&missing));
+        assert_eq!(result, vec![missing]);
+    }
+
+    /// #234 round-3 regression: a symlinked workspace root must canonicalize
+    /// to its real path, matching what LSP servers report in diagnostics --
+    /// otherwise `diagnostic_path_in_workspace`'s uncanonicalized prefix check
+    /// would silently drop every diagnostic for that workspace.
+    #[test]
+    #[cfg(unix)]
+    fn test_canonicalize_workspace_roots_resolves_symlink() {
+        use std::os::unix::fs::symlink;
+
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let real_dir = base.join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link_dir = base.join("link");
+        symlink(&real_dir, &link_dir).unwrap();
+
+        let result = canonicalize_workspace_roots(&[link_dir]);
+        assert_eq!(result, vec![real_dir]);
+    }
 
     #[test]
     fn test_resolve_workspace_roots_empty_config() {
@@ -930,6 +1080,13 @@ mod tests {
             Arc::new(OnceCell::new())
         }
 
+        /// Empty workspace roots: `diagnostic_path_in_workspace` allows any
+        /// URI in this mode, matching `validate_path_against_roots`, so these
+        /// pump-mechanics tests don't need to construct real workspace paths.
+        fn no_workspace_roots() -> Arc<[PathBuf]> {
+            Arc::from([])
+        }
+
         /// `PublishDiagnostics` is cached even when the peer is not yet connected.
         #[tokio::test]
         async fn test_pump_caches_before_peer_set() {
@@ -945,11 +1102,14 @@ mod tests {
             tokio::spawn(diagnostics_pump(
                 "rust".to_string(),
                 rx,
-                c,
-                Arc::clone(&subs),
-                Arc::clone(&peer_cell),
                 cancel_rx,
                 true,
+                PumpShared {
+                    notification_cache: c,
+                    subs: Arc::clone(&subs),
+                    peer_cell: Arc::clone(&peer_cell),
+                    workspace_roots: no_workspace_roots(),
+                },
             ));
 
             let uri: Uri = "file:///test/main.rs".parse().unwrap();
@@ -983,6 +1143,84 @@ mod tests {
             assert!(cached, "diagnostics should be cached before peer is set");
         }
 
+        /// #234 (S1 hardening): diagnostics for URIs outside the configured
+        /// workspace roots must be dropped rather than cached, closing the
+        /// vector where a misbehaving server floods the FIFO-bounded cache
+        /// with fabricated URIs to evict every legitimate entry.
+        #[tokio::test]
+        async fn test_pump_drops_diagnostics_outside_workspace_roots() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            let workspace_roots: Arc<[PathBuf]> = Arc::from([PathBuf::from("/workspace")]);
+
+            tokio::spawn(diagnostics_pump(
+                "rust".to_string(),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs: Arc::clone(&subs),
+                    peer_cell: Arc::clone(&peer_cell),
+                    workspace_roots,
+                },
+            ));
+
+            let outside_uri: Uri = "file:///etc/passwd".parse().unwrap();
+            let inside_uri: Uri = "file:///workspace/src/main.rs".parse().unwrap();
+
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: outside_uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: inside_uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            // Poll until the (later-sent) in-workspace sentinel is cached --
+            // proves the pump already processed the earlier out-of-workspace
+            // message too, since the channel preserves send order.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    {
+                        let guard = cache.lock().await;
+                        if guard.get_diagnostics(inside_uri.as_str()).is_some() {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("pump did not cache in-workspace diagnostics within 5 s");
+
+            let found_outside = cache
+                .lock()
+                .await
+                .get_diagnostics(outside_uri.as_str())
+                .is_some();
+            assert!(
+                !found_outside,
+                "diagnostics for a URI outside workspace roots must not be cached"
+            );
+        }
+
         /// Pump exits cleanly when the cancel watch sends `true`.
         #[tokio::test]
         async fn test_pump_exits_on_cancel() {
@@ -995,11 +1233,14 @@ mod tests {
             let handle = tokio::spawn(diagnostics_pump(
                 "rust".to_string(),
                 rx,
-                cache,
-                subs,
-                peer_cell,
                 cancel_rx,
                 true,
+                PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
             ));
 
             cancel_tx.send(true).unwrap();
@@ -1022,11 +1263,14 @@ mod tests {
             let handle = tokio::spawn(diagnostics_pump(
                 "rust".to_string(),
                 rx,
-                cache,
-                subs,
-                peer_cell,
                 cancel_rx,
                 true,
+                PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
             ));
 
             drop(cancel_tx); // triggers Err in cancel_rx.changed()
@@ -1064,11 +1308,14 @@ mod tests {
             tokio::spawn(diagnostics_pump(
                 "rust".to_string(),
                 rx,
-                Arc::clone(&cache),
-                subs,
-                peer_cell,
                 cancel_rx,
                 true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
             ));
 
             let uri: Uri = "file:///test/locked.rs".parse().unwrap();

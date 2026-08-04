@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub use language::{base_language_id, react_variant_language_id};
-pub use routing::{ServerId, ToolKind, ToolRouter};
+pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, ServerHeuristics};
 

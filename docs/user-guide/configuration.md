@@ -411,12 +411,12 @@ to a server that explicitly declined it via `handles`.
 **Exception: `workspace_symbol_search`.** This tool has no document, so it
 has no language to route on. It resolves, across all configured servers, to
 the first one that explicitly claims `workspace_symbols`, else the first
-catch-all, else — only as a last resort, and only if neither of those exist
-— the first live server at all, even one that declined `workspace_symbols`
-via `handles`. This last-resort step is intentional (workspace search is
-better served imperfectly than not at all) but means `handles` is not an
-absolute guarantee for this one tool the way it is for every
-document-scoped tool above.
+catch-all. Unlike every document-scoped tool above, there is no per-language
+fallback to try (`handles` is per-language, and this tool has no language) —
+if neither an explicit claimer nor a catch-all exists anywhere in the
+workspace, the request fails naming the tool rather than being forwarded to
+an arbitrary server that declined it via `handles`. Add `workspace_symbols`
+to a server's `handles` list, or configure a catch-all, to enable this tool.
 
 ## Environment Variables
 

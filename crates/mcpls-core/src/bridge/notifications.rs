@@ -2,7 +2,7 @@
 //!
 //! Stores diagnostics, log messages, and server messages received from LSP servers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
@@ -10,6 +10,19 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum number of log entries to store.
 const MAX_LOG_ENTRIES: usize = 100;
+
+/// Maximum number of distinct document URIs to retain diagnostics for.
+///
+/// Guards against unbounded growth when a spawned LSP server publishes
+/// diagnostics for an unbounded number of distinct URIs over a long-running
+/// session, matching the bounding already applied to `logs`/`messages`.
+//
+// TODO(critic-M4): this budget is shared across every registered LSP server
+// via one `NotificationCache`; a noisy server can evict a quiet server's
+// entries in a multi-language workspace. Pre-existing structure (the cache
+// was always shared), newly load-bearing now that a cap exists. Worth a
+// per-server-partitioned cache as a follow-up, not a blocker here.
+const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 
 /// Normalize a URI string to a stable cache key.
 ///
@@ -119,6 +132,19 @@ impl From<lsp_types::MessageType> for MessageType {
 pub struct NotificationCache {
     /// Diagnostics indexed by document URI.
     diagnostics: HashMap<String, DiagnosticInfo>,
+    /// `diagnostics` keys ordered oldest-write-first, keyed by a monotonic
+    /// sequence number rather than position: a re-publish removes its old
+    /// entry by key in `O(log n)` (via `diagnostic_seq`) instead of scanning
+    /// for it, which a plain `VecDeque` would require. Kept in sync with
+    /// `diagnostics` by every method that adds or removes an entry.
+    diagnostic_order: BTreeMap<u64, String>,
+    /// Maps each cached URI to its current key in `diagnostic_order`, so a
+    /// re-publish can find and remove its old order entry without scanning.
+    diagnostic_seq: HashMap<String, u64>,
+    /// Next sequence number to assign in `diagnostic_order`. Monotonically
+    /// increasing for the cache's lifetime; never reused, so it never
+    /// collides with an older entry still pending eviction.
+    next_diagnostic_seq: u64,
     /// Recent log entries (FIFO queue with max size).
     logs: VecDeque<LogEntry>,
     /// Recent server messages (FIFO queue with max size).
@@ -137,6 +163,9 @@ impl NotificationCache {
     pub fn new() -> Self {
         Self {
             diagnostics: HashMap::with_capacity(32),
+            diagnostic_order: BTreeMap::new(),
+            diagnostic_seq: HashMap::with_capacity(32),
+            next_diagnostic_seq: 0,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
         }
@@ -144,20 +173,44 @@ impl NotificationCache {
 
     /// Store diagnostics for a document.
     ///
-    /// If diagnostics already exist for the URI, they are replaced.
+    /// Evicted by recency of write (LRU-by-update), not strict insertion
+    /// order: re-publishing an already-cached URI moves it to the back of
+    /// `diagnostic_order` rather than leaving it at its original position.
+    /// Without this, a file the user is actively editing -- republished on
+    /// every keystroke -- would get evicted ahead of files that were merely
+    /// opened once and never touched again, since only brand-new URIs
+    /// advanced the FIFO position. Once `MAX_DIAGNOSTIC_ENTRIES` distinct
+    /// URIs are cached, the least-recently-written URI is evicted to make
+    /// room, matching the bounding used for `logs`/`messages`.
     pub fn store_diagnostics(
         &mut self,
         uri: &Uri,
         version: Option<i32>,
         diagnostics: Vec<LspDiagnostic>,
     ) {
+        let key = uri_cache_key(uri.as_str()).into_owned();
         let info = DiagnosticInfo {
             uri: uri.clone(),
             version,
             diagnostics,
         };
-        self.diagnostics
-            .insert(uri_cache_key(uri.as_str()).into_owned(), info);
+
+        if let Some(old_seq) = self.diagnostic_seq.remove(&key) {
+            self.diagnostic_order.remove(&old_seq);
+        } else if self.diagnostics.len() >= MAX_DIAGNOSTIC_ENTRIES
+            && let Some((&oldest_seq, oldest_key)) = self.diagnostic_order.iter().next()
+        {
+            let oldest_key = oldest_key.clone();
+            self.diagnostic_order.remove(&oldest_seq);
+            self.diagnostic_seq.remove(&oldest_key);
+            self.diagnostics.remove(&oldest_key);
+        }
+
+        let seq = self.next_diagnostic_seq;
+        self.next_diagnostic_seq += 1;
+        self.diagnostic_order.insert(seq, key.clone());
+        self.diagnostic_seq.insert(key.clone(), seq);
+        self.diagnostics.insert(key, info);
     }
 
     /// Store a log entry.
@@ -217,12 +270,21 @@ impl NotificationCache {
     ///
     /// Returns the cleared diagnostics if they existed.
     pub fn clear_diagnostics(&mut self, uri: &str) -> Option<DiagnosticInfo> {
-        self.diagnostics.remove(uri_cache_key(uri).as_ref())
+        let key = uri_cache_key(uri);
+        let cleared = self.diagnostics.remove(key.as_ref());
+        if cleared.is_some()
+            && let Some(seq) = self.diagnostic_seq.remove(key.as_ref())
+        {
+            self.diagnostic_order.remove(&seq);
+        }
+        cleared
     }
 
     /// Clear all diagnostics.
     pub fn clear_all_diagnostics(&mut self) {
         self.diagnostics.clear();
+        self.diagnostic_order.clear();
+        self.diagnostic_seq.clear();
     }
 
     /// Clear all logs.
@@ -585,6 +647,96 @@ mod tests {
         cache.store_message(MessageType::Info, "overflow".to_string());
         assert_eq!(cache.messages_count(), MAX_SERVER_MESSAGES);
         assert_eq!(cache.get_messages().front().unwrap().message, "message 1");
+    }
+
+    #[test]
+    fn test_diagnostics_max_capacity() {
+        let mut cache = NotificationCache::new();
+
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES + 10 {
+            let uri: Uri = format!("file:///test{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&uri, Some(1), vec![]);
+        }
+
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+
+        // Oldest entries should be evicted (FIFO).
+        let evicted: Uri = "file:///test0.rs".parse().unwrap();
+        assert!(cache.get_diagnostics(evicted.as_str()).is_none());
+        let newest: Uri = format!("file:///test{}.rs", MAX_DIAGNOSTIC_ENTRIES + 9)
+            .parse()
+            .unwrap();
+        assert!(cache.get_diagnostics(newest.as_str()).is_some());
+    }
+
+    #[test]
+    fn test_diagnostics_replacing_existing_uri_does_not_trigger_eviction() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///stable.rs".parse().unwrap();
+
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES {
+            cache.store_diagnostics(&uri, Some(i32::try_from(i).unwrap()), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), 1);
+        assert!(cache.get_diagnostics(uri.as_str()).is_some());
+    }
+
+    #[test]
+    fn test_diagnostics_republish_refreshes_eviction_order() {
+        // #234 S2 regression: an actively-edited file, republished on every
+        // keystroke, must not be evicted ahead of a file that was merely
+        // opened once and never touched again.
+        let mut cache = NotificationCache::new();
+        let actively_edited: Uri = "file:///keep.rs".parse().unwrap();
+        cache.store_diagnostics(&actively_edited, Some(1), vec![]);
+
+        // Fill the rest of the cache with untouched entries.
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES - 1 {
+            let uri: Uri = format!("file:///untouched{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&uri, Some(1), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+
+        // Republish the actively-edited file -- this must move it to the
+        // back of the eviction order, not leave it at its original (oldest)
+        // position.
+        cache.store_diagnostics(&actively_edited, Some(2), vec![]);
+
+        // One more new URI arrives, exceeding the cap by one: the oldest
+        // *untouched* entry must be evicted, not the republished one.
+        let overflow: Uri = "file:///overflow.rs".parse().unwrap();
+        cache.store_diagnostics(&overflow, Some(1), vec![]);
+
+        assert!(
+            cache.get_diagnostics(actively_edited.as_str()).is_some(),
+            "republished entry must survive eviction after being refreshed"
+        );
+        let oldest_untouched: Uri = "file:///untouched0.rs".parse().unwrap();
+        assert!(
+            cache.get_diagnostics(oldest_untouched.as_str()).is_none(),
+            "the oldest never-republished entry must be evicted instead"
+        );
+        assert!(cache.get_diagnostics(overflow.as_str()).is_some());
+    }
+
+    #[test]
+    fn test_clear_diagnostics_then_refill_does_not_evict_early() {
+        let mut cache = NotificationCache::new();
+        let first: Uri = "file:///first.rs".parse().unwrap();
+        cache.store_diagnostics(&first, Some(1), vec![]);
+        cache.clear_diagnostics(first.as_str());
+        assert_eq!(cache.diagnostics_count(), 0);
+
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES {
+            let uri: Uri = format!("file:///test{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&uri, Some(1), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+        // Every entry from this batch must still be present -- the earlier
+        // clear must not have left a stale `diagnostic_order` entry that
+        // causes a premature eviction here.
+        let first_of_batch: Uri = "file:///test0.rs".parse().unwrap();
+        assert!(cache.get_diagnostics(first_of_batch.as_str()).is_some());
     }
 
     #[test]

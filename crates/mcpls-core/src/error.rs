@@ -89,9 +89,29 @@ pub enum Error {
         server_id: ServerId,
     },
 
+    /// A workspace-wide tool (one with no file to resolve a language from,
+    /// e.g. `workspace_symbol_search`) could not be routed because at least
+    /// one expected LSP server has not registered yet. Unlike
+    /// [`Error::ServerInitializing`], resolution never narrowed down to a
+    /// single candidate server, so no `server_id` is available.
+    #[error(
+        "LSP servers are still initializing (large project load in progress); wait and retry the request (this may take a few minutes on large projects)"
+    )]
+    WorkspaceServersInitializing,
+
     /// No LSP server is currently configured.
     #[error("no LSP server configured")]
     NoServerConfigured,
+
+    /// At least one server is configured somewhere in the workspace, but
+    /// none of them claims a workspace-wide tool that has no file to
+    /// resolve a language from (e.g. `workspace_symbol_search`). The
+    /// language-less counterpart of [`Error::NoServerForTool`].
+    #[error("no server handles tool '{tool}' (no server's `handles` list or catch-all claims it)")]
+    NoServerForWorkspaceTool {
+        /// Tool that no server claims anywhere in the workspace.
+        tool: ToolKind,
+    },
 
     /// Configuration error.
     #[error("configuration error: {0}")]
@@ -290,6 +310,21 @@ mod tests {
             err.to_string(),
             "no LSP server configured for language: rust"
         );
+    }
+
+    #[test]
+    fn test_error_display_workspace_servers_initializing() {
+        let err = Error::WorkspaceServersInitializing;
+        assert!(err.to_string().contains("still initializing"));
+    }
+
+    #[test]
+    fn test_error_display_no_server_for_workspace_tool() {
+        let err = Error::NoServerForWorkspaceTool {
+            tool: crate::config::ToolKind::WorkspaceSymbols,
+        };
+        assert!(err.to_string().contains("workspace_symbols"));
+        assert!(err.to_string().contains("no server's `handles` list"));
     }
 
     #[test]

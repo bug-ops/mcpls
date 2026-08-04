@@ -556,7 +556,8 @@ impl ServerHandler for McplsServer {
         // Build the URI from the canonicalized path (not the raw input path):
         // it must match what `diagnostics_pump` stores from LSP notifications,
         // which are always keyed by the canonical form.
-        let lsp_uri = crate::bridge::path_to_uri(&validated_path);
+        let lsp_uri = crate::bridge::path_to_uri(&validated_path)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
         // in the response shape. Currently both return `{"diagnostics":null}` which is
@@ -612,7 +613,8 @@ impl ServerHandler for McplsServer {
 
         // Build the URI from the canonicalized path, matching `read_resource` and
         // what `diagnostics_pump` stores from LSP notifications.
-        let lsp_uri = crate::bridge::path_to_uri(&validated_path);
+        let lsp_uri = crate::bridge::path_to_uri(&validated_path)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let has_cached_diagnostics = {
             let cache = self.context.notification_cache.lock().await;
             cache.get_diagnostics(lsp_uri.as_str()).is_some()
@@ -1298,8 +1300,8 @@ mod tests {
         let validated = validate_path_against_roots(&noncanonical, &[]).unwrap();
         assert_eq!(validated, test_file.canonicalize().unwrap());
 
-        let uri_from_raw_path = crate::bridge::path_to_uri(&noncanonical);
-        let uri_from_validated_path = crate::bridge::path_to_uri(&validated);
+        let uri_from_raw_path = crate::bridge::path_to_uri(&noncanonical).unwrap();
+        let uri_from_validated_path = crate::bridge::path_to_uri(&validated).unwrap();
         assert_ne!(
             uri_from_raw_path, uri_from_validated_path,
             "raw and canonical paths must differ here, otherwise this test can't \

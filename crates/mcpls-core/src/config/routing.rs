@@ -195,6 +195,23 @@ struct LanguageRoutes {
     default: Option<ServerId>,
 }
 
+/// Why [`ToolRouter::resolve_any`] could not find a server for a
+/// workspace-wide tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoServerReason {
+    /// No server is registered in this workspace at all. Reflects what has
+    /// *registered* (i.e. finished spawning), not what is configured in
+    /// `mcpls.toml` — a server that is still initializing, or one that was
+    /// configured but failed to spawn, is indistinguishable from "nothing
+    /// configured" at this layer. Callers with access to the set of servers
+    /// still expected to register (e.g. `Translator::expected_servers`) can
+    /// tell these apart.
+    NothingRegistered,
+    /// At least one server is registered, but none explicitly claims the
+    /// requested tool and none is a catch-all.
+    NoClaimant,
+}
+
 /// Resolves `(language, tool)` to the [`ServerId`] that should handle it.
 ///
 /// Built once at startup by [`Self::from_configs`] over the *applicable*
@@ -411,18 +428,24 @@ impl ToolRouter {
     /// workspace-wide tools like `workspace_symbol_search` that have no
     /// document to detect a language from.
     ///
-    /// Resolves in three tiers, in config declaration order:
+    /// Resolves in two tiers, in config declaration order:
     /// 1. the first server that explicitly claims `tool`;
-    /// 2. else the first catch-all server;
-    /// 3. else the first server at all.
+    /// 2. else the first catch-all server.
     ///
-    /// Tier 2 exists so that a narrowly-scoped server declared before a
-    /// catch-all cannot win a tool it explicitly declined: a catch-all
-    /// claims every tool *implicitly*, so it must still lose to an *explicit*
-    /// claimer in tier 1, but it must beat tier 3's arbitrary "any server"
-    /// fallback.
-    #[must_use]
-    pub fn resolve_any(&self, tool: ToolKind) -> Option<&ServerId> {
+    /// Deliberately does *not* fall back to "the first server at all" when
+    /// neither tier matches: a server with a `handles` list has explicitly
+    /// declined every tool not on it, so forwarding an unclaimed workspace-wide
+    /// tool to it anyway would silently violate that declaration. Callers get
+    /// [`NoServerReason`] instead, distinguishing "nothing configured" from
+    /// "something is configured but nothing claims this tool" so they can
+    /// report a precise error rather than defaulting to an arbitrary server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NoServerReason::NothingRegistered`] if no server is
+    /// registered at all, or [`NoServerReason::NoClaimant`] if servers are
+    /// registered but none explicitly claims `tool` and none is a catch-all.
+    pub fn resolve_any(&self, tool: ToolKind) -> std::result::Result<&ServerId, NoServerReason> {
         let claims_explicitly = |id: &ServerId| {
             self.by_language
                 .values()
@@ -438,7 +461,11 @@ impl ToolRouter {
             .iter()
             .find(|id| claims_explicitly(id))
             .or_else(|| self.order.iter().find(|id| is_catch_all(id)))
-            .or_else(|| self.order.first())
+            .ok_or(if self.order.is_empty() {
+                NoServerReason::NothingRegistered
+            } else {
+                NoServerReason::NoClaimant
+            })
     }
 
     /// Whether `language_id` currently has at least one live-or-configured
@@ -519,7 +546,7 @@ mod tests {
         // though python was declared first.
         assert_eq!(
             router.resolve_any(ToolKind::WorkspaceSymbols),
-            Some(&ServerId::from("rust-catch-all"))
+            Ok(&ServerId::from("rust-catch-all"))
         );
     }
 
@@ -536,7 +563,7 @@ mod tests {
         let router = ToolRouter::from_configs(&configs).unwrap();
         assert_eq!(
             router.resolve_any(ToolKind::WorkspaceSymbols),
-            Some(&ServerId::from("python-explicit"))
+            Ok(&ServerId::from("python-explicit"))
         );
     }
 
@@ -677,7 +704,10 @@ mod tests {
         let mut router = ToolRouter::from_configs(&configs).unwrap();
         router.rebind_to_registered(&HashSet::new());
         assert_eq!(router.resolve("rust", ToolKind::Hover), None);
-        assert_eq!(router.resolve_any(ToolKind::Hover), None);
+        assert_eq!(
+            router.resolve_any(ToolKind::Hover),
+            Err(NoServerReason::NothingRegistered)
+        );
         // A single-server-per-language config whose server fails to spawn
         // must report NoServerForLanguage upstream, not NoServerForTool --
         // has_language must go back to false once every route is dropped.
@@ -692,7 +722,20 @@ mod tests {
         router.rebind_to_registered(&registered);
         assert_eq!(
             router.resolve_any(ToolKind::Hover),
-            Some(&ServerId::from("b"))
+            Ok(&ServerId::from("b"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_any_no_claimant_does_not_fall_back_to_arbitrary_server() {
+        // A single narrowly-scoped server that does not claim WorkspaceSymbols
+        // and has no catch-all anywhere must not be silently conscripted for
+        // it -- that would violate its explicit `handles` declaration.
+        let configs = vec![cfg("python", Some("pyright"), Some(vec![ToolKind::Hover]))];
+        let router = ToolRouter::from_configs(&configs).unwrap();
+        assert_eq!(
+            router.resolve_any(ToolKind::WorkspaceSymbols),
+            Err(NoServerReason::NoClaimant)
         );
     }
 

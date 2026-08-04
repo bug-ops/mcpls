@@ -24,7 +24,7 @@ use tokio::time::Duration;
 use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DiagnosticInfo, DocumentTracker, NotificationCache, lock_std};
 use crate::bridge::encoding::mcp_to_lsp_position;
-use crate::config::{ServerId, ToolKind, ToolRouter, base_language_id};
+use crate::config::{NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id};
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
@@ -1837,7 +1837,23 @@ impl Translator {
         let server_id = lock_std(&self.router)
             .resolve_any(ToolKind::WorkspaceSymbols)
             .cloned()
-            .ok_or(Error::NoServerConfigured)?;
+            .map_err(|reason| match reason {
+                // `resolve_any` reports "nothing registered", which also
+                // covers a server that is configured but has not finished
+                // spawning yet -- check `expected_servers` (unavailable to
+                // `ToolRouter` itself) to tell the two apart, mirroring
+                // `get_client_for_file`'s `ServerInitializing` check below.
+                NoServerReason::NothingRegistered => {
+                    if lock_std(&self.expected_servers).is_empty() {
+                        Error::NoServerConfigured
+                    } else {
+                        Error::WorkspaceServersInitializing
+                    }
+                }
+                NoServerReason::NoClaimant => Error::NoServerForWorkspaceTool {
+                    tool: ToolKind::WorkspaceSymbols,
+                },
+            })?;
         self.respawn_if_dead(&server_id).await?;
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
         let client = client.ok_or_else(|| {
@@ -2184,7 +2200,7 @@ impl Translator {
 
         // Use path_to_uri (strips \\?\ on Windows) so the key matches what
         // rust-analyzer stores in publishDiagnostics notifications.
-        Ok(path_to_uri(&validated_path).to_string())
+        Ok(path_to_uri(&validated_path)?.to_string())
     }
 
     /// Convert a cached diagnostics entry into the MCP-facing result shape.
@@ -3663,6 +3679,55 @@ fi
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
         assert!(matches!(result, Err(Error::NoServerConfigured)));
+    }
+
+    /// #242/S4 regression: a server is configured and still spawning (large
+    /// project load) rather than never having existed -- the router alone
+    /// cannot tell these apart (both look like "nothing registered"), so
+    /// `handle_workspace_symbol` must consult `expected_servers` to report
+    /// "still initializing" instead of the misleading "no server configured".
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_reports_initializing_when_expected_but_not_registered() {
+        let translator = Translator::new();
+        translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await;
+        assert!(matches!(result, Err(Error::WorkspaceServersInitializing)));
+    }
+
+    /// #242 regression: a server *is* configured and running, it just
+    /// doesn't claim `workspace_symbols` and there is no catch-all -- the
+    /// error must name the tool rather than collapse into the generic
+    /// "no LSP server configured" message a client would also see if
+    /// nothing were running at all.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_no_claimant_names_tool() {
+        let configs = vec![crate::config::LspServerConfig {
+            language_id: "python".to_string(),
+            command: "pyright-langserver".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            file_patterns: vec![],
+            initialization_options: None,
+            timeout_seconds: 30,
+            heuristics: None,
+            name: Some("pyright".to_string()),
+            handles: Some(vec![ToolKind::Hover]),
+        }];
+        let router = ToolRouter::from_configs(&configs).unwrap();
+        let translator = Translator::new().with_router(router);
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::NoServerForWorkspaceTool {
+                tool: ToolKind::WorkspaceSymbols
+            })
+        ));
     }
 
     #[tokio::test]
@@ -5529,7 +5594,7 @@ fi
         // up (path_to_uri over the canonicalized path, same as
         // document_tracker uses to open the document).
         let canonical = path.canonicalize().unwrap();
-        let uri = path_to_uri(&canonical);
+        let uri = path_to_uri(&canonical).unwrap();
         let notification_cache = Mutex::new(NotificationCache::new());
         {
             let mut cache = notification_cache.lock().await;

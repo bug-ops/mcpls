@@ -226,7 +226,7 @@ impl DocumentTracker {
     pub fn open(&self, path: PathBuf, content: String) -> Result<Uri> {
         self.check_file_size(content.len() as u64)?;
 
-        let uri = path_to_uri(&path);
+        let uri = path_to_uri(&path)?;
         let language_id = detect_language(&path, &self.extension_map);
 
         let state = DocumentState {
@@ -785,14 +785,19 @@ impl Decision {
 
 /// Convert a file path to a URI.
 ///
-/// # Panics
+/// Prefer `try_path_to_uri` on paths that come from configuration or
+/// otherwise untrusted input; this wrapper exists for the common case of an
+/// already-canonicalized path, where the conversion is not expected to fail
+/// but must still surface as an error rather than a panic to keep the
+/// `panic = "abort"` release profile safe against unforeseen inputs.
 ///
-/// Panics if the path cannot be represented as a `file://` URI. This should
-/// not occur for valid absolute paths.
-#[must_use]
-pub fn path_to_uri(path: &Path) -> Uri {
-    #[allow(clippy::expect_used)]
-    try_path_to_uri(path).expect("failed to create URI from path")
+/// # Errors
+///
+/// Returns [`Error::InvalidUri`] if the path cannot be represented as a
+/// `file://` URI.
+pub fn path_to_uri(path: &Path) -> Result<Uri> {
+    try_path_to_uri(path)
+        .ok_or_else(|| Error::InvalidUri(format!("cannot convert path to URI: {}", path.display())))
 }
 
 /// Convert a file path to a URI, returning `None` if the path cannot be
@@ -1345,7 +1350,7 @@ mod tests {
         #[cfg(not(windows))]
         {
             let path = Path::new("/home/user/project/main.rs");
-            let uri = path_to_uri(path);
+            let uri = path_to_uri(path).unwrap();
             assert!(
                 uri.as_str()
                     .starts_with("file:///home/user/project/main.rs")
@@ -1356,7 +1361,7 @@ mod tests {
     #[test]
     fn test_path_to_uri_with_special_chars() {
         let path = Path::new("/home/user/project-test/main.rs");
-        let uri = path_to_uri(path);
+        let uri = path_to_uri(path).unwrap();
         assert!(uri.as_str().starts_with("file://"));
         assert!(uri.as_str().contains("project-test"));
     }
@@ -1368,7 +1373,7 @@ mod tests {
         #[cfg(not(windows))]
         let path = Path::new("/home/user/routes/api/[...]^|.ts");
 
-        let uri = path_to_uri(path);
+        let uri = path_to_uri(path).unwrap();
 
         #[cfg(windows)]
         let expected = "file:///C:/home/user/routes/api/%5B...%5D%5E%7C.ts";
@@ -1388,6 +1393,15 @@ mod tests {
         assert_eq!(try_path_to_uri(Path::new("relative/file.ts")), None);
     }
 
+    /// #234 regression: `path_to_uri` must surface a conversion failure as
+    /// `Err`, not panic -- the whole point of the fix was making this path
+    /// testable instead of aborting the process.
+    #[test]
+    fn test_path_to_uri_returns_err_for_relative_path() {
+        let err = path_to_uri(Path::new("relative/file.ts")).unwrap_err();
+        assert!(matches!(err, Error::InvalidUri(_)));
+    }
+
     #[cfg(windows)]
     #[test]
     fn test_try_path_to_uri_encodes_synthetic_windows_root() {
@@ -1404,7 +1418,7 @@ mod tests {
         #[cfg(not(windows))]
         let path = Path::new("/[a].ts");
 
-        let uri = path_to_uri(path);
+        let uri = path_to_uri(path).unwrap();
 
         assert!(
             uri.as_str().ends_with("%5Ba%5D.ts"),
