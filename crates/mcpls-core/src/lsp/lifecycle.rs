@@ -639,6 +639,11 @@ impl LspServer {
     ///
     /// The underlying client and child process are inert placeholders — only
     /// `capabilities()` is meaningful on the returned value.
+    ///
+    /// Uses `LspClient::new` (uninitialized, no background task) rather than
+    /// `LspClient::from_transport`, so this does not depend on the Tokio
+    /// message loop — only `_child`'s spawn needs a Tokio runtime, i.e. an
+    /// async test context (`#[tokio::test]`).
     #[allow(clippy::unwrap_used)]
     pub(crate) fn new_for_test(capabilities: ServerCapabilities) -> Self {
         let child = Command::new("echo")
@@ -648,26 +653,7 @@ impl LspServer {
             .spawn()
             .unwrap();
 
-        let stdin = Command::new("cat")
-            .stdin(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let stdout = Command::new("echo")
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport = LspTransport::new(stdin, stdout);
-        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let client = LspClient::new(LspServerConfig::rust_analyzer());
         let (_, notification_rx) = mpsc::channel(1);
 
         Self {
