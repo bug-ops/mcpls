@@ -292,6 +292,8 @@ jobs:
 
   security:
     name: Security Audit
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
