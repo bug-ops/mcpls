@@ -13,17 +13,29 @@ use crate::config::ServerId;
 /// Maximum number of log entries to store.
 const MAX_LOG_ENTRIES: usize = 100;
 
-/// Global budget for distinct-URI diagnostic entries, shared fairly across
-/// every registered diagnostics-route server rather than claimed by one
-/// server alone.
+/// Global budget for distinct-URI diagnostic entries, shared work-conservingly
+/// across every registered diagnostics-route server rather than claimed by
+/// one server alone.
 ///
 /// Guards against unbounded growth when a spawned LSP server publishes
 /// diagnostics for an unbounded number of distinct URIs over a long-running
 /// session, matching the bounding already applied to `logs`/`messages`.
-/// Each server's own share is `MAX_DIAGNOSTIC_ENTRIES / diagnostics_route_count`
-/// (see [`NotificationCache::set_diagnostics_route_count`]): a noisy server
-/// can only exhaust its own share and evict its own least-recently-written
-/// entries, never another server's (#266).
+/// Eviction only triggers once this global total is reached; it then targets
+/// whichever server most exceeds its fair share of
+/// `MAX_DIAGNOSTIC_ENTRIES / diagnostics_route_count` (see
+/// [`NotificationCache::set_diagnostics_route_count`]), falling back to the
+/// writer's own oldest entry when every server is within its share. A noisy
+/// server can therefore only evict its own entries, never a server that is
+/// exceeding its fair share less than it is -- with one narrow exception:
+/// if the writer itself has no entries yet and every existing server is
+/// already within its own share, the largest of those in-share servers is
+/// evicted from instead, since otherwise there would be nothing to evict
+/// and the aggregate cap could be exceeded (see the private
+/// `server_to_evict_from` for that fallback). Outside that edge case, a
+/// server within its fair share is never touched (#266). A single active
+/// server can still use the full budget when other registered servers are
+/// idle (#276) instead of being capped at a static equal split regardless
+/// of how much of it they actually use.
 const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 
 /// Normalize a URI string to a stable cache key.
@@ -140,11 +152,15 @@ pub struct NotificationCache {
     /// Per-server `diagnostics` keys ordered oldest-write-first, keyed by a
     /// monotonic sequence number rather than position: a re-publish removes
     /// its old entry by key in `O(log n)` (via `diagnostic_seq`) instead of
-    /// scanning for it, which a plain `VecDeque` would require. Bounded per
-    /// server to a fair share of `MAX_DIAGNOSTIC_ENTRIES` (see
-    /// [`NotificationCache::set_diagnostics_route_count`]), so one server's
-    /// write volume can never evict another's entries (#266). Kept in sync
-    /// with `diagnostics` by every method that adds or removes an entry.
+    /// scanning for it, which a plain `VecDeque` would require. Not
+    /// independently capped per server -- only the aggregate across all
+    /// servers is bounded, by `MAX_DIAGNOSTIC_ENTRIES` -- but each server's
+    /// own map length is what eviction compares against its fair share (see
+    /// [`NotificationCache::server_to_evict_from`]) to decide which server
+    /// loses an entry once the aggregate is full, so one server's write
+    /// volume can never evict another's entries while it still has room
+    /// left in the global budget (#266, #276). Kept in sync with
+    /// `diagnostics` by every method that adds or removes an entry.
     diagnostic_order: HashMap<ServerId, BTreeMap<u64, String>>,
     /// Maps each cached URI to its current sequence number in its owner's
     /// `diagnostic_order` map, so a re-publish or clear can find and remove
@@ -190,31 +206,76 @@ impl NotificationCache {
     /// Configure how many diagnostics-route servers share the global
     /// `MAX_DIAGNOSTIC_ENTRIES` budget.
     ///
-    /// Each server's own cap becomes `MAX_DIAGNOSTIC_ENTRIES / count`
-    /// (minimum 1): registering more diagnostics-capable servers gives each
-    /// a smaller but still fair share, rather than each getting an
-    /// independent full `MAX_DIAGNOSTIC_ENTRIES` budget of its own -- which
-    /// would let the aggregate cache size grow without bound as more
-    /// servers register (#266). Call once after server registration
-    /// completes and before diagnostics start flowing. Defaults to `1` if
-    /// never called (a single implicit server gets the whole budget).
+    /// Each server's fair share becomes `MAX_DIAGNOSTIC_ENTRIES / count`
+    /// (minimum 1). This does not cap any server's entries by itself -- the
+    /// aggregate cache is only ever trimmed once it reaches
+    /// `MAX_DIAGNOSTIC_ENTRIES` total -- it only decides, at that point,
+    /// which server's oldest entry is the one that gets evicted. Call once
+    /// after server registration completes and before diagnostics start
+    /// flowing. Defaults to `1` if never called (a single implicit server
+    /// owns the whole budget).
     pub fn set_diagnostics_route_count(&mut self, count: usize) {
         self.diagnostics_route_count = count.max(1);
     }
 
-    /// Current per-server diagnostics budget: `MAX_DIAGNOSTIC_ENTRIES`
-    /// divided fairly across `diagnostics_route_count` servers, floored at 1
-    /// so a large server count can never reduce a server's share to zero.
+    /// Current per-server fair share of `MAX_DIAGNOSTIC_ENTRIES`, divided
+    /// evenly across `diagnostics_route_count` servers and floored at 1 so a
+    /// large server count can never reduce a server's share to zero.
     ///
-    /// The floor means the aggregate cache size (`count * per_server_budget`)
-    /// only stays within `MAX_DIAGNOSTIC_ENTRIES` while
-    /// `count <= MAX_DIAGNOSTIC_ENTRIES`; beyond that, every server still
-    /// gets its minimum share of 1 and the aggregate grows with `count`
-    /// instead of staying capped. Registering more than `MAX_DIAGNOSTIC_ENTRIES`
-    /// diagnostics-route servers is not a realistic deployment today, so this
-    /// is documented rather than additionally guarded against.
+    /// This is a tie-breaker for eviction, not a hard per-server cap: a
+    /// server may hold more than its fair share of entries at any time, as
+    /// long as the aggregate across all servers stays within
+    /// `MAX_DIAGNOSTIC_ENTRIES` (#276).
     fn per_server_budget(&self) -> usize {
         (MAX_DIAGNOSTIC_ENTRIES / self.diagnostics_route_count.max(1)).max(1)
+    }
+
+    /// Picks which server's oldest entry to evict once the aggregate cache
+    /// is full: whichever registered server holds the most entries, if that
+    /// exceeds its fair share ([`Self::per_server_budget`]) -- so a noisy
+    /// server can only ever evict its own entries, never a quiet server's
+    /// that is still within its share (#266). If every server (including
+    /// `writer`) is within its share, falls back to `writer`'s own oldest
+    /// entry, since it is the one currently growing. Falls back further, to
+    /// whichever server holds the most entries regardless of share, only in
+    /// the edge case where `writer` has no entries of its own yet (its very
+    /// first write) while the aggregate is already full purely from other
+    /// servers each individually within their share -- otherwise there
+    /// would be nothing to evict from and the aggregate cap could be
+    /// exceeded despite every server behaving fairly.
+    ///
+    /// Ties in entry count are broken by `ServerId`, not left to
+    /// `HashMap`'s iteration order: `Iterator::max_by_key` returns the
+    /// *last* equally-maximal element it sees, and a `HashMap`'s iteration
+    /// order is randomized per process, so an `order.len()`-only key would
+    /// make the eviction target for a genuine tie vary from run to run.
+    /// Every candidate here is a distinct `diagnostic_order` key, so pairing
+    /// the count with `id.as_str()` makes the sort key unique per server --
+    /// no two entries can ever tie on the full key, which eliminates the
+    /// non-determinism outright rather than just picking a fixed side of it.
+    fn server_to_evict_from(&self, writer: &ServerId) -> Option<ServerId> {
+        let largest = self
+            .diagnostic_order
+            .iter()
+            .filter(|(_, order)| !order.is_empty())
+            .max_by_key(|(id, order)| (order.len(), id.as_str()));
+
+        let budget = self.per_server_budget();
+        if let Some((id, order)) = largest
+            && order.len() > budget
+        {
+            return Some(id.clone());
+        }
+
+        if self
+            .diagnostic_order
+            .get(writer)
+            .is_some_and(|order| !order.is_empty())
+        {
+            return Some(writer.clone());
+        }
+
+        largest.map(|(id, _)| id.clone())
     }
 
     /// Store diagnostics for a document published by `server_id`.
@@ -222,12 +283,19 @@ impl NotificationCache {
     /// If diagnostics already exist for the URI, they are replaced and the
     /// entry is repositioned to the back of its owner's eviction order, so
     /// a URI republished on every edit is tracked as most-recently-written
-    /// and evicted last, not first. Each registered server's distinct-URI
-    /// entries are bounded independently by its fair share of
-    /// `MAX_DIAGNOSTIC_ENTRIES` (see
-    /// [`Self::set_diagnostics_route_count`]): once a server's own share is
-    /// exhausted, storing diagnostics for a new URI evicts that same
-    /// server's least-recently-written entry, never another server's.
+    /// and evicted last, not first -- and, since it is not a new distinct
+    /// URI, never triggers eviction on its own.
+    ///
+    /// Eviction is work-conserving (#276): storing diagnostics for a
+    /// genuinely new URI only evicts an existing entry once the *aggregate*
+    /// across every server reaches `MAX_DIAGNOSTIC_ENTRIES`, and then only
+    /// the least-recently-written entry of whichever server most exceeds its
+    /// fair share -- with one narrow exception documented on
+    /// `server_to_evict_from`, this is never an entry belonging to a server
+    /// that still has room in its fair share. This lets a single active
+    /// server use the full aggregate budget while other registered servers
+    /// are idle, instead of being capped at a static equal split regardless
+    /// of how much of it they actually use.
     ///
     /// # Examples
     ///
@@ -259,38 +327,41 @@ impl NotificationCache {
         // Remove the URI's existing order entry, if any -- from its
         // previous owner's order map, whether that's this same server (a
         // republish, repositioned to the back below) or a different one
-        // (the diagnostics route changed, e.g. on respawn).
-        if let Some(old_seq) = self.diagnostic_seq.remove(&key)
-            && let Some(previous_owner) = self.diagnostics_owners.get(&key)
-            && let Some(order) = self.diagnostic_order.get_mut(previous_owner)
-        {
-            order.remove(&old_seq);
+        // (the diagnostics route changed, e.g. on respawn). Also tells us
+        // whether this store adds a new entry to the aggregate (and so may
+        // need to evict to stay within budget) or merely replaces one.
+        let mut is_new_entry = true;
+        if let Some(old_seq) = self.diagnostic_seq.remove(&key) {
+            is_new_entry = false;
+            if let Some(previous_owner) = self.diagnostics_owners.get(&key)
+                && let Some(order) = self.diagnostic_order.get_mut(previous_owner)
+            {
+                order.remove(&old_seq);
+            }
         }
 
-        let budget = self.per_server_budget();
-        let order = self.diagnostic_order.entry(server_id.clone()).or_default();
-        // `while`, not `if`: normally at most one eviction is ever needed
-        // here (each store adds exactly one entry), but `budget` can shrink
-        // out from under an already-populated server if a caller invokes
-        // `set_diagnostics_route_count` again with a larger count after
-        // diagnostics have started flowing. `while` guarantees convergence
-        // to the new, smaller budget in that case instead of leaving the
-        // server permanently one (or more) entries over it.
-        while order.len() >= budget
-            && let Some((&oldest_seq, oldest_key)) = order.iter().next()
-        {
-            let oldest_key = oldest_key.clone();
-            order.remove(&oldest_seq);
-            self.diagnostic_seq.remove(&oldest_key);
-            self.diagnostics_owners.remove(&oldest_key);
-            self.diagnostics.remove(&oldest_key);
+        if is_new_entry {
+            while self.diagnostics.len() >= MAX_DIAGNOSTIC_ENTRIES
+                && let Some(evict_from) = self.server_to_evict_from(server_id)
+                && let Some(order) = self.diagnostic_order.get_mut(&evict_from)
+                && let Some((&oldest_seq, oldest_key)) = order.iter().next()
+            {
+                let oldest_key = oldest_key.clone();
+                order.remove(&oldest_seq);
+                self.diagnostic_seq.remove(&oldest_key);
+                self.diagnostics_owners.remove(&oldest_key);
+                self.diagnostics.remove(&oldest_key);
+            }
         }
 
         self.diagnostics_owners
             .insert(key.clone(), server_id.clone());
         let seq = self.next_diagnostic_seq;
         self.next_diagnostic_seq += 1;
-        order.insert(seq, key.clone());
+        self.diagnostic_order
+            .entry(server_id.clone())
+            .or_default()
+            .insert(seq, key.clone());
         self.diagnostic_seq.insert(key.clone(), seq);
         self.diagnostics.insert(key, info);
     }
@@ -888,11 +959,11 @@ mod tests {
         assert_eq!(stored.version, None);
     }
 
-    /// #266: with a single registered diagnostics-route server (the
-    /// default), a noisy server publishing diagnostics for more distinct
-    /// URIs than the global budget allows must only evict its own oldest
-    /// entries, never a quiet server's, even though both share one
-    /// `NotificationCache`.
+    /// #266/#276: once the *aggregate* cache is full, a noisy server that has
+    /// grown far past its fair share must have its own oldest entries
+    /// evicted, never a quiet server's, even though both share one
+    /// `NotificationCache` and the noisy server was allowed to keep growing
+    /// past its static equal share while the aggregate still had room.
     #[test]
     fn test_noisy_server_does_not_evict_quiet_server_entries() {
         let mut cache = NotificationCache::new();
@@ -903,12 +974,16 @@ mod tests {
         let quiet_uri: Uri = "file:///quiet/only_file.rs".parse().unwrap();
         cache.store_diagnostics(&quiet, &quiet_uri, Some(1), vec![]);
 
-        let per_server_budget = MAX_DIAGNOSTIC_ENTRIES / 2;
-        for i in 0..per_server_budget + 50 {
+        // Drive the noisy server well past the aggregate cap -- it must be
+        // allowed to consume nearly all of it since the quiet server leaves
+        // the rest unused (#276), and once the aggregate is full it must
+        // only evict its own oldest entries.
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES + 50 {
             let uri: Uri = format!("file:///noisy/file{i}.rs").parse().unwrap();
             cache.store_diagnostics(&noisy, &uri, Some(1), vec![]);
         }
 
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
         assert!(
             cache.get_diagnostics(quiet_uri.as_str()).is_some(),
             "quiet server's only entry must survive the noisy server's overflow"
@@ -917,30 +992,126 @@ mod tests {
         let noisy_first: Uri = "file:///noisy/file0.rs".parse().unwrap();
         assert!(
             cache.get_diagnostics(noisy_first.as_str()).is_none(),
-            "noisy server's own oldest entries must be evicted once its share is exceeded"
+            "noisy server's own oldest entries must be evicted once the aggregate cache is full"
         );
     }
 
-    /// #266 M6: registering more diagnostics-route servers gives each a
-    /// smaller, fair share of the global budget rather than each getting an
-    /// independent full `MAX_DIAGNOSTIC_ENTRIES` -- otherwise the aggregate
-    /// cache size would grow unboundedly with the number of servers.
+    /// #276: a dominant server must be able to exceed its static equal share
+    /// of the budget while other registered diagnostics-route servers are
+    /// idle -- eviction is work-conserving and only triggers once the
+    /// *aggregate* cache reaches `MAX_DIAGNOSTIC_ENTRIES`, not once a single
+    /// server passes `MAX_DIAGNOSTIC_ENTRIES / diagnostics_route_count`.
     #[test]
-    fn test_fair_share_budget_divided_by_registered_server_count() {
+    fn test_dominant_server_exceeds_equal_share_while_others_idle() {
         let mut cache = NotificationCache::new();
         cache.set_diagnostics_route_count(4);
-        let server = ServerId::from("one-of-four");
+        let dominant = ServerId::from("dominant");
 
-        let expected_share = MAX_DIAGNOSTIC_ENTRIES / 4;
-        for i in 0..expected_share + 10 {
+        let equal_share = MAX_DIAGNOSTIC_ENTRIES / 4;
+        let more_than_share = equal_share + 100;
+        for i in 0..more_than_share {
             let uri: Uri = format!("file:///file{i}.rs").parse().unwrap();
-            cache.store_diagnostics(&server, &uri, Some(1), vec![]);
+            cache.store_diagnostics(&dominant, &uri, Some(1), vec![]);
         }
+        assert_eq!(
+            cache.diagnostics_count(),
+            more_than_share,
+            "a dominant server must be able to exceed its static equal share while the aggregate has room"
+        );
+
+        // The other three registered servers never write anything, so the
+        // dominant server can keep growing all the way to the full budget.
+        for i in more_than_share..MAX_DIAGNOSTIC_ENTRIES {
+            let uri: Uri = format!("file:///file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&dominant, &uri, Some(1), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+    }
+
+    /// M1: eviction-target ties (multiple servers holding the same entry
+    /// count) must resolve deterministically, not depend on `HashMap`'s
+    /// per-process randomized iteration order. This pins the exact winner
+    /// rather than only checking repeat-call stability -- stability across
+    /// calls would hold trivially even without the fix, since a single
+    /// `HashMap` instance's iteration order does not change between calls
+    /// within one process; the real risk is a *different* winner on a
+    /// *different* process run, which this test can't observe directly, but
+    /// the pinned assertion below only passes because the tie-break key
+    /// (`(order.len(), id.as_str())`) is unique per server -- no two
+    /// distinct `ServerId`s can ever share it, so `max_by_key` never
+    /// actually has a tie left to resolve by iteration order.
+    #[test]
+    fn test_eviction_target_tie_break_is_deterministic() {
+        let mut cache = NotificationCache::new();
+        cache.set_diagnostics_route_count(1000); // fair share floors at 1
+
+        let a = ServerId::from("a");
+        let b = ServerId::from("b");
+        for i in 0..2 {
+            let uri: Uri = format!("file:///a/file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&a, &uri, Some(1), vec![]);
+        }
+        for i in 0..2 {
+            let uri: Uri = format!("file:///b/file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&b, &uri, Some(1), vec![]);
+        }
+
+        // `a` and `b` are tied at 2 entries each, both over the floor-1
+        // share -- `"b"` sorts after `"a"` lexicographically, so it is the
+        // one always picked.
+        let writer = ServerId::from("writer");
+        assert_eq!(cache.server_to_evict_from(&writer), Some(b));
+    }
+
+    /// M2: `server_to_evict_from`'s "largest in-share server" fallback is
+    /// reachable and correct through the public `store_diagnostics` API,
+    /// not just in isolation -- a brand-new server's first write must still
+    /// evict something when the aggregate cache is already full purely from
+    /// other servers that are each individually within their fair share.
+    /// Without this fallback there would be nothing to evict from (the
+    /// writer has no entries yet, and no one else exceeds their share) and
+    /// the aggregate could grow past `MAX_DIAGNOSTIC_ENTRIES`.
+    #[test]
+    fn test_new_writer_still_evicts_when_every_existing_server_is_in_share() {
+        let mut cache = NotificationCache::new();
+        cache.set_diagnostics_route_count(2); // fair share = 500 each
+
+        let a = ServerId::from("a");
+        let b = ServerId::from("b");
+        for i in 0..500 {
+            let uri: Uri = format!("file:///a/file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&a, &uri, Some(1), vec![]);
+        }
+        for i in 0..500 {
+            let uri: Uri = format!("file:///b/file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&b, &uri, Some(1), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+
+        // `c` has never written before -- its very first write hits a full,
+        // entirely-in-share aggregate.
+        let c = ServerId::from("c");
+        let new_uri: Uri = "file:///c/first.rs".parse().unwrap();
+        cache.store_diagnostics(&c, &new_uri, Some(1), vec![]);
 
         assert_eq!(
             cache.diagnostics_count(),
-            expected_share,
-            "one of four servers must be capped at a quarter of the global budget"
+            MAX_DIAGNOSTIC_ENTRIES,
+            "the aggregate cap must still be enforced even when every existing server is within share"
+        );
+        assert!(cache.get_diagnostics(new_uri.as_str()).is_some());
+
+        // `a` and `b` are tied at 500 entries each; the deterministic
+        // tie-break in `server_to_evict_from` picks `b`, so `b`'s oldest
+        // entry is the one evicted, not `a`'s.
+        let b_oldest: Uri = "file:///b/file0.rs".parse().unwrap();
+        assert!(
+            cache.get_diagnostics(b_oldest.as_str()).is_none(),
+            "the largest in-share server (tie-broken to b) must lose its oldest entry"
+        );
+        assert!(
+            cache.get_diagnostics("file:///a/file0.rs").is_some(),
+            "the other in-share server must be untouched"
         );
     }
 
@@ -1013,34 +1184,45 @@ mod tests {
         assert_eq!(cache.diagnostics_count(), 1);
     }
 
-    /// M8: `set_diagnostics_route_count` can shrink a server's budget out
-    /// from under entries it already holds (e.g. more servers register
-    /// later). A single subsequent `store_diagnostics` call must evict
-    /// enough entries in one pass to converge to the new, smaller budget --
-    /// an `if` here would only ever evict one entry per call, leaving the
-    /// server permanently over budget.
+    /// #276: `set_diagnostics_route_count` shrinking a server's fair share
+    /// must not retroactively evict any of its already-cached entries --
+    /// eviction is work-conserving and only fires once the *aggregate* cache
+    /// is full. Once full, though, the shrunk share is what makes that
+    /// server the eviction target for a *different* server's write, rather
+    /// than the write that actually needed room being rejected or evicting
+    /// its own (nonexistent) entries.
     #[test]
-    fn test_shrinking_budget_converges_in_a_single_store_call() {
+    fn test_shrinking_budget_affects_eviction_target_not_existing_entries() {
         let mut cache = NotificationCache::new();
         let server = ServerId::from("server");
 
-        for i in 0..5 {
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES {
             let uri: Uri = format!("file:///file{i}.rs").parse().unwrap();
             cache.store_diagnostics(&server, &uri, Some(1), vec![]);
         }
-        assert_eq!(cache.diagnostics_count(), 5);
-
-        // MAX_DIAGNOSTIC_ENTRIES / 500 == 2: a drastic shrink relative to
-        // the 5 entries already held.
-        cache.set_diagnostics_route_count(500);
-
-        let new_uri: Uri = "file:///new.rs".parse().unwrap();
-        cache.store_diagnostics(&server, &new_uri, Some(1), vec![]);
-
         assert_eq!(
             cache.diagnostics_count(),
-            2,
-            "a single store after a budget shrink must evict down to the new budget in one pass"
+            MAX_DIAGNOSTIC_ENTRIES,
+            "filling to the aggregate cap must not evict anything early"
+        );
+
+        // A drastic shrink relative to the entries `server` already holds --
+        // must not evict anything by itself.
+        cache.set_diagnostics_route_count(4);
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+
+        // A different server's first write, once the aggregate is full,
+        // evicts from `server` (now far over its shrunk share) instead.
+        let other = ServerId::from("other");
+        let new_uri: Uri = "file:///other/new.rs".parse().unwrap();
+        cache.store_diagnostics(&other, &new_uri, Some(1), vec![]);
+
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+        assert!(cache.get_diagnostics(new_uri.as_str()).is_some());
+        let server_oldest: Uri = "file:///file0.rs".parse().unwrap();
+        assert!(
+            cache.get_diagnostics(server_oldest.as_str()).is_none(),
+            "the pre-existing server's oldest entry, now far over its shrunk share, must be evicted"
         );
     }
 }
