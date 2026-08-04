@@ -884,11 +884,15 @@ mod tests {
     /// #249: `has_exited` must distinguish a live child from one that has
     /// already exited, since this is the signal the respawn path relies on
     /// to detect a crashed LSP server.
+    ///
+    /// Unix-only: spawns a real `sleep` subprocess, which is unavailable on
+    /// the Windows CI runner.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_has_exited_reflects_child_process_state() {
         use lsp_types::ServerCapabilities;
 
-        let mock_child = tokio::process::Command::new("sleep")
+        let mut mock_child = tokio::process::Command::new("sleep")
             .arg("2")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -896,20 +900,8 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let mock_stdin = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-        let mock_stdout = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
+        let mock_stdin = mock_child.stdin.take().unwrap();
+        let mock_stdout = mock_child.stdout.take().unwrap();
 
         let transport = LspTransport::new(mock_stdin, mock_stdout);
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);

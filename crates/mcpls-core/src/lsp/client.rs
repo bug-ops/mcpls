@@ -844,6 +844,10 @@ mod tests {
     /// "server": it never writes anything to stdout, so no response can ever
     /// arrive and the request is guaranteed to time out rather than race a
     /// real answer.
+    ///
+    /// Unix-only: spawns a real `sleep` subprocess, which is unavailable on
+    /// the Windows CI runner.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_request_timeout_removes_pending_entry() {
         let mut child = tokio::process::Command::new("sleep")
