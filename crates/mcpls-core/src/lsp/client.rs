@@ -55,6 +55,15 @@ pub struct LspClient {
     /// Command sender for outbound messages.
     command_tx: mpsc::Sender<ClientCommand>,
 
+    /// Requests awaiting a response, shared with the background message loop.
+    ///
+    /// Exposed here (not just captured by the loop) so [`Self::request`] can
+    /// remove its own entry on timeout instead of leaking it, and so a
+    /// connection known to be dead can fail its stragglers immediately via
+    /// [`Self::fail_pending_requests`] rather than leaving each to discover
+    /// that only when its own timeout elapses.
+    pending_requests: Arc<Mutex<PendingRequests>>,
+
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
 }
@@ -70,6 +79,7 @@ impl Clone for LspClient {
             state: Arc::clone(&self.state),
             request_counter: Arc::clone(&self.request_counter),
             command_tx: self.command_tx.clone(),
+            pending_requests: Arc::clone(&self.pending_requests),
             receiver_task: None,
         }
     }
@@ -108,6 +118,7 @@ impl LspClient {
             state: Arc::new(Mutex::new(super::ServerState::Uninitialized)),
             request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
             receiver_task: None,
         }
     }
@@ -126,7 +137,7 @@ impl LspClient {
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
-            pending_requests,
+            Arc::clone(&pending_requests),
             None,
         ));
 
@@ -135,6 +146,7 @@ impl LspClient {
             state,
             request_counter,
             command_tx,
+            pending_requests,
             receiver_task: Some(receiver_task),
         }
     }
@@ -157,7 +169,7 @@ impl LspClient {
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
-            pending_requests,
+            Arc::clone(&pending_requests),
             Some(notification_tx),
         ));
 
@@ -166,6 +178,7 @@ impl LspClient {
             state,
             request_counter,
             command_tx,
+            pending_requests,
             receiver_task: Some(receiver_task),
         }
     }
@@ -241,10 +254,17 @@ impl LspClient {
                 .await
                 .map_err(|_| Error::ServerTerminated)?;
 
-            let outcome = timeout(timeout_duration, response_rx)
-                .await
-                .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?
-                .map_err(|_| Error::ServerTerminated)?;
+            let outcome = match timeout(timeout_duration, response_rx).await {
+                Ok(received) => received.map_err(|_| Error::ServerTerminated)?,
+                Err(_elapsed) => {
+                    // The response may still arrive after this point (the
+                    // server is just slow, not dead), but nothing will ever
+                    // read it again -- drop the now-orphaned entry instead of
+                    // leaking it in `pending_requests` forever.
+                    self.pending_requests.lock().await.remove(&id);
+                    return Err(Error::Timeout(timeout_duration.as_secs()));
+                }
+            };
 
             match outcome {
                 Ok(result_value) => {
@@ -289,6 +309,20 @@ impl LspClient {
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
         })
+    }
+
+    /// Fail every request still parked in `pending_requests` with
+    /// `Error::ServerTerminated`, instead of leaving each to discover a dead
+    /// connection only when its own timeout elapses.
+    ///
+    /// Intended for a client that is about to be discarded -- e.g.
+    /// superseded by a respawned replacement for the same server -- so
+    /// callers still waiting on it unblock immediately.
+    pub(crate) async fn fail_pending_requests(&self) {
+        let mut pending = self.pending_requests.lock().await;
+        for (_, sender) in pending.drain() {
+            let _ = sender.send(Err(Error::ServerTerminated));
+        }
     }
 
     /// Send notification (fire-and-forget, no response expected).
@@ -803,5 +837,75 @@ mod tests {
     #[test]
     fn test_jsonrpc_version_constant() {
         assert_eq!(JSONRPC_VERSION, "2.0");
+    }
+
+    /// #239 regression: a request that times out must remove its own entry
+    /// from `pending_requests` instead of leaking it. `sleep` is used as the
+    /// "server": it never writes anything to stdout, so no response can ever
+    /// arrive and the request is guaranteed to time out rather than race a
+    /// real answer.
+    #[tokio::test]
+    async fn test_request_timeout_removes_pending_entry() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("2")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        let transport = LspTransport::new(stdin, stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+        let result: Result<Value> = client
+            .request(
+                "textDocument/hover",
+                serde_json::json!({}),
+                Duration::from_millis(50),
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))), "got {result:?}");
+        assert!(
+            client.pending_requests.lock().await.is_empty(),
+            "timed-out request must not remain in pending_requests"
+        );
+    }
+
+    /// #249 continuation: a client about to be discarded (e.g. superseded by
+    /// a respawned replacement) must fail every still-pending request
+    /// immediately rather than leaving callers to wait out their timeout.
+    #[tokio::test]
+    async fn test_fail_pending_requests_resolves_all_as_server_terminated() {
+        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
+        let (command_tx, _command_rx) = mpsc::channel(1);
+
+        let client = LspClient {
+            config: LspServerConfig::rust_analyzer(),
+            state: Arc::new(Mutex::new(super::super::ServerState::Ready)),
+            request_counter: Arc::new(AtomicI64::new(1)),
+            command_tx,
+            pending_requests: Arc::clone(&pending_requests),
+            receiver_task: None,
+        };
+
+        let (tx1, rx1) = oneshot::channel::<Result<Value>>();
+        let (tx2, rx2) = oneshot::channel::<Result<Value>>();
+        pending_requests
+            .lock()
+            .await
+            .insert(RequestId::Number(1), tx1);
+        pending_requests
+            .lock()
+            .await
+            .insert(RequestId::Number(2), tx2);
+
+        client.fail_pending_requests().await;
+
+        assert!(pending_requests.lock().await.is_empty());
+        assert!(matches!(rx1.await.unwrap(), Err(Error::ServerTerminated)));
+        assert!(matches!(rx2.await.unwrap(), Err(Error::ServerTerminated)));
     }
 }
