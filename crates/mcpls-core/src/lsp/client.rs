@@ -912,4 +912,266 @@ mod tests {
         assert!(matches!(rx1.await.unwrap(), Err(Error::ServerTerminated)));
         assert!(matches!(rx2.await.unwrap(), Err(Error::ServerTerminated)));
     }
+
+    #[test]
+    fn test_should_retrigger_defaults_to_true_when_data_absent() {
+        assert!(LspClient::should_retrigger(None));
+    }
+
+    #[test]
+    fn test_should_retrigger_false_when_flag_false() {
+        assert!(!LspClient::should_retrigger(Some(&serde_json::json!({
+            "retriggerRequest": false
+        }))));
+    }
+
+    #[test]
+    fn test_should_retrigger_true_when_flag_true() {
+        assert!(LspClient::should_retrigger(Some(&serde_json::json!({
+            "retriggerRequest": true
+        }))));
+    }
+
+    mod retry_behavior {
+        use std::process::Stdio;
+
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+        use super::*;
+        use crate::config::LspServerConfig;
+
+        struct FakeServer {
+            _write_half: Child,
+            _read_half: Child,
+            read_half_stdin: ChildStdin,
+            write_stdout: ChildStdout,
+        }
+
+        fn fake_lsp_client() -> (LspClient, FakeServer) {
+            let mut write_half = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let write_stdin = write_half.stdin.take().unwrap();
+            let write_stdout = write_half.stdout.take().unwrap();
+
+            let mut read_half = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let read_stdout = read_half.stdout.take().unwrap();
+            let read_stdin = read_half.stdin.take().unwrap();
+
+            let transport = LspTransport::new(write_stdin, read_stdout);
+            let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+            (
+                client,
+                FakeServer {
+                    _write_half: write_half,
+                    _read_half: read_half,
+                    read_half_stdin: read_stdin,
+                    write_stdout,
+                },
+            )
+        }
+
+        /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
+        async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> Value {
+            let mut content_length = None;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((key, value)) = line.trim_end().split_once(':')
+                    && key.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut buf = vec![0u8; content_length.unwrap()];
+            reader.read_exact(&mut buf).await.unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        }
+
+        /// Writes a framed JSON-RPC `ServerCancelled` (-32802) error response.
+        async fn write_server_cancelled_response(
+            stdin: &mut ChildStdin,
+            id: &Value,
+            retrigger: bool,
+        ) {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": SERVER_CANCELLED_CODE,
+                    "message": "server cancelled the request",
+                    "data": { "retriggerRequest": retrigger },
+                },
+            });
+            let content = serde_json::to_string(&response).unwrap();
+            let header = format!("Content-Length: {}\r\n\r\n", content.len());
+            stdin.write_all(header.as_bytes()).await.unwrap();
+            stdin.write_all(content.as_bytes()).await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        /// Writes a framed JSON-RPC success response.
+        async fn write_success_response(stdin: &mut ChildStdin, id: &Value, result: Value) {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            });
+            let content = serde_json::to_string(&response).unwrap();
+            let header = format!("Content-Length: {}\r\n\r\n", content.len());
+            stdin.write_all(header.as_bytes()).await.unwrap();
+            stdin.write_all(content.as_bytes()).await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        // Not `start_paused`: the retry loop's real backoff sleeps
+        // interleave with real subprocess pipe I/O below, and paused
+        // virtual time does not reliably auto-advance across both.
+        #[tokio::test]
+        async fn test_retry_exhaustion_returns_original_server_cancelled_error() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            // Initial attempt plus SERVER_CANCELLED_MAX_RETRIES retries: every
+            // attempt gets ServerCancelled, so retries must exhaust rather
+            // than loop forever or swallow the error.
+            for _ in 0..=SERVER_CANCELLED_MAX_RETRIES {
+                let request = read_framed_message(&mut reader).await;
+                let id = request["id"].clone();
+                write_server_cancelled_response(&mut server.read_half_stdin, &id, true).await;
+            }
+
+            let result = request_task.await.unwrap();
+
+            match result {
+                Err(Error::LspServerError {
+                    code,
+                    message,
+                    data,
+                }) => {
+                    // Assert the exact original error surfaces, not merely
+                    // "some error with this code" -- a freshly constructed
+                    // placeholder error would satisfy a code-only check.
+                    assert_eq!(code, SERVER_CANCELLED_CODE);
+                    assert_eq!(message, "server cancelled the request");
+                    assert_eq!(data, Some(serde_json::json!({ "retriggerRequest": true })));
+                }
+                other => panic!("expected exhausted ServerCancelled error, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_retrigger_false_returns_immediately_without_retry() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let id = request["id"].clone();
+            write_server_cancelled_response(&mut server.read_half_stdin, &id, false).await;
+
+            // With `retriggerRequest: false`, `should_retrigger`'s gate on
+            // the retry branch must short-circuit the loop: the error
+            // returns well under the first 500ms backoff, and no second
+            // request is ever sent. If the `&& Self::should_retrigger(..)`
+            // guard were ever dropped from the retry match arm, this would
+            // instead retry and both assertions below would fail.
+            let result = tokio::time::timeout(Duration::from_millis(200), request_task)
+                .await
+                .unwrap()
+                .unwrap();
+
+            match result {
+                Err(Error::LspServerError { code, .. }) => {
+                    assert_eq!(code, SERVER_CANCELLED_CODE);
+                }
+                other => panic!("expected immediate ServerCancelled error, got {other:?}"),
+            }
+
+            let second_request =
+                tokio::time::timeout(Duration::from_millis(200), read_framed_message(&mut reader))
+                    .await;
+            assert!(
+                second_request.is_err(),
+                "no retry should have been sent after retriggerRequest: false"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_retry_succeeds_after_one_server_cancelled_response() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            // First attempt is cancelled and must retrigger.
+            let first = read_framed_message(&mut reader).await;
+            write_server_cancelled_response(
+                &mut server.read_half_stdin,
+                &first["id"].clone(),
+                true,
+            )
+            .await;
+
+            // Second attempt (after backoff) succeeds -- proves the loop
+            // genuinely re-sends the request rather than just counting down.
+            let second = read_framed_message(&mut reader).await;
+            assert_ne!(
+                first["id"], second["id"],
+                "retry must use a fresh request id"
+            );
+            let expected_result = serde_json::json!({ "contents": "resolved on retry" });
+            write_success_response(
+                &mut server.read_half_stdin,
+                &second["id"].clone(),
+                expected_result.clone(),
+            )
+            .await;
+
+            let result = request_task.await.unwrap();
+            assert_eq!(result.unwrap(), expected_result);
+        }
+    }
 }
