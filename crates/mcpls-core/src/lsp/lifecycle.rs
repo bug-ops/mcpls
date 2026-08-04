@@ -466,10 +466,13 @@ impl LspServer {
                 "initialize",
                 params,
                 // Clamped for the same reason as `LspClient::request_timeout`:
-                // `serve()` accepts a caller-built `ServerConfig` without going
-                // through `ServerConfig::validate()`, so an out-of-range value
-                // (0, or an unbounded one that would silently disable the
-                // timeout via tokio's `Instant::far_future()` fallback) is
+                // `serve()`/`serve_with()` now validate the top-level
+                // `ServerConfig` via `ServerConfig::validate()`, but this call
+                // operates on the per-server `config.server_config` reached
+                // through `LspServer::spawn`/`spawn_batch`, which bypass that
+                // top-level validation entirely, so an out-of-range value (0,
+                // or an unbounded one that would silently disable the timeout
+                // via tokio's `Instant::far_future()` fallback) is still
                 // reachable here and needs a last-line-of-defense clamp.
                 Duration::from_secs(
                     config

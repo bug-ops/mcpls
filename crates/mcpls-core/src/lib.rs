@@ -438,6 +438,22 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
+    // `ServerConfig::load`/`load_from` already validate the TOML-loading
+    // path; this covers the other one -- a caller building `ServerConfig`
+    // programmatically (e.g. a library embedder) previously hit no
+    // diagnosable error here, only silent clamping at accessor level (e.g.
+    // `LspClient::request_timeout`). `serve` delegates to this function, so
+    // one call site here covers both public entry points (`serve` and
+    // `serve_with`); note this does mean a config loaded via the CLI's
+    // `load_from` -> `serve` path is validated twice (harmless -- `validate`
+    // is a pure check with no side effects beyond a `tracing::warn!` for a
+    // non-fatal duplicate-name case, which will simply log twice).
+    //
+    // Considered wrapping this in a `Validated<ServerConfig>` marker type to
+    // make "already validated" a compile-time guarantee instead of a runtime
+    // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
+    config.validate()?;
+
     let project_config_ignored = config.project_config_ignored;
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
     let extension_map = config.build_effective_extension_map();
@@ -1193,6 +1209,62 @@ mod tests {
                     !matches!(err, Error::NoServersAvailable(_)),
                     "serve() must not return NoServersAvailable for empty lsp_servers config"
                 );
+            }
+        }
+
+        /// #282: a `ServerConfig` built programmatically (not via `load`/
+        /// `load_from`, which already run `validate()`) previously skipped
+        /// validation entirely, so `serve`/`serve_with` never rejected it —
+        /// misconfiguration only surfaced later as silent accessor-level
+        /// clamping. `serve` delegates straight to `serve_with`, so
+        /// exercising it here also covers `serve_with`'s own `validate()`
+        /// call. `validate()` runs before any LSP spawn or transport setup,
+        /// so this returns immediately without needing a timeout guard.
+        #[tokio::test]
+        async fn test_serve_rejects_invalid_caller_supplied_config() {
+            use crate::config::{LspServerConfig, WorkspaceConfig};
+
+            let config = ServerConfig {
+                workspace: WorkspaceConfig {
+                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    language_extensions: vec![],
+                    heuristics_max_depth: 10,
+                },
+                lsp_servers: vec![LspServerConfig {
+                    language_id: "rust".to_string(),
+                    command: String::new(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec!["**/*.rs".to_string()],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                    request_timeout_seconds: 10,
+                    heuristics: None,
+                    name: None,
+                    handles: None,
+                }],
+                project_config_ignored: false,
+            };
+
+            // `validate()` runs before any spawn/transport work and should
+            // return immediately; bound it anyway so a regression that lets
+            // an invalid config reach the stdio transport fails fast with a
+            // clear timeout instead of hanging nextest for the default 120s
+            // (mirroring the guard on `test_serve_degrades_when_all_servers_fail_to_spawn`).
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(2), serve(config)).await;
+
+            match outcome {
+                Err(elapsed) => panic!(
+                    "serve() must reject the invalid config immediately, not hang until \
+                     timeout: {elapsed}"
+                ),
+                Ok(result) => assert!(
+                    matches!(result, Err(Error::InvalidConfig(_))),
+                    "serve() must reject a caller-supplied config with an empty `command` via \
+                     Error::InvalidConfig, matching the load_from path; got: {result:?}"
+                ),
             }
         }
 

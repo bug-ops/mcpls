@@ -213,17 +213,21 @@ impl LspClient {
     /// retry backoff delays).
     ///
     /// The configured value is clamped to the range from 1 second to
-    /// [`MAX_TIMEOUT_SECONDS`]. [`ServerConfig::load_from`] rejects
-    /// `request_timeout_seconds` that is `0` or greater than
-    /// [`MAX_TIMEOUT_SECONDS`] at load time for TOML-sourced configs (a
-    /// value equal to [`MAX_TIMEOUT_SECONDS`] itself is accepted), but
-    /// [`crate::serve`] accepts a caller-built `ServerConfig` without going
-    /// through that validation (unless the caller opts in via
-    /// [`ServerConfig::validate`]), so this clamp is the last line of defense
-    /// against a zero-duration timeout that would fail every request
-    /// instantly, or an astronomically large one that tokio's
-    /// `timeout`/`sleep` would silently treat as unbounded (they fall back to
-    /// `Instant::far_future()` rather than panicking).
+    /// [`MAX_TIMEOUT_SECONDS`]. [`crate::serve`]/[`crate::serve_with`] now
+    /// validate the top-level `ServerConfig` (via [`ServerConfig::validate`],
+    /// which rejects `request_timeout_seconds` that is `0` or greater than
+    /// [`MAX_TIMEOUT_SECONDS`]) regardless of whether it came from
+    /// [`ServerConfig::load_from`] or was built programmatically by the
+    /// caller. But `Self::new`, [`super::LspServer::spawn`], and
+    /// [`super::LspServer::spawn_batch`] are all `pub` and take an
+    /// [`LspServerConfig`] (or [`super::ServerInitConfig`] wrapping one)
+    /// directly, bypassing that top-level validation entirely — it operates
+    /// on the top-level `ServerConfig`, not the per-server one. This clamp is
+    /// the last line of defense against a zero-duration timeout that would
+    /// fail every request instantly, or an astronomically large one that
+    /// tokio's `timeout`/`sleep` would silently treat as unbounded (they fall
+    /// back to `Instant::far_future()` rather than panicking), for a caller
+    /// reaching either of these levels directly.
     ///
     /// [`ServerConfig::load_from`]: crate::config::ServerConfig::load_from
     /// [`ServerConfig::validate`]: crate::config::ServerConfig::validate

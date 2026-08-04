@@ -511,14 +511,15 @@ impl ServerConfig {
     /// exists (two servers for one language with mutually exclusive
     /// `heuristics` is a legitimate config that must still load here).
     ///
-    /// [`Self::load_from`] always calls this. It is also `pub` so that a
-    /// caller building a `ServerConfig` programmatically (not via TOML), e.g.
-    /// for [`crate::serve`], can opt into the same diagnosable-error checks
-    /// rather than only discovering a bad value indirectly (for example, an
-    /// out-of-range `timeout_seconds`/`request_timeout_seconds` is otherwise
-    /// silently clamped rather than rejected — see
-    /// [`crate::lsp::LspClient::request_timeout`]). `serve`/`serve_with` do
-    /// not call this automatically for a caller-supplied config.
+    /// [`Self::load_from`] always calls this, and so do [`crate::serve`] and
+    /// [`crate::serve_with`] for every `ServerConfig` regardless of origin —
+    /// a caller-constructed config (not loaded via TOML) gets the same
+    /// diagnosable [`Error::InvalidConfig`] rejection as one loaded from
+    /// disk, instead of only failing later via silent accessor-level
+    /// clamping (see [`crate::lsp::LspClient::request_timeout`]). Remains
+    /// `pub` so a caller can also validate a config up front, before handing
+    /// it to `serve`/`serve_with` (which consume it by value and run until
+    /// shutdown).
     ///
     /// # Errors
     ///
