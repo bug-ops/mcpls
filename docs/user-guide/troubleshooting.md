@@ -691,8 +691,13 @@ rust-analyzer --version  # or other LSP server
 rustc --version
 uname -a
 
-# Configuration (adjust path for your platform: macOS uses ~/Library/Application\ Support/mcpls/mcpls.toml)
+# Configuration:
+# Linux:
 cat ~/.config/mcpls/mcpls.toml
+# macOS:
+cat ~/Library/Application\ Support/mcpls/mcpls.toml
+# Windows (PowerShell):
+Get-Content "$env:APPDATA\mcpls\mcpls.toml"
 
 # Debug logs (run command that fails)
 mcpls --log-level trace 2>&1 | tee bug-report.log
