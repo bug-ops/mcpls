@@ -13,12 +13,27 @@ mod logging;
 use args::Args;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
     let args = Args::parse();
 
-    // Initialize logging
-    logging::init(&args.log_level)?;
+    // Initialize logging. No subscriber is installed yet, so failures here
+    // must go straight to stderr.
+    if let Err(err) = logging::init(&args.log_level, args.log_json) {
+        eprintln!("failed to initialize logging: {err:?}");
+        return std::process::ExitCode::FAILURE;
+    }
 
+    // Route fatal errors through the tracing subscriber (rather than the
+    // default `Result` `Termination` printer) so they honor --log-json too.
+    if let Err(err) = run(args).await {
+        tracing::error!(error = ?err, "mcpls exited with an error");
+        return std::process::ExitCode::FAILURE;
+    }
+
+    std::process::ExitCode::SUCCESS
+}
+
+async fn run(args: Args) -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
 
     // Load configuration

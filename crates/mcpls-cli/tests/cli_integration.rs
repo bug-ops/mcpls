@@ -14,15 +14,17 @@ use tempfile::TempDir;
 /// Vars that could leak in from the ambient environment (e.g. a developer's
 /// shell, or a repo `.envrc`) and change these tests' outcome: `MCPLS_LOG`
 /// could suppress a warning a test greps for, `MCPLS_CONFIG` could redirect
-/// config loading away from the CWD/`--config` path under test, and
+/// config loading away from the CWD/`--config` path under test,
 /// `MCPLS_TRUST_PROJECT_CONFIG` could flip the trust decision a test is
-/// specifically exercising. `assert_cmd::Command`/`std::process::Command`
+/// specifically exercising, and `MCPLS_LOG_JSON` could flip the log output
+/// format a test asserts on. `assert_cmd::Command`/`std::process::Command`
 /// inherit the parent's full environment by default, so every test must
 /// clear these before setting the ones it actually wants.
 fn clear_ambient_env(cmd: &mut Command) -> &mut Command {
     cmd.env_remove("MCPLS_LOG")
         .env_remove("MCPLS_CONFIG")
         .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_LOG_JSON")
 }
 
 #[test]
@@ -277,4 +279,61 @@ fn test_config_file_with_spaces_in_path() {
         .arg(&config_path)
         .assert()
         .failure();
+}
+
+/// #279: `--log-json` was parsed by clap but never passed to
+/// `logging::init`, so the flag had no observable effect. A nonexistent
+/// `--config` path is used to force a fast, deterministic failure right
+/// after the "starting mcpls" line is logged (see `main.rs`), without
+/// needing a timeout+kill for a process that would otherwise block on
+/// stdio. `tracing_subscriber`'s JSON formatter always quotes the event's
+/// `message` field as `"message":"..."`, which the default compact
+/// formatter never produces (it renders unquoted `starting mcpls
+/// version=...`), so this substring is a reliable discriminator between the
+/// two formats without pulling in `serde_json` just for tests.
+#[test]
+fn test_log_json_flag_emits_json_formatted_logs() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .arg("--log-json")
+        .arg("--config")
+        .arg("/nonexistent/path/to/config.toml")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("\"message\":\"starting mcpls\""));
+}
+
+/// Same as `test_log_json_flag_emits_json_formatted_logs`, but via the
+/// `MCPLS_LOG_JSON` env var (clap's `env` attribute on `Args::log_json`)
+/// instead of the `--log-json` flag, since the two are parsed through
+/// separate clap code paths that both need to reach `logging::init`.
+#[test]
+fn test_log_json_env_var_emits_json_formatted_logs() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .env("MCPLS_LOG_JSON", "true")
+        .arg("--config")
+        .arg("/nonexistent/path/to/config.toml")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("\"message\":\"starting mcpls\""));
+}
+
+/// Complements the two tests above: without `--log-json`/`MCPLS_LOG_JSON`,
+/// output must stay in the default compact format. Guards against a
+/// regression that flips the default (e.g. an inverted `if log_json`
+/// condition), which the JSON-mode tests alone wouldn't catch.
+#[test]
+fn test_default_logging_is_not_json() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .arg("--config")
+        .arg("/nonexistent/path/to/config.toml")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("starting mcpls"))
+        .stderr(predicate::str::contains("\"message\":\"starting mcpls\"").not());
 }
