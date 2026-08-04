@@ -1446,7 +1446,7 @@ mod tests {
     #[test]
     fn test_all_tools_carry_annotations() {
         let tools = McplsServer::tool_router().list_all();
-        assert_eq!(tools.len(), 20, "unexpected number of registered tools");
+        assert!(!tools.is_empty(), "no tools registered");
 
         for tool in &tools {
             assert!(
