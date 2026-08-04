@@ -163,6 +163,28 @@ impl std::fmt::Display for ToolKind {
     }
 }
 
+/// Describe a `[[lsp_servers]]` entry for use in error messages that must let
+/// a user tell apart two entries sharing the same [`ServerId`] — the id
+/// alone is useless there, since it's exactly what collided.
+///
+/// Deliberately does not include a positional index: [`ToolRouter::from_configs`]
+/// only ever sees the post-heuristics *applicable* subset for a given
+/// workspace, not the raw `[[lsp_servers]]` array, so a printed index would
+/// usually name the wrong TOML entry (misleading, worse than omitting it).
+/// `command`/`args` distinguish the entries instead; when two entries are
+/// truly identical in every visible field, the description is the same for
+/// both halves, which is an honest reflection of the ambiguity.
+fn describe_entry(cfg: &LspServerConfig) -> String {
+    if cfg.args.is_empty() {
+        format!("language '{}', command '{}'", cfg.language_id, cfg.command)
+    } else {
+        format!(
+            "language '{}', command '{}', args {:?}",
+            cfg.language_id, cfg.command, cfg.args
+        )
+    }
+}
+
 /// Per-language routing table: which server handles which tool.
 #[derive(Debug, Default)]
 struct LanguageRoutes {
@@ -218,15 +240,15 @@ impl ToolRouter {
         for cfg in cfgs {
             let id = cfg.id();
 
-            if let Some(prev_language) = seen_ids.get(&id) {
+            if let Some(prev_description) = seen_ids.get(&id) {
                 return Err(Error::InvalidConfig(format!(
-                    "duplicate server id '{id}' in this workspace (used by both the \
-                     '{prev_language}' and '{}' language entries); add a unique `name` to \
-                     each `[[lsp_servers]]` entry",
-                    cfg.language_id
+                    "duplicate server id '{id}' in this workspace (used by both an entry with \
+                     {prev_description} and one with {}); add a unique `name` to each \
+                     `[[lsp_servers]]` entry",
+                    describe_entry(cfg)
                 )));
             }
-            seen_ids.insert(id.clone(), cfg.language_id.clone());
+            seen_ids.insert(id.clone(), describe_entry(cfg));
             order.push(id.clone());
 
             let routes = by_language.entry(cfg.language_id.clone()).or_default();
@@ -526,6 +548,72 @@ mod tests {
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
         assert!(matches!(err, Error::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn test_from_configs_duplicate_server_id_error_distinguishes_entries() {
+        // Two `[[lsp_servers]]` entries sharing `language_id = "rust"` with
+        // neither setting `name`: both resolve to the same ServerId, which
+        // used to make the error message name both conflicting halves
+        // identically ("used by both the 'rust' and 'rust' language
+        // entries"). The message must let a user tell the two entries apart.
+        let configs = vec![
+            LspServerConfig {
+                language_id: "rust".to_string(),
+                command: "rust-analyzer".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+                name: None,
+                handles: None,
+            },
+            LspServerConfig {
+                language_id: "rust".to_string(),
+                command: "rust-analyzer".to_string(),
+                args: vec!["--dummy-second-instance".to_string()],
+                env: HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 30,
+                heuristics: None,
+                name: None,
+                handles: None,
+            },
+        ];
+        let err = ToolRouter::from_configs(&configs).unwrap_err();
+        let Error::InvalidConfig(msg) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        // Must not print a positional index: `from_configs` only ever sees
+        // the post-heuristics applicable subset, so any "entry #N" would
+        // usually name the wrong `[[lsp_servers]]` array position.
+        assert!(!msg.contains("entry #"), "message was: {msg}");
+        assert!(msg.contains("rust-analyzer"), "message was: {msg}");
+        assert!(
+            msg.contains("--dummy-second-instance"),
+            "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_from_configs_duplicate_server_id_error_identical_entries_still_reports() {
+        // When two colliding entries are identical in every visible field,
+        // there's nothing left to distinguish them by; the message should
+        // still name the collision (both halves read the same) rather than
+        // fabricate a misleading index.
+        let configs = vec![cfg("rust", None, None), cfg("rust", None, None)];
+        let err = ToolRouter::from_configs(&configs).unwrap_err();
+        let Error::InvalidConfig(msg) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(!msg.contains("entry #"), "message was: {msg}");
+        assert!(
+            msg.contains("duplicate server id 'rust'"),
+            "message was: {msg}"
+        );
     }
 
     #[test]
