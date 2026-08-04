@@ -3850,6 +3850,7 @@ fi
             file_patterns: vec![],
             initialization_options: None,
             timeout_seconds: 30,
+            request_timeout_seconds: 30,
             heuristics: None,
             name: Some("pyright".to_string()),
             handles: Some(vec![ToolKind::Hover]),
