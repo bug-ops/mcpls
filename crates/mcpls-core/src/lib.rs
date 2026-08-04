@@ -183,9 +183,14 @@ pub(crate) struct RegisteredServers {
 /// so no external synchronization is required here; the rebind that follows
 /// relies only on all of *this* function's inserts having completed, which
 /// the sequential code below guarantees.
+///
+/// `configs` supplies the `ServerInitConfig` each surviving server was
+/// spawned from, keyed by routing identity, so the translator can respawn it
+/// later if its process dies (see `Translator::respawn_if_dead`).
 pub(crate) fn register_servers(
     mut result: lsp::ServerInitResult,
     translator: &bridge::Translator,
+    configs: &HashMap<ServerId, ServerInitConfig>,
 ) -> RegisteredServers {
     let mut receivers = HashMap::new();
     for (id, server) in &mut result.servers {
@@ -199,6 +204,18 @@ pub(crate) fn register_servers(
         let client = server.client().clone();
         language_by_id.insert(id.clone(), client.language_id().to_string());
         translator.register_client(id.clone(), client);
+        if let Some(config) = configs.get(&id) {
+            translator.register_server_config(id.clone(), config.clone());
+        } else {
+            // Would silently turn auto-respawn into a no-op for this server
+            // (surfacing as `Error::ServerUnavailable` instead of actually
+            // recovering) -- the keys are derived identically on both sides
+            // (`LspServerConfig::id()`), so this should never happen; warn
+            // rather than fail, since the server is otherwise usable.
+            warn!(
+                "No respawn config registered for LSP server '{id}'; auto-respawn on crash will be unavailable for it"
+            );
+        }
         translator.register_server(id, server);
     }
 
@@ -367,9 +384,19 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // conflicting `[[lsp_servers]]` entries, not a silent drop.
     let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
 
+    // Built here (rather than alongside `subscriptions`/`peer_cell` below) so
+    // it can be handed to the translator, which uses it to invalidate a
+    // respawned server's stale cached diagnostics -- see
+    // `Translator::with_notification_cache`. Independent of `translator`
+    // itself, which holds no outer lock: the pump only ever locks this
+    // cache, so it never contends with a request handler running an
+    // in-flight LSP round-trip.
+    let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+
     let mut translator = Translator::new()
         .with_extensions(extension_map)
-        .with_router(router);
+        .with_router(router)
+        .with_notification_cache(Arc::clone(&notification_cache));
     translator.set_workspace_roots(workspace_roots.clone());
 
     // Mark applicable servers as "expected" so a tool call that arrives while
@@ -393,10 +420,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
 
     let translator = Arc::new(translator);
-    // Independent of `translator`, which itself holds no outer lock: the pump
-    // only ever locks this cache, so it never contends with a request handler
-    // running an in-flight LSP round-trip.
-    let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
     let peer_cell = Arc::new(OnceCell::new());
@@ -466,6 +489,10 @@ fn spawn_lsp_servers_background(
     cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
+        let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
+            .iter()
+            .map(|c| (c.server_config.id(), c.clone()))
+            .collect();
         let result = LspServer::spawn_batch(&applicable_configs).await;
 
         if result.all_failed() {
@@ -499,7 +526,7 @@ fn spawn_lsp_servers_background(
         }
 
         let server_count = result.server_count();
-        let registered = register_servers(result, &translator);
+        let registered = register_servers(result, &translator, &configs_by_id);
         // Background initialization has completed; stop reporting "still
         // initializing" (especially for servers that failed to spawn on
         // partial success, which would otherwise return ServerInitializing

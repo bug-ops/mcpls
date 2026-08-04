@@ -159,6 +159,20 @@ pub enum Error {
     #[error("LSP server process terminated unexpectedly")]
     ServerTerminated,
 
+    /// A crashed server could not be automatically respawned.
+    ///
+    /// Distinct from [`Self::ServerTerminated`] so a caller (or a log
+    /// reader) can tell "the connection just died" apart from "mcpls tried
+    /// to bring it back and could not" -- e.g. no respawn config was ever
+    /// registered for it, or it is crash-looping and is being backed off.
+    #[error("LSP server '{server_id}' is unavailable: {reason}")]
+    ServerUnavailable {
+        /// Routing identity of the server that could not be respawned.
+        server_id: ServerId,
+        /// Human-readable reason the respawn did not proceed.
+        reason: String,
+    },
+
     /// Invalid tool parameters provided.
     #[error("invalid tool parameters: {0}")]
     InvalidToolParams(String),

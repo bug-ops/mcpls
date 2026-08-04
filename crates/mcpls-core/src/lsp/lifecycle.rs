@@ -216,9 +216,10 @@ pub struct LspServer {
     /// Extract this before registering the server to receive real-time
     /// notifications (e.g., `textDocument/publishDiagnostics`, `$/progress`).
     pub notification_rx: mpsc::Receiver<LspNotification>,
-    /// Child process handle. Kept alive for process lifetime management.
-    /// When dropped, the process is terminated via SIGKILL (`kill_on_drop`).
-    _child: tokio::process::Child,
+    /// Child process handle. Kept alive for process lifetime management and
+    /// queried by [`Self::has_exited`] to detect a crash. When dropped, the
+    /// process is terminated via SIGKILL (`kill_on_drop`).
+    child: tokio::process::Child,
 }
 
 impl std::fmt::Debug for LspServer {
@@ -228,7 +229,7 @@ impl std::fmt::Debug for LspServer {
             .field("capabilities", &self.capabilities)
             .field("position_encoding", &self.position_encoding)
             .field("notification_rx", &"<channel>")
-            .field("_child", &"<process>")
+            .field("child", &"<process>")
             .finish()
     }
 }
@@ -321,7 +322,7 @@ impl LspServer {
             capabilities,
             position_encoding,
             notification_rx,
-            _child: child,
+            child,
         })
     }
 
@@ -503,6 +504,22 @@ impl LspServer {
         &self.client
     }
 
+    /// Non-blocking check for whether the child process has already exited.
+    ///
+    /// Uses [`tokio::process::Child::try_wait`], which never blocks waiting
+    /// for the process: `true` means it is gone (crashed, killed, or exited
+    /// on its own), and any [`LspClient`] obtained from [`Self::client`] is
+    /// now permanently disconnected -- new requests through it fail with
+    /// [`crate::error::Error::ServerTerminated`]. Callers that want to
+    /// recover substitute a freshly [`Self::spawn`]ed replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS fails to report the process's status.
+    pub fn has_exited(&mut self) -> Result<bool> {
+        Ok(self.child.try_wait()?.is_some())
+    }
+
     /// Shutdown server gracefully.
     ///
     /// Sends shutdown request, waits for response, then sends exit notification.
@@ -642,7 +659,7 @@ impl LspServer {
     ///
     /// Uses `LspClient::new` (uninitialized, no background task) rather than
     /// `LspClient::from_transport`, so this does not depend on the Tokio
-    /// message loop — only `_child`'s spawn needs a Tokio runtime, i.e. an
+    /// message loop — only `child`'s spawn needs a Tokio runtime, i.e. an
     /// async test context (`#[tokio::test]`).
     #[allow(clippy::unwrap_used)]
     pub(crate) fn new_for_test(capabilities: ServerCapabilities) -> Self {
@@ -661,7 +678,7 @@ impl LspServer {
             capabilities,
             position_encoding: PositionEncodingKind::UTF16,
             notification_rx,
-            _child: child,
+            child,
         }
     }
 }
@@ -864,6 +881,62 @@ mod tests {
         assert_eq!(config.workspace_roots.len(), 3);
     }
 
+    /// #249: `has_exited` must distinguish a live child from one that has
+    /// already exited, since this is the signal the respawn path relies on
+    /// to detect a crashed LSP server.
+    #[tokio::test]
+    async fn test_has_exited_reflects_child_process_state() {
+        use lsp_types::ServerCapabilities;
+
+        let mock_child = tokio::process::Command::new("sleep")
+            .arg("2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mock_stdin = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+        let mock_stdout = tokio::process::Command::new("echo")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+
+        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let (_, mock_notification_rx) = mpsc::channel(1);
+
+        let mut server = LspServer {
+            client,
+            capabilities: ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            notification_rx: mock_notification_rx,
+            child: mock_child,
+        };
+
+        assert!(
+            !server.has_exited().unwrap(),
+            "freshly spawned `sleep 2` should still be running"
+        );
+
+        server.child.kill().await.unwrap();
+        // `kill().await` waits for the process to actually exit, so the
+        // very next `try_wait` reliably observes it as gone.
+        assert!(
+            server.has_exited().unwrap(),
+            "killed child must report as exited"
+        );
+    }
+
     #[tokio::test]
     async fn test_lsp_server_getters() {
         use lsp_types::ServerCapabilities;
@@ -900,7 +973,7 @@ mod tests {
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
-            _child: mock_child,
+            child: mock_child,
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -990,7 +1063,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx1,
-            _child: mock_child1,
+            child: mock_child1,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1038,7 +1111,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
-            _child: mock_child,
+            child: mock_child,
         };
 
         result.add_server("rust".to_string(), server);
@@ -1101,7 +1174,7 @@ mod tests {
                 capabilities: lsp_types::ServerCapabilities::default(),
                 position_encoding: PositionEncodingKind::UTF8,
                 notification_rx: mock_notification_rx,
-                _child: mock_child,
+                child: mock_child,
             };
 
             result.add_server(config.language_id, server);
@@ -1150,7 +1223,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx1,
-            _child: mock_child1,
+            child: mock_child1,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1188,7 +1261,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF16,
             notification_rx: mock_notification_rx2,
-            _child: mock_child2,
+            child: mock_child2,
         };
 
         result.add_server("rust".to_string(), server2);
@@ -1483,7 +1556,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
-            _child: mock_child,
+            child: mock_child,
         }
     }
 
@@ -1658,7 +1731,7 @@ mod tests {
         let mut result = ServerInitResult::new();
         result.add_server(pylsp_id.clone(), fake_lsp_server());
 
-        let registered = crate::register_servers(result, &translator);
+        let registered = crate::register_servers(result, &translator, &HashMap::new());
 
         assert_eq!(
             registered.diagnostics_flags.get(&pylsp_id),

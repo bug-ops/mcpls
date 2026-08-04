@@ -164,6 +164,13 @@ pub struct DocumentTracker {
     /// path, so calls for different paths never wait on each other. See
     /// `lock_path` for how entries are created and evicted.
     path_locks: StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+    /// Per-server sync generation, bumped by [`Self::forget_server`].
+    ///
+    /// `ensure_open` captures a server's generation before doing any I/O and
+    /// only commits its `synced` update if the generation is unchanged when
+    /// it finishes -- see [`Self::forget_server`]'s docs for the race this
+    /// closes. Absent from the map is equivalent to generation `0`.
+    generations: StdMutex<HashMap<ServerId, u64>>,
     /// Resource limits for tracking.
     limits: ResourceLimits,
     /// Custom file extension to language ID mappings.
@@ -177,6 +184,7 @@ impl DocumentTracker {
         Self {
             documents: StdMutex::new(HashMap::new()),
             path_locks: StdMutex::new(HashMap::new()),
+            generations: StdMutex::new(HashMap::new()),
             limits,
             extension_map,
         }
@@ -306,6 +314,41 @@ impl DocumentTracker {
         lock_std(&self.documents).keys().cloned().collect()
     }
 
+    /// Forget `server`'s last-synced version for every currently open
+    /// document, so the next `ensure_open` call sends `didOpen` again
+    /// instead of `didChange`.
+    ///
+    /// Called after `server` is respawned: the fresh process has no memory
+    /// of any document the old one had open, so this tracker's per-server
+    /// sync history for it must be forgotten too, or `ensure_open` would
+    /// wrongly send `didChange` for a document the new process never saw.
+    ///
+    /// Also bumps `server`'s sync generation. Clearing `synced` alone is not
+    /// enough: a call already in flight against the old (dead) connection
+    /// when this runs can still have its `didOpen`/`didChange` notify
+    /// "succeed" (`LspClient::notify` only enqueues onto a channel -- a dead
+    /// process is not observed by the send itself), and would otherwise
+    /// re-insert a stale entry after this method has already cleared it.
+    /// `ensure_open` captures the generation before starting and discards
+    /// its `synced` write if the generation moved in the meantime, closing
+    /// that race regardless of exactly when the notify "succeeds".
+    pub fn forget_server(&self, server: &ServerId) {
+        *lock_std(&self.generations)
+            .entry(server.clone())
+            .or_insert(0) += 1;
+        for state in lock_std(&self.documents).values_mut() {
+            state.synced.remove(server);
+        }
+    }
+
+    /// Current sync generation for `server` (see [`Self::forget_server`]).
+    fn generation(&self, server: &ServerId) -> u64 {
+        lock_std(&self.generations)
+            .get(server)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Acquire the per-path lock used by [`Self::ensure_open`], creating its
     /// entry on first use.
     ///
@@ -412,8 +455,10 @@ impl DocumentTracker {
         lsp_client: &LspClient,
     ) -> Result<Uri> {
         let _path_guard = self.lock_path(path).await;
+        let generation = self.generation(server);
         let decision = self.disk_phase(path).await?;
-        self.sync_phase(path, server, lsp_client, decision).await
+        self.sync_phase(path, server, lsp_client, decision, generation)
+            .await
     }
 
     /// Disk-verification phase of `ensure_open`: decides the version `path`
@@ -543,12 +588,20 @@ impl DocumentTracker {
     /// Per-server sync phase of `ensure_open`: sends `didOpen`, `didChange`,
     /// or nothing to `server` depending on its last-synced version, and
     /// commits the outcome only after the notification succeeds.
+    ///
+    /// `generation` is `server`'s sync generation as observed by the caller
+    /// before this call started (see [`Self::forget_server`]): the
+    /// `synced` write at the end is skipped if it no longer matches,
+    /// meaning `server` was respawned while this call was in flight and its
+    /// notify -- however it turned out -- was not actually delivered to the
+    /// connection now on file for `server`.
     async fn sync_phase(
         &self,
         path: &Path,
         server: &ServerId,
         lsp_client: &LspClient,
         decision: Decision,
+        generation: u64,
     ) -> Result<Uri> {
         let Decision {
             uri,
@@ -649,7 +702,18 @@ impl DocumentTracker {
             st.content = fresh;
             st.disk = snap;
         }
-        st.synced.insert(server.clone(), target_version);
+        // Read while `documents` is still held, not before: `forget_server`
+        // bumps the generation strictly before it acquires `documents`
+        // itself (see its docs), so checking under this same lock is
+        // airtight against the TOCTOU a separate, earlier read would leave
+        // open -- either this sees the new generation and skips (in which
+        // case `forget_server` has already cleared `synced`, or is blocked
+        // waiting for *this* guard to release before it does), or it sees
+        // the old one, in which case `forget_server` cannot have started
+        // clearing yet and will correctly clear the entry this commits.
+        if self.generation(server) == generation {
+            st.synced.insert(server.clone(), target_version);
+        }
         drop(documents);
 
         Ok(uri)
@@ -855,6 +919,105 @@ mod tests {
         tracker.close(&path);
         assert!(!tracker.is_open(&path));
         assert!(tracker.is_empty());
+    }
+
+    /// #249: after a respawn, `forget_server` must clear only the respawned
+    /// server's sync history so the next `ensure_open` call for it sends
+    /// `didOpen` again -- while leaving other servers synced to the same
+    /// document untouched (a path can be synced to more than one server,
+    /// e.g. hover routed to one, diagnostics to another).
+    #[test]
+    fn test_forget_server_clears_only_that_servers_synced_version() {
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/test/file.rs");
+        tracker
+            .open(path.clone(), "fn main() {}".to_string())
+            .unwrap();
+
+        let respawned = ServerId::from("rust-respawned");
+        let untouched = ServerId::from("rust-diagnostics");
+        lock_std(&tracker.documents)
+            .get_mut(&path)
+            .unwrap()
+            .synced
+            .insert(respawned.clone(), 1);
+        lock_std(&tracker.documents)
+            .get_mut(&path)
+            .unwrap()
+            .synced
+            .insert(untouched.clone(), 1);
+
+        tracker.forget_server(&respawned);
+
+        let state = tracker.get(&path).unwrap();
+        assert!(!state.synced.contains_key(&respawned));
+        assert!(state.synced.contains_key(&untouched));
+    }
+
+    /// #249 S1 regression: a `sync_phase` call that captured `server`'s
+    /// generation *before* a concurrent `forget_server` bumped it must not
+    /// commit its `synced` write, even though its notification against the
+    /// now-superseded connection reports success (`fake_lsp_client`'s `cat`
+    /// backend always accepts writes, standing in for the window where a
+    /// server's process has already died but its message loop has not yet
+    /// observed that). Without this, a document synced against the old
+    /// (crashed) process would be wrongly marked as already open on the
+    /// respawned one, permanently desyncing it.
+    #[tokio::test]
+    async fn test_sync_phase_skips_commit_when_generation_is_stale() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("race.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let server = ServerId::from("rust");
+        let generation_before_respawn = 0; // fresh tracker: generation starts at 0
+
+        // A respawn happens "concurrently" with the in-flight call that
+        // captured the generation above before this ran.
+        tracker.forget_server(&server);
+
+        let (stale_client, _guard) = fake_lsp_client();
+        let decision = tracker.disk_phase(&path).await.unwrap();
+        tracker
+            .sync_phase(
+                &path,
+                &server,
+                &stale_client,
+                decision,
+                generation_before_respawn,
+            )
+            .await
+            .unwrap();
+
+        let state = tracker.get(&path).unwrap();
+        assert!(
+            !state.synced.contains_key(&server),
+            "a sync_phase call that captured a stale generation must not \
+             commit `synced`, even though its notify against the \
+             superseded connection succeeded"
+        );
+    }
+
+    /// Companion to the regression above: the ordinary, non-racing path
+    /// (`ensure_open` capturing and committing against the *current*
+    /// generation) must still work -- the generation check must not
+    /// suppress a legitimate commit.
+    #[tokio::test]
+    async fn test_ensure_open_commits_when_generation_is_current() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("no_race.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let server = ServerId::from("rust");
+        let (client, _guard) = fake_lsp_client();
+
+        tracker.ensure_open(&path, &server, &client).await.unwrap();
+
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.synced.get(&server), Some(&1));
     }
 
     #[test]
