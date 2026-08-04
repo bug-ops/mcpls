@@ -27,6 +27,41 @@ use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 
+/// Environment variables passed through to a spawned LSP server even though
+/// its environment is otherwise cleared.
+///
+/// `PATH` lets the server resolve its own toolchain (e.g. rustup shims, venv
+/// binaries); `HOME`/`USERPROFILE` and `TMPDIR`/`TEMP`/`TMP` let it find user
+/// config/cache and scratch directories.
+///
+/// This list is not exhaustive: session-specific values that cannot be
+/// hardcoded into a static [`LspServerConfig::env`] table (e.g.
+/// `SSH_AUTH_SOCK`, which changes every login session) have no way through
+/// today. See [`LspServerConfig::env`] for the config-level override/addition
+/// mechanism this list feeds into.
+const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"];
+
+/// Windows-only additions to [`ENV_PASSTHROUGH`].
+///
+/// `SystemRoot`/`SystemDrive`/`windir` are required by the Windows process
+/// loader itself; `APPDATA`/`LOCALAPPDATA` are read by the Node-based default
+/// servers (pyright, typescript-language-server) for global config and
+/// cache; the rest are conventionally expected by Windows child processes.
+#[cfg(windows)]
+const ENV_PASSTHROUGH_WINDOWS: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "COMSPEC",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "USERNAME",
+];
+
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
@@ -229,17 +264,21 @@ impl LspServer {
             config.server_config.command, config.server_config.args
         );
 
-        let mut child = Command::new(&config.server_config.command)
-            .args(&config.server_config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| Error::ServerSpawnFailed {
-                command: config.server_config.command.clone(),
-                source: e,
-            })?;
+        let mut command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
+
+        debug!(
+            "Effective LSP server env keys: {:?}",
+            command
+                .as_std()
+                .get_envs()
+                .map(|(k, _)| k.to_string_lossy())
+                .collect::<Vec<_>>()
+        );
+
+        let mut child = command.spawn().map_err(|e| Error::ServerSpawnFailed {
+            command: config.server_config.command.clone(),
+            source: e,
+        })?;
 
         let stdin = child
             .stdin
@@ -269,6 +308,44 @@ impl LspServer {
             notification_rx,
             _child: child,
         })
+    }
+
+    /// Build the child `Command` for a spawned LSP server, without spawning it.
+    ///
+    /// The child's environment is cleared, then [`ENV_PASSTHROUGH`] (plus
+    /// [`ENV_PASSTHROUGH_WINDOWS`] under `cfg(windows)`) is copied in from
+    /// `parent_env` for whichever of those keys it returns `Some` for, then
+    /// `config.env` is applied last so it can override any passthrough
+    /// value. `parent_env` is injected (production passes
+    /// `std::env::var_os`) so tests can supply a fixed environment without
+    /// racing on real process-global state.
+    fn build_command(
+        config: &LspServerConfig,
+        parent_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Command {
+        let mut command = Command::new(&config.command);
+        command.args(&config.args).env_clear();
+
+        for key in ENV_PASSTHROUGH {
+            if let Some(value) = parent_env(key) {
+                command.env(key, value);
+            }
+        }
+        #[cfg(windows)]
+        for key in ENV_PASSTHROUGH_WINDOWS {
+            if let Some(value) = parent_env(key) {
+                command.env(key, value);
+            }
+        }
+
+        command
+            .envs(&config.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        command
     }
 
     /// Perform LSP initialization handshake.
@@ -1358,6 +1435,129 @@ mod tests {
             notification_rx: mock_notification_rx,
             _child: mock_child,
         }
+    }
+
+    /// Minimal [`LspServerConfig`] for `build_command` tests, where only
+    /// `command`/`args`/`env` matter.
+    fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
+        LspServerConfig {
+            language_id: "test".to_string(),
+            command: "irrelevant-for-build-command".to_string(),
+            args: vec![],
+            env,
+            file_patterns: vec![],
+            initialization_options: None,
+            timeout_seconds: 5,
+            heuristics: None,
+            name: None,
+            handles: None,
+        }
+    }
+
+    /// Collects the env vars a `Command` would set, resolving `env_clear`
+    /// removals (`None` values from `get_envs`) away so the map reflects
+    /// what the child process would actually see.
+    fn effective_envs(command: &Command) -> HashMap<String, String> {
+        command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Regression test for #236/#246: a spawned LSP server used to inherit
+    /// mcpls's entire environment. `build_command` must only pass through
+    /// `ENV_PASSTHROUGH` keys from `parent_env`, not arbitrary ones.
+    #[test]
+    fn test_build_command_excludes_non_allowlisted_parent_env_vars() {
+        let config = bare_server_config(HashMap::new());
+        let command = LspServer::build_command(&config, |key| match key {
+            "PATH" => Some("/parent/bin".into()),
+            "MCPLS_TEST_LEAK_CANARY" => Some("should-not-reach-child".into()),
+            _ => None,
+        });
+
+        let envs = effective_envs(&command);
+
+        assert!(
+            !envs.contains_key("MCPLS_TEST_LEAK_CANARY"),
+            "non-allowlisted parent env var leaked into child command: {envs:?}"
+        );
+
+        // The assertion above is provably vacuous on its own:
+        // `Command::get_envs()` only reports explicit `.env()`/`.envs()`
+        // modifications and is blind to whether `.env_clear()` was called,
+        // and `build_command`'s passthrough loop never even queries
+        // `parent_env` for a key outside `ENV_PASSTHROUGH`, so it would
+        // pass unchanged even if `.env_clear()` were deleted from
+        // `build_command` entirely. `std::process::Command`'s `Debug` impl
+        // does encode clearing, prefixing the formatted command with
+        // `env -i ` on Unix once `.env_clear()` has run; assert on that to
+        // actually guard against the clear being removed.
+        #[cfg(unix)]
+        assert!(
+            format!("{:?}", command.as_std()).starts_with("env -i "),
+            "build_command must call .env_clear() so the child doesn't inherit the full parent environment"
+        );
+    }
+
+    /// Regression test for #236/#246: allowlisted vars present in the parent
+    /// (e.g. `PATH`) must still reach the child.
+    #[test]
+    fn test_build_command_passes_through_allowlisted_env_vars() {
+        let config = bare_server_config(HashMap::new());
+        let command =
+            LspServer::build_command(&config, |key| (key == "PATH").then(|| "/parent/bin".into()));
+
+        let envs = effective_envs(&command);
+
+        assert_eq!(envs.get("PATH"), Some(&"/parent/bin".to_string()));
+    }
+
+    /// Regression test for #247: `LspServerConfig::env` entries must reach
+    /// the spawned child (previously dead configuration).
+    #[test]
+    fn test_build_command_includes_configured_env_vars() {
+        let mut env = HashMap::new();
+        env.insert(
+            "MCPLS_TEST_CONFIGURED".to_string(),
+            "from-server-config".to_string(),
+        );
+        let config = bare_server_config(env);
+        let command = LspServer::build_command(&config, |_| None);
+
+        let envs = effective_envs(&command);
+
+        assert_eq!(
+            envs.get("MCPLS_TEST_CONFIGURED"),
+            Some(&"from-server-config".to_string())
+        );
+    }
+
+    /// Regression test for #247: a `LspServerConfig::env` entry must be able
+    /// to override an allowlisted passthrough value, since `config.env` is
+    /// applied after the passthrough loop in `build_command`.
+    #[test]
+    fn test_build_command_configured_env_overrides_allowlisted_var() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/configured/override/path".to_string());
+        let config = bare_server_config(env);
+        let command =
+            LspServer::build_command(&config, |key| (key == "PATH").then(|| "/parent/bin".into()));
+
+        let envs = effective_envs(&command);
+
+        assert_eq!(
+            envs.get("PATH"),
+            Some(&"/configured/override/path".to_string())
+        );
     }
 
     /// #174 §8/S2 regression: `register_servers`'s diagnostics-cache flags

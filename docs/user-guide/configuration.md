@@ -308,6 +308,17 @@ See your language server documentation for available options.
 
 Environment variables to set for the LSP server process.
 
+The spawned server does **not** inherit mcpls's full environment. Its
+environment is cleared, then a minimal allowlist is passed through from
+mcpls's own process — `PATH`, `HOME`, `USERPROFILE`, `TMPDIR`/`TEMP`/`TMP` on
+every platform, plus Windows essentials (`SystemRoot`, `APPDATA`,
+`LOCALAPPDATA`, and others the process loader and Node-based servers need) —
+and only then is `env` applied on top, so entries here can override any
+passthrough value. Use `env` to restore anything your server needs beyond
+that allowlist: proxy settings, `VIRTUAL_ENV`/`PYTHONPATH`, toolchain
+variables a `build.rs` reads (`DATABASE_URL`, `LIBCLANG_PATH`, …), or
+session-specific values like `SSH_AUTH_SOCK`.
+
 ```toml
 [[lsp_servers]]
 language_id = "python"
@@ -319,6 +330,13 @@ file_patterns = ["**/*.py"]
 PYTHONPATH = "/custom/path"
 VIRTUAL_ENV = "/path/to/venv"
 ```
+
+**Caution:** setting `PATH` here *replaces* the passthrough value rather than
+prepending to it, and the two platforms then diverge — Unix searches your
+explicit `PATH` first, so a bare `command` (no directory component) becomes
+unresolvable unless your `PATH` entry still contains it; Windows still falls
+back to searching the parent's `PATH` afterward. If you only need to add a
+directory, prefer an absolute path in `command` over overriding `PATH`.
 
 ### `name`
 
