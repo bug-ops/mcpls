@@ -833,6 +833,12 @@ fn windows_rooted_path_to_file_url(path: &Path) -> Option<Url> {
     Some(file_url)
 }
 
+/// Percent-encodes the RFC 3986 §2.2 "other reserved" characters that the
+/// `url` crate's default WHATWG path percent-encode set leaves untouched:
+/// `[`, `]`, `^`, `|`. The remaining three characters in that set -- `{`,
+/// `}`, and backtick -- are already encoded by `url` on serialization, so
+/// they need no handling here; see
+/// `test_path_to_uri_percent_encodes_all_rfc3986_other_reserved_chars`.
 fn encode_rfc3986_path_chars(url: &Url) -> String {
     let prefix = url[..url::Position::BeforePath].to_owned();
     let encoded = url[url::Position::BeforePath..]
@@ -1406,6 +1412,39 @@ mod tests {
             uri.as_str()
         );
         assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
+    }
+
+    #[test]
+    fn test_path_to_uri_percent_encodes_all_rfc3986_other_reserved_chars() {
+        // RFC 3986 §2.2 "other reserved" characters. The `url` crate already
+        // percent-encodes `{`, `}`, and backtick when serializing; `[`, `]`,
+        // `^`, `|` are handled explicitly by `encode_rfc3986_path_chars`.
+        #[cfg(windows)]
+        let path = Path::new(r"C:\home\user\test[]^|{}`.ts");
+        #[cfg(not(windows))]
+        let path = Path::new("/home/user/test[]^|{}`.ts");
+
+        let uri = try_path_to_uri(path).unwrap();
+        let uri_str = uri.as_str();
+
+        for (raw, encoded) in [
+            ('[', "%5B"),
+            (']', "%5D"),
+            ('^', "%5E"),
+            ('|', "%7C"),
+            ('{', "%7B"),
+            ('}', "%7D"),
+            ('`', "%60"),
+        ] {
+            assert!(
+                uri_str.contains(encoded),
+                "expected {raw:?} to be percent-encoded as {encoded} in {uri_str}"
+            );
+        }
+        assert!(
+            !uri_str.contains(['[', ']', '^', '|', '{', '}', '`']),
+            "no raw reserved characters should remain in {uri_str}"
+        );
     }
 
     #[test]
