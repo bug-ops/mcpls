@@ -705,7 +705,7 @@ fn resolve_position_encodings(configured: &[String]) -> Vec<PositionEncodingKind
         .filter_map(|value| {
             let kind = crate::config::parse_position_encoding(value);
             if kind.is_none() {
-                warn!("ignoring invalid configured position encoding '{value}'");
+                warn!(value = %value, "ignoring invalid configured position encoding");
             }
             kind
         })
