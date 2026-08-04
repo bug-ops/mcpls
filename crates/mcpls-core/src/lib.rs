@@ -39,7 +39,7 @@ pub mod mcp;
 pub mod transport;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
 use bridge::resources::make_uri;
@@ -90,6 +90,18 @@ fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &[PathBuf]) -> bool 
     let Some(path) = bridge::uri_to_path(uri) else {
         return false;
     };
+    // `Path::starts_with` compares components lexically and does not resolve
+    // `.`/`..`, so `/workspace/../etc/passwd` would otherwise pass the
+    // `/workspace` prefix check despite pointing outside it. A legitimate LSP
+    // server never publishes such a path (canonical paths never contain
+    // `.`/`..` components), so rejecting them outright costs nothing and
+    // closes the bypass for a server that deliberately crafts one.
+    if path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return false;
+    }
     workspace_roots.iter().any(|root| path.starts_with(root))
 }
 
@@ -679,6 +691,19 @@ mod tests {
     fn test_diagnostic_path_in_workspace_rejects_non_file_uri() {
         let root = PathBuf::from("/workspace/project");
         let uri: Uri = "untitled:Untitled-1".parse().unwrap();
+        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+    }
+
+    /// `Path::starts_with` is a lexical, component-wise comparison that does
+    /// not resolve `.`/`..` — without an explicit check, a URI like
+    /// `file:///workspace/project/../../etc/passwd` would lexically "start
+    /// with" `/workspace/project` despite pointing outside it.
+    #[test]
+    fn test_diagnostic_path_in_workspace_rejects_parent_dir_traversal() {
+        let root = PathBuf::from("/workspace/project");
+        let uri: Uri = "file:///workspace/project/../../etc/passwd"
+            .parse()
+            .unwrap();
         assert!(!diagnostic_path_in_workspace(&uri, &[root]));
     }
 
