@@ -210,14 +210,17 @@ mcpls --log-level debug
 - Large projects time out
 - Tools return timeout errors
 
-**Note**: `timeout_seconds` only bounds the initial `initialize` handshake - it
-does **not** affect the timeout on individual tool-call requests (hover,
-definition, references, etc.), which is a fixed 30 s internally (10 s for
-completions) and not configurable. If a server needs minutes to load a large
+**Note**: `timeout_seconds` only bounds the initial `initialize` handshake -
+it does **not** affect the timeout on individual tool-call requests (hover,
+definition, references, etc.); use `request_timeout_seconds` for that (see
+Solution 2). A tool call that triggers a server respawn (the previous process
+had died) costs `timeout_seconds + (4 * request_timeout_seconds + 3.5 s)` in
+the worst case, since the `initialize` handshake runs again before the
+request itself is retried. If a server needs minutes to load a large
 solution, Solution 1 below is what helps; while it's still initializing, tool
 calls for that language return a "server is still initializing - wait and
 retry" message rather than a hard "no server configured" error. If requests
-are timing out *after* initialization completes, Solution 2 or 3 are the
+are timing out *after* initialization completes, Solution 2, 3, or 4 are the
 relevant fixes.
 
 **Solution 1**: Increase the `initialize` handshake timeout:
@@ -230,14 +233,26 @@ file_patterns = ["**/*.rs"]
 timeout_seconds = 120  # Give a slow `initialize` handshake more time
 ```
 
-**Solution 2**: Wait for initial indexing to complete:
+**Solution 2**: Increase the per-request timeout:
+```toml
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+request_timeout_seconds = 60  # Give slow tool-call requests more time
+```
+Note that `textDocument/completion` requests are capped at 10 s regardless of
+this setting - completions cannot be raised above that ceiling today.
+
+**Solution 3**: Wait for initial indexing to complete:
 ```bash
 # rust-analyzer needs time to index on first run
 # Monitor with debug logging
 mcpls --log-level debug
 ```
 
-**Solution 3**: Reduce workspace size:
+**Solution 4**: Reduce workspace size:
 ```toml
 [workspace]
 # Limit to active project only
@@ -467,10 +482,10 @@ files.excludeDirs = ["target", "node_modules", ".git", "dist"]
 
 **Solutions**:
 
-1. **Increase timeout**:
+1. **Increase the per-request timeout** (this is what bounds tool calls, not `timeout_seconds`):
 ```toml
 [[lsp_servers]]
-timeout_seconds = 60
+request_timeout_seconds = 60
 ```
 
 2. **Pre-warm LSP server**:

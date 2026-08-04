@@ -465,7 +465,11 @@ impl LspServer {
             .request(
                 "initialize",
                 params,
-                Duration::from_secs(config.server_config.timeout_seconds),
+                // `.max(1)` guards the same gap as `LspClient::request_timeout`'s
+                // clamp: `serve()` accepts a caller-built `ServerConfig` without
+                // going through `ServerConfig::validate()`, so `0` is reachable
+                // here and would otherwise produce a 0-duration timeout.
+                Duration::from_secs(config.server_config.timeout_seconds.max(1)),
             )
             .await
             .map_err(|e| Error::LspInitFailed {
@@ -919,6 +923,7 @@ mod tests {
                 file_patterns: vec!["**/*.py".to_string()],
                 initialization_options: Some(init_opts.clone()),
                 timeout_seconds: 10,
+                request_timeout_seconds: 10,
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -1401,6 +1406,7 @@ mod tests {
                 file_patterns: vec!["**/*.rs".to_string()],
                 initialization_options: None,
                 timeout_seconds: 10,
+                request_timeout_seconds: 10,
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -1436,6 +1442,7 @@ mod tests {
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -1453,6 +1460,7 @@ mod tests {
                     file_patterns: vec!["**/*.py".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -1470,6 +1478,7 @@ mod tests {
                     file_patterns: vec!["**/*.ts".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -1510,6 +1519,7 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -1527,6 +1537,7 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -1560,6 +1571,7 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -1577,6 +1589,7 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -1605,6 +1618,7 @@ mod tests {
             file_patterns: vec![],
             initialization_options: None,
             timeout_seconds: 5,
+            request_timeout_seconds: 5,
             heuristics: None,
             name: None,
             handles: None,
@@ -1741,6 +1755,7 @@ mod tests {
                 file_patterns: vec![],
                 initialization_options: None,
                 timeout_seconds: 30,
+                request_timeout_seconds: 30,
                 heuristics: None,
                 name: Some("pyright-diag".to_string()),
                 handles: Some(vec![ToolKind::Diagnostics]),
@@ -1753,6 +1768,7 @@ mod tests {
                 file_patterns: vec![],
                 initialization_options: None,
                 timeout_seconds: 30,
+                request_timeout_seconds: 30,
                 heuristics: None,
                 name: Some("pylsp".to_string()),
                 handles: None,

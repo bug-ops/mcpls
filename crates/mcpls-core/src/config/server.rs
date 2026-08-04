@@ -170,9 +170,25 @@ pub struct LspServerConfig {
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
 
-    /// Request timeout in seconds.
+    /// Handshake timeout in seconds: bounds the `initialize` request during
+    /// server startup. Does not affect individual tool-call requests sent
+    /// after initialization; see [`Self::request_timeout_seconds`] for that.
+    /// The LSP server's `shutdown` request during teardown uses a separate,
+    /// fixed 5-second timeout that is not configurable by this field.
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+
+    /// Per-request timeout in seconds, applied to each LSP request issued
+    /// while translating an MCP tool call (hover, definition, references, etc.).
+    ///
+    /// This bounds a single request attempt, not a whole tool call: on a
+    /// `-32802` (content modified) response, [`crate::lsp::LspClient::request`]
+    /// retries up to 4 attempts with backoff, so the worst-case latency for one
+    /// tool call is `4 * request_timeout_seconds + 3.5` seconds. Completion
+    /// requests are further capped at 10 seconds regardless of this value; see
+    /// [`crate::lsp::LspClient::completion_timeout`].
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_seconds: u64,
 
     /// Heuristics for determining if this server should be spawned.
     /// If not specified, the server will always attempt to spawn.
@@ -199,6 +215,10 @@ pub struct LspServerConfig {
 }
 
 const fn default_timeout() -> u64 {
+    30
+}
+
+const fn default_request_timeout() -> u64 {
     30
 }
 
@@ -241,6 +261,7 @@ impl LspServerConfig {
             file_patterns: vec!["**/*.rs".to_string()],
             initialization_options: None,
             timeout_seconds: default_timeout(),
+            request_timeout_seconds: default_request_timeout(),
             heuristics: Some(ServerHeuristics::with_markers([
                 "Cargo.toml",
                 "rust-toolchain.toml",
@@ -261,6 +282,7 @@ impl LspServerConfig {
             file_patterns: vec!["**/*.py".to_string()],
             initialization_options: None,
             timeout_seconds: default_timeout(),
+            request_timeout_seconds: default_request_timeout(),
             heuristics: Some(ServerHeuristics::with_markers([
                 "pyproject.toml",
                 "setup.py",
@@ -283,6 +305,7 @@ impl LspServerConfig {
             file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
             initialization_options: None,
             timeout_seconds: default_timeout(),
+            request_timeout_seconds: default_request_timeout(),
             heuristics: Some(ServerHeuristics::with_markers([
                 "package.json",
                 "tsconfig.json",
@@ -304,6 +327,7 @@ impl LspServerConfig {
             file_patterns: vec!["**/*.go".to_string()],
             initialization_options: None,
             timeout_seconds: default_timeout(),
+            request_timeout_seconds: default_request_timeout(),
             heuristics: Some(ServerHeuristics::with_markers(["go.mod", "go.sum"])),
             name: None,
             handles: None,
@@ -326,6 +350,7 @@ impl LspServerConfig {
             ],
             initialization_options: None,
             timeout_seconds: default_timeout(),
+            request_timeout_seconds: default_request_timeout(),
             heuristics: Some(ServerHeuristics::with_markers([
                 "CMakeLists.txt",
                 "compile_commands.json",
@@ -348,6 +373,7 @@ impl LspServerConfig {
             file_patterns: vec!["**/*.zig".to_string()],
             initialization_options: None,
             timeout_seconds: default_timeout(),
+            request_timeout_seconds: default_request_timeout(),
             heuristics: Some(ServerHeuristics::with_markers([
                 "build.zig",
                 "build.zig.zon",
@@ -422,6 +448,7 @@ mod tests {
             file_patterns: vec!["**/*.custom".to_string()],
             initialization_options: Some(serde_json::json!({"key": "value"})),
             timeout_seconds: 60,
+            request_timeout_seconds: 45,
             heuristics: None,
             name: None,
             handles: None,
@@ -447,6 +474,15 @@ mod tests {
         assert_eq!(deserialized.command, original.command);
         assert_eq!(deserialized.args, original.args);
         assert_eq!(deserialized.timeout_seconds, original.timeout_seconds);
+        assert_eq!(
+            deserialized.request_timeout_seconds,
+            original.request_timeout_seconds
+        );
+    }
+
+    #[test]
+    fn test_default_request_timeout() {
+        assert_eq!(default_request_timeout(), 30);
     }
 
     #[test]
@@ -530,6 +566,7 @@ mod tests {
             file_patterns: vec![],
             initialization_options: None,
             timeout_seconds: 30,
+            request_timeout_seconds: 30,
             heuristics: None,
             name: None,
             handles: None,

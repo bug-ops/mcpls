@@ -520,6 +520,18 @@ impl ServerConfig {
                     server.language_id
                 )));
             }
+            if server.timeout_seconds == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "timeout_seconds cannot be 0 for language '{}'",
+                    server.language_id
+                )));
+            }
+            if server.request_timeout_seconds == 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "request_timeout_seconds cannot be 0 for language '{}'",
+                    server.language_id
+                )));
+            }
             if let Some(name) = &server.name {
                 if name.is_empty() {
                     return Err(Error::InvalidConfig(format!(
@@ -636,6 +648,77 @@ mod tests {
         assert_eq!(config.workspace.position_encodings, vec!["utf-8"]);
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "rust");
+    }
+
+    #[test]
+    fn test_load_from_toml_without_request_timeout_seconds_defaults_to_thirty() {
+        // Mirrors the shape of every auto-generated pre-#267 config file:
+        // `timeout_seconds` present, `request_timeout_seconds` absent.
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            timeout_seconds = 30
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.lsp_servers[0].request_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_timeout_seconds() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            timeout_seconds = 0
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            // `contains("timeout_seconds cannot be 0")` would also match the
+            // `request_timeout_seconds` message below (it ends in the same
+            // suffix), so assert the exact message to actually discriminate
+            // which field triggered the error.
+            assert_eq!(msg, "timeout_seconds cannot be 0 for language 'rust'");
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_request_timeout_seconds() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            request_timeout_seconds = 0
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert_eq!(
+                msg,
+                "request_timeout_seconds cannot be 0 for language 'rust'"
+            );
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
     }
 
     #[test]
@@ -995,6 +1078,7 @@ mod tests {
                 file_patterns: vec!["**/*.c".to_string(), "**/*.h".to_string()],
                 initialization_options: None,
                 timeout_seconds: 30,
+                request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -1019,6 +1103,7 @@ mod tests {
                 file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
                 initialization_options: None,
                 timeout_seconds: 30,
+                request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -1043,6 +1128,7 @@ mod tests {
                 file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
                 initialization_options: None,
                 timeout_seconds: 30,
+                request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -1067,6 +1153,7 @@ mod tests {
                 file_patterns: vec!["**/*".to_string(), "**/*.{h,hpp}".to_string()],
                 initialization_options: None,
                 timeout_seconds: 30,
+                request_timeout_seconds: 30,
                 heuristics: None,
                 name: None,
                 handles: None,

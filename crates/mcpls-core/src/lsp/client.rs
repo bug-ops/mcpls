@@ -31,6 +31,15 @@ const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
 /// Initial backoff delay for server-cancelled retries (milliseconds).
 const SERVER_CANCELLED_INITIAL_DELAY_MS: u64 = 500;
 
+/// Upper bound on the effective timeout for completion requests, regardless
+/// of `request_timeout_seconds`.
+///
+/// Completions are latency-sensitive: a completion list that takes longer
+/// than this is no longer useful to the caller. This is a deliberate MVP
+/// ceiling, not an oversight — completions cannot be configured above this
+/// value today. See [`LspClient::completion_timeout`].
+const COMPLETION_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
 
@@ -192,6 +201,70 @@ impl LspClient {
     /// Get the current server state.
     pub async fn state(&self) -> super::ServerState {
         *self.state.lock().await
+    }
+
+    /// The timeout applied to a single LSP request attempt, derived from
+    /// [`LspServerConfig::request_timeout_seconds`].
+    ///
+    /// This bounds one attempt, not a whole tool call: [`Self::request`]
+    /// retries up to `SERVER_CANCELLED_MAX_RETRIES` (3) additional times on a
+    /// `-32802` (`ServerCancelled`) response, so the worst-case latency for a
+    /// single tool call is `4 * request_timeout() + 3.5s` (the sum of the
+    /// retry backoff delays).
+    ///
+    /// The configured value is clamped to at least 1 second. [`ServerConfig::load_from`]
+    /// rejects `request_timeout_seconds == 0` at load time for TOML-sourced
+    /// configs, but [`crate::serve`] accepts a caller-built `ServerConfig`
+    /// without going through that validation, so this clamp is the last line
+    /// of defense against a zero-duration timeout that would fail every
+    /// request instantly.
+    ///
+    /// [`ServerConfig::load_from`]: crate::config::ServerConfig::load_from
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::config::LspServerConfig;
+    /// use mcpls_core::lsp::LspClient;
+    ///
+    /// let mut config = LspServerConfig::rust_analyzer();
+    /// config.request_timeout_seconds = 45;
+    /// let client = LspClient::new(config);
+    ///
+    /// assert_eq!(client.request_timeout(), Duration::from_secs(45));
+    /// ```
+    #[must_use]
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.config.request_timeout_seconds.max(1))
+    }
+
+    /// The timeout applied to completion (`textDocument/completion`) requests.
+    ///
+    /// Equal to [`Self::request_timeout`], capped at 10 seconds. Completions
+    /// cannot be configured above this cap by any
+    /// value of `request_timeout_seconds` — if that proves insufficient in
+    /// practice, the fix is a dedicated `completion_timeout_seconds` field,
+    /// not raising this cap.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::config::LspServerConfig;
+    /// use mcpls_core::lsp::LspClient;
+    ///
+    /// let mut config = LspServerConfig::rust_analyzer();
+    /// config.request_timeout_seconds = 300;
+    /// let client = LspClient::new(config);
+    ///
+    /// // Capped at 10s even though request_timeout_seconds is 300.
+    /// assert_eq!(client.completion_timeout(), Duration::from_secs(10));
+    /// assert!(client.completion_timeout() <= client.request_timeout());
+    /// ```
+    #[must_use]
+    pub fn completion_timeout(&self) -> Duration {
+        self.request_timeout().min(COMPLETION_TIMEOUT_CAP)
     }
 
     /// Send request and wait for response with timeout.
@@ -603,6 +676,55 @@ mod tests {
             cloned.receiver_task.is_none(),
             "Cloned client should not own receiver task"
         );
+    }
+
+    #[test]
+    fn test_request_timeout_and_completion_timeout_at_default() {
+        let config = LspServerConfig::rust_analyzer();
+        let client = LspClient::new(config);
+
+        assert_eq!(client.request_timeout(), Duration::from_secs(30));
+        assert_eq!(client.completion_timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_completion_timeout_clamps_to_ten_seconds() {
+        for secs in [1, 2, 3, 30, 300] {
+            let mut config = LspServerConfig::rust_analyzer();
+            config.request_timeout_seconds = secs;
+            let client = LspClient::new(config);
+
+            assert_eq!(
+                client.completion_timeout(),
+                Duration::from_secs(secs.min(10)),
+                "request_timeout_seconds={secs}"
+            );
+            assert!(client.completion_timeout() <= client.request_timeout());
+        }
+    }
+
+    #[test]
+    fn test_request_timeout_clamps_zero_to_one_second() {
+        let mut config = LspServerConfig::rust_analyzer();
+        config.request_timeout_seconds = 0;
+        let client = LspClient::new(config);
+
+        assert_eq!(client.request_timeout(), Duration::from_secs(1));
+        assert_eq!(client.completion_timeout(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_request_timeout_independent_per_server() {
+        let mut config_a = LspServerConfig::rust_analyzer();
+        config_a.request_timeout_seconds = 5;
+        let mut config_b = LspServerConfig::pyright();
+        config_b.request_timeout_seconds = 15;
+
+        let client_a = LspClient::new(config_a);
+        let client_b = LspClient::new(config_b);
+
+        assert_eq!(client_a.request_timeout(), Duration::from_secs(5));
+        assert_eq!(client_b.request_timeout(), Duration::from_secs(15));
     }
 
     #[test]

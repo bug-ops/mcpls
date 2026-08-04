@@ -64,6 +64,7 @@ command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
 timeout_seconds = 30
+request_timeout_seconds = 30
 
 # Optional: LSP server initialization options
 [lsp_servers.initialization_options]
@@ -272,19 +273,57 @@ Glob pattern syntax:
 **Type**: Integer
 **Default**: `30`
 
-Timeout in seconds for the initial `initialize` handshake only. Servers that
-load a large project before answering `initialize` (e.g. OmniSharp on a big
-Unity/C# solution) need this raised - the default 30 s can otherwise cut the
-server off mid-initialization.
+Timeout in seconds for the `initialize` handshake during server startup.
+Servers that load a large project before answering `initialize` (e.g.
+OmniSharp on a big Unity/C# solution) need this raised - the default 30 s can
+otherwise cut the server off mid-initialization.
 
 This does **not** bound individual tool-call requests (hover, definition,
-references, etc.) sent after initialization - those use a fixed internal
-timeout (30 s for most requests, 10 s for completions) that `timeout_seconds`
-does not affect.
+references, etc.) sent after initialization - see `request_timeout_seconds`
+below for that. The LSP server's `shutdown` request during teardown uses a
+separate, fixed 5 s timeout that is not configurable.
 
 ```toml
 [[lsp_servers]]
 timeout_seconds = 60  # Increase for servers slow to complete `initialize`
+```
+
+### `request_timeout_seconds`
+
+**Type**: Integer
+**Default**: `30`
+
+Timeout in seconds applied to each individual LSP request issued while
+translating an MCP tool call (hover, definition, references, diagnostics,
+rename, etc.). Independent of `timeout_seconds`, which only bounds the
+`initialize` handshake.
+
+This bounds a single request **attempt**, not a whole tool call: when the LSP
+server responds with `-32802` (content modified), mcpls retries up to 4
+attempts total with exponential backoff (0.5 s + 1 s + 2 s = 3.5 s of total
+sleep). So the worst-case latency for one tool call is:
+
+```
+4 * request_timeout_seconds + 3.5 seconds
+```
+
+If a tool call also triggers a server respawn (because the previous server
+process had died), add `timeout_seconds` on top of that, since
+`initialize` runs again before the request is retried.
+
+Completion requests (`textDocument/completion`) are further capped at 10
+seconds regardless of this setting - completions are latency-sensitive
+enough that a slower result isn't useful, and this cap cannot currently be
+raised. If completions specifically need a higher ceiling, file an issue
+requesting a dedicated `completion_timeout_seconds` field rather than raising
+`request_timeout_seconds`, which would not affect completions above 10 s.
+
+A value of `0` is rejected at config load time; the effective timeout is
+always at least 1 second.
+
+```toml
+[[lsp_servers]]
+request_timeout_seconds = 60  # Increase for a slow LSP server (e.g. large monorepo indexing)
 ```
 
 ### `initialization_options`
@@ -723,7 +762,8 @@ language_id = "rust"
 command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
-timeout_seconds = 120  # 2 minutes for initial indexing
+timeout_seconds = 120         # 2 minutes for initial indexing
+request_timeout_seconds = 60  # slower tool-call responses (see the field's docs above for the retry-ceiling math)
 ```
 
 ### Multiple Workspaces

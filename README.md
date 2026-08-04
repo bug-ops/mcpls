@@ -251,6 +251,7 @@ command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
 timeout_seconds = 30
+request_timeout_seconds = 30
 
 [lsp_servers.heuristics]
 project_markers = ["Cargo.toml", "rust-toolchain.toml"]

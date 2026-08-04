@@ -1136,7 +1136,7 @@ Common error scenarios:
 | LSP server not available | No server configured for file type | Add LSP server to config |
 | File not found | File doesn't exist | Check file path |
 | Position out of bounds | Invalid line/character | Verify position is valid |
-| Timeout | LSP server too slow | Increase timeout in config |
+| Timeout | LSP server too slow | Increase `request_timeout_seconds` in config |
 | No hover information | Not hoverable | Try different position |
 
 ## Performance Considerations
@@ -1156,7 +1156,7 @@ Common error scenarios:
 ### Optimization Tips
 
 1. Limit workspace roots to active projects
-2. Increase timeouts for large codebases
+2. Increase `request_timeout_seconds` for large codebases
 3. Use file patterns to exclude build artifacts
 4. Close unnecessary language servers
 
