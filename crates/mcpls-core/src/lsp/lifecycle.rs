@@ -266,13 +266,28 @@ impl LspServer {
 
         let mut command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
 
+        // Log allowlist presence and an override count only — never the
+        // configured keys themselves, since `config.server_config.env` may
+        // hold secret-bearing names (e.g. `AWS_SECRET_ACCESS_KEY`) whose
+        // mere presence in a debug log would be its own disclosure.
+        let passthrough_present = {
+            let base = ENV_PASSTHROUGH
+                .iter()
+                .filter(|key| std::env::var_os(key).is_some())
+                .count();
+            #[cfg(windows)]
+            let windows = ENV_PASSTHROUGH_WINDOWS
+                .iter()
+                .filter(|key| std::env::var_os(key).is_some())
+                .count();
+            #[cfg(not(windows))]
+            let windows = 0;
+            base + windows
+        };
         debug!(
-            "Effective LSP server env keys: {:?}",
-            command
-                .as_std()
-                .get_envs()
-                .map(|(k, _)| k.to_string_lossy())
-                .collect::<Vec<_>>()
+            "Effective LSP server env: {passthrough_present} allowlisted key(s) present, \
+             {} configured override(s) applied",
+            config.server_config.env.len()
         );
 
         let mut child = command.spawn().map_err(|e| Error::ServerSpawnFailed {
