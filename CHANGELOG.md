@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **HTTP transport startup warning gave inverted authentication guidance** — the non-loopback bind warning previously read "...ensure no authentication is required", which could be misread as instructing operators to confirm auth is *not* needed. mcpls performs no authentication on any transport; the message now tells operators to put such deployments behind a reverse proxy that enforces authentication. (#233)
+- **`config::mod` CWD-mutating tests could leave the process working directory changed after a mid-test panic** — added a `CwdGuard` RAII helper that restores the original directory on drop, not only on the successful path, alongside the existing mutex serialization against concurrent CWD use. (#238)
 
 ## [0.3.8] - 2026-07-27
 

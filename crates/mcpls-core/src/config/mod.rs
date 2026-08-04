@@ -1130,8 +1130,53 @@ mod tests {
     // must not run concurrently with each other or with any other test that
     // relies on CWD (e.g. via a bare `load()`/`load_with_trust()` call).
     // Nextest runs each test in its own process, but `cargo test` in-process
-    // would race; guard with a mutex.
+    // would race; guard with a mutex. `CwdGuard` below additionally restores
+    // the original directory on drop, so a panic mid-test (e.g. a failed
+    // `assert_eq!` between the temp-dir switch and the manual restore) can
+    // never leave the process cwd changed for the rest of the run.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that serializes CWD-mutating tests behind [`CWD_LOCK`] and
+    /// switches into `dir` for the guard's lifetime, restoring the original
+    /// working directory on drop — including on an early return or panic.
+    struct CwdGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        original_dir: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let lock = CWD_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let original_dir = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self {
+                _lock: lock,
+                original_dir,
+            }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original_dir);
+        }
+    }
+
+    #[test]
+    fn test_cwd_guard_restores_cwd_on_panic() {
+        let original_dir = std::env::current_dir().unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            panic!("boom");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(std::env::current_dir().unwrap(), original_dir);
+    }
 
     #[test]
     fn test_load_ignores_untrusted_project_local_config() {
@@ -1142,9 +1187,6 @@ mod tests {
         // covers this without any filesystem interaction. This test only
         // needs to prove the planted attacker file's content never leaks
         // through `load()`.
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
 
@@ -1165,9 +1207,10 @@ mod tests {
 
         fs::write(&config_path, custom_toml).unwrap();
 
-        std::env::set_current_dir(tmp_dir.path()).unwrap();
-        let config = ServerConfig::load().unwrap();
-        std::env::set_current_dir(&original_dir).unwrap();
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load().unwrap()
+        };
 
         assert!(
             !config
@@ -1185,9 +1228,6 @@ mod tests {
 
     #[test]
     fn test_load_with_trust_loads_trusted_project_local_config() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
 
@@ -1202,9 +1242,10 @@ mod tests {
 
         fs::write(&config_path, custom_toml).unwrap();
 
-        std::env::set_current_dir(tmp_dir.path()).unwrap();
-        let config = ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap();
-        std::env::set_current_dir(&original_dir).unwrap();
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap()
+        };
 
         assert_eq!(config.workspace.roots, vec![PathBuf::from("/custom/path")]);
         assert_eq!(config.lsp_servers.len(), 1);
@@ -1213,9 +1254,6 @@ mod tests {
 
     #[test]
     fn test_load_with_trust_untrusted_ignores_workspace_and_servers() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
 
@@ -1232,9 +1270,10 @@ mod tests {
 
         fs::write(&config_path, custom_toml).unwrap();
 
-        std::env::set_current_dir(tmp_dir.path()).unwrap();
-        let config = ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap();
-        std::env::set_current_dir(&original_dir).unwrap();
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap()
+        };
 
         assert!(
             !config
