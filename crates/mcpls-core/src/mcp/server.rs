@@ -26,7 +26,8 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    NotificationCache, ResourceSubscriptions, Translator, validate_path_against_roots,
+    DiagnosticInfo, NotificationCache, ResourceSubscriptions, Translator,
+    validate_path_against_roots,
 };
 
 /// MCP server that exposes LSP capabilities as tools.
@@ -101,6 +102,33 @@ fn paginate_resource_paths<'a>(
     let next_cursor = (next_start < paths.len()).then(|| next_start.to_string());
 
     Ok((page, next_cursor))
+}
+
+/// `read_resource`'s diagnostics payload, distinguishing a file the LSP
+/// client has never opened (`tracked: false`) from one that is open but has
+/// no cached diagnostics, whether clean or not yet analyzed (`tracked: true,
+/// diagnostics: []`).
+///
+/// `version` is the document version the diagnostics were computed against
+/// (the client's staleness signal, mirroring `DiagnosticInfo::version`) --
+/// `None` both when untracked and when tracked but nothing has been
+/// published yet. `uri` is deliberately omitted: the caller already knows it
+/// (it's the resource they requested).
+#[derive(serde::Serialize)]
+struct ResourceDiagnosticsResponse {
+    tracked: bool,
+    version: Option<i32>,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+}
+
+impl ResourceDiagnosticsResponse {
+    fn new(tracked: bool, entry: Option<&DiagnosticInfo>) -> Self {
+        Self {
+            tracked,
+            version: entry.and_then(|e| e.version),
+            diagnostics: entry.map(|e| e.diagnostics.clone()).unwrap_or_default(),
+        }
+    }
 }
 
 #[tool_router]
@@ -805,15 +833,21 @@ impl ServerHandler for McplsServer {
         let lsp_uri = crate::bridge::path_to_uri(&validated_path)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
-        // in the response shape. Currently both return `{"diagnostics":null}` which is
-        // ambiguous for clients that need to know whether analysis has run yet.
-        let diagnostics = {
+        // "Tracked" comes from `DocumentTracker` (via `is_document_open`), not from
+        // cache presence: `get_diagnostics` returning `None` is also true for a
+        // tracked-but-clean file or one evicted from the LRU cache, so it alone
+        // can't distinguish "never opened" from "opened, nothing to report".
+        let tracked = self.context.translator.is_document_open(&validated_path);
+        // Build the response from a borrow of the cache entry rather than
+        // `.cloned()`-ing the whole `DiagnosticInfo` first: `new` only ever
+        // needs `version` (Copy) and its own clone of `diagnostics`, so
+        // cloning the entry up front would clone `diagnostics` twice.
+        let response = {
             let cache = self.context.notification_cache.lock().await;
-            cache.get_diagnostics(lsp_uri.as_str()).cloned()
+            ResourceDiagnosticsResponse::new(tracked, cache.get_diagnostics(lsp_uri.as_str()))
         };
 
-        let json = serde_json::to_string(&diagnostics)
+        let json = serde_json::to_string(&response)
             .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
 
         Ok(ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into())
@@ -1709,6 +1743,99 @@ mod tests {
 
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json.get("nextCursor").unwrap(), "100");
+    }
+
+    // ------------------------------------------------------------------
+    // `ResourceDiagnosticsResponse` (tracked-vs-untracked shape behind
+    // `read_resource`)
+    // ------------------------------------------------------------------
+
+    fn sample_diagnostic_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticInfo {
+        use url::Url;
+
+        let uri: lsp_types::Uri = Url::parse("file:///sample.rs")
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        DiagnosticInfo {
+            uri,
+            version: Some(1),
+            diagnostics,
+        }
+    }
+
+    #[test]
+    fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
+        let response = ResourceDiagnosticsResponse::new(false, None);
+        assert!(!response.tracked);
+        assert!(response.version.is_none());
+        assert!(response.diagnostics.is_empty());
+
+        // #132's contract is the wire shape, not the Rust struct -- assert the JSON directly.
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["tracked"], false);
+        assert!(json["version"].is_null());
+        assert_eq!(json["diagnostics"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
+        let response = ResourceDiagnosticsResponse::new(true, None);
+        assert!(response.tracked);
+        assert!(response.version.is_none());
+        assert!(response.diagnostics.is_empty());
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["tracked"], true);
+        assert!(json["version"].is_null());
+        assert_eq!(json["diagnostics"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_resource_diagnostics_response_tracked_with_diagnostics() {
+        let entry = sample_diagnostic_info(vec![lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: None,
+            message: "boom".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        }]);
+        let response = ResourceDiagnosticsResponse::new(true, Some(&entry));
+        assert!(response.tracked);
+        assert_eq!(response.version, Some(1));
+        assert_eq!(response.diagnostics.len(), 1);
+        assert_eq!(response.diagnostics[0].message, "boom");
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["tracked"], true);
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["diagnostics"][0]["message"], "boom");
+    }
+
+    /// `read_resource` derives `tracked` from `Translator::is_document_open`, not from
+    /// diagnostics-cache presence -- exercise the real accessor it calls.
+    #[tokio::test]
+    async fn test_read_resource_untracked_path_is_not_open() {
+        let server = create_test_server();
+        let tracked = server
+            .context
+            .translator
+            .is_document_open(std::path::Path::new("/never/opened.rs"));
+        assert!(!tracked);
     }
 
     /// `parse_uri` rejects `file://` scheme — ensures `read_resource` would return an error.
