@@ -40,6 +40,18 @@ pub struct ServerConfig {
     /// LSP server configurations.
     #[serde(default)]
     pub lsp_servers: Vec<LspServerConfig>,
+
+    /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted
+    /// during this load (see [`ProjectConfigTrust`]).
+    ///
+    /// Load-time metadata, not user-configurable: never read from or written
+    /// to a TOML file. Consumed by `McplsServer::get_info` (the
+    /// `ServerHandler` implementation in `crate::mcp::server`) to surface
+    /// the ignore decision in-band to MCP clients, supplementing the
+    /// `tracing::warn!` emitted at load time (which is stderr-only and
+    /// typically invisible to an MCP client).
+    #[serde(skip)]
+    pub project_config_ignored: bool,
 }
 
 /// Workspace-level configuration.
@@ -373,6 +385,10 @@ impl ServerConfig {
     /// logged naming the ignored path; discovery falls through to the
     /// global config tier or built-in defaults, so project-marker
     /// heuristics (e.g. `Cargo.toml` → rust-analyzer) still apply normally.
+    /// The returned config's [`project_config_ignored`](Self::project_config_ignored)
+    /// is set to `true` in that case, so callers with access to the loaded
+    /// config (e.g. `McplsServer::get_info`) can surface the ignore decision
+    /// in-band, not just via the stderr-only warning.
     ///
     /// `$MCPLS_CONFIG` and an explicit path are unaffected by `trust` and
     /// are always loaded: naming a path is itself the user's consent.
@@ -393,11 +409,14 @@ impl ServerConfig {
             return Self::load_from(Path::new(&path));
         }
 
+        let mut project_config_ignored = false;
+
         let local_config = PathBuf::from("mcpls.toml");
         if local_config.exists() {
             match trust {
                 ProjectConfigTrust::Trusted => return Self::load_from(&local_config),
                 ProjectConfigTrust::Untrusted => {
+                    project_config_ignored = true;
                     let display_path = local_config.canonicalize().unwrap_or_else(|_| {
                         std::env::current_dir()
                             .map_or_else(|_| local_config.clone(), |cwd| cwd.join(&local_config))
@@ -415,7 +434,9 @@ impl ServerConfig {
         if let Some(config_dir) = dirs::config_dir() {
             let user_config = config_dir.join("mcpls").join("mcpls.toml");
             if user_config.exists() {
-                return Self::load_from(&user_config);
+                let mut config = Self::load_from(&user_config)?;
+                config.project_config_ignored = project_config_ignored;
+                return Ok(config);
             }
 
             // No config found - create default config file
@@ -431,7 +452,10 @@ impl ServerConfig {
         }
 
         // Return default configuration
-        Ok(Self::default())
+        Ok(Self {
+            project_config_ignored,
+            ..Self::default()
+        })
     }
 
     /// Load configuration from a specific path.
@@ -553,6 +577,7 @@ impl Default for ServerConfig {
                 LspServerConfig::clangd(),
                 LspServerConfig::zls(),
             ],
+            project_config_ignored: false,
         }
     }
 }
@@ -974,6 +999,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            project_config_ignored: false,
         };
 
         let map = config.build_effective_extension_map();
@@ -997,6 +1023,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            project_config_ignored: false,
         };
 
         let map = config.build_effective_extension_map();
@@ -1020,6 +1047,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            project_config_ignored: false,
         };
 
         let map = config.build_effective_extension_map();
@@ -1043,6 +1071,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            project_config_ignored: false,
         };
 
         let map = config.build_effective_extension_map();
@@ -1178,6 +1207,26 @@ mod tests {
         assert_eq!(std::env::current_dir().unwrap(), original_dir);
     }
 
+    /// Precondition for tests that assert on `ServerConfig::load_with_trust`'s
+    /// CWD-local-file branch: a `$MCPLS_CONFIG` set in the ambient
+    /// environment makes `load_with_trust` return before ever looking at
+    /// CWD (see its `MCPLS_CONFIG` branch above), which would otherwise fail
+    /// the test for a reason unrelated to the code under test.
+    ///
+    /// Scrubbing the variable for the test's duration would be the more
+    /// thorough fix, but `std::env::remove_var`/`set_var` are `unsafe`
+    /// (mutate process-wide state) and this crate denies `unsafe_code`
+    /// workspace-wide with no existing exception — so this asserts the
+    /// precondition instead of silently working around it, turning an
+    /// environment-dependent false failure into an explicit, legible one.
+    fn assert_mcpls_config_env_unset() {
+        assert!(
+            std::env::var_os("MCPLS_CONFIG").is_none(),
+            "this test requires MCPLS_CONFIG to be unset in the test environment, since \
+             load_with_trust returns before consulting CWD when it's set"
+        );
+    }
+
     #[test]
     fn test_load_ignores_untrusted_project_local_config() {
         // `ServerConfig::default()` (what untrusted discovery falls back to
@@ -1283,6 +1332,44 @@ mod tests {
         );
         assert_ne!(config.workspace.heuristics_max_depth, 999_999);
         assert!(!config.lsp_servers.iter().any(|s| s.language_id == "evil"));
+    }
+
+    #[test]
+    fn test_load_with_trust_sets_project_config_ignored_flag() {
+        assert_mcpls_config_env_unset();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls.toml");
+        fs::write(&config_path, "[workspace]\nroots = []\n").unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap()
+        };
+        assert!(config.project_config_ignored);
+
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls.toml");
+        fs::write(&config_path, "[workspace]\nroots = []\n").unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap()
+        };
+        assert!(!config.project_config_ignored);
+    }
+
+    #[test]
+    fn test_load_no_local_config_leaves_flag_unset() {
+        assert_mcpls_config_env_unset();
+
+        let tmp_dir = TempDir::new().unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap()
+        };
+        assert!(!config.project_config_ignored);
     }
 
     #[test]

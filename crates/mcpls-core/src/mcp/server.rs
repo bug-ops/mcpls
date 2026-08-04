@@ -49,18 +49,25 @@ fn to_tool_result<T: serde::Serialize>(
 impl McplsServer {
     /// Create a new MCP server with the given translator, notification cache,
     /// workspace roots, and subscriptions.
+    ///
+    /// `project_config_ignored` reports whether a CWD-discovered
+    /// `./mcpls.toml` was skipped as untrusted when the active config was
+    /// loaded (see [`ServerConfig::project_config_ignored`](crate::config::ServerConfig::project_config_ignored));
+    /// `get_info` surfaces it in [`ServerInfo::instructions`].
     #[must_use]
     pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
+        project_config_ignored: bool,
     ) -> Self {
         let context = Arc::new(BridgeContext::new(
             translator,
             notification_cache,
             workspace_roots,
             subscriptions,
+            project_config_ignored,
         ));
         Self { context }
     }
@@ -659,15 +666,23 @@ impl ServerHandler for McplsServer {
             .build();
         let mut server_info = ServerInfo::new(capabilities);
         server_info.server_info = implementation;
-        server_info.instructions = Some(
-            concat!(
-                "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
-                "capabilities as MCP tools for semantic code intelligence. ",
-                "Supports hover, definition, references, diagnostics, rename, ",
-                "completions, symbols, and formatting."
-            )
-            .to_string(),
-        );
+        let mut instructions = concat!(
+            "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
+            "capabilities as MCP tools for semantic code intelligence. ",
+            "Supports hover, definition, references, diagnostics, rename, ",
+            "completions, symbols, and formatting."
+        )
+        .to_string();
+
+        if self.context.project_config_ignored {
+            instructions.push_str(
+                " NOTE: a project-local mcpls.toml was found in the current directory but \
+                 ignored as untrusted; the server is running on built-in defaults or a global \
+                 config instead. If this repository is trusted, restart mcpls with \
+                 --trust-project-config (or MCPLS_TRUST_PROJECT_CONFIG=true) to load it.",
+            );
+        }
+        server_info.instructions = Some(instructions);
 
         server_info
     }
@@ -679,6 +694,10 @@ mod tests {
     use super::*;
 
     fn create_test_server() -> McplsServer {
+        create_test_server_with_ignored_flag(false)
+    }
+
+    fn create_test_server_with_ignored_flag(project_config_ignored: bool) -> McplsServer {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
@@ -688,6 +707,7 @@ mod tests {
             notification_cache,
             workspace_roots,
             subscriptions,
+            project_config_ignored,
         )
     }
 
@@ -699,6 +719,24 @@ mod tests {
         assert!(info.capabilities.tools.is_some());
         assert_eq!(info.server_info.name, "mcpls");
         assert!(info.instructions.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_server_info_omits_ignore_notice_when_not_ignored() {
+        let server = create_test_server_with_ignored_flag(false);
+        let info = server.get_info();
+
+        assert!(!info.instructions.unwrap().contains("ignored as untrusted"));
+    }
+
+    #[tokio::test]
+    async fn test_server_info_surfaces_ignored_project_config() {
+        let server = create_test_server_with_ignored_flag(true);
+        let info = server.get_info();
+
+        let instructions = info.instructions.unwrap();
+        assert!(instructions.contains("ignored as untrusted"));
+        assert!(instructions.contains("--trust-project-config"));
     }
 
     #[tokio::test]

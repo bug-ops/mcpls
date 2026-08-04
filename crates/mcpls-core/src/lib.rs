@@ -326,6 +326,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
+    let project_config_ignored = config.project_config_ignored;
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
@@ -426,6 +427,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Arc::clone(&notification_cache),
         Arc::clone(&workspace_roots_snapshot),
         Arc::clone(&subscriptions),
+        project_config_ignored,
     );
     info!("MCPLS server initialized successfully");
 
@@ -821,6 +823,7 @@ mod tests {
                     name: None,
                     handles: None,
                 }],
+                project_config_ignored: false,
             };
 
             // serve() proceeds to run the MCP server and blocks on the stdio
@@ -859,6 +862,7 @@ mod tests {
                     heuristics_max_depth: 10,
                 },
                 lsp_servers: vec![],
+                project_config_ignored: false,
             };
 
             let result = serve(config).await;

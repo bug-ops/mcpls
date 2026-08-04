@@ -39,6 +39,13 @@ pub struct BridgeContext {
     pub workspace_roots: Arc<[PathBuf]>,
     /// Set of resource URIs the MCP client has subscribed to.
     pub subscriptions: Arc<ResourceSubscriptions>,
+    /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted when
+    /// the active [`ServerConfig`](crate::config::ServerConfig) was loaded.
+    ///
+    /// Surfaced in-band via `McplsServer::get_info`'s `ServerInfo.instructions`
+    /// (stderr's `tracing::warn!` at load time is typically invisible to an
+    /// MCP client).
+    pub project_config_ignored: bool,
 }
 
 impl BridgeContext {
@@ -49,12 +56,14 @@ impl BridgeContext {
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
+        project_config_ignored: bool,
     ) -> Self {
         Self {
             translator,
             notification_cache,
             workspace_roots,
             subscriptions,
+            project_config_ignored,
         }
     }
 }
@@ -75,6 +84,7 @@ mod tests {
             notification_cache,
             workspace_roots,
             subscriptions,
+            false,
         );
         assert_eq!(Arc::strong_count(&context.translator), 1);
     }

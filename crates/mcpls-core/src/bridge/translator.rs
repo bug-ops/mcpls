@@ -4161,6 +4161,7 @@ mod tests {
                 heuristics_max_depth: 10,
             },
             lsp_servers: vec![],
+            project_config_ignored: false,
         };
 
         let extension_map = config.build_effective_extension_map();

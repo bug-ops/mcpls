@@ -573,7 +573,8 @@ mod tests {
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server = McplsServer::new(translator, notification_cache, workspace_roots, subs);
+            let server =
+                McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
 
             // Bind port 0 so the OS assigns a free port.
             let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -614,7 +615,8 @@ mod tests {
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server = McplsServer::new(translator, notification_cache, workspace_roots, subs);
+            let server =
+                McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
 
             let cfg = HttpConfig::new(addr, "/mcp");
 
@@ -642,7 +644,7 @@ mod tests {
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            McplsServer::new(translator, notification_cache, workspace_roots, subs)
+            McplsServer::new(translator, notification_cache, workspace_roots, subs, false)
         }
 
         /// Sends a raw HTTP/1.1 POST request over TCP and returns the raw response
