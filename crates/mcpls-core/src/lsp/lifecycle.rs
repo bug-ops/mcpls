@@ -632,6 +632,55 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 }
 
 #[cfg(test)]
+impl LspServer {
+    /// Construct an `LspServer` fixture carrying the given capabilities, for
+    /// tests elsewhere in the crate that need to drive capability-gated
+    /// dispatch paths in `Translator` without spawning a real language server.
+    ///
+    /// The underlying client and child process are inert placeholders — only
+    /// `capabilities()` is meaningful on the returned value.
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn new_for_test(capabilities: ServerCapabilities) -> Self {
+        let child = Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let stdin = Command::new("cat")
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap();
+
+        let stdout = Command::new("echo")
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+            .stdout
+            .take()
+            .unwrap();
+
+        let transport = LspTransport::new(stdin, stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let (_, notification_rx) = mpsc::channel(1);
+
+        Self {
+            client,
+            capabilities,
+            position_encoding: PositionEncodingKind::UTF16,
+            notification_rx,
+            _child: child,
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

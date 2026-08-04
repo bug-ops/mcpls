@@ -218,6 +218,17 @@ pub enum Error {
     /// No LSP servers available (none configured or all failed).
     #[error("{0}")]
     NoServersAvailable(String),
+
+    /// The server routed for this request does not advertise support for the
+    /// requested LSP capability (e.g. no `renameProvider` in its
+    /// `ServerCapabilities`).
+    #[error("server '{server_id}' does not support capability '{capability}'")]
+    CapabilityNotSupported {
+        /// Routing identity of the server that lacks the capability.
+        server_id: ServerId,
+        /// Name of the missing LSP capability field (e.g. `"renameProvider"`).
+        capability: &'static str,
+    },
 }
 
 /// A specialized Result type for mcpls-core operations.
@@ -465,5 +476,17 @@ mod tests {
         let custom_msg = "none configured or all failed to initialize";
         let err = Error::NoServersAvailable(custom_msg.to_string());
         assert_eq!(err.to_string(), custom_msg);
+    }
+
+    #[test]
+    fn test_error_display_capability_not_supported() {
+        let err = Error::CapabilityNotSupported {
+            server_id: ServerId::from("rust"),
+            capability: "renameProvider",
+        };
+        assert_eq!(
+            err.to_string(),
+            "server 'rust' does not support capability 'renameProvider'"
+        );
     }
 }

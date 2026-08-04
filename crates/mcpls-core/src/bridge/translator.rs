@@ -724,19 +724,102 @@ impl Translator {
     /// file can be routed to more than one server; a wedged server-A notify
     /// still holds this path's lock and can therefore delay a healthy
     /// server-B call for that *same* file.)
+    /// Resolve the server/client routed for `file_path`/`tool` and validate
+    /// the path, without opening the document.
+    ///
+    /// Split out from [`Self::prepare_document`] so [`Self::prepare_gated_document`]
+    /// can check the routed server's capabilities *before* `ensure_open` sends
+    /// `textDocument/didOpen` -- a server rejected by the gate should never
+    /// observe an open notification for a request it can't service.
+    fn resolve_client_for_file(
+        &self,
+        file_path: &str,
+        tool: ToolKind,
+    ) -> Result<(ServerId, LspClient, PathBuf)> {
+        let path = PathBuf::from(file_path);
+        let validated_path = self.validate_path(&path)?;
+        let (server_id, client) = self.get_client_for_file(&validated_path, tool)?;
+        Ok((server_id, client, validated_path))
+    }
+
     async fn prepare_document(
         &self,
         file_path: &str,
         tool: ToolKind,
-    ) -> Result<(LspClient, lsp_types::Uri)> {
-        let path = PathBuf::from(file_path);
-        let validated_path = self.validate_path(&path)?;
-        let (server_id, client) = self.get_client_for_file(&validated_path, tool)?;
+    ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
+        let (server_id, client, validated_path) = self.resolve_client_for_file(file_path, tool)?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &server_id, &client)
             .await?;
-        Ok((client, uri))
+        Ok((server_id, client, uri))
+    }
+
+    /// Like [`Self::prepare_document`], but checks `capability` against the
+    /// routed server's `ServerCapabilities` *before* opening the document --
+    /// see [`Self::resolve_client_for_file`]'s doc comment for why the
+    /// ordering matters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CapabilityNotSupported`] if the routed server's
+    /// `ServerCapabilities` explicitly does not advertise `capability`.
+    async fn prepare_gated_document(
+        &self,
+        file_path: &str,
+        tool: ToolKind,
+        capability: &'static str,
+        supported: impl FnOnce(&lsp_types::ServerCapabilities) -> bool,
+    ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
+        let (server_id, client, validated_path) = self.resolve_client_for_file(file_path, tool)?;
+        self.require_capability(&server_id, capability, supported)?;
+        let uri = self
+            .document_tracker
+            .ensure_open(&validated_path, &server_id, &client)
+            .await?;
+        Ok((server_id, client, uri))
+    }
+
+    /// Verify the routed server advertises support for a capability before
+    /// dispatching a capability-gated LSP request.
+    ///
+    /// Production always registers an [`LspServer`] alongside its
+    /// [`LspClient`] in the same `register_servers` step (see `lib.rs`), so in
+    /// practice a registered client always has known capabilities. If no
+    /// `LspServer` is registered for `server_id` regardless -- a client
+    /// registered without its server, which only happens in tests, or a
+    /// narrow window during registration where the two maps are inserted
+    /// under separate locks -- the capability is assumed supported rather
+    /// than blocking the request: this mirrors the graceful-degradation
+    /// stance used elsewhere in `Translator` when capability information is
+    /// unavailable rather than known-absent.
+    ///
+    /// Note: this checks the `ServerCapabilities` snapshot captured at
+    /// `initialize` time. A server that advertises a capability later via
+    /// `client/registerCapability` (dynamic registration) is not reflected
+    /// here and will be incorrectly rejected; mcpls does not currently apply
+    /// dynamic registrations back onto the stored capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CapabilityNotSupported`] if the registered server's
+    /// `ServerCapabilities` explicitly does not advertise `capability`.
+    fn require_capability(
+        &self,
+        server_id: &ServerId,
+        capability: &'static str,
+        supported: impl FnOnce(&lsp_types::ServerCapabilities) -> bool,
+    ) -> Result<()> {
+        let servers = lock_std(&self.lsp_servers);
+        match servers.get(server_id) {
+            Some(server) if !supported(server.capabilities()) => {
+                Err(Error::CapabilityNotSupported {
+                    server_id: server_id.clone(),
+                    capability,
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Parse and validate a file URI, returning the validated path.
@@ -781,14 +864,25 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `hoverProvider` support.
     pub async fn handle_hover(
         &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<HoverResult> {
-        let (client, uri) = self.prepare_document(&file_path, ToolKind::Hover).await?;
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(&file_path, ToolKind::Hover, "hoverProvider", |caps| {
+                matches!(
+                    caps.hover_provider,
+                    Some(
+                        lsp_types::HoverProviderCapability::Simple(true)
+                            | lsp_types::HoverProviderCapability::Options(_)
+                    )
+                )
+            })
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspHoverParams {
@@ -823,15 +917,26 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `definitionProvider` support.
     pub async fn handle_definition(
         &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<DefinitionResult> {
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::Definition)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::Definition,
+                "definitionProvider",
+                |caps| {
+                    matches!(
+                        caps.definition_provider,
+                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                    )
+                },
+            )
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
@@ -879,7 +984,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `referencesProvider` support.
     pub async fn handle_references(
         &self,
         file_path: String,
@@ -887,8 +993,18 @@ impl Translator {
         character: u32,
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::References)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::References,
+                "referencesProvider",
+                |caps| {
+                    matches!(
+                        caps.references_provider,
+                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                    )
+                },
+            )
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
@@ -955,7 +1071,7 @@ impl Translator {
         file_path: String,
         notification_cache: &Mutex<NotificationCache>,
     ) -> Result<DiagnosticsResult> {
-        let (client, uri) = self
+        let (_server_id, client, uri) = self
             .prepare_document(&file_path, ToolKind::Diagnostics)
             .await?;
 
@@ -1002,7 +1118,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `renameProvider` support.
     pub async fn handle_rename(
         &self,
         file_path: String,
@@ -1010,7 +1127,14 @@ impl Translator {
         character: u32,
         new_name: String,
     ) -> Result<RenameResult> {
-        let (client, uri) = self.prepare_document(&file_path, ToolKind::Rename).await?;
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(&file_path, ToolKind::Rename, "renameProvider", |caps| {
+                matches!(
+                    caps.rename_provider,
+                    Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                )
+            })
+            .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
         let params = LspRenameParams {
@@ -1092,7 +1216,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `completionProvider` support.
     pub async fn handle_completions(
         &self,
         file_path: String,
@@ -1100,8 +1225,13 @@ impl Translator {
         character: u32,
         trigger: Option<String>,
     ) -> Result<CompletionsResult> {
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::Completions)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::Completions,
+                "completionProvider",
+                |caps| caps.completion_provider.is_some(),
+            )
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
@@ -1153,13 +1283,24 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `documentSymbolProvider` support.
     pub async fn handle_document_symbols(
         &self,
         file_path: String,
     ) -> Result<DocumentSymbolsResult> {
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::DocumentSymbols)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::DocumentSymbols,
+                "documentSymbolProvider",
+                |caps| {
+                    matches!(
+                        caps.document_symbol_provider,
+                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                    )
+                },
+            )
             .await?;
 
         let params = DocumentSymbolParams {
@@ -1197,15 +1338,26 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `documentFormattingProvider` support.
     pub async fn handle_format_document(
         &self,
         file_path: String,
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::FormatDocument)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::FormatDocument,
+                "documentFormattingProvider",
+                |caps| {
+                    matches!(
+                        caps.document_formatting_provider,
+                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                    )
+                },
+            )
             .await?;
 
         let params = DocumentFormattingParams {
@@ -1242,7 +1394,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or no server is configured.
+    /// Returns an error if the LSP request fails, no server is configured, or
+    /// the routed server does not advertise `workspaceSymbolProvider` support.
     pub async fn handle_workspace_symbol(
         &self,
         query: String,
@@ -1309,10 +1462,18 @@ impl Translator {
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
         let client = client.ok_or_else(|| {
             if lock_std(&self.expected_servers).contains(&server_id) {
-                Error::ServerInitializing { server_id }
+                Error::ServerInitializing {
+                    server_id: server_id.clone(),
+                }
             } else {
                 Error::NoServerConfigured
             }
+        })?;
+        self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
+            matches!(
+                caps.workspace_symbol_provider,
+                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+            )
         })?;
 
         let params = LspWorkspaceSymbolParams {
@@ -1355,7 +1516,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `codeActionProvider` support.
     pub async fn handle_code_actions(
         &self,
         file_path: String,
@@ -1373,8 +1535,21 @@ impl Translator {
             kind_filter.as_deref(),
         )?;
 
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::CodeActions)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::CodeActions,
+                "codeActionProvider",
+                |caps| {
+                    matches!(
+                        caps.code_action_provider,
+                        Some(
+                            lsp_types::CodeActionProviderCapability::Simple(true)
+                                | lsp_types::CodeActionProviderCapability::Options(_)
+                        )
+                    )
+                },
+            )
             .await?;
 
         let range = lsp_types::Range {
@@ -1439,7 +1614,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `callHierarchyProvider` support.
     pub async fn handle_call_hierarchy_prepare(
         &self,
         file_path: String,
@@ -1459,8 +1635,13 @@ impl Translator {
             )));
         }
 
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::CallHierarchy)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::CallHierarchy,
+                "callHierarchyProvider",
+                call_hierarchy_provider_supported,
+            )
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
@@ -1495,7 +1676,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the item is invalid.
+    /// Returns an error if the LSP request fails, the item is invalid, or the
+    /// routed server does not advertise `callHierarchyProvider` support.
     pub async fn handle_incoming_calls(
         &self,
         item: serde_json::Value,
@@ -1509,7 +1691,12 @@ impl Translator {
         // that server is guaranteed to be the same one `prepare` synced the
         // document to since both resolve via the same (language, tool) route.
         let path = self.parse_file_uri(&lsp_item.uri)?;
-        let (_server_id, client) = self.get_client_for_file(&path, ToolKind::CallHierarchy)?;
+        let (server_id, client) = self.get_client_for_file(&path, ToolKind::CallHierarchy)?;
+        self.require_capability(
+            &server_id,
+            "callHierarchyProvider",
+            call_hierarchy_provider_supported,
+        )?;
 
         let params = CallHierarchyIncomingCallsParams {
             item: lsp_item,
@@ -1548,7 +1735,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the item is invalid.
+    /// Returns an error if the LSP request fails, the item is invalid, or the
+    /// routed server does not advertise `callHierarchyProvider` support.
     pub async fn handle_outgoing_calls(
         &self,
         item: serde_json::Value,
@@ -1559,7 +1747,12 @@ impl Translator {
         // Parse and validate the URI. Same ToolKind/route as `prepare` and
         // `handle_incoming_calls` -- see that function's comment.
         let path = self.parse_file_uri(&lsp_item.uri)?;
-        let (_server_id, client) = self.get_client_for_file(&path, ToolKind::CallHierarchy)?;
+        let (server_id, client) = self.get_client_for_file(&path, ToolKind::CallHierarchy)?;
+        self.require_capability(
+            &server_id,
+            "callHierarchyProvider",
+            call_hierarchy_provider_supported,
+        )?;
 
         let params = CallHierarchyOutgoingCallsParams {
             item: lsp_item,
@@ -1781,15 +1974,21 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `signatureHelpProvider` support.
     pub async fn handle_signature_help(
         &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<SignatureHelpResult> {
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::SignatureHelp)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::SignatureHelp,
+                "signatureHelpProvider",
+                |caps| caps.signature_help_provider.is_some(),
+            )
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
@@ -1850,15 +2049,29 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `implementationProvider` support.
     pub async fn handle_implementation(
         &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::Implementation)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::Implementation,
+                "implementationProvider",
+                |caps| {
+                    matches!(
+                        caps.implementation_provider,
+                        Some(
+                            lsp_types::ImplementationProviderCapability::Simple(true)
+                                | lsp_types::ImplementationProviderCapability::Options(_)
+                        )
+                    )
+                },
+            )
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
@@ -1888,15 +2101,29 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `typeDefinitionProvider` support.
     pub async fn handle_type_definition(
         &self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::TypeDefinition)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::TypeDefinition,
+                "typeDefinitionProvider",
+                |caps| {
+                    matches!(
+                        caps.type_definition_provider,
+                        Some(
+                            lsp_types::TypeDefinitionProviderCapability::Simple(true)
+                                | lsp_types::TypeDefinitionProviderCapability::Options(_)
+                        )
+                    )
+                },
+            )
             .await?;
         let lsp_position = mcp_to_lsp_position(line, character);
 
@@ -1926,7 +2153,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or the file cannot be opened.
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `inlayHintProvider` support.
     pub async fn handle_inlay_hints(
         &self,
         file_path: String,
@@ -1937,8 +2165,18 @@ impl Translator {
     ) -> Result<InlayHintsResult> {
         use crate::bridge::encoding::lsp_to_mcp_position;
 
-        let (client, uri) = self
-            .prepare_document(&file_path, ToolKind::InlayHints)
+        let (_server_id, client, uri) = self
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::InlayHints,
+                "inlayHintProvider",
+                |caps| {
+                    matches!(
+                        caps.inlay_hint_provider,
+                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                    )
+                },
+            )
             .await?;
 
         let lsp_start = mcp_to_lsp_position(start_line, start_character);
@@ -2111,6 +2349,20 @@ fn validate_code_action_params(
     }
 
     Ok(())
+}
+
+/// Whether a server's capabilities advertise `callHierarchyProvider` support.
+///
+/// Shared by `handle_call_hierarchy_prepare`, `handle_incoming_calls`, and
+/// `handle_outgoing_calls`, which all gate on the same capability field.
+const fn call_hierarchy_provider_supported(caps: &lsp_types::ServerCapabilities) -> bool {
+    matches!(
+        caps.call_hierarchy_provider,
+        Some(
+            lsp_types::CallHierarchyServerCapability::Simple(true)
+                | lsp_types::CallHierarchyServerCapability::Options(_)
+        )
+    )
 }
 
 /// Convert a `CallHierarchyItemResult` JSON (1-based MCP coordinates) into
@@ -4487,6 +4739,620 @@ mod tests {
         assert!(
             result.is_err(),
             "pull error with no cache data must propagate, got {result:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Capability gate tests (#240)
+    // ------------------------------------------------------------------
+
+    /// No `LspServer` registered for `server_id` (only a raw `LspClient`, as
+    /// most tests in this module do) -- capability is unknown, so the gate
+    /// must not block the request.
+    #[test]
+    fn test_require_capability_ok_when_server_not_registered() {
+        let translator = Translator::new();
+        let result =
+            translator.require_capability(&ServerId::from("rust"), "renameProvider", |_| false);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_require_capability_ok_when_capability_present() {
+        let translator = Translator::new();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
+
+        let result = translator.require_capability(&server_id, "renameProvider", |c| {
+            matches!(
+                c.rename_provider,
+                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+            )
+        });
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_require_capability_err_when_capability_absent() {
+        let translator = Translator::new();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities::default();
+        translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
+
+        let result = translator.require_capability(&server_id, "renameProvider", |c| {
+            matches!(
+                c.rename_provider,
+                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+            )
+        });
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "renameProvider",
+                ..
+            })
+        ));
+    }
+
+    /// Builds a single-server translator routed to `server_id` for every tool,
+    /// with a registered `LspServer` fixture carrying `capabilities` (default
+    /// capabilities advertise nothing).
+    fn translator_with_capabilities(
+        dir: &TempDir,
+        server_id: &ServerId,
+        capabilities: lsp_types::ServerCapabilities,
+    ) -> (Translator, FakeServer) {
+        let mut extensions = HashMap::new();
+        extensions.insert("rs".to_string(), "rust".to_string());
+
+        let mut translator =
+            Translator::new()
+                .with_extensions(extensions)
+                .with_router(ToolRouter::catch_all([(
+                    server_id.clone(),
+                    "rust".to_string(),
+                )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client, server) = fake_lsp_client();
+        translator.register_client(server_id.clone(), client);
+        translator.register_server(server_id.clone(), LspServer::new_for_test(capabilities));
+
+        (translator, server)
+    }
+
+    #[tokio::test]
+    async fn test_handle_rename_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_rename(
+                path.to_string_lossy().to_string(),
+                1,
+                1,
+                "renamed".to_string(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "renameProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_code_actions_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_code_actions(path.to_string_lossy().to_string(), 1, 1, 1, 5, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "codeActionProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_signature_help_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_signature_help(path.to_string_lossy().to_string(), 1, 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "signatureHelpProvider",
+                ..
+            })
+        ));
+    }
+
+    /// `handle_incoming_calls` resolves its server via `get_client_for_file`
+    /// directly (not `prepare_document`), a separate code path from the other
+    /// gated handlers -- exercise it explicitly.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+
+        let item = serde_json::json!({
+            "name": "test_function",
+            "kind": 12,
+            "uri": uri,
+            "range": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
+            },
+            "selectionRange": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
+            }
+        });
+
+        let result = translator.handle_incoming_calls(item).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "callHierarchyProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_outgoing_calls_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+
+        let item = serde_json::json!({
+            "name": "test_function",
+            "kind": 12,
+            "uri": uri,
+            "range": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
+            },
+            "selectionRange": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
+            }
+        });
+
+        let result = translator.handle_outgoing_calls(item).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "callHierarchyProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_format_document_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_format_document(path.to_string_lossy().to_string(), 4, true)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "documentFormattingProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_hierarchy_prepare_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_call_hierarchy_prepare(path.to_string_lossy().to_string(), 1, 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "callHierarchyProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_inlay_hints_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_inlay_hints(path.to_string_lossy().to_string(), 1, 1, 10, 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "inlayHintProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_hover_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_hover(path.to_string_lossy().to_string(), 1, 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "hoverProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_definition_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_definition(path.to_string_lossy().to_string(), 1, 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "definitionProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_references_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_references(path.to_string_lossy().to_string(), 1, 1, false)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "referencesProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_completions_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_completions(path.to_string_lossy().to_string(), 1, 1, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "completionProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_document_symbols_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_document_symbols(path.to_string_lossy().to_string())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "documentSymbolProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let result = translator
+            .handle_workspace_symbol("main".to_string(), None, 100)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "workspaceSymbolProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_implementation_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_implementation(path.to_string_lossy().to_string(), 1, 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "implementationProvider",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_type_definition_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_type_definition(path.to_string_lossy().to_string(), 1, 1)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "typeDefinitionProvider",
+                ..
+            })
+        ));
+    }
+
+    /// Explicit `Some(OneOf::Left(false))` -- as distinct from an absent
+    /// (`None`) field -- must also be rejected: some servers advertise a
+    /// provider field with an explicit `false` rather than omitting it.
+    #[tokio::test]
+    async fn test_require_capability_err_when_capability_explicitly_false() {
+        let translator = Translator::new();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::OneOf::Left(false)),
+            ..Default::default()
+        };
+        translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
+
+        let result = translator.require_capability(&server_id, "renameProvider", |c| {
+            matches!(
+                c.rename_provider,
+                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+            )
+        });
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "renameProvider",
+                ..
+            })
+        ));
+    }
+
+    /// Positive path: when the routed server *does* advertise the gated
+    /// capability, the gate must let the request proceed into dispatch rather
+    /// than short-circuiting with `CapabilityNotSupported`. Drives the fake
+    /// wire to answer the request so the call completes quickly instead of
+    /// idling out its internal 30s request timeout.
+    #[tokio::test]
+    async fn test_handle_rename_proceeds_when_capability_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::OneOf::Left(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(path_str, 1, 1, "renamed".to_string())
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let rename_request = read_framed_message(&mut wire).await;
+        assert_eq!(rename_request["method"], "textDocument/rename");
+        write_response(
+            &mut server.read_half_stdin,
+            &rename_request["id"],
+            JsonValue::Null,
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap();
+
+        assert!(
+            !matches!(result, Err(Error::CapabilityNotSupported { .. })),
+            "capability is supported, gate must not block dispatch, got {result:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "fake server answered, expected Ok: {result:?}"
         );
     }
 }

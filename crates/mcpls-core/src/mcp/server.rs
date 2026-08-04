@@ -34,6 +34,17 @@ pub struct McplsServer {
     context: Arc<BridgeContext>,
 }
 
+/// Map a bridge-layer result to the MCP tool response shape shared by every `#[tool]` handler.
+fn to_tool_result<T: serde::Serialize>(
+    result: crate::error::Result<T>,
+) -> Result<String, McpError> {
+    match result {
+        Ok(value) => serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+        Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+    }
+}
+
 #[tool_router]
 impl McplsServer {
     /// Create a new MCP server with the given translator, notification cache,
@@ -73,11 +84,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get the definition location of a symbol.
@@ -99,11 +106,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Find all references to a symbol.
@@ -126,11 +129,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get diagnostics for a file.
@@ -150,11 +149,7 @@ impl McplsServer {
             .handle_diagnostics(file_path, &self.context.notification_cache)
             .await;
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Rename a symbol across the workspace.
@@ -177,11 +172,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get code completion suggestions.
@@ -204,11 +195,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get all symbols in a document.
@@ -226,11 +213,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Format a document according to language server rules.
@@ -252,11 +235,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Search for symbols across the workspace.
@@ -278,11 +257,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get code actions for a range.
@@ -314,11 +289,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Prepare call hierarchy at a position.
@@ -340,11 +311,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get incoming calls (callers).
@@ -357,11 +324,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let result = { self.context.translator.handle_incoming_calls(item).await };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get outgoing calls (callees).
@@ -374,11 +337,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let result = { self.context.translator.handle_outgoing_calls(item).await };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get cached diagnostics for a file.
@@ -404,11 +363,7 @@ impl McplsServer {
                 Err(e) => Err(e),
             };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get recent LSP server log messages.
@@ -424,11 +379,7 @@ impl McplsServer {
             Translator::handle_server_logs(&cache, limit, min_level)
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get recent LSP server messages.
@@ -444,11 +395,7 @@ impl McplsServer {
             Translator::handle_server_messages(&cache, limit)
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get signature help at a position.
@@ -470,11 +417,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Go to implementation locations.
@@ -496,11 +439,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Go to type definition location.
@@ -522,11 +461,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 
     /// Get inlay hints for a range.
@@ -556,11 +491,7 @@ impl McplsServer {
                 .await
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        to_tool_result(result)
     }
 }
 
