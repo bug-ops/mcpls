@@ -5,8 +5,10 @@
 
 .DESCRIPTION
     Downloads the latest (or a pinned) mcpls release archive for the current
-    architecture, verifies its SHA256 checksum, and installs the binary to
-    a directory on PATH.
+    architecture, verifies its SHA256 checksum, and installs the binary to a
+    per-user directory. That directory is added to PATH for the current
+    session; if it is not already on your permanent PATH, the script prints
+    the command needed to add it.
 
 .PARAMETER Version
     Release tag to install, e.g. "v0.3.8". Defaults to the latest release.
@@ -26,6 +28,14 @@ param(
 $ErrorActionPreference = "Stop"
 $Repo = "bug-ops/mcpls"
 $BinName = "mcpls.exe"
+
+# -UseBasicParsing was required on Windows PowerShell 5.1 to avoid a dependency
+# on the IE engine; it is a no-op on PowerShell 6+ but not always accepted, so
+# only pass it where it is needed.
+$script:WebRequestParams = @{}
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $script:WebRequestParams["UseBasicParsing"] = $true
+}
 
 function Get-Arch {
     $arch = $env:PROCESSOR_ARCHITECTURE
@@ -66,8 +76,8 @@ function Main {
         $checksumPath = "$archivePath.sha256"
 
         Write-Host "Downloading $archive..."
-        Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile $archivePath -UseBasicParsing
-        Invoke-WebRequest -Uri "$baseUrl/$archive.sha256" -OutFile $checksumPath -UseBasicParsing
+        Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile $archivePath @script:WebRequestParams
+        Invoke-WebRequest -Uri "$baseUrl/$archive.sha256" -OutFile $checksumPath @script:WebRequestParams
 
         Write-Host "Verifying checksum..."
         $expected = (Get-Content $checksumPath -Raw).Trim().Split()[0].ToLowerInvariant()

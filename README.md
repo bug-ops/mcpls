@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.
 irm https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.ps1 | iex
 ```
 
-Both scripts detect your OS/architecture, download the matching release archive, verify its SHA256 checksum, and install `mcpls` to `~/.local/bin` (no `sudo` required).
+Both scripts detect your OS/architecture, download the matching release archive, verify its SHA256 checksum, and install `mcpls` to a per-user directory (`~/.local/bin` on Linux/macOS, `$HOME\.local\bin` on Windows) — no `sudo`/admin rights required.
 
 <details>
 <summary><strong>Cargo, pre-built binaries & other methods</strong></summary>

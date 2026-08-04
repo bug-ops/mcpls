@@ -66,6 +66,8 @@ main() {
     need_cmd curl
     need_cmd tar
     need_cmd mktemp
+    need_cmd awk
+    need_cmd install
 
     if command -v sha256sum >/dev/null 2>&1; then
         sha256_cmd="sha256sum"
