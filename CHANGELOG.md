@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`HttpConfig::max_request_body_bytes` / `HttpConfig::max_concurrent_sessions`** — HTTP transport now caps POST request body size (`413 Payload Too Large` on overflow, wired into `rmcp`'s built-in body-size enforcement) and concurrent HTTP sessions. The session cap is a hard bound enforced atomically at session creation by a semaphore-backed `SessionManager` wrapper (not inferred from request headers, which cannot reliably distinguish session-creating requests across `rmcp`'s legacy and stateless protocol paths); requests rejected once the cap is reached receive `429 Too Many Requests` with a `Retry-After` header. `HttpConfig` gains a `new(bind, path)` constructor plus `with_max_request_body_bytes`/`with_max_concurrent_sessions` builders and is now `#[non_exhaustive]`; existing `HttpConfig { .. }` struct-literal construction must switch to `HttpConfig::new(..)`. (#243)
+
 ### Changed
 
 - **Spawned LSP servers no longer inherit mcpls's full environment** — Breaking change: previously `LspServer::spawn` called `tokio::process::Command::new` with no `.env_clear()`/`.env()`/`.envs()`, so every LSP server process (and every tool *it* invokes, e.g. rust-analyzer's `cargo`/`rustc`/`build.rs` children) inherited the entire parent environment by default; separately, the `env` field on `[[lsp_servers]]` config entries was parsed but never applied (dead code). `spawn` now clears the child's environment and passes through only a minimal allowlist — `PATH`, `HOME`, `USERPROFILE`, `TMPDIR`/`TEMP`/`TMP` on every platform, plus `SystemRoot`, `SystemDrive`, `windir`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, `ProgramFiles`, `COMSPEC`, `PATHEXT`, `NUMBER_OF_PROCESSORS`, `USERNAME` on Windows — for variables actually present in the parent process, then applies `[lsp_servers.env]` on top so configured entries can override the passthrough. If your server relies on an inherited variable outside this allowlist (proxy settings, `SSH_AUTH_SOCK`, toolchain env like `DATABASE_URL`/`LIBCLANG_PATH` read by a `build.rs`, custom `PATH` entries, etc.), add it explicitly under that server's `[lsp_servers.env]` in `mcpls.toml` — see `docs/user-guide/configuration.md#env`. This closes a real information-disclosure risk: any secret or token present in mcpls's own environment was previously leaked to every third-party LSP binary, whether or not it had a legitimate need for it. (#236, #246, #247)
+
+### Fixed
+
+- **HTTP transport startup warning gave inverted authentication guidance** — the non-loopback bind warning previously read "...ensure no authentication is required", which could be misread as instructing operators to confirm auth is *not* needed. mcpls performs no authentication on any transport; the message now tells operators to put such deployments behind a reverse proxy that enforces authentication. (#233)
 
 ## [0.3.8] - 2026-07-27
 

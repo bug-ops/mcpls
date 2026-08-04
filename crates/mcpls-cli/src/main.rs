@@ -44,10 +44,10 @@ async fn main() -> Result<()> {
         #[cfg(feature = "transport-http")]
         {
             match args.listen {
-                Some(bind) => mcpls_core::Transport::Http(mcpls_core::HttpConfig {
+                Some(bind) => mcpls_core::Transport::Http(mcpls_core::HttpConfig::new(
                     bind,
-                    path: args.http_path.clone(),
-                }),
+                    args.http_path.clone(),
+                )),
                 None => mcpls_core::Transport::Stdio,
             }
         }

@@ -26,10 +26,8 @@
 //!     // Stdio (default):
 //!     serve(config).await
 //!     // HTTP (requires `transport-http` feature):
-//!     // serve_with(config, Transport::Http(mcpls_core::HttpConfig {
-//!     //     bind: "127.0.0.1:3000".parse().unwrap(),
-//!     //     path: "/mcp".to_string(),
-//!     // })).await
+//!     // let http = mcpls_core::HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp");
+//!     // serve_with(config, Transport::Http(http)).await
 //! }
 //! ```
 
