@@ -679,6 +679,16 @@ const MAX_POSITION_VALUE: u32 = 1_000_000;
 /// Maximum allowed range size in lines.
 const MAX_RANGE_LINES: u32 = 10_000;
 
+/// Default timeout for most LSP request/response round trips.
+///
+/// Independent of `LspServerConfig::timeout_seconds`, which only bounds the
+/// `initialize` handshake (see `lsp::lifecycle`) and has no effect on
+/// per-request timeouts. There is currently no way to configure this value.
+const DEFAULT_LSP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for `textDocument/completion`, kept shorter than
+/// [`DEFAULT_LSP_TIMEOUT`] since completions are latency-sensitive.
+const COMPLETIONS_LSP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Validate that `path` is within one of `workspace_roots`.
 ///
 /// Free function (rather than a `Translator` method) so callers that only need
@@ -1270,9 +1280,8 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<Hover> = client
-            .request("textDocument/hover", params, timeout_duration)
+            .request("textDocument/hover", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let result = match response {
@@ -1326,9 +1335,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<lsp_types::GotoDefinitionResponse> = client
-            .request("textDocument/definition", params, timeout_duration)
+            .request("textDocument/definition", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let locations = match response {
@@ -1397,9 +1405,8 @@ impl Translator {
             },
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<Vec<lsp_types::Location>> = client
-            .request("textDocument/references", params, timeout_duration)
+            .request("textDocument/references", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let locations = response.unwrap_or_default();
@@ -1454,9 +1461,8 @@ impl Translator {
 
         let params = diagnostic_request_params(TextDocumentIdentifier { uri: uri.clone() });
 
-        let timeout_duration = Duration::from_secs(30);
         let pull_response: Result<lsp_types::DocumentDiagnosticReportResult> = client
-            .request("textDocument/diagnostic", params, timeout_duration)
+            .request("textDocument/diagnostic", params, DEFAULT_LSP_TIMEOUT)
             .await;
 
         let diag_info = {
@@ -1523,9 +1529,8 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<WorkspaceEdit> = client
-            .request("textDocument/rename", params, timeout_duration)
+            .request("textDocument/rename", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let changes = if let Some(edit) = response {
@@ -1627,9 +1632,8 @@ impl Translator {
             context,
         };
 
-        let timeout_duration = Duration::from_secs(10);
         let response: Option<lsp_types::CompletionResponse> = client
-            .request("textDocument/completion", params, timeout_duration)
+            .request("textDocument/completion", params, COMPLETIONS_LSP_TIMEOUT)
             .await?;
 
         let items = match response {
@@ -1686,9 +1690,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<lsp_types::DocumentSymbolResponse> = client
-            .request("textDocument/documentSymbol", params, timeout_duration)
+            .request("textDocument/documentSymbol", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let symbols = match response {
@@ -1747,9 +1750,8 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<Vec<lsp_types::TextEdit>> = client
-            .request("textDocument/formatting", params, timeout_duration)
+            .request("textDocument/formatting", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let edits = response.unwrap_or_default();
@@ -1860,9 +1862,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<Vec<lsp_types::SymbolInformation>> = client
-            .request("workspace/symbol", params, timeout_duration)
+            .request("workspace/symbol", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let mut symbols: Vec<WorkspaceSymbol> = response
@@ -1956,9 +1957,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<lsp_types::CodeActionResponse> = client
-            .request("textDocument/codeAction", params, timeout_duration)
+            .request("textDocument/codeAction", params, DEFAULT_LSP_TIMEOUT)
             .await?;
         let response_vec = response.unwrap_or_default();
         let mut actions = Vec::with_capacity(response_vec.len());
@@ -2031,12 +2031,11 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<Vec<CallHierarchyItem>> = client
             .request(
                 "textDocument/prepareCallHierarchy",
                 params,
-                timeout_duration,
+                DEFAULT_LSP_TIMEOUT,
             )
             .await?;
 
@@ -2084,9 +2083,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<Vec<CallHierarchyIncomingCall>> = client
-            .request("callHierarchy/incomingCalls", params, timeout_duration)
+            .request("callHierarchy/incomingCalls", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         // Pre-allocate and build result
@@ -2142,9 +2140,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<Vec<CallHierarchyOutgoingCall>> = client
-            .request("callHierarchy/outgoingCalls", params, timeout_duration)
+            .request("callHierarchy/outgoingCalls", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         // Pre-allocate and build result
@@ -2383,9 +2380,8 @@ impl Translator {
             context: None,
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<lsp_types::SignatureHelp> = client
-            .request("textDocument/signatureHelp", params, timeout_duration)
+            .request("textDocument/signatureHelp", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let result = match response {
@@ -2466,9 +2462,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<lsp_types::GotoDefinitionResponse> = client
-            .request("textDocument/implementation", params, timeout_duration)
+            .request("textDocument/implementation", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         Ok(LocationsResult {
@@ -2518,9 +2513,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<lsp_types::GotoDefinitionResponse> = client
-            .request("textDocument/typeDefinition", params, timeout_duration)
+            .request("textDocument/typeDefinition", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         Ok(LocationsResult {
@@ -2573,9 +2567,8 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<Vec<lsp_types::InlayHint>> = client
-            .request("textDocument/inlayHint", params, timeout_duration)
+            .request("textDocument/inlayHint", params, DEFAULT_LSP_TIMEOUT)
             .await?;
 
         let hints = response

@@ -210,14 +210,24 @@ mcpls --log-level debug
 - Large projects time out
 - Tools return timeout errors
 
-**Solution 1**: Increase timeout in configuration:
+**Note**: `timeout_seconds` only bounds the initial `initialize` handshake - it
+does **not** affect the timeout on individual tool-call requests (hover,
+definition, references, etc.), which is a fixed 30 s internally (10 s for
+completions) and not configurable. If a server needs minutes to load a large
+solution, Solution 1 below is what helps; while it's still initializing, tool
+calls for that language return a "server is still initializing - wait and
+retry" message rather than a hard "no server configured" error. If requests
+are timing out *after* initialization completes, Solution 2 or 3 are the
+relevant fixes.
+
+**Solution 1**: Increase the `initialize` handshake timeout:
 ```toml
 [[lsp_servers]]
 language_id = "rust"
 command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
-timeout_seconds = 120  # Increase from default 30
+timeout_seconds = 120  # Give a slow `initialize` handshake more time
 ```
 
 **Solution 2**: Wait for initial indexing to complete:
@@ -233,8 +243,6 @@ mcpls --log-level debug
 # Limit to active project only
 roots = ["/Users/username/current-project"]
 ```
-
-**Note**: `timeout_seconds` also bounds the initial `initialize` handshake, so raising it (Solution 1) is what helps a server that needs minutes to load a large solution. While a configured server is still initializing, tool calls for that language return a "server is still initializing - wait and retry" message (loading a large solution may take a few minutes) rather than a hard "no server configured" error.
 
 ### "rust-analyzer indexing takes forever"
 
