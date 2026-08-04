@@ -73,9 +73,12 @@ const RESOURCE_PAGE_SIZE: usize = 100;
 ///
 /// # Errors
 ///
-/// Returns an error if `cursor` is not a valid page-start index. A
-/// well-formed but out-of-range cursor (e.g. documents were closed between
-/// calls) is not an error -- it yields an empty final page.
+/// Returns an error only if `cursor` fails to parse as a `usize`. Any
+/// parseable value is accepted as a page-start index, including one that
+/// isn't page-aligned (not a value this function itself ever returns via
+/// `next_cursor`) or is out of range (e.g. documents were closed between
+/// calls) -- an out-of-range cursor is not an error, it yields an empty
+/// final page.
 fn paginate_resource_paths<'a>(
     paths: &'a [PathBuf],
     cursor: Option<&str>,
@@ -104,10 +107,12 @@ fn paginate_resource_paths<'a>(
     Ok((page, next_cursor))
 }
 
-/// `read_resource`'s diagnostics payload, distinguishing a file the LSP
-/// client has never opened (`tracked: false`) from one that is open but has
-/// no cached diagnostics, whether clean or not yet analyzed (`tracked: true,
-/// diagnostics: []`).
+/// `read_resource`'s diagnostics payload, distinguishing a file mcpls has no
+/// information about (`tracked: false`, always paired with empty
+/// `diagnostics`) from one it does -- whether because the file is currently
+/// open via `DocumentTracker`, or an LSP server has published diagnostics
+/// for it regardless of open state (`tracked: true`; `diagnostics: []` if
+/// clean or not yet analyzed).
 ///
 /// `version` is the document version the diagnostics were computed against
 /// (the client's staleness signal, mirroring `DiagnosticInfo::version`) --
@@ -129,6 +134,22 @@ impl ResourceDiagnosticsResponse {
             diagnostics: entry.map(|e| e.diagnostics.clone()).unwrap_or_default(),
         }
     }
+}
+
+/// Build `read_resource`'s response for a file. `tracked` is true when the
+/// file is currently open via `DocumentTracker` (`document_open`) *or* the
+/// diagnostics cache already holds an entry for it (`entry.is_some()`) --
+/// not `document_open` alone: an LSP server publishes
+/// `textDocument/publishDiagnostics` for whatever it analyzes, including
+/// files mcpls never explicitly opened (e.g. one rust-analyzer pulls in
+/// transitively), so `document_open` alone could report `tracked: false`
+/// while `diagnostics` is still non-empty, contradicting the documented
+/// "untracked implies empty diagnostics" contract.
+fn build_resource_diagnostics_response(
+    document_open: bool,
+    entry: Option<&DiagnosticInfo>,
+) -> ResourceDiagnosticsResponse {
+    ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry)
 }
 
 #[tool_router]
@@ -833,18 +854,16 @@ impl ServerHandler for McplsServer {
         let lsp_uri = crate::bridge::path_to_uri(&validated_path)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // "Tracked" comes from `DocumentTracker` (via `is_document_open`), not from
-        // cache presence: `get_diagnostics` returning `None` is also true for a
-        // tracked-but-clean file or one evicted from the LRU cache, so it alone
-        // can't distinguish "never opened" from "opened, nothing to report".
-        let tracked = self.context.translator.is_document_open(&validated_path);
-        // Build the response from a borrow of the cache entry rather than
-        // `.cloned()`-ing the whole `DiagnosticInfo` first: `new` only ever
-        // needs `version` (Copy) and its own clone of `diagnostics`, so
-        // cloning the entry up front would clone `diagnostics` twice.
+        // Built from a borrow of the cache entry rather than `.cloned()`-ing the
+        // whole `DiagnosticInfo` first: `build_resource_diagnostics_response`
+        // only ever needs `version` (Copy) and its own clone of `diagnostics`,
+        // so cloning the entry up front would clone `diagnostics` twice.
         let response = {
             let cache = self.context.notification_cache.lock().await;
-            ResourceDiagnosticsResponse::new(tracked, cache.get_diagnostics(lsp_uri.as_str()))
+            build_resource_diagnostics_response(
+                self.context.translator.is_document_open(&validated_path),
+                cache.get_diagnostics(lsp_uri.as_str()),
+            )
         };
 
         let json = serde_json::to_string(&response)
@@ -1826,8 +1845,8 @@ mod tests {
         assert_eq!(json["diagnostics"][0]["message"], "boom");
     }
 
-    /// `read_resource` derives `tracked` from `Translator::is_document_open`, not from
-    /// diagnostics-cache presence -- exercise the real accessor it calls.
+    /// A path `read_resource` never opened reports `is_document_open() == false`
+    /// -- one of the two inputs `build_resource_diagnostics_response` ORs together.
     #[tokio::test]
     async fn test_read_resource_untracked_path_is_not_open() {
         let server = create_test_server();
@@ -1836,6 +1855,58 @@ mod tests {
             .translator
             .is_document_open(std::path::Path::new("/never/opened.rs"));
         assert!(!tracked);
+    }
+
+    #[test]
+    fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
+        let response = build_resource_diagnostics_response(false, None);
+        assert!(!response.tracked);
+        assert!(response.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
+        let response = build_resource_diagnostics_response(true, None);
+        assert!(response.tracked);
+        assert!(response.diagnostics.is_empty());
+    }
+
+    /// Regression: an LSP server can publish diagnostics for a file mcpls never
+    /// explicitly opened via `DocumentTracker` (e.g. one rust-analyzer analyzes
+    /// transitively). `tracked` must still be `true` here -- deriving it from
+    /// `document_open` alone would report `tracked: false` while `diagnostics`
+    /// is non-empty, contradicting the documented "untracked implies empty
+    /// diagnostics" contract.
+    #[test]
+    fn test_build_resource_diagnostics_response_cached_but_unopened_is_tracked() {
+        let entry = sample_diagnostic_info(vec![lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            code: None,
+            code_description: None,
+            source: None,
+            message: "transitively analyzed".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        }]);
+
+        let response = build_resource_diagnostics_response(false, Some(&entry));
+        assert!(
+            response.tracked,
+            "a cached diagnostics entry must make the response tracked, \
+             even for a file that was never explicitly opened"
+        );
+        assert_eq!(response.diagnostics.len(), 1);
     }
 
     /// `parse_uri` rejects `file://` scheme — ensures `read_resource` would return an error.
