@@ -456,7 +456,14 @@ async fn enforce_session_cap(
     // streaming SSE/JSON success bodies never carry a 500 status, so this
     // never touches them. 64 KiB is far beyond any realistic error message.
     let Ok(bytes) = axum::body::to_bytes(body, 64 * 1024).await else {
-        return axum::response::Response::from_parts(parts, axum::body::Body::empty());
+        // Buffering the original error body failed (e.g. it exceeded the 64
+        // KiB cap, which should never happen per the comment above, or the
+        // body stream errored). Preserve the 500 status but substitute a
+        // minimal fallback body rather than dropping the error entirely.
+        return axum::response::Response::from_parts(
+            parts,
+            axum::body::Body::from("Internal Server Error"),
+        );
     };
 
     if bytes
