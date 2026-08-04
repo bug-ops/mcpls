@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 2
     outputs:
       run-full-ci: ${{ steps.classify.outputs.run-full-ci }}
+      scripts: ${{ steps.filter.outputs.scripts }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - name: Filter changed paths
@@ -37,6 +38,9 @@ jobs:
             workflows:
               - '.github/workflows/**'
               - '.cargo/**'
+            scripts:
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
       - name: Classify changes
         id: classify
         run: |
@@ -275,6 +279,8 @@ jobs:
 
   shellcheck:
     name: Shellcheck
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
