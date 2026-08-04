@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Sort `[workspace.dependencies]` in root `Cargo.toml` alphabetically (#232)
 - **Shared `DEFAULT_LSP_TIMEOUT` constant** — the 16 handler methods in `bridge::translator` that each duplicated `Duration::from_secs(30)` now share one module-level constant; `get_completions`'s intentionally shorter timeout is now the named `COMPLETIONS_LSP_TIMEOUT` constant. No behavior change. (#231)
 - Regression test pinning RFC 3986 §2.2 percent-encoding of `[`, `]`, `^`, `|`, `{`, `}`, and backtick in the `try_path_to_uri`/`encode_rfc3986_path_chars` `file://` URI conversion; confirms the `url` crate already encodes `{`, `}`, and backtick, so no code change was needed for those three. Scope: covers `file://` URI conversion only — `bridge::resources`'s separate `lsp-diagnostics://` URI construction does not call `encode_rfc3986_path_chars` and is not covered here. (#168)
 - Unit tests for `LspClient::should_retrigger` and its wiring into the `ServerCancelled` (-32802) retry loop: full retry exhaustion returns the original error, `retriggerRequest: false` returns immediately without retrying, and a cancelled-then-successful retry resolves normally. (#161)
