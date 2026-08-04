@@ -205,6 +205,14 @@ impl NotificationCache {
     /// Current per-server diagnostics budget: `MAX_DIAGNOSTIC_ENTRIES`
     /// divided fairly across `diagnostics_route_count` servers, floored at 1
     /// so a large server count can never reduce a server's share to zero.
+    ///
+    /// The floor means the aggregate cache size (`count * per_server_budget`)
+    /// only stays within `MAX_DIAGNOSTIC_ENTRIES` while
+    /// `count <= MAX_DIAGNOSTIC_ENTRIES`; beyond that, every server still
+    /// gets its minimum share of 1 and the aggregate grows with `count`
+    /// instead of staying capped. Registering more than `MAX_DIAGNOSTIC_ENTRIES`
+    /// diagnostics-route servers is not a realistic deployment today, so this
+    /// is documented rather than additionally guarded against.
     fn per_server_budget(&self) -> usize {
         (MAX_DIAGNOSTIC_ENTRIES / self.diagnostics_route_count.max(1)).max(1)
     }
