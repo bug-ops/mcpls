@@ -18,7 +18,8 @@ pub struct Args {
     /// If not specified, searches for mcpls.toml in:
     /// 1. `$MCPLS_CONFIG` environment variable
     /// 2. Current directory (only loaded with `--trust-project-config`)
-    /// 3. ~/.config/mcpls/mcpls.toml
+    /// 3. Platform config dir: ~/.config/mcpls/ (Linux),
+    ///    ~/Library/Application Support/mcpls/ (macOS), %APPDATA%\mcpls\ (Windows)
     #[arg(short, long, value_name = "FILE", env = "MCPLS_CONFIG")]
     pub config: Option<PathBuf>,
 

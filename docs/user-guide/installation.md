@@ -168,7 +168,10 @@ pyright --version
 
 **Configuration:**
 
-Create `~/.config/mcpls/mcpls.toml`:
+Create `mcpls.toml` in your platform's config directory:
+- Linux: `~/.config/mcpls/mcpls.toml`
+- macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+- Windows: `%APPDATA%\mcpls\mcpls.toml`
 
 ```toml
 [[lsp_servers]]
@@ -296,7 +299,10 @@ mcpls searches for configuration files in the following order:
 2. `$MCPLS_CONFIG` environment variable
 3. `./mcpls.toml` (current directory) — requires `--trust-project-config` (see
    [Configuration Reference](configuration.md#trusting-a-project-local-config))
-4. `~/.config/mcpls/mcpls.toml` (user config directory)
+4. Platform user-config directory:
+   - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
+   - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+   - Windows: `%APPDATA%\mcpls\mcpls.toml`
 
 ### Minimal Configuration
 
@@ -417,8 +423,13 @@ cargo uninstall mcpls
 # Remove binary
 sudo rm /usr/local/bin/mcpls
 
-# Remove configuration (optional)
+# Remove configuration (optional) — choose the path for your platform:
+# Linux:
 rm -rf ~/.config/mcpls
+# macOS:
+rm -rf ~/Library/Application\ Support/mcpls
+# Windows (PowerShell):
+Remove-Item "$env:APPDATA\mcpls" -Recurse -Force
 ```
 
 ### Docker

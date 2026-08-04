@@ -358,7 +358,9 @@ impl ServerConfig {
     /// 1. `$MCPLS_CONFIG` environment variable (always trusted)
     /// 2. `./mcpls.toml` (current directory) — **skipped**; see
     ///    [`load_with_trust`](Self::load_with_trust) to opt in
-    /// 3. `~/.config/mcpls/mcpls.toml` (Linux/macOS)
+    /// 3. Platform user-config directory:
+    ///    - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
+    ///    - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
     /// 4. `%APPDATA%\mcpls\mcpls.toml` (Windows)
     ///
     /// If no configuration file exists, creates a default configuration file

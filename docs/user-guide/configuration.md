@@ -10,7 +10,10 @@ mcpls uses TOML format for configuration. The file can be placed in several loca
 2. `$MCPLS_CONFIG` environment variable
 3. `./mcpls.toml` (current directory) — **only loaded with `--trust-project-config`** (or
    `MCPLS_TRUST_PROJECT_CONFIG=true`); see [Trusting a Project-Local Config](#trusting-a-project-local-config)
-4. `~/.config/mcpls/mcpls.toml` (user config directory)
+4. Platform user-config directory:
+   - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
+   - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+   - Windows: `%APPDATA%\mcpls\mcpls.toml`
 
 ### Trusting a Project-Local Config
 

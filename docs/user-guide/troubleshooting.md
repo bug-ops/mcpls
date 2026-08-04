@@ -174,7 +174,10 @@ pyright --version
 typescript-language-server --version
 ```
 
-3. Configure in `~/.config/mcpls/mcpls.toml` if needed (Rust works zero-config)
+3. Configure in your platform's config directory if needed (Rust works zero-config):
+   - Linux: `~/.config/mcpls/mcpls.toml` (or `$XDG_CONFIG_HOME/mcpls/mcpls.toml`)
+   - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+   - Windows: `%APPDATA%\mcpls\mcpls.toml`
 
 ---
 
@@ -186,7 +189,11 @@ typescript-language-server --version
 
 **Solution**:
 
-Create `~/.config/mcpls/mcpls.toml`:
+Create a config file in your platform's config directory:
+- Linux: `~/.config/mcpls/mcpls.toml` (or `$XDG_CONFIG_HOME/mcpls/mcpls.toml`)
+- macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+- Windows: `%APPDATA%\mcpls\mcpls.toml`
+
 ```toml
 [[lsp_servers]]
 language_id = "python"
@@ -371,9 +378,23 @@ mcpls
 ```
 
 **Solution 3**: Place in default location:
+
+On Linux:
 ```bash
 mkdir -p ~/.config/mcpls
 cp mcpls.toml ~/.config/mcpls/
+```
+
+On macOS:
+```bash
+mkdir -p ~/Library/Application\ Support/mcpls
+cp mcpls.toml ~/Library/Application\ Support/mcpls/
+```
+
+On Windows (PowerShell):
+```powershell
+New-Item -Type Directory -Path "$env:APPDATA\mcpls" -Force
+Copy-Item mcpls.toml "$env:APPDATA\mcpls\"
 ```
 
 **Solution 4**: If `mcpls.toml` is in the current directory, it is ignored by
@@ -619,9 +640,14 @@ rustc --version
 uname -a  # OS info
 ```
 
-3. **Verify configuration**:
+3. **Verify configuration** (replace path with your platform's config directory):
 ```bash
+# Linux:
 cat ~/.config/mcpls/mcpls.toml
+# macOS:
+cat ~/Library/Application\ Support/mcpls/mcpls.toml
+# Windows (PowerShell):
+Get-Content "$env:APPDATA\mcpls\mcpls.toml"
 ```
 
 4. **Test minimal example**:
@@ -665,7 +691,7 @@ rust-analyzer --version  # or other LSP server
 rustc --version
 uname -a
 
-# Configuration
+# Configuration (adjust path for your platform: macOS uses ~/Library/Application\ Support/mcpls/mcpls.toml)
 cat ~/.config/mcpls/mcpls.toml
 
 # Debug logs (run command that fails)
@@ -725,7 +751,7 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | mcpls
 Watch configuration file:
 ```bash
 # macOS
-fswatch ~/.config/mcpls/mcpls.toml | xargs -n1 echo "Config changed:"
+fswatch ~/Library/Application\ Support/mcpls/mcpls.toml | xargs -n1 echo "Config changed:"
 
 # Linux
 inotifywait -m ~/.config/mcpls/mcpls.toml
@@ -769,6 +795,7 @@ mcpls --version
 
 ### Reset configuration
 
+On Linux:
 ```bash
 # Backup existing config
 cp ~/.config/mcpls/mcpls.toml ~/.config/mcpls/mcpls.toml.backup
@@ -781,6 +808,36 @@ command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
 EOF
+```
+
+On macOS:
+```bash
+# Backup existing config
+cp ~/Library/Application\ Support/mcpls/mcpls.toml ~/Library/Application\ Support/mcpls/mcpls.toml.backup
+
+# Start with minimal config
+cat > ~/Library/Application\ Support/mcpls/mcpls.toml <<EOF
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+EOF
+```
+
+On Windows (PowerShell):
+```powershell
+# Backup existing config
+Copy-Item "$env:APPDATA\mcpls\mcpls.toml" "$env:APPDATA\mcpls\mcpls.toml.backup"
+
+# Start with minimal config
+@"
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+"@ | Out-File "$env:APPDATA\mcpls\mcpls.toml" -Encoding UTF8
 ```
 
 ### Check logs

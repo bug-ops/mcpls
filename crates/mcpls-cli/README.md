@@ -38,8 +38,8 @@ mcpls --listen 127.0.0.1:3000             # HTTP transport (transport-http featu
 > (or set `MCPLS_TRUST_PROJECT_CONFIG=true`) only for repositories you trust.
 
 Create or edit `mcpls.toml` in the appropriate location:
-- **Linux/macOS:** `~/.config/mcpls/mcpls.toml`
-- **macOS (alternative):** `~/Library/Application Support/mcpls/mcpls.toml`
+- **Linux:** `~/.config/mcpls/mcpls.toml` (or `$XDG_CONFIG_HOME/mcpls/mcpls.toml`)
+- **macOS:** `~/Library/Application Support/mcpls/mcpls.toml`
 - **Windows:** `%APPDATA%\mcpls\mcpls.toml`
 
 See the main [README](../../README.md) for configuration examples and custom extension mapping.

@@ -224,8 +224,8 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 
 | Platform | Default Location |
 |----------|-----------------|
-| Linux | `~/.config/mcpls/mcpls.toml` |
-| macOS | `~/.config/mcpls/mcpls.toml` or `~/Library/Application Support/mcpls/` |
+| Linux | `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml` |
+| macOS | `~/Library/Application Support/mcpls/mcpls.toml` |
 | Windows | `%APPDATA%\mcpls\mcpls.toml` |
 
 > [!WARNING]

@@ -164,8 +164,7 @@ mcpls resolves configuration in this order; the first match wins:
 | Windows | `%APPDATA%\mcpls\mcpls.toml` |
 
 `~/.config/mcpls/mcpls.toml` is **not** read on macOS — only
-`~/Library/Application Support/mcpls/mcpls.toml` is. This differs from what some of
-this repository's own docs currently say; see [Troubleshooting](#troubleshooting) below.
+`~/Library/Application Support/mcpls/mcpls.toml` is.
 
 **First run writes a default config.** If auto-detection (tiers 2–4 above) finds no
 existing file, mcpls writes one to the platform path in the table, populated with all
@@ -247,10 +246,6 @@ For symptom-driven debugging, see
 - ["LSP server not available for file type"](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#lsp-server-issues) — no `[[lsp_servers]]` entry matches the file's extension.
 - ["Configuration file not found" / unexpected config used](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#configuration-issues) — check the [search order and paths](#search-order-and-paths) above first.
 - [High memory or CPU usage](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#performance-issues) — usually an over-broad `workspace.roots` or too many configured servers.
-
-The linked troubleshooting doc's copy-paste commands assume the Linux config path
-(`~/.config/mcpls/`); on macOS substitute `~/Library/Application Support/mcpls/` per
-the [path table](#search-order-and-paths) above.
 
 ## Further reference
 

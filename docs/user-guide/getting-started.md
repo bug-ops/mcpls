@@ -92,11 +92,14 @@ mcpls searches for configuration in:
 2. `$MCPLS_CONFIG` environment variable
 3. `./mcpls.toml` (current directory) — requires `--trust-project-config` (see
    [Configuration Reference](configuration.md#trusting-a-project-local-config))
-4. `~/.config/mcpls/mcpls.toml`
+4. Platform user-config directory:
+   - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
+   - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+   - Windows: `%APPDATA%\mcpls\mcpls.toml`
 
 ### Example Configuration
 
-Create `~/.config/mcpls/mcpls.toml`:
+Create a configuration file in your platform's config directory (e.g., `~/.config/mcpls/mcpls.toml` on Linux or `~/Library/Application Support/mcpls/mcpls.toml` on macOS):
 
 ```toml
 [workspace]
