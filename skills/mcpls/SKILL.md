@@ -81,8 +81,9 @@ mcpls --version
 
 ## CLI Reference
 
-All flags accept an equivalent `MCPLS_*` environment variable; the flag takes
-precedence when both are set.
+Each mcpls-specific option below accepts an equivalent `MCPLS_*` environment
+variable; the flag takes precedence when both are set. `--version`/`--help` have
+no environment variable equivalent.
 
 | Flag | Short | Env var | Default | Notes |
 |---|---|---|---|---|
