@@ -273,6 +273,17 @@ jobs:
       - name: Doc-tests
         run: cargo test --doc --workspace --all-features
 
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Shellcheck install script
+        run: shellcheck --shell=sh scripts/install.sh
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -317,7 +328,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, security, coverage]
+    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, security, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -333,6 +344,7 @@ jobs:
             "${{ needs.test-e2e.result }}"
             "${{ needs.msrv.result }}"
             "${{ needs.docs.result }}"
+            "${{ needs.shellcheck.result }}"
             "${{ needs.security.result }}"
             "${{ needs.coverage.result }}"
           )

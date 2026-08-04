@@ -28,22 +28,41 @@ AI coding assistants are remarkably capable, but they're working blind. They see
 
 ## Installation
 
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.ps1 | iex
+```
+
+Both scripts detect your OS/architecture, download the matching release archive, verify its SHA256 checksum, and install `mcpls` to `~/.local/bin` (no `sudo` required).
+
+<details>
+<summary><strong>Cargo, pre-built binaries & other methods</strong></summary>
+
+**Cargo:**
+
 ```bash
 cargo install mcpls
 ```
 
-<details>
-<summary><strong>Pre-built binaries & other methods</strong></summary>
+**Manual download:**
 
-Download from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest):
+Download the archive matching your platform from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest). Each archive has a corresponding `.sha256` checksum file published alongside it — the install scripts above verify this automatically; verify manually if downloading by hand.
 
-| Platform | Architecture | Download |
-|----------|--------------|----------|
-| Linux | x86_64 | [mcpls-linux-x86_64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
-| Linux | x86_64 (static) | [mcpls-linux-x86_64-musl.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
-| macOS | Intel | [mcpls-macos-x86_64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
-| macOS | Apple Silicon | [mcpls-macos-aarch64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
-| Windows | x86_64 | [mcpls-windows-x86_64.zip](https://github.com/bug-ops/mcpls/releases/latest) |
+| Platform | Architecture | Archive |
+|----------|--------------|---------|
+| Linux | x86_64 | `mcpls-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux | aarch64 | `mcpls-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS | Intel | `mcpls-x86_64-apple-darwin.tar.gz` |
+| macOS | Apple Silicon | `mcpls-aarch64-apple-darwin.tar.gz` |
+| Windows | x86_64 | `mcpls-x86_64-pc-windows-msvc.zip` |
+| Windows | ARM64 | `mcpls-aarch64-pc-windows-msvc.zip` |
 
 **From source:**
 
