@@ -122,6 +122,11 @@ const RESPAWN_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Upper bound on the exponential backoff delay between respawn attempts.
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Upper bound on how long [`Translator::shutdown_servers`] waits for a
+/// single LSP server's graceful `shutdown`/`exit` handshake before giving up
+/// and letting `kill_on_drop` terminate it instead.
+const SERVER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Translator {
     /// Create a new translator.
     ///
@@ -248,6 +253,18 @@ impl Translator {
         lock_std(&self.server_configs).insert(id.into(), config);
     }
 
+    /// Number of currently registered LSP servers.
+    ///
+    /// Test-only: `lsp_servers` is private, so this is the one way a test
+    /// outside this module (e.g. `crate::tests`, exercising
+    /// [`Translator::shutdown_servers`] indirectly through `serve_with`'s
+    /// shutdown sequence) can observe that a registered server was actually
+    /// drained.
+    #[cfg(test)]
+    pub(crate) fn registered_server_count(&self) -> usize {
+        lock_std(&self.lsp_servers).len()
+    }
+
     /// Snapshot of currently open document paths, used for MCP resource listing.
     #[must_use]
     pub fn open_document_paths(&self) -> Vec<PathBuf> {
@@ -260,10 +277,59 @@ impl Translator {
         self.document_tracker.is_open(path)
     }
 
-    // TODO: These methods will be implemented in Phase 3-5
-    // Initialize and shutdown are now handled by LspServer in lifecycle.rs
+    /// Gracefully shut down every registered LSP server.
+    ///
+    /// Drains the registered LSP servers and, for each one concurrently,
+    /// sends the LSP `shutdown` request and `exit` notification via
+    /// [`LspServer::shutdown`], bounded by a fixed per-server timeout. A
+    /// server that errors or fails to respond in time is simply dropped
+    /// instead: its child process handle is `kill_on_drop(true)`, so the
+    /// process is killed rather than left running. Call this once, from the
+    /// top-level shutdown path, after the MCP transport has stopped
+    /// accepting new requests.
+    ///
+    /// # Limitations
+    ///
+    /// This only runs on the normal shutdown path (stdio EOF, `SIGTERM`/
+    /// `SIGINT`, or the HTTP transport's own graceful shutdown). This crate's
+    /// workspace `[profile.release]` builds with `panic = "abort"`, so a
+    /// panic reachable from a request handler or background pump task in a
+    /// release build still terminates the process without unwinding — this
+    /// method never runs, and spawned LSP children are orphaned exactly as
+    /// before this fix. Making that path safe would need process-group
+    /// isolation (`kill_on_drop` alone doesn't help, since no `Drop` runs
+    /// either); tracked separately, out of scope here.
+    ///
+    /// `pub(crate)` rather than `pub`: this is meant for exactly one call
+    /// site (`serve_with`'s post-transport shutdown sequence), after the MCP
+    /// transport is already down. An external caller invoking it mid-session
+    /// would drain `lsp_servers` while `lsp_clients` (routing table) still
+    /// points at the now-shut-down servers, so in-flight tool calls would
+    /// resolve to a client whose server is gone.
+    pub(crate) async fn shutdown_servers(&self) {
+        let servers: Vec<(ServerId, LspServer)> = lock_std(&self.lsp_servers).drain().collect();
+        if servers.is_empty() {
+            return;
+        }
 
-    // Future implementation will use LspServer instead of LspClient directly
+        let mut tasks = tokio::task::JoinSet::new();
+        for (id, server) in servers {
+            tasks.spawn(async move {
+                match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, server.shutdown()).await {
+                    Ok(Ok(())) => tracing::debug!(%id, "LSP server shut down gracefully"),
+                    Ok(Err(e)) => tracing::warn!(
+                        %id, error = %e,
+                        "LSP server shutdown handshake failed, killing process instead"
+                    ),
+                    Err(_) => tracing::warn!(
+                        %id, timeout = ?SERVER_SHUTDOWN_TIMEOUT,
+                        "LSP server did not shut down in time, killing process instead"
+                    ),
+                }
+            });
+        }
+        tasks.join_all().await;
+    }
 }
 
 impl Default for Translator {
@@ -2987,6 +3053,52 @@ mod tests {
         // and a real LSP server process. The actual registration functionality is
         // tested in integration tests (see rust_analyzer_tests.rs).
         // This test verifies the data structure is properly initialized.
+    }
+
+    /// #241: `shutdown_servers` on an empty registry must return immediately
+    /// rather than blocking (e.g. on a `JoinSet` that's never populated).
+    #[tokio::test]
+    async fn test_shutdown_servers_empty_registry_returns_promptly() {
+        let translator = Translator::new();
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), translator.shutdown_servers()).await;
+
+        assert!(
+            result.is_ok(),
+            "shutdown_servers must return promptly when no servers are registered"
+        );
+    }
+
+    /// #241: `shutdown_servers` must drain every registered `LspServer` —
+    /// this is the core behavior the issue is about (orphaned LSP children
+    /// on shutdown). Uses `fake_lsp_server()` (mock `echo`/`cat` child
+    /// processes, real `LspServer`, see `lsp::lifecycle`), which won't
+    /// answer the LSP `shutdown` handshake — proving the drain completes,
+    /// via the timeout/error fallback path, without hanging on
+    /// non-responsive servers.
+    #[tokio::test]
+    async fn test_shutdown_servers_drains_registered_servers() {
+        let translator = Translator::new();
+        translator.register_server("server-a", crate::lsp::fake_lsp_server());
+        translator.register_server("server-b", crate::lsp::fake_lsp_server());
+        assert_eq!(lock_std(&translator.lsp_servers).len(), 2);
+
+        // Bounded well above `SERVER_SHUTDOWN_TIMEOUT` (10s) so a genuine
+        // regression (a hang) still fails the test instead of the harness
+        // itself timing out ambiguously.
+        let result =
+            tokio::time::timeout(Duration::from_secs(20), translator.shutdown_servers()).await;
+
+        assert!(
+            result.is_ok(),
+            "shutdown_servers must not hang against non-responsive mock servers"
+        );
+        assert_eq!(
+            lock_std(&translator.lsp_servers).len(),
+            0,
+            "all registered servers must be drained"
+        );
     }
 
     #[test]

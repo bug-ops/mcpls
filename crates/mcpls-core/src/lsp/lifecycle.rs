@@ -18,7 +18,7 @@ use lsp_types::{
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, ServerId};
@@ -40,6 +40,11 @@ use crate::lsp::types::LspNotification;
 /// today. See [`LspServerConfig::env`] for the config-level override/addition
 /// mechanism this list feeds into.
 const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"];
+
+/// Upper bound [`LspServer::shutdown`] waits for the child process to exit on
+/// its own after sending the LSP `exit` notification, before falling back to
+/// `kill_on_drop`.
+const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Windows-only additions to [`ENV_PASSTHROUGH`].
 ///
@@ -217,8 +222,10 @@ pub struct LspServer {
     /// notifications (e.g., `textDocument/publishDiagnostics`, `$/progress`).
     pub notification_rx: mpsc::Receiver<LspNotification>,
     /// Child process handle. Kept alive for process lifetime management and
-    /// queried by [`Self::has_exited`] to detect a crash. When dropped, the
-    /// process is terminated via SIGKILL (`kill_on_drop`).
+    /// queried by [`Self::has_exited`] to detect a crash. [`LspServer::shutdown`]
+    /// waits for it to exit after sending `exit`; otherwise, or if that wait
+    /// times out, dropping it terminates the process via SIGKILL
+    /// (`kill_on_drop`).
     child: tokio::process::Child,
 }
 
@@ -522,23 +529,50 @@ impl LspServer {
 
     /// Shutdown server gracefully.
     ///
-    /// Sends shutdown request, waits for response, then sends exit notification.
+    /// Sends the LSP `shutdown` request, waits for the response, sends the
+    /// `exit` notification, then waits up to a fixed grace period for the
+    /// child process to exit on its own. If it hasn't by then, or if the
+    /// `shutdown`/`exit` handshake itself fails, the child is simply dropped
+    /// here — `kill_on_drop` terminates it via SIGKILL (a no-op if it has
+    /// already exited).
     ///
     /// # Errors
     ///
-    /// Returns an error if shutdown sequence fails.
+    /// Returns an error if the `shutdown`/`exit` handshake fails. The child
+    /// process is still torn down (gracefully if it exits in time, killed
+    /// otherwise) regardless of whether this returns `Ok` or `Err`.
     pub async fn shutdown(self) -> Result<()> {
         debug!("Shutting down LSP server");
 
-        let _: serde_json::Value = self
-            .client
-            .request("shutdown", serde_json::Value::Null, Duration::from_secs(5))
-            .await?;
+        let handshake: Result<()> = async move {
+            let _: serde_json::Value = self
+                .client
+                .request("shutdown", serde_json::Value::Null, Duration::from_secs(5))
+                .await?;
+            self.client.notify("exit", serde_json::Value::Null).await?;
+            self.client.shutdown().await
+        }
+        .await;
 
-        self.client.notify("exit", serde_json::Value::Null).await?;
+        let mut child = self.child;
+        match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
+            Ok(Ok(status)) => {
+                debug!(
+                    ?status,
+                    "LSP server process exited after `exit` notification"
+                );
+            }
+            Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
+            Err(_) => warn!(
+                timeout = ?CHILD_EXIT_GRACE,
+                "LSP server process did not exit within grace period after `exit` \
+                 notification, killing it"
+            ),
+        }
+        // `child` drops here: `kill_on_drop` kills it if still running, and is a
+        // no-op if `wait()` above already reaped it.
 
-        self.client.shutdown().await?;
-
+        handshake?;
         info!("LSP server shut down successfully");
         Ok(())
     }
@@ -646,6 +680,49 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
             .unwrap_or("workspace")
             .to_string(),
     })
+}
+
+/// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so it
+/// can be registered without a real language server.
+///
+/// `pub(crate)` rather than private to this module's own `tests`: it
+/// constructs `LspServer` via a struct literal, which only code inside this
+/// module can do (all its fields are private), so this is the one place
+/// other modules' shutdown-path tests (`bridge::translator`, `lib.rs`) can
+/// get a real, registerable `LspServer` from.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub fn fake_lsp_server() -> LspServer {
+    let mock_child = tokio::process::Command::new("echo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mock_stdin = tokio::process::Command::new("cat")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .stdin
+        .take()
+        .unwrap();
+    let mock_stdout = tokio::process::Command::new("echo")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .stdout
+        .take()
+        .unwrap();
+    let transport = LspTransport::new(mock_stdin, mock_stdout);
+    let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
+    let (_, mock_notification_rx) = mpsc::channel(1);
+    LspServer {
+        client,
+        capabilities: lsp_types::ServerCapabilities::default(),
+        position_encoding: PositionEncodingKind::UTF8,
+        notification_rx: mock_notification_rx,
+        child: mock_child,
+    }
 }
 
 #[cfg(test)]
@@ -1513,43 +1590,6 @@ mod tests {
         assert_eq!(result.failure_count(), 2);
         assert_eq!(result.failures[0].language_id, "test1");
         assert_eq!(result.failures[1].language_id, "test2");
-    }
-
-    /// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so
-    /// it can be registered without a real language server. Mirrors the
-    /// pattern already used by this module's other `LspServer`-literal
-    /// tests (e.g. `test_server_init_result_partial_success`).
-    fn fake_lsp_server() -> LspServer {
-        let mock_child = tokio::process::Command::new("echo")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mock_stdin = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-        let mock_stdout = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-        let transport = LspTransport::new(mock_stdin, mock_stdout);
-        let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
-        let (_, mock_notification_rx) = mpsc::channel(1);
-        LspServer {
-            client,
-            capabilities: lsp_types::ServerCapabilities::default(),
-            position_encoding: PositionEncodingKind::UTF8,
-            notification_rx: mock_notification_rx,
-            child: mock_child,
-        }
     }
 
     /// Minimal [`LspServerConfig`] for `build_command` tests, where only

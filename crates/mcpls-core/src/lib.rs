@@ -572,11 +572,26 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Transport::Http(cfg) => run_http(mcp_server, cfg).await,
     };
 
-    // Signal background pump tasks to exit.
-    let _ = cancel_tx.send(true);
+    shutdown(&cancel_tx, &translator).await;
 
     info!("MCPLS server shutting down");
     result
+}
+
+/// Post-transport shutdown sequence, run once the transport future
+/// (`run_stdio`/`run_http`) returns — whether that's because of a
+/// `SIGTERM`/`SIGINT`, stdio EOF, or (for HTTP) its own graceful shutdown.
+///
+/// Signals background pump tasks to exit, then gracefully shuts down every
+/// LSP server registered on `translator` (see
+/// [`Translator::shutdown_servers`] for what "gracefully" bounds and falls
+/// back to). Extracted from [`serve_with`] so this sequence is exercised
+/// directly in tests without needing a full stdio/HTTP transport round trip.
+async fn shutdown(cancel_tx: &tokio::sync::watch::Sender<bool>, translator: &Translator) {
+    let _ = cancel_tx.send(true);
+
+    info!("Shutting down LSP servers...");
+    translator.shutdown_servers().await;
 }
 
 /// Spawn the applicable LSP servers in a background task and register them into
@@ -1113,6 +1128,43 @@ mod tests {
                     "serve() must not return NoServersAvailable for empty lsp_servers config"
                 );
             }
+        }
+
+        /// #241: `serve_with`'s post-transport shutdown sequence must drain
+        /// registered LSP servers rather than orphaning them. Exercises
+        /// `shutdown()` directly (the exact code `serve_with` runs after its
+        /// transport future returns) against a `Translator` with a real,
+        /// registered `LspServer` — `serve_with` itself can't be driven
+        /// through this path in a portable unit test, since it only
+        /// registers a server after a successful LSP `initialize` handshake,
+        /// which requires a real language server binary.
+        #[tokio::test]
+        async fn test_shutdown_drains_registered_lsp_server() {
+            let translator = Translator::new();
+            translator.register_server("fake-server", crate::lsp::fake_lsp_server());
+            assert_eq!(translator.registered_server_count(), 1);
+
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                super::super::shutdown(&cancel_tx, &translator),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "shutdown must not hang against a non-responsive mock LSP server"
+            );
+            assert_eq!(
+                translator.registered_server_count(),
+                0,
+                "shutdown must drain every registered LSP server"
+            );
+            assert!(
+                *cancel_rx.borrow(),
+                "shutdown must signal background pump tasks to exit"
+            );
         }
     }
 

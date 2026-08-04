@@ -145,11 +145,47 @@ use rmcp::transport::streamable_http_server::session::{
     ServerSseMessage, SessionId, SessionManager,
 };
 
+/// Waits for a shutdown signal: `SIGTERM` on Unix (as sent by containers and
+/// systemd) or `Ctrl-C` (`SIGINT`) on any platform.
+///
+/// Shared between [`run_stdio`] and [`run_http`] so both transports react to
+/// the same signals the same way.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "SIGTERM handler registration failed ({e}), falling back to SIGINT only"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Run the MCP server over stdio.
 ///
 /// Serves the given `mcp_server` using stdin/stdout and populates `peer_cell`
 /// once the transport is established so that diagnostic pump tasks can begin
-/// forwarding `resources/updated` notifications.
+/// forwarding `resources/updated` notifications. Returns as soon as either
+/// the stdio transport closes (client disconnect / stdin EOF) or a `SIGTERM`/
+/// `SIGINT` is received, so callers can run orderly cleanup — such as
+/// [`crate::bridge::Translator::shutdown_servers`] — before the process
+/// exits. On signal, the in-flight `RunningService` is dropped rather than
+/// awaited to completion; `rmcp` closes it asynchronously in that case,
+/// which is acceptable here since the process exits shortly after.
 pub(crate) async fn run_stdio(
     mcp_server: crate::mcp::McplsServer,
     peer_cell: &tokio::sync::OnceCell<rmcp::Peer<rmcp::RoleServer>>,
@@ -163,11 +199,15 @@ pub(crate) async fn run_stdio(
         tracing::debug!("Peer cell already set ({}), ignoring", e);
     }
 
-    service
-        .waiting()
-        .await
-        .map(|_| ())
-        .map_err(|e| crate::Error::McpServer(format!("MCP server error: {e}")))
+    tokio::select! {
+        result = service.waiting() => result
+            .map(|_| ())
+            .map_err(|e| crate::Error::McpServer(format!("MCP server error: {e}"))),
+        () = wait_for_shutdown_signal() => {
+            tracing::info!("shutdown signal received, stopping stdio transport");
+            Ok(())
+        }
+    }
 }
 
 /// Run the MCP server over Streamable HTTP (MCP spec 2025-11-25).
@@ -193,6 +233,14 @@ pub(crate) async fn run_stdio(
 /// sessions are active, a request that would start a new one is rejected with
 /// `429 Too Many Requests` — enforced as a hard bound at session creation by
 /// [`CappedSessionManager`] and surfaced over HTTP by [`enforce_session_cap`].
+///
+/// # Shutdown
+///
+/// On `SIGTERM`/`SIGINT`, in-flight connections get up to
+/// [`HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`] to finish before this function returns
+/// regardless — bounding shutdown this way lets the caller run its own
+/// post-shutdown cleanup (e.g. closing registered LSP servers) even if a
+/// connection never observes the cancellation (a stuck SSE stream, say).
 #[cfg(feature = "transport-http")]
 // `session_manager` and `service` are moved into `app`, which is served until
 // shutdown — clippy's drop-tightening heuristic misreads that as an
@@ -245,39 +293,45 @@ pub(crate) async fn run_http(
         );
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            // On Unix, containers (Docker/systemd) send SIGTERM; handle both
-            // SIGTERM and SIGINT (Ctrl-C) so shutdown is clean in all environments.
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{SignalKind, signal};
-                let mut sigterm = signal(SignalKind::terminate())
-                    .map_err(|e| crate::Error::McpServer(format!("SIGTERM handler: {e}")));
-                match sigterm {
-                    Ok(ref mut s) => {
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {},
-                            _ = s.recv() => {},
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "SIGTERM handler registration failed ({e}), falling back to SIGINT only"
-                        );
-                        let _ = tokio::signal::ctrl_c().await;
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-            cancel.cancel();
-        })
-        .await
-        .map_err(|e| crate::Error::McpServer(format!("http serve: {e}")))
+    // `cancel` is cancelled exactly once, when the shutdown signal fires
+    // (below). Cloned first so the force-timeout branch can observe that
+    // same moment independently of the `with_graceful_shutdown` closure,
+    // which consumes its own clone.
+    let cancel_for_force_timeout = cancel.clone();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        wait_for_shutdown_signal().await;
+        cancel.cancel();
+    });
+
+    // The force-timeout only starts counting once `cancel` is actually
+    // cancelled — i.e. once a shutdown signal has been received — not from
+    // server startup. Without that ordering, `tokio::time::timeout` wrapping
+    // `serve` directly would tear down the listener after
+    // `HTTP_GRACEFUL_SHUTDOWN_TIMEOUT` of ordinary uptime, signal or not.
+    // This bounds only the "drain in-flight connections after shutdown was
+    // requested" phase, so a connection that never observes `cancel` (e.g. a
+    // stuck SSE stream) can't hang the caller's post-shutdown cleanup
+    // (draining/closing LSP servers) indefinitely.
+    tokio::select! {
+        result = serve => result.map_err(|e| crate::Error::McpServer(format!("http serve: {e}"))),
+        () = async move {
+            cancel_for_force_timeout.cancelled().await;
+            tokio::time::sleep(HTTP_GRACEFUL_SHUTDOWN_TIMEOUT).await;
+        } => {
+            tracing::warn!(
+                timeout = ?HTTP_GRACEFUL_SHUTDOWN_TIMEOUT,
+                "HTTP graceful shutdown did not complete in time, proceeding with shutdown anyway"
+            );
+            Ok(())
+        }
+    }
 }
+
+/// Upper bound [`run_http`] waits, once shutdown has been signaled, for
+/// `axum`'s graceful shutdown to finish draining in-flight connections
+/// before giving up and returning anyway.
+#[cfg(feature = "transport-http")]
+const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Wraps [`LocalSessionManager`], bounding concurrent HTTP sessions to a
 /// fixed capacity.
@@ -494,6 +548,57 @@ mod tests {
         assert!(matches!(t, super::Transport::Stdio));
     }
 
+    /// #241: `run_stdio` must not hang when the transport never even
+    /// establishes — it must surface the failure promptly.
+    ///
+    /// This is the closest portable coverage of `run_stdio`'s non-signal
+    /// path achievable here: `run_stdio` is hardcoded to the process's real
+    /// stdin/stdout (no injectable transport), and this crate is
+    /// `deny(unsafe_code)`, so a test can't redirect the fd to simulate "the
+    /// MCP handshake completes, *then* stdin closes" — the specific
+    /// scenario that would drive `service.waiting()` to resolve inside the
+    /// `tokio::select!` and hit its `Ok(())` arm. What a test *can* rely on:
+    /// under `cargo nextest`, each test's stdin is already closed before the
+    /// test body runs, so `mcp_server.serve(...)` fails during the initial
+    /// `initialize` handshake — before `run_stdio` ever reaches the
+    /// `select!`. That still exercises real production code (the `.serve()`
+    /// call and its error mapping) and proves `run_stdio` returns promptly
+    /// rather than hanging, which is what a broken `select!` (e.g. one
+    /// missing a branch, or awaiting the wrong future) would look like.
+    #[tokio::test]
+    async fn test_run_stdio_returns_promptly_when_stdin_is_already_closed() {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+
+        use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+        use crate::mcp::McplsServer;
+
+        let translator = Arc::new(Translator::new());
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let subs = Arc::new(ResourceSubscriptions::new());
+        let server = McplsServer::new(translator, notification_cache, workspace_roots, subs);
+        let peer_cell = tokio::sync::OnceCell::new();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::run_stdio(server, &peer_cell),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "run_stdio must not hang when stdin is already closed"
+        );
+        let result = outcome.unwrap();
+        assert!(
+            matches!(result, Err(crate::Error::McpServer(_))),
+            "expected a McpServer error from the failed handshake, got: {result:?}"
+        );
+    }
+
     #[cfg(feature = "transport-http")]
     mod http_tests {
         use std::net::SocketAddr;
@@ -591,6 +696,57 @@ mod tests {
             assert!(
                 connected.is_ok(),
                 "HTTP listener should accept TCP connections"
+            );
+
+            server_task.abort();
+        }
+
+        /// #241 C1 regression: `run_http` must not self-terminate after
+        /// `HTTP_GRACEFUL_SHUTDOWN_TIMEOUT` of ordinary uptime when no
+        /// shutdown signal has been sent — the graceful-shutdown timeout
+        /// must only start counting once a signal actually arrives, not
+        /// from server startup.
+        ///
+        /// Uses `#[tokio::test(start_paused = true)]` plus
+        /// `tokio::time::advance` to fast-forward virtual time past the
+        /// timeout instead of sleeping the real 30s. Under the bug this
+        /// regresses against — `tokio::time::timeout(HTTP_GRACEFUL_SHUTDOWN_TIMEOUT,
+        /// serve)` wrapping the whole `serve` future from construction —
+        /// advancing virtual time past the timeout resolves that timer and
+        /// finishes the task immediately, even with no signal sent. Under
+        /// the fix, nothing inside `run_http` starts a timer until `cancel`
+        /// is cancelled, so this advance must have no effect and the task
+        /// must still be running.
+        #[tokio::test(start_paused = true)]
+        async fn test_run_http_does_not_self_terminate_without_signal() {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+
+            let cfg = HttpConfig::new(addr, "/mcp");
+            let server_task = tokio::spawn(super::super::run_http(test_server(), cfg));
+
+            // Let the spawned task make initial progress (bind the
+            // listener, enter its `select!`) without depending on any real
+            // or virtual delay.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+
+            // Fast-forward well past `HTTP_GRACEFUL_SHUTDOWN_TIMEOUT` with
+            // no shutdown signal ever sent.
+            tokio::time::advance(
+                super::super::HTTP_GRACEFUL_SHUTDOWN_TIMEOUT + std::time::Duration::from_secs(5),
+            )
+            .await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+
+            assert!(
+                !server_task.is_finished(),
+                "run_http must still be serving after HTTP_GRACEFUL_SHUTDOWN_TIMEOUT of uptime \
+                 with no shutdown signal sent"
             );
 
             server_task.abort();
