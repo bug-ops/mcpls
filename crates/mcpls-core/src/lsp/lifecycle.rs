@@ -685,11 +685,13 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 /// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so it
 /// can be registered without a real language server.
 ///
-/// `pub(crate)` rather than private to this module's own `tests`: it
-/// constructs `LspServer` via a struct literal, which only code inside this
-/// module can do (all its fields are private), so this is the one place
-/// other modules' shutdown-path tests (`bridge::translator`, `lib.rs`) can
-/// get a real, registerable `LspServer` from.
+/// `pub` rather than private to this module's own `tests` (`lifecycle` is a
+/// private module, so this stays crate-scoped in practice, per the
+/// `redundant_pub_crate` clippy lint): it constructs `LspServer` via a
+/// struct literal, which only code inside this module can do (all its
+/// fields are private), so this is the one place other modules'
+/// shutdown-path tests (`bridge::translator`, `lib.rs`) can get a real,
+/// registerable `LspServer` from.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub fn fake_lsp_server() -> LspServer {
