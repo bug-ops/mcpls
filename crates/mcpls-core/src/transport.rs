@@ -579,7 +579,7 @@ mod tests {
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subs = Arc::new(ResourceSubscriptions::new());
-        let server = McplsServer::new(translator, notification_cache, workspace_roots, subs);
+        let server = McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
         let peer_cell = tokio::sync::OnceCell::new();
 
         let outcome = tokio::time::timeout(
