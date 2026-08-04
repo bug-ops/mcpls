@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
-pub use server::{DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, ServerHeuristics};
+pub use server::{
+    DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, ServerHeuristics,
+};
 
 use crate::error::{Error, Result};
 
@@ -506,7 +508,29 @@ impl ServerConfig {
     /// `serve_with` — see that function's module docs for why the split
     /// exists (two servers for one language with mutually exclusive
     /// `heuristics` is a legitimate config that must still load here).
-    fn validate(&self) -> Result<()> {
+    ///
+    /// [`Self::load_from`] always calls this. It is also `pub` so that a
+    /// caller building a `ServerConfig` programmatically (not via TOML), e.g.
+    /// for [`crate::serve`], can opt into the same diagnosable-error checks
+    /// rather than only discovering a bad value indirectly (for example, an
+    /// out-of-range `timeout_seconds`/`request_timeout_seconds` is otherwise
+    /// silently clamped rather than rejected — see
+    /// [`crate::lsp::LspClient::request_timeout`]). `serve`/`serve_with` do
+    /// not call this automatically for a caller-supplied config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] on the first rule violated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::config::ServerConfig;
+    ///
+    /// let config = ServerConfig::default();
+    /// assert!(config.validate().is_ok());
+    /// ```
+    pub fn validate(&self) -> Result<()> {
         let mut seen_names: HashMap<&str, &str> = HashMap::new();
         for server in &self.lsp_servers {
             if server.language_id.is_empty() {
@@ -526,10 +550,23 @@ impl ServerConfig {
                     server.language_id
                 )));
             }
+            if server.timeout_seconds > MAX_TIMEOUT_SECONDS {
+                return Err(Error::InvalidConfig(format!(
+                    "timeout_seconds ({}) exceeds the maximum of {} seconds for language '{}'",
+                    server.timeout_seconds, MAX_TIMEOUT_SECONDS, server.language_id
+                )));
+            }
             if server.request_timeout_seconds == 0 {
                 return Err(Error::InvalidConfig(format!(
                     "request_timeout_seconds cannot be 0 for language '{}'",
                     server.language_id
+                )));
+            }
+            if server.request_timeout_seconds > MAX_TIMEOUT_SECONDS {
+                return Err(Error::InvalidConfig(format!(
+                    "request_timeout_seconds ({}) exceeds the maximum of {} seconds for \
+                     language '{}'",
+                    server.request_timeout_seconds, MAX_TIMEOUT_SECONDS, server.language_id
                 )));
             }
             if let Some(name) = &server.name {
@@ -719,6 +756,98 @@ mod tests {
         } else {
             panic!("Expected InvalidConfig error, got {result:?}");
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_request_timeout_seconds_above_max() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = format!(
+            r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            request_timeout_seconds = {}
+        "#,
+            MAX_TIMEOUT_SECONDS + 1
+        );
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("request_timeout_seconds"));
+            assert!(msg.contains("exceeds the maximum"));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_request_timeout_seconds_at_max() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = format!(
+            r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            request_timeout_seconds = {MAX_TIMEOUT_SECONDS}
+        "#
+        );
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_validate_rejects_timeout_seconds_above_max() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = format!(
+            r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            timeout_seconds = {}
+        "#,
+            MAX_TIMEOUT_SECONDS + 1
+        );
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("timeout_seconds"));
+            assert!(msg.contains("exceeds the maximum"));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_timeout_seconds_at_max() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = format!(
+            r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            timeout_seconds = {MAX_TIMEOUT_SECONDS}
+        "#
+        );
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]

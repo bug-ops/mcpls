@@ -212,14 +212,21 @@ impl LspClient {
     /// single tool call is `4 * request_timeout() + 3.5s` (the sum of the
     /// retry backoff delays).
     ///
-    /// The configured value is clamped to at least 1 second. [`ServerConfig::load_from`]
-    /// rejects `request_timeout_seconds == 0` at load time for TOML-sourced
-    /// configs, but [`crate::serve`] accepts a caller-built `ServerConfig`
-    /// without going through that validation, so this clamp is the last line
-    /// of defense against a zero-duration timeout that would fail every
-    /// request instantly.
+    /// The configured value is clamped to the range from 1 second to
+    /// [`MAX_TIMEOUT_SECONDS`]. [`ServerConfig::load_from`] rejects
+    /// `request_timeout_seconds` that is `0` or above
+    /// [`MAX_TIMEOUT_SECONDS`] at load time for TOML-sourced configs, but
+    /// [`crate::serve`] accepts a caller-built `ServerConfig` without going
+    /// through that validation (unless the caller opts in via
+    /// [`ServerConfig::validate`]), so this clamp is the last line of defense
+    /// against a zero-duration timeout that would fail every request
+    /// instantly, or an astronomically large one that tokio's
+    /// `timeout`/`sleep` would silently treat as unbounded (they fall back to
+    /// `Instant::far_future()` rather than panicking).
     ///
     /// [`ServerConfig::load_from`]: crate::config::ServerConfig::load_from
+    /// [`ServerConfig::validate`]: crate::config::ServerConfig::validate
+    /// [`MAX_TIMEOUT_SECONDS`]: crate::config::MAX_TIMEOUT_SECONDS
     ///
     /// # Examples
     ///
@@ -236,7 +243,11 @@ impl LspClient {
     /// ```
     #[must_use]
     pub fn request_timeout(&self) -> Duration {
-        Duration::from_secs(self.config.request_timeout_seconds.max(1))
+        Duration::from_secs(
+            self.config
+                .request_timeout_seconds
+                .clamp(1, crate::config::MAX_TIMEOUT_SECONDS),
+        )
     }
 
     /// The timeout applied to completion (`textDocument/completion`) requests.
@@ -711,6 +722,18 @@ mod tests {
 
         assert_eq!(client.request_timeout(), Duration::from_secs(1));
         assert_eq!(client.completion_timeout(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_request_timeout_clamps_above_max_to_max() {
+        let mut config = LspServerConfig::rust_analyzer();
+        config.request_timeout_seconds = u64::MAX;
+        let client = LspClient::new(config);
+
+        assert_eq!(
+            client.request_timeout(),
+            Duration::from_secs(crate::config::MAX_TIMEOUT_SECONDS)
+        );
     }
 
     #[test]

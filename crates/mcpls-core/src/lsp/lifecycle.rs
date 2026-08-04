@@ -465,11 +465,18 @@ impl LspServer {
             .request(
                 "initialize",
                 params,
-                // `.max(1)` guards the same gap as `LspClient::request_timeout`'s
-                // clamp: `serve()` accepts a caller-built `ServerConfig` without
-                // going through `ServerConfig::validate()`, so `0` is reachable
-                // here and would otherwise produce a 0-duration timeout.
-                Duration::from_secs(config.server_config.timeout_seconds.max(1)),
+                // Clamped for the same reason as `LspClient::request_timeout`:
+                // `serve()` accepts a caller-built `ServerConfig` without going
+                // through `ServerConfig::validate()`, so an out-of-range value
+                // (0, or an unbounded one that would silently disable the
+                // timeout via tokio's `Instant::far_future()` fallback) is
+                // reachable here and needs a last-line-of-defense clamp.
+                Duration::from_secs(
+                    config
+                        .server_config
+                        .timeout_seconds
+                        .clamp(1, crate::config::MAX_TIMEOUT_SECONDS),
+                ),
             )
             .await
             .map_err(|e| Error::LspInitFailed {

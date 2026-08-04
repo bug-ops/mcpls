@@ -222,6 +222,28 @@ const fn default_request_timeout() -> u64 {
     30
 }
 
+/// Maximum allowed value, in seconds, for both [`LspServerConfig::timeout_seconds`]
+/// and [`LspServerConfig::request_timeout_seconds`].
+///
+/// Both fields are passed straight into `Duration::from_secs` — `timeout_seconds`
+/// in the `initialize` handshake (`lsp::lifecycle::LspServer::initialize`),
+/// `request_timeout_seconds` in [`crate::lsp::LspClient::request_timeout`].
+/// tokio's `timeout`/`sleep` fall back to `Instant::far_future()` for
+/// astronomically large durations instead of panicking, so an unbounded value
+/// on either field (misconfiguration or typo) would silently disable the
+/// timeout rather than fail with a diagnosable error. One shared constant
+/// bounds both, since the underlying defect and fix are identical for each.
+///
+/// Set to 900 (15 minutes), not a rounder 3600 (1 hour): [`LspClient::request`]
+/// retries a request up to 4 times total on a `-32802` (`ServerCancelled`)
+/// response, so the worst-case latency for a single call bounded by this
+/// value is `4 * 900 + 3.5s` ≈ 1 hour, not 4 hours — this constant bounds one
+/// attempt, so it is chosen such that the actually-experienced worst case
+/// (the retried total) stays within about an hour.
+///
+/// [`LspClient::request`]: crate::lsp::LspClient::request
+pub const MAX_TIMEOUT_SECONDS: u64 = 900;
+
 impl LspServerConfig {
     /// Check if this server should be spawned for the given workspace.
     ///
