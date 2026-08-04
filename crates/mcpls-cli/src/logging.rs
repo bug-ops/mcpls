@@ -10,9 +10,11 @@ use tracing_subscriber::{EnvFilter, fmt};
 /// JSON instead of the default compact human-readable format, for
 /// consumption by structured-logging pipelines.
 ///
+/// An invalid `level` falls back to `"info"` rather than erroring.
+///
 /// # Errors
 ///
-/// Returns an error if the log level is invalid or initialization fails.
+/// Returns an error if the fallback `"info"` filter itself fails to parse.
 pub fn init(level: &str, log_json: bool) -> Result<()> {
     let filter = EnvFilter::try_new(level)
         .or_else(|_| EnvFilter::try_new("info"))

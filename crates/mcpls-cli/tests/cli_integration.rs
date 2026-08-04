@@ -290,7 +290,9 @@ fn test_config_file_with_spaces_in_path() {
 /// `message` field as `"message":"..."`, which the default compact
 /// formatter never produces (it renders unquoted `starting mcpls
 /// version=...`), so this substring is a reliable discriminator between the
-/// two formats without pulling in `serde_json` just for tests.
+/// two formats without pulling in `serde_json` just for tests. Also asserts
+/// on the fatal-error line (`main`'s `tracing::error!` on `run()` failure)
+/// to guard the crash path staying JSON too, not just the startup line.
 #[test]
 fn test_log_json_flag_emits_json_formatted_logs() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
@@ -301,7 +303,10 @@ fn test_log_json_flag_emits_json_formatted_logs() {
         .arg("/nonexistent/path/to/config.toml")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("\"message\":\"starting mcpls\""));
+        .stderr(predicate::str::contains("\"message\":\"starting mcpls\""))
+        .stderr(predicate::str::contains(
+            "\"message\":\"mcpls exited with an error\"",
+        ));
 }
 
 /// Same as `test_log_json_flag_emits_json_formatted_logs`, but via the
@@ -318,7 +323,10 @@ fn test_log_json_env_var_emits_json_formatted_logs() {
         .arg("/nonexistent/path/to/config.toml")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("\"message\":\"starting mcpls\""));
+        .stderr(predicate::str::contains("\"message\":\"starting mcpls\""))
+        .stderr(predicate::str::contains(
+            "\"message\":\"mcpls exited with an error\"",
+        ));
 }
 
 /// Complements the two tests above: without `--log-json`/`MCPLS_LOG_JSON`,
