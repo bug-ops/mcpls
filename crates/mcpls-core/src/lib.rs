@@ -145,7 +145,7 @@ pub(crate) struct PumpShared {
 /// rather than blocking — a pump stalled behind someone else's lock would
 /// previously lose notifications under sustained push traffic.
 pub(crate) async fn diagnostics_pump(
-    _server_id: String,
+    server_id: ServerId,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     caches_diagnostics: bool,
@@ -190,7 +190,7 @@ pub(crate) async fn diagnostics_pump(
                         }
                         {
                             let mut cache = notification_cache.lock().await;
-                            cache.store_diagnostics(&p.uri, p.version, p.diagnostics);
+                            cache.store_diagnostics(&server_id, &p.uri, p.version, p.diagnostics);
                         }
 
                         // Fast path: skip URI construction when nothing is subscribed.
@@ -659,6 +659,19 @@ fn spawn_lsp_servers_background(
         translator.clear_expected_servers();
         info!("Proceeding with {} LSP server(s)", server_count);
 
+        // Give each diagnostics-route server a fair share of the shared
+        // diagnostics cache budget now that the full set is known -- see
+        // `NotificationCache::set_diagnostics_route_count` (#266).
+        let diagnostics_route_count = registered
+            .diagnostics_flags
+            .values()
+            .filter(|&&is_route| is_route)
+            .count();
+        notification_cache
+            .lock()
+            .await
+            .set_diagnostics_route_count(diagnostics_route_count);
+
         // Start diagnostics pump tasks now that servers are registered.
         let pump_shared = PumpShared {
             notification_cache,
@@ -674,7 +687,7 @@ fn spawn_lsp_servers_background(
                 .copied()
                 .unwrap_or(false);
             pumps.spawn(diagnostics_pump(
-                id.to_string(),
+                id,
                 rx,
                 cancel_rx.clone(),
                 caches_diagnostics,
@@ -1214,7 +1227,7 @@ mod tests {
 
             let c = Arc::clone(&cache);
             tokio::spawn(diagnostics_pump(
-                "rust".to_string(),
+                ServerId::from("rust"),
                 rx,
                 cancel_rx,
                 true,
@@ -1286,7 +1299,7 @@ mod tests {
             let workspace_roots: Arc<[PathBuf]> = Arc::from([workspace_root]);
 
             tokio::spawn(diagnostics_pump(
-                "rust".to_string(),
+                ServerId::from("rust"),
                 rx,
                 cancel_rx,
                 true,
@@ -1359,7 +1372,7 @@ mod tests {
             let (cancel_tx, cancel_rx) = watch::channel(false);
 
             let handle = tokio::spawn(diagnostics_pump(
-                "rust".to_string(),
+                ServerId::from("rust"),
                 rx,
                 cancel_rx,
                 true,
@@ -1389,7 +1402,7 @@ mod tests {
             let (cancel_tx, cancel_rx) = watch::channel(false);
 
             let handle = tokio::spawn(diagnostics_pump(
-                "rust".to_string(),
+                ServerId::from("rust"),
                 rx,
                 cancel_rx,
                 true,
@@ -1434,7 +1447,7 @@ mod tests {
             lock_acquired.notified().await;
 
             tokio::spawn(diagnostics_pump(
-                "rust".to_string(),
+                ServerId::from("rust"),
                 rx,
                 cancel_rx,
                 true,

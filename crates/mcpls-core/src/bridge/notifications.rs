@@ -8,20 +8,22 @@ use chrono::{DateTime, Utc};
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ServerId;
+
 /// Maximum number of log entries to store.
 const MAX_LOG_ENTRIES: usize = 100;
 
-/// Maximum number of distinct document URIs to retain diagnostics for.
+/// Global budget for distinct-URI diagnostic entries, shared fairly across
+/// every registered diagnostics-route server rather than claimed by one
+/// server alone.
 ///
 /// Guards against unbounded growth when a spawned LSP server publishes
 /// diagnostics for an unbounded number of distinct URIs over a long-running
 /// session, matching the bounding already applied to `logs`/`messages`.
-//
-// TODO(critic-M4): this budget is shared across every registered LSP server
-// via one `NotificationCache`; a noisy server can evict a quiet server's
-// entries in a multi-language workspace. Pre-existing structure (the cache
-// was always shared), newly load-bearing now that a cap exists. Worth a
-// per-server-partitioned cache as a follow-up, not a blocker here.
+/// Each server's own share is `MAX_DIAGNOSTIC_ENTRIES / diagnostics_route_count`
+/// (see [`NotificationCache::set_diagnostics_route_count`]): a noisy server
+/// can only exhaust its own share and evict its own least-recently-written
+/// entries, never another server's (#266).
 const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 
 /// Normalize a URI string to a stable cache key.
@@ -132,19 +134,31 @@ impl From<lsp_types::MessageType> for MessageType {
 pub struct NotificationCache {
     /// Diagnostics indexed by document URI.
     diagnostics: HashMap<String, DiagnosticInfo>,
-    /// `diagnostics` keys ordered oldest-write-first, keyed by a monotonic
-    /// sequence number rather than position: a re-publish removes its old
-    /// entry by key in `O(log n)` (via `diagnostic_seq`) instead of scanning
-    /// for it, which a plain `VecDeque` would require. Kept in sync with
-    /// `diagnostics` by every method that adds or removes an entry.
-    diagnostic_order: BTreeMap<u64, String>,
-    /// Maps each cached URI to its current key in `diagnostic_order`, so a
-    /// re-publish can find and remove its old order entry without scanning.
+    /// Server that currently owns each cached URI, so an entry's order map
+    /// can be found without scanning every server's.
+    diagnostics_owners: HashMap<String, ServerId>,
+    /// Per-server `diagnostics` keys ordered oldest-write-first, keyed by a
+    /// monotonic sequence number rather than position: a re-publish removes
+    /// its old entry by key in `O(log n)` (via `diagnostic_seq`) instead of
+    /// scanning for it, which a plain `VecDeque` would require. Bounded per
+    /// server to a fair share of `MAX_DIAGNOSTIC_ENTRIES` (see
+    /// [`NotificationCache::set_diagnostics_route_count`]), so one server's
+    /// write volume can never evict another's entries (#266). Kept in sync
+    /// with `diagnostics` by every method that adds or removes an entry.
+    diagnostic_order: HashMap<ServerId, BTreeMap<u64, String>>,
+    /// Maps each cached URI to its current sequence number in its owner's
+    /// `diagnostic_order` map, so a re-publish or clear can find and remove
+    /// its old order entry without scanning.
     diagnostic_seq: HashMap<String, u64>,
-    /// Next sequence number to assign in `diagnostic_order`. Monotonically
-    /// increasing for the cache's lifetime; never reused, so it never
-    /// collides with an older entry still pending eviction.
+    /// Next sequence number to assign in `diagnostic_order`. Shared across
+    /// every server's order map and monotonically increasing for the
+    /// cache's lifetime; never reused, so it never collides with an older
+    /// entry still pending eviction.
     next_diagnostic_seq: u64,
+    /// Number of registered diagnostics-route servers currently sharing the
+    /// `MAX_DIAGNOSTIC_ENTRIES` budget; see
+    /// [`NotificationCache::set_diagnostics_route_count`].
+    diagnostics_route_count: usize,
     /// Recent log entries (FIFO queue with max size).
     logs: VecDeque<LogEntry>,
     /// Recent server messages (FIFO queue with max size).
@@ -163,27 +177,66 @@ impl NotificationCache {
     pub fn new() -> Self {
         Self {
             diagnostics: HashMap::with_capacity(32),
-            diagnostic_order: BTreeMap::new(),
+            diagnostics_owners: HashMap::with_capacity(32),
+            diagnostic_order: HashMap::new(),
             diagnostic_seq: HashMap::with_capacity(32),
             next_diagnostic_seq: 0,
+            diagnostics_route_count: 1,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
         }
     }
 
-    /// Store diagnostics for a document.
+    /// Configure how many diagnostics-route servers share the global
+    /// `MAX_DIAGNOSTIC_ENTRIES` budget.
     ///
-    /// Evicted by recency of write (LRU-by-update), not strict insertion
-    /// order: re-publishing an already-cached URI moves it to the back of
-    /// `diagnostic_order` rather than leaving it at its original position.
-    /// Without this, a file the user is actively editing -- republished on
-    /// every keystroke -- would get evicted ahead of files that were merely
-    /// opened once and never touched again, since only brand-new URIs
-    /// advanced the FIFO position. Once `MAX_DIAGNOSTIC_ENTRIES` distinct
-    /// URIs are cached, the least-recently-written URI is evicted to make
-    /// room, matching the bounding used for `logs`/`messages`.
+    /// Each server's own cap becomes `MAX_DIAGNOSTIC_ENTRIES / count`
+    /// (minimum 1): registering more diagnostics-capable servers gives each
+    /// a smaller but still fair share, rather than each getting an
+    /// independent full `MAX_DIAGNOSTIC_ENTRIES` budget of its own -- which
+    /// would let the aggregate cache size grow without bound as more
+    /// servers register (#266). Call once after server registration
+    /// completes and before diagnostics start flowing. Defaults to `1` if
+    /// never called (a single implicit server gets the whole budget).
+    pub fn set_diagnostics_route_count(&mut self, count: usize) {
+        self.diagnostics_route_count = count.max(1);
+    }
+
+    /// Current per-server diagnostics budget: `MAX_DIAGNOSTIC_ENTRIES`
+    /// divided fairly across `diagnostics_route_count` servers, floored at 1
+    /// so a large server count can never reduce a server's share to zero.
+    fn per_server_budget(&self) -> usize {
+        (MAX_DIAGNOSTIC_ENTRIES / self.diagnostics_route_count.max(1)).max(1)
+    }
+
+    /// Store diagnostics for a document published by `server_id`.
+    ///
+    /// If diagnostics already exist for the URI, they are replaced and the
+    /// entry is repositioned to the back of its owner's eviction order, so
+    /// a URI republished on every edit is tracked as most-recently-written
+    /// and evicted last, not first. Each registered server's distinct-URI
+    /// entries are bounded independently by its fair share of
+    /// `MAX_DIAGNOSTIC_ENTRIES` (see
+    /// [`Self::set_diagnostics_route_count`]): once a server's own share is
+    /// exhausted, storing diagnostics for a new URI evicts that same
+    /// server's least-recently-written entry, never another server's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::NotificationCache;
+    /// use mcpls_core::config::ServerId;
+    /// use lsp_types::Uri;
+    ///
+    /// let mut cache = NotificationCache::new();
+    /// let server: ServerId = "rust-analyzer".into();
+    /// let uri: Uri = "file:///main.rs".parse().unwrap();
+    /// cache.store_diagnostics(&server, &uri, Some(1), vec![]);
+    /// assert!(cache.get_diagnostics(uri.as_str()).is_some());
+    /// ```
     pub fn store_diagnostics(
         &mut self,
+        server_id: &ServerId,
         uri: &Uri,
         version: Option<i32>,
         diagnostics: Vec<LspDiagnostic>,
@@ -195,20 +248,41 @@ impl NotificationCache {
             diagnostics,
         };
 
-        if let Some(old_seq) = self.diagnostic_seq.remove(&key) {
-            self.diagnostic_order.remove(&old_seq);
-        } else if self.diagnostics.len() >= MAX_DIAGNOSTIC_ENTRIES
-            && let Some((&oldest_seq, oldest_key)) = self.diagnostic_order.iter().next()
+        // Remove the URI's existing order entry, if any -- from its
+        // previous owner's order map, whether that's this same server (a
+        // republish, repositioned to the back below) or a different one
+        // (the diagnostics route changed, e.g. on respawn).
+        if let Some(old_seq) = self.diagnostic_seq.remove(&key)
+            && let Some(previous_owner) = self.diagnostics_owners.get(&key)
+            && let Some(order) = self.diagnostic_order.get_mut(previous_owner)
+        {
+            order.remove(&old_seq);
+        }
+
+        let budget = self.per_server_budget();
+        let order = self.diagnostic_order.entry(server_id.clone()).or_default();
+        // `while`, not `if`: normally at most one eviction is ever needed
+        // here (each store adds exactly one entry), but `budget` can shrink
+        // out from under an already-populated server if a caller invokes
+        // `set_diagnostics_route_count` again with a larger count after
+        // diagnostics have started flowing. `while` guarantees convergence
+        // to the new, smaller budget in that case instead of leaving the
+        // server permanently one (or more) entries over it.
+        while order.len() >= budget
+            && let Some((&oldest_seq, oldest_key)) = order.iter().next()
         {
             let oldest_key = oldest_key.clone();
-            self.diagnostic_order.remove(&oldest_seq);
+            order.remove(&oldest_seq);
             self.diagnostic_seq.remove(&oldest_key);
+            self.diagnostics_owners.remove(&oldest_key);
             self.diagnostics.remove(&oldest_key);
         }
 
+        self.diagnostics_owners
+            .insert(key.clone(), server_id.clone());
         let seq = self.next_diagnostic_seq;
         self.next_diagnostic_seq += 1;
-        self.diagnostic_order.insert(seq, key.clone());
+        order.insert(seq, key.clone());
         self.diagnostic_seq.insert(key.clone(), seq);
         self.diagnostics.insert(key, info);
     }
@@ -270,19 +344,57 @@ impl NotificationCache {
     ///
     /// Returns the cleared diagnostics if they existed.
     pub fn clear_diagnostics(&mut self, uri: &str) -> Option<DiagnosticInfo> {
-        let key = uri_cache_key(uri);
-        let cleared = self.diagnostics.remove(key.as_ref());
-        if cleared.is_some()
-            && let Some(seq) = self.diagnostic_seq.remove(key.as_ref())
+        let key = uri_cache_key(uri).into_owned();
+        if let Some(owner) = self.diagnostics_owners.remove(&key)
+            && let Some(seq) = self.diagnostic_seq.remove(&key)
+            && let Some(order) = self.diagnostic_order.get_mut(&owner)
         {
-            self.diagnostic_order.remove(&seq);
+            order.remove(&seq);
         }
-        cleared
+        self.diagnostics.remove(&key)
     }
 
-    /// Clear all diagnostics.
+    /// Clear all diagnostics owned by a single server.
+    ///
+    /// Used when a server crashes and respawns: its own stale entries must
+    /// be invalidated without disturbing any other server's cache entries
+    /// (#266), unlike [`Self::clear_all_diagnostics`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::NotificationCache;
+    /// use mcpls_core::config::ServerId;
+    /// use lsp_types::Uri;
+    ///
+    /// let mut cache = NotificationCache::new();
+    /// let crashed: ServerId = "pyright".into();
+    /// let healthy: ServerId = "rust-analyzer".into();
+    /// let crashed_uri: Uri = "file:///main.py".parse().unwrap();
+    /// let healthy_uri: Uri = "file:///main.rs".parse().unwrap();
+    /// cache.store_diagnostics(&crashed, &crashed_uri, Some(1), vec![]);
+    /// cache.store_diagnostics(&healthy, &healthy_uri, Some(1), vec![]);
+    ///
+    /// cache.clear_server_diagnostics(&crashed);
+    ///
+    /// assert!(cache.get_diagnostics(crashed_uri.as_str()).is_none());
+    /// assert!(cache.get_diagnostics(healthy_uri.as_str()).is_some());
+    /// ```
+    pub fn clear_server_diagnostics(&mut self, server_id: &ServerId) {
+        let Some(order) = self.diagnostic_order.remove(server_id) else {
+            return;
+        };
+        for (_, key) in order {
+            self.diagnostics.remove(&key);
+            self.diagnostics_owners.remove(&key);
+            self.diagnostic_seq.remove(&key);
+        }
+    }
+
+    /// Clear all diagnostics, for every server.
     pub fn clear_all_diagnostics(&mut self) {
         self.diagnostics.clear();
+        self.diagnostics_owners.clear();
         self.diagnostic_order.clear();
         self.diagnostic_seq.clear();
     }
@@ -326,6 +438,13 @@ mod tests {
 
     use super::*;
 
+    /// Every test in this module that doesn't exercise multi-server
+    /// fairness routes through one implicit server, so `set_diagnostics_route_count`
+    /// is left at its default of `1` (full `MAX_DIAGNOSTIC_ENTRIES` budget).
+    fn test_server() -> ServerId {
+        ServerId::from("test-server")
+    }
+
     #[test]
     fn test_notification_cache_new() {
         let cache = NotificationCache::new();
@@ -360,7 +479,7 @@ mod tests {
             data: None,
         };
 
-        cache.store_diagnostics(&uri, Some(1), vec![diagnostic]);
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
         let stored = cache.get_diagnostics(uri.as_str()).unwrap();
         assert_eq!(stored.uri, uri);
@@ -374,10 +493,10 @@ mod tests {
         let mut cache = NotificationCache::new();
         let uri: Uri = "file:///test.rs".parse().unwrap();
 
-        cache.store_diagnostics(&uri, Some(1), vec![]);
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
 
-        cache.store_diagnostics(&uri, Some(2), vec![]);
+        cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
 
         let stored = cache.get_diagnostics(uri.as_str()).unwrap();
@@ -389,7 +508,7 @@ mod tests {
         let mut cache = NotificationCache::new();
         let uri: Uri = "file:///test.rs".parse().unwrap();
 
-        cache.store_diagnostics(&uri, Some(1), vec![]);
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
 
         let cleared = cache.clear_diagnostics(uri.as_str());
@@ -403,8 +522,8 @@ mod tests {
         let uri1: Uri = "file:///test1.rs".parse().unwrap();
         let uri2: Uri = "file:///test2.rs".parse().unwrap();
 
-        cache.store_diagnostics(&uri1, Some(1), vec![]);
-        cache.store_diagnostics(&uri2, Some(1), vec![]);
+        cache.store_diagnostics(&test_server(), &uri1, Some(1), vec![]);
+        cache.store_diagnostics(&test_server(), &uri2, Some(1), vec![]);
         assert_eq!(cache.diagnostics_count(), 2);
 
         cache.clear_all_diagnostics();
@@ -571,7 +690,7 @@ mod tests {
             data: None,
         };
 
-        cache.store_diagnostics(&uri, Some(1), vec![diagnostic]);
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
         assert_eq!(
             cache
                 .get_diagnostics(uri.as_str())
@@ -581,7 +700,7 @@ mod tests {
             1
         );
 
-        cache.store_diagnostics(&uri, Some(2), vec![]);
+        cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
         let stored = cache.get_diagnostics(uri.as_str()).unwrap();
         assert_eq!(stored.diagnostics.len(), 0);
         assert_eq!(stored.version, Some(2));
@@ -615,7 +734,7 @@ mod tests {
             })
             .collect();
 
-        cache.store_diagnostics(&uri, Some(1), diagnostics);
+        cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
         let stored = cache.get_diagnostics(uri.as_str()).unwrap();
         assert_eq!(stored.diagnostics.len(), 100);
@@ -655,7 +774,7 @@ mod tests {
 
         for i in 0..MAX_DIAGNOSTIC_ENTRIES + 10 {
             let uri: Uri = format!("file:///test{i}.rs").parse().unwrap();
-            cache.store_diagnostics(&uri, Some(1), vec![]);
+            cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         }
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
@@ -675,7 +794,12 @@ mod tests {
         let uri: Uri = "file:///stable.rs".parse().unwrap();
 
         for i in 0..MAX_DIAGNOSTIC_ENTRIES {
-            cache.store_diagnostics(&uri, Some(i32::try_from(i).unwrap()), vec![]);
+            cache.store_diagnostics(
+                &test_server(),
+                &uri,
+                Some(i32::try_from(i).unwrap()),
+                vec![],
+            );
         }
         assert_eq!(cache.diagnostics_count(), 1);
         assert!(cache.get_diagnostics(uri.as_str()).is_some());
@@ -683,29 +807,29 @@ mod tests {
 
     #[test]
     fn test_diagnostics_republish_refreshes_eviction_order() {
-        // #234 S2 regression: an actively-edited file, republished on every
-        // keystroke, must not be evicted ahead of a file that was merely
-        // opened once and never touched again.
+        // #234 S2 / #266 S3 regression: an actively-edited file, republished
+        // on every keystroke, must not be evicted ahead of a file that was
+        // merely opened once and never touched again.
         let mut cache = NotificationCache::new();
         let actively_edited: Uri = "file:///keep.rs".parse().unwrap();
-        cache.store_diagnostics(&actively_edited, Some(1), vec![]);
+        cache.store_diagnostics(&test_server(), &actively_edited, Some(1), vec![]);
 
         // Fill the rest of the cache with untouched entries.
         for i in 0..MAX_DIAGNOSTIC_ENTRIES - 1 {
             let uri: Uri = format!("file:///untouched{i}.rs").parse().unwrap();
-            cache.store_diagnostics(&uri, Some(1), vec![]);
+            cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         }
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
 
         // Republish the actively-edited file -- this must move it to the
         // back of the eviction order, not leave it at its original (oldest)
         // position.
-        cache.store_diagnostics(&actively_edited, Some(2), vec![]);
+        cache.store_diagnostics(&test_server(), &actively_edited, Some(2), vec![]);
 
         // One more new URI arrives, exceeding the cap by one: the oldest
         // *untouched* entry must be evicted, not the republished one.
         let overflow: Uri = "file:///overflow.rs".parse().unwrap();
-        cache.store_diagnostics(&overflow, Some(1), vec![]);
+        cache.store_diagnostics(&test_server(), &overflow, Some(1), vec![]);
 
         assert!(
             cache.get_diagnostics(actively_edited.as_str()).is_some(),
@@ -723,13 +847,13 @@ mod tests {
     fn test_clear_diagnostics_then_refill_does_not_evict_early() {
         let mut cache = NotificationCache::new();
         let first: Uri = "file:///first.rs".parse().unwrap();
-        cache.store_diagnostics(&first, Some(1), vec![]);
+        cache.store_diagnostics(&test_server(), &first, Some(1), vec![]);
         cache.clear_diagnostics(first.as_str());
         assert_eq!(cache.diagnostics_count(), 0);
 
         for i in 0..MAX_DIAGNOSTIC_ENTRIES {
             let uri: Uri = format!("file:///test{i}.rs").parse().unwrap();
-            cache.store_diagnostics(&uri, Some(1), vec![]);
+            cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         }
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
         // Every entry from this batch must still be present -- the earlier
@@ -751,8 +875,164 @@ mod tests {
         let mut cache = NotificationCache::new();
         let uri: Uri = "file:///test.rs".parse().unwrap();
 
-        cache.store_diagnostics(&uri, None, vec![]);
+        cache.store_diagnostics(&test_server(), &uri, None, vec![]);
         let stored = cache.get_diagnostics(uri.as_str()).unwrap();
         assert_eq!(stored.version, None);
+    }
+
+    /// #266: with a single registered diagnostics-route server (the
+    /// default), a noisy server publishing diagnostics for more distinct
+    /// URIs than the global budget allows must only evict its own oldest
+    /// entries, never a quiet server's, even though both share one
+    /// `NotificationCache`.
+    #[test]
+    fn test_noisy_server_does_not_evict_quiet_server_entries() {
+        let mut cache = NotificationCache::new();
+        cache.set_diagnostics_route_count(2);
+        let noisy = ServerId::from("noisy");
+        let quiet = ServerId::from("quiet");
+
+        let quiet_uri: Uri = "file:///quiet/only_file.rs".parse().unwrap();
+        cache.store_diagnostics(&quiet, &quiet_uri, Some(1), vec![]);
+
+        let per_server_budget = MAX_DIAGNOSTIC_ENTRIES / 2;
+        for i in 0..per_server_budget + 50 {
+            let uri: Uri = format!("file:///noisy/file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&noisy, &uri, Some(1), vec![]);
+        }
+
+        assert!(
+            cache.get_diagnostics(quiet_uri.as_str()).is_some(),
+            "quiet server's only entry must survive the noisy server's overflow"
+        );
+
+        let noisy_first: Uri = "file:///noisy/file0.rs".parse().unwrap();
+        assert!(
+            cache.get_diagnostics(noisy_first.as_str()).is_none(),
+            "noisy server's own oldest entries must be evicted once its share is exceeded"
+        );
+    }
+
+    /// #266 M6: registering more diagnostics-route servers gives each a
+    /// smaller, fair share of the global budget rather than each getting an
+    /// independent full `MAX_DIAGNOSTIC_ENTRIES` -- otherwise the aggregate
+    /// cache size would grow unboundedly with the number of servers.
+    #[test]
+    fn test_fair_share_budget_divided_by_registered_server_count() {
+        let mut cache = NotificationCache::new();
+        cache.set_diagnostics_route_count(4);
+        let server = ServerId::from("one-of-four");
+
+        let expected_share = MAX_DIAGNOSTIC_ENTRIES / 4;
+        for i in 0..expected_share + 10 {
+            let uri: Uri = format!("file:///file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&server, &uri, Some(1), vec![]);
+        }
+
+        assert_eq!(
+            cache.diagnostics_count(),
+            expected_share,
+            "one of four servers must be capped at a quarter of the global budget"
+        );
+    }
+
+    /// Re-publishing diagnostics for a URI under its existing owner must not
+    /// count as a new entry against that server's budget.
+    #[test]
+    fn test_repeated_writes_same_owner_do_not_grow_order_map() {
+        let mut cache = NotificationCache::new();
+        let server = ServerId::from("server");
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        let max_version = i32::try_from(MAX_DIAGNOSTIC_ENTRIES).unwrap() + 10;
+        for version in 0..max_version {
+            cache.store_diagnostics(&server, &uri, Some(version), vec![]);
+        }
+
+        assert_eq!(cache.diagnostics_count(), 1);
+        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        assert_eq!(stored.version, Some(max_version - 1));
+    }
+
+    /// If a URI's diagnostics route changes to a different server (e.g.
+    /// after a respawn rebind), the entry must move to the new owner's
+    /// order map rather than staying attributed to the old one.
+    #[test]
+    fn test_store_diagnostics_reassigns_ownership() {
+        let mut cache = NotificationCache::new();
+        let old_owner = ServerId::from("old");
+        let new_owner = ServerId::from("new");
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        cache.store_diagnostics(&old_owner, &uri, Some(1), vec![]);
+        cache.store_diagnostics(&new_owner, &uri, Some(2), vec![]);
+
+        assert_eq!(cache.diagnostics_count(), 1);
+        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        assert_eq!(stored.version, Some(2));
+
+        // The old owner's order map must no longer reference this URI:
+        // filling the old owner's budget with fresh entries must not evict
+        // this URI a second time (it's not there to evict) nor corrupt state.
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES + 5 {
+            let other: Uri = format!("file:///old/file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&old_owner, &other, Some(1), vec![]);
+        }
+        assert!(cache.get_diagnostics(uri.as_str()).is_some());
+    }
+
+    /// #266 S2: clearing one server's diagnostics must not disturb another
+    /// server's cached entries, unlike `clear_all_diagnostics`.
+    #[test]
+    fn test_clear_server_diagnostics_scopes_to_one_server() {
+        let mut cache = NotificationCache::new();
+        let crashed = ServerId::from("crashed");
+        let healthy = ServerId::from("healthy");
+
+        let crashed_uri: Uri = "file:///crashed/main.py".parse().unwrap();
+        let healthy_uri: Uri = "file:///healthy/main.rs".parse().unwrap();
+        cache.store_diagnostics(&crashed, &crashed_uri, Some(1), vec![]);
+        cache.store_diagnostics(&healthy, &healthy_uri, Some(1), vec![]);
+
+        cache.clear_server_diagnostics(&crashed);
+
+        assert!(cache.get_diagnostics(crashed_uri.as_str()).is_none());
+        assert!(cache.get_diagnostics(healthy_uri.as_str()).is_some());
+        assert_eq!(cache.diagnostics_count(), 1);
+
+        // Idempotent / no-op for a server with no (or no longer any) entries.
+        cache.clear_server_diagnostics(&crashed);
+        assert_eq!(cache.diagnostics_count(), 1);
+    }
+
+    /// M8: `set_diagnostics_route_count` can shrink a server's budget out
+    /// from under entries it already holds (e.g. more servers register
+    /// later). A single subsequent `store_diagnostics` call must evict
+    /// enough entries in one pass to converge to the new, smaller budget --
+    /// an `if` here would only ever evict one entry per call, leaving the
+    /// server permanently over budget.
+    #[test]
+    fn test_shrinking_budget_converges_in_a_single_store_call() {
+        let mut cache = NotificationCache::new();
+        let server = ServerId::from("server");
+
+        for i in 0..5 {
+            let uri: Uri = format!("file:///file{i}.rs").parse().unwrap();
+            cache.store_diagnostics(&server, &uri, Some(1), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), 5);
+
+        // MAX_DIAGNOSTIC_ENTRIES / 500 == 2: a drastic shrink relative to
+        // the 5 entries already held.
+        cache.set_diagnostics_route_count(500);
+
+        let new_uri: Uri = "file:///new.rs".parse().unwrap();
+        cache.store_diagnostics(&server, &new_uri, Some(1), vec![]);
+
+        assert_eq!(
+            cache.diagnostics_count(),
+            2,
+            "a single store after a budget shrink must evict down to the new budget in one pass"
+        );
     }
 }

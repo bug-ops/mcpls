@@ -1312,7 +1312,12 @@ mod tests {
         };
         {
             let mut cache = server.context.notification_cache.lock().await;
-            cache.store_diagnostics(&uri, Some(1), vec![diagnostic]);
+            cache.store_diagnostics(
+                &crate::config::ServerId::from("rust"),
+                &uri,
+                Some(1),
+                vec![diagnostic],
+            );
         }
 
         // Textually distinct from `test_file`, but canonicalizes to the same path.

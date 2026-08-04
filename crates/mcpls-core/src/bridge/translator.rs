@@ -1027,15 +1027,11 @@ impl Translator {
         // per-URI clear scoped to synced documents would miss most of what
         // needs invalidating.
         //
-        // `clear_all_diagnostics` is workspace-wide, not scoped to this
-        // server's language: in a multi-language workspace, a crashed
-        // rust-analyzer also wipes a healthy pyright's cached diagnostics
-        // for Python files. Accepted as bounded collateral rather than
-        // fixed here -- `handle_diagnostics`'s authoritative pull path is
-        // unaffected by this, only `get_cached_diagnostics` degrades for
-        // the unrelated language until that server republishes.
-        // `NotificationCache` has no per-language clear to scope this to
-        // yet; a per-language key iterator would be the proper fix.
+        // `clear_server_diagnostics` scopes the clear to just this server's
+        // own entries, tracked via `NotificationCache`'s per-server
+        // ownership map (#266) -- a crashed rust-analyzer no longer wipes a
+        // healthy pyright's cached diagnostics for Python files in the same
+        // workspace.
         //
         // This clear is not atomic with the swap above: a caller that reads
         // `lsp_clients` between the swap and this point sees the new client
@@ -1045,7 +1041,7 @@ impl Translator {
         if self.is_diagnostics_route(&language_id, id)
             && let Some(cache) = &self.notification_cache
         {
-            cache.lock().await.clear_all_diagnostics();
+            cache.lock().await.clear_server_diagnostics(id);
         }
 
         if let Some(old_client) = old_client {
@@ -3515,10 +3511,10 @@ fi
         }
 
         /// #249 C1 regression: respawning the *diagnostics-route* server
-        /// for a language must invalidate the whole diagnostics cache,
-        /// rather than leaving stale entries to be merged into fresh pull
-        /// results as if still current -- the crashed process's pump is
-        /// gone and will never update or clear them itself.
+        /// for a language must invalidate that server's diagnostics cache
+        /// entries, rather than leaving stale entries to be merged into
+        /// fresh pull results as if still current -- the crashed process's
+        /// pump is gone and will never update or clear them itself.
         ///
         /// Covers the "under-clear" failure mode a scoped-to-synced-URIs
         /// clear has: a real diagnostics-route server (e.g. rust-analyzer)
@@ -3526,6 +3522,13 @@ fi
         /// opened through mcpls), so `never_opened_uri` below stands in for
         /// an entry that must still be cleared despite never having gone
         /// through `ensure_open`.
+        ///
+        /// #266 S2 regression (over-clear direction, multi-language case):
+        /// `other_language_uri` is owned by a *different* diagnostics-route
+        /// server (e.g. pyright for Python, in the same workspace as the
+        /// rust-analyzer under test here) and must survive -- `clear_server_diagnostics`
+        /// replaced a workspace-wide `clear_all_diagnostics` that used to
+        /// wipe every language's cache on any single server's respawn.
         #[tokio::test]
         async fn test_respawn_if_dead_clears_diagnostics_cache_when_diagnostics_route() {
             let dir = TempDir::new().unwrap();
@@ -3545,14 +3548,21 @@ fi
             let synced_uri: lsp_types::Uri = "file:///workspace/opened.rs".parse().unwrap();
             let never_opened_uri: lsp_types::Uri =
                 "file:///workspace/never_opened.rs".parse().unwrap();
+            let other_language_uri: lsp_types::Uri = "file:///workspace/main.py".parse().unwrap();
             cache
                 .lock()
                 .await
-                .store_diagnostics(&synced_uri, None, vec![]);
+                .store_diagnostics(&id, &synced_uri, None, vec![]);
             cache
                 .lock()
                 .await
-                .store_diagnostics(&never_opened_uri, None, vec![]);
+                .store_diagnostics(&id, &never_opened_uri, None, vec![]);
+            cache.lock().await.store_diagnostics(
+                &ServerId::from("python"),
+                &other_language_uri,
+                None,
+                vec![],
+            );
 
             wait_until_dead(&translator, &id).await;
 
@@ -3572,6 +3582,11 @@ fi
                 guard.get_diagnostics(never_opened_uri.as_str()).is_none(),
                 "workspace-wide diagnostics for a file mcpls never opened \
                  must also be invalidated, not just synced documents"
+            );
+            assert!(
+                guard.get_diagnostics(other_language_uri.as_str()).is_some(),
+                "a different diagnostics-route server's entries must survive \
+                 an unrelated server's respawn-triggered cache clear"
             );
             drop(guard);
         }
@@ -3637,7 +3652,7 @@ fi
             cache
                 .lock()
                 .await
-                .store_diagnostics(&owned_by_healthy_server, None, vec![]);
+                .store_diagnostics(&hover_id, &owned_by_healthy_server, None, vec![]);
 
             wait_until_dead(&translator, &hover_id).await;
 
@@ -4412,7 +4427,7 @@ fi
             data: None,
         };
 
-        cache.store_diagnostics(&uri, Some(1), vec![diagnostic]);
+        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
@@ -4526,7 +4541,7 @@ fi
             },
         ];
 
-        cache.store_diagnostics(&uri, Some(1), diagnostics);
+        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), diagnostics);
 
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
@@ -4585,7 +4600,7 @@ fi
             data: None,
         };
 
-        cache.store_diagnostics(&uri, Some(1), vec![diagnostic]);
+        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
@@ -5742,6 +5757,7 @@ fi
         {
             let mut cache = notification_cache.lock().await;
             cache.store_diagnostics(
+                &ServerId::from("rust"),
                 &uri,
                 Some(1),
                 vec![lsp_diag(
