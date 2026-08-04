@@ -590,6 +590,29 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 /// registered anything for `shutdown_servers` to act on).
 const LSP_INIT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Awaits the background LSP init task's `JoinHandle` with a bounded
+/// `timeout`, logging a panic at `error` level (previously dropped
+/// silently, see #196) or an unresponsive task at `warn` level instead of
+/// letting either go unnoticed.
+///
+/// `timeout` is a parameter (rather than always
+/// [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`]) so tests can exercise the timeout
+/// branch without waiting out the real bound. Awaits `handle` by `&mut`
+/// (not by value): dropping an *owned* `JoinHandle` on timeout would only
+/// detach the task — it keeps running rather than stopping, contradicting
+/// the warning logged below. Retaining ownership lets `abort()` make that
+/// message true.
+async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => error!("Background LSP initialization task failed: {err}"),
+        Err(_) => {
+            warn!("Timed out waiting for background LSP initialization task to stop");
+            handle.abort();
+        }
+    }
+}
+
 /// Post-transport shutdown sequence, run once the transport future
 /// (`run_stdio`/`run_http`) returns — whether that's because of a
 /// `SIGTERM`/`SIGINT`, stdio EOF, or (for HTTP) its own graceful shutdown.
@@ -598,12 +621,11 @@ const LSP_INIT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// LSP server registered on `translator` (see
 /// [`Translator::shutdown_servers`] for what "gracefully" bounds and falls
 /// back to). Finally, if the background LSP init task (see
-/// [`spawn_lsp_servers_background`]) is still running, awaits its
-/// `JoinHandle` with a bounded timeout: this surfaces a panic in that task
-/// (previously dropped silently, see #196) and gives its diagnostics pump
-/// tasks a chance to finish draining before `serve_with` returns.
-/// Extracted from [`serve_with`] so this sequence is exercised directly in
-/// tests without needing a full stdio/HTTP transport round trip.
+/// [`spawn_lsp_servers_background`]) is still running, awaits it via
+/// [`await_lsp_init_handle`], giving its diagnostics pump tasks a chance to
+/// finish draining before `serve_with` returns. Extracted from
+/// [`serve_with`] so this sequence is exercised directly in tests without
+/// needing a full stdio/HTTP transport round trip.
 async fn shutdown(
     cancel_tx: &tokio::sync::watch::Sender<bool>,
     translator: &Translator,
@@ -615,13 +637,7 @@ async fn shutdown(
     translator.shutdown_servers().await;
 
     if let Some(handle) = lsp_init_handle {
-        match tokio::time::timeout(LSP_INIT_TASK_SHUTDOWN_TIMEOUT, handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => error!("Background LSP initialization task failed: {err}"),
-            Err(_) => {
-                warn!("Timed out waiting for background LSP initialization task to stop");
-            }
-        }
+        await_lsp_init_handle(handle, LSP_INIT_TASK_SHUTDOWN_TIMEOUT).await;
     }
 }
 
@@ -1246,27 +1262,114 @@ mod tests {
             );
         }
 
-        /// #196: a panicking background init task must not hang or crash
-        /// `shutdown` — the panic is caught by the `JoinHandle` and logged.
+        /// A timed-out background init task must actually be stopped
+        /// (`JoinHandle::abort`), not merely detached: awaiting the handle
+        /// *by value* inside `tokio::time::timeout` would drop only the
+        /// `JoinHandle` on timeout, which detaches the task without
+        /// cancelling it — it keeps running (and its future is never
+        /// dropped) despite the "timed out waiting ... to stop" log.
+        ///
+        /// Tests `await_lsp_init_handle` directly with a millisecond-scale
+        /// `timeout` (rather than going through `shutdown` with the real
+        /// multi-second `LSP_INIT_TASK_SHUTDOWN_TIMEOUT`) so this stays
+        /// fast. A `completed`-style flag set at the end of the task
+        /// couldn't tell "aborted" from "merely detached" apart here either
+        /// way, since the task hasn't finished its (deliberately long)
+        /// sleep yet in both cases — so this uses a `Drop`-signaling guard
+        /// held across the `.await` instead: `abort()` drops the task's
+        /// future promptly (well inside the grace period below), while a
+        /// detached-but-still-running task would only drop it once its
+        /// sleep actually finishes.
         #[tokio::test]
-        async fn test_shutdown_logs_panicking_background_init_task() {
-            let translator = Translator::new();
-            let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+        async fn test_await_lsp_init_handle_aborts_on_timeout() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            struct DropFlag(Arc<AtomicBool>);
+            impl Drop for DropFlag {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            let future_dropped = Arc::new(AtomicBool::new(false));
+            let guard = DropFlag(Arc::clone(&future_dropped));
+            let handle = tokio::spawn(async move {
+                let _guard = guard;
+                // Far longer than the timeout below, so it only elapses if
+                // the task is genuinely aborted rather than left running.
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            });
+
+            super::super::await_lsp_init_handle(handle, std::time::Duration::from_millis(20)).await;
+
+            // Give the just-aborted task's cancellation a moment to land.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                future_dropped.load(Ordering::SeqCst),
+                "timed-out background init task's future must be dropped via abort(), \
+                 not left running detached until its own sleep completes"
+            );
+        }
+
+        /// #196: a panicking background init task must not hang or crash
+        /// `shutdown`, and the panic must actually be logged (not merely
+        /// swallowed while `shutdown` happens not to hang for other
+        /// reasons) — asserted via a captured `tracing` event rather than
+        /// just checking completion.
+        #[tokio::test]
+        async fn test_await_lsp_init_handle_logs_panic() {
+            use tracing_subscriber::layer::SubscriberExt as _;
 
             let handle = tokio::spawn(async {
                 panic!("simulated background LSP init panic");
             });
 
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                super::super::shutdown(&cancel_tx, &translator, Some(handle)),
-            )
-            .await;
+            let captured = CapturedMessages::default();
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
 
+            super::super::await_lsp_init_handle(handle, std::time::Duration::from_secs(5)).await;
+
+            drop(guard);
+
+            let messages = captured.0.lock().unwrap().clone();
             assert!(
-                result.is_ok(),
-                "shutdown must not hang or propagate a panic from the background init task"
+                messages
+                    .iter()
+                    .any(|m| m.contains("Background LSP initialization task failed")),
+                "expected an error! log for the panicking background init task, got: {messages:?}"
             );
+        }
+
+        /// Captures `tracing` events emitted while a closure runs. Mirrors
+        /// `transport::tests::http_tests::CapturedMessages` — duplicated
+        /// rather than shared since this crate has no common test-support
+        /// module and the two live in separate, non-`pub` test submodules.
+        #[derive(Clone, Default)]
+        struct CapturedMessages(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedMessages {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct MessageVisitor(String);
+                impl tracing::field::Visit for MessageVisitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut visitor = MessageVisitor(String::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
         }
     }
 
