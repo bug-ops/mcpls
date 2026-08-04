@@ -14,6 +14,7 @@ categories = ["development-tools"]
 async-trait = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+dunce = { workspace = true }
 futures = { workspace = true }
 ignore = { workspace = true }
 lsp-types = { workspace = true }

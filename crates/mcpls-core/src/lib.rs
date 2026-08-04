@@ -359,10 +359,18 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
 /// prefix comparison against an already-resolved LSP path (see
 /// `diagnostic_path_in_workspace`) works without a filesystem syscall on
 /// that hot per-notification path.
+///
+/// Uses [`dunce::canonicalize`] rather than [`Path::canonicalize`]: on
+/// Windows, the latter returns the `\\?\`-prefixed verbatim form (e.g.
+/// `\\?\C:\...`), which a URI-derived path from `Url::to_file_path` (never
+/// verbatim-prefixed) can never `starts_with`-match, silently dropping every
+/// diagnostic. `dunce::canonicalize` resolves symlinks identically but
+/// returns the ordinary `C:\...` form when the result doesn't require the
+/// verbatim syntax (i.e. essentially always, for realistic workspace paths).
 fn canonicalize_workspace_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     roots
         .iter()
-        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .map(|root| dunce::canonicalize(root).unwrap_or_else(|_| root.clone()))
         .collect()
 }
 
@@ -675,15 +683,36 @@ mod tests {
 
     #[test]
     fn test_diagnostic_path_in_workspace_accepts_uri_under_root() {
-        let root = PathBuf::from("/workspace/project");
-        let uri: Uri = "file:///workspace/project/src/main.rs".parse().unwrap();
+        // `Url::to_file_path` on Windows requires the URL's first path
+        // segment to be a drive letter; a Unix-style path with no drive
+        // letter fails to convert at all (`uri_to_path` returns `None`),
+        // trivially satisfying this assertion for the wrong reason. Use a
+        // drive-letter path so the test actually exercises the prefix check
+        // on every platform.
+        #[cfg(windows)]
+        let (root, uri_str) = (
+            PathBuf::from(r"C:\workspace\project"),
+            "file:///C:/workspace/project/src/main.rs",
+        );
+        #[cfg(not(windows))]
+        let (root, uri_str) = (
+            PathBuf::from("/workspace/project"),
+            "file:///workspace/project/src/main.rs",
+        );
+        let uri: Uri = uri_str.parse().unwrap();
         assert!(diagnostic_path_in_workspace(&uri, &[root]));
     }
 
     #[test]
     fn test_diagnostic_path_in_workspace_rejects_uri_outside_roots() {
-        let root = PathBuf::from("/workspace/project");
-        let uri: Uri = "file:///etc/passwd".parse().unwrap();
+        #[cfg(windows)]
+        let (root, uri_str) = (
+            PathBuf::from(r"C:\workspace\project"),
+            "file:///C:/etc/passwd",
+        );
+        #[cfg(not(windows))]
+        let (root, uri_str) = (PathBuf::from("/workspace/project"), "file:///etc/passwd");
+        let uri: Uri = uri_str.parse().unwrap();
         assert!(!diagnostic_path_in_workspace(&uri, &[root]));
     }
 
@@ -700,10 +729,17 @@ mod tests {
     /// with" `/workspace/project` despite pointing outside it.
     #[test]
     fn test_diagnostic_path_in_workspace_rejects_parent_dir_traversal() {
-        let root = PathBuf::from("/workspace/project");
-        let uri: Uri = "file:///workspace/project/../../etc/passwd"
-            .parse()
-            .unwrap();
+        #[cfg(windows)]
+        let (root, uri_str) = (
+            PathBuf::from(r"C:\workspace\project"),
+            "file:///C:/workspace/project/../../etc/passwd",
+        );
+        #[cfg(not(windows))]
+        let (root, uri_str) = (
+            PathBuf::from("/workspace/project"),
+            "file:///workspace/project/../../etc/passwd",
+        );
+        let uri: Uri = uri_str.parse().unwrap();
         assert!(!diagnostic_path_in_workspace(&uri, &[root]));
     }
 
@@ -1180,7 +1216,21 @@ mod tests {
             let (tx, rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-            let workspace_roots: Arc<[PathBuf]> = Arc::from([PathBuf::from("/workspace")]);
+            // See `test_diagnostic_path_in_workspace_accepts_uri_under_root`
+            // for why Windows needs a drive-letter path here.
+            #[cfg(windows)]
+            let (workspace_root, outside_uri_str, inside_uri_str) = (
+                PathBuf::from(r"C:\workspace"),
+                "file:///C:/etc/passwd",
+                "file:///C:/workspace/src/main.rs",
+            );
+            #[cfg(not(windows))]
+            let (workspace_root, outside_uri_str, inside_uri_str) = (
+                PathBuf::from("/workspace"),
+                "file:///etc/passwd",
+                "file:///workspace/src/main.rs",
+            );
+            let workspace_roots: Arc<[PathBuf]> = Arc::from([workspace_root]);
 
             tokio::spawn(diagnostics_pump(
                 "rust".to_string(),
@@ -1195,8 +1245,8 @@ mod tests {
                 },
             ));
 
-            let outside_uri: Uri = "file:///etc/passwd".parse().unwrap();
-            let inside_uri: Uri = "file:///workspace/src/main.rs".parse().unwrap();
+            let outside_uri: Uri = outside_uri_str.parse().unwrap();
+            let inside_uri: Uri = inside_uri_str.parse().unwrap();
 
             tx.send(LspNotification::PublishDiagnostics(
                 PublishDiagnosticsParams {
