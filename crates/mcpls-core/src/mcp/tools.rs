@@ -3,10 +3,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Parameters for the `get_hover` tool.
+/// Shared position parameters (file path plus 1-based line/character) used by
+/// every tool that operates at a single point in a file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for getting hover information at a position in a file.")]
-pub struct HoverParams {
+pub struct PositionParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
@@ -16,36 +16,51 @@ pub struct HoverParams {
     /// Character/column number (1-based).
     #[schemars(description = "Character/column number (1-based).")]
     pub character: u32,
+}
+
+/// Shared range parameters (1-based start/end line and character) used by
+/// every tool that operates over a range in a file.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RangeParams {
+    /// Start line (1-based).
+    #[schemars(description = "Start line (1-based).")]
+    pub start_line: u32,
+    /// Start character (1-based).
+    #[schemars(description = "Start character (1-based).")]
+    pub start_character: u32,
+    /// End line (1-based).
+    #[schemars(description = "End line (1-based).")]
+    pub end_line: u32,
+    /// End character (1-based).
+    #[schemars(description = "End character (1-based).")]
+    pub end_character: u32,
+}
+
+/// Parameters for the `get_hover` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for getting hover information at a position in a file.")]
+pub struct HoverParams {
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
 }
 
 /// Parameters for the `get_definition` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting the definition location of a symbol.")]
 pub struct DefinitionParams {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
-    /// Line number (1-based).
-    #[schemars(description = "Line number (1-based).")]
-    pub line: u32,
-    /// Character/column number (1-based).
-    #[schemars(description = "Character/column number (1-based).")]
-    pub character: u32,
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
 }
 
 /// Parameters for the `get_references` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for finding all references to a symbol.")]
 pub struct ReferencesParams {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
-    /// Line number (1-based).
-    #[schemars(description = "Line number (1-based).")]
-    pub line: u32,
-    /// Character/column number (1-based).
-    #[schemars(description = "Character/column number (1-based).")]
-    pub character: u32,
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
     /// Whether to include the declaration in the results.
     #[schemars(description = "Whether to include the declaration in the results.")]
     #[serde(default)]
@@ -65,15 +80,9 @@ pub struct DiagnosticsParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for renaming a symbol across the workspace.")]
 pub struct RenameParams {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
-    /// Line number (1-based).
-    #[schemars(description = "Line number (1-based).")]
-    pub line: u32,
-    /// Character/column number (1-based).
-    #[schemars(description = "Character/column number (1-based).")]
-    pub character: u32,
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
     /// New name for the symbol.
     #[schemars(description = "New name for the symbol.")]
     pub new_name: String,
@@ -83,15 +92,9 @@ pub struct RenameParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting code completion suggestions.")]
 pub struct CompletionsParams {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
-    /// Line number (1-based).
-    #[schemars(description = "Line number (1-based).")]
-    pub line: u32,
-    /// Character/column number (1-based).
-    #[schemars(description = "Character/column number (1-based).")]
-    pub character: u32,
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
     /// Optional trigger character (e.g., '.', ':', '->').
     #[schemars(description = "Optional trigger character (e.g., '.', ':', '->').")]
     pub trigger: Option<String>,
@@ -161,18 +164,9 @@ pub struct CodeActionsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
-    /// Start line (1-based).
-    #[schemars(description = "Start line (1-based).")]
-    pub start_line: u32,
-    /// Start character (1-based).
-    #[schemars(description = "Start character (1-based).")]
-    pub start_character: u32,
-    /// End line (1-based).
-    #[schemars(description = "End line (1-based).")]
-    pub end_line: u32,
-    /// End character (1-based).
-    #[schemars(description = "End character (1-based).")]
-    pub end_character: u32,
+    /// Range in the file to operate on.
+    #[serde(flatten)]
+    pub range: RangeParams,
     /// Optional filter by action kind (quickfix, refactor, source, etc.).
     #[schemars(description = "Optional filter by action kind (quickfix, refactor, source, etc.).")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,15 +177,9 @@ pub struct CodeActionsParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for preparing call hierarchy at a position.")]
 pub struct CallHierarchyPrepareParams {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
-    /// Line number (1-based).
-    #[schemars(description = "Line number (1-based).")]
-    pub line: u32,
-    /// Character/column number (1-based).
-    #[schemars(description = "Character/column number (1-based).")]
-    pub character: u32,
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
 }
 
 /// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.
@@ -254,45 +242,27 @@ const fn default_message_limit() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting signature help at a position in a file.")]
 pub struct SignatureHelpParams {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
-    /// Line number (1-based).
-    #[schemars(description = "Line number (1-based).")]
-    pub line: u32,
-    /// Character/column number (1-based).
-    #[schemars(description = "Character/column number (1-based).")]
-    pub character: u32,
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
 }
 
 /// Parameters for the `go_to_implementation` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for navigating to implementations of a symbol.")]
 pub struct GoToImplementationParams {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
-    /// Line number (1-based).
-    #[schemars(description = "Line number (1-based).")]
-    pub line: u32,
-    /// Character/column number (1-based).
-    #[schemars(description = "Character/column number (1-based).")]
-    pub character: u32,
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
 }
 
 /// Parameters for the `go_to_type_definition` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for navigating to the type definition of an expression.")]
 pub struct GoToTypeDefinitionParams {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
-    /// Line number (1-based).
-    #[schemars(description = "Line number (1-based).")]
-    pub line: u32,
-    /// Character/column number (1-based).
-    #[schemars(description = "Character/column number (1-based).")]
-    pub character: u32,
+    /// Position in the file to operate on.
+    #[serde(flatten)]
+    pub position: PositionParams,
 }
 
 /// Parameters for the `get_inlay_hints` tool.
@@ -302,16 +272,99 @@ pub struct InlayHintsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
-    /// Start line (1-based).
-    #[schemars(description = "Start line (1-based).")]
-    pub start_line: u32,
-    /// Start character (1-based).
-    #[schemars(description = "Start character (1-based).")]
-    pub start_character: u32,
-    /// End line (1-based).
-    #[schemars(description = "End line (1-based).")]
-    pub end_line: u32,
-    /// End character (1-based).
-    #[schemars(description = "End character (1-based).")]
-    pub end_character: u32,
+    /// Range in the file to operate on.
+    #[serde(flatten)]
+    pub range: RangeParams,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// `#[serde(flatten)]` must keep `PositionParams`/`RangeParams` fields at
+    /// the top level of the wire format, since MCP clients send flat JSON
+    /// objects with no knowledge of the Rust-side nesting.
+    #[test]
+    fn flattened_params_serialize_to_flat_json() {
+        let hover = HoverParams {
+            position: PositionParams {
+                file_path: "/a.rs".to_string(),
+                line: 1,
+                character: 2,
+            },
+        };
+        let json = serde_json::to_value(&hover).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2})
+        );
+
+        let inlay = InlayHintsParams {
+            file_path: "/b.rs".to_string(),
+            range: RangeParams {
+                start_line: 1,
+                start_character: 2,
+                end_line: 3,
+                end_character: 4,
+            },
+        };
+        let json = serde_json::to_value(&inlay).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "file_path": "/b.rs",
+                "start_line": 1,
+                "start_character": 2,
+                "end_line": 3,
+                "end_character": 4,
+            })
+        );
+    }
+
+    /// A flat JSON object (what an MCP client actually sends) must deserialize
+    /// into the nested Rust shape produced by `#[serde(flatten)]`.
+    #[test]
+    fn flat_json_deserializes_into_flattened_params() {
+        let json = serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2});
+        let hover: HoverParams = serde_json::from_value(json).unwrap();
+        assert_eq!(hover.position.file_path, "/a.rs");
+        assert_eq!(hover.position.line, 1);
+        assert_eq!(hover.position.character, 2);
+    }
+
+    /// The generated JSON schema must expose `PositionParams`/`RangeParams`
+    /// fields as top-level properties, not nested under `position`/`range` --
+    /// otherwise MCP clients would see a schema that no longer matches the
+    /// flat wire format.
+    #[test]
+    fn generated_schema_exposes_flattened_fields_at_top_level() {
+        let schema = schemars::schema_for!(HoverParams);
+        let properties = schema
+            .as_object()
+            .unwrap()
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(properties.contains_key("file_path"));
+        assert!(properties.contains_key("line"));
+        assert!(properties.contains_key("character"));
+        assert!(!properties.contains_key("position"));
+
+        let schema = schemars::schema_for!(InlayHintsParams);
+        let properties = schema
+            .as_object()
+            .unwrap()
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(properties.contains_key("file_path"));
+        assert!(properties.contains_key("start_line"));
+        assert!(properties.contains_key("start_character"));
+        assert!(properties.contains_key("end_line"));
+        assert!(properties.contains_key("end_character"));
+        assert!(!properties.contains_key("range"));
+    }
 }
