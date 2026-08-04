@@ -12,6 +12,8 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use url::Url;
 
+use super::state::encode_rfc3986_path_chars;
+
 /// URI scheme used for diagnostic resources.
 const SCHEME: &str = "lsp-diagnostics";
 
@@ -45,7 +47,10 @@ pub enum ResourceUriError {
 /// Encode an absolute filesystem path into a `lsp-diagnostics:///…` resource URI.
 ///
 /// Percent-encoding is delegated to [`url::Url::from_file_path`], which
-/// handles spaces, unicode, `%`, `?`, `#`, and platform separators correctly.
+/// handles spaces, unicode, `%`, `?`, `#`, and platform separators correctly,
+/// plus an additional pass for the RFC 3986 §2.2 "other reserved" characters
+/// (`[ ] ^ |`) that `url` otherwise leaves unescaped — the same encoding
+/// applied to `file://` URIs.
 ///
 /// # Errors
 ///
@@ -66,8 +71,10 @@ pub fn make_uri(path: &Path) -> Result<String, ResourceUriError> {
         .map_err(|()| ResourceUriError::InvalidPath(path.display().to_string()))?;
 
     // Replace the "file" scheme with our custom scheme while keeping the
-    // already-percent-encoded path and authority (empty) components.
-    let uri = format!("{SCHEME}://{}", &file_url[url::Position::BeforeHost..]);
+    // percent-encoded path and authority (empty) components.
+    let encoded = encode_rfc3986_path_chars(&file_url);
+    let after_scheme = encoded.strip_prefix(file_url.scheme()).unwrap_or(&encoded);
+    let uri = format!("{SCHEME}{after_scheme}");
     Ok(uri)
 }
 
@@ -256,6 +263,40 @@ mod tests {
         // Space must be percent-encoded as %20
         assert!(uri.contains("%20"), "Expected %20 in: {uri}");
         assert!(uri.starts_with("lsp-diagnostics:///"));
+    }
+
+    /// #265 regression: all seven RFC 3986 §2.2 "other reserved" characters
+    /// must be percent-encoded in `lsp-diagnostics://` URIs, same as
+    /// `file://` URIs from `try_path_to_uri` (see
+    /// `test_path_to_uri_percent_encodes_all_rfc3986_other_reserved_chars`
+    /// in `state.rs`). `{`, `}`, and backtick are already encoded by the
+    /// `url` crate on serialization; `[`, `]`, `^`, `|` are handled
+    /// explicitly by `encode_rfc3986_path_chars`.
+    #[cfg(unix)]
+    #[test]
+    fn test_make_uri_percent_encodes_reserved_chars() {
+        let path = Path::new("/home/user/test[]^|{}`.ts");
+        let uri = make_uri(path).unwrap();
+
+        for (raw, encoded) in [
+            ('[', "%5B"),
+            (']', "%5D"),
+            ('^', "%5E"),
+            ('|', "%7C"),
+            ('{', "%7B"),
+            ('}', "%7D"),
+            ('`', "%60"),
+        ] {
+            assert!(
+                uri.contains(encoded),
+                "expected {raw:?} to be percent-encoded as {encoded} in {uri}"
+            );
+        }
+        assert!(
+            !uri.contains(['[', ']', '^', '|', '{', '}', '`']),
+            "no raw reserved characters should remain in {uri}"
+        );
+        assert_eq!(parse_uri(&uri).unwrap(), path);
     }
 
     // ------------------------------------------------------------------

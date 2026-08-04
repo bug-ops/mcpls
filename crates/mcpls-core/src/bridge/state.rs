@@ -844,7 +844,10 @@ fn windows_rooted_path_to_file_url(path: &Path) -> Option<Url> {
 /// `}`, and backtick -- are already encoded by `url` on serialization, so
 /// they need no handling here; see
 /// `test_path_to_uri_percent_encodes_all_rfc3986_other_reserved_chars`.
-fn encode_rfc3986_path_chars(url: &Url) -> String {
+///
+/// Shared with [`crate::bridge::resources::make_uri`] so `lsp-diagnostics://`
+/// resource URIs get the same encoding as `file://` document URIs.
+pub(super) fn encode_rfc3986_path_chars(url: &Url) -> String {
     let prefix = url[..url::Position::BeforePath].to_owned();
     let encoded = url[url::Position::BeforePath..]
         .replace('[', "%5B")
