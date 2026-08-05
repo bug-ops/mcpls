@@ -9,7 +9,7 @@ mod tools;
 
 pub use server::McplsServer;
 pub use tools::{
-    CallHierarchyCallsParams, CallHierarchyPrepareParams, CompletionsParams, DefinitionParams,
-    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams, PositionParams,
-    RangeParams, ReferencesParams, RenameParams, WorkspaceSymbolParams,
+    CallHierarchyCallsParams, CompletionsParams, DiagnosticsParams, DocumentSymbolsParams,
+    FormatDocumentParams, PositionParams, RangeParams, ReferencesParams, RenameParams,
+    WorkspaceSymbolParams,
 };

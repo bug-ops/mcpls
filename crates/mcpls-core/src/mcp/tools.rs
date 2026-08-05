@@ -36,24 +36,6 @@ pub struct RangeParams {
     pub end_character: u32,
 }
 
-/// Parameters for the `get_hover` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for getting hover information at a position in a file.")]
-pub struct HoverParams {
-    /// Position in the file to operate on.
-    #[serde(flatten)]
-    pub position: PositionParams,
-}
-
-/// Parameters for the `get_definition` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for getting the definition location of a symbol.")]
-pub struct DefinitionParams {
-    /// Position in the file to operate on.
-    #[serde(flatten)]
-    pub position: PositionParams,
-}
-
 /// Parameters for the `get_references` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for finding all references to a symbol.")]
@@ -173,15 +155,6 @@ pub struct CodeActionsParams {
     pub kind_filter: Option<String>,
 }
 
-/// Parameters for the `prepare_call_hierarchy` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for preparing call hierarchy at a position.")]
-pub struct CallHierarchyPrepareParams {
-    /// Position in the file to operate on.
-    #[serde(flatten)]
-    pub position: PositionParams,
-}
-
 /// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(
@@ -238,33 +211,6 @@ const fn default_message_limit() -> usize {
     20
 }
 
-/// Parameters for the `get_signature_help` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for getting signature help at a position in a file.")]
-pub struct SignatureHelpParams {
-    /// Position in the file to operate on.
-    #[serde(flatten)]
-    pub position: PositionParams,
-}
-
-/// Parameters for the `go_to_implementation` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for navigating to implementations of a symbol.")]
-pub struct GoToImplementationParams {
-    /// Position in the file to operate on.
-    #[serde(flatten)]
-    pub position: PositionParams,
-}
-
-/// Parameters for the `go_to_type_definition` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for navigating to the type definition of an expression.")]
-pub struct GoToTypeDefinitionParams {
-    /// Position in the file to operate on.
-    #[serde(flatten)]
-    pub position: PositionParams,
-}
-
 /// Parameters for the `get_inlay_hints` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting inlay hints in a range.")]
@@ -287,17 +233,23 @@ mod tests {
     /// objects with no knowledge of the Rust-side nesting.
     #[test]
     fn flattened_params_serialize_to_flat_json() {
-        let hover = HoverParams {
+        let references = ReferencesParams {
             position: PositionParams {
                 file_path: "/a.rs".to_string(),
                 line: 1,
                 character: 2,
             },
+            include_declaration: true,
         };
-        let json = serde_json::to_value(&hover).unwrap();
+        let json = serde_json::to_value(&references).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2})
+            serde_json::json!({
+                "file_path": "/a.rs",
+                "line": 1,
+                "character": 2,
+                "include_declaration": true,
+            })
         );
 
         let inlay = InlayHintsParams {
@@ -327,10 +279,11 @@ mod tests {
     #[test]
     fn flat_json_deserializes_into_flattened_params() {
         let json = serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2});
-        let hover: HoverParams = serde_json::from_value(json).unwrap();
-        assert_eq!(hover.position.file_path, "/a.rs");
-        assert_eq!(hover.position.line, 1);
-        assert_eq!(hover.position.character, 2);
+        let references: ReferencesParams = serde_json::from_value(json).unwrap();
+        assert_eq!(references.position.file_path, "/a.rs");
+        assert_eq!(references.position.line, 1);
+        assert_eq!(references.position.character, 2);
+        assert!(!references.include_declaration);
     }
 
     /// The generated JSON schema must expose `PositionParams`/`RangeParams`
@@ -339,7 +292,7 @@ mod tests {
     /// flat wire format.
     #[test]
     fn generated_schema_exposes_flattened_fields_at_top_level() {
-        let schema = schemars::schema_for!(HoverParams);
+        let schema = schemars::schema_for!(ReferencesParams);
         let properties = schema
             .as_object()
             .unwrap()
@@ -350,6 +303,7 @@ mod tests {
         assert!(properties.contains_key("file_path"));
         assert!(properties.contains_key("line"));
         assert!(properties.contains_key("character"));
+        assert!(properties.contains_key("include_declaration"));
         assert!(!properties.contains_key("position"));
 
         let schema = schemars::schema_for!(InlayHintsParams);

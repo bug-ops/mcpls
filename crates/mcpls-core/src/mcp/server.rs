@@ -6,23 +6,23 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
     ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
-    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, ToolAnnotations,
+    UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
 use super::tools::{
-    CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
-    CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
-    DocumentSymbolsParams, FormatDocumentParams, GoToImplementationParams,
-    GoToTypeDefinitionParams, HoverParams, InlayHintsParams, PositionParams, RangeParams,
-    ReferencesParams, RenameParams, ServerLogsParams, ServerMessagesParams, SignatureHelpParams,
-    WorkspaceSymbolParams,
+    CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
+    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, InlayHintsParams,
+    PositionParams, RangeParams, ReferencesParams, RenameParams, ServerLogsParams,
+    ServerMessagesParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
@@ -152,7 +152,7 @@ fn build_resource_diagnostics_response(
     ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry)
 }
 
-#[tool_router]
+#[tool_router(router = declared_tool_router)]
 impl McplsServer {
     /// Create a new MCP server with the given translator, notification cache,
     /// workspace roots, and subscriptions.
@@ -179,80 +179,73 @@ impl McplsServer {
         Self { context }
     }
 
+    /// Router for every MCP tool, with the read-only classification applied.
+    ///
+    /// Every mcpls tool is a read-only LSP query: `rename_symbol`,
+    /// `format_document` and `get_code_actions` return a *proposed*
+    /// `WorkspaceEdit` and never write to disk. Applying that once here
+    /// replaces an identical `annotations(...)` block on all 20 `#[tool]`
+    /// attributes. A tool declaring its own annotations keeps them;
+    /// `test_tool_annotation_classifications_match_intent` forces a future
+    /// mutating tool to write down an explicit classification rather than
+    /// inherit this default silently.
+    fn tool_router() -> ToolRouter<Self> {
+        let mut router = Self::declared_tool_router();
+        for route in router.map.values_mut() {
+            let title = route.attr.title.clone();
+            route.attr.annotations.get_or_insert_with(|| {
+                ToolAnnotations::from_raw(title, Some(true), Some(false), Some(true), None)
+            });
+        }
+        router
+    }
+
     /// Get hover information at a position in a file.
     #[tool(
         description = "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols.",
-        title = "Hover",
-        annotations(
-            title = "Hover",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Hover"
     )]
     async fn get_hover(
         &self,
-        Parameters(HoverParams {
-            position:
-                PositionParams {
-                    file_path,
-                    line,
-                    character,
-                },
-        }): Parameters<HoverParams>,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_hover(file_path, line, character)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Get the definition location of a symbol.
     #[tool(
         description = "Definition location of symbol at position. Returns file path, line, and character where declared.",
-        title = "Go to Definition",
-        annotations(
-            title = "Go to Definition",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Go to Definition"
     )]
     async fn get_definition(
         &self,
-        Parameters(DefinitionParams {
-            position:
-                PositionParams {
-                    file_path,
-                    line,
-                    character,
-                },
-        }): Parameters<DefinitionParams>,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_definition(file_path, line, character)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Find all references to a symbol.
     #[tool(
         description = "All references to symbol at position. Returns locations across workspace where symbol is used.",
-        title = "Find References",
-        annotations(
-            title = "Find References",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Find References"
     )]
     async fn get_references(
         &self,
@@ -266,26 +259,18 @@ impl McplsServer {
             include_declaration,
         }): Parameters<ReferencesParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_references(file_path, line, character, include_declaration)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Get diagnostics for a file.
     #[tool(
         description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location.",
-        title = "Diagnostics",
-        annotations(
-            title = "Diagnostics",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Diagnostics"
     )]
     async fn get_diagnostics(
         &self,
@@ -294,13 +279,12 @@ impl McplsServer {
         // Merging push-model (flycheck/clippy) diagnostics into the pull
         // result, including the pull-error-but-cache-has-data fallback, is
         // handled inside handle_diagnostics itself -- see its doc comment.
-        let result = self
-            .context
-            .translator
-            .handle_diagnostics(file_path, &self.context.notification_cache)
-            .await;
-
-        to_tool_result(result)
+        to_tool_result(
+            self.context
+                .translator
+                .handle_diagnostics(file_path, &self.context.notification_cache)
+                .await,
+        )
     }
 
     /// Rename a symbol across the workspace.
@@ -308,13 +292,7 @@ impl McplsServer {
     // has no write-back path today; revisit if that changes.
     #[tool(
         description = "Rename symbol across workspace. Returns text edits for all files where symbol is used.",
-        title = "Rename Symbol",
-        annotations(
-            title = "Rename Symbol",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Rename Symbol"
     )]
     async fn rename_symbol(
         &self,
@@ -328,26 +306,18 @@ impl McplsServer {
             new_name,
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_rename(file_path, line, character, new_name)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Get code completion suggestions.
     #[tool(
         description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets.",
-        title = "Completions",
-        annotations(
-            title = "Completions",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Completions"
     )]
     async fn get_completions(
         &self,
@@ -361,39 +331,29 @@ impl McplsServer {
             trigger,
         }): Parameters<CompletionsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_completions(file_path, line, character, trigger)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Get all symbols in a document.
     #[tool(
         description = "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations.",
-        title = "Document Symbols",
-        annotations(
-            title = "Document Symbols",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Document Symbols"
     )]
     async fn get_document_symbols(
         &self,
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_document_symbols(file_path)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Format a document according to language server rules.
@@ -401,13 +361,7 @@ impl McplsServer {
     // has no write-back path today; revisit if that changes.
     #[tool(
         description = "Format document with language-specific rules. Returns text edits for indentation, spacing, and style.",
-        title = "Format Document",
-        annotations(
-            title = "Format Document",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Format Document"
     )]
     async fn format_document(
         &self,
@@ -417,26 +371,18 @@ impl McplsServer {
             insert_spaces,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_format_document(file_path, tab_size, insert_spaces)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Search for symbols across the workspace.
     #[tool(
         description = "Search workspace symbols by name. Supports partial matching and fuzzy search.",
-        title = "Workspace Symbol Search",
-        annotations(
-            title = "Workspace Symbol Search",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Workspace Symbol Search"
     )]
     async fn workspace_symbol_search(
         &self,
@@ -446,14 +392,12 @@ impl McplsServer {
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_workspace_symbol(query, kind_filter, limit)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Get code actions for a range.
@@ -461,13 +405,7 @@ impl McplsServer {
     // mcpls has no write-back path today; revisit if that changes.
     #[tool(
         description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits.",
-        title = "Code Actions",
-        annotations(
-            title = "Code Actions",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Code Actions"
     )]
     async fn get_code_actions(
         &self,
@@ -483,7 +421,7 @@ impl McplsServer {
             kind_filter,
         }): Parameters<CodeActionsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_code_actions(
@@ -494,94 +432,59 @@ impl McplsServer {
                     end_character,
                     kind_filter,
                 )
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Prepare call hierarchy at a position.
     #[tool(
         description = "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis.",
-        title = "Prepare Call Hierarchy",
-        annotations(
-            title = "Prepare Call Hierarchy",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Prepare Call Hierarchy"
     )]
     async fn prepare_call_hierarchy(
         &self,
-        Parameters(CallHierarchyPrepareParams {
-            position:
-                PositionParams {
-                    file_path,
-                    line,
-                    character,
-                },
-        }): Parameters<CallHierarchyPrepareParams>,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_call_hierarchy_prepare(file_path, line, character)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Get incoming calls (callers).
     #[tool(
         description = "Functions calling the specified item. Takes call hierarchy item, returns all callers.",
-        title = "Incoming Calls",
-        annotations(
-            title = "Incoming Calls",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Incoming Calls"
     )]
     async fn get_incoming_calls(
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let result = { self.context.translator.handle_incoming_calls(item).await };
-
-        to_tool_result(result)
+        to_tool_result(self.context.translator.handle_incoming_calls(item).await)
     }
 
     /// Get outgoing calls (callees).
     #[tool(
         description = "Functions called by the specified item. Takes call hierarchy item, returns all callees.",
-        title = "Outgoing Calls",
-        annotations(
-            title = "Outgoing Calls",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Outgoing Calls"
     )]
     async fn get_outgoing_calls(
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let result = { self.context.translator.handle_outgoing_calls(item).await };
-
-        to_tool_result(result)
+        to_tool_result(self.context.translator.handle_outgoing_calls(item).await)
     }
 
     /// Get cached diagnostics for a file.
     #[tool(
         description = "Cached diagnostics from server notifications. Faster than get_diagnostics, no new analysis.",
-        title = "Cached Diagnostics",
-        annotations(
-            title = "Cached Diagnostics",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Cached Diagnostics"
     )]
     async fn get_cached_diagnostics(
         &self,
@@ -619,155 +522,100 @@ impl McplsServer {
     /// Get recent LSP server log messages.
     #[tool(
         description = "Recent server log messages. Filter by level (error, warning, info, debug) for debugging.",
-        title = "Server Logs",
-        annotations(
-            title = "Server Logs",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Server Logs"
     )]
     async fn get_server_logs(
         &self,
         Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result({
             let cache = self.context.notification_cache.lock().await;
             Translator::handle_server_logs(&cache, limit, min_level)
-        };
-
-        to_tool_result(result)
+        })
     }
 
     /// Get recent LSP server messages.
     #[tool(
         description = "Recent server messages (showMessage notifications). User-facing prompts and status updates.",
-        title = "Server Messages",
-        annotations(
-            title = "Server Messages",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Server Messages"
     )]
     async fn get_server_messages(
         &self,
         Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result({
             let cache = self.context.notification_cache.lock().await;
             Translator::handle_server_messages(&cache, limit)
-        };
-
-        to_tool_result(result)
+        })
     }
 
     /// Get signature help at a position.
     #[tool(
         description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call.",
-        title = "Signature Help",
-        annotations(
-            title = "Signature Help",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Signature Help"
     )]
     async fn get_signature_help(
         &self,
-        Parameters(SignatureHelpParams {
-            position:
-                PositionParams {
-                    file_path,
-                    line,
-                    character,
-                },
-        }): Parameters<SignatureHelpParams>,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_signature_help(file_path, line, character)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Go to implementation locations.
     #[tool(
         description = "Implementation locations of trait method or interface member at position.",
-        title = "Go to Implementation",
-        annotations(
-            title = "Go to Implementation",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Go to Implementation"
     )]
     async fn go_to_implementation(
         &self,
-        Parameters(GoToImplementationParams {
-            position:
-                PositionParams {
-                    file_path,
-                    line,
-                    character,
-                },
-        }): Parameters<GoToImplementationParams>,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_implementation(file_path, line, character)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Go to type definition location.
     #[tool(
         description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings.",
-        title = "Go to Type Definition",
-        annotations(
-            title = "Go to Type Definition",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Go to Type Definition"
     )]
     async fn go_to_type_definition(
         &self,
-        Parameters(GoToTypeDefinitionParams {
-            position:
-                PositionParams {
-                    file_path,
-                    line,
-                    character,
-                },
-        }): Parameters<GoToTypeDefinitionParams>,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_type_definition(file_path, line, character)
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 
     /// Get inlay hints for a range.
     #[tool(
         description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline.",
-        title = "Inlay Hints",
-        annotations(
-            title = "Inlay Hints",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
+        title = "Inlay Hints"
     )]
     async fn get_inlay_hints(
         &self,
@@ -782,7 +630,7 @@ impl McplsServer {
                 },
         }): Parameters<InlayHintsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        to_tool_result(
             self.context
                 .translator
                 .handle_inlay_hints(
@@ -792,10 +640,8 @@ impl McplsServer {
                     end_line,
                     end_character,
                 )
-                .await
-        };
-
-        to_tool_result(result)
+                .await,
+        )
     }
 }
 
@@ -1054,12 +900,10 @@ mod tests {
     #[tokio::test]
     async fn test_hover_tool_with_params() {
         let server = create_test_server();
-        let params = Parameters(HoverParams {
-            position: PositionParams {
-                file_path: "/nonexistent/file.rs".to_string(),
-                line: 1,
-                character: 1,
-            },
+        let params = Parameters(PositionParams {
+            file_path: "/nonexistent/file.rs".to_string(),
+            line: 1,
+            character: 1,
         });
 
         // This should return an error (no LSP server configured)
@@ -1070,12 +914,10 @@ mod tests {
     #[tokio::test]
     async fn test_definition_tool_with_params() {
         let server = create_test_server();
-        let params = Parameters(DefinitionParams {
-            position: PositionParams {
-                file_path: "/test/file.rs".to_string(),
-                line: 10,
-                character: 5,
-            },
+        let params = Parameters(PositionParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
         });
 
         let result = server.get_definition(params).await;
@@ -1197,12 +1039,10 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_call_hierarchy_tool_with_params() {
         let server = create_test_server();
-        let params = Parameters(CallHierarchyPrepareParams {
-            position: PositionParams {
-                file_path: "/test/file.rs".to_string(),
-                line: 10,
-                character: 5,
-            },
+        let params = Parameters(PositionParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
         });
         let result = server.prepare_call_hierarchy(params).await;
         assert!(result.is_err());
@@ -1651,12 +1491,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_signature_help_tool_with_params() {
         let server = create_test_server();
-        let params = Parameters(SignatureHelpParams {
-            position: PositionParams {
-                file_path: "/test/file.rs".to_string(),
-                line: 10,
-                character: 5,
-            },
+        let params = Parameters(PositionParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
         });
 
         let result = server.get_signature_help(params).await;
@@ -1666,12 +1504,10 @@ mod tests {
     #[tokio::test]
     async fn test_go_to_implementation_tool_with_params() {
         let server = create_test_server();
-        let params = Parameters(GoToImplementationParams {
-            position: PositionParams {
-                file_path: "/test/file.rs".to_string(),
-                line: 10,
-                character: 5,
-            },
+        let params = Parameters(PositionParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
         });
 
         let result = server.go_to_implementation(params).await;
@@ -1681,12 +1517,10 @@ mod tests {
     #[tokio::test]
     async fn test_go_to_type_definition_tool_with_params() {
         let server = create_test_server();
-        let params = Parameters(GoToTypeDefinitionParams {
-            position: PositionParams {
-                file_path: "/test/file.rs".to_string(),
-                line: 10,
-                character: 5,
-            },
+        let params = Parameters(PositionParams {
+            file_path: "/test/file.rs".to_string(),
+            line: 10,
+            character: 5,
         });
 
         let result = server.go_to_type_definition(params).await;
@@ -1718,8 +1552,13 @@ mod tests {
     /// `Tool.title`) so MCP clients can decide when to skip confirmation dialogs
     /// (read-only tools) or must prompt the user (destructive tools) without
     /// invoking the tool first. Sourced from `tool_router().list_all()` (not a
-    /// hand-written list of tool names) so a future tool added without
-    /// annotations fails this test instead of silently passing.
+    /// hand-written list of tool names). This test alone does not catch a
+    /// future *mutating* tool that omits `annotations(...)`: `tool_router()`'s
+    /// central pass (see its doc comment) blanket-labels any such tool
+    /// read-only rather than leaving it `None`, so the hint assertions above
+    /// always pass. `test_tool_annotation_classifications_match_intent` below
+    /// forces a new mutating tool to write down an explicit classification,
+    /// though it does not verify that classification is truthful.
     #[test]
     fn test_all_tools_carry_annotations() {
         let tools = McplsServer::tool_router().list_all();
@@ -2176,5 +2015,32 @@ mod tests {
         let server = create_test_server();
         let info = server.get_info();
         assert!(info.capabilities.resources.is_some());
+    }
+
+    /// Dump the current tool surface to stdout so it can be captured into
+    /// `tool_surface.json`. Not part of the regular suite.
+    #[test]
+    #[ignore = "run manually to (re)generate tool_surface.json"]
+    fn dump_tool_surface() {
+        let tools = McplsServer::tool_router().list_all();
+        println!("{}", serde_json::to_string_pretty(&tools).unwrap());
+    }
+
+    /// Pins the client-visible tool surface (name, description, title,
+    /// annotations, input schema) exposed by `tool_router().list_all()`.
+    /// `serde_json::Value` comparison, not string comparison, so key
+    /// order/whitespace drift doesn't cause false failures -- only an actual
+    /// change to what an MCP client sees does.
+    #[test]
+    fn test_tool_surface_matches_golden_snapshot() {
+        let tools = McplsServer::tool_router().list_all();
+        let actual = serde_json::to_value(&tools).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("tool_surface.json")).unwrap();
+        assert_eq!(
+            actual, expected,
+            "client-visible tool surface changed -- update tool_surface.json only if the \
+             change is intentional"
+        );
     }
 }
