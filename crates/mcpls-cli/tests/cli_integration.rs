@@ -180,16 +180,15 @@ fn test_trust_project_config_env_false_does_not_grant_trust() {
     );
 }
 
-/// clap's derived value parser for this flag only accepts the literal
-/// `true`/`false` (see `ArgAction::SetTrue`'s `default_value_parser` in
-/// `clap_builder`, which uses `ValueParser::bool()`, not a boolish parser
-/// accepting `0`/`1`/`yes`/`no`). A malformed value like `0` must be
-/// *rejected* outright rather than silently coerced to either trust state —
-/// this is the strongest form of "does not grant trust": the process never
-/// gets far enough to load anything, trusted or not. We don't pin the exact
-/// clap error wording (brittle across clap upgrades); it's enough that the
-/// process fails before either trust branch's log line could appear, since
-/// argument parsing runs before logging is even initialized.
+/// `parse_bool_flag` (the custom `value_parser` on this field, see
+/// `args.rs`) accepts `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and
+/// `on`/`off`, case-insensitively — but a value outside that set must still
+/// be *rejected* outright rather than silently coerced to either trust
+/// state. This is the strongest form of "does not grant trust": the process
+/// never gets far enough to load anything, trusted or not. We don't pin the
+/// exact clap error wording (brittle across clap upgrades); it's enough
+/// that the process fails before either trust branch's log line could
+/// appear, since argument parsing runs before logging is even initialized.
 #[test]
 fn test_trust_project_config_env_invalid_value_rejected() {
     let temp_dir = TempDir::new().unwrap();
@@ -199,11 +198,46 @@ fn test_trust_project_config_env_invalid_value_rejected() {
     let mut cmd = Command::cargo_bin("mcpls").unwrap();
     clear_ambient_env(&mut cmd)
         .current_dir(temp_dir.path())
-        .env("MCPLS_TRUST_PROJECT_CONFIG", "0")
+        .env("MCPLS_TRUST_PROJECT_CONFIG", "banana")
         .assert()
         .failure()
         .stderr(predicate::str::contains("failed to load configuration").not())
         .stderr(predicate::str::contains("ignoring untrusted project-local config").not());
+}
+
+/// Companion to `test_trust_project_config_env_false_does_not_grant_trust`:
+/// `0` is one of the numeric spellings `parse_bool_flag` accepts as falsy
+/// (issue #295), so it must behave identically to `false` — proceed to the
+/// untrusted-config path, not get rejected as an invalid value like
+/// `test_trust_project_config_env_invalid_value_rejected` above.
+#[test]
+fn test_trust_project_config_env_0_does_not_grant_trust() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("mcpls.toml");
+    fs::write(&config_path, "this is not valid TOML {{{{").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
+    cmd.env_remove("MCPLS_LOG")
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG");
+    let output = cmd
+        .current_dir(temp_dir.path())
+        .env("MCPLS_TRUST_PROJECT_CONFIG", "0")
+        // See test_trust_project_config_env_false_does_not_grant_trust above
+        // for why this timeout is expected to always elapse.
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ignoring untrusted project-local config"),
+        "expected the untrusted-ignore warning, got stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to load configuration"),
+        "MCPLS_TRUST_PROJECT_CONFIG=0 must not grant trust; stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -327,6 +361,65 @@ fn test_log_json_env_var_emits_json_formatted_logs() {
         .stderr(predicate::str::contains(
             "\"message\":\"mcpls exited with an error\"",
         ));
+}
+
+/// Issue #295: `MCPLS_LOG_JSON` must accept boolean spellings beyond the
+/// exact literal `true` already covered above. Exercises the real
+/// `env = "MCPLS_LOG_JSON"` + `value_parser = parse_bool_flag` wiring on
+/// `Args::log_json` end-to-end (through clap, not just `parse_bool_flag` in
+/// isolation) for each truthy spelling, guarding against a regression that
+/// drops either attribute from the field.
+#[test]
+fn test_log_json_env_var_accepts_truthy_conventions() {
+    for value in ["1", "TRUE", "yes", "on", "Y"] {
+        let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+        clear_ambient_env(&mut cmd)
+            .env("MCPLS_LOG_JSON", value)
+            .arg("--config")
+            .arg("/nonexistent/path/to/config.toml")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("\"message\":\"starting mcpls\""));
+    }
+}
+
+/// Falsy counterpart of `test_log_json_env_var_accepts_truthy_conventions`:
+/// each spelling must be accepted (the process reaches `logging::init`, not
+/// a clap parse error) and select the compact non-JSON formatter, same as
+/// the unset-env default.
+#[test]
+fn test_log_json_env_var_accepts_falsy_conventions() {
+    for value in ["0", "no", "off", "N"] {
+        let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+        clear_ambient_env(&mut cmd)
+            .env("MCPLS_LOG_JSON", value)
+            .arg("--config")
+            .arg("/nonexistent/path/to/config.toml")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("starting mcpls"))
+            .stderr(predicate::str::contains("\"message\":\"starting mcpls\"").not());
+    }
+}
+
+/// A value outside `parse_bool_flag`'s accepted set must still be rejected
+/// at argument-parsing time, before `logging::init` (or anything else)
+/// runs — mirrors
+/// `test_trust_project_config_env_invalid_value_rejected` for the other
+/// bool+env field.
+#[test]
+fn test_log_json_env_var_rejects_invalid_value() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .env("MCPLS_LOG_JSON", "banana")
+        .arg("--config")
+        .arg("/nonexistent/path/to/config.toml")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("\"message\":\"starting mcpls\"").not());
 }
 
 /// Complements the two tests above: without `--log-json`/`MCPLS_LOG_JSON`,

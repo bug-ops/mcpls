@@ -88,7 +88,7 @@ no environment variable equivalent.
 | Flag | Short | Env var | Default | Notes |
 |---|---|---|---|---|
 | `--config <FILE>` | `-c` | `MCPLS_CONFIG` | auto-detect | Always trusted, even a *relative* path set via the env var — naming a path is treated as consent, so this bypasses the project-config trust gate entirely (see [Config trust model](#config-trust-model)). Hard-errors at startup if the file doesn't exist — unlike auto-detection, it never falls back to defaults. |
-| `--trust-project-config` | — | `MCPLS_TRUST_PROJECT_CONFIG` | `false` | See [Config trust model](#config-trust-model) below. The env var accepts only the literal strings `true`/`false`; any other value is a startup parse error. |
+| `--trust-project-config` | — | `MCPLS_TRUST_PROJECT_CONFIG` | `false` | See [Config trust model](#config-trust-model) below. The env var accepts `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive); any other value is a startup parse error. |
 | `--log-level <LEVEL>` | `-l` | `MCPLS_LOG` | `info` | Any `tracing-subscriber` `EnvFilter` directive works, e.g. `mcpls=debug,info`. An invalid value does **not** error — it silently falls back to `info`. |
 | `--log-json` | — | `MCPLS_LOG_JSON` | `false` | Parsed and accepted, but **not currently implemented**: logging always uses the compact human-readable formatter regardless of this flag. Do not rely on JSON log output. |
 | `--listen <ADDR>` | — | `MCPLS_LISTEN` | unset | HTTP transport bind address (e.g. `127.0.0.1:3000`). Only exists when built with `--features transport-http` — see [HTTP transport caveats](#registering-with-an-mcp-client). |

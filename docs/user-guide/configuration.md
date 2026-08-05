@@ -487,7 +487,7 @@ mcpls
 
 Output logs in JSON format.
 
-**Values**: `true`, `false`
+**Values**: `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, `on`/`off` (case-insensitive)
 **Default**: `false`
 
 ```bash

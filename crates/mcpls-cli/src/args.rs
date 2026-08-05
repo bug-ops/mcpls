@@ -4,6 +4,29 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// Parses a boolean flag/env value, accepting common truthy and falsy
+/// spellings beyond the strict `"true"`/`"false"` that `str::parse::<bool>`
+/// allows.
+///
+/// Environment variables rarely follow Rust's `bool` literal syntax, so this
+/// parser also accepts (case-insensitively) `1`/`0`, `yes`/`no`, `y`/`n`, and
+/// `on`/`off`. Any other value is rejected with a message naming the input.
+///
+/// The input is not trimmed: a whitespace-padded value (e.g. `" true "`) or
+/// an empty string is rejected, not coerced. This matters for
+/// `Environment=MCPLS_LOG_JSON=` (systemd) or `-e MCPLS_LOG_JSON=` (Docker)
+/// with no value after the `=`, which hard-fails startup rather than being
+/// treated as unset.
+pub fn parse_bool_flag(s: &str) -> Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Ok(true),
+        "0" | "false" | "no" | "n" | "off" => Ok(false),
+        other => Err(format!(
+            "invalid boolean value '{other}' (expected one of: 1, 0, true, false, yes, no, y, n, on, off)"
+        )),
+    }
+}
+
 /// Universal MCP to LSP Bridge
 ///
 /// Exposes Language Server Protocol capabilities as MCP tools,
@@ -31,9 +54,10 @@ pub struct Args {
     /// `command`/`args` mcpls spawns, so it is ignored by default to avoid
     /// arbitrary code execution when running mcpls against an untrusted
     /// checkout. Pass this flag only for repositories you trust. Via
-    /// `MCPLS_TRUST_PROJECT_CONFIG`, only the literal values `true`/`false`
-    /// are accepted; any other value is a parse error at startup.
-    #[arg(long, env = "MCPLS_TRUST_PROJECT_CONFIG")]
+    /// `MCPLS_TRUST_PROJECT_CONFIG`, accepted values are `1`/`0`, `true`/
+    /// `false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive); any
+    /// other value is a parse error at startup.
+    #[arg(long, env = "MCPLS_TRUST_PROJECT_CONFIG", value_parser = parse_bool_flag)]
     pub trust_project_config: bool,
 
     /// Logging level
@@ -43,7 +67,10 @@ pub struct Args {
     pub log_level: String,
 
     /// Output logs as JSON (for structured logging)
-    #[arg(long, default_value = "false", env = "MCPLS_LOG_JSON")]
+    ///
+    /// Via `MCPLS_LOG_JSON`, accepted values are `1`/`0`, `true`/`false`,
+    /// `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).
+    #[arg(long, default_value = "false", env = "MCPLS_LOG_JSON", value_parser = parse_bool_flag)]
     pub log_json: bool,
 
     /// Listen address for HTTP transport (e.g. 127.0.0.1:3000).
@@ -70,6 +97,38 @@ pub struct Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_bool_flag_accepts_truthy_spellings() {
+        for value in ["1", "true", "TRUE", "yes", "YES", "y", "Y", "on", "On"] {
+            assert_eq!(
+                parse_bool_flag(value),
+                Ok(true),
+                "expected {value:?} to parse as true"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_flag_accepts_falsy_spellings() {
+        for value in ["0", "false", "FALSE", "no", "NO", "n", "N", "off", "Off"] {
+            assert_eq!(
+                parse_bool_flag(value),
+                Ok(false),
+                "expected {value:?} to parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_flag_rejects_invalid_values() {
+        for value in ["banana", "2", "", "truee", "yesno"] {
+            assert!(
+                parse_bool_flag(value).is_err(),
+                "expected {value:?} to be rejected"
+            );
+        }
+    }
 
     #[test]
     fn test_default_args() {
