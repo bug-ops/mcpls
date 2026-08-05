@@ -114,7 +114,7 @@ jobs:
         with:
           cache-targets: "false"
           shared-key: "ci"
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
       - name: Build and archive tests
         run: cargo nextest archive --workspace --all-features --lib --bins --tests --archive-file nextest-archive.tar.zst
@@ -149,7 +149,7 @@ jobs:
         with:
           cache-targets: "false"
           shared-key: "build"
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Build binary
         run: cargo build --bin mcpls
       - name: Upload binary
