@@ -202,6 +202,23 @@ impl DocumentTracker {
         lock_std(&self.documents).get(path).cloned()
     }
 
+    /// Text of the 0-based `line`'th line of `path`'s currently tracked
+    /// content, or `None` if the document is not open or has no such line.
+    ///
+    /// Reads the in-memory content mcpls already sent the server via
+    /// `didOpen`/`didChange` -- cheaper than a disk read (no I/O, no
+    /// re-scanning the whole file) and more correct when disk and server
+    /// state have diverged (e.g. an edit not yet flushed to disk).
+    #[must_use]
+    pub fn line_text(&self, path: &Path, line: u32) -> Option<String> {
+        lock_std(&self.documents)
+            .get(path)?
+            .content
+            .lines()
+            .nth(line as usize)
+            .map(str::to_string)
+    }
+
     /// Get the number of open documents.
     #[must_use]
     pub fn len(&self) -> usize {

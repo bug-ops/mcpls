@@ -407,6 +407,16 @@ impl NotificationCache {
         self.diagnostics.get(uri_cache_key(uri).as_ref())
     }
 
+    /// Server that published the currently cached diagnostics for `uri`, if
+    /// any. Used to look up that server's negotiated position encoding for a
+    /// cache-only read that has no live LSP round trip of its own to resolve
+    /// one from.
+    #[inline]
+    #[must_use]
+    pub fn diagnostics_owner(&self, uri: &str) -> Option<&ServerId> {
+        self.diagnostics_owners.get(uri_cache_key(uri).as_ref())
+    }
+
     /// Get all stored log entries.
     #[inline]
     #[must_use]
@@ -1160,6 +1170,47 @@ mod tests {
             cache.store_diagnostics(&old_owner, &other, Some(1), vec![]);
         }
         assert!(cache.get_diagnostics(uri.as_str()).is_some());
+    }
+
+    /// #290: `diagnostics_owner` is what a cache-only read (e.g.
+    /// `get_cached_diagnostics`) uses to resolve the publishing server's
+    /// negotiated position encoding, so both branches -- an owner on record
+    /// and none -- must behave correctly.
+    #[test]
+    fn test_diagnostics_owner_returns_publisher_after_store() {
+        let mut cache = NotificationCache::new();
+        let server = ServerId::from("rust");
+        let uri: Uri = "file:///main.rs".parse().unwrap();
+
+        cache.store_diagnostics(&server, &uri, Some(1), vec![]);
+
+        assert_eq!(cache.diagnostics_owner(uri.as_str()), Some(&server));
+    }
+
+    #[test]
+    fn test_diagnostics_owner_none_for_untracked_uri() {
+        let cache = NotificationCache::new();
+        let uri: Uri = "file:///never-seen.rs".parse().unwrap();
+
+        assert_eq!(cache.diagnostics_owner(uri.as_str()), None);
+    }
+
+    /// Reassigning ownership (see `test_store_diagnostics_reassigns_ownership`
+    /// above) must also update `diagnostics_owner`, not just the cached
+    /// content -- otherwise a stale owner's encoding would be used to
+    /// convert a different server's diagnostics.
+    #[test]
+    fn test_diagnostics_owner_reflects_reassigned_ownership() {
+        let mut cache = NotificationCache::new();
+        let old_owner = ServerId::from("old");
+        let new_owner = ServerId::from("new");
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        cache.store_diagnostics(&old_owner, &uri, Some(1), vec![]);
+        assert_eq!(cache.diagnostics_owner(uri.as_str()), Some(&old_owner));
+
+        cache.store_diagnostics(&new_owner, &uri, Some(2), vec![]);
+        assert_eq!(cache.diagnostics_owner(uri.as_str()), Some(&new_owner));
     }
 
     /// #266 S2: clearing one server's diagnostics must not disturb another

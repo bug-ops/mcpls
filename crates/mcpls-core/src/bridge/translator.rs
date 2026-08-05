@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
-use super::state::{ResourceLimits, detect_language, path_to_uri};
+use super::state::{ResourceLimits, detect_language, path_to_uri, uri_to_path};
 use super::{DiagnosticInfo, DocumentTracker, NotificationCache, lock_std};
-use crate::bridge::encoding::mcp_to_lsp_position;
+use crate::bridge::encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 use crate::config::{NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id};
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
@@ -211,6 +211,31 @@ impl Translator {
         lock_std(&self.router).resolve(language_id, ToolKind::Diagnostics) == Some(id)
     }
 
+    /// Negotiated [`PositionEncoding`] of the registered server `id`, or the
+    /// LSP spec's own default (UTF-16) if `id` is not currently registered.
+    ///
+    /// Note this falls back to UTF-16, not [`PositionEncoding::default`]
+    /// (UTF-8): UTF-16 is what an absent/unrecognized negotiation means per
+    /// the LSP spec and what [`crate::lsp::LspServer::spawn`] itself falls
+    /// back to, so this must match rather than use the bridge type's own
+    /// default, which exists only for `PositionEncoding`'s own internal use.
+    #[must_use]
+    pub(crate) fn position_encoding_for(&self, server_id: &ServerId) -> PositionEncoding {
+        lock_std(&self.lsp_servers)
+            .get(server_id)
+            .and_then(|server| PositionEncoding::from_lsp(server.position_encoding().as_str()))
+            .unwrap_or(PositionEncoding::Utf16)
+    }
+
+    /// Build the [`EncodingCtx`] for converting positions/ranges in
+    /// responses from the registered server `id`.
+    fn encoding_ctx(&self, server_id: &ServerId) -> EncodingCtx {
+        EncodingCtx {
+            encoding: self.position_encoding_for(server_id),
+            tracker: self.document_tracker.clone(),
+        }
+    }
+
     /// Configure custom file extension mappings.
     ///
     /// This method sets the extension map and updates the document tracker
@@ -275,6 +300,14 @@ impl Translator {
     #[must_use]
     pub fn is_document_open(&self, path: &Path) -> bool {
         self.document_tracker.is_open(path)
+    }
+
+    /// The document tracker, shared with [`EncodingCtx`] so a cache-only
+    /// caller (e.g. `get_cached_diagnostics`) can still prefer tracked
+    /// in-memory content over a disk read when converting positions.
+    #[must_use]
+    pub(crate) const fn document_tracker(&self) -> &Arc<DocumentTracker> {
+        &self.document_tracker
     }
 
     /// Gracefully shut down every registered LSP server.
@@ -777,6 +810,117 @@ pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> 
     }
 
     Err(Error::PathOutsideWorkspace(path.to_path_buf()))
+}
+
+/// Per-response encoding context: the negotiated [`PositionEncoding`] of the
+/// LSP server that produced a response, used to convert every
+/// position/range in that response between MCP's 1-based UTF-16 columns and
+/// the server's own 0-based columns.
+///
+/// A single MCP tool call is always answered by exactly one LSP server, so
+/// one context covers every location in its response -- even when
+/// individual locations point into other files (e.g. `references` results
+/// spanning multiple documents): each conversion resolves the *referenced*
+/// file's line text independently rather than assuming it matches the
+/// originally queried document.
+#[derive(Debug, Clone)]
+struct EncodingCtx {
+    encoding: PositionEncoding,
+    /// Source of a tracked document's in-memory content -- the text mcpls
+    /// actually sent the server via `didOpen`/`didChange` -- consulted
+    /// before falling back to disk. See [`read_line_text`].
+    tracker: Arc<DocumentTracker>,
+}
+
+/// Text of the 0-based `line`'th line of the file at `uri`, or `None` if it
+/// cannot be resolved to a path, read, or has no such line.
+///
+/// Only ever consulted when the negotiated encoding is not UTF-16 (see
+/// [`EncodingCtx::to_lsp`]/[`EncodingCtx::to_mcp`]). Checks `tracker` first
+/// (in-memory, no I/O) -- this is by construction both cheaper and more
+/// correct than disk for any document mcpls has opened, since it is exactly
+/// the text the server was told about, so it can't diverge from the
+/// server's own view even if the file has since been edited on disk (see
+/// #290 S1). Only a document `tracker` has never seen falls through to an
+/// async disk read, matching `state.rs`'s `tokio::fs` convention so this
+/// never blocks the executor thread.
+async fn read_line_text(
+    uri: &lsp_types::Uri,
+    line: u32,
+    tracker: &DocumentTracker,
+) -> Option<String> {
+    let path = uri_to_path(uri)?;
+    if let Some(text) = tracker.line_text(&path, line) {
+        return Some(text);
+    }
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    content.lines().nth(line as usize).map(str::to_string)
+}
+
+impl EncodingCtx {
+    /// Convert an MCP position for the document at `uri` into an LSP
+    /// position in this context's negotiated encoding.
+    async fn to_lsp(&self, uri: &lsp_types::Uri, line: u32, character: u32) -> lsp_types::Position {
+        let line_text = if self.encoding == PositionEncoding::Utf16 {
+            None
+        } else {
+            let text = read_line_text(uri, line.saturating_sub(1), &self.tracker).await;
+            if text.is_none() {
+                tracing::warn!(
+                    uri = uri.as_str(),
+                    line,
+                    encoding = self.encoding.to_lsp(),
+                    "could not resolve line text for position conversion; passing MCP column \
+                     through unconverted, which is wrong for a non-UTF-16 server"
+                );
+            }
+            text
+        };
+        mcp_to_lsp_position(line, character, line_text.as_deref(), self.encoding)
+    }
+
+    /// Convert an LSP position (in this context's negotiated encoding) from
+    /// the document at `uri` into an MCP position.
+    async fn to_mcp(&self, uri: &lsp_types::Uri, pos: lsp_types::Position) -> Position2D {
+        let line_text = if self.encoding == PositionEncoding::Utf16 {
+            None
+        } else {
+            let text = read_line_text(uri, pos.line, &self.tracker).await;
+            if text.is_none() {
+                tracing::warn!(
+                    uri = uri.as_str(),
+                    line = pos.line,
+                    encoding = self.encoding.to_lsp(),
+                    "could not resolve line text for position conversion; passing server \
+                     column through unconverted, which is wrong for a non-UTF-16 server"
+                );
+            }
+            text
+        };
+        let (line, character) = lsp_to_mcp_position(pos, line_text.as_deref(), self.encoding);
+        Position2D { line, character }
+    }
+
+    /// Convert an LSP range (in this context's negotiated encoding) from the
+    /// document at `uri` into an MCP range.
+    async fn normalize_range(&self, uri: &lsp_types::Uri, range: lsp_types::Range) -> Range {
+        Range {
+            start: self.to_mcp(uri, range.start).await,
+            end: self.to_mcp(uri, range.end).await,
+        }
+    }
+
+    /// Convert an MCP range for the document at `uri` back into an LSP range
+    /// in this context's negotiated encoding -- the inverse of
+    /// [`Self::normalize_range`].
+    async fn denormalize_range(&self, uri: &lsp_types::Uri, range: &Range) -> lsp_types::Range {
+        lsp_types::Range {
+            start: self
+                .to_lsp(uri, range.start.line, range.start.character)
+                .await,
+            end: self.to_lsp(uri, range.end.line, range.end.character).await,
+        }
+    }
 }
 
 impl Translator {
@@ -1311,7 +1455,7 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<HoverResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(&file_path, ToolKind::Hover, "hoverProvider", |caps| {
                 matches!(
                     caps.hover_provider,
@@ -1322,7 +1466,9 @@ impl Translator {
                 )
             })
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, line, character).await;
+        let response_uri = uri.clone();
 
         let params = LspHoverParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -1339,7 +1485,10 @@ impl Translator {
         let result = match response {
             Some(hover) => {
                 let contents = extract_hover_contents(hover.contents);
-                let range = hover.range.map(normalize_range);
+                let range = match hover.range {
+                    Some(r) => Some(ctx.normalize_range(&response_uri, r).await),
+                    None => None,
+                };
                 HoverResult { contents, range }
             }
             None => HoverResult {
@@ -1363,7 +1512,7 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<DefinitionResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Definition,
@@ -1376,7 +1525,8 @@ impl Translator {
                 },
             )
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -1391,27 +1541,8 @@ impl Translator {
             .request("textDocument/definition", params, client.request_timeout())
             .await?;
 
-        let locations = match response {
-            Some(lsp_types::GotoDefinitionResponse::Scalar(loc)) => vec![loc],
-            Some(lsp_types::GotoDefinitionResponse::Array(locs)) => locs,
-            Some(lsp_types::GotoDefinitionResponse::Link(links)) => links
-                .into_iter()
-                .map(|link| lsp_types::Location {
-                    uri: link.target_uri,
-                    range: link.target_selection_range,
-                })
-                .collect(),
-            None => vec![],
-        };
-
         let result = DefinitionResult {
-            locations: locations
-                .into_iter()
-                .map(|loc| Location {
-                    uri: loc.uri.to_string(),
-                    range: normalize_range(loc.range),
-                })
-                .collect(),
+            locations: goto_response_to_locations(response, &ctx).await,
         };
 
         Ok(result)
@@ -1430,7 +1561,7 @@ impl Translator {
         character: u32,
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::References,
@@ -1443,7 +1574,8 @@ impl Translator {
                 },
             )
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
         let params = ReferenceParams {
             text_document_position: TextDocumentPositionParams {
@@ -1463,14 +1595,15 @@ impl Translator {
 
         let locations = response.unwrap_or_default();
 
+        let mut result_locations = Vec::with_capacity(locations.len());
+        for loc in locations {
+            result_locations.push(Location {
+                uri: loc.uri.to_string(),
+                range: ctx.normalize_range(&loc.uri, loc.range).await,
+            });
+        }
         let result = ReferencesResult {
-            locations: locations
-                .into_iter()
-                .map(|loc| Location {
-                    uri: loc.uri.to_string(),
-                    range: normalize_range(loc.range),
-                })
-                .collect(),
+            locations: result_locations,
         };
 
         Ok(result)
@@ -1507,9 +1640,10 @@ impl Translator {
         file_path: String,
         notification_cache: &Mutex<NotificationCache>,
     ) -> Result<DiagnosticsResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_document(&file_path, ToolKind::Diagnostics)
             .await?;
+        let ctx = self.encoding_ctx(&server_id);
 
         let params = diagnostic_request_params(TextDocumentIdentifier { uri: uri.clone() });
 
@@ -1533,13 +1667,26 @@ impl Translator {
                     },
                     lsp_types::DocumentDiagnosticReportResult::Partial(_) => vec![],
                 };
-                let pull = DiagnosticsResult {
-                    diagnostics: items.iter().map(diagnostic_to_mcp).collect(),
-                };
-                Ok(Self::merge_diagnostics(pull, diag_info.as_ref()))
+                let mut diagnostics = Vec::with_capacity(items.len());
+                for d in &items {
+                    diagnostics.push(diagnostic_to_mcp(d, &ctx, &uri).await);
+                }
+                let pull = DiagnosticsResult { diagnostics };
+                Ok(Self::merge_diagnostics(
+                    pull,
+                    diag_info.as_ref(),
+                    ctx.encoding,
+                    &self.document_tracker,
+                )
+                .await)
             }
             Err(e) => {
-                let cache_only = Self::diagnostics_from_cache_entry(diag_info.as_ref());
+                let cache_only = Self::diagnostics_from_cache_entry(
+                    diag_info.as_ref(),
+                    ctx.encoding,
+                    &self.document_tracker,
+                )
+                .await;
                 if cache_only.diagnostics.is_empty() {
                     Err(e)
                 } else {
@@ -1562,7 +1709,7 @@ impl Translator {
         character: u32,
         new_name: String,
     ) -> Result<RenameResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(&file_path, ToolKind::Rename, "renameProvider", |caps| {
                 matches!(
                     caps.rename_provider,
@@ -1570,7 +1717,8 @@ impl Translator {
                 )
             })
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
         let params = LspRenameParams {
             text_document_position: TextDocumentPositionParams {
@@ -1591,15 +1739,16 @@ impl Translator {
             // Prefer the legacy `changes` map (HashMap<Uri, Vec<TextEdit>>).
             if let Some(changes_map) = edit.changes {
                 for (uri, edits) in changes_map {
+                    let mut text_edits = Vec::with_capacity(edits.len());
+                    for e in edits {
+                        text_edits.push(TextEdit {
+                            range: ctx.normalize_range(&uri, e.range).await,
+                            new_text: e.new_text,
+                        });
+                    }
                     result_changes.push(DocumentChanges {
                         uri: uri.to_string(),
-                        edits: edits
-                            .into_iter()
-                            .map(|e| TextEdit {
-                                range: normalize_range(e.range),
-                                new_text: e.new_text,
-                            })
-                            .collect(),
+                        edits: text_edits,
                     });
                 }
             }
@@ -1618,22 +1767,23 @@ impl Translator {
                     None => vec![],
                 };
                 for tde in text_doc_edits {
+                    let edit_uri = &tde.text_document.uri;
+                    let mut text_edits = Vec::with_capacity(tde.edits.len());
+                    for one_of in tde.edits {
+                        text_edits.push(match one_of {
+                            lsp_types::OneOf::Left(te) => TextEdit {
+                                range: ctx.normalize_range(edit_uri, te.range).await,
+                                new_text: te.new_text,
+                            },
+                            lsp_types::OneOf::Right(ate) => TextEdit {
+                                range: ctx.normalize_range(edit_uri, ate.text_edit.range).await,
+                                new_text: ate.text_edit.new_text,
+                            },
+                        });
+                    }
                     result_changes.push(DocumentChanges {
-                        uri: tde.text_document.uri.to_string(),
-                        edits: tde
-                            .edits
-                            .into_iter()
-                            .map(|one_of| match one_of {
-                                lsp_types::OneOf::Left(te) => TextEdit {
-                                    range: normalize_range(te.range),
-                                    new_text: te.new_text,
-                                },
-                                lsp_types::OneOf::Right(ate) => TextEdit {
-                                    range: normalize_range(ate.text_edit.range),
-                                    new_text: ate.text_edit.new_text,
-                                },
-                            })
-                            .collect(),
+                        uri: edit_uri.to_string(),
+                        edits: text_edits,
                     });
                 }
             }
@@ -1659,7 +1809,7 @@ impl Translator {
         character: u32,
         trigger: Option<String>,
     ) -> Result<CompletionsResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Completions,
@@ -1667,7 +1817,10 @@ impl Translator {
                 |caps| caps.completion_provider.is_some(),
             )
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let lsp_position = self
+            .encoding_ctx(&server_id)
+            .to_lsp(&uri, line, character)
+            .await;
 
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
             trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
@@ -1726,7 +1879,7 @@ impl Translator {
         &self,
         file_path: String,
     ) -> Result<DocumentSymbolsResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::DocumentSymbols,
@@ -1739,6 +1892,8 @@ impl Translator {
                 },
             )
             .await?;
+        let ctx = self.encoding_ctx(&server_id);
+        let response_uri = uri.clone();
 
         let params = DocumentSymbolParams {
             text_document: TextDocumentIdentifier { uri },
@@ -1755,18 +1910,31 @@ impl Translator {
             .await?;
 
         let symbols = match response {
-            Some(lsp_types::DocumentSymbolResponse::Flat(symbols)) => symbols
-                .into_iter()
-                .map(|sym| Symbol {
-                    name: sym.name,
-                    kind: format!("{:?}", sym.kind),
-                    range: normalize_range(sym.location.range),
-                    selection_range: normalize_range(sym.location.range),
-                    children: None,
-                })
-                .collect(),
+            Some(lsp_types::DocumentSymbolResponse::Flat(symbols)) => {
+                let mut result = Vec::with_capacity(symbols.len());
+                for sym in symbols {
+                    let range = ctx
+                        .normalize_range(&sym.location.uri, sym.location.range)
+                        .await;
+                    let selection_range = ctx
+                        .normalize_range(&sym.location.uri, sym.location.range)
+                        .await;
+                    result.push(Symbol {
+                        name: sym.name,
+                        kind: format!("{:?}", sym.kind),
+                        range,
+                        selection_range,
+                        children: None,
+                    });
+                }
+                result
+            }
             Some(lsp_types::DocumentSymbolResponse::Nested(symbols)) => {
-                symbols.into_iter().map(convert_document_symbol).collect()
+                let mut result = Vec::with_capacity(symbols.len());
+                for sym in symbols {
+                    result.push(convert_document_symbol(sym, &ctx, &response_uri).await);
+                }
+                result
             }
             None => vec![],
         };
@@ -1786,7 +1954,7 @@ impl Translator {
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::FormatDocument,
@@ -1799,6 +1967,8 @@ impl Translator {
                 },
             )
             .await?;
+        let ctx = self.encoding_ctx(&server_id);
+        let response_uri = uri.clone();
 
         let params = DocumentFormattingParams {
             text_document: TextDocumentIdentifier { uri },
@@ -1816,14 +1986,15 @@ impl Translator {
 
         let edits = response.unwrap_or_default();
 
+        let mut result_edits = Vec::with_capacity(edits.len());
+        for edit in edits {
+            result_edits.push(TextEdit {
+                range: ctx.normalize_range(&response_uri, edit.range).await,
+                new_text: edit.new_text,
+            });
+        }
         let result = FormatDocumentResult {
-            edits: edits
-                .into_iter()
-                .map(|edit| TextEdit {
-                    range: normalize_range(edit.range),
-                    new_text: edit.new_text,
-                })
-                .collect(),
+            edits: result_edits,
         };
 
         Ok(result)
@@ -1895,19 +2066,22 @@ impl Translator {
             .request("workspace/symbol", params, client.request_timeout())
             .await?;
 
-        let mut symbols: Vec<WorkspaceSymbol> = response
-            .unwrap_or_default()
-            .into_iter()
-            .map(|sym| WorkspaceSymbol {
+        let ctx = self.encoding_ctx(&server_id);
+        let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
+        for sym in response.unwrap_or_default() {
+            let range = ctx
+                .normalize_range(&sym.location.uri, sym.location.range)
+                .await;
+            symbols.push(WorkspaceSymbol {
                 name: sym.name,
                 kind: format!("{:?}", sym.kind),
                 location: Location {
                     uri: sym.location.uri.to_string(),
-                    range: normalize_range(sym.location.range),
+                    range,
                 },
                 container_name: sym.container_name,
-            })
-            .collect();
+            });
+        }
 
         // Apply kind filter if specified
         if let Some(kind) = kind_filter {
@@ -1943,7 +2117,7 @@ impl Translator {
             kind_filter.as_deref(),
         )?;
 
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::CodeActions,
@@ -1959,10 +2133,12 @@ impl Translator {
                 },
             )
             .await?;
+        let ctx = self.encoding_ctx(&server_id);
+        let response_uri = uri.clone();
 
         let range = lsp_types::Range {
-            start: mcp_to_lsp_position(start_line, start_character),
-            end: mcp_to_lsp_position(end_line, end_character),
+            start: ctx.to_lsp(&uri, start_line, start_character).await,
+            end: ctx.to_lsp(&uri, end_line, end_character).await,
         };
 
         // Build context with optional kind filter
@@ -1994,7 +2170,9 @@ impl Translator {
 
         for action_or_command in response_vec {
             let action = match action_or_command {
-                lsp_types::CodeActionOrCommand::CodeAction(action) => convert_code_action(action),
+                lsp_types::CodeActionOrCommand::CodeAction(action) => {
+                    convert_code_action(action, &ctx, &response_uri).await
+                }
                 lsp_types::CodeActionOrCommand::Command(cmd) => {
                     let arguments = cmd.arguments.unwrap_or_else(Vec::new);
                     CodeAction {
@@ -2042,7 +2220,7 @@ impl Translator {
             )));
         }
 
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::CallHierarchy,
@@ -2050,7 +2228,8 @@ impl Translator {
                 call_hierarchy_provider_supported,
             )
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
         let params = LspCallHierarchyPrepareParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -2072,7 +2251,7 @@ impl Translator {
         let lsp_items = response.unwrap_or_default();
         let mut items = Vec::with_capacity(lsp_items.len());
         for item in lsp_items {
-            items.push(convert_call_hierarchy_item(item));
+            items.push(convert_call_hierarchy_item(item, &ctx).await);
         }
 
         Ok(CallHierarchyPrepareResult { items })
@@ -2088,15 +2267,15 @@ impl Translator {
         &self,
         item: serde_json::Value,
     ) -> Result<IncomingCallsResult> {
-        // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
-        let lsp_item = mcp_item_to_lsp(item)?;
+        // Deserialize as our own type (1-based coords).
+        let parsed = parse_mcp_call_hierarchy_item(item)?;
 
         // Parse and validate the URI. Resolved with the same ToolKind as
         // `handle_call_hierarchy_prepare` -- the opaque item this call
         // receives is only meaningful to the server that produced it, and
         // that server is guaranteed to be the same one `prepare` synced the
         // document to since both resolve via the same (language, tool) route.
-        let path = self.parse_file_uri(&lsp_item.uri)?;
+        let path = self.parse_file_uri(&parsed.uri)?;
         let (server_id, client) = self
             .resolve_client_for_file(&path, ToolKind::CallHierarchy)
             .await?;
@@ -2105,6 +2284,8 @@ impl Translator {
             "callHierarchyProvider",
             call_hierarchy_provider_supported,
         )?;
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_item = call_hierarchy_item_to_lsp(parsed, &ctx).await;
 
         let params = CallHierarchyIncomingCallsParams {
             item: lsp_item,
@@ -2125,16 +2306,19 @@ impl Translator {
         let mut calls = Vec::with_capacity(lsp_calls.len());
 
         for call in lsp_calls {
+            // Per the LSP spec, `fromRanges` are ranges within the *caller's*
+            // document (`call.from.uri`), not the queried item's document.
+            let from_uri = call.from.uri.clone();
             let from_ranges = {
                 let mut ranges = Vec::with_capacity(call.from_ranges.len());
                 for range in call.from_ranges {
-                    ranges.push(normalize_range(range));
+                    ranges.push(ctx.normalize_range(&from_uri, range).await);
                 }
                 ranges
             };
 
             calls.push(IncomingCall {
-                from: convert_call_hierarchy_item(call.from),
+                from: convert_call_hierarchy_item(call.from, &ctx).await,
                 from_ranges,
             });
         }
@@ -2152,12 +2336,12 @@ impl Translator {
         &self,
         item: serde_json::Value,
     ) -> Result<OutgoingCallsResult> {
-        // Deserialize as our own type (1-based coords) then convert to LSP (0-based).
-        let lsp_item = mcp_item_to_lsp(item)?;
+        // Deserialize as our own type (1-based coords).
+        let parsed = parse_mcp_call_hierarchy_item(item)?;
 
         // Parse and validate the URI. Same ToolKind/route as `prepare` and
         // `handle_incoming_calls` -- see that function's comment.
-        let path = self.parse_file_uri(&lsp_item.uri)?;
+        let path = self.parse_file_uri(&parsed.uri)?;
         let (server_id, client) = self
             .resolve_client_for_file(&path, ToolKind::CallHierarchy)
             .await?;
@@ -2166,6 +2350,11 @@ impl Translator {
             "callHierarchyProvider",
             call_hierarchy_provider_supported,
         )?;
+        let ctx = self.encoding_ctx(&server_id);
+        // Per the LSP spec, an outgoing call's `fromRanges` are ranges within
+        // the *queried* item's own document, not the callee's (`call.to.uri`).
+        let source_uri = parsed.uri.clone();
+        let lsp_item = call_hierarchy_item_to_lsp(parsed, &ctx).await;
 
         let params = CallHierarchyOutgoingCallsParams {
             item: lsp_item,
@@ -2189,13 +2378,13 @@ impl Translator {
             let from_ranges = {
                 let mut ranges = Vec::with_capacity(call.from_ranges.len());
                 for range in call.from_ranges {
-                    ranges.push(normalize_range(range));
+                    ranges.push(ctx.normalize_range(&source_uri, range).await);
                 }
                 ranges
             };
 
             calls.push(OutgoingCall {
-                to: convert_call_hierarchy_item(call.to),
+                to: convert_call_hierarchy_item(call.to, &ctx).await,
                 from_ranges,
             });
         }
@@ -2230,15 +2419,30 @@ impl Translator {
     /// `NotificationCache` lock) rather than the cache itself, so this
     /// mapping — which is not a bounded operation for a large diagnostics set
     /// — never runs while the cache is locked.
+    ///
+    /// `encoding` is the negotiated encoding of the server that published
+    /// these diagnostics; pass `PositionEncoding::Utf16` when no live server
+    /// context is available (e.g. a cache-only read with no resolved owner).
     #[must_use]
-    pub fn diagnostics_from_cache_entry(diag_info: Option<&DiagnosticInfo>) -> DiagnosticsResult {
-        let diagnostics = diag_info.map_or_else(Vec::new, |diag_info| {
-            diag_info
-                .diagnostics
-                .iter()
-                .map(diagnostic_to_mcp)
-                .collect()
-        });
+    pub async fn diagnostics_from_cache_entry(
+        diag_info: Option<&DiagnosticInfo>,
+        encoding: PositionEncoding,
+        tracker: &Arc<DocumentTracker>,
+    ) -> DiagnosticsResult {
+        let diagnostics = match diag_info {
+            Some(diag_info) => {
+                let ctx = EncodingCtx {
+                    encoding,
+                    tracker: tracker.clone(),
+                };
+                let mut result = Vec::with_capacity(diag_info.diagnostics.len());
+                for d in &diag_info.diagnostics {
+                    result.push(diagnostic_to_mcp(d, &ctx, &diag_info.uri).await);
+                }
+                result
+            }
+            None => Vec::new(),
+        };
 
         DiagnosticsResult { diagnostics }
     }
@@ -2279,9 +2483,11 @@ impl Translator {
     /// cache-only entries don't land out of document order after the
     /// pull-model ones.
     #[must_use]
-    pub fn merge_diagnostics(
+    pub async fn merge_diagnostics(
         mut pull: DiagnosticsResult,
         diag_info: Option<&DiagnosticInfo>,
+        encoding: PositionEncoding,
+        tracker: &Arc<DocumentTracker>,
     ) -> DiagnosticsResult {
         /// Start-line distance within which same-code, same-severity
         /// diagnostics from the two models are still considered the same
@@ -2310,7 +2516,9 @@ impl Translator {
             })
         }
 
-        let cached = Self::diagnostics_from_cache_entry(diag_info).diagnostics;
+        let cached = Self::diagnostics_from_cache_entry(diag_info, encoding, tracker)
+            .await
+            .diagnostics;
         let new_diagnostics: Vec<_> = cached
             .into_iter()
             .filter(|c| !is_duplicate(&pull.diagnostics, c))
@@ -2398,7 +2606,7 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<SignatureHelpResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::SignatureHelp,
@@ -2406,7 +2614,10 @@ impl Translator {
                 |caps| caps.signature_help_provider.is_some(),
             )
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let lsp_position = self
+            .encoding_ctx(&server_id)
+            .to_lsp(&uri, line, character)
+            .await;
 
         let params = LspSignatureHelpParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -2476,7 +2687,7 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Implementation,
@@ -2492,7 +2703,8 @@ impl Translator {
                 },
             )
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -2512,7 +2724,7 @@ impl Translator {
             .await?;
 
         Ok(LocationsResult {
-            locations: goto_response_to_locations(response),
+            locations: goto_response_to_locations(response, &ctx).await,
         })
     }
 
@@ -2531,7 +2743,7 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::TypeDefinition,
@@ -2547,7 +2759,8 @@ impl Translator {
                 },
             )
             .await?;
-        let lsp_position = mcp_to_lsp_position(line, character);
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -2567,7 +2780,7 @@ impl Translator {
             .await?;
 
         Ok(LocationsResult {
-            locations: goto_response_to_locations(response),
+            locations: goto_response_to_locations(response, &ctx).await,
         })
     }
 
@@ -2588,9 +2801,7 @@ impl Translator {
         end_line: u32,
         end_character: u32,
     ) -> Result<InlayHintsResult> {
-        use crate::bridge::encoding::lsp_to_mcp_position;
-
-        let (_server_id, client, uri) = self
+        let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::InlayHints,
@@ -2603,9 +2814,11 @@ impl Translator {
                 },
             )
             .await?;
+        let ctx = self.encoding_ctx(&server_id);
+        let response_uri = uri.clone();
 
-        let lsp_start = mcp_to_lsp_position(start_line, start_character);
-        let lsp_end = mcp_to_lsp_position(end_line, end_character);
+        let lsp_start = ctx.to_lsp(&uri, start_line, start_character).await;
+        let lsp_end = ctx.to_lsp(&uri, end_line, end_character).await;
 
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
@@ -2620,41 +2833,35 @@ impl Translator {
             .request("textDocument/inlayHint", params, client.request_timeout())
             .await?;
 
-        let hints = response
-            .unwrap_or_default()
-            .into_iter()
-            .map(|hint| {
-                let (mcp_line, mcp_character) = lsp_to_mcp_position(hint.position);
-                let label = match hint.label {
-                    InlayHintLabel::String(s) => s,
-                    InlayHintLabel::LabelParts(parts) => parts
-                        .into_iter()
-                        .map(|p| p.value)
-                        .collect::<Vec<_>>()
-                        .concat(),
-                };
-                let tooltip = hint.tooltip.map(|t| match t {
-                    lsp_types::InlayHintTooltip::String(s) => s,
-                    lsp_types::InlayHintTooltip::MarkupContent(m) => m.value,
-                });
-                InlayHintEntry {
-                    position: Position2D {
-                        line: mcp_line,
-                        character: mcp_character,
-                    },
-                    label,
-                    kind: hint.kind.and_then(|k| {
-                        serde_json::to_value(k)
-                            .ok()
-                            .and_then(|v| v.as_i64())
-                            .and_then(|n| u8::try_from(n).ok())
-                    }),
-                    padding_left: hint.padding_left,
-                    padding_right: hint.padding_right,
-                    tooltip,
-                }
-            })
-            .collect();
+        let mut hints = Vec::new();
+        for hint in response.unwrap_or_default() {
+            let position = ctx.to_mcp(&response_uri, hint.position).await;
+            let label = match hint.label {
+                InlayHintLabel::String(s) => s,
+                InlayHintLabel::LabelParts(parts) => parts
+                    .into_iter()
+                    .map(|p| p.value)
+                    .collect::<Vec<_>>()
+                    .concat(),
+            };
+            let tooltip = hint.tooltip.map(|t| match t {
+                lsp_types::InlayHintTooltip::String(s) => s,
+                lsp_types::InlayHintTooltip::MarkupContent(m) => m.value,
+            });
+            hints.push(InlayHintEntry {
+                position,
+                label,
+                kind: hint.kind.and_then(|k| {
+                    serde_json::to_value(k)
+                        .ok()
+                        .and_then(|v| v.as_i64())
+                        .and_then(|n| u8::try_from(n).ok())
+                }),
+                padding_left: hint.padding_left,
+                padding_right: hint.padding_right,
+                tooltip,
+            });
+        }
 
         Ok(InlayHintsResult { hints })
     }
@@ -2670,8 +2877,9 @@ fn extract_documentation(doc: lsp_types::Documentation) -> String {
 }
 
 /// Normalize a `GotoDefinitionResponse` into a flat list of MCP `Location` values.
-fn goto_response_to_locations(
+async fn goto_response_to_locations(
     response: Option<lsp_types::GotoDefinitionResponse>,
+    ctx: &EncodingCtx,
 ) -> Vec<Location> {
     let lsp_locs: Vec<lsp_types::Location> = match response {
         Some(lsp_types::GotoDefinitionResponse::Scalar(loc)) => vec![loc],
@@ -2686,13 +2894,14 @@ fn goto_response_to_locations(
         None => vec![],
     };
 
-    lsp_locs
-        .into_iter()
-        .map(|loc| Location {
+    let mut locations = Vec::with_capacity(lsp_locs.len());
+    for loc in lsp_locs {
+        locations.push(Location {
             uri: loc.uri.to_string(),
-            range: normalize_range(loc.range),
-        })
-        .collect()
+            range: ctx.normalize_range(&loc.uri, loc.range).await,
+        });
+    }
+    locations
 }
 
 fn extract_hover_contents(contents: HoverContents) -> String {
@@ -2841,14 +3050,22 @@ const fn call_hierarchy_provider_supported(caps: &lsp_types::ServerCapabilities)
     )
 }
 
-/// Convert a `CallHierarchyItemResult` JSON (1-based MCP coordinates) into
-/// a `lsp_types::CallHierarchyItem` (0-based LSP coordinates).
+/// Parsed form of an MCP-facing `CallHierarchyItemResult` JSON value (1-based
+/// coordinates), before its ranges are converted back to the routed server's
+/// negotiated encoding -- which requires resolving that server first (from
+/// [`Self::uri`]), so that step is left to callers via
+/// [`call_hierarchy_item_to_lsp`].
+struct ParsedCallHierarchyItem {
+    uri: lsp_types::Uri,
+    mcp: CallHierarchyItemResult,
+}
+
+/// Deserialize an MCP-facing `CallHierarchyItemResult` JSON value and parse
+/// its URI.
 ///
 /// MCP clients receive `CallHierarchyItemResult` from `prepare_call_hierarchy`
 /// and pass it back opaquely to `get_incoming_calls` / `get_outgoing_calls`.
-/// The bridge serialises ranges as 1-based; this function inverts that mapping
-/// before forwarding the item to the LSP server.
-fn mcp_item_to_lsp(item: serde_json::Value) -> Result<CallHierarchyItem> {
+fn parse_mcp_call_hierarchy_item(item: serde_json::Value) -> Result<ParsedCallHierarchyItem> {
     let mcp: CallHierarchyItemResult = serde_json::from_value(item)
         .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
 
@@ -2856,53 +3073,33 @@ fn mcp_item_to_lsp(item: serde_json::Value) -> Result<CallHierarchyItem> {
         Error::InvalidToolParams(format!("Invalid URI in call hierarchy item: {e}"))
     })?;
 
-    let detail = mcp.detail;
-    let data = mcp.data;
+    Ok(ParsedCallHierarchyItem { uri, mcp })
+}
+
+/// Convert a parsed MCP call hierarchy item (1-based coordinates) into a
+/// `lsp_types::CallHierarchyItem` (0-based, in `ctx`'s negotiated encoding).
+async fn call_hierarchy_item_to_lsp(
+    parsed: ParsedCallHierarchyItem,
+    ctx: &EncodingCtx,
+) -> CallHierarchyItem {
+    let ParsedCallHierarchyItem { uri, mcp } = parsed;
 
     // Round-trip via serde: `convert_call_hierarchy_item` stored the kind as a u32
     // by serialising `SymbolKind`; we reverse this to reconstruct the same value.
     let kind: lsp_types::SymbolKind = serde_json::from_value(serde_json::json!(mcp.kind))
         .unwrap_or(lsp_types::SymbolKind::FUNCTION);
+    let range = ctx.denormalize_range(&uri, &mcp.range).await;
+    let selection_range = ctx.denormalize_range(&uri, &mcp.selection_range).await;
 
-    Ok(CallHierarchyItem {
+    CallHierarchyItem {
         name: mcp.name,
         kind,
         tags: None,
-        detail,
+        detail: mcp.detail,
         uri,
-        range: denormalize_range(&mcp.range),
-        selection_range: denormalize_range(&mcp.selection_range),
-        data,
-    })
-}
-
-/// Convert a 1-based MCP range back to a 0-based LSP range.
-///
-/// Used when MCP clients pass back a `CallHierarchyItemResult` that was
-/// previously returned by `prepare_call_hierarchy` (which stores 1-based coords).
-const fn denormalize_range(range: &Range) -> lsp_types::Range {
-    lsp_types::Range {
-        start: lsp_types::Position {
-            line: range.start.line.saturating_sub(1),
-            character: range.start.character.saturating_sub(1),
-        },
-        end: lsp_types::Position {
-            line: range.end.line.saturating_sub(1),
-            character: range.end.character.saturating_sub(1),
-        },
-    }
-}
-
-const fn normalize_range(range: lsp_types::Range) -> Range {
-    Range {
-        start: Position2D {
-            line: range.start.line + 1,
-            character: range.start.character + 1,
-        },
-        end: Position2D {
-            line: range.end.line + 1,
-            character: range.end.character + 1,
-        },
+        range,
+        selection_range,
+        data: mcp.data,
     }
 }
 
@@ -2912,9 +3109,13 @@ const fn normalize_range(range: lsp_types::Range) -> Range {
 /// (`diagnostics_from_cache_entry`) diagnostic paths, so their output never
 /// diverges in formatting — `merge_diagnostics`'s dedup logic depends on
 /// both sides mapping severity/code identically.
-fn diagnostic_to_mcp(diag: &lsp_types::Diagnostic) -> Diagnostic {
+async fn diagnostic_to_mcp(
+    diag: &lsp_types::Diagnostic,
+    ctx: &EncodingCtx,
+    uri: &lsp_types::Uri,
+) -> Diagnostic {
     Diagnostic {
-        range: normalize_range(diag.range),
+        range: ctx.normalize_range(uri, diag.range).await,
         severity: match diag.severity {
             Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
             Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
@@ -2930,21 +3131,49 @@ fn diagnostic_to_mcp(diag: &lsp_types::Diagnostic) -> Diagnostic {
     }
 }
 
-/// Convert LSP document symbol to MCP symbol.
-fn convert_document_symbol(symbol: DocumentSymbol) -> Symbol {
-    Symbol {
-        name: symbol.name,
-        kind: format!("{:?}", symbol.kind),
-        range: normalize_range(symbol.range),
-        selection_range: normalize_range(symbol.selection_range),
-        children: symbol
-            .children
-            .map(|children| children.into_iter().map(convert_document_symbol).collect()),
-    }
+/// Convert LSP document symbol to MCP symbol. `uri` is the queried
+/// document's own URI: nested `DocumentSymbol` entries have no URI of their
+/// own, since `textDocument/documentSymbol` is always scoped to one file.
+///
+/// Boxed because it recurses through `children` and an `async fn` cannot
+/// call itself directly (its future would have unbounded size).
+fn convert_document_symbol<'a>(
+    symbol: DocumentSymbol,
+    ctx: &'a EncodingCtx,
+    uri: &'a lsp_types::Uri,
+) -> futures::future::BoxFuture<'a, Symbol> {
+    Box::pin(async move {
+        let range = ctx.normalize_range(uri, symbol.range).await;
+        let selection_range = ctx.normalize_range(uri, symbol.selection_range).await;
+        let children = match symbol.children {
+            Some(children) => {
+                let mut result = Vec::with_capacity(children.len());
+                for child in children {
+                    result.push(convert_document_symbol(child, ctx, uri).await);
+                }
+                Some(result)
+            }
+            None => None,
+        };
+
+        Symbol {
+            name: symbol.name,
+            kind: format!("{:?}", symbol.kind),
+            range,
+            selection_range,
+            children,
+        }
+    })
 }
 
 /// Convert LSP call hierarchy item to MCP call hierarchy item.
-fn convert_call_hierarchy_item(item: CallHierarchyItem) -> CallHierarchyItemResult {
+async fn convert_call_hierarchy_item(
+    item: CallHierarchyItem,
+    ctx: &EncodingCtx,
+) -> CallHierarchyItemResult {
+    let range = ctx.normalize_range(&item.uri, item.range).await;
+    let selection_range = ctx.normalize_range(&item.uri, item.selection_range).await;
+
     CallHierarchyItemResult {
         name: item.name,
         kind: serde_json::to_value(item.kind)
@@ -2954,58 +3183,57 @@ fn convert_call_hierarchy_item(item: CallHierarchyItem) -> CallHierarchyItemResu
             .unwrap_or(0),
         detail: item.detail,
         uri: item.uri.to_string(),
-        range: normalize_range(item.range),
-        selection_range: normalize_range(item.selection_range),
+        range,
+        selection_range,
         data: item.data,
     }
 }
 
-/// Convert LSP code action to MCP code action.
-fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
-    let diagnostics = action.diagnostics.map_or_else(Vec::new, |diags| {
-        let mut result = Vec::with_capacity(diags.len());
-        for d in diags {
-            result.push(Diagnostic {
-                range: normalize_range(d.range),
-                severity: match d.severity {
-                    Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                    Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
-                    Some(lsp_types::DiagnosticSeverity::INFORMATION) => {
-                        DiagnosticSeverity::Information
-                    }
-                    Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
-                    _ => DiagnosticSeverity::Information,
-                },
-                message: d.message,
-                code: d.code.map(|c| match c {
-                    lsp_types::NumberOrString::Number(n) => n.to_string(),
-                    lsp_types::NumberOrString::String(s) => s,
-                }),
-            });
-        }
-        result
-    });
-
-    let edit = action.edit.map(|edit| {
-        let changes = edit.changes.map_or_else(Vec::new, |changes_map| {
-            let mut result = Vec::with_capacity(changes_map.len());
-            for (uri, edits) in changes_map {
-                let mut text_edits = Vec::with_capacity(edits.len());
-                for e in edits {
-                    text_edits.push(TextEdit {
-                        range: normalize_range(e.range),
-                        new_text: e.new_text,
-                    });
-                }
-                result.push(DocumentChanges {
-                    uri: uri.to_string(),
-                    edits: text_edits,
-                });
+/// Convert LSP code action to MCP code action. `uri` is the queried
+/// document's own URI, used for the action's `diagnostics` (always scoped to
+/// the requested document); `edit.changes` carries its own per-file URIs.
+async fn convert_code_action(
+    action: lsp_types::CodeAction,
+    ctx: &EncodingCtx,
+    uri: &lsp_types::Uri,
+) -> CodeAction {
+    let diagnostics = match action.diagnostics {
+        Some(diags) => {
+            let mut result = Vec::with_capacity(diags.len());
+            for d in &diags {
+                result.push(diagnostic_to_mcp(d, ctx, uri).await);
             }
             result
-        });
-        WorkspaceEditDescription { changes }
-    });
+        }
+        None => Vec::new(),
+    };
+
+    let edit = match action.edit {
+        Some(edit) => {
+            let changes = match edit.changes {
+                Some(changes_map) => {
+                    let mut result = Vec::with_capacity(changes_map.len());
+                    for (uri, edits) in changes_map {
+                        let mut text_edits = Vec::with_capacity(edits.len());
+                        for e in edits {
+                            text_edits.push(TextEdit {
+                                range: ctx.normalize_range(&uri, e.range).await,
+                                new_text: e.new_text,
+                            });
+                        }
+                        result.push(DocumentChanges {
+                            uri: uri.to_string(),
+                            edits: text_edits,
+                        });
+                    }
+                    result
+                }
+                None => Vec::new(),
+            };
+            Some(WorkspaceEditDescription { changes })
+        }
+        None => None,
+    };
 
     let command = action.command.map(|cmd| {
         let arguments = cmd.arguments.unwrap_or_else(Vec::new);
@@ -3035,6 +3263,39 @@ mod tests {
     use url::Url;
 
     use super::*;
+
+    /// A UTF-16 `EncodingCtx`, matching the pre-negotiation behavior: no
+    /// disk reads, pure line/column offsetting.
+    fn test_ctx() -> EncodingCtx {
+        test_ctx_with(PositionEncoding::Utf16)
+    }
+
+    /// An `EncodingCtx` with a fresh, empty `DocumentTracker` -- suitable for
+    /// tests that need a non-UTF-16 encoding and don't care about the
+    /// tracker fast path (e.g. exercising the disk-read fallback directly).
+    fn test_ctx_with(encoding: PositionEncoding) -> EncodingCtx {
+        EncodingCtx {
+            encoding,
+            tracker: Arc::new(DocumentTracker::new(
+                ResourceLimits::default(),
+                HashMap::new(),
+            )),
+        }
+    }
+
+    fn test_uri() -> lsp_types::Uri {
+        "file:///test.rs".parse().unwrap()
+    }
+
+    /// A fresh, empty `DocumentTracker` for tests that call
+    /// `diagnostics_from_cache_entry`/`merge_diagnostics` directly and don't
+    /// care about the tracker fast path.
+    fn test_tracker() -> Arc<DocumentTracker> {
+        Arc::new(DocumentTracker::new(
+            ResourceLimits::default(),
+            HashMap::new(),
+        ))
+    }
 
     #[test]
     fn test_translator_new() {
@@ -3776,8 +4037,8 @@ fi
         assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
     }
 
-    #[test]
-    fn test_normalize_range() {
+    #[tokio::test]
+    async fn test_normalize_range() {
         let lsp_range = lsp_types::Range {
             start: lsp_types::Position {
                 line: 0,
@@ -3789,11 +4050,107 @@ fi
             },
         };
 
-        let mcp_range = normalize_range(lsp_range);
+        let mcp_range = test_ctx().normalize_range(&test_uri(), lsp_range).await;
         assert_eq!(mcp_range.start.line, 1);
         assert_eq!(mcp_range.start.character, 1);
         assert_eq!(mcp_range.end.line, 3);
         assert_eq!(mcp_range.end.character, 6);
+    }
+
+    /// End-to-end proof that a non-UTF-16 `EncodingCtx` is actually wired to
+    /// `read_line_text`/disk, not just correct in isolation at the
+    /// `encoding.rs` function level: a real temp file with a multibyte line
+    /// ("héllo"), converted through `EncodingCtx::to_lsp` for a document the
+    /// tracker has never seen (forcing the disk-read fallback).
+    #[tokio::test]
+    async fn test_encoding_ctx_utf8_reads_disk_line_text_for_untracked_document() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("multibyte.rs");
+        fs::write(&path, "héllo").unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        let lsp_pos = ctx.to_lsp(&uri, 1, 3).await;
+        // "hé" is 3 bytes in UTF-8 (h=1, é=2); MCP column 3 (UTF-16, after
+        // "hé") must re-derive to that byte offset via the disk-read line
+        // text, matching the `encoding.rs`-level math for the same input.
+        assert_eq!(lsp_pos.character, 3);
+    }
+
+    /// C3/S1: when a document is tracked, `EncodingCtx` must prefer its
+    /// in-memory content over disk -- both cheaper (no I/O) and more correct
+    /// when they've diverged. Here disk holds stale ASCII ("hello", no
+    /// accent) while the tracker holds the live multibyte content
+    /// ("héllo"); if conversion used disk instead, MCP column 3 would
+    /// re-derive to LSP byte offset 2 (ASCII, no multibyte char) instead of
+    /// 3 (multibyte-correct) -- so this distinguishes the two sources rather
+    /// than merely tolerating either.
+    #[tokio::test]
+    async fn test_encoding_ctx_utf8_prefers_tracked_content_over_stale_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tracked.rs");
+        fs::write(&path, "hello").unwrap(); // stale: no accent
+
+        let tracker = Arc::new(DocumentTracker::new(
+            ResourceLimits::default(),
+            HashMap::new(),
+        ));
+        let uri = tracker.open(path.clone(), "héllo".to_string()).unwrap(); // live: accent
+
+        let ctx = EncodingCtx {
+            encoding: PositionEncoding::Utf8,
+            tracker,
+        };
+        let lsp_pos = ctx.to_lsp(&uri, 1, 3).await;
+        assert_eq!(
+            lsp_pos.character, 3,
+            "must convert against the tracker's live content (\"héllo\" -> byte 3), not disk's \
+             stale content (\"hello\" -> byte 2)"
+        );
+    }
+
+    /// A single `EncodingCtx` answering one MCP tool call may still need to
+    /// convert positions in several different files (e.g. `references`
+    /// results spanning multiple documents) -- each conversion must resolve
+    /// *that* location's own file, never reuse or leak another file's line
+    /// text. Two untracked files with different content at the same
+    /// byte offset make a wrong-file conversion produce a visibly different
+    /// (wrong) answer: byte offset 3 is UTF-16 column 3 in "héllo" but
+    /// column 4 in the all-ASCII "hello".
+    #[tokio::test]
+    async fn test_normalize_range_multi_file_converts_each_location_against_its_own_uri() {
+        let dir = TempDir::new().unwrap();
+        let path_a = dir.path().join("a.rs");
+        fs::write(&path_a, "héllo").unwrap();
+        let uri_a = path_to_uri(&path_a).unwrap();
+
+        let path_b = dir.path().join("b.rs");
+        fs::write(&path_b, "hello").unwrap();
+        let uri_b = path_to_uri(&path_b).unwrap();
+
+        let lsp_range = lsp_types::Range {
+            start: lsp_types::Position {
+                line: 0,
+                character: 0,
+            },
+            end: lsp_types::Position {
+                line: 0,
+                character: 3,
+            },
+        };
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        let range_a = ctx.normalize_range(&uri_a, lsp_range).await;
+        let range_b = ctx.normalize_range(&uri_b, lsp_range).await;
+
+        assert_eq!(
+            range_a.end.character, 3,
+            "must convert against a.rs's own content"
+        );
+        assert_eq!(
+            range_b.end.character, 4,
+            "must convert against b.rs's own content"
+        );
     }
 
     #[test]
@@ -4030,8 +4387,8 @@ fi
         assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
     }
 
-    #[test]
-    fn test_convert_code_action_minimal() {
+    #[tokio::test]
+    async fn test_convert_code_action_minimal() {
         let lsp_action = lsp_types::CodeAction {
             title: "Fix issue".to_string(),
             kind: None,
@@ -4043,7 +4400,7 @@ fi
             data: None,
         };
 
-        let result = convert_code_action(lsp_action);
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
         assert_eq!(result.title, "Fix issue");
         assert!(result.kind.is_none());
         assert!(result.diagnostics.is_empty());
@@ -4052,9 +4409,9 @@ fi
         assert!(!result.is_preferred);
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    fn test_convert_code_action_with_diagnostics_all_severities() {
+    async fn test_convert_code_action_with_diagnostics_all_severities() {
         let lsp_diagnostics = vec![
             lsp_types::Diagnostic {
                 range: lsp_types::Range {
@@ -4149,7 +4506,7 @@ fi
             data: None,
         };
 
-        let result = convert_code_action(lsp_action);
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
         assert_eq!(result.diagnostics.len(), 4);
         assert!(matches!(
             result.diagnostics[0].severity,
@@ -4171,9 +4528,9 @@ fi
         assert_eq!(result.diagnostics[1].code, Some("W001".to_string()));
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::mutable_key_type)]
-    fn test_convert_code_action_with_workspace_edit() {
+    async fn test_convert_code_action_with_workspace_edit() {
         use std::collections::HashMap;
         use std::str::FromStr;
 
@@ -4211,7 +4568,7 @@ fi
             data: None,
         };
 
-        let result = convert_code_action(lsp_action);
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
@@ -4221,8 +4578,8 @@ fi
         assert!(result.is_preferred);
     }
 
-    #[test]
-    fn test_convert_code_action_with_command() {
+    #[tokio::test]
+    async fn test_convert_code_action_with_command() {
         let lsp_action = lsp_types::CodeAction {
             title: "Run command".to_string(),
             kind: Some(lsp_types::CodeActionKind::REFACTOR),
@@ -4238,7 +4595,7 @@ fi
             data: None,
         };
 
-        let result = convert_code_action(lsp_action);
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
         assert!(result.command.is_some());
         let cmd = result.command.unwrap();
         assert_eq!(cmd.title, "Execute refactor");
@@ -4312,8 +4669,8 @@ fi
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_handle_cached_diagnostics_empty() {
+    #[tokio::test]
+    async fn test_handle_cached_diagnostics_empty() {
         let cache = NotificationCache::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
@@ -4322,7 +4679,12 @@ fi
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
         let diag_info = cache.get_diagnostics(&cache_key).cloned();
-        let diags = Translator::diagnostics_from_cache_entry(diag_info.as_ref());
+        let diags = Translator::diagnostics_from_cache_entry(
+            diag_info.as_ref(),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
         assert_eq!(diags.diagnostics.len(), 0);
     }
 
@@ -4394,8 +4756,8 @@ fi
         assert_eq!(messages.messages.len(), 10);
     }
 
-    #[test]
-    fn test_handle_cached_diagnostics_with_data() {
+    #[tokio::test]
+    async fn test_handle_cached_diagnostics_with_data() {
         let mut cache = NotificationCache::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
@@ -4433,7 +4795,12 @@ fi
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
         let diag_info = cache.get_diagnostics(&cache_key).cloned();
-        let diags = Translator::diagnostics_from_cache_entry(diag_info.as_ref());
+        let diags = Translator::diagnostics_from_cache_entry(
+            diag_info.as_ref(),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
         assert_eq!(diags.diagnostics.len(), 1);
         assert_eq!(diags.diagnostics[0].message, "test error");
         assert_eq!(diags.diagnostics[0].code, Some("E001".to_string()));
@@ -4445,9 +4812,9 @@ fi
         assert_eq!(diags.diagnostics[0].range.start.character, 1);
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    fn test_handle_cached_diagnostics_multiple_severities() {
+    async fn test_handle_cached_diagnostics_multiple_severities() {
         let mut cache = NotificationCache::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
@@ -4547,7 +4914,12 @@ fi
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
         let diag_info = cache.get_diagnostics(&cache_key).cloned();
-        let diags = Translator::diagnostics_from_cache_entry(diag_info.as_ref());
+        let diags = Translator::diagnostics_from_cache_entry(
+            diag_info.as_ref(),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
         assert_eq!(diags.diagnostics.len(), 4);
         assert!(matches!(
             diags.diagnostics[0].severity,
@@ -4567,8 +4939,8 @@ fi
         ));
     }
 
-    #[test]
-    fn test_handle_cached_diagnostics_with_numeric_code() {
+    #[tokio::test]
+    async fn test_handle_cached_diagnostics_with_numeric_code() {
         let mut cache = NotificationCache::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
@@ -4606,7 +4978,12 @@ fi
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
         let diag_info = cache.get_diagnostics(&cache_key).cloned();
-        let diags = Translator::diagnostics_from_cache_entry(diag_info.as_ref());
+        let diags = Translator::diagnostics_from_cache_entry(
+            diag_info.as_ref(),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
         assert_eq!(diags.diagnostics.len(), 1);
         assert_eq!(diags.diagnostics[0].code, Some("42".to_string()));
     }
@@ -4652,8 +5029,8 @@ fi
         }
     }
 
-    #[test]
-    fn test_merge_diagnostics_cache_only_appends_to_empty_pull() {
+    #[tokio::test]
+    async fn test_merge_diagnostics_cache_only_appends_to_empty_pull() {
         let pull = DiagnosticsResult {
             diagnostics: vec![],
         };
@@ -4665,7 +5042,13 @@ fi
             None,
         )]);
 
-        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+        let merged = Translator::merge_diagnostics(
+            pull,
+            Some(&cache),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
 
         assert_eq!(merged.diagnostics.len(), 1);
         assert_eq!(merged.diagnostics[0].message, "unused import: `std::fmt`");
@@ -4675,8 +5058,8 @@ fi
         ));
     }
 
-    #[test]
-    fn test_merge_diagnostics_exact_duplicate_not_repeated() {
+    #[tokio::test]
+    async fn test_merge_diagnostics_exact_duplicate_not_repeated() {
         // Same range/severity/message/code as the cache entry below, expressed
         // in the 1-based MCP shape `diagnostics_from_cache_entry` would produce.
         let pull_diag = Diagnostic {
@@ -4705,14 +5088,20 @@ fi
             Some("E0308"),
         )]);
 
-        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+        let merged = Translator::merge_diagnostics(
+            pull,
+            Some(&cache),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
 
         assert_eq!(merged.diagnostics.len(), 1);
         assert_eq!(merged.diagnostics[0], pull_diag);
     }
 
-    #[test]
-    fn test_merge_diagnostics_no_cache_entry_returns_pull_unchanged() {
+    #[tokio::test]
+    async fn test_merge_diagnostics_no_cache_entry_returns_pull_unchanged() {
         let pull_diag = Diagnostic {
             range: Range {
                 start: Position2D {
@@ -4732,13 +5121,15 @@ fi
             diagnostics: vec![pull_diag.clone()],
         };
 
-        let merged = Translator::merge_diagnostics(pull, None);
+        let merged =
+            Translator::merge_diagnostics(pull, None, PositionEncoding::Utf16, &test_tracker())
+                .await;
 
         assert_eq!(merged.diagnostics, vec![pull_diag]);
     }
 
-    #[test]
-    fn test_merge_diagnostics_multiple_distinct_cache_entries_all_appear() {
+    #[tokio::test]
+    async fn test_merge_diagnostics_multiple_distinct_cache_entries_all_appear() {
         let pull = DiagnosticsResult {
             diagnostics: vec![],
         };
@@ -4759,7 +5150,13 @@ fi
             ),
         ]);
 
-        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+        let merged = Translator::merge_diagnostics(
+            pull,
+            Some(&cache),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
 
         assert_eq!(merged.diagnostics.len(), 2);
         assert!(
@@ -4776,8 +5173,8 @@ fi
         );
     }
 
-    #[test]
-    fn test_merge_diagnostics_same_range_different_message_not_deduped() {
+    #[tokio::test]
+    async fn test_merge_diagnostics_same_range_different_message_not_deduped() {
         let pull_diag = Diagnostic {
             range: Range {
                 start: Position2D {
@@ -4806,7 +5203,13 @@ fi
             None,
         )]);
 
-        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+        let merged = Translator::merge_diagnostics(
+            pull,
+            Some(&cache),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
 
         assert_eq!(merged.diagnostics.len(), 2);
     }
@@ -4818,8 +5221,8 @@ fi
     /// (terse vs. rustc's full rendering), but shared `code` and `severity`.
     /// Exact-field dedup would report this twice; the `(severity, code)`
     /// fingerprint must collapse it to one entry.
-    #[test]
-    fn test_merge_diagnostics_same_code_different_range_and_message_deduped() {
+    #[tokio::test]
+    async fn test_merge_diagnostics_same_code_different_range_and_message_deduped() {
         let pull_diag = Diagnostic {
             range: Range {
                 start: Position2D {
@@ -4849,7 +5252,13 @@ fi
             Some("E0046"),
         )]);
 
-        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+        let merged = Translator::merge_diagnostics(
+            pull,
+            Some(&cache),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
 
         assert_eq!(merged.diagnostics.len(), 1);
         assert_eq!(merged.diagnostics[0], pull_diag);
@@ -4869,8 +5278,9 @@ fi
     /// The range-proximity check on `is_duplicate` (see `merge_diagnostics`)
     /// closes this: these two diagnostics are 45 lines apart, far outside
     /// `DUPLICATE_RANGE_PROXIMITY_LINES`, so both must survive the merge.
-    #[test]
-    fn test_merge_diagnostics_same_code_distinct_diagnostics_at_different_locations_both_kept() {
+    #[tokio::test]
+    async fn test_merge_diagnostics_same_code_distinct_diagnostics_at_different_locations_both_kept()
+     {
         let pull_diag = Diagnostic {
             range: Range {
                 start: Position2D {
@@ -4900,7 +5310,13 @@ fi
             Some("E0308"),
         )]);
 
-        let merged = Translator::merge_diagnostics(pull, Some(&cache));
+        let merged = Translator::merge_diagnostics(
+            pull,
+            Some(&cache),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
 
         assert_eq!(merged.diagnostics.len(), 2);
         assert_eq!(merged.diagnostics[0], pull_diag);
@@ -5300,8 +5716,8 @@ fi
         }
     }
 
-    #[test]
-    fn test_convert_call_hierarchy_item_kind_is_numeric() {
+    #[tokio::test]
+    async fn test_convert_call_hierarchy_item_kind_is_numeric() {
         let item = lsp_types::CallHierarchyItem {
             name: "my_fn".to_string(),
             kind: lsp_types::SymbolKind::FUNCTION,
@@ -5330,7 +5746,7 @@ fi
             },
             data: None,
         };
-        let result = convert_call_hierarchy_item(item);
+        let result = convert_call_hierarchy_item(item, &test_ctx()).await;
         // SymbolKind::FUNCTION is LSP integer 12
         assert_eq!(result.kind, 12u32);
         assert_eq!(result.name, "my_fn");
@@ -5950,6 +6366,37 @@ fi
         (translator, server)
     }
 
+    /// As [`translator_with_capabilities`], but with a caller-chosen
+    /// negotiated `position_encoding` -- for tests exercising a non-UTF-16
+    /// `EncodingCtx` conversion path through a full mocked LSP round trip.
+    fn translator_with_capabilities_and_encoding(
+        dir: &TempDir,
+        server_id: &ServerId,
+        capabilities: lsp_types::ServerCapabilities,
+        position_encoding: lsp_types::PositionEncodingKind,
+    ) -> (Translator, FakeServer) {
+        let mut extensions = HashMap::new();
+        extensions.insert("rs".to_string(), "rust".to_string());
+
+        let mut translator =
+            Translator::new()
+                .with_extensions(extensions)
+                .with_router(ToolRouter::catch_all([(
+                    server_id.clone(),
+                    "rust".to_string(),
+                )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client, server) = fake_lsp_client();
+        translator.register_client(server_id.clone(), client);
+        translator.register_server(
+            server_id.clone(),
+            LspServer::new_for_test_with_encoding(capabilities, position_encoding),
+        );
+
+        (translator, server)
+    }
+
     #[tokio::test]
     async fn test_handle_rename_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
@@ -6112,6 +6559,224 @@ fi
                 ..
             })
         ));
+    }
+
+    /// Per the LSP spec, an incoming call's `fromRanges` are ranges within
+    /// the *caller's* document (`call.from.uri`), not the queried item's
+    /// document -- `handle_incoming_calls` must convert them against
+    /// `caller.rs`'s own content, not `queried.rs`'s. Uses a UTF-8-negotiated
+    /// server and two files with different multibyte content, so converting
+    /// against the wrong file's line text produces a different, wrong
+    /// answer: `"aöb"` (caller) puts LSP byte offset 3 at UTF-16 column 3
+    /// (`ö` is 2 UTF-8 bytes / 1 UTF-16 unit), while the ASCII `"abc"`
+    /// (queried item) would put the same byte offset at column 4.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_from_ranges_convert_against_callers_own_uri() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyServerCapability::Simple(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities_and_encoding(
+            &dir,
+            &server_id,
+            caps,
+            lsp_types::PositionEncodingKind::UTF8,
+        );
+
+        let queried_path = dir.path().join("queried.rs");
+        fs::write(&queried_path, "abc").unwrap();
+        let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
+
+        let caller_path = dir.path().join("caller.rs");
+        fs::write(&caller_path, "aöb").unwrap();
+        let caller_uri = Url::from_file_path(&caller_path).unwrap().to_string();
+
+        let item = CallHierarchyItemResult {
+            name: "queried_fn".to_string(),
+            kind: 12,
+            detail: None,
+            uri: queried_uri,
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            selection_range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            data: None,
+        };
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let item = serde_json::to_value(item).unwrap();
+            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "callHierarchy/incomingCalls");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "from": {
+                    "name": "caller_fn",
+                    "kind": 12,
+                    "uri": caller_uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    },
+                    "selectionRange": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    }
+                },
+                "fromRanges": [{
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 3}
+                }]
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.calls.len(), 1);
+        let from_range = &result.calls[0].from_ranges[0];
+        assert_eq!(
+            from_range.end.character, 3,
+            "fromRanges must convert against the caller's own file (\"aöb\"), not the queried \
+             item's (\"abc\") -- a byte offset of 3 is UTF-16 column 3 in the former, 4 in the \
+             latter"
+        );
+    }
+
+    /// Per the LSP spec, an outgoing call's `fromRanges` are ranges within
+    /// the *queried* item's own document, not the callee's (`call.to.uri`) --
+    /// the inverse directional convention from incoming calls, tested above.
+    #[tokio::test]
+    async fn test_handle_outgoing_calls_from_ranges_convert_against_queried_uri() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyServerCapability::Simple(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities_and_encoding(
+            &dir,
+            &server_id,
+            caps,
+            lsp_types::PositionEncodingKind::UTF8,
+        );
+
+        let queried_path = dir.path().join("queried.rs");
+        fs::write(&queried_path, "aöb").unwrap();
+        let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
+
+        let callee_path = dir.path().join("callee.rs");
+        fs::write(&callee_path, "abc").unwrap();
+        let callee_uri = Url::from_file_path(&callee_path).unwrap().to_string();
+
+        let item = CallHierarchyItemResult {
+            name: "queried_fn".to_string(),
+            kind: 12,
+            detail: None,
+            uri: queried_uri,
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            selection_range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            data: None,
+        };
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let item = serde_json::to_value(item).unwrap();
+            tokio::spawn(async move { translator.handle_outgoing_calls(item).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "callHierarchy/outgoingCalls");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "to": {
+                    "name": "callee_fn",
+                    "kind": 12,
+                    "uri": callee_uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    },
+                    "selectionRange": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    }
+                },
+                "fromRanges": [{
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 3}
+                }]
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.calls.len(), 1);
+        let from_range = &result.calls[0].from_ranges[0];
+        assert_eq!(
+            from_range.end.character, 3,
+            "fromRanges must convert against the queried item's own file (\"aöb\"), not the \
+             callee's (\"abc\") -- a byte offset of 3 is UTF-16 column 3 in the former, 4 in \
+             the latter"
+        );
     }
 
     #[tokio::test]

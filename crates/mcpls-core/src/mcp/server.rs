@@ -26,7 +26,7 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    DiagnosticInfo, NotificationCache, ResourceSubscriptions, Translator,
+    DiagnosticInfo, NotificationCache, PositionEncoding, ResourceSubscriptions, Translator,
     validate_path_against_roots,
 };
 
@@ -593,11 +593,22 @@ impl McplsServer {
                     // Lock only long enough for the map lookup + clone: no
                     // canonicalize() or Vec mapping while `notification_cache`
                     // is held, since `diagnostics_pump` needs the same lock.
-                    let diag_info = {
+                    let (diag_info, owner) = {
                         let cache = self.context.notification_cache.lock().await;
-                        cache.get_diagnostics(&uri).cloned()
+                        (
+                            cache.get_diagnostics(&uri).cloned(),
+                            cache.diagnostics_owner(&uri).cloned(),
+                        )
                     };
-                    Ok(Translator::diagnostics_from_cache_entry(diag_info.as_ref()))
+                    let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
+                        self.context.translator.position_encoding_for(&server_id)
+                    });
+                    Ok(Translator::diagnostics_from_cache_entry(
+                        diag_info.as_ref(),
+                        encoding,
+                        self.context.translator.document_tracker(),
+                    )
+                    .await)
                 }
                 Err(e) => Err(e),
             };
@@ -1334,6 +1345,148 @@ mod tests {
         let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].get("message").unwrap(), "cached error");
+    }
+
+    /// #290 gap: a cache-only read must resolve the *owner* server's
+    /// negotiated encoding, not silently assume UTF-16. Registers the
+    /// publishing server as UTF-8 and stores a diagnostic over a real
+    /// multibyte line ("héllo") so a UTF-16 assumption would produce a
+    /// visibly different (wrong) column: LSP byte offset 3 is MCP column 3
+    /// under the registered server's UTF-8 encoding, but would read as raw
+    /// column 4 (unconverted passthrough) under the UTF-16 default tested in
+    /// `test_cached_diagnostics_tool_no_owner_falls_back_to_utf16` below.
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_uses_registered_owner_encoding() {
+        use std::fs;
+
+        use tempfile::TempDir;
+        use url::Url;
+
+        let server = create_test_server();
+        let owner = crate::config::ServerId::from("rust");
+        server.context.translator.register_server(
+            owner.clone(),
+            crate::lsp::LspServer::new_for_test_with_encoding(
+                lsp_types::ServerCapabilities::default(),
+                lsp_types::PositionEncodingKind::UTF8,
+            ),
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "héllo").unwrap();
+
+        let canonical_path = test_file.canonicalize().unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: None,
+            message: "multibyte range".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+        {
+            let mut cache = server.context.notification_cache.lock().await;
+            cache.store_diagnostics(&owner, &uri, Some(1), vec![diagnostic]);
+        }
+
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: test_file.to_str().unwrap().to_string(),
+        });
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
+        assert_eq!(
+            diagnostics[0]["range"]["end"]["character"], 3,
+            "byte offset 3 on \"héllo\" is UTF-16 column 3 when converted against the \
+             registered UTF-8 owner"
+        );
+    }
+
+    /// Companion to the test above: when no server is registered under the
+    /// cached entry's owner id (or no owner is tracked at all),
+    /// `get_cached_diagnostics` must fall back to UTF-16 -- a raw,
+    /// unconverted passthrough -- rather than panicking or guessing.
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_no_owner_falls_back_to_utf16() {
+        use std::fs;
+
+        use tempfile::TempDir;
+        use url::Url;
+
+        let server = create_test_server();
+        // Deliberately not registered with `translator.register_server`.
+        let owner = crate::config::ServerId::from("rust");
+
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "héllo").unwrap();
+
+        let canonical_path = test_file.canonicalize().unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: None,
+            message: "multibyte range".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+        {
+            let mut cache = server.context.notification_cache.lock().await;
+            cache.store_diagnostics(&owner, &uri, Some(1), vec![diagnostic]);
+        }
+
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: test_file.to_str().unwrap().to_string(),
+        });
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
+        assert_eq!(
+            diagnostics[0]["range"]["end"]["character"], 4,
+            "with no registered owner, must fall back to UTF-16 (raw passthrough: \
+             character + 1), not the UTF-8-correct column"
+        );
     }
 
     #[tokio::test]

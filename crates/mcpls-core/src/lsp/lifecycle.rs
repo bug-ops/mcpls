@@ -801,6 +801,18 @@ impl LspServer {
     /// async test context (`#[tokio::test]`).
     #[allow(clippy::unwrap_used)]
     pub(crate) fn new_for_test(capabilities: ServerCapabilities) -> Self {
+        Self::new_for_test_with_encoding(capabilities, PositionEncodingKind::UTF16)
+    }
+
+    /// As [`Self::new_for_test`], but with a caller-chosen negotiated
+    /// encoding -- for tests exercising a non-UTF-16 conversion path (e.g.
+    /// `EncodingCtx`-driven range conversion) without spawning a real
+    /// process.
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn new_for_test_with_encoding(
+        capabilities: ServerCapabilities,
+        position_encoding: PositionEncodingKind,
+    ) -> Self {
         let child = Command::new("echo")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -814,7 +826,7 @@ impl LspServer {
         Self {
             client,
             capabilities,
-            position_encoding: PositionEncodingKind::UTF16,
+            position_encoding,
             notification_rx,
             child,
         }

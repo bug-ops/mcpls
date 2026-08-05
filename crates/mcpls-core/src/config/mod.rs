@@ -172,6 +172,22 @@ fn language_id_for_pattern_extension(server_language_id: &str, extension: &str) 
         .to_string()
 }
 
+/// The client-preference order offered to every spawned server during
+/// `initialize`.
+///
+/// `utf-8` is listed first deliberately, not just historically: probing both
+/// rust-analyzer and clangd (this project's two flagship servers) against
+/// exactly this offer shows both negotiate down to `utf-8`, so it is the
+/// common case, not a rare fallback. Earlier revisions of this file
+/// (`#290`/`#291`) treated the non-UTF-16 conversion path in
+/// `bridge/encoding.rs` as an edge case on that (false) assumption, which
+/// hid a char-boundary panic and an uncached-disk-read cost on what turned
+/// out to be the default path for both servers. Both are now fixed
+/// (`bridge/encoding.rs`'s boundary guards; `bridge/translator.rs`'s
+/// `EncodingCtx` preferring `DocumentTracker`'s in-memory content over
+/// disk), so there is no longer a correctness or performance reason to
+/// prefer `utf-16` here -- reordering would only reintroduce UTF-16 by
+/// default bias, undoing the point of negotiating an encoding at all.
 pub(crate) fn default_position_encodings() -> Vec<String> {
     vec!["utf-8".to_string(), "utf-16".to_string()]
 }
