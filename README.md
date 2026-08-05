@@ -239,6 +239,9 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 | `MCPLS_LOG` | Log level (trace, debug, info, warn, error) | `info` |
 | `MCPLS_LOG_JSON` | Output logs as JSON | `false` |
 
+> [!NOTE]
+> The two boolean flags above accept `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).
+
 **Config file locations:**
 
 | Platform | Default Location |

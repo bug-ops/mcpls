@@ -55,6 +55,9 @@ See the main [README](../../README.md) for configuration examples and custom ext
 | `--listen <ADDR>` | `MCPLS_LISTEN` | Bind address for HTTP transport (`transport-http` feature) |
 | `--http-path <PATH>` | `MCPLS_HTTP_PATH` | URL prefix for HTTP transport (default: `/mcp`) |
 
+> [!NOTE]
+> `MCPLS_TRUST_PROJECT_CONFIG` and `MCPLS_LOG_JSON` accept `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).
+
 ## Claude Code Integration
 
 Add to your Claude Code configuration (`~/.claude/claude_desktop_config.json`):
