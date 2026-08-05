@@ -31,6 +31,9 @@ const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
 /// Initial backoff delay for server-cancelled retries (milliseconds).
 const SERVER_CANCELLED_INITIAL_DELAY_MS: u64 = 500;
 
+/// Byte-length threshold for truncating an LSP error message before logging it.
+const MAX_ERROR_MESSAGE_LOG_BYTES: usize = 200;
+
 /// Upper bound on the effective timeout for completion requests, regardless
 /// of `request_timeout_seconds`.
 ///
@@ -488,6 +491,25 @@ impl LspClient {
         result
     }
 
+    /// Truncate an LSP server's error message for logging, bounding the payload to at most
+    /// [`MAX_ERROR_MESSAGE_LOG_BYTES`] bytes (the full formatted string is slightly longer).
+    ///
+    /// `message` is attacker-influenceable (echoed back by the spawned LSP server), so the
+    /// cut point is the last UTF-8 char boundary at or before that limit rather than a raw
+    /// byte index, which would panic if it fell inside a multi-byte codepoint.
+    fn truncate_error_message_for_log(message: &str) -> String {
+        if message.len() <= MAX_ERROR_MESSAGE_LOG_BYTES {
+            return message.to_string();
+        }
+        let cut = message
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= MAX_ERROR_MESSAGE_LOG_BYTES)
+            .last()
+            .unwrap_or(0);
+        format!("{}... (truncated)", &message[..cut])
+    }
+
     async fn message_loop_inner(
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
@@ -538,11 +560,7 @@ impl LspClient {
 
                             if let Some(sender) = sender {
                                 if let Some(error) = response.error {
-                                    let message = if error.message.len() > 200 {
-                                        format!("{}... (truncated)", &error.message[..200])
-                                    } else {
-                                        error.message.clone()
-                                    };
+                                    let message = Self::truncate_error_message_for_log(&error.message);
                                     error!("LSP error response: {} (code {})", message, error.code);
                                     let _ = sender.send(Err(Error::LspServerError {
                                         code: error.code,
@@ -959,6 +977,44 @@ mod tests {
         } else {
             panic!("Expected LspServerError");
         }
+    }
+
+    #[test]
+    fn test_truncate_error_message_for_log_handles_multibyte_boundary() {
+        // 199 ASCII bytes followed by a 3-byte UTF-8 char ('€') straddles the byte-200 cut.
+        let message = format!("{}€{}", "x".repeat(199), "y".repeat(50));
+
+        let truncated = LspClient::truncate_error_message_for_log(&message);
+
+        // Cutting before the multi-byte char keeps the message valid UTF-8 (no panic) and
+        // pins the payload to 199 bytes, not 200.
+        assert_eq!(truncated, format!("{}... (truncated)", "x".repeat(199)));
+    }
+
+    #[test]
+    fn test_truncate_error_message_for_log_no_truncation_at_or_below_limit() {
+        let exact = "x".repeat(200);
+        assert_eq!(LspClient::truncate_error_message_for_log(&exact), exact);
+        assert_eq!(LspClient::truncate_error_message_for_log(""), "");
+    }
+
+    #[test]
+    fn test_truncate_error_message_for_log_truncates_just_above_limit() {
+        let message = "x".repeat(201);
+        assert_eq!(
+            LspClient::truncate_error_message_for_log(&message),
+            format!("{}... (truncated)", "x".repeat(200))
+        );
+    }
+
+    #[test]
+    fn test_truncate_error_message_for_log_handles_wide_char_at_limit() {
+        // A 4-byte emoji run straddling every possible alignment near the byte-200 boundary.
+        let message = format!("{}{}", "x".repeat(197), "🦀".repeat(10));
+
+        let truncated = LspClient::truncate_error_message_for_log(&message);
+
+        assert_eq!(truncated, format!("{}... (truncated)", "x".repeat(197)));
     }
 
     #[tokio::test]
