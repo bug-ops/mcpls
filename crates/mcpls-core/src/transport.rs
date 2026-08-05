@@ -359,7 +359,7 @@ const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration:
 /// Enforcement lives here, at the `SessionManager` layer, rather than in Axum
 /// middleware sniffing request headers, because that is the only place
 /// guaranteed to run exactly when — and only when — a session is actually
-/// created. `rmcp` 3.0.0's `StreamableHttpService::handle_post` calls
+/// created. `rmcp` 3.1.0's `StreamableHttpService::handle_post` calls
 /// `create_session` solely on legacy-mode POSTs with no `Mcp-Session-Id`
 /// header (the `initialize` handshake); modern-protocol POSTs (SEP-2567,
 /// protocol `>= 2026-07-28`, which removes sessions entirely) and
