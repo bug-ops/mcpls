@@ -152,33 +152,130 @@ use rmcp::transport::streamable_http_server::session::{
     ServerSseMessage, SessionId, SessionManager,
 };
 
-/// Waits for a shutdown signal: `SIGTERM` on Unix (as sent by containers and
-/// systemd) or `Ctrl-C` (`SIGINT`) on any platform.
+/// A registered handle for waiting on a shutdown signal: `SIGTERM`/`SIGINT`
+/// on Unix (as sent by containers, systemd, and `Ctrl-C`) or `Ctrl-C` on
+/// Windows.
 ///
-/// Shared between [`run_stdio`] and [`run_http`] so both transports react to
-/// the same signals the same way.
-async fn wait_for_shutdown_signal() {
+/// Constructed once by [`crate::serve_with`], *before* any startup work
+/// (LSP-server discovery heuristics, `spawn_lsp_servers_background`) runs,
+/// and moved by value into whichever transport (`run_stdio`/`run_http`) ends
+/// up serving. Registering this early — rather than inside the transport
+/// function itself — closes the startup window between process start and the
+/// transport loop, during which a signal would otherwise hit the OS's
+/// default disposition (immediate termination, bypassing
+/// [`crate::bridge::Translator::shutdown_servers`] and risking an orphaned
+/// LSP child process that `spawn_lsp_servers_background` is mid-spawning;
+/// see #270).
+///
+/// Every signal kind is held as its own persistent stream
+/// (`tokio::signal::unix::Signal` / `tokio::signal::windows::CtrlC`) for the
+/// lifetime of this value, rather than re-registered on every
+/// [`ShutdownSignal::recv`] call via `tokio::signal::ctrl_c()`: a signal
+/// delivered while a *specific* listener isn't being polled is only observed
+/// by that same listener's next poll — a freshly (re-)subscribed one starts
+/// at the broadcast's current version and never sees it (tokio
+/// `signal/registry.rs`). Since [`recv`](ShutdownSignal::recv) is awaited
+/// from more than one call site — both by [`run_stdio`], which races it
+/// against the MCP handshake and then the post-handshake serve loop, and
+/// across the gap between construction in `serve_with` and the first await
+/// inside the transport — a fresh registration per call would risk losing a
+/// signal delivered in between.
+pub(crate) struct ShutdownSignal {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = sigterm.recv() => {},
+    sigterm: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    sigint: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+}
+
+impl ShutdownSignal {
+    /// Registers the process's shutdown signal handler(s) up front.
+    pub(crate) fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let sigterm = match signal(SignalKind::terminate()) {
+                Ok(sigterm) => Some(sigterm),
+                Err(e) => {
+                    tracing::warn!(
+                        "SIGTERM handler registration failed ({e}), SIGTERM will not be caught"
+                    );
+                    None
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "SIGTERM handler registration failed ({e}), falling back to SIGINT only"
-                );
-                let _ = tokio::signal::ctrl_c().await;
-            }
+            };
+            let sigint = match signal(SignalKind::interrupt()) {
+                Ok(sigint) => Some(sigint),
+                Err(e) => {
+                    tracing::warn!(
+                        "SIGINT handler registration failed ({e}), SIGINT will not be caught"
+                    );
+                    None
+                }
+            };
+            Self { sigterm, sigint }
+        }
+        #[cfg(windows)]
+        {
+            let ctrl_c = match tokio::signal::windows::ctrl_c() {
+                Ok(ctrl_c) => Some(ctrl_c),
+                Err(e) => {
+                    tracing::warn!("Ctrl-C handler registration failed ({e})");
+                    None
+                }
+            };
+            Self { ctrl_c }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    /// Waits for the next shutdown signal. May be awaited repeatedly.
+    pub(crate) async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            match (self.sigterm.as_mut(), self.sigint.as_mut()) {
+                (Some(sigterm), Some(sigint)) => {
+                    tokio::select! {
+                        _ = sigterm.recv() => {},
+                        _ = sigint.recv() => {},
+                    }
+                }
+                (Some(sigterm), None) => {
+                    sigterm.recv().await;
+                }
+                (None, Some(sigint)) => {
+                    sigint.recv().await;
+                }
+                (None, None) => {
+                    // Both registrations failed above; fall back to a
+                    // one-shot listener so shutdown is still possible, even
+                    // though it doesn't carry the same across-calls
+                    // durability the held streams above do (see the struct
+                    // docs).
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            match self.ctrl_c.as_mut() {
+                Some(ctrl_c) => {
+                    ctrl_c.recv().await;
+                }
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            // No persistent listener is available on this platform; same
+            // caveat as the Unix double-registration-failure fallback above.
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
@@ -190,21 +287,36 @@ async fn wait_for_shutdown_signal() {
 /// the stdio transport closes (client disconnect / stdin EOF) or a `SIGTERM`/
 /// `SIGINT` is received, so callers can run orderly cleanup — such as
 /// [`crate::bridge::Translator::shutdown_servers`] — before the process
-/// exits. On signal, the in-flight `RunningService` is dropped rather than
-/// awaited to completion; `rmcp` closes it asynchronously in that case,
-/// which is acceptable here since the process exits shortly after --
-/// callers must exit via `std::process::exit` rather than returning
-/// normally from `main`, or an uncancellable `tokio::io::stdin()` blocking
-/// thread can stall runtime shutdown indefinitely (see `mcpls-cli`'s
-/// `main.rs` and #308).
+/// exits.
+///
+/// `shutdown_signal` is constructed by [`crate::serve_with`] *before* any
+/// startup work runs (see [`ShutdownSignal`]'s docs) and is raced here
+/// against both the MCP handshake and, once it completes, the
+/// post-handshake serve loop. `serve(..)` awaits the full MCP `initialize`
+/// handshake internally (reading the client's request and writing the
+/// response) before resolving, so a signal arriving during that wait — which
+/// can be indefinite if the client is slow to send `initialize` — must be
+/// caught there too, not only after the handshake finishes. On signal, the
+/// in-flight handshake or `RunningService` is dropped rather than awaited to
+/// completion; `rmcp` closes it asynchronously in that case, which is
+/// acceptable here since the process exits shortly after -- callers must
+/// exit via `std::process::exit` rather than returning normally from `main`,
+/// or an uncancellable `tokio::io::stdin()` blocking thread can stall
+/// runtime shutdown indefinitely (see `mcpls-cli`'s `main.rs` and #308).
 pub(crate) async fn run_stdio(
     mcp_server: crate::mcp::McplsServer,
     peer_cell: &tokio::sync::OnceCell<rmcp::Peer<rmcp::RoleServer>>,
+    mut shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
-    let service = mcp_server
-        .serve(rmcp::transport::stdio())
-        .await
-        .map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?;
+    let service = tokio::select! {
+        result = mcp_server.serve(rmcp::transport::stdio()) => {
+            result.map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?
+        }
+        () = shutdown_signal.recv() => {
+            tracing::info!("shutdown signal received during handshake, stopping stdio transport");
+            return Ok(());
+        }
+    };
 
     if let Err(e) = peer_cell.set(service.peer().clone()) {
         tracing::debug!("Peer cell already set ({}), ignoring", e);
@@ -214,7 +326,7 @@ pub(crate) async fn run_stdio(
         result = service.waiting() => result
             .map(|_| ())
             .map_err(|e| crate::Error::McpServer(format!("MCP server error: {e}"))),
-        () = wait_for_shutdown_signal() => {
+        () = shutdown_signal.recv() => {
             tracing::info!("shutdown signal received, stopping stdio transport");
             Ok(())
         }
@@ -252,6 +364,10 @@ pub(crate) async fn run_stdio(
 /// regardless — bounding shutdown this way lets the caller run its own
 /// post-shutdown cleanup (e.g. closing registered LSP servers) even if a
 /// connection never observes the cancellation (a stuck SSE stream, say).
+/// `shutdown_signal` is constructed by [`crate::serve_with`] before any
+/// startup work runs (see [`ShutdownSignal`]'s docs), so its registration
+/// predates this function's own `TcpListener::bind` call — a signal between
+/// bind and the graceful-shutdown future's first poll is still caught.
 #[cfg(feature = "transport-http")]
 // `session_manager` and `service` are moved into `app`, which is served until
 // shutdown — clippy's drop-tightening heuristic misreads that as an
@@ -261,6 +377,7 @@ pub(crate) async fn run_stdio(
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,
     cfg: HttpConfig,
+    mut shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
     use std::sync::Arc;
 
@@ -310,7 +427,7 @@ pub(crate) async fn run_http(
     // which consumes its own clone.
     let cancel_for_force_timeout = cancel.clone();
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-        wait_for_shutdown_signal().await;
+        shutdown_signal.recv().await;
         cancel.cancel();
     });
 
@@ -595,7 +712,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            super::run_stdio(server, &peer_cell),
+            super::run_stdio(server, &peer_cell, super::ShutdownSignal::new()),
         )
         .await;
 
@@ -699,7 +816,11 @@ mod tests {
 
             let cfg = HttpConfig::new(addr, "/mcp");
 
-            let server_task = tokio::spawn(super::super::run_http(server, cfg));
+            let server_task = tokio::spawn(super::super::run_http(
+                server,
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             // A successful TCP connect proves the listener is up.
@@ -735,7 +856,11 @@ mod tests {
             drop(probe);
 
             let cfg = HttpConfig::new(addr, "/mcp");
-            let server_task = tokio::spawn(super::super::run_http(test_server(), cfg));
+            let server_task = tokio::spawn(super::super::run_http(
+                test_server(),
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
 
             // Let the spawned task make initial progress (bind the
             // listener, enter its `select!`) without depending on any real
@@ -787,7 +912,8 @@ mod tests {
 
             let cfg = HttpConfig::new(addr, "/mcp");
 
-            let result = super::super::run_http(server, cfg).await;
+            let result =
+                super::super::run_http(server, cfg, super::super::ShutdownSignal::new()).await;
             assert!(
                 result.is_err(),
                 "run_http should fail when port is occupied"
@@ -857,7 +983,11 @@ mod tests {
             drop(probe);
 
             let cfg = HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64);
-            let server_task = tokio::spawn(super::super::run_http(test_server(), cfg));
+            let server_task = tokio::spawn(super::super::run_http(
+                test_server(),
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let oversized_body = vec![b'a'; 65];
@@ -888,7 +1018,11 @@ mod tests {
             drop(probe);
 
             let cfg = HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64);
-            let server_task = tokio::spawn(super::super::run_http(test_server(), cfg));
+            let server_task = tokio::spawn(super::super::run_http(
+                test_server(),
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let small_body = vec![b'a'; 32];
@@ -1063,7 +1197,11 @@ mod tests {
             drop(probe);
 
             let cfg = HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1);
-            let server_task = tokio::spawn(super::super::run_http(test_server(), cfg));
+            let server_task = tokio::spawn(super::super::run_http(
+                test_server(),
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
@@ -1101,7 +1239,11 @@ mod tests {
             drop(probe);
 
             let cfg = HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1);
-            let server_task = tokio::spawn(super::super::run_http(test_server(), cfg));
+            let server_task = tokio::spawn(super::super::run_http(
+                test_server(),
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let accept_headers =
@@ -1179,7 +1321,7 @@ mod tests {
             // is enough to observe it.
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(200),
-                super::super::run_http(test_server(), cfg),
+                super::super::run_http(test_server(), cfg, super::super::ShutdownSignal::new()),
             )
             .await;
 

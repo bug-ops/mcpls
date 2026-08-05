@@ -342,6 +342,14 @@ fn test_e2e_multiple_requests() -> Result<()> {
 /// `std::process::exit` fix in `mcpls-cli`'s `main`, `#[tokio::main]`'s
 /// runtime-shutdown wait for that thread would hang indefinitely as long as
 /// the client (this test, via `McpClient`) keeps stdin's write end open.
+///
+/// Sending `SIGTERM` immediately after the handshake completes (no
+/// artificial delay) also touches the tail of #318's window — the narrow gap
+/// between `run_stdio`'s two `select!` blocks — but only weakly: signaling
+/// this soon after `initialize()` returns reproduced the pre-fix bug in just
+/// 1/15 runs, since the client-side I/O latency before the `kill` command
+/// even runs dwarfs that gap. `test_e2e_sigterm_exits_promptly_during_handshake_wait`
+/// below is the reliable reproducer for #318 (5/5 against pre-fix code).
 #[test]
 #[cfg(unix)]
 #[ignore = "Requires mcpls binary built"]
@@ -349,16 +357,12 @@ fn test_e2e_sigterm_exits_promptly_while_client_stdin_open() -> Result<()> {
     let mut client = McpClient::spawn()?;
     client.initialize()?;
 
-    // `run_stdio` only registers its SIGTERM handler once `mcp_server.serve(..)`
-    // returns and its own `tokio::select!` is entered -- a short but real gap
-    // after the client's `initialize()` call already unblocks (empirically,
-    // long enough to consistently lose a signal sent with no delay at all).
-    // In real usage a client stays connected far longer than this before a
-    // `SIGTERM` arrives, so this sleep reproduces that realistic ordering
-    // instead of racing an unrelated startup window that has nothing to do
-    // with #308.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
+    // No delay here is intentional: `run_stdio` now registers its SIGTERM
+    // handler before awaiting the handshake at all (see #318), so the signal
+    // is raced against the handshake/select loop from the moment the
+    // process starts. Sending SIGTERM immediately after `initialize()`
+    // returns exercises the narrowest part of that window instead of
+    // masking it behind an artificial delay.
     let pid = client.pid();
     let status = std::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
@@ -389,6 +393,68 @@ fn test_e2e_sigterm_exits_promptly_while_client_stdin_open() -> Result<()> {
             std::time::Instant::now() < deadline,
             "mcpls did not exit within 5s of SIGTERM while the client's stdin write end \
              was still open (issue #308 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Test that mcpls exits promptly on `SIGTERM` sent *before* the client ever
+/// sends the `initialize` request -- i.e. strictly during the MCP handshake
+/// wait itself (regression test for #318).
+///
+/// This targets the actual bug in #318 directly: pre-fix, `run_stdio`
+/// registered its `SIGTERM` handler only *after* `mcp_server.serve(..)`
+/// resolved, so any signal arriving while `serve(..)` was still awaiting the
+/// client's `initialize` request -- which can be an arbitrarily long wait in
+/// real usage -- fell through to the OS's default disposition (immediate
+/// kill, no graceful shutdown, no LSP cleanup). Sending `SIGTERM`
+/// immediately after spawning, before writing anything to the child's
+/// stdin, reliably lands inside that wait rather than racing the much
+/// narrower post-handshake gap that
+/// `test_e2e_sigterm_exits_promptly_while_client_stdin_open` exercises.
+#[test]
+#[cfg(unix)]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_sigterm_exits_promptly_during_handshake_wait() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+
+    // A brief sleep before signaling clears the unrelated, unfixable gap
+    // between `fork`/`exec` and the point where *any* process code (the
+    // runtime init that precedes even the fixed `ShutdownSignal::new()`)
+    // has run -- the OS applies the default disposition until then no
+    // matter what the binary does, so signaling with zero delay would fail
+    // even against the fix and wouldn't be exercising #318 at all. 50ms is
+    // far below the 5s deadline below and well within the handshake wait,
+    // since `initialize()` is deliberately never called: the child is left
+    // parked inside `mcp_server.serve(..)`, waiting to read the client's
+    // first request.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let pid = client.pid();
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()?;
+    assert!(
+        status.success(),
+        "failed to send SIGTERM to mcpls (pid {pid})"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(exit_status) = client.try_wait()? {
+            assert_eq!(
+                exit_status.code(),
+                Some(0),
+                "mcpls should exit with status 0 via its own shutdown path even when SIGTERM \
+                 arrives before the MCP handshake completes, not be killed by the default \
+                 SIGTERM disposition (issue #318 regression)"
+            );
+            return Ok(());
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mcpls did not exit within 5s of SIGTERM sent before the handshake completed \
+             (issue #318 regression)"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }

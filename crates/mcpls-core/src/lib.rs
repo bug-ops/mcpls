@@ -63,7 +63,7 @@ pub use transport::HttpConfig;
 pub use transport::Transport;
 #[cfg(feature = "transport-http")]
 use transport::run_http;
-use transport::run_stdio;
+use transport::{ShutdownSignal, run_stdio};
 
 /// Whether `uri` falls within one of `workspace_roots`.
 ///
@@ -467,6 +467,17 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
+    // Registered before any other startup work -- including
+    // `spawn_lsp_servers_background` below, which spawns LSP child processes
+    // concurrently on another worker thread -- so a `SIGTERM`/`SIGINT`
+    // arriving during config validation, workspace-root heuristics, or LSP
+    // spawning is caught rather than hitting the OS's default disposition
+    // (immediate termination, orphaning any LSP child mid-spawn; see #270)
+    // and skipping the `shutdown()` cleanup below entirely. See
+    // `ShutdownSignal`'s docs for why this must be a single instance carried
+    // through by value rather than re-registered later.
+    let shutdown_signal = ShutdownSignal::new();
+
     // `ServerConfig::load`/`load_from` already validate the TOML-loading
     // path; this covers the other one -- a caller building `ServerConfig`
     // programmatically (e.g. a library embedder) previously hit no
@@ -615,10 +626,10 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let result = match transport {
         Transport::Stdio => {
             info!("Listening for MCP requests on stdio...");
-            run_stdio(mcp_server, &peer_cell).await
+            run_stdio(mcp_server, &peer_cell, shutdown_signal).await
         }
         #[cfg(feature = "transport-http")]
-        Transport::Http(cfg) => run_http(mcp_server, cfg).await,
+        Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
     };
 
     shutdown(&cancel_tx, &translator, lsp_init_handle).await;
