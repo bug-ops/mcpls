@@ -349,6 +349,22 @@ impl McpClient {
         self.request_id += 1;
         self.request_id
     }
+
+    /// Return the OS process ID of the spawned mcpls process.
+    #[allow(dead_code)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.process.id()
+    }
+
+    /// Non-blocking check for whether the process has exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS query for the process status fails.
+    #[allow(dead_code)]
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.process.try_wait()
+    }
 }
 
 impl Drop for McpClient {

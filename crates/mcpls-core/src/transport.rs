@@ -14,13 +14,20 @@
 ///
 /// # Examples
 ///
+/// See [`crate::serve_with`]'s "Shutdown" section before copying this
+/// verbatim: under [`Transport::Stdio`], `main` must call
+/// `std::process::exit` rather than returning normally, or `SIGTERM`/
+/// `SIGINT` can hang while an MCP client's stdin write end is still open
+/// (#308).
+///
 /// ```rust,ignore
 /// use mcpls_core::{Transport, serve_with, ServerConfig};
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), mcpls_core::Error> {
-///     let config = ServerConfig::load()?;
-///     serve_with(config, Transport::Stdio).await
+/// async fn main() {
+///     let config = ServerConfig::load().expect("failed to load config");
+///     let result = serve_with(config, Transport::Stdio).await;
+///     std::process::exit(if result.is_ok() { 0 } else { 1 });
 /// }
 /// ```
 #[non_exhaustive]
@@ -185,7 +192,11 @@ async fn wait_for_shutdown_signal() {
 /// [`crate::bridge::Translator::shutdown_servers`] — before the process
 /// exits. On signal, the in-flight `RunningService` is dropped rather than
 /// awaited to completion; `rmcp` closes it asynchronously in that case,
-/// which is acceptable here since the process exits shortly after.
+/// which is acceptable here since the process exits shortly after --
+/// callers must exit via `std::process::exit` rather than returning
+/// normally from `main`, or an uncancellable `tokio::io::stdin()` blocking
+/// thread can stall runtime shutdown indefinitely (see `mcpls-cli`'s
+/// `main.rs` and #308).
 pub(crate) async fn run_stdio(
     mcp_server: crate::mcp::McplsServer,
     peer_cell: &tokio::sync::OnceCell<rmcp::Peer<rmcp::RoleServer>>,

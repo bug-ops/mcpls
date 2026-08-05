@@ -21,13 +21,17 @@
 //! use mcpls_core::{serve, serve_with, Transport, ServerConfig};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), mcpls_core::Error> {
-//!     let config = ServerConfig::load()?;
+//! async fn main() {
+//!     let config = ServerConfig::load().expect("failed to load config");
 //!     // Stdio (default):
-//!     serve(config).await
+//!     let result = serve(config).await;
 //!     // HTTP (requires `transport-http` feature):
 //!     // let http = mcpls_core::HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp");
-//!     // serve_with(config, Transport::Http(http)).await
+//!     // let result = serve_with(config, Transport::Http(http)).await;
+//!
+//!     // See `serve`/`serve_with`'s "Shutdown" docs: process::exit avoids a
+//!     // runtime-shutdown hang under the stdio transport.
+//!     std::process::exit(if result.is_ok() { 0 } else { 1 });
 //! }
 //! ```
 
@@ -392,6 +396,12 @@ fn canonicalize_workspace_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// - **All servers succeed**: Service runs normally
 /// - **Partial success**: Logs warnings for failures, continues with available servers
 /// - **All servers fail**: Returns `Error::AllServersFailedToInit` with details
+///
+/// # Shutdown
+///
+/// See [`serve_with`]'s "Shutdown" section — this function uses
+/// [`Transport::Stdio`], so the same `std::process::exit` requirement
+/// applies to callers.
 pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     serve_with(config, Transport::Stdio).await
 }
@@ -424,15 +434,34 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 /// (or another loopback alias) to the mcpls process. Direct non-loopback
 /// access is intentionally blocked to prevent DNS-rebinding attacks.
 ///
+/// # Shutdown
+///
+/// [`Transport::Stdio`] is backed by `tokio::io::stdin()`, which internally
+/// parks an uncancellable blocking-pool thread in a raw `read()` syscall
+/// that only returns on more input or EOF. If your `main` uses
+/// `#[tokio::main]` and simply returns after awaiting this function, the
+/// macro-generated runtime-shutdown wrapper blocks waiting for that thread
+/// -- hanging indefinitely on `SIGTERM`/`SIGINT` as long as the MCP
+/// client's stdin write end is still open, since that never triggers EOF.
+/// Call `std::process::exit` right after this function resolves instead of
+/// returning normally from `main`, as in the example below (see mcpls's own
+/// `mcpls-cli` binary; tracked as #308). This does not apply to
+/// [`Transport::Http`], which never touches `tokio::io::stdin()`.
+///
 /// # Examples
 ///
 /// ```rust,ignore
 /// use mcpls_core::{serve_with, Transport, ServerConfig};
 ///
 /// #[tokio::main]
-/// async fn main() -> Result<(), mcpls_core::Error> {
-///     let config = ServerConfig::load()?;
-///     serve_with(config, Transport::Stdio).await
+/// async fn main() {
+///     let config = ServerConfig::load().expect("failed to load config");
+///     let exit_code = match serve_with(config, Transport::Stdio).await {
+///         Ok(()) => 0,
+///         Err(_) => 1,
+///     };
+///     // See "Shutdown" above: process::exit avoids a runtime-shutdown hang.
+///     std::process::exit(exit_code);
 /// }
 /// ```
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
@@ -619,6 +648,18 @@ const LSP_INIT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// detach the task — it keeps running rather than stopping, contradicting
 /// the warning logged below. Retaining ownership lets `abort()` make that
 /// message true.
+///
+/// `abort()` only *requests* cancellation; the task's locals (which may own
+/// not-yet-registered `tokio::process::Child` handles for LSP servers
+/// [`spawn_lsp_servers_background`] is still spawning via `spawn_batch`,
+/// relying entirely on `kill_on_drop` to terminate them) are only actually
+/// dropped once the runtime polls the task to completion. `mcpls-cli`'s
+/// `main` calls `std::process::exit` right after `serve_with` returns (see
+/// #308), which skips the executor's own task teardown that used to do this
+/// polling implicitly — so this function awaits the aborted handle again,
+/// bounded, to drive that drop here instead of leaving it to chance.
+/// Otherwise a `SIGTERM` arriving mid-`spawn_batch` could orphan those LSP
+/// child processes, the exact failure mode #270 was filed to prevent.
 async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
     match tokio::time::timeout(timeout, &mut handle).await {
         Ok(Ok(())) => {}
@@ -626,6 +667,7 @@ async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
         Err(_) => {
             warn!("Timed out waiting for background LSP initialization task to stop");
             handle.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
         }
     }
 }

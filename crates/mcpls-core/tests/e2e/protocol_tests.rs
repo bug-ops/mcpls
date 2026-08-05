@@ -333,3 +333,63 @@ fn test_e2e_multiple_requests() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that mcpls exits promptly on `SIGTERM` while the client's stdin
+/// write end is still open (regression test for #308).
+///
+/// The MCP stdio transport is backed by `tokio::io::stdin()`, which parks an
+/// uncancellable blocking-pool thread in a raw `read()` syscall. Without the
+/// `std::process::exit` fix in `mcpls-cli`'s `main`, `#[tokio::main]`'s
+/// runtime-shutdown wait for that thread would hang indefinitely as long as
+/// the client (this test, via `McpClient`) keeps stdin's write end open.
+#[test]
+#[cfg(unix)]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_sigterm_exits_promptly_while_client_stdin_open() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+    client.initialize()?;
+
+    // `run_stdio` only registers its SIGTERM handler once `mcp_server.serve(..)`
+    // returns and its own `tokio::select!` is entered -- a short but real gap
+    // after the client's `initialize()` call already unblocks (empirically,
+    // long enough to consistently lose a signal sent with no delay at all).
+    // In real usage a client stays connected far longer than this before a
+    // `SIGTERM` arrives, so this sleep reproduces that realistic ordering
+    // instead of racing an unrelated startup window that has nothing to do
+    // with #308.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let pid = client.pid();
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()?;
+    assert!(
+        status.success(),
+        "failed to send SIGTERM to mcpls (pid {pid})"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(exit_status) = client.try_wait()? {
+            // Distinguishes a graceful `process::exit(0)` from the process
+            // being killed outright by the default SIGTERM disposition
+            // (e.g. if the signal handler failed to register) -- the latter
+            // would also make `try_wait` return `Some`, but with no LSP
+            // shutdown having run. On Unix, `code()` is `None` for
+            // signal-termination, so this one assertion covers both.
+            assert_eq!(
+                exit_status.code(),
+                Some(0),
+                "mcpls should exit with status 0 via its own shutdown path, not be killed \
+                 by the default SIGTERM disposition (issue #308 regression)"
+            );
+            return Ok(());
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mcpls did not exit within 5s of SIGTERM while the client's stdin write end \
+             was still open (issue #308 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}

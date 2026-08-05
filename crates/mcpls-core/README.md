@@ -54,10 +54,14 @@ flowchart LR
 use mcpls_core::{ServerConfig, Transport};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let config = ServerConfig::load()?;
-    mcpls_core::serve_with(config, Transport::Stdio).await?;
-    Ok(())
+async fn main() {
+    let config = ServerConfig::load().expect("failed to load config");
+    let result = mcpls_core::serve_with(config, Transport::Stdio).await;
+    // `Transport::Stdio` is backed by `tokio::io::stdin()`, which parks an
+    // uncancellable blocking-pool thread; returning normally from `main`
+    // here can hang on SIGTERM/SIGINT while a client's stdin is still open.
+    // See `serve_with`'s "Shutdown" docs.
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 ```
 
