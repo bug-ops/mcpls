@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-08-05
+
 ### Added
 
 - **`workspace.max_documents`/`workspace.max_file_size` TOML config fields** — expose `DocumentTracker`'s previously hardcoded resource limits (100 open documents, 10MB max file size) for configuration, following the existing `heuristics_max_depth` flat-field-on-`[workspace]` pattern. `0` disables either limit, matching `ResourceLimits`'s existing semantics; omitting either field preserves today's defaults unchanged. New `WorkspaceConfig::resource_limits()` maps the two fields onto `bridge::ResourceLimits`, and new `Translator::with_resource_limits` builder wires the resolved limits into `serve()`'s `Translator` construction alongside the existing `with_extensions` builder — the two builders now read each other's already-set field when rebuilding `document_tracker`, so they can be called in either order without one silently discarding the other's effect. `Error::DocumentLimitExceeded`/`FileSizeLimitExceeded` messages gained a static hint pointing at the relevant config field. Documented under "Workspace Section" in `docs/user-guide/configuration.md`. Note: `bridge::ResourceLimits` is now re-exported from `bridge` (previously private to `bridge::state`), which as a side effect makes the already-`pub` `DocumentTracker::new` constructible from outside the crate for the first time — this narrows the rationale given in the `DocumentState` encapsulation entry below (#304), which assumed `ResourceLimits`'s privacy made `DocumentTracker` uninstantiable externally; `DocumentState`'s own field privacy and invariant-enforcing methods are unaffected. (#315)
@@ -50,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`mcp::tools`'s six position-only parameter wrappers collapsed into `PositionParams`** — `HoverParams`, `DefinitionParams`, `SignatureHelpParams`, `GoToImplementationParams`, `GoToTypeDefinitionParams`, and `CallHierarchyPrepareParams` each wrapped `PositionParams` with `#[serde(flatten)]` and added nothing: `rmcp`'s schema validation already strips the top-level `title`/`description` these wrappers carried before it reaches an MCP client, so the six were structurally identical to `PositionParams` itself. The six corresponding `#[tool]` handlers (`get_hover`, `get_definition`, `get_signature_help`, `go_to_implementation`, `go_to_type_definition`, `prepare_call_hierarchy`) now take `Parameters<PositionParams>` directly. No client-visible schema or wire-format change. (#302)
 - **`bridge::translator.rs` split into `bridge/translator/` submodules** — the single 7100+ line file (setup/lifecycle, all 20 tool handlers, DTOs, and their tests) is now `mod.rs` (the `Translator` struct and setup/lifecycle methods) plus twelve sibling modules grouped by domain (`clock`, `respawn`, `routing`, `dto`, `encoding_ctx`, `navigation`, `diagnostics`, `edits`, `symbols`, `assist`, `call_hierarchy`, and a shared `testing` fixture module), matching the existing per-file test convention used by `bridge::state`/`bridge::notifications`/`bridge::encoding`. Pure code motion — `bridge::translator`'s public re-export surface (`bridge/mod.rs`'s `pub use translator::{...}` block) and every `Translator` method signature are unchanged. (#300)
 - **Respawn-backoff bookkeeping now goes through an injectable `Clock`** — `Translator::respawn_if_dead` and its backoff helpers (previously hardcoded to `std::time::Instant::now()`) now read time through a new `bridge::translator::clock::Clock` trait, defaulted to `SystemClock` in production. No production behavior change; this is a test-only seam (`Translator::with_clock`, `#[cfg(test)]`) that lets backoff-window tests advance a `FakeClock` deterministically instead of relying on real sleeps or incidental timing. Also switches the two call sites that used `Instant::elapsed`/`duration_since` directly to `saturating_duration_since`, for explicitness at the injection seam now that the clock reading is no longer guaranteed to be `SystemClock`; behavior is unchanged (`elapsed`/`duration_since` and `saturating_duration_since` are equivalent on current Rust). (#292)
+- **`config::server`'s builtin `LspServerConfig` constructors deduplicated** — extracted a private `builtin()` helper for the six fields (`env`, `initialization_options`, `timeout_seconds`, `request_timeout_seconds`, `name`, `handles`) previously repeated verbatim across all six built-in language constructors (`rust_analyzer`, `pyright`, `typescript`, `gopls`, `clangd`, `zls`); only the per-language values remain at each call site. No behavior change. (#316)
+- Bump rmcp from 2.2.0 to 3.0.0
+- Bump toml from 1.1.3+spec-1.1.0 to 1.1.4+spec-1.1.0
+- CI: bump actions/checkout from 7.0.0 to 7.0.1
+- CI: bump actions/labeler from 6 to 7
+- CI: bump cargo-bins/cargo-binstall from 1.21.0 to 1.21.1
+- CI: bump lewagon/wait-on-check-action from 1.8.1 to 1.9.0
 
 ### Removed
 
@@ -650,7 +659,9 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.9...HEAD
+[0.3.9]: https://github.com/bug-ops/mcpls/compare/v0.3.8...v0.3.9
+[0.3.8]: https://github.com/bug-ops/mcpls/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/bug-ops/mcpls/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/bug-ops/mcpls/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/bug-ops/mcpls/compare/v0.3.4...v0.3.5
