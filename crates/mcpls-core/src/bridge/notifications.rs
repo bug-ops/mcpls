@@ -1407,7 +1407,7 @@ mod tests {
 
         cache.store_log(LogLevel::Info, oversized.clone());
 
-        let stored = &cache.get_logs()[0].message;
+        let stored = &cache.logs()[0].message;
         assert!(stored.len() < oversized.len());
         assert!(stored.ends_with("... (truncated)"));
     }
@@ -1419,7 +1419,7 @@ mod tests {
 
         cache.store_log(LogLevel::Info, message.clone());
 
-        assert_eq!(cache.get_logs()[0].message, message);
+        assert_eq!(cache.logs()[0].message, message);
     }
 
     #[test]
@@ -1485,7 +1485,7 @@ mod tests {
 
         cache.store_message(MessageType::Info, oversized.clone());
 
-        let stored = &cache.get_messages()[0].message;
+        let stored = &cache.messages()[0].message;
         assert!(stored.len() < oversized.len());
         assert!(stored.ends_with("... (truncated)"));
     }
