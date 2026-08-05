@@ -46,7 +46,7 @@ fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> R
 
     if query.len() > MAX_QUERY_LENGTH {
         return Err(Error::InvalidToolParams(format!(
-            "Query too long: {} chars (max {MAX_QUERY_LENGTH})",
+            "Query too long: {} bytes (max {MAX_QUERY_LENGTH})",
             query.len()
         )));
     }

@@ -8,6 +8,7 @@ mod routing;
 mod server;
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub use language::{base_language_id, react_variant_language_id};
@@ -410,6 +411,30 @@ pub enum ProjectConfigTrust {
     Trusted,
 }
 
+/// Maximum size, in bytes, of a config file `load_from` will read.
+///
+/// A config file is trusted TOML on a normal setup, but nothing stops a
+/// path from pointing at an arbitrarily large or adversarial file (e.g. a
+/// misconfigured `$MCPLS_CONFIG`) -- `load_from` used to call
+/// `std::fs::read_to_string` with no upper bound, so it could be made to
+/// buffer an unbounded amount of memory before `toml::from_str` ever runs
+/// (#309). 8 MiB is far larger than any legitimate `mcpls.toml`, which
+/// realistically stays in the low kilobytes even with dozens of configured
+/// servers.
+///
+/// Enforced via a bounded read (`Read::take`), not a `std::fs::metadata`
+/// pre-check: `metadata().len()` reports `0` for character devices, FIFOs,
+/// and many procfs entries regardless of how much data they can actually
+/// produce (e.g. `/dev/zero`), so a path pointing at one of those would
+/// sail past a size-only pre-check and still block `read_to_string` on an
+/// effectively infinite read -- the exact "slow/infinite device" case #309
+/// named. A pure metadata check is also TOCTOU-able for a regular file that
+/// grows between the check and the read. Reading `MAX_CONFIG_FILE_BYTES +
+/// 1` bytes, one past the cap, is what distinguishes "exactly at the
+/// boundary" (allowed) from "over" (rejected) without needing a second
+/// syscall.
+const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 impl ServerConfig {
     /// Build the effective extension map used for language detection.
     ///
@@ -546,15 +571,32 @@ impl ServerConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file doesn't exist or parsing fails.
+    /// Returns an error if the file doesn't exist, exceeds the maximum
+    /// allowed config file size, or parsing fails.
     pub fn load_from(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path).map_err(|e| {
+        let file = std::fs::File::open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::ConfigNotFound(path.to_path_buf())
             } else {
                 Error::Io(e)
             }
         })?;
+
+        // Bounded read, not a `metadata().len()` pre-check -- see
+        // `MAX_CONFIG_FILE_BYTES`'s doc for why the pre-check alone is
+        // bypassable.
+        let mut buf = Vec::new();
+        file.take(MAX_CONFIG_FILE_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(Error::Io)?;
+        if buf.len() as u64 > MAX_CONFIG_FILE_BYTES {
+            return Err(Error::FileSizeLimitExceeded {
+                size: buf.len() as u64,
+                max: MAX_CONFIG_FILE_BYTES,
+            });
+        }
+        let content = String::from_utf8(buf)
+            .map_err(|e| Error::InvalidConfig(format!("config file is not valid UTF-8: {e}")))?;
 
         let config: Self = toml::from_str(&content)?;
         config.validate()?;
@@ -968,6 +1010,67 @@ mod tests {
 
         let result = ServerConfig::load_from(&config_path);
         assert!(result.is_err());
+    }
+
+    /// #309: a config file larger than `MAX_CONFIG_FILE_BYTES` must be
+    /// rejected before `read_to_string` buffers it, not merely fail to
+    /// parse as TOML afterward.
+    #[test]
+    fn test_load_from_rejects_oversized_file() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("oversized.toml");
+
+        // One byte over the cap; content doesn't need to be valid TOML since
+        // the size check runs before parsing.
+        let oversized = "#".repeat(usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap() + 1);
+        fs::write(&config_path, &oversized).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(matches!(
+            result,
+            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
+        ));
+    }
+
+    #[test]
+    fn test_load_from_accepts_file_at_exact_size_cap() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("exact.toml");
+
+        // Pad a valid, minimal TOML document with a trailing comment up to
+        // exactly the cap -- the boundary itself must not be rejected.
+        let mut toml_content = "[workspace]\n# ".to_string();
+        toml_content.push_str(
+            &"a".repeat(usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap() - toml_content.len()),
+        );
+        assert_eq!(toml_content.len() as u64, MAX_CONFIG_FILE_BYTES);
+        fs::write(&config_path, &toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    /// #309 S1: `std::fs::metadata` reports `len() == 0` for character
+    /// devices regardless of how much data they can actually produce --
+    /// `/dev/zero` is the canonical example. A size check based on metadata
+    /// alone would pass and let `load_from` block on an effectively
+    /// infinite read; the bounded `Read::take` must still reject it via
+    /// `MAX_CONFIG_FILE_BYTES`, not hang or OOM.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_rejects_infinite_special_file() {
+        let path = Path::new("/dev/zero");
+        assert_eq!(
+            fs::metadata(path).unwrap().len(),
+            0,
+            "test assumption: /dev/zero must report zero length"
+        );
+
+        let result = ServerConfig::load_from(path);
+        assert!(matches!(
+            result,
+            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
+        ));
     }
 
     #[test]

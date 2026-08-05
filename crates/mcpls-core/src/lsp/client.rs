@@ -32,7 +32,23 @@ const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
 const SERVER_CANCELLED_INITIAL_DELAY_MS: u64 = 500;
 
 /// Byte-length threshold for truncating an LSP error message before logging it.
+///
+/// Kept short since this feeds a single `tracing::error!` log line, not the
+/// MCP caller -- see `MAX_ERROR_MESSAGE_CALLER_BYTES` for that budget.
 const MAX_ERROR_MESSAGE_LOG_BYTES: usize = 200;
+
+/// Byte-length threshold for the LSP error message forwarded to the MCP
+/// caller in [`Error::LspServerError`] (#313).
+///
+/// Deliberately much larger than `MAX_ERROR_MESSAGE_LOG_BYTES`: a
+/// legitimate LSP error (e.g. a verbose rust-analyzer type-mismatch
+/// diagnostic reported through an error response) can run into the low
+/// kilobytes, and that detail is useful to the calling model -- a log line
+/// should stay terse, but a truncated-to-200-bytes error handed to the
+/// model would cut off real content on every longer-but-honest error. Still
+/// far below #311's 256 KiB cache-entry cap: this string is echoed directly
+/// into the MCP tool result / model context, not merely cached.
+const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
 
 /// Upper bound on the effective timeout for completion requests, regardless
 /// of `request_timeout_seconds`.
@@ -491,23 +507,15 @@ impl LspClient {
         result
     }
 
-    /// Truncate an LSP server's error message for logging, bounding the payload to at most
-    /// [`MAX_ERROR_MESSAGE_LOG_BYTES`] bytes (the full formatted string is slightly longer).
+    /// Truncate an LSP server's error message for the `tracing::error!` log
+    /// line, bounding it to at most [`MAX_ERROR_MESSAGE_LOG_BYTES`] bytes
+    /// (the full formatted string is slightly longer).
     ///
-    /// `message` is attacker-influenceable (echoed back by the spawned LSP server), so the
-    /// cut point is the last UTF-8 char boundary at or before that limit rather than a raw
-    /// byte index, which would panic if it fell inside a multi-byte codepoint.
+    /// Log-line use only -- the message forwarded to the MCP caller in
+    /// [`Error::LspServerError`] is truncated separately, to the larger
+    /// [`MAX_ERROR_MESSAGE_CALLER_BYTES`] (#313).
     fn truncate_error_message_for_log(message: &str) -> String {
-        if message.len() <= MAX_ERROR_MESSAGE_LOG_BYTES {
-            return message.to_string();
-        }
-        let cut = message
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|&i| i <= MAX_ERROR_MESSAGE_LOG_BYTES)
-            .last()
-            .unwrap_or(0);
-        format!("{}... (truncated)", &message[..cut])
+        crate::util::truncate_str(message, MAX_ERROR_MESSAGE_LOG_BYTES)
     }
 
     async fn message_loop_inner(
@@ -560,11 +568,20 @@ impl LspClient {
 
                             if let Some(sender) = sender {
                                 if let Some(error) = response.error {
-                                    let message = Self::truncate_error_message_for_log(&error.message);
-                                    error!("LSP error response: {} (code {})", message, error.code);
+                                    let log_message = Self::truncate_error_message_for_log(&error.message);
+                                    error!("LSP error response: {} (code {})", log_message, error.code);
+                                    // Truncated separately from the log line, to the larger
+                                    // MAX_ERROR_MESSAGE_CALLER_BYTES -- the raw message is
+                                    // unbounded and attacker-influenceable (#313), but a
+                                    // log-line-sized cut would also clip legitimate long
+                                    // errors before the model ever sees them (S2).
+                                    let caller_message = crate::util::truncate_str(
+                                        &error.message,
+                                        MAX_ERROR_MESSAGE_CALLER_BYTES,
+                                    );
                                     let _ = sender.send(Err(Error::LspServerError {
                                         code: error.code,
-                                        message: error.message,
+                                        message: caller_message,
                                         data: error.data,
                                     }));
                                 } else if let Some(result) = response.result {
@@ -929,56 +946,6 @@ mod tests {
         assert!(sender.is_none(), "Should not find sender for unknown ID");
     }
 
-    #[tokio::test]
-    async fn test_long_error_message_truncation() {
-        use crate::lsp::types::{JsonRpcError, JsonRpcResponse, RequestId};
-
-        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
-        let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
-
-        pending_requests
-            .lock()
-            .await
-            .insert(RequestId::Number(1), response_tx);
-
-        let long_message = "x".repeat(250);
-        let error_response = JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: RequestId::Number(1),
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32700,
-                message: long_message.clone(),
-                data: None,
-            }),
-        };
-
-        let sender = pending_requests.lock().await.remove(&error_response.id);
-        if let Some(sender) = sender
-            && let Some(error) = error_response.error
-        {
-            let _ = sender.send(Err(Error::LspServerError {
-                code: error.code,
-                message: error.message,
-                data: error.data,
-            }));
-        }
-
-        let result = response_rx.await.unwrap();
-        assert!(result.is_err());
-
-        if let Err(Error::LspServerError { code, message, .. }) = result {
-            assert_eq!(code, -32700);
-            assert_eq!(
-                message.len(),
-                250,
-                "Full message should be preserved in Error"
-            );
-        } else {
-            panic!("Expected LspServerError");
-        }
-    }
-
     #[test]
     fn test_truncate_error_message_for_log_handles_multibyte_boundary() {
         // 199 ASCII bytes followed by a 3-byte UTF-8 char ('€') straddles the byte-200 cut.
@@ -1230,6 +1197,25 @@ mod tests {
             stdin.flush().await.unwrap();
         }
 
+        /// Writes a framed JSON-RPC error response with an arbitrary code/message.
+        async fn write_error_response(
+            stdin: &mut ChildStdin,
+            id: &Value,
+            code: i32,
+            message: &str,
+        ) {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": code, "message": message },
+            });
+            let content = serde_json::to_string(&response).unwrap();
+            let header = format!("Content-Length: {}\r\n\r\n", content.len());
+            stdin.write_all(header.as_bytes()).await.unwrap();
+            stdin.write_all(content.as_bytes()).await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+
         /// Writes a framed JSON-RPC success response.
         async fn write_success_response(stdin: &mut ChildStdin, id: &Value, result: Value) {
             let response = serde_json::json!({
@@ -1378,6 +1364,89 @@ mod tests {
 
             let result = request_task.await.unwrap();
             assert_eq!(result.unwrap(), expected_result);
+        }
+
+        /// #313: an oversized, server-controlled error message must be
+        /// truncated before it reaches the MCP caller in
+        /// `Error::LspServerError`, not just before it is logged. Routes
+        /// through the real `message_loop_inner` (via `fake_lsp_client`)
+        /// rather than constructing the error by hand, so it actually
+        /// exercises the fix.
+        #[tokio::test]
+        async fn test_oversized_error_message_truncated_for_caller() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let id = request["id"].clone();
+            let oversized_message = "x".repeat(MAX_ERROR_MESSAGE_CALLER_BYTES + 500);
+            write_error_response(&mut server.read_half_stdin, &id, -32603, &oversized_message)
+                .await;
+
+            let result = request_task.await.unwrap();
+
+            match result {
+                Err(Error::LspServerError { code, message, .. }) => {
+                    assert_eq!(code, -32603);
+                    assert!(
+                        message.len() < oversized_message.len(),
+                        "caller-facing message must be truncated, got {} bytes",
+                        message.len()
+                    );
+                    assert!(message.ends_with("... (truncated)"));
+                }
+                other => panic!("expected truncated LspServerError, got {other:?}"),
+            }
+        }
+
+        /// #313 S2: a legitimate error message longer than the log-line cap
+        /// (`MAX_ERROR_MESSAGE_LOG_BYTES`, 200 bytes) but shorter than the
+        /// caller-facing cap must reach the MCP caller intact -- the
+        /// caller-facing budget must not silently collapse to the log
+        /// budget.
+        #[tokio::test]
+        async fn test_error_message_between_log_and_caller_caps_reaches_caller_intact() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let id = request["id"].clone();
+            let message = "x".repeat(MAX_ERROR_MESSAGE_LOG_BYTES + 50);
+            write_error_response(&mut server.read_half_stdin, &id, -32603, &message).await;
+
+            let result = request_task.await.unwrap();
+
+            match result {
+                Err(Error::LspServerError {
+                    message: returned, ..
+                }) => {
+                    assert_eq!(
+                        returned, message,
+                        "message under the caller cap must not be truncated"
+                    );
+                }
+                other => panic!("expected untruncated LspServerError, got {other:?}"),
+            }
         }
     }
 }

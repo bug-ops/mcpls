@@ -327,6 +327,8 @@ mod tests {
 
     use super::*;
     use crate::bridge::NotificationCache;
+    use crate::bridge::translator::assist::MAX_TRIGGER_CHARACTER_BYTES;
+    use crate::bridge::translator::edits::MAX_NEW_NAME_LENGTH;
     use crate::bridge::translator::testing::*;
     use crate::config::{LspServerConfig, ToolRouter};
     use crate::error::Error;
@@ -942,6 +944,20 @@ mod tests {
         ));
     }
 
+    /// #309: an oversized `new_name` must be rejected before any server
+    /// routing is attempted, so no LSP server needs to be registered here.
+    #[tokio::test]
+    async fn test_handle_rename_rejects_oversized_new_name() {
+        let translator = Translator::new();
+        let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
+
+        let result = translator
+            .handle_rename("/main.rs".to_string(), 1, 1, new_name)
+            .await;
+
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
     #[tokio::test]
     async fn test_handle_rename_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
@@ -1260,6 +1276,20 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// #309 M3: an oversized `trigger` must be rejected before any server
+    /// routing is attempted.
+    #[tokio::test]
+    async fn test_handle_completions_rejects_oversized_trigger() {
+        let translator = Translator::new();
+        let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
+
+        let result = translator
+            .handle_completions("/main.rs".to_string(), 1, 1, Some(trigger))
+            .await;
+
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ pub mod error;
 pub mod lsp;
 pub mod mcp;
 pub mod transport;
+mod util;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, PathBuf};

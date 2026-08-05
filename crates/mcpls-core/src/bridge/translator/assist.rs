@@ -12,7 +12,7 @@ use super::dto::{
     SignatureInfo, SignatureParameter,
 };
 use crate::config::ToolKind;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Extract hover contents as markdown string.
 /// Convert LSP `Documentation` to a plain string.
@@ -23,13 +23,38 @@ fn extract_documentation(doc: lsp_types::Documentation) -> String {
     }
 }
 
+/// Maximum length, in bytes, of a `get_completions` `trigger` parameter.
+///
+/// The LSP spec defines `triggerCharacter` as a single character, but
+/// `CompletionsParams.trigger` is still an unbounded free-form `String`
+/// forwarded to the LSP server as `trigger_character` with no cap of its
+/// own (#309 M3) -- the same forwarding-without-a-cap shape `new_name` and
+/// `query` had. 8 bytes comfortably covers any single Unicode codepoint (at
+/// most 4 bytes in UTF-8) with margin, while still rejecting anything that
+/// isn't plausibly "one character".
+pub(super) const MAX_TRIGGER_CHARACTER_BYTES: usize = 8;
+
+/// Validate parameters for `handle_completions`.
+fn validate_completions_params(trigger: Option<&str>) -> Result<()> {
+    if let Some(trigger) = trigger
+        && trigger.len() > MAX_TRIGGER_CHARACTER_BYTES
+    {
+        return Err(Error::InvalidToolParams(format!(
+            "trigger too long: {} bytes (max {MAX_TRIGGER_CHARACTER_BYTES})",
+            trigger.len()
+        )));
+    }
+    Ok(())
+}
+
 impl Translator {
     /// Handle completions request.
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `completionProvider` support.
+    /// Returns an error if `trigger` exceeds the maximum allowed length,
+    /// the LSP request fails, the file cannot be opened, or the routed
+    /// server does not advertise `completionProvider` support.
     pub async fn handle_completions(
         &self,
         file_path: String,
@@ -37,6 +62,8 @@ impl Translator {
         character: u32,
         trigger: Option<String>,
     ) -> Result<CompletionsResult> {
+        validate_completions_params(trigger.as_deref())?;
+
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -259,5 +286,30 @@ impl Translator {
         }
 
         Ok(InlayHintsResult { hints })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// #309 M3: `trigger` has no cap of its own even though the LSP spec
+    /// defines it as a single character.
+    #[test]
+    fn test_validate_completions_params_rejects_oversized_trigger() {
+        let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
+        let result = validate_completions_params(Some(&trigger));
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[test]
+    fn test_validate_completions_params_accepts_typical_trigger_char() {
+        assert!(validate_completions_params(Some(".")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_completions_params_accepts_none() {
+        assert!(validate_completions_params(None).is_ok());
     }
 }

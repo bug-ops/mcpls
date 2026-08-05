@@ -77,6 +77,26 @@ fn validate_code_action_params(
     Ok(())
 }
 
+/// Maximum length, in bytes, of a `rename_symbol` `new_name` parameter.
+///
+/// `new_name` is forwarded to the routed LSP server as-is with no inherent
+/// bound of its own -- unlike `workspace_symbol_search`'s `query` (see
+/// `validate_workspace_symbol_params`), it previously relied entirely on
+/// outer transport limits (#309). No real identifier approaches this length
+/// in any language mcpls targets.
+pub(super) const MAX_NEW_NAME_LENGTH: usize = 1_000;
+
+/// Validate parameters for `handle_rename`.
+fn validate_rename_params(new_name: &str) -> Result<()> {
+    if new_name.len() > MAX_NEW_NAME_LENGTH {
+        return Err(Error::InvalidToolParams(format!(
+            "new_name too long: {} bytes (max {MAX_NEW_NAME_LENGTH})",
+            new_name.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Convert LSP code action to MCP code action. `uri` is the queried
 /// document's own URI, used for the action's `diagnostics` (always scoped to
 /// the requested document); `edit.changes` carries its own per-file URIs.
@@ -147,8 +167,9 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `renameProvider` support.
+    /// Returns an error if `new_name` exceeds the maximum allowed length,
+    /// the LSP request fails, the file cannot be opened, or the routed
+    /// server does not advertise `renameProvider` support.
     pub async fn handle_rename(
         &self,
         file_path: String,
@@ -156,6 +177,8 @@ impl Translator {
         character: u32,
         new_name: String,
     ) -> Result<RenameResult> {
+        validate_rename_params(&new_name)?;
+
         let (server_id, client, uri) = self
             .prepare_gated_document(&file_path, ToolKind::Rename, "renameProvider", |caps| {
                 matches!(
@@ -411,6 +434,34 @@ mod tests {
     use super::*;
     use crate::bridge::translator::dto::DiagnosticSeverity;
     use crate::bridge::translator::testing::*;
+
+    /// #309: `new_name` has no inherent bound of its own and is forwarded to
+    /// the LSP server as-is, so it must be rejected before that happens.
+    #[test]
+    fn test_validate_rename_params_rejects_oversized_new_name() {
+        let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
+        let result = validate_rename_params(&new_name);
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    #[test]
+    fn test_validate_rename_params_accepts_name_at_exact_limit() {
+        let new_name = "a".repeat(MAX_NEW_NAME_LENGTH);
+        assert!(validate_rename_params(&new_name).is_ok());
+    }
+
+    #[test]
+    fn test_validate_rename_params_accepts_typical_identifier() {
+        assert!(validate_rename_params("my_variable").is_ok());
+    }
+
+    /// #309: length checks have no lower bound -- an empty `new_name` is
+    /// syntactically valid input for this validator (semantic rejection of
+    /// an empty rename target, if desired, is a separate concern).
+    #[test]
+    fn test_validate_rename_params_accepts_empty_string() {
+        assert!(validate_rename_params("").is_ok());
+    }
 
     #[tokio::test]
     async fn test_handle_code_actions_invalid_kind() {

@@ -7,11 +7,51 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use chrono::{DateTime, Utc};
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::config::ServerId;
+use crate::util::{truncate_str, truncate_string};
 
 /// Maximum number of log entries to store.
 const MAX_LOG_ENTRIES: usize = 100;
+
+/// Maximum size, in bytes, of a single cached log message, server message,
+/// or a single diagnostic's free-form `message` text.
+///
+/// `MAX_LOG_ENTRIES`/`MAX_SERVER_MESSAGES`/`MAX_DIAGNOSTIC_ENTRIES` bound
+/// the *number* of cached entries, but not the size of any one entry -- a
+/// spawned LSP server could publish a single pathologically large message
+/// and still fit under those caps while consuming unbounded memory (#311).
+/// This is independent of the transport-level `MAX_CONTENT_LENGTH` cap in
+/// `lsp::transport`, which bounds a whole JSON-RPC frame, not one field
+/// within it. 256 KiB comfortably fits any realistic diagnostic or log
+/// message while still capping the worst case.
+///
+/// This alone does not bound a whole diagnostics *entry* (a
+/// `Vec<LspDiagnostic>`), only one diagnostic's `message` field -- see
+/// `MAX_DIAGNOSTICS_ENTRY_BYTES` for the entry-level cap.
+const MAX_ENTRY_TEXT_BYTES: usize = 256 * 1024;
+
+/// Maximum serialized size, in bytes, of a single document's *whole*
+/// diagnostics list (`Vec<LspDiagnostic>`), enforced by
+/// [`cap_diagnostics_entry_size`].
+///
+/// `MAX_ENTRY_TEXT_BYTES` alone does not bound this: it only truncates one
+/// diagnostic's `message` field, but the list's *length* is uncapped, and
+/// `LspDiagnostic` carries several more free-form or arbitrary-JSON fields
+/// besides `message` (`source`, `code`, `code_description`,
+/// `related_information`, `data`). A hostile server can stay under
+/// `MAX_ENTRY_TEXT_BYTES` on every individual message while still
+/// publishing e.g. 100k diagnostics for one URI, or a single diagnostic
+/// with a multi-MiB `data` blob -- both still fit under the transport-level
+/// `lsp::transport::MAX_CONTENT_LENGTH` (10 MiB) per notification, and
+/// `MAX_DIAGNOSTIC_ENTRIES` bounds only the *number* of distinct cached
+/// URIs, not their individual size, so up to 1000 such entries could
+/// otherwise accumulate to gigabytes. 1 MiB is far larger than any
+/// realistic diagnostics list for one file, and combined with
+/// `MAX_DIAGNOSTIC_ENTRIES` bounds the cache's total diagnostics footprint
+/// to roughly 1 GiB in the worst case.
+const MAX_DIAGNOSTICS_ENTRY_BYTES: usize = 1024 * 1024;
 
 /// Global budget for distinct-URI diagnostic entries, shared work-conservingly
 /// across every registered diagnostics-route server rather than claimed by
@@ -55,6 +95,250 @@ fn uri_cache_key(uri: &str) -> std::borrow::Cow<'_, str> {
 
 /// Maximum number of server messages to store.
 const MAX_SERVER_MESSAGES: usize = 50;
+
+/// Conservative fixed-field/JSON-structure overhead assumed per diagnostic
+/// (`range`, `severity`, and object/field-name punctuation) by
+/// [`cap_diagnostics_entry_size`]'s cheap size estimate. Deliberately
+/// generous relative to the true overhead (`range` alone serializes to
+/// roughly 70 bytes) so the estimate can only ever *overcount*, never
+/// undercount, actual serialized size.
+const DIAGNOSTIC_ESTIMATE_OVERHEAD_BYTES: usize = 256;
+
+/// Worst-case JSON string-escaping expansion factor, applied to each raw
+/// string field's byte length in [`cap_diagnostics_entry_size`]'s cheap
+/// size estimate.
+///
+/// A raw byte's serialized JSON form is at most 6 bytes: `"` and `\` and
+/// the five control characters with a short escape (`\b \f \n \r \t`) cost
+/// 2 bytes, but every other control character (`U+0000`..=`U+001F`, e.g.
+/// NUL) has no short escape and is emitted as `\u00XX` -- 6 bytes for 1 raw
+/// byte. The original estimate summed raw string lengths directly and
+/// could *undercount* an escape-heavy string (e.g. all-NUL) by up to this
+/// factor, letting an oversized entry skip the real `fits` check
+/// entirely -- multiplying by it keeps the estimate a true upper bound on
+/// serialized size rather than merely a typical-case guess.
+const JSON_ESCAPE_WORST_CASE_FACTOR: usize = 6;
+
+/// Last-resort message length used by [`cap_diagnostics_entry_size`]'s
+/// terminal-enforcement fallback -- small enough that a single diagnostic
+/// (fixed-size `range`/`severity` plus this one short string, every other
+/// field cleared) can never approach [`MAX_DIAGNOSTICS_ENTRY_BYTES`]
+/// regardless of JSON encoding overhead.
+const DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES: usize = 1024;
+
+/// Ordinal rank used to sort diagnostics by severity before
+/// [`cap_diagnostics_entry_size`] truncates an oversized list -- lower rank
+/// sorts first, so it is kept preferentially (#311 S6).
+///
+/// `DiagnosticSeverity`'s inner value is private, so its natural numeric
+/// ordering (`ERROR` < `WARNING` < `INFORMATION` < `HINT`) can't be read
+/// directly; `Option<DiagnosticSeverity>`'s *derived* `Ord` would also rank
+/// `None` before every `Some` value, the opposite of what's wanted here
+/// (no reported severity is treated as least important, same as `HINT`).
+/// This maps explicitly instead of relying on either.
+const fn diagnostic_severity_rank(diagnostic: &LspDiagnostic) -> u8 {
+    match diagnostic.severity {
+        Some(lsp_types::DiagnosticSeverity::ERROR) => 0,
+        Some(lsp_types::DiagnosticSeverity::WARNING) => 1,
+        Some(lsp_types::DiagnosticSeverity::INFORMATION) => 2,
+        // An unrecognized (future) severity value is treated the same as
+        // no severity at all: least important, not most.
+        Some(_) | None => 3,
+    }
+}
+
+/// Largest `k` such that `fits(&diagnostics[..k])`, found via binary search
+/// rather than a linear scan or a flat halve (#311 S6).
+///
+/// Correct because a JSON array's serialized length is monotonically
+/// non-decreasing in its element count -- appending a diagnostic can only
+/// add bytes, never remove them -- so `fits(&diagnostics[..k])` is `true`
+/// for a contiguous run of small `k` and `false` for every larger `k`,
+/// exactly the shape a boundary binary search requires. `fits(&[])` is
+/// always `true`, so the search is well-defined even if no diagnostic at
+/// all fits individually.
+fn largest_fitting_prefix(
+    diagnostics: &[LspDiagnostic],
+    fits: impl Fn(&[LspDiagnostic]) -> bool,
+) -> usize {
+    let (mut lo, mut hi) = (0usize, diagnostics.len());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(&diagnostics[..mid]) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// Bounds `diagnostics`' serialized size to at most
+/// `MAX_DIAGNOSTICS_ENTRY_BYTES` (#311 C1 fix).
+///
+/// Measures the list's *actual* serialized size via `serde_json::to_vec`
+/// rather than bounding each field individually -- that covers every
+/// field on `LspDiagnostic` (`source`, `code`, `code_description`,
+/// `related_information`, `data`, `tags`) at once, not just `message`.
+///
+/// # Guarantee
+///
+/// The postcondition -- the returned list's serialized size is at most
+/// `MAX_DIAGNOSTICS_ENTRY_BYTES` -- is enforced directly by a final,
+/// unconditional check at the end of this function, not merely assumed to
+/// follow from the field-specific mitigations below it. Those mitigations
+/// are best-effort (preserve as much real content as fits) and only cover
+/// the fields known today; the terminal step is what actually guarantees
+/// the bound holds even if a mitigation is incomplete or `LspDiagnostic`
+/// gains a new unbounded field in a future `lsp-types` upgrade.
+///
+/// # Cost (#311 S5)
+///
+/// `publishDiagnostics` is a hot path (rust-analyzer republishes
+/// whole-workspace diagnostics on every save), so this avoids a full
+/// `serde_json` serialization pass whenever every diagnostic's size is
+/// cheaply accountable from `message`/`source`/`code` alone (i.e. none
+/// carry `data`, `code_description`, `related_information`, or `tags`,
+/// each of which needs real serialization to size safely) and a
+/// conservative *upper bound* on their sum already fits. The estimate is
+/// not their raw byte length: JSON string escaping can expand a byte up to
+/// [`JSON_ESCAPE_WORST_CASE_FACTOR`]-fold (a NUL-heavy string previously
+/// let this fast path undercount actual serialized size by that much and
+/// skip the real `fits` check below entirely), so raw lengths are
+/// multiplied by that factor before comparing against the cap.
+///
+/// # Visibility (#311 S7)
+///
+/// Every mitigation that drops or truncates real content -- discarding
+/// diagnostics entirely, or clearing a survivor's `data` (which the LSP
+/// spec says is preserved through to a later `textDocument/codeAction`
+/// request, so losing it can silently break that diagnostic's quick fix)
+/// -- logs a `tracing::warn!` so the degradation is visible rather than a
+/// silent, hard-to-diagnose gap in what a caller sees.
+fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
+    let fits = |ds: &[LspDiagnostic]| {
+        // A serialization error is conservatively treated as "does not
+        // fit" (triggers the mitigations below) rather than as success.
+        // `LspDiagnostic`'s fields can't actually produce one in practice
+        // (no floats, no non-string map keys anywhere in `Diagnostic` or
+        // `serde_json::Value`'s own object representation), but failing
+        // safe costs nothing here.
+        serde_json::to_vec(ds).is_ok_and(|bytes| bytes.len() <= MAX_DIAGNOSTICS_ENTRY_BYTES)
+    };
+
+    let cheaply_estimable = diagnostics.iter().all(|d| {
+        d.data.is_none()
+            && d.code_description.is_none()
+            && d.related_information.is_none()
+            && d.tags.is_none()
+    });
+    if cheaply_estimable {
+        let estimated: usize = diagnostics
+            .iter()
+            .map(|d| {
+                let raw_string_bytes = d.message.len()
+                    + d.source.as_deref().map_or(0, str::len)
+                    + match &d.code {
+                        Some(lsp_types::NumberOrString::String(s)) => s.len(),
+                        _ => 0,
+                    };
+                raw_string_bytes * JSON_ESCAPE_WORST_CASE_FACTOR
+                    + DIAGNOSTIC_ESTIMATE_OVERHEAD_BYTES
+            })
+            .sum();
+        if estimated <= MAX_DIAGNOSTICS_ENTRY_BYTES {
+            return;
+        }
+    }
+
+    if fits(diagnostics) {
+        return;
+    }
+
+    let original_count = diagnostics.len();
+
+    // Prefer dropping lower-severity diagnostics first (a stable sort, so
+    // same-severity diagnostics keep their original -- typically
+    // file-position -- relative order), then keep the largest prefix that
+    // actually fits rather than a flat halve, which both overshoots (a
+    // list one byte over the cap would otherwise lose half its
+    // diagnostics) and was severity-blind (would keep hundreds of leading
+    // HINT-level noise over a later ERROR). At least one diagnostic is
+    // always kept here so the mitigations below have a survivor to act on.
+    diagnostics.sort_by_key(diagnostic_severity_rank);
+    let keep = largest_fitting_prefix(diagnostics, fits).max(1);
+    diagnostics.truncate(keep);
+    if diagnostics.len() < original_count {
+        warn!(
+            "diagnostics for {} exceeded the {MAX_DIAGNOSTICS_ENTRY_BYTES}-byte cache cap; kept \
+             the {} highest-severity of {original_count} diagnostics",
+            uri.as_str(),
+            diagnostics.len(),
+        );
+    }
+
+    // Drop opaque/structured fields first -- cheap, and often enough on
+    // its own (e.g. the single-huge-`data`-blob shape).
+    if diagnostics.len() == 1 && !fits(diagnostics) {
+        let diagnostic = &mut diagnostics[0];
+        let had_data = diagnostic.data.is_some();
+        diagnostic.data = None;
+        diagnostic.code_description = None;
+        diagnostic.related_information = None;
+        diagnostic.tags = None;
+        warn!(
+            "diagnostic for {} exceeded the cache cap; dropped its data/code_description/\
+             related_information/tags fields{}",
+            uri.as_str(),
+            if had_data {
+                " (a later code-action request for this diagnostic may not resolve its quick fix)"
+            } else {
+                ""
+            },
+        );
+    }
+
+    // Still oversized: `source`/`code` (plain strings, unlike the opaque
+    // fields above) are truncated rather than dropped, to preserve some
+    // content.
+    if diagnostics.len() == 1 && !fits(diagnostics) {
+        let diagnostic = &mut diagnostics[0];
+        if let Some(source) = &diagnostic.source {
+            diagnostic.source = Some(truncate_str(source, MAX_ENTRY_TEXT_BYTES));
+        }
+        if let Some(lsp_types::NumberOrString::String(code)) = &diagnostic.code {
+            diagnostic.code = Some(lsp_types::NumberOrString::String(truncate_str(
+                code,
+                MAX_ENTRY_TEXT_BYTES,
+            )));
+        }
+    }
+
+    // Terminal enforcement: guarantee the postcondition directly rather
+    // than trusting the mitigations above to have covered every case --
+    // see this function's doc.
+    if !fits(diagnostics) {
+        diagnostics.truncate(1);
+        if let Some(diagnostic) = diagnostics.first_mut() {
+            diagnostic.message = truncate_str(
+                &diagnostic.message,
+                DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES,
+            );
+            diagnostic.source = None;
+            diagnostic.code = None;
+            diagnostic.code_description = None;
+            diagnostic.related_information = None;
+            diagnostic.tags = None;
+            diagnostic.data = None;
+        }
+        warn!(
+            "diagnostic for {} still exceeded the cache cap after every other mitigation; \
+             truncated its message to {DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES} bytes and \
+             cleared all other fields",
+            uri.as_str(),
+        );
+    }
+}
 
 /// Information about diagnostics for a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +564,13 @@ impl NotificationCache {
 
     /// Store diagnostics for a document published by `server_id`.
     ///
+    /// Each diagnostic's `message` is truncated to `MAX_ENTRY_TEXT_BYTES`,
+    /// and the whole list is bounded to `MAX_DIAGNOSTICS_ENTRY_BYTES`
+    /// serialized bytes, before storing (#311). When that bound requires
+    /// dropping diagnostics, the *survivors* come back sorted by severity
+    /// (`diagnostic_severity_rank`: `ERROR` first), not in the original
+    /// publish/file-position order -- see [`Self::get_diagnostics`].
+    ///
     /// If diagnostics already exist for the URI, they are replaced and the
     /// entry is repositioned to the back of its owner's eviction order, so
     /// a URI republished on every edit is tracked as most-recently-written
@@ -317,8 +608,22 @@ impl NotificationCache {
         server_id: &ServerId,
         uri: &Uri,
         version: Option<i32>,
-        diagnostics: Vec<LspDiagnostic>,
+        mut diagnostics: Vec<LspDiagnostic>,
     ) {
+        // Bound each diagnostic's free-form message text (#311); see
+        // `MAX_ENTRY_TEXT_BYTES`. `mem::take` + `truncate_string` avoids an
+        // extra clone on the common (already-under-limit) path, since
+        // `message` is already an owned `String` here.
+        for diagnostic in &mut diagnostics {
+            diagnostic.message = truncate_string(
+                std::mem::take(&mut diagnostic.message),
+                MAX_ENTRY_TEXT_BYTES,
+            );
+        }
+        // Bound the whole list's serialized size (#311 C1); see
+        // `MAX_DIAGNOSTICS_ENTRY_BYTES`.
+        cap_diagnostics_entry_size(uri, &mut diagnostics);
+
         let key = uri_cache_key(uri.as_str()).into_owned();
         let info = DiagnosticInfo {
             uri: uri.clone(),
@@ -371,10 +676,11 @@ impl NotificationCache {
     /// Store a log entry.
     ///
     /// Maintains a maximum of `MAX_LOG_ENTRIES` entries, removing oldest when full.
+    /// `message` is truncated to `MAX_ENTRY_TEXT_BYTES` before storing.
     pub fn store_log(&mut self, level: LogLevel, message: String) {
         let entry = LogEntry {
             level,
-            message,
+            message: truncate_string(message, MAX_ENTRY_TEXT_BYTES),
             timestamp: Utc::now(),
         };
 
@@ -387,10 +693,11 @@ impl NotificationCache {
     /// Store a server message.
     ///
     /// Maintains a maximum of `MAX_SERVER_MESSAGES` entries, removing oldest when full.
+    /// `message` is truncated to `MAX_ENTRY_TEXT_BYTES` before storing.
     pub fn store_message(&mut self, message_type: MessageType, message: String) {
         let msg = ServerMessage {
             message_type,
-            message,
+            message: truncate_string(message, MAX_ENTRY_TEXT_BYTES),
             timestamp: Utc::now(),
         };
 
@@ -401,6 +708,12 @@ impl NotificationCache {
     }
 
     /// Get diagnostics for a document URI.
+    ///
+    /// If the stored list was ever truncated by `store_diagnostics`'s
+    /// `MAX_DIAGNOSTICS_ENTRY_BYTES` cap (#311), the diagnostics here are in
+    /// severity order (`ERROR` first), not the original publish/file-position
+    /// order -- callers that assume file-position order should not rely on
+    /// it after a cap-triggered truncation.
     #[inline]
     #[must_use]
     pub fn get_diagnostics(&self, uri: &str) -> Option<&DiagnosticInfo> {
@@ -579,6 +892,434 @@ mod tests {
         assert_eq!(stored.diagnostics[0].message, "test error");
     }
 
+    /// #311: a single diagnostic's `message` must be bounded independently
+    /// of `MAX_DIAGNOSTIC_ENTRIES`, which only caps the number of entries.
+    #[test]
+    fn test_store_diagnostics_truncates_oversized_message() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let oversized = "a".repeat(MAX_ENTRY_TEXT_BYTES + 100);
+
+        let diagnostic = LspDiagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: oversized.clone(),
+            code: None,
+            source: None,
+            code_description: None,
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics[0].message;
+        assert!(stored.len() < oversized.len());
+        assert!(stored.ends_with("... (truncated)"));
+    }
+
+    /// Minimal diagnostic with an arbitrary `message`, for tests that only
+    /// care about size/count bounds rather than range/severity details.
+    fn minimal_diagnostic(message: String) -> LspDiagnostic {
+        LspDiagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message,
+            code: None,
+            source: None,
+            code_description: None,
+            related_information: None,
+            tags: None,
+            data: None,
+        }
+    }
+
+    /// #311 C1: `MAX_ENTRY_TEXT_BYTES` alone bounds one `message` field, not
+    /// the whole entry -- many diagnostics, each individually small, must
+    /// still be capped in aggregate.
+    #[test]
+    fn test_store_diagnostics_caps_aggregate_size_for_many_small_diagnostics() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        // Each diagnostic is far under MAX_ENTRY_TEXT_BYTES individually,
+        // but 5000 of them comfortably exceeds MAX_DIAGNOSTICS_ENTRY_BYTES
+        // in aggregate.
+        let diagnostics: Vec<LspDiagnostic> = (0..5000)
+            .map(|i| {
+                minimal_diagnostic(format!(
+                    "diagnostic number {i}, padded: {}",
+                    "x".repeat(200)
+                ))
+            })
+            .collect();
+        let original_count = diagnostics.len();
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        assert!(
+            stored.len() < original_count,
+            "aggregate cap must trim the list, kept {} of {original_count}",
+            stored.len()
+        );
+        assert!(!stored.is_empty(), "must keep at least one diagnostic");
+        let serialized_len = serde_json::to_vec(stored).unwrap().len();
+        assert!(
+            serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
+            "stored entry must fit the aggregate cap, got {serialized_len} bytes"
+        );
+    }
+
+    /// #311 S6: a naive flat halve would keep only the first N/2
+    /// diagnostics even when far more than that would actually fit --
+    /// truncation must find the largest prefix that fits instead.
+    #[test]
+    fn test_store_diagnostics_truncation_keeps_largest_fitting_prefix() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        // Each diagnostic serializes to roughly 300 bytes; ~3800 of them
+        // fit under the 1 MiB cap, well over half of the 5000 published --
+        // a flat halve would incorrectly stop at 2500.
+        let diagnostics: Vec<LspDiagnostic> = (0..5000)
+            .map(|i| minimal_diagnostic(format!("diagnostic {i}: {}", "x".repeat(250))))
+            .collect();
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        assert!(
+            stored.len() > 2600,
+            "largest-fitting-prefix search must keep far more than half, kept {}",
+            stored.len()
+        );
+        let serialized_len = serde_json::to_vec(stored).unwrap().len();
+        assert!(serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES);
+        // The search must find the *largest* fitting prefix, not just *a*
+        // fitting one: one more diagnostic than what was kept must no
+        // longer fit (otherwise it should have been kept too).
+        let mut with_one_more = stored.clone();
+        with_one_more.push(minimal_diagnostic(format!(
+            "diagnostic overflow: {}",
+            "x".repeat(250)
+        )));
+        assert!(
+            serde_json::to_vec(&with_one_more).unwrap().len() > MAX_DIAGNOSTICS_ENTRY_BYTES,
+            "kept count must be the largest that fits, not merely a fitting count"
+        );
+    }
+
+    /// #311 S6: truncation must prefer keeping higher-severity diagnostics,
+    /// not just whichever the server happened to publish first -- a late
+    /// `ERROR` must survive over leading `HINT`-level noise.
+    #[test]
+    fn test_store_diagnostics_truncation_prefers_higher_severity() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        let mut diagnostics: Vec<LspDiagnostic> = (0..5000)
+            .map(|i| {
+                let mut d = minimal_diagnostic(format!("hint {i}: {}", "x".repeat(200)));
+                d.severity = Some(lsp_types::DiagnosticSeverity::HINT);
+                d
+            })
+            .collect();
+        let mut trailing_error = minimal_diagnostic("the one real error".to_string());
+        trailing_error.severity = Some(lsp_types::DiagnosticSeverity::ERROR);
+        diagnostics.push(trailing_error);
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        assert!(
+            stored.iter().any(|d| d.message == "the one real error"),
+            "the trailing ERROR diagnostic must survive truncation over leading HINT noise"
+        );
+    }
+
+    /// Captures `tracing` events emitted while a closure runs, mirroring
+    /// `transport::tests::http_tests::CapturedMessages` -- there is no
+    /// shared `tracing_test`-style helper in this codebase to reuse.
+    #[derive(Clone, Default)]
+    struct CapturedMessages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedMessages {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    /// #311 S7 / M7: truncating the diagnostics list must not be silent --
+    /// a caller with no visibility into this cache would otherwise have no
+    /// way to know a `get_cached_diagnostics` result is incomplete.
+    #[test]
+    fn test_store_diagnostics_warns_when_truncating_list() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let diagnostics: Vec<LspDiagnostic> = (0..5000)
+            .map(|i| minimal_diagnostic(format!("diagnostic {i}: {}", "x".repeat(250))))
+            .collect();
+
+        let captured = CapturedMessages::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
+        drop(guard);
+
+        let messages = captured.0.lock().unwrap().clone();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("highest-severity") && m.contains("file:///test.rs")),
+            "expected a truncation warning naming the URI, got: {messages:?}"
+        );
+    }
+
+    /// #311 S7: dropping a diagnostic's `data` breaks the LSP contract that
+    /// it round-trips to a later `textDocument/codeAction` request -- this
+    /// must be logged, not silent.
+    #[test]
+    fn test_store_diagnostics_warns_when_dropping_data_blob() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let mut diagnostic = minimal_diagnostic("small message".to_string());
+        diagnostic.data = Some(serde_json::json!({
+            "blob": "x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000),
+        }));
+
+        let captured = CapturedMessages::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
+        drop(guard);
+
+        let messages = captured.0.lock().unwrap().clone();
+        assert!(
+            messages.iter().any(|m| m.contains("code-action")),
+            "expected a warning noting the code-action quick-fix impact, got: {messages:?}"
+        );
+    }
+
+    /// #311 C1: a single diagnostic dominated by an oversized `data` blob
+    /// must be capped even though `message` alone is small -- the aggregate
+    /// list-halving path can't shrink a one-element list, so the opaque
+    /// fields on that single diagnostic must be dropped instead.
+    #[test]
+    fn test_store_diagnostics_drops_oversized_data_blob_on_single_diagnostic() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        let mut diagnostic = minimal_diagnostic("small message".to_string());
+        diagnostic.data = Some(serde_json::json!({
+            "blob": "x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000),
+        }));
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].message, "small message");
+        assert!(
+            stored[0].data.is_none(),
+            "oversized data blob must be dropped"
+        );
+        let serialized_len = serde_json::to_vec(stored).unwrap().len();
+        assert!(
+            serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
+            "stored entry must fit the aggregate cap after dropping data, got {serialized_len} bytes"
+        );
+    }
+
+    /// #311 C1 follow-up: an oversized `source` (not `data`) on a single
+    /// diagnostic must also be brought back under the cap -- the
+    /// opaque-field-drop mitigation alone does not touch `source`, which is
+    /// a plain string and must be truncated instead.
+    #[test]
+    fn test_store_diagnostics_truncates_oversized_source_on_single_diagnostic() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        let mut diagnostic = minimal_diagnostic("small message".to_string());
+        diagnostic.source = Some("x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000));
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].message, "small message");
+        let serialized_len = serde_json::to_vec(stored).unwrap().len();
+        assert!(
+            serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
+            "stored entry must fit the aggregate cap after truncating source, got {serialized_len} bytes"
+        );
+    }
+
+    /// #311 C1 follow-up: `cap_diagnostics_entry_size`'s postcondition --
+    /// the result always fits `MAX_DIAGNOSTICS_ENTRY_BYTES` -- must hold
+    /// even when every uncapped field is maxed out simultaneously, not just
+    /// one at a time. This is the terminal-enforcement guarantee itself,
+    /// exercised end to end through `store_diagnostics` rather than by
+    /// calling the private function directly.
+    #[test]
+    fn test_store_diagnostics_caps_single_diagnostic_with_every_field_maxed_out() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        // Each field individually exceeds MAX_ENTRY_TEXT_BYTES (so
+        // source/code truncation is exercised) and the combination exceeds
+        // MAX_DIAGNOSTICS_ENTRY_BYTES, without needing to allocate multiple
+        // megabytes per field just to prove the same point.
+        let mut diagnostic = minimal_diagnostic("x".repeat(MAX_ENTRY_TEXT_BYTES + 1000));
+        diagnostic.source = Some("x".repeat(MAX_ENTRY_TEXT_BYTES + 1000));
+        diagnostic.code = Some(lsp_types::NumberOrString::String(
+            "x".repeat(MAX_ENTRY_TEXT_BYTES + 1000),
+        ));
+        diagnostic.data = Some(serde_json::json!({ "blob": "x".repeat(MAX_ENTRY_TEXT_BYTES) }));
+        diagnostic.tags = Some(vec![lsp_types::DiagnosticTag::UNNECESSARY; 50]);
+        diagnostic.related_information = Some(vec![
+            lsp_types::DiagnosticRelatedInformation {
+                location: lsp_types::Location {
+                    uri: uri.clone(),
+                    range: Range::default(),
+                },
+                message: "x".repeat(1000),
+            };
+            5
+        ]);
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        assert_eq!(stored.len(), 1);
+        let serialized_len = serde_json::to_vec(stored).unwrap().len();
+        assert!(
+            serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
+            "postcondition must hold even with every field maxed out, got {serialized_len} bytes"
+        );
+    }
+
+    /// #311 C1 follow-up: exercises `cap_diagnostics_entry_size`'s terminal
+    /// fallback directly. `message` is the one field the field-specific
+    /// mitigations never touch (they only cover
+    /// `source`/`code`/`data`/`code_description`/`related_information`/
+    /// `tags`), so an oversized, *untruncated* message -- as it would be if
+    /// this private function were ever called without `store_diagnostics`'s
+    /// own prior message truncation -- must still be brought under budget
+    /// by the terminal step, not left to slip through.
+    #[test]
+    fn test_cap_diagnostics_entry_size_terminal_fallback_bounds_untruncated_message() {
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let mut diagnostics = vec![minimal_diagnostic(
+            "x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000),
+        )];
+
+        cap_diagnostics_entry_size(&uri, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0].message.len() <= DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES + 20,
+            "terminal fallback must truncate the message itself, got {} bytes",
+            diagnostics[0].message.len()
+        );
+        let serialized_len = serde_json::to_vec(&diagnostics).unwrap().len();
+        assert!(
+            serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
+            "postcondition must hold via the terminal fallback, got {serialized_len} bytes"
+        );
+    }
+
+    /// #311 S5: when no diagnostic carries `data`/`code_description`/
+    /// `related_information`/`tags` and the cheap size estimate is already
+    /// under budget, nothing should be modified -- the fast path must not
+    /// alter content it didn't need to touch.
+    #[test]
+    fn test_store_diagnostics_cheap_path_leaves_small_diagnostics_untouched() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        let mut diagnostic = minimal_diagnostic("a small, ordinary diagnostic message".to_string());
+        diagnostic.source = Some("rustc".to_string());
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].message, "a small, ordinary diagnostic message");
+        assert_eq!(stored[0].source.as_deref(), Some("rustc"));
+    }
+
+    /// #311 S5 follow-up: the critic's exact counterexample. A NUL-heavy
+    /// message's *raw* byte length looks small enough for the cheap
+    /// estimate to skip the real check, but its *serialized* (JSON-escaped)
+    /// size is up to `JSON_ESCAPE_WORST_CASE_FACTOR`x larger -- each NUL
+    /// byte costs 6 bytes as `\u0000` once JSON-encoded. Three diagnostics
+    /// at exactly `MAX_ENTRY_TEXT_BYTES` of NULs each previously passed the
+    /// old raw-length estimate (787,200 bytes, under the 1 MiB cap) while
+    /// actually serializing to roughly 4.5 MiB -- letting an entry ~4.5x
+    /// over budget skip `fits`/truncation/terminal-fallback entirely.
+    #[test]
+    fn test_store_diagnostics_cheap_path_escape_safe_for_control_character_heavy_message() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = "file:///test.rs".parse().unwrap();
+
+        let nul_heavy_message = "\0".repeat(MAX_ENTRY_TEXT_BYTES);
+        let diagnostics: Vec<LspDiagnostic> = (0..3)
+            .map(|_| minimal_diagnostic(nul_heavy_message.clone()))
+            .collect();
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
+
+        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let serialized_len = serde_json::to_vec(stored).unwrap().len();
+        assert!(
+            serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
+            "escape-heavy content must not let the cheap-estimate fast path skip the real cap, \
+             got {serialized_len} bytes"
+        );
+    }
+
     #[test]
     fn test_store_diagnostics_replaces_existing() {
         let mut cache = NotificationCache::new();
@@ -656,6 +1397,31 @@ mod tests {
         );
     }
 
+    /// #311: `MAX_LOG_ENTRIES` bounds the number of log entries, but not the
+    /// size of any one entry -- an oversized message must be truncated
+    /// rather than stored verbatim.
+    #[test]
+    fn test_store_log_truncates_oversized_message() {
+        let mut cache = NotificationCache::new();
+        let oversized = "a".repeat(MAX_ENTRY_TEXT_BYTES + 100);
+
+        cache.store_log(LogLevel::Info, oversized.clone());
+
+        let stored = &cache.get_logs()[0].message;
+        assert!(stored.len() < oversized.len());
+        assert!(stored.ends_with("... (truncated)"));
+    }
+
+    #[test]
+    fn test_store_log_does_not_truncate_message_at_or_below_limit() {
+        let mut cache = NotificationCache::new();
+        let message = "a".repeat(MAX_ENTRY_TEXT_BYTES);
+
+        cache.store_log(LogLevel::Info, message.clone());
+
+        assert_eq!(cache.get_logs()[0].message, message);
+    }
+
     #[test]
     fn test_clear_logs() {
         let mut cache = NotificationCache::new();
@@ -709,6 +1475,19 @@ mod tests {
 
         cache.clear_messages();
         assert_eq!(cache.messages_count(), 0);
+    }
+
+    /// #311: same per-entry byte cap as `store_log`, applied to server messages.
+    #[test]
+    fn test_store_message_truncates_oversized_message() {
+        let mut cache = NotificationCache::new();
+        let oversized = "a".repeat(MAX_ENTRY_TEXT_BYTES + 100);
+
+        cache.store_message(MessageType::Info, oversized.clone());
+
+        let stored = &cache.get_messages()[0].message;
+        assert!(stored.len() < oversized.len());
+        assert!(stored.ends_with("... (truncated)"));
     }
 
     #[test]
