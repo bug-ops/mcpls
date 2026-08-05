@@ -65,11 +65,9 @@ pub fn mcp_to_lsp_position(
     let lsp_character = match (encoding, line_text) {
         (PositionEncoding::Utf16, _) | (_, None) => mcp_character,
         (_, Some(text)) => {
-            let utf16 = EncodingConverter::new(PositionEncoding::Utf16);
             let target = EncodingConverter::new(encoding);
-            utf16
-                .character_to_byte_offset(text, mcp_character)
-                .and_then(|byte_offset| target.byte_offset_to_character(text, byte_offset))
+            exact_byte_offset(text, mcp_character, PositionEncoding::Utf16)
+                .and_then(|byte_offset| target.byte_offset_to_character(text, byte_offset).ok())
                 .unwrap_or(mcp_character)
         }
     };
@@ -94,16 +92,38 @@ pub fn lsp_to_mcp_position(
     let mcp_character = match (encoding, line_text) {
         (PositionEncoding::Utf16, _) | (_, None) => pos.character,
         (_, Some(text)) => {
-            let source = EncodingConverter::new(encoding);
             let utf16 = EncodingConverter::new(PositionEncoding::Utf16);
-            source
-                .character_to_byte_offset(text, pos.character)
-                .and_then(|byte_offset| utf16.byte_offset_to_character(text, byte_offset))
+            exact_byte_offset(text, pos.character, encoding)
+                .and_then(|byte_offset| utf16.byte_offset_to_character(text, byte_offset).ok())
                 .unwrap_or(pos.character)
         }
     };
 
     (pos.line + 1, mcp_character + 1)
+}
+
+/// Resolve `character_offset` (in `encoding`'s units) to a byte offset in
+/// `text`, requiring the mapping to be exact.
+///
+/// `EncodingConverter::character_to_byte_offset` finds the byte boundary at
+/// or after the requested offset, so an offset that lands inside a
+/// multi-unit character (e.g. a UTF-16 surrogate pair) silently resolves to
+/// the *next* character boundary instead of erroring. Round-tripping the
+/// result back through `byte_offset_to_character` detects that case: if it
+/// doesn't reproduce `character_offset` exactly, the offset wasn't
+/// representable, and `None` signals the caller to fall back to the raw
+/// value rather than use a rounded-forward position.
+fn exact_byte_offset(
+    text: &str,
+    character_offset: u32,
+    encoding: PositionEncoding,
+) -> Option<usize> {
+    let converter = EncodingConverter::new(encoding);
+    let byte_offset = converter
+        .character_to_byte_offset(text, character_offset)
+        .ok()?;
+    let round_trip = converter.byte_offset_to_character(text, byte_offset).ok()?;
+    (round_trip == character_offset).then_some(byte_offset)
 }
 
 /// Position encoding converter for handling UTF-8/UTF-16/UTF-32 conversions.
@@ -525,6 +545,20 @@ mod tests {
             PositionEncoding::Utf8,
         );
         assert_eq!(mcp_char, 3);
+    }
+
+    /// Copilot review finding: an MCP character offset landing inside a
+    /// UTF-16 surrogate pair (e.g. a client miscounting an astral character)
+    /// must fall back to the raw offset, not silently round forward to the
+    /// byte offset *after* the whole character. `𝄞` (U+1D11E) is a surrogate
+    /// pair (2 UTF-16 units); MCP column 2 (1-based) sits between them.
+    #[test]
+    fn test_mcp_to_lsp_position_mid_surrogate_falls_back() {
+        let line_text = "𝄞x";
+        let lsp_pos = mcp_to_lsp_position(1, 2, Some(line_text), PositionEncoding::Utf8);
+        // Falls back to the raw (unconverted) MCP character rather than
+        // rounding forward to byte offset 4 (right after the astral char).
+        assert_eq!(lsp_pos.character, 1);
     }
 
     /// CRLF line endings: `line_text` (as sourced by callers via `str::lines`)
