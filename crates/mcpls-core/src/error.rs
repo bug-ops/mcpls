@@ -212,7 +212,9 @@ pub enum Error {
     PathOutsideWorkspace(PathBuf),
 
     /// Document limit exceeded.
-    #[error("document limit exceeded: {current}/{max}")]
+    #[error(
+        "document limit exceeded: {current}/{max} (raise workspace.max_documents in config to increase this)"
+    )]
     DocumentLimitExceeded {
         /// Current number of documents.
         current: usize,
@@ -221,7 +223,9 @@ pub enum Error {
     },
 
     /// File size limit exceeded.
-    #[error("file size limit exceeded: {size} bytes (max: {max} bytes)")]
+    #[error(
+        "file size limit exceeded: {size} bytes, max {max} bytes (raise workspace.max_file_size in config to increase this)"
+    )]
     FileSizeLimitExceeded {
         /// Actual file size.
         size: u64,
@@ -339,7 +343,10 @@ mod tests {
             current: 150,
             max: 100,
         };
-        assert_eq!(err.to_string(), "document limit exceeded: 150/100");
+        assert_eq!(
+            err.to_string(),
+            "document limit exceeded: 150/100 (raise workspace.max_documents in config to increase this)"
+        );
     }
 
     #[test]
@@ -348,7 +355,10 @@ mod tests {
             size: 20_000_000,
             max: 10_000_000,
         };
-        assert!(err.to_string().contains("file size limit exceeded"));
+        assert_eq!(
+            err.to_string(),
+            "file size limit exceeded: 20000000 bytes, max 10000000 bytes (raise workspace.max_file_size in config to increase this)"
+        );
     }
 
     #[test]

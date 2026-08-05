@@ -52,6 +52,12 @@ pub struct Translator {
     lsp_servers: Arc<StdMutex<HashMap<ServerId, LspServer>>>,
     /// Document state tracker. Locks its own state internally, per path.
     document_tracker: Arc<DocumentTracker>,
+    /// Resource limits `document_tracker` was last built with. Kept
+    /// alongside `document_tracker` so [`Self::with_extensions`] and
+    /// [`Self::with_resource_limits`] can each rebuild the tracker from
+    /// whichever of (limits, extension map) the other has already set,
+    /// regardless of call order -- see [`Self::with_resource_limits`].
+    resource_limits: ResourceLimits,
     /// Allowed workspace roots for path validation. Read-only after `serve()`
     /// setup, so no lock is needed.
     workspace_roots: Arc<Vec<PathBuf>>,
@@ -141,6 +147,7 @@ impl Translator {
                 ResourceLimits::default(),
                 HashMap::new(),
             )),
+            resource_limits: ResourceLimits::default(),
             workspace_roots: Arc::new(Vec::new()),
             extension_map: Arc::new(HashMap::new()),
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
@@ -236,6 +243,23 @@ impl Translator {
         }
     }
 
+    /// Rebuilds `document_tracker` from `self.resource_limits` and
+    /// `self.extension_map`, whatever the two are currently set to.
+    ///
+    /// Called by every builder that touches either input ([`Self::with_extensions`],
+    /// [`Self::with_resource_limits`]), so each one only needs to set its own
+    /// field and call this -- it always reads *both* current values, so the
+    /// builders remain order-independent (see [`Self::with_resource_limits`])
+    /// without each one needing to know the other's field. A future builder
+    /// that adds a third tracker input should follow the same pattern:
+    /// update its own field, then call this.
+    fn rebuild_document_tracker(&mut self) {
+        self.document_tracker = Arc::new(DocumentTracker::new(
+            self.resource_limits,
+            (*self.extension_map).clone(),
+        ));
+    }
+
     /// Configure custom file extension mappings.
     ///
     /// This method sets the extension map and updates the document tracker
@@ -245,11 +269,26 @@ impl Translator {
     /// shared, so this replaces the `Arc`-wrapped fields wholesale.
     #[must_use]
     pub fn with_extensions(mut self, extension_map: HashMap<String, String>) -> Self {
-        self.document_tracker = Arc::new(DocumentTracker::new(
-            ResourceLimits::default(),
-            extension_map.clone(),
-        ));
         self.extension_map = Arc::new(extension_map);
+        self.rebuild_document_tracker();
+        self
+    }
+
+    /// Configure resource limits (max open documents, max file size) for the
+    /// document tracker.
+    ///
+    /// Only called during single-owner setup, before the translator is
+    /// shared. This builder and [`Self::with_extensions`] may be called in
+    /// either order -- each rebuilds `document_tracker` from *both* of
+    /// `self.resource_limits`/`self.extension_map`'s current values,
+    /// instead of one of them starting fresh from
+    /// `ResourceLimits::default()`/an empty extension map, which previously
+    /// meant whichever builder ran last silently discarded the other's
+    /// effect.
+    #[must_use]
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self.rebuild_document_tracker();
         self
     }
 
@@ -2558,7 +2597,7 @@ impl Translator {
             None
         };
 
-        let all_logs = cache.get_logs();
+        let all_logs = cache.logs();
 
         let logs: Vec<_> = all_logs
             .iter()
@@ -2586,7 +2625,7 @@ impl Translator {
         cache: &NotificationCache,
         limit: usize,
     ) -> Result<ServerMessagesResult> {
-        let all_messages = cache.get_messages();
+        let all_messages = cache.messages();
         let messages: Vec<_> = all_messages.iter().take(limit).cloned().collect();
         Ok(ServerMessagesResult { messages })
     }
@@ -3262,6 +3301,7 @@ mod tests {
     use tempfile::TempDir;
     use url::Url;
 
+    use super::super::state::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
     use super::*;
 
     /// A UTF-16 `EncodingCtx`, matching the pre-negotiation behavior: no
@@ -3303,6 +3343,66 @@ mod tests {
         assert_eq!(translator.workspace_roots.len(), 0);
         assert_eq!(lock_std(&translator.lsp_clients).len(), 0);
         assert_eq!(lock_std(&translator.lsp_servers).len(), 0);
+    }
+
+    /// `with_resource_limits` called before `with_extensions` (the order
+    /// `serve()` uses) must reach `document_tracker`.
+    #[test]
+    fn test_with_resource_limits_applies_before_with_extensions() {
+        let limits = ResourceLimits {
+            max_documents: 1,
+            max_file_size: 0,
+        };
+        let translator = Translator::new()
+            .with_resource_limits(limits)
+            .with_extensions(HashMap::new());
+
+        translator
+            .document_tracker
+            .open(PathBuf::from("/tmp/a.rs"), "a".to_string())
+            .unwrap();
+        let err = translator
+            .document_tracker
+            .open(PathBuf::from("/tmp/b.rs"), "b".to_string())
+            .unwrap_err();
+        assert!(matches!(err, Error::DocumentLimitExceeded { max: 1, .. }));
+    }
+
+    /// `with_resource_limits` called *after* `with_extensions` (the reverse
+    /// of `serve()`'s order) must still reach `document_tracker` -- the two
+    /// builders must not clobber each other regardless of call order. See
+    /// `Translator::with_resource_limits`'s docs.
+    ///
+    /// Uses a non-empty extension map (unlike the "before" test above) and
+    /// asserts it survived `with_resource_limits`'s rebuild by checking the
+    /// tracked document's resolved `language_id` -- a bug that dropped the
+    /// extension map (e.g. rebuilding from `HashMap::new()` instead of
+    /// `self.extension_map`) would leave `max_documents` correct but the
+    /// extension map silently empty, which the "before" test alone cannot
+    /// detect.
+    #[test]
+    fn test_with_resource_limits_applies_after_with_extensions() {
+        let limits = ResourceLimits {
+            max_documents: 1,
+            max_file_size: 0,
+        };
+        let translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]))
+            .with_resource_limits(limits);
+
+        let path = PathBuf::from("/tmp/a.rs");
+        translator
+            .document_tracker
+            .open(path.clone(), "a".to_string())
+            .unwrap();
+        let err = translator
+            .document_tracker
+            .open(PathBuf::from("/tmp/b.rs"), "b".to_string())
+            .unwrap_err();
+        assert!(matches!(err, Error::DocumentLimitExceeded { max: 1, .. }));
+
+        let state = translator.document_tracker.close(&path).unwrap();
+        assert_eq!(state.language_id(), "rust");
     }
 
     #[test]
@@ -5696,6 +5796,8 @@ fi
                 position_encodings: vec!["utf-8".to_string()],
                 language_extensions: language_extensions.clone(),
                 heuristics_max_depth: 10,
+                max_documents: DEFAULT_MAX_DOCUMENTS,
+                max_file_size: DEFAULT_MAX_FILE_SIZE,
             },
             lsp_servers: vec![],
             project_config_ignored: false,

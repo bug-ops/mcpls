@@ -17,6 +17,7 @@ pub use server::{
     DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, ServerHeuristics,
 };
 
+use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
 use crate::error::{Error, Result};
 
 /// Maps file extensions to LSP language identifiers.
@@ -85,6 +86,25 @@ pub struct WorkspaceConfig {
     /// Default: 10
     #[serde(default = "default_heuristics_max_depth")]
     pub heuristics_max_depth: usize,
+
+    /// Maximum number of documents `DocumentTracker` will keep open
+    /// simultaneously. A `textDocument/didOpen`-triggering tool call (hover,
+    /// definition, diagnostics, etc.) for a document beyond this count fails
+    /// with `DocumentLimitExceeded`. Documents stay tracked for the whole
+    /// mcpls process lifetime (there is no eviction), so once the ceiling is
+    /// reached, opening any further new path fails until either the process
+    /// is restarted or this limit is raised; already-tracked paths are
+    /// unaffected. `0` disables the limit.
+    /// Default: 100
+    #[serde(default = "default_max_documents")]
+    pub max_documents: usize,
+
+    /// Maximum size, in bytes, of a single file `DocumentTracker` will open.
+    /// A file larger than this fails with `FileSizeLimitExceeded`. `0`
+    /// disables the limit.
+    /// Default: 10485760 (10MB)
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size: u64,
 }
 
 impl Default for WorkspaceConfig {
@@ -94,12 +114,22 @@ impl Default for WorkspaceConfig {
             position_encodings: default_position_encodings(),
             language_extensions: default_language_extensions(),
             heuristics_max_depth: default_heuristics_max_depth(),
+            max_documents: default_max_documents(),
+            max_file_size: default_max_file_size(),
         }
     }
 }
 
 const fn default_heuristics_max_depth() -> usize {
     DEFAULT_HEURISTICS_MAX_DEPTH
+}
+
+const fn default_max_documents() -> usize {
+    DEFAULT_MAX_DOCUMENTS
+}
+
+const fn default_max_file_size() -> u64 {
+    DEFAULT_MAX_FILE_SIZE
 }
 
 impl WorkspaceConfig {
@@ -137,6 +167,16 @@ impl WorkspaceConfig {
             }
         }
         None
+    }
+
+    /// Maps the configured `max_documents`/`max_file_size` onto the bridge
+    /// layer's [`ResourceLimits`], for [`Translator::with_resource_limits`](crate::bridge::Translator::with_resource_limits).
+    #[must_use]
+    pub const fn resource_limits(&self) -> ResourceLimits {
+        ResourceLimits {
+            max_documents: self.max_documents,
+            max_file_size: self.max_file_size,
+        }
     }
 }
 
@@ -1276,6 +1316,8 @@ mod tests {
                 },
             ],
             heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
+            max_documents: DEFAULT_MAX_DOCUMENTS,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
         };
 
         let map = workspace.build_extension_map();
@@ -1425,6 +1467,8 @@ mod tests {
                 },
             ],
             heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
+            max_documents: DEFAULT_MAX_DOCUMENTS,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
         };
 
         assert_eq!(
@@ -1768,5 +1812,141 @@ mod tests {
             config.workspace.heuristics_max_depth,
             DEFAULT_HEURISTICS_MAX_DEPTH
         );
+    }
+
+    #[test]
+    fn test_max_documents_default() {
+        let config = WorkspaceConfig::default();
+        assert_eq!(config.max_documents, DEFAULT_MAX_DOCUMENTS);
+    }
+
+    #[test]
+    fn test_max_file_size_default() {
+        let config = WorkspaceConfig::default();
+        assert_eq!(config.max_file_size, DEFAULT_MAX_FILE_SIZE);
+    }
+
+    #[test]
+    fn test_max_documents_from_config() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("limits.toml");
+
+        let toml_content = r"
+            [workspace]
+            max_documents = 500
+        ";
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.workspace.max_documents, 500);
+    }
+
+    #[test]
+    fn test_max_file_size_from_config() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("limits.toml");
+
+        let toml_content = r"
+            [workspace]
+            max_file_size = 20971520
+        ";
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.workspace.max_file_size, 20_971_520);
+    }
+
+    #[test]
+    fn test_max_documents_uses_default_when_not_specified() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("no_limits.toml");
+
+        let toml_content = r"
+            [workspace]
+            roots = []
+        ";
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.workspace.max_documents, DEFAULT_MAX_DOCUMENTS);
+        assert_eq!(config.workspace.max_file_size, DEFAULT_MAX_FILE_SIZE);
+    }
+
+    /// `max_file_size = 0` is the documented "unlimited" sentinel (see
+    /// `ResourceLimits::max_file_size`'s doc comment); config loading must
+    /// pass it through unchanged rather than treating `0` as "unset".
+    #[test]
+    fn test_max_file_size_zero_means_unlimited() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("unlimited.toml");
+
+        let toml_content = r"
+            [workspace]
+            max_file_size = 0
+        ";
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.workspace.max_file_size, 0);
+        assert_eq!(config.workspace.resource_limits().max_file_size, 0);
+    }
+
+    #[test]
+    fn test_workspace_config_resource_limits_maps_fields() {
+        let workspace = WorkspaceConfig {
+            max_documents: 250,
+            max_file_size: 0,
+            ..WorkspaceConfig::default()
+        };
+
+        let limits = workspace.resource_limits();
+        assert_eq!(limits.max_documents, 250);
+        assert_eq!(limits.max_file_size, 0);
+    }
+
+    #[test]
+    fn test_workspace_config_toml_round_trip() {
+        let original = WorkspaceConfig {
+            roots: vec![PathBuf::from("/tmp/round-trip")],
+            position_encodings: vec!["utf-8".to_string()],
+            language_extensions: vec![LanguageExtensionMapping {
+                extensions: vec!["nu".to_string()],
+                language_id: "nushell".to_string(),
+            }],
+            heuristics_max_depth: 5,
+            max_documents: 500,
+            max_file_size: 0,
+        };
+
+        let toml_content = toml::to_string_pretty(&original).unwrap();
+        let round_tripped: WorkspaceConfig = toml::from_str(&toml_content).unwrap();
+
+        assert_eq!(round_tripped.roots, original.roots);
+        assert_eq!(
+            round_tripped.position_encodings,
+            original.position_encodings
+        );
+        assert_eq!(
+            round_tripped.language_extensions.len(),
+            original.language_extensions.len()
+        );
+        assert_eq!(
+            round_tripped.language_extensions[0].extensions,
+            original.language_extensions[0].extensions
+        );
+        assert_eq!(
+            round_tripped.language_extensions[0].language_id,
+            original.language_extensions[0].language_id
+        );
+        assert_eq!(
+            round_tripped.heuristics_max_depth,
+            original.heuristics_max_depth
+        );
+        assert_eq!(round_tripped.max_documents, original.max_documents);
+        assert_eq!(round_tripped.max_file_size, original.max_file_size);
     }
 }

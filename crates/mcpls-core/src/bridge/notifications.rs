@@ -417,17 +417,17 @@ impl NotificationCache {
         self.diagnostics_owners.get(uri_cache_key(uri).as_ref())
     }
 
-    /// Get all stored log entries.
+    /// All stored log entries.
     #[inline]
     #[must_use]
-    pub const fn get_logs(&self) -> &VecDeque<LogEntry> {
+    pub const fn logs(&self) -> &VecDeque<LogEntry> {
         &self.logs
     }
 
-    /// Get all stored server messages.
+    /// All stored server messages.
     #[inline]
     #[must_use]
-    pub const fn get_messages(&self) -> &VecDeque<ServerMessage> {
+    pub const fn messages(&self) -> &VecDeque<ServerMessage> {
         &self.messages
     }
 
@@ -628,7 +628,7 @@ mod tests {
         cache.store_log(LogLevel::Error, "error message".to_string());
         cache.store_log(LogLevel::Info, "info message".to_string());
 
-        let logs = cache.get_logs();
+        let logs = cache.logs();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].level, LogLevel::Error);
         assert_eq!(logs[0].message, "error message");
@@ -648,7 +648,7 @@ mod tests {
         assert_eq!(cache.logs_count(), MAX_LOG_ENTRIES);
 
         // Oldest entries should be removed (FIFO)
-        let logs = cache.get_logs();
+        let logs = cache.logs();
         assert_eq!(logs.front().unwrap().message, "message 10");
         assert_eq!(
             logs.back().unwrap().message,
@@ -673,7 +673,7 @@ mod tests {
         cache.store_message(MessageType::Error, "error msg".to_string());
         cache.store_message(MessageType::Warning, "warning msg".to_string());
 
-        let messages = cache.get_messages();
+        let messages = cache.messages();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].message_type, MessageType::Error);
         assert_eq!(messages[0].message, "error msg");
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(cache.messages_count(), MAX_SERVER_MESSAGES);
 
         // Oldest entries should be removed (FIFO)
-        let messages = cache.get_messages();
+        let messages = cache.messages();
         assert_eq!(messages.front().unwrap().message, "message 10");
         assert_eq!(
             messages.back().unwrap().message,
@@ -720,7 +720,7 @@ mod tests {
         cache.store_log(LogLevel::Info, "info".to_string());
         cache.store_log(LogLevel::Debug, "debug".to_string());
 
-        let logs = cache.get_logs();
+        let logs = cache.logs();
         assert_eq!(logs[0].level, LogLevel::Error);
         assert_eq!(logs[1].level, LogLevel::Warning);
         assert_eq!(logs[2].level, LogLevel::Info);
@@ -736,7 +736,7 @@ mod tests {
         cache.store_message(MessageType::Info, "info".to_string());
         cache.store_message(MessageType::Log, "log".to_string());
 
-        let messages = cache.get_messages();
+        let messages = cache.messages();
         assert_eq!(messages[0].message_type, MessageType::Error);
         assert_eq!(messages[1].message_type, MessageType::Warning);
         assert_eq!(messages[2].message_type, MessageType::Info);
@@ -751,7 +751,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         cache.store_log(LogLevel::Info, "second".to_string());
 
-        let logs = cache.get_logs();
+        let logs = cache.logs();
         assert!(logs[0].timestamp < logs[1].timestamp);
     }
 
@@ -842,7 +842,7 @@ mod tests {
 
         cache.store_log(LogLevel::Info, "overflow".to_string());
         assert_eq!(cache.logs_count(), MAX_LOG_ENTRIES);
-        assert_eq!(cache.get_logs().front().unwrap().message, "message 1");
+        assert_eq!(cache.logs().front().unwrap().message, "message 1");
     }
 
     #[test]
@@ -856,7 +856,7 @@ mod tests {
 
         cache.store_message(MessageType::Info, "overflow".to_string());
         assert_eq!(cache.messages_count(), MAX_SERVER_MESSAGES);
-        assert_eq!(cache.get_messages().front().unwrap().message, "message 1");
+        assert_eq!(cache.messages().front().unwrap().message, "message 1");
     }
 
     #[test]

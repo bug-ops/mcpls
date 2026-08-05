@@ -535,6 +535,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
 
     let mut translator = Translator::new()
+        .with_resource_limits(config.workspace.resource_limits())
         .with_extensions(extension_map)
         .with_router(router)
         .with_notification_cache(Arc::clone(&notification_cache));
@@ -812,6 +813,8 @@ fn spawn_lsp_servers_background(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
+
     use super::*;
 
     #[test]
@@ -1187,6 +1190,8 @@ mod tests {
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    max_documents: DEFAULT_MAX_DOCUMENTS,
+                    max_file_size: DEFAULT_MAX_FILE_SIZE,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -1238,6 +1243,8 @@ mod tests {
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    max_documents: DEFAULT_MAX_DOCUMENTS,
+                    max_file_size: DEFAULT_MAX_FILE_SIZE,
                 },
                 lsp_servers: vec![],
                 project_config_ignored: false,
@@ -1273,6 +1280,8 @@ mod tests {
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    max_documents: DEFAULT_MAX_DOCUMENTS,
+                    max_file_size: DEFAULT_MAX_FILE_SIZE,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),

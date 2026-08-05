@@ -234,6 +234,14 @@ impl DocumentState {
     }
 }
 
+/// Default value for [`ResourceLimits::max_documents`], also used as the
+/// TOML default for `workspace.max_documents` (`config::default_max_documents`).
+pub const DEFAULT_MAX_DOCUMENTS: usize = 100;
+
+/// Default value for [`ResourceLimits::max_file_size`] (10MB), also used as
+/// the TOML default for `workspace.max_file_size` (`config::default_max_file_size`).
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Resource limits for document tracking.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceLimits {
@@ -246,8 +254,8 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_documents: 100,
-            max_file_size: 10 * 1024 * 1024, // 10MB
+            max_documents: DEFAULT_MAX_DOCUMENTS,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
         }
     }
 }

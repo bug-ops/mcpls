@@ -200,6 +200,34 @@ language_id = "python"
 
 This reduces memory usage compared to loading all 30 default mappings.
 
+### `workspace.max_documents`
+
+**Type**: Integer
+**Default**: `100`
+
+Maximum number of documents mcpls will keep open simultaneously. A tool call (hover, definition, diagnostics, etc.) that would open a document beyond this count fails with a "document limit exceeded" error. Documents stay tracked for the whole mcpls process lifetime — there is no automatic eviction — so once the ceiling is reached, opening any further new file fails until you restart mcpls or raise this limit; already-open files are unaffected. Set to `0` to disable the limit.
+
+```toml
+[workspace]
+max_documents = 500
+```
+
+Raising this limit increases mcpls's steady-state memory usage, since each open document's full content is held in memory. This is most useful for long-running agent sessions or broad-scope work (large monorepo audits, repo-wide refactors) that touch more than 100 distinct files.
+
+### `workspace.max_file_size`
+
+**Type**: Integer (bytes)
+**Default**: `10485760` (10MB)
+
+Maximum size, in bytes, of a single file mcpls will open. A file larger than this fails with a "file size limit exceeded" error. Set to `0` to disable the limit.
+
+```toml
+[workspace]
+max_file_size = 0  # unlimited
+```
+
+Useful when a project contains files larger than 10MB (e.g. generated code, data fixtures) that still need LSP-backed tools to work against them.
+
 ## LSP Server Configuration
 
 Each `[[lsp_servers]]` section defines a language server.
