@@ -272,137 +272,110 @@ impl LspServerConfig {
             .map_or_else(|| ServerId::from(self.language_id.clone()), ServerId::from)
     }
 
-    /// Create a default configuration for rust-analyzer.
-    #[must_use]
-    pub fn rust_analyzer() -> Self {
+    /// Build a built-in server config, filling in every field not passed as
+    /// a parameter.
+    fn builtin(
+        language_id: &str,
+        command: &str,
+        args: &[&str],
+        file_patterns: &[&str],
+        markers: impl IntoIterator<Item = &'static str>,
+    ) -> Self {
         Self {
-            language_id: "rust".to_string(),
-            command: "rust-analyzer".to_string(),
-            args: vec![],
+            language_id: language_id.to_string(),
+            command: command.to_string(),
+            args: args.iter().map(ToString::to_string).collect(),
             env: HashMap::new(),
-            file_patterns: vec!["**/*.rs".to_string()],
+            file_patterns: file_patterns.iter().map(ToString::to_string).collect(),
             initialization_options: None,
             timeout_seconds: default_timeout(),
             request_timeout_seconds: default_request_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
-                "Cargo.toml",
-                "rust-toolchain.toml",
-            ])),
+            heuristics: Some(ServerHeuristics::with_markers(markers)),
             name: None,
             handles: None,
         }
+    }
+
+    /// Create a default configuration for rust-analyzer.
+    #[must_use]
+    pub fn rust_analyzer() -> Self {
+        Self::builtin(
+            "rust",
+            "rust-analyzer",
+            &[],
+            &["**/*.rs"],
+            ["Cargo.toml", "rust-toolchain.toml"],
+        )
     }
 
     /// Create a default configuration for pyright.
     #[must_use]
     pub fn pyright() -> Self {
-        Self {
-            language_id: "python".to_string(),
-            command: "pyright-langserver".to_string(),
-            args: vec!["--stdio".to_string()],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.py".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            request_timeout_seconds: default_request_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
+        Self::builtin(
+            "python",
+            "pyright-langserver",
+            &["--stdio"],
+            &["**/*.py"],
+            [
                 "pyproject.toml",
                 "setup.py",
                 "requirements.txt",
                 "pyrightconfig.json",
-            ])),
-            name: None,
-            handles: None,
-        }
+            ],
+        )
     }
 
     /// Create a default configuration for TypeScript language server.
     #[must_use]
     pub fn typescript() -> Self {
-        Self {
-            language_id: "typescript".to_string(),
-            command: "typescript-language-server".to_string(),
-            args: vec!["--stdio".to_string()],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            request_timeout_seconds: default_request_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
-                "package.json",
-                "tsconfig.json",
-                "jsconfig.json",
-            ])),
-            name: None,
-            handles: None,
-        }
+        Self::builtin(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
+            &["**/*.ts", "**/*.tsx"],
+            ["package.json", "tsconfig.json", "jsconfig.json"],
+        )
     }
 
     /// Create a default configuration for gopls.
     #[must_use]
     pub fn gopls() -> Self {
-        Self {
-            language_id: "go".to_string(),
-            command: "gopls".to_string(),
-            args: vec!["serve".to_string()],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.go".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            request_timeout_seconds: default_request_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers(["go.mod", "go.sum"])),
-            name: None,
-            handles: None,
-        }
+        Self::builtin(
+            "go",
+            "gopls",
+            &["serve"],
+            &["**/*.go"],
+            ["go.mod", "go.sum"],
+        )
     }
 
     /// Create a default configuration for clangd.
     #[must_use]
     pub fn clangd() -> Self {
-        Self {
-            language_id: "cpp".to_string(),
-            command: "clangd".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            file_patterns: vec![
-                "**/*.c".to_string(),
-                "**/*.cpp".to_string(),
-                "**/*.h".to_string(),
-                "**/*.hpp".to_string(),
-            ],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            request_timeout_seconds: default_request_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
+        Self::builtin(
+            "cpp",
+            "clangd",
+            &[],
+            &["**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp"],
+            [
                 "CMakeLists.txt",
                 "compile_commands.json",
                 "Makefile",
                 ".clangd",
-            ])),
-            name: None,
-            handles: None,
-        }
+            ],
+        )
     }
 
     /// Create a default configuration for zls.
     #[must_use]
     pub fn zls() -> Self {
-        Self {
-            language_id: "zig".to_string(),
-            command: "zls".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.zig".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            request_timeout_seconds: default_request_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
-                "build.zig",
-                "build.zig.zon",
-            ])),
-            name: None,
-            handles: None,
-        }
+        Self::builtin(
+            "zig",
+            "zls",
+            &[],
+            &["**/*.zig"],
+            ["build.zig", "build.zig.zon"],
+        )
     }
 }
 
