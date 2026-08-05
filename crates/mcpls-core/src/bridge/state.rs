@@ -97,38 +97,141 @@ impl PartialEq for DiskSync {
 impl Eq for DiskSync {}
 
 /// State of a single document.
+///
+/// All fields are private. `DocumentTracker::open` (via `Self::new`)
+/// establishes the initial state: `version` starts at 1, `disk` provenance
+/// starts `None`, and no server is recorded as synced. From there, every
+/// mutation goes through a dedicated method (`apply_local_edit`,
+/// `commit_reload`, `set_disk`, `mark_synced`, `forget_server`) rather than a
+/// partial field write, so within a single tracked lifetime `version` (see
+/// [`Self::version`]) only increases. This does not cover re-opening: calling
+/// `DocumentTracker::open` again for an already-tracked path unconditionally
+/// replaces the entry, resetting `version` to 1 and clearing `synced` -- see
+/// that method's docs.
+///
+/// The `disk` provenance invariant: `None` means the content's on-disk
+/// provenance is unknown (it came from an in-memory `open`/`update` call, not
+/// a verified disk read), so `ensure_open` must always re-verify by content
+/// compare rather than trusting a stat match. `DiskSync`'s hand-written
+/// `PartialEq` excludes `content_checked_at` (see that field's doc comment),
+/// and that exclusion propagates here: two `DocumentState`s can compare
+/// equal via this struct's derived `PartialEq`/`Eq` despite having been
+/// disk-verified at different instants. This is intentional --
+/// `content_checked_at` is a debounce timer, not part of a document's
+/// logical state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentState {
+    uri: Uri,
+    language_id: String,
+    version: i32,
+    content: String,
+    disk: Option<DiskSync>,
+    synced: HashMap<ServerId, i32>,
+}
+
+impl DocumentState {
+    /// Creates a new document state at version 1, with unknown disk
+    /// provenance and no server yet recorded as synced.
+    fn new(uri: Uri, language_id: String, content: String) -> Self {
+        Self {
+            uri,
+            language_id,
+            version: 1,
+            content,
+            disk: None,
+            synced: HashMap::new(),
+        }
+    }
+
     /// Document URI.
-    pub uri: Uri,
+    #[must_use]
+    pub const fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
     /// Language identifier.
-    pub language_id: String,
-    /// Document version (monotonically increasing).
-    pub version: i32,
+    #[must_use]
+    pub fn language_id(&self) -> &str {
+        &self.language_id
+    }
+
+    /// Document version. Monotonically increasing: every mutation that
+    /// changes `content` (`apply_local_edit`, `commit_reload`) also bumps
+    /// this, and never decreases it.
+    #[must_use]
+    pub const fn version(&self) -> i32 {
+        self.version
+    }
+
     /// Document content.
-    pub content: String,
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
     /// Filesystem snapshot as of the last time `content` was read from disk.
-    ///
-    /// `None` means the content's on-disk provenance is unknown (it came from
-    /// an in-memory `open`/`update` call, not a verified disk read), so
-    /// `ensure_open` must always re-verify by content compare rather than
-    /// trusting a stat match.
-    ///
-    /// `DiskSync`'s hand-written `PartialEq` excludes `content_checked_at`
-    /// (see that field's doc comment), and that exclusion propagates here:
-    /// two `DocumentState`s can compare equal via this struct's derived
-    /// `PartialEq`/`Eq` despite having been disk-verified at different
-    /// instants. This is intentional -- `content_checked_at` is a debounce
-    /// timer, not part of a document's logical state.
-    pub disk: Option<DiskSync>,
-    /// Last document version pushed to each server via `didOpen`/`didChange`.
+    /// See the struct-level docs for the meaning of `None`.
+    const fn disk(&self) -> Option<DiskSync> {
+        self.disk
+    }
+
+    /// Last document version pushed to `server` via `didOpen`/`didChange`,
+    /// or `None` if `server` has never seen this document.
     ///
     /// A single document can be synced to multiple servers (e.g. hover
     /// routed to one server, diagnostics to another for the same language),
     /// each needing its own `didOpen`/`didChange` history -- a server absent
     /// from this map has never seen the document and must receive
     /// `didOpen`, not `didChange`, on its next `ensure_open` call.
-    pub synced: HashMap<ServerId, i32>,
+    #[must_use]
+    pub fn synced_version(&self, server: &ServerId) -> Option<i32> {
+        self.synced.get(server).copied()
+    }
+
+    /// Whether no server has ever synced this document.
+    fn has_never_synced(&self) -> bool {
+        self.synced.is_empty()
+    }
+
+    /// Applies a local (non-disk) edit: bumps `version`, replaces `content`,
+    /// and clears `disk` provenance, since the new content did not come from
+    /// a verified disk read. Returns the new version.
+    fn apply_local_edit(&mut self, content: String) -> i32 {
+        self.version += 1;
+        self.content = content;
+        self.disk = None;
+        self.version
+    }
+
+    /// Commits a disk-verified reload: sets `version`, `content`, and `disk`
+    /// together. `version` must be no less than the current version,
+    /// preserving the monotonicity invariant. (Not strictly greater: the
+    /// caller computes `version` via `saturating_add`, which can legitimately
+    /// clamp to the current value at `i32::MAX`.)
+    fn commit_reload(&mut self, version: i32, content: String, snap: Option<DiskSync>) {
+        debug_assert!(
+            version >= self.version,
+            "document version must be monotonically increasing"
+        );
+        self.version = version;
+        self.content = content;
+        self.disk = snap;
+    }
+
+    /// Sets the disk snapshot without changing `content` or `version`.
+    const fn set_disk(&mut self, snap: DiskSync) {
+        self.disk = Some(snap);
+    }
+
+    /// Records that `server` has synced up to `version`.
+    fn mark_synced(&mut self, server: ServerId, version: i32) {
+        self.synced.insert(server, version);
+    }
+
+    /// Forgets `server`'s sync history for this document.
+    fn forget_server(&mut self, server: &ServerId) {
+        self.synced.remove(server);
+    }
 }
 
 /// Resource limits for document tracking.
@@ -246,14 +349,7 @@ impl DocumentTracker {
         let uri = path_to_uri(&path)?;
         let language_id = detect_language(&path, &self.extension_map);
 
-        let state = DocumentState {
-            uri: uri.clone(),
-            language_id,
-            version: 1,
-            content,
-            disk: None,
-            synced: HashMap::new(),
-        };
+        let state = DocumentState::new(uri.clone(), language_id, content);
 
         // Check document limit and insert under a single lock acquisition so
         // two concurrent `open` calls for different new paths can't both
@@ -276,16 +372,12 @@ impl DocumentTracker {
     /// Returns `None` if the document is not open. The updated content has no
     /// known disk provenance, so the next `ensure_open` call on this path
     /// will always re-verify by content compare rather than trusting a stat.
+    // TODO(critic): `update`/`open` may race a concurrent `ensure_open` for
+    // the same path; see #304 review.
     pub fn update(&self, path: &Path, content: String) -> Option<i32> {
-        let mut documents = lock_std(&self.documents);
-        if let Some(state) = documents.get_mut(path) {
-            state.version += 1;
-            state.content = content;
-            state.disk = None;
-            Some(state.version)
-        } else {
-            None
-        }
+        lock_std(&self.documents)
+            .get_mut(path)
+            .map(|state| state.apply_local_edit(content))
     }
 
     /// Returns an error if `size` exceeds the configured file size limit.
@@ -307,7 +399,7 @@ impl DocumentTracker {
     /// lookup.
     fn set_disk(&self, path: &Path, snap: DiskSync) {
         if let Some(st) = lock_std(&self.documents).get_mut(path) {
-            st.disk = Some(snap);
+            st.set_disk(snap);
         }
     }
 
@@ -354,7 +446,7 @@ impl DocumentTracker {
             .entry(server.clone())
             .or_insert(0) += 1;
         for state in lock_std(&self.documents).values_mut() {
-            state.synced.remove(server);
+            state.forget_server(server);
         }
     }
 
@@ -416,8 +508,8 @@ impl DocumentTracker {
     /// document must still receive `didOpen` even if the file has not
     /// changed since a first server was opened on it.
     ///
-    /// **Sync phase**: compares `server`'s last-synced version (tracked in
-    /// [`DocumentState::synced`]) against the version decided by the disk
+    /// **Sync phase**: compares `server`'s last-synced version (tracked via
+    /// [`DocumentState::synced_version`]) against the version decided by the disk
     /// phase, and sends exactly one of `didOpen` (server has never seen this
     /// document), `didChange` (server is behind), or nothing (server is
     /// already caught up). A `didChange` is always a single full-replacement
@@ -500,8 +592,10 @@ impl DocumentTracker {
         // held while `fast_path` is computed.
         let Some((uri, current_version, fast_path)) =
             lock_std(&self.documents).get(path).map(|st| {
-                let stat_matches = st.disk.is_some_and(|d| d.mtime == mtime && d.size == size);
-                let fast_path = match st.disk {
+                let stat_matches = st
+                    .disk()
+                    .is_some_and(|d| d.mtime == mtime && d.size == size);
+                let fast_path = match st.disk() {
                     Some(d) if stat_matches && d.mtime_settled => true,
                     Some(d)
                         if stat_matches && d.content_checked_at.elapsed() < DISK_CHECK_DEBOUNCE =>
@@ -635,7 +729,7 @@ impl DocumentTracker {
         // of this statement rather than held across the checks that follow.
         let Some(synced_version) = lock_std(&self.documents)
             .get(path)
-            .map(|st| st.synced.get(server).copied())
+            .map(|st| st.synced_version(server))
         else {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
@@ -701,7 +795,7 @@ impl DocumentTracker {
             // them.
             let first_ever_sync = lock_std(&self.documents)
                 .get(path)
-                .is_some_and(|st| st.synced.is_empty());
+                .is_some_and(DocumentState::has_never_synced);
             if is_first_open && first_ever_sync {
                 lock_std(&self.documents).remove(path);
             }
@@ -715,9 +809,7 @@ impl DocumentTracker {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
         if let Some(fresh) = fresh_content {
-            st.version = target_version;
-            st.content = fresh;
-            st.disk = snap;
+            st.commit_reload(target_version, fresh, snap);
         }
         // Read while `documents` is still held, not before: `forget_server`
         // bumps the generation strictly before it acquires `documents`
@@ -729,7 +821,7 @@ impl DocumentTracker {
         // the old one, in which case `forget_server` cannot have started
         // clearing yet and will correctly clear the entry this commits.
         if self.generation(server) == generation {
-            st.synced.insert(server.clone(), target_version);
+            st.mark_synced(server.clone(), target_version);
         }
         drop(documents);
 
@@ -941,8 +1033,8 @@ mod tests {
         assert_eq!(tracker.len(), 1);
 
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version, 1);
-        assert_eq!(state.language_id, "rust");
+        assert_eq!(state.version(), 1);
+        assert_eq!(state.language_id(), "rust");
 
         let new_version = tracker.update(&path, "fn main() { println!() }".to_string());
         assert_eq!(new_version, Some(2));
@@ -981,8 +1073,8 @@ mod tests {
         tracker.forget_server(&respawned);
 
         let state = tracker.get(&path).unwrap();
-        assert!(!state.synced.contains_key(&respawned));
-        assert!(state.synced.contains_key(&untouched));
+        assert!(state.synced_version(&respawned).is_none());
+        assert!(state.synced_version(&untouched).is_some());
     }
 
     /// #249 S1 regression: a `sync_phase` call that captured `server`'s
@@ -1024,7 +1116,7 @@ mod tests {
 
         let state = tracker.get(&path).unwrap();
         assert!(
-            !state.synced.contains_key(&server),
+            state.synced_version(&server).is_none(),
             "a sync_phase call that captured a stale generation must not \
              commit `synced`, even though its notify against the \
              superseded connection succeeded"
@@ -1048,7 +1140,7 @@ mod tests {
         tracker.ensure_open(&path, &server, &client).await.unwrap();
 
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.synced.get(&server), Some(&1));
+        assert_eq!(state.synced_version(&server), Some(1));
     }
 
     #[test]
@@ -1156,10 +1248,10 @@ mod tests {
 
         #[allow(clippy::redundant_clone)]
         let cloned = state.clone();
-        assert_eq!(cloned.uri, state.uri);
-        assert_eq!(cloned.language_id, state.language_id);
-        assert_eq!(cloned.version, 5);
-        assert_eq!(cloned.content, state.content);
+        assert_eq!(cloned.uri(), state.uri());
+        assert_eq!(cloned.language_id(), state.language_id());
+        assert_eq!(cloned.version(), 5);
+        assert_eq!(cloned.content(), state.content());
     }
 
     #[test]
@@ -1234,16 +1326,16 @@ mod tests {
         let path = PathBuf::from("/test/versioned.rs");
 
         tracker.open(path.clone(), "v1".to_string()).unwrap();
-        assert_eq!(tracker.get(&path).unwrap().version, 1);
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
 
         tracker.update(&path, "v2".to_string());
-        assert_eq!(tracker.get(&path).unwrap().version, 2);
+        assert_eq!(tracker.get(&path).unwrap().version(), 2);
 
         tracker.update(&path, "v3".to_string());
-        assert_eq!(tracker.get(&path).unwrap().version, 3);
+        assert_eq!(tracker.get(&path).unwrap().version(), 3);
 
         tracker.update(&path, "v4".to_string());
-        assert_eq!(tracker.get(&path).unwrap().version, 4);
+        assert_eq!(tracker.get(&path).unwrap().version(), 4);
     }
 
     #[test]
@@ -1498,8 +1590,8 @@ mod tests {
         assert!(tracker.is_open(&path2));
 
         tracker.update(&path1, "new content1".to_string());
-        assert_eq!(tracker.get(&path1).unwrap().content, "new content1");
-        assert_eq!(tracker.get(&path2).unwrap().content, "content2");
+        assert_eq!(tracker.get(&path1).unwrap().content(), "new content1");
+        assert_eq!(tracker.get(&path2).unwrap().content(), "content2");
 
         tracker.close(&path1);
         assert_eq!(tracker.len(), 1);
@@ -1517,7 +1609,7 @@ mod tests {
 
         tracker.open(path.clone(), String::new()).unwrap();
         assert!(tracker.is_open(&path));
-        assert_eq!(tracker.get(&path).unwrap().content, "");
+        assert_eq!(tracker.get(&path).unwrap().content(), "");
     }
 
     #[test]
@@ -1530,7 +1622,7 @@ mod tests {
         let content = "fn テスト() { println!(\"こんにちは\"); }";
 
         tracker.open(path.clone(), content.to_string()).unwrap();
-        assert_eq!(tracker.get(&path).unwrap().content, content);
+        assert_eq!(tracker.get(&path).unwrap().content(), content);
     }
 
     #[test]
@@ -1638,7 +1730,7 @@ mod tests {
             .unwrap();
 
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.language_id, "nushell");
+        assert_eq!(state.language_id(), "nushell");
     }
 
     #[test]
@@ -1653,7 +1745,7 @@ mod tests {
             .unwrap();
 
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.language_id, "rust");
+        assert_eq!(state.language_id(), "rust");
     }
 
     #[test]
@@ -1886,15 +1978,15 @@ mod tests {
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
             .unwrap();
-        assert_eq!(tracker.get(&path).unwrap().version, 1);
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
 
         let uri2 = tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
             .unwrap();
         assert_eq!(uri1, uri2);
-        assert_eq!(tracker.get(&path).unwrap().version, 1);
-        assert_eq!(tracker.get(&path).unwrap().content, "fn main() {}");
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
     }
 
     #[tokio::test]
@@ -1919,8 +2011,8 @@ mod tests {
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version, 2);
-        assert_eq!(state.content, "fn main() { println!(\"hi\"); }");
+        assert_eq!(state.version(), 2);
+        assert_eq!(state.content(), "fn main() { println!(\"hi\"); }");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1951,10 +2043,11 @@ mod tests {
             .unwrap();
         let state = tracker.get(&path).unwrap();
         assert_eq!(
-            state.version, 2,
+            state.version(),
+            2,
             "must resync despite identical (mtime, size)"
         );
-        assert_eq!(state.content, "BBBB");
+        assert_eq!(state.content(), "BBBB");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1985,8 +2078,8 @@ mod tests {
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version, 1, "documented limitation: fast path taken");
-        assert_eq!(state.content, "AAAA");
+        assert_eq!(state.version(), 1, "documented limitation: fast path taken");
+        assert_eq!(state.content(), "AAAA");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2012,8 +2105,8 @@ mod tests {
             .unwrap();
 
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version, 2);
-        assert_eq!(state.content, "BBBBBBBB");
+        assert_eq!(state.version(), 2);
+        assert_eq!(state.content(), "BBBBBBBB");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2039,7 +2132,7 @@ mod tests {
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await
             .unwrap();
-        assert_eq!(tracker.get(&path).unwrap().version, 1);
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
 
         tokio::time::advance(Duration::from_millis(300)).await;
         tracker
@@ -2047,8 +2140,8 @@ mod tests {
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version, 2);
-        assert_eq!(state.content, "BBBB");
+        assert_eq!(state.version(), 2);
+        assert_eq!(state.content(), "BBBB");
     }
 
     #[tokio::test]
@@ -2072,8 +2165,8 @@ mod tests {
             .await;
         assert!(matches!(result, Err(Error::FileIo { .. })));
         assert!(tracker.is_open(&path));
-        assert_eq!(tracker.get(&path).unwrap().version, 1);
-        assert_eq!(tracker.get(&path).unwrap().content, "fn main() {}");
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
     }
 
     #[tokio::test]
@@ -2100,8 +2193,8 @@ mod tests {
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await;
         assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
-        assert_eq!(tracker.get(&path).unwrap().content, "small");
-        assert_eq!(tracker.get(&path).unwrap().version, 1);
+        assert_eq!(tracker.get(&path).unwrap().content(), "small");
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
     }
 
     #[tokio::test]
@@ -2132,7 +2225,7 @@ mod tests {
             "resync must not re-run the doc-count check on an already-tracked path"
         );
         assert_eq!(tracker.len(), 1);
-        assert_eq!(tracker.get(&path).unwrap().version, 2);
+        assert_eq!(tracker.get(&path).unwrap().version(), 2);
     }
 
     #[tokio::test]
@@ -2316,8 +2409,8 @@ mod tests {
         let opened = read_framed_message(&mut wire).await;
         assert_eq!(opened["method"], "textDocument/didOpen");
         assert_eq!(
-            tracker.get(&path).unwrap().synced.get(&id),
-            Some(&1),
+            tracker.get(&path).unwrap().synced_version(&id),
+            Some(1),
             "second call for the same server must not re-open or re-change"
         );
     }
@@ -2358,21 +2451,21 @@ mod tests {
         // starting point rather than drifting the tracker out of sync with
         // what was actually acknowledged over the wire.
         assert!(tracker.is_open(&path));
-        assert_eq!(tracker.get(&path).unwrap().content, "fn main() {}");
-        assert_eq!(tracker.get(&path).unwrap().version, 1);
-        assert_eq!(tracker.get(&path).unwrap().synced.get(&id_a), Some(&1));
-        assert_eq!(tracker.get(&path).unwrap().synced.get(&id_b), Some(&1));
+        assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(tracker.get(&path).unwrap().synced_version(&id_a), Some(1));
+        assert_eq!(tracker.get(&path).unwrap().synced_version(&id_b), Some(1));
 
         // A's next call must independently detect the disk change (B's
         // failure did not consume it) and successfully advance both the
         // shared content/version and its own synced entry.
         tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
         assert_eq!(
-            tracker.get(&path).unwrap().content,
+            tracker.get(&path).unwrap().content(),
             "fn main() { updated(); }"
         );
-        assert_eq!(tracker.get(&path).unwrap().synced.get(&id_a), Some(&2));
-        assert_eq!(tracker.get(&path).unwrap().synced.get(&id_b), Some(&1));
+        assert_eq!(tracker.get(&path).unwrap().synced_version(&id_a), Some(2));
+        assert_eq!(tracker.get(&path).unwrap().synced_version(&id_b), Some(1));
     }
 
     // ------------------------------------------------------------------
@@ -2448,7 +2541,7 @@ mod tests {
         .unwrap();
 
         handle_a.await.unwrap().unwrap();
-        assert_eq!(tracker.get(&path_a).unwrap().content, "fn a() {}");
+        assert_eq!(tracker.get(&path_a).unwrap().content(), "fn a() {}");
     }
 
     /// Regression for #227: N concurrent `ensure_open` calls for the same
@@ -2497,8 +2590,8 @@ mod tests {
             "expected no additional notification after the single didOpen"
         );
 
-        assert_eq!(tracker.get(&path).unwrap().synced.get(&id), Some(&1));
-        assert_eq!(tracker.get(&path).unwrap().version, 1);
+        assert_eq!(tracker.get(&path).unwrap().synced_version(&id), Some(1));
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
     }
 
     /// Regression for #227: `lock_path`'s guard must evict its `path_locks`
