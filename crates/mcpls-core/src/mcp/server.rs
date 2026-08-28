@@ -645,6 +645,10 @@ impl McplsServer {
     }
 }
 
+// `list_resources` is synchronous (no `.await`), but `ServerHandler::list_resources`
+// requires `async fn`; `#[tool_handler]` also expands other trait methods without
+// `.await`, so the lint is suppressed for the whole impl block.
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for McplsServer {
     async fn list_resources(
