@@ -18,7 +18,6 @@ categories = ["development-tools", "command-line-utilities"]
 # Sorted alphabetically
 anyhow = "1.0"
 assert_cmd = "2.2"
-async-trait = "0.1"
 axum = "0.8"
 chrono = "0.4.45"
 clap = "4.6"

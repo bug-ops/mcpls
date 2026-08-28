@@ -981,7 +981,6 @@ name = "mcpls-core"
 version = "0.3.9"
 dependencies = [
  "anyhow",
- "async-trait",
  "axum",
  "chrono",
  "dirs",
