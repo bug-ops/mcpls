@@ -1681,6 +1681,7 @@ mod tests {
         use std::process::Stdio;
 
         use serde_json::Value;
+        use tempfile::TempDir;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -1796,6 +1797,44 @@ mod tests {
             .await;
 
             // The response written above must let `initialize` complete successfully.
+            init_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_initialize_accepts_resolved_dot_workspace_root() {
+            let temp_dir = TempDir::new().unwrap();
+            let base = dunce::canonicalize(temp_dir.path()).unwrap();
+            let workspace_roots =
+                crate::resolve_workspace_roots(&[PathBuf::from(".")], &base).unwrap();
+            assert_eq!(workspace_roots, vec![base.clone()]);
+
+            let (client, mut server) = fake_lsp_client();
+            let config = ServerInitConfig {
+                server_config: LspServerConfig::rust_analyzer(),
+                workspace_roots,
+                initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
+            };
+
+            let init_task =
+                tokio::spawn(async move { LspServer::initialize(&client, &config).await });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let expected_uri = try_path_to_uri(&base).unwrap();
+            assert_eq!(
+                request["params"]["workspaceFolders"][0]["uri"],
+                expected_uri.as_str()
+            );
+
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                serde_json::json!({ "capabilities": {} }),
+            )
+            .await;
+
             init_task.await.unwrap().unwrap();
         }
     }

@@ -44,7 +44,7 @@ pub mod transport;
 mod util;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,7 +84,7 @@ use transport::{ShutdownSignal, run_stdio};
 /// silently fails to match and gets dropped (a raw `[[lsp_servers]]`-derived
 /// or relative root will never `starts_with`-match a canonical LSP path).
 /// `serve_with` guarantees this by passing `workspace_roots_snapshot`, which
-/// is built via [`canonicalize_workspace_roots`] -- see that function's docs.
+/// clones the roots already normalized by [`resolve_workspace_roots`].
 ///
 /// An empty `workspace_roots` (no workspace configured) allows any URI,
 /// matching `validate_path_against_roots`'s "no roots = no restriction"
@@ -312,59 +312,54 @@ pub(crate) fn register_servers(
     }
 }
 
-/// Resolve workspace roots from config or current directory.
+/// Resolve workspace roots against an absolute base directory.
 ///
-/// If no workspace roots are provided in the configuration, this function
-/// will use the current working directory, canonicalized for security.
+/// If no workspace roots are provided, the base directory itself is used.
+/// Configured relative roots are joined to the base directory. Every existing
+/// path is canonicalized before it can reach workspace heuristics, LSP
+/// initialization, path validation, or diagnostics filtering.
 ///
 /// # Returns
 ///
-/// A vector of workspace root paths. If config roots are provided, they are
-/// returned as-is. Otherwise, returns the canonicalized current directory,
-/// falling back to relative "." if canonicalization fails.
-fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
+/// A vector of absolute workspace root paths. A relative root that cannot be
+/// canonicalized is rejected as invalid configuration rather than being left
+/// to fail later during `file://` URI conversion. An absolute root retains the
+/// previous fallback behavior and is kept as-is if canonicalization fails.
+fn resolve_workspace_roots(
+    config_roots: &[PathBuf],
+    base_dir: &Path,
+) -> Result<Vec<PathBuf>, Error> {
+    if !base_dir.is_absolute() {
+        return Err(Error::InvalidConfig(format!(
+            "workspace root base must be absolute: {}",
+            base_dir.display()
+        )));
+    }
+
     if config_roots.is_empty() {
-        match std::env::current_dir() {
-            Ok(cwd) => {
-                // current_dir() always returns an absolute path
-                match cwd.canonicalize() {
-                    Ok(canonical) => {
-                        info!(
-                            "Using current directory as workspace root: {}",
-                            canonical.display()
-                        );
-                        vec![canonical]
-                    }
-                    Err(e) => {
-                        // Canonicalization can fail if directory was deleted or permissions changed
-                        // but cwd itself is still absolute
-                        warn!(
-                            "Failed to canonicalize current directory: {e}, using non-canonical path"
-                        );
-                        vec![cwd]
-                    }
-                }
-            }
+        let root = match dunce::canonicalize(base_dir) {
+            Ok(canonical) => canonical,
             Err(e) => {
-                // This is extremely rare - only happens if cwd was deleted or unlinked
-                // In this case, we have no choice but to use a relative path
-                warn!("Failed to get current directory: {e}, using fallback");
-                vec![PathBuf::from(".")]
+                warn!(
+                    "Failed to canonicalize workspace base directory {}: {e}, using non-canonical absolute path",
+                    base_dir.display()
+                );
+                base_dir.to_path_buf()
             }
-        }
+        };
+        info!("Using workspace base directory as root: {}", root.display());
+        Ok(vec![root])
     } else {
-        config_roots.to_vec()
+        canonicalize_workspace_roots(config_roots, base_dir)
     }
 }
 
-/// Canonicalize each workspace root, falling back to the original path for
-/// any root that fails to canonicalize (e.g. deleted after startup).
+/// Resolve and canonicalize each configured workspace root.
 ///
-/// `resolve_workspace_roots` returns config-provided roots unmodified
-/// (relative paths, symlinks kept as-is); this normalizes them so a plain
-/// prefix comparison against an already-resolved LSP path (see
-/// `diagnostic_path_in_workspace`) works without a filesystem syscall on
-/// that hot per-notification path.
+/// Relative roots are resolved against `base_dir` and must exist. Absolute
+/// roots keep the historical fallback behavior: if canonicalization fails
+/// (for example because the directory is created after startup), the original
+/// absolute path is retained.
 ///
 /// Uses [`dunce::canonicalize`] rather than [`Path::canonicalize`]: on
 /// Windows, the latter returns the `\\?\`-prefixed verbatim form (e.g.
@@ -373,10 +368,34 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
 /// diagnostic. `dunce::canonicalize` resolves symlinks identically but
 /// returns the ordinary `C:\...` form when the result doesn't require the
 /// verbatim syntax (i.e. essentially always, for realistic workspace paths).
-fn canonicalize_workspace_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+fn canonicalize_workspace_roots(roots: &[PathBuf], base_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     roots
         .iter()
-        .map(|root| dunce::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .map(|root| {
+            let is_relative = root.is_relative();
+            let resolved = if is_relative {
+                base_dir.join(root)
+            } else {
+                root.clone()
+            };
+
+            match dunce::canonicalize(&resolved) {
+                Ok(canonical) => Ok(canonical),
+                Err(source) if is_relative => Err(Error::InvalidConfig(format!(
+                    "workspace root '{}' resolved relative to '{}' as '{}' could not be canonicalized: {source}",
+                    root.display(),
+                    base_dir.display(),
+                    resolved.display()
+                ))),
+                Err(source) => {
+                    warn!(
+                        "Failed to canonicalize absolute workspace root {}: {source}, using non-canonical path",
+                        resolved.display()
+                    );
+                    Ok(resolved)
+                }
+            }
+        })
         .collect()
 }
 
@@ -496,7 +515,13 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     config.validate()?;
 
     let project_config_ignored = config.project_config_ignored;
-    let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
+    // `current_dir()` always returns an absolute path. Configs loaded from a
+    // TOML file have already had relative roots rebased to that file's
+    // directory in `ServerConfig::load_from`; this second pass covers
+    // caller-built `ServerConfig`s, whose relative roots are defined against
+    // the process cwd.
+    let workspace_base = std::env::current_dir().map_err(Error::Io)?;
+    let workspace_roots = resolve_workspace_roots(&config.workspace.roots, &workspace_base)?;
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
@@ -572,20 +597,11 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
     // validate a path without locking `translator` below.
     //
-    // Canonicalized once here rather than left as-is: `resolve_workspace_roots`
-    // returns config-provided roots unmodified (relative paths, symlinks kept),
-    // but `diagnostic_path_in_workspace` (fed by this snapshot) does a plain
-    // prefix check with no filesystem I/O on its hot per-notification path --
-    // that only matches correctly if both sides are already in the same
-    // (canonical) form, and LSP servers report already-resolved canonical
-    // paths. Comparing an un-canonicalized root against a canonical path would
-    // silently drop every diagnostic for a workspace configured with a
-    // relative or symlinked root. Falls back to the original root if
-    // canonicalization fails (e.g. deleted between startup and this point);
-    // `validate_path_against_roots`'s own per-call canonicalize is unaffected
-    // either way, since canonicalizing an already-canonical path is a no-op.
-    let workspace_roots_snapshot: Arc<[PathBuf]> =
-        Arc::from(canonicalize_workspace_roots(&workspace_roots));
+    // `resolve_workspace_roots` canonicalizes before any consumer sees these
+    // paths. The snapshot can therefore stay allocation-only while preserving
+    // `diagnostic_path_in_workspace`'s canonical-root precondition and avoiding
+    // filesystem I/O on the hot per-notification path.
+    let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
 
     let translator = Arc::new(translator);
     let subscriptions = Arc::new(ResourceSubscriptions::new());
@@ -898,10 +914,27 @@ mod tests {
     }
 
     #[test]
-    fn test_canonicalize_workspace_roots_falls_back_on_nonexistent_path() {
-        let missing = PathBuf::from("/definitely/does/not/exist/anywhere");
-        let result = canonicalize_workspace_roots(std::slice::from_ref(&missing));
+    fn test_canonicalize_workspace_roots_falls_back_on_nonexistent_absolute_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let missing = base.join("missing");
+        let result = canonicalize_workspace_roots(std::slice::from_ref(&missing), &base).unwrap();
         assert_eq!(result, vec![missing]);
+    }
+
+    #[test]
+    fn test_canonicalize_workspace_roots_rejects_nonexistent_relative_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let missing = PathBuf::from("missing");
+
+        let err = canonicalize_workspace_roots(std::slice::from_ref(&missing), &base).unwrap_err();
+
+        let Error::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(message.contains("workspace root 'missing'"));
+        assert!(message.contains(&base.display().to_string()));
     }
 
     /// #234 round-3 regression: a symlinked workspace root must canonicalize
@@ -916,19 +949,20 @@ mod tests {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let base = temp_dir.path().canonicalize().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
         let real_dir = base.join("real");
         std::fs::create_dir(&real_dir).unwrap();
         let link_dir = base.join("link");
         symlink(&real_dir, &link_dir).unwrap();
 
-        let result = canonicalize_workspace_roots(&[link_dir]);
+        let result = canonicalize_workspace_roots(&[link_dir], &base).unwrap();
         assert_eq!(result, vec![real_dir]);
     }
 
     #[test]
     fn test_resolve_workspace_roots_empty_config() {
-        let roots = resolve_workspace_roots(&[]);
+        let cwd = std::env::current_dir().unwrap();
+        let roots = resolve_workspace_roots(&[], &cwd).unwrap();
         assert_eq!(roots.len(), 1);
         assert!(
             roots[0].is_absolute(),
@@ -938,109 +972,154 @@ mod tests {
 
     #[test]
     fn test_resolve_workspace_roots_with_config() {
-        let config_roots = vec![PathBuf::from("/test/root")];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots, config_roots);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+
+        let roots = resolve_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
+        assert_eq!(roots, vec![root]);
     }
 
     #[test]
     fn test_resolve_workspace_roots_multiple_paths() {
-        let config_roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
-        let roots = resolve_workspace_roots(&config_roots);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let config_roots = vec![base.join("root1"), base.join("root2")];
+        for root in &config_roots {
+            std::fs::create_dir(root).unwrap();
+        }
+
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
         assert_eq!(roots, config_roots);
         assert_eq!(roots.len(), 2);
     }
 
     #[test]
     fn test_resolve_workspace_roots_preserves_order() {
-        let config_roots = vec![
-            PathBuf::from("/workspace/alpha"),
-            PathBuf::from("/workspace/beta"),
-            PathBuf::from("/workspace/gamma"),
-        ];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots[0], PathBuf::from("/workspace/alpha"));
-        assert_eq!(roots[1], PathBuf::from("/workspace/beta"));
-        assert_eq!(roots[2], PathBuf::from("/workspace/gamma"));
-    }
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let config_roots = vec![base.join("alpha"), base.join("beta"), base.join("gamma")];
+        for root in &config_roots {
+            std::fs::create_dir(root).unwrap();
+        }
 
-    #[test]
-    fn test_resolve_workspace_roots_single_path() {
-        let config_roots = vec![PathBuf::from("/single/workspace")];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0], PathBuf::from("/single/workspace"));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_empty_returns_cwd() {
-        let roots = resolve_workspace_roots(&[]);
-        assert!(
-            !roots.is_empty(),
-            "Should return at least one workspace root"
-        );
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_relative_paths() {
-        let config_roots = vec![
-            PathBuf::from("relative/path1"),
-            PathBuf::from("relative/path2"),
-        ];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], PathBuf::from("relative/path1"));
-        assert_eq!(roots[1], PathBuf::from("relative/path2"));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_mixed_paths() {
-        let config_roots = vec![
-            PathBuf::from("/absolute/path"),
-            PathBuf::from("relative/path"),
-        ];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], PathBuf::from("/absolute/path"));
-        assert_eq!(roots[1], PathBuf::from("relative/path"));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_with_dot_path() {
-        let config_roots = vec![PathBuf::from(".")];
-        let roots = resolve_workspace_roots(&config_roots);
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
         assert_eq!(roots, config_roots);
     }
 
     #[test]
-    fn test_resolve_workspace_roots_with_parent_path() {
-        let config_roots = vec![PathBuf::from("..")];
-        let roots = resolve_workspace_roots(&config_roots);
+    fn test_resolve_workspace_roots_single_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let root = base.join("workspace");
+        std::fs::create_dir(&root).unwrap();
+
+        let roots = resolve_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
         assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0], PathBuf::from(".."));
+        assert_eq!(roots[0], root);
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_empty_returns_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let roots = resolve_workspace_roots(&[], &cwd).unwrap();
+        assert_eq!(roots, vec![dunce::canonicalize(cwd).unwrap()]);
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_relative_paths() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let config_roots = vec![
+            PathBuf::from("relative/path1"),
+            PathBuf::from("relative/path2"),
+        ];
+        for root in &config_roots {
+            std::fs::create_dir_all(base.join(root)).unwrap();
+        }
+
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
+        assert_eq!(
+            roots,
+            vec![base.join("relative/path1"), base.join("relative/path2")]
+        );
+        assert!(roots.iter().all(|root| root.is_absolute()));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_mixed_paths() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let absolute = base.join("absolute");
+        let relative = PathBuf::from("relative/path");
+        std::fs::create_dir(&absolute).unwrap();
+        std::fs::create_dir_all(base.join(&relative)).unwrap();
+        let config_roots = vec![absolute.clone(), relative];
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], absolute);
+        assert_eq!(roots[1], base.join("relative/path"));
+        assert!(roots.iter().all(|root| root.is_absolute()));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_with_dot_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let config_roots = vec![PathBuf::from(".")];
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
+        assert_eq!(roots, vec![base]);
+        assert!(roots[0].is_absolute());
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_with_parent_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let parent = dunce::canonicalize(temp_dir.path()).unwrap();
+        let base = parent.join("nested");
+        std::fs::create_dir(&base).unwrap();
+        let config_roots = vec![PathBuf::from("..")];
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], parent);
+        assert!(roots[0].is_absolute());
     }
 
     #[test]
     fn test_resolve_workspace_roots_unicode_paths() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
         let config_roots = vec![
-            PathBuf::from("/workspace/テスト"),
-            PathBuf::from("/workspace/тест"),
+            PathBuf::from("workspace/テスト"),
+            PathBuf::from("workspace/тест"),
         ];
-        let roots = resolve_workspace_roots(&config_roots);
+        for root in &config_roots {
+            std::fs::create_dir_all(base.join(root)).unwrap();
+        }
+
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
         assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], PathBuf::from("/workspace/テスト"));
-        assert_eq!(roots[1], PathBuf::from("/workspace/тест"));
+        assert_eq!(roots[0], base.join("workspace/テスト"));
+        assert_eq!(roots[1], base.join("workspace/тест"));
     }
 
     #[test]
     fn test_resolve_workspace_roots_spaces_in_paths() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
         let config_roots = vec![
-            PathBuf::from("/workspace/path with spaces"),
-            PathBuf::from("/another path/workspace"),
+            PathBuf::from("workspace/path with spaces"),
+            PathBuf::from("another path/workspace"),
         ];
-        let roots = resolve_workspace_roots(&config_roots);
+        for root in &config_roots {
+            std::fs::create_dir_all(base.join(root)).unwrap();
+        }
+
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
         assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], PathBuf::from("/workspace/path with spaces"));
+        assert_eq!(roots[0], base.join("workspace/path with spaces"));
+        assert_eq!(roots[1], base.join("another path/workspace"));
     }
 
     // Tests for graceful degradation behavior

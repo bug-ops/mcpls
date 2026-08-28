@@ -98,6 +98,29 @@ roots = [
 roots = []
 ```
 
+When a configuration file is loaded, each relative root is resolved against
+the directory containing that TOML file, not against mcpls's process working
+directory. The resolved path must exist and is canonicalized before any LSP
+server is initialized. For example, a repository-owned config at
+`<repo>/.agents/mcpls.toml` can target the repository root portably with:
+
+```toml
+[workspace]
+roots = [".."]
+```
+
+In that same file, `roots = ["."]` selects `<repo>/.agents`. This behavior
+applies to explicit `--config` and `$MCPLS_CONFIG` paths as well as other
+file-loading modes, so launcher cwd differences do not change the meaning of
+a committed config. A `ServerConfig` built programmatically has no config-file
+location; its relative roots are resolved against the process cwd when
+`serve`/`serve_with` starts.
+
+The empty default, `roots = []`, remains distinct: it selects the process cwd
+at startup. Absolute roots continue to work unchanged. A missing relative root
+is rejected as invalid configuration instead of reaching LSP initialization as
+an invalid `file://` URI.
+
 ### `workspace.position_encodings`
 
 **Type**: Array of strings

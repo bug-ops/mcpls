@@ -569,6 +569,11 @@ impl ServerConfig {
 
     /// Load configuration from a specific path.
     ///
+    /// Relative [`WorkspaceConfig::roots`] are resolved against the directory
+    /// containing `path`, then canonicalized. This keeps an explicitly named
+    /// config portable when mcpls is launched from a different working
+    /// directory.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file doesn't exist, exceeds the maximum
@@ -598,8 +603,31 @@ impl ServerConfig {
         let content = String::from_utf8(buf)
             .map_err(|e| Error::InvalidConfig(format!("config file is not valid UTF-8: {e}")))?;
 
-        let config: Self = toml::from_str(&content)?;
+        let mut config: Self = toml::from_str(&content)?;
         config.validate()?;
+
+        if !config.workspace.roots.is_empty() {
+            let absolute_config_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().map_err(Error::Io)?.join(path)
+            };
+            let config_dir = absolute_config_path.parent().ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "configuration path has no parent directory: {}",
+                    absolute_config_path.display()
+                ))
+            })?;
+            let config_dir = dunce::canonicalize(config_dir).map_err(|source| {
+                Error::InvalidConfig(format!(
+                    "configuration directory '{}' could not be canonicalized: {source}",
+                    config_dir.display()
+                ))
+            })?;
+            config.workspace.roots =
+                crate::resolve_workspace_roots(&config.workspace.roots, &config_dir)?;
+        }
+
         Ok(config)
     }
 
@@ -779,6 +807,10 @@ mod tests {
 
     use super::*;
 
+    fn toml_path_literal(path: &Path) -> String {
+        toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+    }
+
     #[test]
     fn test_default_config() {
         let config = ServerConfig::default();
@@ -802,28 +834,71 @@ mod tests {
     fn test_load_from_valid_toml() {
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("config.toml");
+        let workspace_root = tmp_dir.path().join("workspace");
+        fs::create_dir(&workspace_root).unwrap();
+        let workspace_root_literal = toml_path_literal(&workspace_root);
 
-        let toml_content = r#"
+        let toml_content = format!(
+            r#"
             [workspace]
-            roots = ["/tmp/workspace"]
+            roots = [{workspace_root_literal}]
             position_encodings = ["utf-8"]
 
             [[lsp_servers]]
             language_id = "rust"
             command = "rust-analyzer"
             timeout_seconds = 30
-        "#;
+        "#
+        );
 
-        fs::write(&config_path, toml_content).unwrap();
+        fs::write(&config_path, &toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
         assert_eq!(
             config.workspace.roots,
-            vec![PathBuf::from("/tmp/workspace")]
+            vec![dunce::canonicalize(workspace_root).unwrap()]
         );
         assert_eq!(config.workspace.position_encodings, vec!["utf-8"]);
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "rust");
+    }
+
+    #[test]
+    fn test_load_from_resolves_relative_roots_against_config_directory() {
+        let tmp_dir = TempDir::new().unwrap();
+        let project_root = dunce::canonicalize(tmp_dir.path()).unwrap();
+        let config_dir = project_root.join(".agents");
+        fs::create_dir(&config_dir).unwrap();
+        let config_path = config_dir.join("mcpls.toml");
+        fs::write(
+            &config_path,
+            r#"
+                [workspace]
+                roots = [".", ".."]
+            "#,
+        )
+        .unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+
+        assert_eq!(config.workspace.roots, vec![config_dir, project_root]);
+        assert!(config.workspace.roots.iter().all(|root| root.is_absolute()));
+    }
+
+    #[test]
+    fn test_load_from_rejects_nonexistent_relative_workspace_root() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("mcpls.toml");
+        fs::write(&config_path, "[workspace]\nroots = [\"missing\"]\n").unwrap();
+
+        let err = ServerConfig::load_from(&config_path).unwrap_err();
+
+        let Error::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(message.contains("workspace root 'missing'"));
+        let config_dir = dunce::canonicalize(tmp_dir.path()).unwrap();
+        assert!(message.contains(&config_dir.display().to_string()));
     }
 
     #[test]
@@ -1767,24 +1842,32 @@ mod tests {
     fn test_load_with_trust_loads_trusted_project_local_config() {
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
+        let custom_root = tmp_dir.path().join("custom");
+        fs::create_dir(&custom_root).unwrap();
+        let custom_root_literal = toml_path_literal(&custom_root);
 
-        let custom_toml = r#"
+        let custom_toml = format!(
+            r#"
             [workspace]
-            roots = ["/custom/path"]
+            roots = [{custom_root_literal}]
 
             [[lsp_servers]]
             language_id = "python"
             command = "pyright-langserver"
-        "#;
+        "#
+        );
 
-        fs::write(&config_path, custom_toml).unwrap();
+        fs::write(&config_path, &custom_toml).unwrap();
 
         let config = {
             let _guard = CwdGuard::enter(tmp_dir.path());
             ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap()
         };
 
-        assert_eq!(config.workspace.roots, vec![PathBuf::from("/custom/path")]);
+        assert_eq!(
+            config.workspace.roots,
+            vec![dunce::canonicalize(custom_root).unwrap()]
+        );
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "python");
     }

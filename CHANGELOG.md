@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`async-trait` direct dependency** — dropped from the workspace and `mcpls-core`; unused now that no trait in the crate needs it, remains available transitively through `rmcp`'s own optional dependency when its `--all-features` build enables it.
 
+### Fixed
+
+- **Explicit relative `workspace.roots` no longer fail LSP initialization with `Invalid workspace root`** — configured roots are now made absolute and canonical before `ServerInitConfig` is built, while the URI layer continues to reject any relative path that reaches it. Roots loaded from a TOML file resolve against that file's directory, making committed `--config`/`MCPLS_CONFIG` files independent of launcher cwd; relative roots on caller-built `ServerConfig`s resolve against process cwd. A missing relative root now fails early with a clear invalid-configuration error instead of becoming an invalid `file://` URI. Absolute roots and the empty-roots cwd fallback retain their existing behavior. (#345)
+
 ## [0.3.9] - 2026-08-05
 
 ### Added
