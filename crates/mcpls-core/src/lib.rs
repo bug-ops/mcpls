@@ -374,7 +374,7 @@ fn canonicalize_workspace_roots(roots: &[PathBuf], base_dir: &Path) -> Result<Ve
         .map(|root| {
             let is_relative = root.is_relative();
             let resolved = if is_relative {
-                base_dir.join(root)
+                join_relative_root(base_dir, root)
             } else {
                 root.clone()
             };
@@ -397,6 +397,40 @@ fn canonicalize_workspace_roots(roots: &[PathBuf], base_dir: &Path) -> Result<Ve
             }
         })
         .collect()
+}
+
+/// Join a relative `root` onto `base_dir`, correctly handling a root that
+/// [`Path::is_relative`] classifies `true` yet still carries a leading
+/// [`Component::Prefix`] and/or [`Component::RootDir`] -- on Windows,
+/// `is_absolute()` requires *both* a prefix and a root, so two distinct
+/// shapes are `is_relative() == true` despite being (partially) rooted:
+/// - no prefix, has root (e.g. `\workspace`) -- rooted on whichever drive is
+///   current.
+/// - has prefix, no root (e.g. `C:workspace`) -- drive-relative, resolved
+///   against that drive's own current directory.
+///
+/// Plain `base_dir.join(root)` would hit [`PathBuf::push`]'s documented
+/// special cases for both shapes, each discarding some or all of `base_dir`
+/// (e.g. `C:\proj\.agents`.join(`\workspace`) -> `C:\workspace`, and
+/// `C:\proj\.agents`.join(`C:workspace`) -> `C:workspace` -- `proj\.agents`
+/// is silently dropped either way). Skipping any leading `Prefix`/`RootDir`
+/// components before joining sidesteps both: only the ordinary relative tail
+/// (`Normal`/`CurDir`/`ParentDir` components) is ever appended to `base_dir`.
+/// For an already-ordinary relative root (the common case, no such leading
+/// components), this is equivalent to `base_dir.join(root)` up to a trailing
+/// separator (`.join` preserves one from a trailing empty/`CurDir`
+/// component; `.extend` does not -- immaterial after canonicalization, and
+/// the one case where it mattered, an empty root, is now rejected by
+/// `validate()`). Detected via `Component` iteration (not
+/// `#[cfg(windows)]`), so the logic itself is exercised by a unit test on
+/// any host -- see `#348`.
+fn join_relative_root(base_dir: &Path, root: &Path) -> PathBuf {
+    let mut joined = base_dir.to_path_buf();
+    joined.extend(
+        root.components()
+            .skip_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir)),
+    );
+    joined
 }
 
 /// Start the MCPLS server with the given configuration over stdio.
@@ -519,9 +553,21 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // TOML file have already had relative roots rebased to that file's
     // directory in `ServerConfig::load_from`; this second pass covers
     // caller-built `ServerConfig`s, whose relative roots are defined against
-    // the process cwd.
-    let workspace_base = std::env::current_dir().map_err(Error::Io)?;
-    let workspace_roots = resolve_workspace_roots(&config.workspace.roots, &workspace_base)?;
+    // the process cwd. Only actually called when a root needs it (empty
+    // `roots`, which defaults to cwd, or at least one relative root): a
+    // fully-absolute `workspace.roots` must not fail startup just because
+    // cwd happens to be unreadable/removed (#348).
+    let workspace_roots = if config.workspace.roots.is_empty()
+        || config.workspace.roots.iter().any(|root| root.is_relative())
+    {
+        let workspace_base = std::env::current_dir().map_err(Error::Io)?;
+        resolve_workspace_roots(&config.workspace.roots, &workspace_base)?
+    } else {
+        // Every root is absolute already, so `base_dir` is never joined
+        // against inside `canonicalize_workspace_roots` -- pass an
+        // arbitrary placeholder rather than paying for `current_dir()`.
+        canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
+    };
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
@@ -920,6 +966,83 @@ fn spawn_lsp_servers_background(
     })
 }
 
+/// Shared by any `#[cfg(test)]` module in this crate that needs to mutate
+/// the process-wide working directory (`std::env::set_current_dir`). Such
+/// tests must not run concurrently with each other or with any other test
+/// that relies on cwd -- nextest runs each test in its own process, so this
+/// only matters under a plain `cargo test`, but a single shared lock is what
+/// makes that true across every module's tests in this crate, not just
+/// within one module (#348).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that serializes CWD-mutating tests behind [`CWD_LOCK`] and
+    /// switches into `dir` for the guard's lifetime, restoring the original
+    /// working directory on drop — including on an early return or panic.
+    ///
+    /// `pub`, not `pub(crate)`: this module is itself private (unexported),
+    /// so `pub(crate)` on its items would be redundant -- see
+    /// `clippy::redundant_pub_crate`. Still only reachable crate-internally
+    /// via `crate::test_support::CwdGuard`, since the module isn't `pub`.
+    pub struct CwdGuard {
+        _lock: MutexGuard<'static, ()>,
+        original_dir: PathBuf,
+    }
+
+    impl CwdGuard {
+        pub fn enter(dir: &Path) -> Self {
+            let lock = CWD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            let original_dir = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self {
+                _lock: lock,
+                original_dir,
+            }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let restored = std::env::set_current_dir(&self.original_dir);
+            // A failure here during an already-unwinding panic must not
+            // panic again (double panic aborts the process, losing the
+            // original failure's message). On the normal path, though,
+            // silently swallowing this would leave the process cwd wrong
+            // for every subsequent test with no diagnostic — panic loudly
+            // instead, since that's exactly the failure mode this guard
+            // exists to prevent.
+            if !std::thread::panicking() {
+                #[allow(clippy::expect_used)]
+                restored.expect("CwdGuard failed to restore original working directory");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::CwdGuard;
+
+        #[test]
+        fn test_cwd_guard_restores_cwd_on_panic() {
+            let original_dir = std::env::current_dir().unwrap();
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = CwdGuard::enter(tmp_dir.path());
+                panic!("boom");
+            }));
+
+            assert!(result.is_err());
+            assert_eq!(std::env::current_dir().unwrap(), original_dir);
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1041,6 +1164,99 @@ mod tests {
         assert_eq!(result, vec![real_dir]);
     }
 
+    /// #348 case 3 (S2): direct, platform-independent test of
+    /// `join_relative_root`'s `Component`-stripping logic. The bug it fixes
+    /// (a root that's rooted-without-prefix, e.g. `\workspace`) only makes
+    /// `Path::is_relative()` return `true` on Windows, so the end-to-end
+    /// `#[cfg(windows)]` test below is the only one that reproduces the
+    /// actual failure through the public call path -- but the underlying
+    /// `Component` shape it strips (a leading `RootDir` with no preceding
+    /// `Prefix`) is reproducible on any OS by calling the helper directly,
+    /// bypassing the `is_relative()` gate that would otherwise route such
+    /// input elsewhere on non-Windows hosts.
+    #[test]
+    fn test_join_relative_root_strips_leading_root_and_prefix_components() {
+        let base = Path::new("/base/dir");
+
+        assert_eq!(
+            join_relative_root(base, Path::new("/workspace")),
+            PathBuf::from("/base/dir/workspace")
+        );
+        assert_eq!(
+            join_relative_root(base, Path::new("/workspace/sub")),
+            PathBuf::from("/base/dir/workspace/sub")
+        );
+        // An ordinary relative root (no leading `Prefix`/`RootDir`) is
+        // unaffected -- equivalent to a plain `base_dir.join(root)`.
+        assert_eq!(
+            join_relative_root(base, Path::new("workspace")),
+            PathBuf::from("/base/dir/workspace")
+        );
+        assert_eq!(
+            join_relative_root(base, Path::new("..")),
+            PathBuf::from("/base/dir/..")
+        );
+    }
+
+    /// #348 case 3: a configured root with no drive/UNC prefix (e.g.
+    /// `\workspace`) is `Path::is_relative() == true` on Windows despite
+    /// being rooted (`is_absolute()` requires a prefix there). Plain
+    /// `base_dir.join(root)` would hit `PathBuf::push`'s "root without
+    /// prefix" behavior and silently discard everything in `base_dir` past
+    /// its own prefix -- only reproducible on Windows, since elsewhere a
+    /// leading `/` either makes the root absolute (Unix) or isn't a
+    /// separator at all.
+    #[test]
+    #[cfg(windows)]
+    fn test_canonicalize_workspace_roots_windows_root_without_prefix() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let nested = base.join("workspace");
+        std::fs::create_dir(&nested).unwrap();
+
+        let root = PathBuf::from(r"\workspace");
+        assert!(root.is_relative());
+
+        let result = canonicalize_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
+        assert_eq!(result, vec![nested]);
+    }
+
+    /// #348 M2: a Windows drive-relative root (`C:workspace` -- a leading
+    /// `Component::Prefix` with no `RootDir`) is also `is_relative() ==
+    /// true`. Plain `base_dir.join(root)` would hit `PathBuf::push`'s
+    /// "has a prefix" special case and discard `base_dir` entirely instead
+    /// of joining under it -- the same class of failure as the
+    /// rooted-without-prefix case above, via a prefix instead of a root
+    /// separator. `join_relative_root` deliberately does not replicate
+    /// native Windows drive-relative resolution (which resolves against
+    /// that drive's own current directory); it joins under `base_dir`
+    /// instead, consistent with every other relative root.
+    #[test]
+    #[cfg(windows)]
+    fn test_canonicalize_workspace_roots_windows_drive_relative_root() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let nested = base.join("workspace");
+        std::fs::create_dir(&nested).unwrap();
+
+        // Built from `base`'s own drive prefix so the test doesn't depend on
+        // which drive CI happens to check the repo out onto.
+        let drive_prefix = base
+            .components()
+            .find_map(|c| match c {
+                Component::Prefix(p) => Some(p.as_os_str().to_owned()),
+                _ => None,
+            })
+            .expect("temp dir path should have a Windows drive prefix");
+        let mut root = drive_prefix;
+        root.push("workspace");
+        let root = PathBuf::from(root);
+        assert!(root.is_relative());
+
+        let result = canonicalize_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
+        assert_eq!(result, vec![nested]);
+    }
+
     #[test]
     fn test_resolve_workspace_roots_empty_config() {
         let cwd = std::env::current_dir().unwrap();
@@ -1143,6 +1359,23 @@ mod tests {
         assert_eq!(roots[0], absolute);
         assert_eq!(roots[1], base.join("relative/path"));
         assert!(roots.iter().all(|root| root.is_absolute()));
+    }
+
+    /// #348 case 1: `serve_with` skips `std::env::current_dir()` entirely
+    /// for a fully-absolute `workspace.roots`, passing an unused placeholder
+    /// base directory straight to `canonicalize_workspace_roots` instead of
+    /// `resolve_workspace_roots`. Confirms that placeholder is never
+    /// dereferenced when every root is already absolute.
+    #[test]
+    fn test_canonicalize_workspace_roots_ignores_base_dir_when_all_absolute() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+
+        let result =
+            canonicalize_workspace_roots(std::slice::from_ref(&root), Path::new("")).unwrap();
+        assert_eq!(result, vec![root]);
     }
 
     #[test]
@@ -1432,6 +1665,75 @@ mod tests {
                     !matches!(err, Error::NoServersAvailable(_)),
                     "serve() must not return NoServersAvailable for empty lsp_servers config"
                 );
+            }
+        }
+
+        /// #348 case 1 (tester-flagged coverage gap): proves `serve_with`
+        /// itself skips `current_dir()` for an all-absolute
+        /// `workspace.roots`, not just that `canonicalize_workspace_roots`
+        /// tolerates an unused base when called directly (see
+        /// `test_canonicalize_workspace_roots_ignores_base_dir_when_all_absolute`
+        /// in the outer `tests` module, which never exercises `serve_with`'s
+        /// branch selection and would still pass if that `if` were inverted
+        /// or deleted). Mutates the process cwd (chdir into a directory,
+        /// then remove it -- `current_dir()` reliably fails afterward on
+        /// Unix), so it uses the crate-shared `test_support::CwdGuard` --
+        /// the same lock/restore-on-drop `config::tests` uses -- rather than
+        /// a one-off guard, since both modules' tests mutate cwd and compile
+        /// into one binary. Unix-only since removing a directory that is
+        /// still a live process's cwd is a Windows-specific error case, not
+        /// the same reproducible `current_dir()` failure.
+        #[tokio::test]
+        #[cfg(unix)]
+        async fn test_serve_with_all_absolute_roots_skips_current_dir() {
+            use crate::config::WorkspaceConfig;
+            use crate::test_support::CwdGuard;
+
+            // Kept alive for the whole test so the configured workspace root
+            // stays a valid, existing absolute directory distinct from the
+            // cwd this test is about to remove.
+            let workspace_root_dir = tempfile::TempDir::new().unwrap();
+            let workspace_root = dunce::canonicalize(workspace_root_dir.path()).unwrap();
+
+            let doomed_cwd = tempfile::TempDir::new().unwrap();
+            let _guard = CwdGuard::enter(doomed_cwd.path());
+            doomed_cwd.close().unwrap();
+
+            let config = ServerConfig {
+                workspace: WorkspaceConfig {
+                    roots: vec![workspace_root],
+                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    language_extensions: vec![],
+                    heuristics_max_depth: 10,
+                    max_documents: DEFAULT_MAX_DOCUMENTS,
+                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                },
+                lsp_servers: vec![],
+                project_config_ignored: false,
+            };
+
+            // serve() with no LSP servers configured blocks on the stdio
+            // transport, same as `test_serve_starts_with_empty_config`;
+            // bound it so the test can't hang.
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(2), serve(config)).await;
+
+            match outcome {
+                // Still serving after the deadline => it did not fail fast. Good.
+                Err(_elapsed) => {}
+                // Transport closed cleanly. Also fine.
+                Ok(Ok(())) => {}
+                // It returned an error: it must not be the `current_dir()`
+                // failure this test set up (`ErrorKind::NotFound` from the
+                // removed cwd). Narrowed to that specific `io::ErrorKind`
+                // rather than any `Error::Io`, since the latter would also
+                // match an unrelated IO error from the stdio transport
+                // within the timeout window.
+                Ok(Err(err)) => assert!(
+                    !matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+                    "serve() must not need a working process cwd for an all-absolute \
+                     workspace.roots; got: {err:?}"
+                ),
             }
         }
 

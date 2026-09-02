@@ -435,6 +435,23 @@ pub enum ProjectConfigTrust {
 /// syscall.
 const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// What a relative [`WorkspaceConfig::roots`] entry resolves against, for
+/// [`ServerConfig::load_from_with_root_base`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelativeRootBase {
+    /// Resolve against the directory containing the loaded config file.
+    /// [`ServerConfig::load_from`]'s documented behavior, used for an
+    /// explicitly named config path (including a trusted project-local
+    /// `mcpls.toml` and `$MCPLS_CONFIG`) -- portable when mcpls is launched
+    /// from a different working directory than the config lives in.
+    ConfigDir,
+    /// Resolve against the process's current working directory. Used only
+    /// for the auto-discovered global/user config
+    /// (`~/.config/mcpls/mcpls.toml`), which is not tied to any particular
+    /// project (#348 case 2).
+    Cwd,
+}
+
 impl ServerConfig {
     /// Build the effective extension map used for language detection.
     ///
@@ -502,6 +519,14 @@ impl ServerConfig {
     /// `$MCPLS_CONFIG` and an explicit path are unaffected by `trust` and
     /// are always loaded: naming a path is itself the user's consent.
     ///
+    /// Unlike [`load_from`](Self::load_from)'s documented default (relative
+    /// [`WorkspaceConfig::roots`] resolved against the config file's own
+    /// directory), the global/user config tier
+    /// (`~/.config/mcpls/mcpls.toml`, or the platform equivalent) resolves
+    /// relative roots against the process's current working directory
+    /// instead -- it isn't tied to any particular project, so cwd is the
+    /// more intuitive base (#348).
+    ///
     /// # Errors
     ///
     /// Returns an error if parsing an existing config fails.
@@ -543,7 +568,16 @@ impl ServerConfig {
         if let Some(config_dir) = dirs::config_dir() {
             let user_config = config_dir.join("mcpls").join("mcpls.toml");
             if user_config.exists() {
-                let mut config = Self::load_from(&user_config)?;
+                // The auto-discovered global/user config is not tied to any
+                // particular project, so a relative `workspace.roots` entry
+                // is more intuitively resolved against the process cwd than
+                // against `~/.config/mcpls/` itself (matches pre-#345
+                // behavior; #348 case 2). This differs from `load_from`'s
+                // public default, which resolves against the directory of
+                // an explicitly named config file -- that behavior is kept
+                // unchanged for project-local `mcpls.toml` and `$MCPLS_CONFIG`.
+                let mut config =
+                    Self::load_from_with_root_base(&user_config, RelativeRootBase::Cwd)?;
                 config.project_config_ignored = project_config_ignored;
                 return Ok(config);
             }
@@ -579,6 +613,18 @@ impl ServerConfig {
     /// Returns an error if the file doesn't exist, exceeds the maximum
     /// allowed config file size, or parsing fails.
     pub fn load_from(path: &Path) -> Result<Self> {
+        Self::load_from_with_root_base(path, RelativeRootBase::ConfigDir)
+    }
+
+    /// Implements [`load_from`](Self::load_from), parameterized over what a
+    /// relative [`WorkspaceConfig::roots`] entry resolves against.
+    ///
+    /// [`load_with_trust`](Self::load_with_trust) uses
+    /// [`RelativeRootBase::Cwd`] for the auto-discovered global/user config
+    /// (#348 case 2); every other caller (including the public
+    /// [`load_from`](Self::load_from)) uses
+    /// [`RelativeRootBase::ConfigDir`], preserving #345's original behavior.
+    fn load_from_with_root_base(path: &Path, relative_root_base: RelativeRootBase) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::ConfigNotFound(path.to_path_buf())
@@ -607,25 +653,45 @@ impl ServerConfig {
         config.validate()?;
 
         if !config.workspace.roots.is_empty() {
-            let absolute_config_path = if path.is_absolute() {
-                path.to_path_buf()
+            config.workspace.roots = if config.workspace.roots.iter().any(|root| root.is_relative())
+            {
+                // A relative root needs an absolute base directory to
+                // resolve against -- compute `config_dir` (and, for `Cwd`,
+                // `current_dir()`) only in this branch: an all-absolute
+                // `workspace.roots` must not fail just because `path` needs
+                // `current_dir()` to become absolute, or because
+                // `config_dir` is unreadable/removed (#348 case 4; mirrors
+                // the analogous `serve_with` fix for case 1).
+                let absolute_config_path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir().map_err(Error::Io)?.join(path)
+                };
+                let config_dir = absolute_config_path.parent().ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "configuration path has no parent directory: {}",
+                        absolute_config_path.display()
+                    ))
+                })?;
+
+                let base_dir = match relative_root_base {
+                    RelativeRootBase::ConfigDir => {
+                        dunce::canonicalize(config_dir).map_err(|source| {
+                            Error::InvalidConfig(format!(
+                                "configuration directory '{}' could not be canonicalized: {source}",
+                                config_dir.display()
+                            ))
+                        })?
+                    }
+                    RelativeRootBase::Cwd => std::env::current_dir().map_err(Error::Io)?,
+                };
+                crate::resolve_workspace_roots(&config.workspace.roots, &base_dir)?
             } else {
-                std::env::current_dir().map_err(Error::Io)?.join(path)
+                // Every root is absolute already, so no base directory is
+                // ever joined against -- pass an arbitrary placeholder
+                // rather than computing one.
+                crate::canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
             };
-            let config_dir = absolute_config_path.parent().ok_or_else(|| {
-                Error::InvalidConfig(format!(
-                    "configuration path has no parent directory: {}",
-                    absolute_config_path.display()
-                ))
-            })?;
-            let config_dir = dunce::canonicalize(config_dir).map_err(|source| {
-                Error::InvalidConfig(format!(
-                    "configuration directory '{}' could not be canonicalized: {source}",
-                    config_dir.display()
-                ))
-            })?;
-            config.workspace.roots =
-                crate::resolve_workspace_roots(&config.workspace.roots, &config_dir)?;
         }
 
         Ok(config)
@@ -696,6 +762,21 @@ impl ServerConfig {
                      \"utf-8\", \"utf-16\", \"utf-32\""
                 )));
             }
+        }
+        // `Path::is_relative()` is `true` for an empty path, and joining it
+        // onto a base directory silently yields that base directory
+        // unchanged rather than the empty string the user presumably meant
+        // to be an accident -- reject it explicitly instead of letting it
+        // pass through workspace-root resolution unnoticed (#348 M4).
+        if self
+            .workspace
+            .roots
+            .iter()
+            .any(|root| root.as_os_str().is_empty())
+        {
+            return Err(Error::InvalidConfig(
+                "workspace.roots entries cannot be empty".to_string(),
+            ));
         }
 
         let mut seen_names: HashMap<&str, &str> = HashMap::new();
@@ -883,6 +964,35 @@ mod tests {
 
         assert_eq!(config.workspace.roots, vec![config_dir, project_root]);
         assert!(config.workspace.roots.iter().all(|root| root.is_absolute()));
+    }
+
+    /// #348 case 2: unlike `load_from`'s `ConfigDir` default (see
+    /// `test_load_from_resolves_relative_roots_against_config_directory`
+    /// above), `load_with_trust`'s auto-discovered global/user config uses
+    /// `RelativeRootBase::Cwd` so a relative root resolves against the
+    /// process cwd instead of `~/.config/mcpls/`. Exercises the private
+    /// `load_from_with_root_base` helper directly, since the global config
+    /// path itself lives under `dirs::config_dir()`, which tests cannot
+    /// override without mutating process-wide env state (denied by this
+    /// crate's `unsafe_code` lint).
+    #[test]
+    fn test_load_from_with_root_base_cwd_resolves_relative_roots_against_cwd() {
+        let config_tmp_dir = TempDir::new().unwrap();
+        let config_dir = dunce::canonicalize(config_tmp_dir.path()).unwrap();
+        let config_path = config_dir.join("mcpls.toml");
+        fs::write(&config_path, "[workspace]\nroots = [\"relative-root\"]\n").unwrap();
+
+        let cwd_tmp_dir = TempDir::new().unwrap();
+        let cwd = dunce::canonicalize(cwd_tmp_dir.path()).unwrap();
+        let expected_root = cwd.join("relative-root");
+        fs::create_dir(&expected_root).unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(&cwd);
+            ServerConfig::load_from_with_root_base(&config_path, RelativeRootBase::Cwd).unwrap()
+        };
+
+        assert_eq!(config.workspace.roots, vec![expected_root]);
     }
 
     #[test]
@@ -1282,6 +1392,30 @@ mod tests {
         let result = ServerConfig::load_from(&config_path);
         if let Err(Error::InvalidConfig(msg)) = result {
             assert_eq!(msg, "workspace.position_encodings cannot be empty");
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    /// #348 M4: `roots = [""]` previously reached workspace-root resolution
+    /// (an empty path is `is_relative() == true`) and silently resolved to
+    /// `base_dir` unchanged -- almost certainly not what an empty string in
+    /// config was meant to express. `validate()` now rejects it outright.
+    #[test]
+    fn test_validate_rejects_empty_workspace_root_entry() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [workspace]
+            roots = [""]
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert_eq!(msg, "workspace.roots entries cannot be empty");
         } else {
             panic!("Expected InvalidConfig error, got {result:?}");
         }
@@ -1708,67 +1842,13 @@ mod tests {
     }
 
     // These tests mutate the process-wide CWD via `set_current_dir`, so they
-    // must not run concurrently with each other or with any other test that
-    // relies on CWD (e.g. via a bare `load()`/`load_with_trust()` call).
-    // Nextest runs each test in its own process, but `cargo test` in-process
-    // would race; guard with a mutex. `CwdGuard` below additionally restores
-    // the original directory on drop, so a panic mid-test (e.g. a failed
-    // `assert_eq!` between the temp-dir switch and the manual restore) can
-    // never leave the process cwd changed for the rest of the run.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard that serializes CWD-mutating tests behind [`CWD_LOCK`] and
-    /// switches into `dir` for the guard's lifetime, restoring the original
-    /// working directory on drop — including on an early return or panic.
-    struct CwdGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        original_dir: PathBuf,
-    }
-
-    impl CwdGuard {
-        fn enter(dir: &Path) -> Self {
-            let lock = CWD_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let original_dir = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
-            Self {
-                _lock: lock,
-                original_dir,
-            }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let restored = std::env::set_current_dir(&self.original_dir);
-            // A failure here during an already-unwinding panic must not
-            // panic again (double panic aborts the process, losing the
-            // original failure's message). On the normal path, though,
-            // silently swallowing this would leave the process cwd wrong
-            // for every subsequent test with no diagnostic — panic loudly
-            // instead, since that's exactly the failure mode this guard
-            // exists to prevent.
-            if !std::thread::panicking() {
-                #[allow(clippy::expect_used)]
-                restored.expect("CwdGuard failed to restore original working directory");
-            }
-        }
-    }
-
-    #[test]
-    fn test_cwd_guard_restores_cwd_on_panic() {
-        let original_dir = std::env::current_dir().unwrap();
-        let tmp_dir = TempDir::new().unwrap();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = CwdGuard::enter(tmp_dir.path());
-            panic!("boom");
-        }));
-
-        assert!(result.is_err());
-        assert_eq!(std::env::current_dir().unwrap(), original_dir);
-    }
+    // use the crate-shared `CwdGuard` (see `crate::test_support`) rather
+    // than a module-local guard: `lib.rs`'s own tests mutate cwd too, and
+    // both modules' tests compile into the same binary, so a lock scoped to
+    // just this module would not prevent a cross-module race under a plain
+    // `cargo test` (nextest runs each test in its own process, so this only
+    // matters there).
+    use crate::test_support::CwdGuard;
 
     /// Precondition for tests that assert on `ServerConfig::load_with_trust`'s
     /// CWD-local-file branch: a `$MCPLS_CONFIG` set in the ambient

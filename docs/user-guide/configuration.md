@@ -98,23 +98,41 @@ roots = [
 roots = []
 ```
 
-When a configuration file is loaded, each relative root is resolved against
-the directory containing that TOML file, not against mcpls's process working
-directory. The resolved path must exist and is canonicalized before any LSP
-server is initialized. For example, a repository-owned config at
-`<repo>/.agents/mcpls.toml` can target the repository root portably with:
+Where a relative root resolves against depends on which config file it comes
+from:
 
-```toml
-[workspace]
-roots = [".."]
-```
+- **An explicitly named config file** -- a project-local `mcpls.toml`, or a
+  config named via `--config`/`$MCPLS_CONFIG` -- resolves each relative root
+  against the directory containing that TOML file, not against mcpls's
+  process working directory. For example, a repository-owned config at
+  `<repo>/.agents/mcpls.toml` can target the repository root portably with:
 
-In that same file, `roots = ["."]` selects `<repo>/.agents`. This behavior
-applies to explicit `--config` and `$MCPLS_CONFIG` paths as well as other
-file-loading modes, so launcher cwd differences do not change the meaning of
-a committed config. A `ServerConfig` built programmatically has no config-file
-location; its relative roots are resolved against the process cwd when
-`serve`/`serve_with` starts.
+  ```toml
+  [workspace]
+  roots = [".."]
+  ```
+
+  In that same file, `roots = ["."]` selects `<repo>/.agents`. This keeps a
+  committed config's meaning stable regardless of launcher cwd.
+- **The auto-discovered global/user config**
+  (`~/.config/mcpls/mcpls.toml`, or the platform equivalent), loaded only
+  when no project-local or explicitly named config applies, resolves each
+  relative root against the process working directory instead. It isn't
+  tied to any particular project, so a relative root there is more
+  intuitively read as "relative to wherever mcpls was launched."
+
+The resolved path must exist and is canonicalized before any LSP server is
+initialized. A `ServerConfig` built programmatically has no config-file
+location either; its relative roots are likewise resolved against the
+process cwd when `serve`/`serve_with` starts.
+
+On Windows, a `workspace.roots` entry that is rooted-without-a-drive (e.g.
+`\workspace`) or drive-relative (e.g. `C:workspace`) is joined under the base
+directory above, the same as any other relative root -- this deliberately
+does not replicate native Windows path semantics (where those forms resolve
+against the current drive's root or that drive's own current directory,
+respectively). This differs from `--config`/`$MCPLS_CONFIG` itself, whose
+path is still resolved with native semantics.
 
 The empty default, `roots = []`, remains distinct: it selects the process cwd
 at startup. Absolute roots continue to work unchanged. A missing relative root
