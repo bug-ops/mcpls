@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Repeat `SIGTERM`/`SIGINT` during shutdown cleanup can now force-quit a stuck cleanup** — previously, a signal arriving while `shutdown()` was mid `shutdown_servers`/LSP-init cleanup had no listener to catch it and was silently discarded, making that window uninterruptible short of `SIGKILL`. `shutdown()` now re-registers its own signal handler for the duration of cleanup, so a repeat signal there triggers an immediate exit.
+- **Repeat `SIGTERM`/`SIGINT` during shutdown cleanup can now force-quit a stuck cleanup** — previously, a signal arriving while `shutdown()` was mid `shutdown_servers`/LSP-init cleanup had no listener to catch it and was silently discarded, making that window uninterruptible short of `SIGKILL`. `shutdown()` now re-registers its own signal handler for the duration of cleanup, so a repeat signal there triggers an immediate exit. (#350)
 - **Explicit relative `workspace.roots` no longer fail LSP initialization with `Invalid workspace root`** — configured roots are now made absolute and canonical before `ServerInitConfig` is built, while the URI layer continues to reject any relative path that reaches it. Roots loaded from a TOML file resolve against that file's directory, making committed `--config`/`MCPLS_CONFIG` files independent of launcher cwd; relative roots on caller-built `ServerConfig`s resolve against process cwd. A missing relative root now fails early with a clear invalid-configuration error instead of becoming an invalid `file://` URI. Absolute roots and the empty-roots cwd fallback retain their existing behavior. (#345)
 
 ## [0.3.9] - 2026-08-05
