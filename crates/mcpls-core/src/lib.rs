@@ -701,6 +701,30 @@ async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
     }
 }
 
+/// Aborts the wrapped [`JoinHandle`] when dropped, including on an unwind out
+/// of the enclosing scope — unlike a bare `.abort()` call placed at the end
+/// of a function body, which is skipped if that scope is left early (a
+/// panic, or a future `?` added above it).
+struct AbortOnDrop<'a, T>(&'a JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<'_, T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Whether a shutdown signal caught during [`shutdown`]'s cleanup window
+/// should force an immediate `std::process::exit`, given how many such
+/// signals (including this one) have been received so far.
+///
+/// Extracted as a pure function, rather than inlined into the loop that
+/// calls it, so the threshold is unit-testable without actually invoking
+/// `std::process::exit` — which would tear down the test process itself
+/// under `cargo nextest` before any assertion could run.
+const fn should_escalate(repeat_signals: u32) -> bool {
+    repeat_signals >= 1
+}
+
 /// Post-transport shutdown sequence, run once the transport future
 /// (`run_stdio`/`run_http`) returns — whether that's because of a
 /// `SIGTERM`/`SIGINT`, stdio EOF, or (for HTTP) its own graceful shutdown.
@@ -714,12 +738,70 @@ async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
 /// finish draining before `serve_with` returns. Extracted from
 /// [`serve_with`] so this sequence is exercised directly in tests without
 /// needing a full stdio/HTTP transport round trip.
+///
+/// # Signal handling during cleanup (#329)
+///
+/// The OS-level `SIGTERM`/`SIGINT` handler installed by [`ShutdownSignal::new`]
+/// stays installed for the rest of the process's life once registered —
+/// `tokio::signal` never uninstalls it, regardless of how many [`ShutdownSignal`]
+/// values are constructed or dropped. So dropping the instance built in
+/// `serve_with` and moved into `run_stdio`/`run_http` (which happens as soon
+/// as that transport function returns, right before this function runs)
+/// does *not* reopen a window where a repeat signal could hit the OS's
+/// default disposition. What it does instead: with no live [`ShutdownSignal`]
+/// subscribed, a signal delivered during `shutdown_servers`/
+/// `await_lsp_init_handle` (bounded by [`Translator::shutdown_servers`]'s own
+/// per-server timeout and [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst
+/// case) is recorded and then silently discarded — there is no receiver to
+/// broadcast it to. Before this fix, that made cleanup **uninterruptible**:
+/// an operator's repeat `Ctrl-C`/`SIGTERM` during that window was a no-op
+/// short of `SIGKILL`.
+///
+/// This function re-registers a fresh `ShutdownSignal` first thing to give
+/// cleanup a listener again, restoring the ability to force-quit a stuck
+/// cleanup on request. A brief gap remains between the old registration's
+/// last live receiver dropping and this one subscribing, in which a signal
+/// can still be discarded the same way as before the fix — see the
+/// escalation behavior below for how that's bounded.
+///
+/// A signal caught here means "the operator wants out": the first one during
+/// cleanup ([`should_escalate`]) is logged and forces an immediate
+/// `std::process::exit(1)`, since the graceful default (waiting out
+/// `shutdown_servers`'s bounded timeouts) already had its chance before the
+/// operator intervened. This is deliberately not lenient — because a signal
+/// in the re-registration gap above is silently dropped rather than
+/// counted, requiring a second repeat before acting would let an unlucky
+/// operator's second press go unnoticed too. `exit(1)` skips unwinding, so
+/// it forfeits `Drop` (`kill_on_drop` on any still-running LSP child)
+/// exactly like the pre-existing panic/abort gap documented on
+/// [`Translator::shutdown_servers`]'s "Limitations" section — an explicit
+/// trade the operator is asking for, not a case this fix silently
+/// regresses.
 async fn shutdown(
     cancel_tx: &tokio::sync::watch::Sender<bool>,
     translator: &Translator,
     lsp_init_handle: Option<JoinHandle<()>>,
 ) {
     let _ = cancel_tx.send(true);
+
+    let mut cleanup_signal = ShutdownSignal::new();
+    let force_exit_on_signal = tokio::spawn(async move {
+        let mut repeat_signals = 0u32;
+        loop {
+            cleanup_signal.recv().await;
+            repeat_signals += 1;
+            if should_escalate(repeat_signals) {
+                error!("shutdown signal received during cleanup, forcing immediate exit");
+                std::process::exit(1);
+            }
+        }
+    });
+    // Aborts `force_exit_on_signal` on every exit from this scope, including
+    // an unwind out of `shutdown_servers().await` below (debug builds only;
+    // release uses `panic = "abort"`) — otherwise that path would merely
+    // detach the task instead of stopping it, unlike the equivalent
+    // abort-on-timeout handling in `await_lsp_init_handle`.
+    let _abort_force_exit_on_signal = AbortOnDrop(&force_exit_on_signal);
 
     info!("Shutting down LSP servers...");
     translator.shutdown_servers().await;

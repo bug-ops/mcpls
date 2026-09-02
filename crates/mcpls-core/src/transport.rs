@@ -180,6 +180,19 @@ use rmcp::transport::streamable_http_server::session::{
 /// across the gap between construction in `serve_with` and the first await
 /// inside the transport — a fresh registration per call would risk losing a
 /// signal delivered in between.
+///
+/// This instance is dropped as soon as the transport function it was moved
+/// into returns — but that does *not* deregister the OS-level handler:
+/// `tokio::signal` installs it once per process and never uninstalls it, no
+/// matter how many `ShutdownSignal`s are constructed or dropped. What
+/// dropping the last live instance actually does is remove the only
+/// receiver a delivered signal could be broadcast to, so until a new one
+/// subscribes, a signal is recorded and then silently discarded rather than
+/// observed by anything — making that stretch of code uninterruptible
+/// rather than unsafe. [`crate::shutdown`] (the post-transport cleanup run
+/// immediately after) registers a *second* `ShutdownSignal` of its own so a
+/// repeat signal during cleanup has a receiver again and can force an exit;
+/// see #329.
 pub(crate) struct ShutdownSignal {
     #[cfg(unix)]
     sigterm: Option<tokio::signal::unix::Signal>,
@@ -287,7 +300,11 @@ impl ShutdownSignal {
 /// the stdio transport closes (client disconnect / stdin EOF) or a `SIGTERM`/
 /// `SIGINT` is received, so callers can run orderly cleanup — such as
 /// [`crate::bridge::Translator::shutdown_servers`] — before the process
-/// exits.
+/// exits. `shutdown_signal` is dropped when this function returns, and this
+/// function does no draining of its own after a signal arrives — so a
+/// repeat signal during the post-return cleanup in [`crate::shutdown`] is
+/// caught only by the second `ShutdownSignal` that function registers for
+/// itself, not by this one (see [`ShutdownSignal`]'s docs and #329).
 ///
 /// `shutdown_signal` is constructed by [`crate::serve_with`] *before* any
 /// startup work runs (see [`ShutdownSignal`]'s docs) and is raced here
@@ -368,6 +385,15 @@ pub(crate) async fn run_stdio(
 /// startup work runs (see [`ShutdownSignal`]'s docs), so its registration
 /// predates this function's own `TcpListener::bind` call — a signal between
 /// bind and the graceful-shutdown future's first poll is still caught.
+/// `shutdown_signal` is moved into (and dropped by) the
+/// `with_graceful_shutdown` closure below once it resolves — i.e. as soon as
+/// the *first* signal is received, well before this function returns — so
+/// there is no listener at all for a repeat signal arriving during the
+/// connection-drain wait that follows (bounded by
+/// [`HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`]). [`crate::shutdown`]'s own
+/// registration only takes effect once *this* function returns, so it
+/// covers the post-transport cleanup window, not the drain wait inside this
+/// one; see #329 and the TODO on the closure below for that gap.
 #[cfg(feature = "transport-http")]
 // `session_manager` and `service` are moved into `app`, which is served until
 // shutdown — clippy's drop-tightening heuristic misreads that as an
@@ -425,6 +451,13 @@ pub(crate) async fn run_http(
     // (below). Cloned first so the force-timeout branch can observe that
     // same moment independently of the `with_graceful_shutdown` closure,
     // which consumes its own clone.
+    // TODO(#349): `shutdown_signal` is dropped
+    // once this closure resolves, leaving the connection-drain wait below
+    // (up to `HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`) with no signal listener at
+    // all -- a repeat signal there is silently discarded the same way a
+    // repeat signal during post-transport cleanup used to be, before this
+    // fix added one there. Not addressed here; this fix only covers the
+    // window after `run_http` returns.
     let cancel_for_force_timeout = cancel.clone();
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown_signal.recv().await;
@@ -674,6 +707,54 @@ mod tests {
     fn test_transport_stdio_variant() {
         let t = super::Transport::Stdio;
         assert!(matches!(t, super::Transport::Stdio));
+    }
+
+    /// #329 regression: `crate::shutdown`'s cleanup-window fix hinges on a
+    /// freshly constructed `ShutdownSignal` still receiving real OS signals
+    /// after an *earlier* `ShutdownSignal` (e.g. the one `run_stdio`/
+    /// `run_http` held) has already been dropped — proving there is no
+    /// window in which the OS handler itself gets deregistered (per
+    /// `ShutdownSignal`'s corrected struct doc: `tokio::signal` never
+    /// uninstalls it, regardless of how many instances are constructed or
+    /// dropped). Exercises this with a real self-sent `SIGTERM` via the
+    /// external `kill` binary rather than mocking `ShutdownSignal`, since
+    /// that's the exact mechanism `crate::shutdown`'s force-exit task relies
+    /// on. Safe under `cargo nextest`'s one-process-per-test model, so no
+    /// other test's signal disposition is affected.
+    ///
+    /// Deliberately does not go through `crate::shutdown` itself: a signal
+    /// caught there unconditionally calls `std::process::exit(1)`, which
+    /// would kill this test's own process for real rather than fail an
+    /// assertion — see the #329 regression-test handoff for why a test
+    /// triggering `std::process::exit(1)` isn't attempted here.
+    #[tokio::test]
+    async fn test_fresh_shutdown_signal_still_receives_sigterm_after_prior_instance_dropped() {
+        let earlier = super::ShutdownSignal::new();
+        drop(earlier);
+
+        let mut cleanup_signal = super::ShutdownSignal::new();
+
+        let pid = std::process::id();
+        let signal_sender = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let status = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status()
+                .unwrap();
+            assert!(status.success(), "`kill -TERM {pid}` must succeed");
+        });
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), cleanup_signal.recv()).await;
+        signal_sender.await.unwrap();
+
+        assert!(
+            result.is_ok(),
+            "a freshly constructed ShutdownSignal must still receive a real SIGTERM sent after \
+             an earlier instance was dropped — this is the exact mechanism crate::shutdown's \
+             cleanup-window force-exit task depends on"
+        );
     }
 
     /// #241: `run_stdio` must not hang when the transport never even
