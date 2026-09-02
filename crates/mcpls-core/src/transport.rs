@@ -727,6 +727,11 @@ mod tests {
     /// would kill this test's own process for real rather than fail an
     /// assertion — see the #329 regression-test handoff for why a test
     /// triggering `std::process::exit(1)` isn't attempted here.
+    ///
+    /// Unix-only: `SIGTERM` and the external `kill` binary this test relies
+    /// on don't exist on Windows, where `ShutdownSignal` listens for
+    /// Ctrl-C instead (see the struct's `#[cfg(windows)]` arm above).
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_fresh_shutdown_signal_still_receives_sigterm_after_prior_instance_dropped() {
         let earlier = super::ShutdownSignal::new();
