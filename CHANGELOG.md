@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added end-to-end and TOML parse-error test coverage for `workspace.max_documents`/`max_file_size` resource-limit config. (#325)
+
 ### Changed
 
 - Relocated the SDD spec package from `.local/specs/` to repo-root `specs/`, reorganized into functional blocks (config/lsp/mcp/bridge/runtime/testing) with block-scoped numbering, and added retroactive specs for previously undocumented core subsystems (position encoding, config discovery, LSP lifecycle, document tracker sync, MCP tool routing). (#368)

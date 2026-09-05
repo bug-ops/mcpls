@@ -2295,6 +2295,64 @@ mod tests {
         assert_eq!(config.workspace.resource_limits().max_file_size, 0);
     }
 
+    /// #325: `max_documents` is `usize`, so a negative TOML integer must fail
+    /// `toml::from_str` deserialization cleanly (`Err`), not panic.
+    #[test]
+    fn test_max_documents_rejects_negative_value() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("negative_max_documents.toml");
+
+        let toml_content = r"
+            [workspace]
+            max_documents = -1
+        ";
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        // Asserting on the message text (not just the `TomlDe` variant) rules
+        // out passing for the wrong reason -- `WorkspaceConfig` also has
+        // `#[serde(deny_unknown_fields)]`, which produces the same variant
+        // for an unrelated typo'd field name.
+        if let Err(Error::TomlDe(e)) = &result {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("-1") && msg.contains("usize"),
+                "expected a type-mismatch message naming the offending value and the \
+                 expected type, got: {msg}"
+            );
+        } else {
+            panic!("Expected Err(Error::TomlDe(_)), got {result:?}");
+        }
+    }
+
+    /// #325: `max_file_size` is `u64`, so a string value must fail
+    /// `toml::from_str` deserialization cleanly (`Err`), not panic.
+    #[test]
+    fn test_max_file_size_rejects_string_value() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("string_max_file_size.toml");
+
+        let toml_content = r#"
+            [workspace]
+            max_file_size = "10MB"
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::TomlDe(e)) = &result {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("10MB") && msg.contains("u64"),
+                "expected a type-mismatch message naming the offending value and the \
+                 expected type, got: {msg}"
+            );
+        } else {
+            panic!("Expected Err(Error::TomlDe(_)), got {result:?}");
+        }
+    }
+
     #[test]
     fn test_workspace_config_resource_limits_maps_fields() {
         let workspace = WorkspaceConfig {
