@@ -20,7 +20,8 @@ use mcpls_core::lsp::{LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use crate::common::test_utils::{rust_analyzer_available, rust_workspace_path};
+use crate::common::test_utils::rust_workspace_path;
+use crate::skip_if_no_rust_analyzer;
 
 static INIT_TRACING: Once = Once::new();
 
@@ -152,10 +153,7 @@ async fn wait_for_indexing_ready(
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_hover_on_std_vec() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -200,10 +198,7 @@ async fn test_hover_on_std_vec() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_hover_on_u64_type() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -243,10 +238,7 @@ async fn test_hover_on_u64_type() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_definition_user_struct() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -290,10 +282,7 @@ async fn test_definition_user_struct() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_definition_across_files() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -333,10 +322,7 @@ async fn test_definition_across_files() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_references_create_repo_function() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -379,10 +365,7 @@ async fn test_references_create_repo_function() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_references_user_struct() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -422,10 +405,7 @@ async fn test_references_user_struct() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_diagnostics_with_error() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -475,10 +455,7 @@ async fn test_diagnostics_with_error() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_diagnostics_no_errors() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -521,10 +498,7 @@ async fn test_diagnostics_no_errors() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_document_symbols() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -578,10 +552,7 @@ async fn test_document_symbols() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_document_symbols_types_file() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -624,10 +595,7 @@ async fn test_document_symbols_types_file() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_completions_basic() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -670,10 +638,7 @@ async fn test_completions_basic() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_format_document() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -713,10 +678,7 @@ async fn test_format_document() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_timeout_handling() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -742,10 +704,7 @@ async fn test_timeout_handling() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_invalid_file_path() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
 
@@ -769,10 +728,7 @@ async fn test_invalid_file_path() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_out_of_bounds_position() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
@@ -806,10 +762,7 @@ async fn test_out_of_bounds_position() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_workspace_symbol_search_basic() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
 
@@ -852,10 +805,7 @@ async fn test_workspace_symbol_search_basic() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_workspace_symbol_search_with_kind_filter() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
 
@@ -891,10 +841,7 @@ async fn test_workspace_symbol_search_with_kind_filter() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_workspace_symbol_search_max_results() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
 
@@ -925,10 +872,7 @@ async fn test_workspace_symbol_search_max_results() {
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_workspace_symbol_search_function() {
-    if !rust_analyzer_available() {
-        eprintln!("Skipping: rust-analyzer not available");
-        return;
-    }
+    skip_if_no_rust_analyzer!();
 
     let translator = setup_rust_analyzer().await;
 

@@ -5,8 +5,10 @@
 
 use anyhow::Result;
 use serde_json::json;
+use tempfile::TempDir;
 
 use super::mcp_client::McpClient;
+use crate::common::test_utils::{rust_analyzer_available, rust_workspace_path};
 
 /// Test the MCP initialize handshake.
 ///
@@ -267,8 +269,6 @@ fn test_e2e_tool_call_invalid_file() -> Result<()> {
 fn test_e2e_tool_call_invalid_position() -> Result<()> {
     use std::fs;
 
-    use tempfile::TempDir;
-
     let mut client = McpClient::spawn()?;
     client.initialize()?;
 
@@ -489,4 +489,187 @@ fn test_e2e_sigterm_exits_promptly_during_handshake_wait() -> Result<()> {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+// ---------------------------------------------------------------------------
+// #325: workspace resource-limit config, enforced through the real
+// `serve()`/`serve_with()` startup path.
+// ---------------------------------------------------------------------------
+
+/// Spawns the real `mcpls` binary against a config naming a real
+/// rust-analyzer server for `tests/fixtures/rust_workspace`, with
+/// `[workspace]` extended by `extra_workspace_toml` (e.g. `max_documents = 3`).
+///
+/// This is what makes the resulting tests exercise the actual wiring in
+/// `crates/mcpls-core/src/lib.rs`'s `serve_with` (`ServerConfig::load_from`
+/// -> `WorkspaceConfig::resource_limits()` -> `Translator::with_resource_limits`)
+/// rather than a hand-copied reconstruction of it. The returned `TempDir`
+/// must be kept alive for as long as `McpClient`; it's only needed at
+/// startup (the config file is read once), but dropping it early is
+/// needless risk for no benefit.
+fn spawn_mcpls_with_workspace_config(extra_workspace_toml: &str) -> Result<(TempDir, McpClient)> {
+    let workspace_path = rust_workspace_path();
+    let config_dir = TempDir::new()?;
+    let config_path = config_dir.path().join("mcpls.toml");
+    let toml_content = format!(
+        r#"
+        [workspace]
+        roots = ["{}"]
+        {extra_workspace_toml}
+
+        [[lsp_servers]]
+        language_id = "rust"
+        command = "rust-analyzer"
+        args = []
+        file_patterns = ["**/*.rs"]
+        "#,
+        workspace_path.to_string_lossy().replace('\\', "\\\\")
+    );
+    std::fs::write(&config_path, toml_content)?;
+
+    let mut client = McpClient::spawn_with_args(&[
+        "--config",
+        config_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?,
+    ])?;
+    client.initialize()?;
+
+    Ok((config_dir, client))
+}
+
+fn hover_args(path: &std::path::Path) -> serde_json::Value {
+    json!({
+        "file_path": path.to_string_lossy(),
+        "line": 1,
+        "character": 1,
+    })
+}
+
+/// Calls `get_hover` on `path`, retrying while the error is
+/// `Error::ServerInitializing`/`WorkspaceServersInitializing` (message
+/// contains "initializing") -- the transient state before rust-analyzer's
+/// background `initialize` handshake (`spawn_lsp_servers_background` in
+/// `lib.rs`) has completed and it registers with the translator. This is the
+/// only rust-analyzer-readiness state that can affect the calls below:
+/// opening a document happens in `prepare_gated_document` *before* the
+/// capability-gated LSP round trip (`bridge/translator/routing.rs`), so
+/// whether rust-analyzer has finished *indexing* the workspace never affects
+/// whether a document is counted against `max_documents`/`max_file_size`.
+fn call_hover_past_server_init(
+    client: &mut McpClient,
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value> {
+    loop {
+        match client.call_tool("get_hover", &hover_args(path)) {
+            Err(e) if e.to_string().contains("initializing") => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rust-analyzer never finished initializing: {e}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// #325: end-to-end proof that `workspace.max_documents`, set in a real
+/// `mcpls.toml`, is enforced by `DocumentTracker` through the actual
+/// `serve()`/`serve_with()` startup path (`main` -> `serve` -> `serve_with`
+/// -> `Translator::with_resource_limits`), not an in-process reconstruction
+/// of that wiring.
+///
+/// `DocumentTracker::open` rejects (returns `Err(DocumentLimitExceeded)`)
+/// rather than evicting the oldest document once the limit is reached (see
+/// `crates/mcpls-core/src/bridge/state.rs`), so this asserts rejection, not
+/// eviction: the in-limit calls must not fail with that specific error, and
+/// the over-limit call must.
+#[test]
+#[ignore = "Requires mcpls binary built and rust-analyzer installed"]
+fn test_e2e_max_documents_config_enforced() -> Result<()> {
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return Ok(());
+    }
+
+    let max_documents = 3;
+    let workspace_path = rust_workspace_path();
+    let (_config_dir, mut client) =
+        spawn_mcpls_with_workspace_config(&format!("max_documents = {max_documents}"))?;
+
+    // More real, distinct files than the configured limit, so opening them
+    // one by one crosses the boundary set in TOML.
+    let files = [
+        workspace_path.join("src/lib.rs"),
+        workspace_path.join("src/types.rs"),
+        workspace_path.join("src/functions.rs"),
+        workspace_path.join("extras/untouched.rs"),
+    ];
+    assert!(
+        files.len() > max_documents,
+        "fixture must provide more files than the configured limit to exercise the (N+1)th open"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for (i, path) in files[..max_documents].iter().enumerate() {
+        let result = call_hover_past_server_init(&mut client, path, deadline);
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("document limit exceeded"),
+                "opening document {} of {max_documents} (within the configured limit) must \
+                 not hit the limit: {e}",
+                i + 1
+            );
+        }
+    }
+
+    let over_limit_path = &files[max_documents];
+    let result = call_hover_past_server_init(&mut client, over_limit_path, deadline);
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("document limit exceeded"),
+            "expected a DocumentLimitExceeded error (per DocumentTracker::open's actual \
+             reject-not-evict behavior), got: {e}"
+        ),
+        Ok(_) => panic!(
+            "opening the (N+1)th distinct document must be rejected once \
+             workspace.max_documents is reached"
+        ),
+    }
+
+    Ok(())
+}
+
+/// #325: end-to-end proof that `workspace.max_file_size`, set in a real
+/// `mcpls.toml`, is enforced by `DocumentTracker` through the real
+/// `serve()`/`serve_with()` startup path. Companion to
+/// `test_e2e_max_documents_config_enforced`, covering the other
+/// `[workspace]` resource-limit field #325 asked for.
+#[test]
+#[ignore = "Requires mcpls binary built and rust-analyzer installed"]
+fn test_e2e_max_file_size_config_enforced() -> Result<()> {
+    if !rust_analyzer_available() {
+        eprintln!("Skipping: rust-analyzer not available");
+        return Ok(());
+    }
+
+    let workspace_path = rust_workspace_path();
+    // Every real fixture file is larger than 1 byte, so this deterministically
+    // rejects the very first document opened, regardless of which one.
+    let (_config_dir, mut client) = spawn_mcpls_with_workspace_config("max_file_size = 1")?;
+
+    let lib_rs = workspace_path.join("src/lib.rs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let result = call_hover_past_server_init(&mut client, &lib_rs, deadline);
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("file size limit exceeded"),
+            "expected a FileSizeLimitExceeded error, got: {e}"
+        ),
+        Ok(_) => panic!("a file exceeding the configured max_file_size must be rejected"),
+    }
+
+    Ok(())
 }

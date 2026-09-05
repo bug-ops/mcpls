@@ -136,7 +136,7 @@ crates/mcpls-core/tests/
 | Level | Framework | What to Test | Coverage Target |
 |-------|-----------|---------------|-------------------|
 | E2E (this suite) | `cargo nextest`/`cargo test`, `--ignored` | Every MCP tool's real round trip through mcpls to rust-analyzer | 24/24 sub-cases pass with rust-analyzer installed |
-| Unit/integration (unchanged, out of scope here) | `MockLspServer` | Protocol-level translation logic in isolation | Existing coverage, not modified by this suite |
+| Unit/integration (unchanged, out of scope here) | `cargo test`/`cargo nextest` (no LSP server backing) | Protocol-level translation logic in isolation (`tests/e2e/protocol_tests.rs`, `tests/integration/`) | Existing coverage, not modified by this suite |
 
 ## 4. CI Gating (as shipped, deviating from the original design's Section 8)
 
