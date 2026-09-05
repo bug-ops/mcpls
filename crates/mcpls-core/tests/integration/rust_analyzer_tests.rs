@@ -416,9 +416,15 @@ async fn test_diagnostics_with_error() {
     // Give rust-analyzer extra time to analyze and generate diagnostics
     wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
-    // Get diagnostics from lib.rs (has intentional error on line 37). No
-    // push notifications are captured in this harness, so the cache is
-    // empty and handle_diagnostics falls back to the pull-only result.
+    // lib.rs has two intentional errors: an undefined variable in
+    // has_error() (line 37) and an incomplete trait impl for
+    // CodeActionTarget. The former is a flycheck/cargo-check diagnostic,
+    // only ever delivered via textDocument/publishDiagnostics push; this
+    // harness never wires push notifications into the cache, so the cache
+    // stays empty and handle_diagnostics falls back to the pull-only
+    // (textDocument/diagnostic) result, which only ever surfaces
+    // rust-analyzer's own native diagnostics — the missing-trait-item
+    // error (E0046), not the flycheck error.
     let notification_cache = Mutex::new(NotificationCache::new());
     let result = timeout(
         Duration::from_secs(10),
@@ -440,9 +446,9 @@ async fn test_diagnostics_with_error() {
     let diag_json = diag_result.unwrap();
     let diag_str = serde_json::to_string(&diag_json).unwrap();
 
-    // Should contain the error about undefined_variable
+    // Should contain the native "missing trait items" error reachable via pull
     assert!(
-        diag_str.contains("undefined_variable") || diag_str.contains("cannot find"),
+        diag_str.contains("not all trait items implemented") || diag_str.contains("E0046"),
         "Diagnostics should report the intentional error, got: {}",
         diag_str
     );

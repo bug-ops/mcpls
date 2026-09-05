@@ -147,9 +147,7 @@ impl Translator {
                     let range = ctx
                         .normalize_range(&sym.location.uri, sym.location.range)
                         .await;
-                    let selection_range = ctx
-                        .normalize_range(&sym.location.uri, sym.location.range)
-                        .await;
+                    let selection_range = range.clone();
                     result.push(Symbol {
                         name: sym.name,
                         kind: format!("{:?}", sym.kind),
@@ -272,8 +270,18 @@ impl Translator {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+    use tokio::io::BufReader;
+    use tokio::time::timeout;
 
     use super::*;
+    use crate::bridge::translator::testing::{
+        read_framed_message, translator_with_capabilities, write_response,
+    };
     use crate::config::{ServerId, ToolRouter};
 
     #[tokio::test]
@@ -333,5 +341,66 @@ mod tests {
                 tool: ToolKind::WorkspaceSymbols
             })
         ));
+    }
+
+    /// #361 regression: a `Flat` (`SymbolInformation`) document-symbol
+    /// response has only one range in the wire format, so `selection_range`
+    /// must equal `range` exactly -- not merely be numerically close, which
+    /// a bug re-deriving it via a second `normalize_range` call could still
+    /// produce if line-text resolution raced with a concurrent edit.
+    #[tokio::test]
+    async fn test_handle_document_symbols_flat_response_selection_range_matches_range() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, mut server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities {
+                document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+                ..Default::default()
+            },
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move { translator.handle_document_symbols(path_str).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let symbol_request = read_framed_message(&mut wire).await;
+        assert_eq!(symbol_request["method"], "textDocument/documentSymbol");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &symbol_request["id"],
+            serde_json::json!([{
+                "name": "main",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///main.rs",
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 12},
+                    },
+                },
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .expect("flat document symbol response should succeed");
+
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].range, result.symbols[0].selection_range);
     }
 }

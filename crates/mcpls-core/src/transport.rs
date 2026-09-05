@@ -387,13 +387,25 @@ pub(crate) async fn run_stdio(
 /// bind and the graceful-shutdown future's first poll is still caught.
 /// `shutdown_signal` is moved into (and dropped by) the
 /// `with_graceful_shutdown` closure below once it resolves — i.e. as soon as
-/// the *first* signal is received, well before this function returns — so
-/// there is no listener at all for a repeat signal arriving during the
+/// the *first* signal is received, well before this function returns. A
+/// second, freshly constructed `ShutdownSignal` then covers the
 /// connection-drain wait that follows (bounded by
-/// [`HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`]). [`crate::shutdown`]'s own
-/// registration only takes effect once *this* function returns, so it
-/// covers the post-transport cleanup window, not the drain wait inside this
-/// one; see #329 and the TODO on the closure below for that gap.
+/// [`HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`]): a repeat signal caught there cuts the
+/// drain short (dropping `serve` the same way the timeout branch already
+/// does) instead of making the operator wait out the full timeout.
+///
+/// Cutting the drain short is *not* an immediate process exit: this function
+/// still returns `Ok(())` normally, and its caller ([`crate::serve_with`])
+/// proceeds straight into the ordinary post-transport shutdown sequence
+/// ([`crate::shutdown`] — LSP server shutdown plus any pending background
+/// init task, bounded by its own ~15s worst case). [`crate::shutdown`]'s own
+/// registration (#329) takes over once *this* function returns, covering
+/// that cleanup window and escalating to a forced `std::process::exit(1)` on
+/// any *further* repeat signal — so an operator wanting a true immediate exit
+/// needs a third signal, not a second. This is a deliberate choice, not an
+/// oversight: calling `exit(1)` directly from this branch would skip
+/// unwinding and forfeit `kill_on_drop` cleanup of any still-running LSP
+/// child processes, which is worse than requiring one more signal.
 #[cfg(feature = "transport-http")]
 // `session_manager` and `service` are moved into `app`, which is served until
 // shutdown — clippy's drop-tightening heuristic misreads that as an
@@ -448,17 +460,11 @@ pub(crate) async fn run_http(
     }
 
     // `cancel` is cancelled exactly once, when the shutdown signal fires
-    // (below). Cloned first so the force-timeout branch can observe that
-    // same moment independently of the `with_graceful_shutdown` closure,
-    // which consumes its own clone.
-    // TODO(#349): `shutdown_signal` is dropped
-    // once this closure resolves, leaving the connection-drain wait below
-    // (up to `HTTP_GRACEFUL_SHUTDOWN_TIMEOUT`) with no signal listener at
-    // all -- a repeat signal there is silently discarded the same way a
-    // repeat signal during post-transport cleanup used to be, before this
-    // fix added one there. Not addressed here; this fix only covers the
-    // window after `run_http` returns.
+    // (below). Cloned first so the force-timeout and repeat-signal branches
+    // can each observe that same moment independently of the
+    // `with_graceful_shutdown` closure, which consumes its own clone.
     let cancel_for_force_timeout = cancel.clone();
+    let cancel_for_repeat_signal = cancel.clone();
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown_signal.recv().await;
         cancel.cancel();
@@ -482,6 +488,33 @@ pub(crate) async fn run_http(
             tracing::warn!(
                 timeout = ?HTTP_GRACEFUL_SHUTDOWN_TIMEOUT,
                 "HTTP graceful shutdown did not complete in time, proceeding with shutdown anyway"
+            );
+            Ok(())
+        }
+        // #349: `shutdown_signal` above is consumed and dropped as soon as
+        // the first signal arrives, leaving no listener for a repeat signal
+        // during the connection-drain wait that follows. Wait for `cancel`
+        // first and only then construct a fresh `ShutdownSignal` -- rather
+        // than registering one up front, alongside `shutdown_signal` -- so
+        // it starts with no pending signal of its own: `tokio::signal`
+        // fans a delivered signal out to every live listener, so a listener
+        // already registered before the first signal arrived would
+        // independently observe that same signal and misreport it as a
+        // repeat. This leaves a much smaller, accepted gap instead: between
+        // `cancel.cancel()` firing and `ShutdownSignal::new()` actually
+        // registering on the next scheduler hop, there is no pollable
+        // listener at all, so a signal delivered in that sub-millisecond
+        // window is lost. Registering up front would only trade this for
+        // the coalescing problem above -- it is not fully closable either
+        // way, and the window is far below human reaction time to a second
+        // keypress.
+        () = async move {
+            cancel_for_repeat_signal.cancelled().await;
+            let mut repeat_signal = ShutdownSignal::new();
+            repeat_signal.recv().await;
+        } => {
+            tracing::warn!(
+                "repeat shutdown signal received during HTTP connection drain, cutting drain short"
             );
             Ok(())
         }
