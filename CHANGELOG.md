@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`DocumentTracker::update`** — Breaking change: now `async`, serializing against `ensure_open` for the same path. (#363)
-- Bump rmcp from 3.1.4 to 3.2.0; an `initialize` request naming `protocolVersion: 2026-07-28` now receives the server's negotiated legacy version in response instead of an echo of the requested version (rmcp behavior change) (#356)
-- Reorder `mcpls-core` `Cargo.toml` dependencies into alphabetical order (#357)
+- Bump rmcp from 3.1.4 to 3.2.0; an `initialize` request naming `protocolVersion: 2026-07-28` now receives the server's negotiated legacy version in response instead of an echo of the requested version (rmcp behavior change) (#364)
+- Reorder `mcpls-core` `Cargo.toml` dependencies into alphabetical order (#364)
 
 ### Fixed
 
