@@ -13,7 +13,9 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 - **Protocol translation** — Converts MCP tool calls to LSP requests and back
 - **Position encoding** — Handles MCP's 1-based positions ↔ LSP's 0-based coordinates
 - **LSP lifecycle** — Manages language server processes (spawn, initialize, shutdown)
+- **Non-blocking startup** — MCP server accepts connections immediately; LSP initialization runs in the background
 - **Document tracking** — Lazy-loads files, maintains synchronization state
+- **Diagnostics cache** — Caches push-based `publishDiagnostics` notifications for fast polling via MCP
 - **Configuration** — Parses TOML configs, discovers LSP servers, manages language extension mappings
 - **Custom extension mapping** — Configurable file extension-to-language ID mappings with sensible defaults
 - **Graceful degradation** — Continues with available servers, even if some fail to initialize
@@ -25,7 +27,7 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 
 ```toml
 [dependencies]
-mcpls-core = "0.3.1"
+mcpls-core = "0.3"
 ```
 
 ## Architecture
@@ -41,7 +43,7 @@ flowchart LR
 
 | Module | Responsibility |
 |--------|----------------|
-| `mcp/` | MCP server implementation with rmcp, 16 tool handlers |
+| `mcp/` | MCP server implementation with rmcp, 20 tool handlers |
 | `bridge/` | Position encoding, document state, notification cache, request translation |
 | `lsp/` | JSON-RPC 2.0 client, process management, notification handling, protocol types |
 | `config/` | TOML parsing, server discovery, workspace configuration |
@@ -49,14 +51,17 @@ flowchart LR
 ## Usage
 
 ```rust
-use mcpls_core::config::Config;
-use mcpls_core::mcp::McplsServer;
+use mcpls_core::{ServerConfig, Transport};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let config = Config::load()?;
-    let server = McplsServer::new(config);
-    server.run().await
+async fn main() {
+    let config = ServerConfig::load().expect("failed to load config");
+    let result = mcpls_core::serve_with(config, Transport::Stdio).await;
+    // `Transport::Stdio` is backed by `tokio::io::stdin()`, which parks an
+    // uncancellable blocking-pool thread; returning normally from `main`
+    // here can hang on SIGTERM/SIGINT while a client's stdin is still open.
+    // See `serve_with`'s "Shutdown" docs.
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 ```
 

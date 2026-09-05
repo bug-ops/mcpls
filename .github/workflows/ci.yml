@@ -4,111 +4,330 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
-
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
 
 permissions: {}
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  NEXTEST_PROFILE: ci
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: Check
+  detect-changes:
+    name: Detect Changes
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 2
+    outputs:
+      run-full-ci: ${{ steps.classify.outputs.run-full-ci }}
+      scripts: ${{ steps.filter.outputs.scripts }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets --all-features
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Filter changed paths
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            workflows:
+              - '.github/workflows/**'
+              - '.cargo/**'
+            scripts:
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+      - name: Classify changes
+        id: classify
+        run: |
+          CODE="${{ steps.filter.outputs.code }}"
+          WORKFLOWS="${{ steps.filter.outputs.workflows }}"
+
+          if [[ "$CODE" == "true" || "$WORKFLOWS" == "true" ]]; then
+            echo "run-full-ci=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run-full-ci=false" >> "$GITHUB_OUTPUT"
+          fi
 
   fmt:
-    name: Format
+    name: Lint (fmt)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
+          toolchain: nightly
           components: rustfmt
-      - run: cargo +nightly fmt --all -- --check
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: Lint (clippy)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: "ci"
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
 
-  test:
-    name: Test
+  build-tests:
+    name: Build Tests (${{ matrix.os }})
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable]
-        include:
-          - os: ubuntu-latest
-            rust: beta
-          - os: ubuntu-latest
-            rust: "1.85"  # MSRV
+    permissions:
+      contents: read
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
         with:
-          toolchain: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --all-features
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-targets: "false"
+          shared-key: "ci"
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - name: Build and archive tests
+        run: cargo nextest archive --workspace --all-features --lib --bins --tests --archive-file nextest-archive.tar.zst
+      - name: Upload test archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-archive-${{ matrix.os }}
+          path: nextest-archive.tar.zst
+          retention-days: 1
 
-  docs:
-    name: Documentation
-    runs-on: ubuntu-latest
+  build:
+    name: Build Binary (${{ matrix.os }})
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-targets: "false"
+          shared-key: "build"
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Build binary
+        run: cargo build --bin mcpls
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcpls-binary-${{ matrix.os }}
+          path: target/debug/mcpls${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+          retention-days: 1
+
+  test:
+    name: Test (unit) (${{ matrix.os }})
+    needs: [detect-changes, fmt, clippy, build-tests]
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive-${{ matrix.os }}
+      - name: Run unit tests
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . -E 'kind(lib) or kind(bin)'
+
+  test-integration:
+    name: Test (integration) (${{ matrix.os }})
+    needs: [detect-changes, fmt, clippy, build-tests]
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive-${{ matrix.os }}
+      - name: Run integration tests
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . -E 'kind(test) and not test(e2e)'
+
+  test-e2e:
+    name: Test (e2e) (${{ matrix.os }})
+    needs: [detect-changes, fmt, clippy, build-tests, build]
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive-${{ matrix.os }}
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: mcpls-binary-${{ matrix.os }}
+          path: target/debug/
+      - name: Make binary executable
+        if: matrix.os != 'windows-latest'
+        run: chmod +x target/debug/mcpls
+      - name: Install rust-analyzer
+        run: rustup component add rust-analyzer
+      - name: Run e2e tests
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test) and test(e2e)'
+
+  msrv:
+    name: MSRV check (1.88)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: "msrv"
+      - name: cargo check (MSRV)
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  docs:
+    name: Rustdoc
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: "ci"
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+      - name: Doc-tests
+        run: cargo test --doc --workspace --all-features
+
+  shellcheck:
+    name: Shellcheck
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Shellcheck install script
+        run: shellcheck --shell=sh scripts/install.sh
 
   security:
     name: Security Audit
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
   coverage:
     name: Coverage
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.run-full-ci == 'true'
+    needs: [detect-changes, fmt, clippy]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
+    # RUSTFLAGS reset: -C instrument-coverage conflicts with -D warnings from the
+    # global env; linting is enforced by the dedicated clippy job.
+    env:
+      RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
         with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v5
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: "coverage"
+      - uses: taiki-e/install-action@caf4aedf2bfe5bfb679703b29290921f4711b2f3 # cargo-llvm-cov
+      - uses: taiki-e/install-action@dee540ee3f3ff5c6a0665fed9996875d0ba04ca2 # nextest
+      - name: Generate coverage
+        run: cargo llvm-cov nextest --workspace --all-features --lib --bins --lcov --output-path lcov.info
+      - name: Upload coverage
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
@@ -117,11 +336,30 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [check, fmt, clippy, test, docs, security, coverage]
+    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, security, coverage]
     runs-on: ubuntu-latest
+    timeout-minutes: 1
     steps:
-      - run: |
-          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "::error::One or more CI jobs failed or were cancelled"
-            exit 1
-          fi
+      - name: Check all jobs
+        run: |
+          results=(
+            "${{ needs.fmt.result }}"
+            "${{ needs.clippy.result }}"
+            "${{ needs.build-tests.result }}"
+            "${{ needs.build.result }}"
+            "${{ needs.test.result }}"
+            "${{ needs.test-integration.result }}"
+            "${{ needs.test-e2e.result }}"
+            "${{ needs.msrv.result }}"
+            "${{ needs.docs.result }}"
+            "${{ needs.shellcheck.result }}"
+            "${{ needs.security.result }}"
+            "${{ needs.coverage.result }}"
+          )
+          for r in "${results[@]}"; do
+            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
+              echo "::error::One or more CI jobs failed or were cancelled"
+              exit 1
+            fi
+          done
+          echo "All jobs passed"

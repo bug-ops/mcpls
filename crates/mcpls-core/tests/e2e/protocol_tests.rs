@@ -50,7 +50,7 @@ fn test_e2e_initialize_handshake() -> Result<()> {
 /// Test listing all available MCP tools.
 ///
 /// Validates that:
-/// - tools/list returns an array of 8 tools
+/// - tools/list returns an array of 16 tools
 /// - All expected tool names are present
 #[test]
 #[ignore = "Requires mcpls binary built"]
@@ -64,42 +64,34 @@ fn test_e2e_list_tools() -> Result<()> {
         .as_array()
         .unwrap_or_else(|| panic!("tools should be an array"));
 
-    assert_eq!(tools.len(), 8, "Should have exactly 8 tools");
+    assert_eq!(tools.len(), 20, "Should have exactly 20 tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    assert!(
-        tool_names.contains(&"get_hover"),
-        "Should have get_hover tool"
-    );
-    assert!(
-        tool_names.contains(&"get_definition"),
-        "Should have get_definition tool"
-    );
-    assert!(
-        tool_names.contains(&"get_references"),
-        "Should have get_references tool"
-    );
-    assert!(
-        tool_names.contains(&"get_diagnostics"),
-        "Should have get_diagnostics tool"
-    );
-    assert!(
-        tool_names.contains(&"rename_symbol"),
-        "Should have rename_symbol tool"
-    );
-    assert!(
-        tool_names.contains(&"get_completions"),
-        "Should have get_completions tool"
-    );
-    assert!(
-        tool_names.contains(&"get_document_symbols"),
-        "Should have get_document_symbols tool"
-    );
-    assert!(
-        tool_names.contains(&"format_document"),
-        "Should have format_document tool"
-    );
+    for expected in &[
+        "get_hover",
+        "get_definition",
+        "get_references",
+        "get_diagnostics",
+        "rename_symbol",
+        "get_completions",
+        "get_document_symbols",
+        "format_document",
+        "workspace_symbol_search",
+        "get_code_actions",
+        "prepare_call_hierarchy",
+        "get_incoming_calls",
+        "get_outgoing_calls",
+        "get_cached_diagnostics",
+        "get_server_logs",
+        "get_server_messages",
+        "get_signature_help",
+        "go_to_implementation",
+        "go_to_type_definition",
+        "get_inlay_hints",
+    ] {
+        assert!(tool_names.contains(expected), "Should have {expected} tool");
+    }
 
     Ok(())
 }
@@ -340,4 +332,130 @@ fn test_e2e_multiple_requests() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Test that mcpls exits promptly on `SIGTERM` while the client's stdin
+/// write end is still open (regression test for #308).
+///
+/// The MCP stdio transport is backed by `tokio::io::stdin()`, which parks an
+/// uncancellable blocking-pool thread in a raw `read()` syscall. Without the
+/// `std::process::exit` fix in `mcpls-cli`'s `main`, `#[tokio::main]`'s
+/// runtime-shutdown wait for that thread would hang indefinitely as long as
+/// the client (this test, via `McpClient`) keeps stdin's write end open.
+///
+/// Sending `SIGTERM` immediately after the handshake completes (no
+/// artificial delay) also touches the tail of #318's window — the narrow gap
+/// between `run_stdio`'s two `select!` blocks — but only weakly: signaling
+/// this soon after `initialize()` returns reproduced the pre-fix bug in just
+/// 1/15 runs, since the client-side I/O latency before the `kill` command
+/// even runs dwarfs that gap. `test_e2e_sigterm_exits_promptly_during_handshake_wait`
+/// below is the reliable reproducer for #318 (5/5 against pre-fix code).
+#[test]
+#[cfg(unix)]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_sigterm_exits_promptly_while_client_stdin_open() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+    client.initialize()?;
+
+    // No delay here is intentional: `run_stdio` now registers its SIGTERM
+    // handler before awaiting the handshake at all (see #318), so the signal
+    // is raced against the handshake/select loop from the moment the
+    // process starts. Sending SIGTERM immediately after `initialize()`
+    // returns exercises the narrowest part of that window instead of
+    // masking it behind an artificial delay.
+    let pid = client.pid();
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()?;
+    assert!(
+        status.success(),
+        "failed to send SIGTERM to mcpls (pid {pid})"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(exit_status) = client.try_wait()? {
+            // Distinguishes a graceful `process::exit(0)` from the process
+            // being killed outright by the default SIGTERM disposition
+            // (e.g. if the signal handler failed to register) -- the latter
+            // would also make `try_wait` return `Some`, but with no LSP
+            // shutdown having run. On Unix, `code()` is `None` for
+            // signal-termination, so this one assertion covers both.
+            assert_eq!(
+                exit_status.code(),
+                Some(0),
+                "mcpls should exit with status 0 via its own shutdown path, not be killed \
+                 by the default SIGTERM disposition (issue #308 regression)"
+            );
+            return Ok(());
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mcpls did not exit within 5s of SIGTERM while the client's stdin write end \
+             was still open (issue #308 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Test that mcpls exits promptly on `SIGTERM` sent *before* the client ever
+/// sends the `initialize` request -- i.e. strictly during the MCP handshake
+/// wait itself (regression test for #318).
+///
+/// This targets the actual bug in #318 directly: pre-fix, `run_stdio`
+/// registered its `SIGTERM` handler only *after* `mcp_server.serve(..)`
+/// resolved, so any signal arriving while `serve(..)` was still awaiting the
+/// client's `initialize` request -- which can be an arbitrarily long wait in
+/// real usage -- fell through to the OS's default disposition (immediate
+/// kill, no graceful shutdown, no LSP cleanup). Sending `SIGTERM`
+/// immediately after spawning, before writing anything to the child's
+/// stdin, reliably lands inside that wait rather than racing the much
+/// narrower post-handshake gap that
+/// `test_e2e_sigterm_exits_promptly_while_client_stdin_open` exercises.
+#[test]
+#[cfg(unix)]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_sigterm_exits_promptly_during_handshake_wait() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+
+    // A brief sleep before signaling clears the unrelated, unfixable gap
+    // between `fork`/`exec` and the point where *any* process code (the
+    // runtime init that precedes even the fixed `ShutdownSignal::new()`)
+    // has run -- the OS applies the default disposition until then no
+    // matter what the binary does, so signaling with zero delay would fail
+    // even against the fix and wouldn't be exercising #318 at all. 50ms is
+    // far below the 5s deadline below and well within the handshake wait,
+    // since `initialize()` is deliberately never called: the child is left
+    // parked inside `mcp_server.serve(..)`, waiting to read the client's
+    // first request.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let pid = client.pid();
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()?;
+    assert!(
+        status.success(),
+        "failed to send SIGTERM to mcpls (pid {pid})"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(exit_status) = client.try_wait()? {
+            assert_eq!(
+                exit_status.code(),
+                Some(0),
+                "mcpls should exit with status 0 via its own shutdown path even when SIGTERM \
+                 arrives before the MCP handshake completes, not be killed by the default \
+                 SIGTERM disposition (issue #318 regression)"
+            );
+            return Ok(());
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mcpls did not exit within 5s of SIGTERM sent before the handshake completed \
+             (issue #318 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }

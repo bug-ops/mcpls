@@ -8,8 +8,49 @@ mcpls uses TOML format for configuration. The file can be placed in several loca
 
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
-3. `./mcpls.toml` (current directory)
-4. `~/.config/mcpls/mcpls.toml` (user config directory)
+3. `./mcpls.toml` (current directory) — **only loaded with `--trust-project-config`** (or
+   `MCPLS_TRUST_PROJECT_CONFIG=true`); see [Trusting a Project-Local Config](#trusting-a-project-local-config)
+4. Platform user-config directory:
+   - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
+   - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+   - Windows: `%APPDATA%\mcpls\mcpls.toml`
+
+### Trusting a Project-Local Config
+
+A `mcpls.toml` discovered in the current directory controls which command mcpls
+spawns as an LSP server (and other workspace settings), so mcpls does not load it
+automatically. Running `mcpls` inside an untrusted checkout must not execute
+commands from that checkout without explicit consent.
+
+To load a project-local `mcpls.toml`, opt in explicitly:
+
+```bash
+mcpls --trust-project-config
+# or
+MCPLS_TRUST_PROJECT_CONFIG=true mcpls
+```
+
+Without this flag, a `./mcpls.toml` in the current directory is ignored (a warning
+is logged naming the ignored path) and mcpls falls through to the user config
+directory or built-in defaults — including built-in project-marker heuristics, so
+e.g. a `Cargo.toml` in the workspace still spawns rust-analyzer. An explicit
+`--config <path>` or `$MCPLS_CONFIG` is always trusted, since naming a path is
+itself the user's consent.
+
+> [!WARNING]
+> `--trust-project-config` (and `MCPLS_TRUST_PROJECT_CONFIG=true`) is a **global**
+> trust grant for the whole mcpls process — it is not scoped to a single project.
+> Prefer setting it on a per-project MCP client config entry (the `args`/`env` for
+> that project's `mcpls` server registration) rather than in your shell profile or
+> a user-global MCP client config, so it doesn't silently apply the next time
+> mcpls is launched against a different, untrusted checkout.
+>
+> `$MCPLS_CONFIG` is a second, by-design door past this gate: it is always
+> trusted regardless of this flag, including when set to a relative path. A
+> repository's own `.envrc` (or similar) exporting `MCPLS_CONFIG=./mcpls.toml`
+> would make direnv-style tooling load it automatically — not a bug (an
+> explicitly named path is consent, per the design above), but worth knowing if
+> you audit a checkout for auto-executing config before running mcpls in it.
 
 ## Configuration Structure
 
@@ -26,6 +67,7 @@ command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
 timeout_seconds = 30
+request_timeout_seconds = 30
 
 # Optional: LSP server initialization options
 [lsp_servers.initialization_options]
@@ -56,20 +98,61 @@ roots = [
 roots = []
 ```
 
+Where a relative root resolves against depends on which config file it comes
+from:
+
+- **An explicitly named config file** -- a project-local `mcpls.toml`, or a
+  config named via `--config`/`$MCPLS_CONFIG` -- resolves each relative root
+  against the directory containing that TOML file, not against mcpls's
+  process working directory. For example, a repository-owned config at
+  `<repo>/.agents/mcpls.toml` can target the repository root portably with:
+
+  ```toml
+  [workspace]
+  roots = [".."]
+  ```
+
+  In that same file, `roots = ["."]` selects `<repo>/.agents`. This keeps a
+  committed config's meaning stable regardless of launcher cwd.
+- **The auto-discovered global/user config**
+  (`~/.config/mcpls/mcpls.toml`, or the platform equivalent), loaded only
+  when no project-local or explicitly named config applies, resolves each
+  relative root against the process working directory instead. It isn't
+  tied to any particular project, so a relative root there is more
+  intuitively read as "relative to wherever mcpls was launched."
+
+The resolved path must exist and is canonicalized before any LSP server is
+initialized. A `ServerConfig` built programmatically has no config-file
+location either; its relative roots are likewise resolved against the
+process cwd when `serve`/`serve_with` starts.
+
+On Windows, a `workspace.roots` entry that is rooted-without-a-drive (e.g.
+`\workspace`) or drive-relative (e.g. `C:workspace`) is joined under the base
+directory above, the same as any other relative root -- this deliberately
+does not replicate native Windows path semantics (where those forms resolve
+against the current drive's root or that drive's own current directory,
+respectively). This differs from `--config`/`$MCPLS_CONFIG` itself, whose
+path is still resolved with native semantics.
+
+The empty default, `roots = []`, remains distinct: it selects the process cwd
+at startup. Absolute roots continue to work unchanged. A missing relative root
+is rejected as invalid configuration instead of reaching LSP initialization as
+an invalid `file://` URI.
+
 ### `workspace.position_encodings`
 
 **Type**: Array of strings
 **Default**: `["utf-8", "utf-16"]`
 **Options**: `"utf-8"`, `"utf-16"`, `"utf-32"`
 
-Preferred position encodings for LSP communication.
+Preferred position encodings for LSP communication, offered to each spawned server during the `initialize` handshake in the listed order.
 
 ```toml
 [workspace]
 position_encodings = ["utf-8", "utf-16", "utf-32"]
 ```
 
-Most language servers use UTF-16 encoding. mcpls automatically converts between MCP (UTF-8) and LSP encodings.
+This is a preference, not a restriction: per the LSP spec, UTF-16 is a mandatory fallback encoding, so a server may still reply with UTF-16 even if it's omitted from this list. Most language servers negotiate UTF-16 by default.
 
 ### `workspace.language_extensions`
 
@@ -158,6 +241,34 @@ language_id = "python"
 
 This reduces memory usage compared to loading all 30 default mappings.
 
+### `workspace.max_documents`
+
+**Type**: Integer
+**Default**: `100`
+
+Maximum number of documents mcpls will keep open simultaneously. A tool call (hover, definition, diagnostics, etc.) that would open a document beyond this count fails with a "document limit exceeded" error. Documents stay tracked for the whole mcpls process lifetime — there is no automatic eviction — so once the ceiling is reached, opening any further new file fails until you restart mcpls or raise this limit; already-open files are unaffected. Set to `0` to disable the limit.
+
+```toml
+[workspace]
+max_documents = 500
+```
+
+Raising this limit increases mcpls's steady-state memory usage, since each open document's full content is held in memory. This is most useful for long-running agent sessions or broad-scope work (large monorepo audits, repo-wide refactors) that touch more than 100 distinct files.
+
+### `workspace.max_file_size`
+
+**Type**: Integer (bytes)
+**Default**: `10485760` (10MB)
+
+Maximum size, in bytes, of a single file mcpls will open. A file larger than this fails with a "file size limit exceeded" error. Set to `0` to disable the limit.
+
+```toml
+[workspace]
+max_file_size = 0  # unlimited
+```
+
+Useful when a project contains files larger than 10MB (e.g. generated code, data fixtures) that still need LSP-backed tools to work against them.
+
 ## LSP Server Configuration
 
 Each `[[lsp_servers]]` section defines a language server.
@@ -234,11 +345,57 @@ Glob pattern syntax:
 **Type**: Integer
 **Default**: `30`
 
-Timeout in seconds for LSP server operations.
+Timeout in seconds for the `initialize` handshake during server startup.
+Servers that load a large project before answering `initialize` (e.g.
+OmniSharp on a big Unity/C# solution) need this raised - the default 30 s can
+otherwise cut the server off mid-initialization.
+
+This does **not** bound individual tool-call requests (hover, definition,
+references, etc.) sent after initialization - see `request_timeout_seconds`
+below for that. The LSP server's `shutdown` request during teardown uses a
+separate, fixed 5 s timeout that is not configurable.
 
 ```toml
 [[lsp_servers]]
-timeout_seconds = 60  # Increase for slow servers or large projects
+timeout_seconds = 60  # Increase for servers slow to complete `initialize`
+```
+
+### `request_timeout_seconds`
+
+**Type**: Integer
+**Default**: `30`
+
+Timeout in seconds applied to each individual LSP request issued while
+translating an MCP tool call (hover, definition, references, diagnostics,
+rename, etc.). Independent of `timeout_seconds`, which only bounds the
+`initialize` handshake.
+
+This bounds a single request **attempt**, not a whole tool call: when the LSP
+server responds with `-32802` (content modified), mcpls retries up to 4
+attempts total with exponential backoff (0.5 s + 1 s + 2 s = 3.5 s of total
+sleep). So the worst-case latency for one tool call is:
+
+```
+4 * request_timeout_seconds + 3.5 seconds
+```
+
+If a tool call also triggers a server respawn (because the previous server
+process had died), add `timeout_seconds` on top of that, since
+`initialize` runs again before the request is retried.
+
+Completion requests (`textDocument/completion`) are further capped at 10
+seconds regardless of this setting - completions are latency-sensitive
+enough that a slower result isn't useful, and this cap cannot currently be
+raised. If completions specifically need a higher ceiling, file an issue
+requesting a dedicated `completion_timeout_seconds` field rather than raising
+`request_timeout_seconds`, which would not affect completions above 10 s.
+
+A value of `0` is rejected at config load time; the effective timeout is
+always at least 1 second.
+
+```toml
+[[lsp_servers]]
+request_timeout_seconds = 60  # Increase for a slow LSP server (e.g. large monorepo indexing)
 ```
 
 ### `initialization_options`
@@ -267,6 +424,17 @@ See your language server documentation for available options.
 
 Environment variables to set for the LSP server process.
 
+The spawned server does **not** inherit mcpls's full environment. Its
+environment is cleared, then a minimal allowlist is passed through from
+mcpls's own process — `PATH`, `HOME`, `USERPROFILE`, `TMPDIR`/`TEMP`/`TMP` on
+every platform, plus Windows essentials (`SystemRoot`, `APPDATA`,
+`LOCALAPPDATA`, and others the process loader and Node-based servers need) —
+and only then is `env` applied on top, so entries here can override any
+passthrough value. Use `env` to restore anything your server needs beyond
+that allowlist: proxy settings, `VIRTUAL_ENV`/`PYTHONPATH`, toolchain
+variables a `build.rs` reads (`DATABASE_URL`, `LIBCLANG_PATH`, …), or
+session-specific values like `SSH_AUTH_SOCK`.
+
 ```toml
 [[lsp_servers]]
 language_id = "python"
@@ -278,6 +446,88 @@ file_patterns = ["**/*.py"]
 PYTHONPATH = "/custom/path"
 VIRTUAL_ENV = "/path/to/venv"
 ```
+
+**Caution:** setting `PATH` here *replaces* the passthrough value rather than
+prepending to it, and the two platforms then diverge — Unix searches your
+explicit `PATH` first, so a bare `command` (no directory component) becomes
+unresolvable unless your `PATH` entry still contains it; Windows still falls
+back to searching the parent's `PATH` afterward. If you only need to add a
+directory, prefer an absolute path in `command` over overriding `PATH`.
+
+### `name`
+
+**Type**: String
+**Default**: the server's `language_id`
+
+Explicit routing identity for this server. Two servers may share one
+`language_id` (e.g. two Python servers), but each must have a distinct
+identity — set `name` on at least one of them so they don't collide.
+
+```toml
+[[lsp_servers]]
+name = "pyright"
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[[lsp_servers]]
+name = "pylsp"
+language_id = "python"
+command = "pylsp"
+handles = ["diagnostics"]
+```
+
+### `handles`
+
+**Type**: Array of tool names
+**Default**: unset (catch-all — serves every tool no other server for this language explicitly claims)
+
+Restricts a server to exactly the listed routing values. Valid values:
+`hover`, `definition`, `type_definition`, `implementation`, `references`,
+`diagnostics`, `rename`, `completions`, `signature_help`,
+`document_symbols`, `workspace_symbols`, `format_document`, `code_actions`,
+`call_hierarchy`, `inlay_hints`. These are routing identifiers, not MCP tool
+names — several MCP tools map to a shorter routing value:
+
+| `handles` value | MCP tool(s) it governs |
+|---|---|
+| `rename` | `rename_symbol` |
+| `workspace_symbols` | `workspace_symbol_search` |
+| `implementation` | `go_to_implementation` |
+| `type_definition` | `go_to_type_definition` |
+| `call_hierarchy` | `prepare_call_hierarchy`, `get_incoming_calls`, `get_outgoing_calls` (one route: the item `prepare_call_hierarchy` returns is only meaningful to the server that produced it) |
+| `diagnostics` | `get_diagnostics` (pull) **and** `get_cached_diagnostics` (the push-notification cache is filtered by the same route, so both are always served by the same server) |
+
+Every other value matches its MCP tool name directly (`hover` → `hover`, etc.).
+
+At most one server per language may omit `handles` (the catch-all). A tool
+may be claimed by only one server per language. In the example above,
+`pylsp` handles only diagnostics; `pyright` (the catch-all) handles
+everything else for `python`, including `hover`, `definition`, etc.
+
+**Ambiguous configs fail at startup, not silently.** If two servers for one
+language are *both applicable in the same workspace* (see
+`heuristics` below) and either share a routing identity, both omit
+`handles`, or both claim the same tool, mcpls refuses to start and prints an
+error naming the conflicting `[[lsp_servers]]` entries. A config with
+mutually exclusive `heuristics.project_markers` — where only one of the two
+servers is ever applicable in a given workspace — is not ambiguous and
+starts normally.
+
+**If the server a tool is routed to fails to spawn**, that tool's requests
+move to the language's catch-all server, if one is running; otherwise they
+report no server available for that tool rather than silently falling back
+to a server that explicitly declined it via `handles`.
+
+**Exception: `workspace_symbol_search`.** This tool has no document, so it
+has no language to route on. It resolves, across all configured servers, to
+the first one that explicitly claims `workspace_symbols`, else the first
+catch-all. Unlike every document-scoped tool above, there is no per-language
+fallback to try (`handles` is per-language, and this tool has no language) —
+if neither an explicit claimer nor a catch-all exists anywhere in the
+workspace, the request fails naming the tool rather than being forwarded to
+an arbitrary server that declined it via `handles`. Add `workspace_symbols`
+to a server's `handles` list, or configure a catch-all, to enable this tool.
 
 ## Environment Variables
 
@@ -306,11 +556,32 @@ mcpls
 
 Output logs in JSON format.
 
-**Values**: `true`, `false`
+**Values**: `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, `on`/`off` (case-insensitive)
 **Default**: `false`
 
 ```bash
 export MCPLS_LOG_JSON=true
+mcpls
+```
+
+### `MCPLS_LISTEN` (transport-http feature)
+
+Bind address for Streamable HTTP transport. When set, mcpls binds this address
+instead of using stdio.
+
+```bash
+export MCPLS_LISTEN=127.0.0.1:3000
+mcpls
+```
+
+### `MCPLS_HTTP_PATH` (transport-http feature)
+
+URL prefix the MCP service is mounted at.
+
+**Default**: `/mcp`
+
+```bash
+export MCPLS_HTTP_PATH=/api/mcp
 mcpls
 ```
 
@@ -341,6 +612,39 @@ timeout_seconds = 45
 [lsp_servers.initialization_options]
 python.analysis.typeCheckingMode = "basic"
 python.analysis.autoSearchPaths = true
+```
+
+To use [ty](https://docs.astral.sh/ty/) instead of the default Pyright server:
+
+```toml
+[[lsp_servers]]
+language_id = "python"
+command = "ty"
+args = ["server"]
+file_patterns = ["**/*.py", "**/*.pyi"]
+
+[lsp_servers.heuristics]
+project_markers = ["pyproject.toml", "ty.toml"]
+```
+
+To run pyright for everything except diagnostics, and a second server
+(`pylsp`) for diagnostics only:
+
+```toml
+[[lsp_servers]]
+name = "pyright"
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+file_patterns = ["**/*.py"]
+
+[[lsp_servers]]
+name = "pylsp"
+language_id = "python"
+command = "pylsp"
+args = []
+file_patterns = ["**/*.py"]
+handles = ["diagnostics"]
 ```
 
 ### TypeScript/JavaScript Project
@@ -489,6 +793,10 @@ mcpls --log-level debug
 # Enable JSON logging
 mcpls --log-json
 
+# HTTP transport (requires transport-http feature)
+mcpls --listen 127.0.0.1:3000
+mcpls --listen 127.0.0.1:3000 --http-path /api/mcp
+
 # Show version
 mcpls --version
 
@@ -526,7 +834,8 @@ language_id = "rust"
 command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
-timeout_seconds = 120  # 2 minutes for initial indexing
+timeout_seconds = 120         # 2 minutes for initial indexing
+request_timeout_seconds = 60  # slower tool-call responses (see the field's docs above for the retry-ceiling math)
 ```
 
 ### Multiple Workspaces

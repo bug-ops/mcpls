@@ -72,9 +72,12 @@ pub enum RequestId {
 
 /// Inbound message from LSP server.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum InboundMessage {
     /// Response to a request.
     Response(JsonRpcResponse),
+    /// Request from server to client.
+    Request(JsonRpcRequest),
     /// Notification from server.
     Notification(JsonRpcNotification),
 }
@@ -87,18 +90,21 @@ pub enum LspNotification {
     /// textDocument/publishDiagnostics
     PublishDiagnostics(PublishDiagnosticsParams),
     /// window/logMessage
-    #[allow(dead_code)] // Used in Phase 4
     LogMessage(LogMessageParams),
     /// window/showMessage
-    #[allow(dead_code)] // Used in Phase 4
     ShowMessage(ShowMessageParams),
+    /// $/progress
+    Progress {
+        /// Progress token (string or number).
+        token: serde_json::Value,
+        /// Progress value.
+        value: serde_json::Value,
+    },
     /// Unknown or unhandled notification
     Other {
         /// Method name.
-        #[allow(dead_code)] // Used in Phase 4
         method: Cow<'static, str>,
         /// Optional parameters.
-        #[allow(dead_code)] // Used in Phase 4
         params: Option<serde_json::Value>,
     },
 }
@@ -111,7 +117,7 @@ impl LspNotification {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```rust,ignore
     /// use mcpls_core::lsp::types::LspNotification;
     /// use serde_json::json;
     ///
@@ -130,13 +136,14 @@ impl LspNotification {
     ///     _ => panic!("Expected LogMessage variant"),
     /// }
     /// ```
+    #[must_use]
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
         match method {
             "textDocument/publishDiagnostics" => {
-                if let Some(p) = params {
-                    if let Ok(parsed) = serde_json::from_value(p) {
-                        return Self::PublishDiagnostics(parsed);
-                    }
+                if let Some(p) = params
+                    && let Ok(parsed) = serde_json::from_value(p)
+                {
+                    return Self::PublishDiagnostics(parsed);
                 }
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
@@ -144,10 +151,10 @@ impl LspNotification {
                 }
             }
             "window/logMessage" => {
-                if let Some(p) = params {
-                    if let Ok(parsed) = serde_json::from_value(p) {
-                        return Self::LogMessage(parsed);
-                    }
+                if let Some(p) = params
+                    && let Ok(parsed) = serde_json::from_value(p)
+                {
+                    return Self::LogMessage(parsed);
                 }
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
@@ -155,14 +162,25 @@ impl LspNotification {
                 }
             }
             "window/showMessage" => {
-                if let Some(p) = params {
-                    if let Ok(parsed) = serde_json::from_value(p) {
-                        return Self::ShowMessage(parsed);
-                    }
+                if let Some(p) = params
+                    && let Ok(parsed) = serde_json::from_value(p)
+                {
+                    return Self::ShowMessage(parsed);
                 }
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
                     params: None,
+                }
+            }
+            "$/progress" => {
+                if let Some(ref p) = params {
+                    let token = p.get("token").cloned().unwrap_or(Value::Null);
+                    let value = p.get("value").cloned().unwrap_or(Value::Null);
+                    return Self::Progress { token, value };
+                }
+                Self::Other {
+                    method: Cow::Owned(method.to_string()),
+                    params,
                 }
             }
             _ => Self::Other {

@@ -19,31 +19,44 @@ cargo install mcpls
 ## Usage
 
 ```bash
-mcpls                           # Run with defaults
-mcpls --log-level debug         # Verbose output
-mcpls --config ./mcpls.toml     # Custom config
+mcpls                                      # stdio transport (default)
+mcpls --log-level debug                    # verbose output
+mcpls --config ./mcpls.toml               # custom config
+mcpls --listen 127.0.0.1:3000             # HTTP transport (transport-http feature)
 ```
 
 ## Configuration
 
 > [!NOTE]
-> Configuration auto-discovery order: `$MCPLS_CONFIG` → `./mcpls.toml` → platform config dir
+> Configuration auto-discovery order: `$MCPLS_CONFIG` → `./mcpls.toml` (requires
+> `--trust-project-config`) → platform config dir
 > Auto-creates default config with 30 language mappings on first run.
 
+> [!WARNING]
+> A `./mcpls.toml` in the current directory is ignored by default, since it can
+> control which command mcpls spawns as an LSP server. Pass `--trust-project-config`
+> (or set `MCPLS_TRUST_PROJECT_CONFIG=true`) only for repositories you trust.
+
 Create or edit `mcpls.toml` in the appropriate location:
-- **Linux/macOS:** `~/.config/mcpls/mcpls.toml`
-- **macOS (alternative):** `~/Library/Application Support/mcpls/mcpls.toml`
+- **Linux:** `~/.config/mcpls/mcpls.toml` (or `$XDG_CONFIG_HOME/mcpls/mcpls.toml`)
+- **macOS:** `~/Library/Application Support/mcpls/mcpls.toml`
 - **Windows:** `%APPDATA%\mcpls\mcpls.toml`
 
 See the main [README](../../README.md) for configuration examples and custom extension mapping.
 
 ## Options
 
-| Flag | Description |
-|------|-------------|
-| `-c, --config <PATH>` | Configuration file path |
-| `-l, --log-level <LEVEL>` | trace, debug, info, warn, error |
-| `--log-json` | JSON-formatted logs for tooling |
+| Flag | Env | Description |
+|------|-----|-------------|
+| `-c, --config <PATH>` | `MCPLS_CONFIG` | Configuration file path |
+| `--trust-project-config` | `MCPLS_TRUST_PROJECT_CONFIG` | Load a `./mcpls.toml` found in the current directory |
+| `-l, --log-level <LEVEL>` | `MCPLS_LOG` | trace, debug, info, warn, error (default: info) |
+| `--log-json` | `MCPLS_LOG_JSON` | JSON-formatted logs for tooling |
+| `--listen <ADDR>` | `MCPLS_LISTEN` | Bind address for HTTP transport (`transport-http` feature) |
+| `--http-path <PATH>` | `MCPLS_HTTP_PATH` | URL prefix for HTTP transport (default: `/mcp`) |
+
+> [!NOTE]
+> `MCPLS_TRUST_PROJECT_CONFIG` and `MCPLS_LOG_JSON` accept `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).
 
 ## Claude Code Integration
 

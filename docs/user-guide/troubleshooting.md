@@ -7,6 +7,7 @@ Common issues and solutions when using mcpls.
 - [Installation Issues](#installation-issues)
 - [Claude Code Integration](#claude-code-integration)
 - [LSP Server Issues](#lsp-server-issues)
+  - [External file changes](#external-file-changes)
 - [Configuration Issues](#configuration-issues)
 - [Performance Issues](#performance-issues)
 - [Common Error Messages](#common-error-messages)
@@ -42,10 +43,10 @@ which mcpls
 
 **Solution**:
 ```bash
-# Update to Rust 1.85 or later
+# Update to Rust 1.88 or later
 rustup update stable
 rustc --version
-# Should output: rustc 1.85.0 or higher
+# Should output: rustc 1.88.0 or higher
 ```
 
 **Problem**: Missing build dependencies
@@ -83,8 +84,8 @@ cargo install --path crates/mcpls-cli
 **Checklist**:
 1. Verify mcpls is installed: `mcpls --version`
 2. Check MCP configuration file exists
-   - macOS/Linux: `~/.claude/mcp.json`
-   - Windows: `%APPDATA%\Claude\mcp.json`
+   - macOS/Linux: `~/.claude/claude_desktop_config.json`
+   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 3. Verify JSON syntax is valid (no trailing commas)
 4. Restart Claude Code completely (quit and reopen)
 5. Check Claude Code logs for errors
@@ -173,7 +174,10 @@ pyright --version
 typescript-language-server --version
 ```
 
-3. Configure in `~/.config/mcpls/mcpls.toml` if needed (Rust works zero-config)
+3. Configure in your platform's config directory if needed (Rust works zero-config):
+   - Linux: `~/.config/mcpls/mcpls.toml` (or `$XDG_CONFIG_HOME/mcpls/mcpls.toml`)
+   - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+   - Windows: `%APPDATA%\mcpls\mcpls.toml`
 
 ---
 
@@ -185,7 +189,11 @@ typescript-language-server --version
 
 **Solution**:
 
-Create `~/.config/mcpls/mcpls.toml`:
+Create a config file in your platform's config directory:
+- Linux: `~/.config/mcpls/mcpls.toml` (or `$XDG_CONFIG_HOME/mcpls/mcpls.toml`)
+- macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+- Windows: `%APPDATA%\mcpls\mcpls.toml`
+
 ```toml
 [[lsp_servers]]
 language_id = "python"
@@ -209,24 +217,49 @@ mcpls --log-level debug
 - Large projects time out
 - Tools return timeout errors
 
-**Solution 1**: Increase timeout in configuration:
+**Note**: `timeout_seconds` only bounds the initial `initialize` handshake -
+it does **not** affect the timeout on individual tool-call requests (hover,
+definition, references, etc.); use `request_timeout_seconds` for that (see
+Solution 2). A tool call that triggers a server respawn (the previous process
+had died) costs `timeout_seconds + (4 * request_timeout_seconds + 3.5 s)` in
+the worst case, since the `initialize` handshake runs again before the
+request itself is retried. If a server needs minutes to load a large
+solution, Solution 1 below is what helps; while it's still initializing, tool
+calls for that language return a "server is still initializing - wait and
+retry" message rather than a hard "no server configured" error. If requests
+are timing out *after* initialization completes, Solution 2, 3, or 4 are the
+relevant fixes.
+
+**Solution 1**: Increase the `initialize` handshake timeout:
 ```toml
 [[lsp_servers]]
 language_id = "rust"
 command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
-timeout_seconds = 120  # Increase from default 30
+timeout_seconds = 120  # Give a slow `initialize` handshake more time
 ```
 
-**Solution 2**: Wait for initial indexing to complete:
+**Solution 2**: Increase the per-request timeout:
+```toml
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+request_timeout_seconds = 60  # Give slow tool-call requests more time
+```
+Note that `textDocument/completion` requests are capped at 10 s regardless of
+this setting - completions cannot be raised above that ceiling today.
+
+**Solution 3**: Wait for initial indexing to complete:
 ```bash
 # rust-analyzer needs time to index on first run
 # Monitor with debug logging
 mcpls --log-level debug
 ```
 
-**Solution 3**: Reduce workspace size:
+**Solution 4**: Reduce workspace size:
 ```toml
 [workspace]
 # Limit to active project only
@@ -308,6 +341,19 @@ npm update -g pyright
 
 ---
 
+### External file changes
+
+**Behavior**: mcpls detects when an open file changes on disk outside of its own tool calls — `git checkout`/`stash`, a formatter, or an external editor — and automatically resynchronizes the language server, so hover/diagnostics/completion results reflect the new content on the next tool call. No restart is needed for this common case.
+
+**Two cases are not covered**:
+
+- A tool that restores a file with an *identical* size and an mtime equal to the last one mcpls observed (e.g. `tar x`, `rsync -a`, `cp -p`) is indistinguishable from "unchanged", no matter how long ago that mtime/size were last recorded — this is not limited to a short window right after the file was read. Detecting this reliably would require hashing file content on every tool call, which mcpls does not do for performance reasons. **Workaround**: touch the file (`touch <file>`) or make a trivial edit to force a size or timestamp change, or restart mcpls.
+- `workspace_symbol_search` is served from the language server's own workspace-wide index rather than from a single tracked document, so it stays unaffected by (and unhelped by) this mechanism for files mcpls has never opened. Re-run the language server's own indexing if its results seem stale.
+
+**Diagnostics semantics**: because a resync never closes and reopens the document, `get_cached_diagnostics` keeps returning the last-known diagnostics for the file until the language server finishes re-analyzing it and publishes fresh ones — there is no transient window where diagnostics appear empty.
+
+---
+
 ## Configuration Issues
 
 ### "Configuration file not found"
@@ -332,9 +378,30 @@ mcpls
 ```
 
 **Solution 3**: Place in default location:
+
+On Linux:
 ```bash
 mkdir -p ~/.config/mcpls
 cp mcpls.toml ~/.config/mcpls/
+```
+
+On macOS:
+```bash
+mkdir -p ~/Library/Application\ Support/mcpls
+cp mcpls.toml ~/Library/Application\ Support/mcpls/
+```
+
+On Windows (PowerShell):
+```powershell
+New-Item -Type Directory -Path "$env:APPDATA\mcpls" -Force
+Copy-Item mcpls.toml "$env:APPDATA\mcpls\"
+```
+
+**Solution 4**: If `mcpls.toml` is in the current directory, it is ignored by
+default and a warning is logged (`mcpls --log-level warn` shows it). Opt in
+explicitly:
+```bash
+mcpls --trust-project-config
 ```
 
 ### "Invalid configuration: missing field"
@@ -436,10 +503,10 @@ files.excludeDirs = ["target", "node_modules", ".git", "dist"]
 
 **Solutions**:
 
-1. **Increase timeout**:
+1. **Increase the per-request timeout** (this is what bounds tool calls, not `timeout_seconds`):
 ```toml
 [[lsp_servers]]
-timeout_seconds = 60
+request_timeout_seconds = 60
 ```
 
 2. **Pre-warm LSP server**:
@@ -573,9 +640,14 @@ rustc --version
 uname -a  # OS info
 ```
 
-3. **Verify configuration**:
+3. **Verify configuration** (replace path with your platform's config directory):
 ```bash
+# Linux:
 cat ~/.config/mcpls/mcpls.toml
+# macOS:
+cat ~/Library/Application\ Support/mcpls/mcpls.toml
+# Windows (PowerShell):
+Get-Content "$env:APPDATA\mcpls\mcpls.toml"
 ```
 
 4. **Test minimal example**:
@@ -619,8 +691,13 @@ rust-analyzer --version  # or other LSP server
 rustc --version
 uname -a
 
-# Configuration
+# Configuration:
+# Linux:
 cat ~/.config/mcpls/mcpls.toml
+# macOS:
+cat ~/Library/Application\ Support/mcpls/mcpls.toml
+# Windows (PowerShell):
+Get-Content "$env:APPDATA\mcpls\mcpls.toml"
 
 # Debug logs (run command that fails)
 mcpls --log-level trace 2>&1 | tee bug-report.log
@@ -679,7 +756,7 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | mcpls
 Watch configuration file:
 ```bash
 # macOS
-fswatch ~/.config/mcpls/mcpls.toml | xargs -n1 echo "Config changed:"
+fswatch ~/Library/Application\ Support/mcpls/mcpls.toml | xargs -n1 echo "Config changed:"
 
 # Linux
 inotifywait -m ~/.config/mcpls/mcpls.toml
@@ -687,13 +764,18 @@ inotifywait -m ~/.config/mcpls/mcpls.toml
 
 ### Network debugging
 
-If using TCP transport (future feature):
+If using HTTP transport (`--listen` flag, requires `transport-http` feature):
 ```bash
-# Monitor network traffic
-tcpdump -i lo0 -A port 8080
+# Start with HTTP transport
+mcpls --listen 127.0.0.1:3000
 
-# Test with netcat
-nc localhost 8080
+# Monitor network traffic
+tcpdump -i lo0 -A port 3000
+
+# Test MCP over HTTP with curl
+curl -X POST http://127.0.0.1:3000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}'
 ```
 
 ---
@@ -718,6 +800,7 @@ mcpls --version
 
 ### Reset configuration
 
+On Linux:
 ```bash
 # Backup existing config
 cp ~/.config/mcpls/mcpls.toml ~/.config/mcpls/mcpls.toml.backup
@@ -730,6 +813,36 @@ command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
 EOF
+```
+
+On macOS:
+```bash
+# Backup existing config
+cp ~/Library/Application\ Support/mcpls/mcpls.toml ~/Library/Application\ Support/mcpls/mcpls.toml.backup
+
+# Start with minimal config
+cat > ~/Library/Application\ Support/mcpls/mcpls.toml <<EOF
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+EOF
+```
+
+On Windows (PowerShell):
+```powershell
+# Backup existing config
+Copy-Item "$env:APPDATA\mcpls\mcpls.toml" "$env:APPDATA\mcpls\mcpls.toml.backup"
+
+# Start with minimal config
+@"
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+"@ | Out-File "$env:APPDATA\mcpls\mcpls.toml" -Encoding UTF8
 ```
 
 ### Check logs

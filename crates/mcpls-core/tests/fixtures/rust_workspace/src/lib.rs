@@ -43,3 +43,62 @@ pub fn has_warning() {
     let unused = 42;
     println!("Hello");
 }
+
+// --- e2e test surface: stable symbols used by ra_e2e test suite ---
+use std::fmt;
+
+/// Adds two integers.
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+/// Calls `add` — used for call hierarchy and reference tests.
+pub fn caller() -> i32 {
+    add(1, 2)
+}
+
+/// A simple point with two coordinates.
+pub struct Point {
+    /// X coordinate.
+    pub x: f64,
+    /// Y coordinate.
+    pub y: f64,
+}
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+/// Previously used for code-action quickfix testing (missing semicolon).
+/// The sub-case now uses structural actions instead; semicolon fixed.
+#[allow(dead_code)]
+pub fn code_action_target() {
+    let _ca_var = 1;
+}
+
+/// Trait used as a code-action trigger.
+///
+/// `CodeActionTarget` below has an empty `impl Greet` — rust-analyzer
+/// reliably offers "Implement missing members" there, a context-free
+/// structural action that does not depend on diagnostic data.
+pub trait Greet {
+    fn hello(&self) -> String;
+}
+
+/// Struct with an empty trait impl for code-action testing.
+#[allow(dead_code)]
+pub struct CodeActionTarget;
+
+// split to multi-line so RA can offer "implement missing members" inside the block
+impl Greet for CodeActionTarget {
+}
+
+/// Stable target for LSP 3.17 sub-cases (signature help, type definition, inlay hints).
+#[allow(dead_code, clippy::let_underscore_untyped)]
+pub fn lsp317_target() {
+    let p = Point { x: 1.0, y: 2.0 };
+    let s = add(1, 2);
+    let _ = (p, s);
+}

@@ -10,11 +10,12 @@
     clippy::unnecessary_unwrap
 )]
 
+use std::path::Path;
 use std::sync::{Arc, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use mcpls_core::bridge::Translator;
-use mcpls_core::config::LspServerConfig;
+use mcpls_core::bridge::{NotificationCache, Translator};
+use mcpls_core::config::{LspServerConfig, ServerId, ToolRouter};
 use mcpls_core::lsp::{LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -41,7 +42,7 @@ fn init_tracing() {
 /// 1. Spawns rust-analyzer process
 /// 2. Initializes the LSP server
 /// 3. Creates and configures a Translator
-/// 4. Returns the translator wrapped in Arc<Mutex>
+/// 4. Returns the translator wrapped in `Arc<Mutex>`
 async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
     init_tracing();
     let workspace_path = rust_workspace_path();
@@ -54,13 +55,18 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         file_patterns: vec!["**/*.rs".to_string()],
         initialization_options: None,
         timeout_seconds: 30,
+        request_timeout_seconds: 30,
         heuristics: None,
+        name: None,
+        handles: None,
     };
 
     let server_init_config = ServerInitConfig {
         server_config: lsp_config,
         workspace_roots: vec![workspace_path.clone()],
         initialization_options: None,
+        position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+        notification_tx: None,
     };
 
     let server = LspServer::spawn(server_init_config)
@@ -69,12 +75,72 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
 
     let client = server.client().clone();
 
-    let mut translator = Translator::new();
+    let extension_map = std::collections::HashMap::from([("rs".to_string(), "rust".to_string())]);
+    let mut translator = Translator::new()
+        .with_extensions(extension_map)
+        .with_router(ToolRouter::catch_all([(
+            ServerId::from("rust"),
+            "rust".to_string(),
+        )]));
     translator.set_workspace_roots(vec![workspace_path]);
     translator.register_client("rust".to_string(), client);
     translator.register_server("rust".to_string(), server);
 
     Arc::new(Mutex::new(translator))
+}
+
+/// Poll hover on the `add` function until rust-analyzer returns consistent results.
+///
+/// Requires 3 consecutive successful hover responses that contain "fn add" and
+/// "i32" before declaring RA ready. This mirrors the approach in `ra_e2e.rs` and
+/// is more reliable than waiting for `publishDiagnostics`, which can arrive before
+/// type-checking is complete.
+async fn wait_for_indexing_ready(
+    translator: &Arc<Mutex<Translator>>,
+    workspace: &Path,
+    timeout: Duration,
+) {
+    let lib_rs = workspace.join("src/lib.rs");
+    let file_path = lib_rs.to_string_lossy().to_string();
+    // `pub fn add(` is on line 51; 'a' of "add" is at column 8 (1-based).
+    let add_line: u32 = 51;
+    let add_col: u32 = 8;
+
+    let deadline = Instant::now() + timeout;
+    let required_consecutive: u32 = 3;
+    let mut consecutive = 0u32;
+
+    loop {
+        if Instant::now() >= deadline {
+            tracing::warn!("Timed out waiting for rust-analyzer readiness");
+            return;
+        }
+
+        let hover_result = translator
+            .lock()
+            .await
+            .handle_hover(file_path.clone(), add_line, add_col)
+            .await;
+
+        match hover_result {
+            Ok(result) => {
+                let text = serde_json::to_string(&result).unwrap_or_default();
+                if text.contains("fn add") && text.contains("i32") {
+                    consecutive += 1;
+                    if consecutive >= required_consecutive {
+                        return;
+                    }
+                } else {
+                    consecutive = 0;
+                }
+            }
+            Err(_) => {
+                consecutive = 0;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 #[tokio::test]
@@ -90,7 +156,7 @@ async fn test_hover_on_std_vec() {
     let file_path = workspace_path.join("src/lib.rs");
 
     // Give rust-analyzer time to index the workspace
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Hover over "String" in User struct (line 20)
     // The line is: `pub name: String,`
@@ -135,7 +201,7 @@ async fn test_hover_on_u64_type() {
     let workspace_path = rust_workspace_path();
     let file_path = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Hover over "u64" in User struct (line 19)
     // The line is: `pub id: u64,`
@@ -144,7 +210,7 @@ async fn test_hover_on_u64_type() {
         translator.lock().await.handle_hover(
             file_path.to_string_lossy().to_string(),
             19,
-            17, // Position on "u64"
+            13, // Position on "u64"
         ),
     )
     .await;
@@ -176,7 +242,7 @@ async fn test_definition_user_struct() {
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Go to definition of User in types.rs (line 9, owner: User)
     // The line is: `pub owner: User,`
@@ -185,7 +251,7 @@ async fn test_definition_user_struct() {
         translator.lock().await.handle_definition(
             types_file.to_string_lossy().to_string(),
             9,
-            20, // Position on "User"
+            16, // Position on "User"
         ),
     )
     .await;
@@ -221,7 +287,7 @@ async fn test_definition_across_files() {
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Go to definition of Repository in functions.rs (line 3, use statement)
     // The line is: `use crate::types::Repository;`
@@ -262,7 +328,7 @@ async fn test_references_create_repo_function() {
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Find references to create_repo function (line 7, function name)
     // The line is: `pub fn create_repo(name: &str) -> Repository {`
@@ -306,7 +372,7 @@ async fn test_references_user_struct() {
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Find references to User struct (line 18, struct name)
     // The line is: `pub struct User {`
@@ -348,15 +414,18 @@ async fn test_diagnostics_with_error() {
     let lib_file = workspace_path.join("src/lib.rs");
 
     // Give rust-analyzer extra time to analyze and generate diagnostics
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
-    // Get diagnostics from lib.rs (has intentional error on line 37)
+    // Get diagnostics from lib.rs (has intentional error on line 37). No
+    // push notifications are captured in this harness, so the cache is
+    // empty and handle_diagnostics falls back to the pull-only result.
+    let notification_cache = Mutex::new(NotificationCache::new());
     let result = timeout(
         Duration::from_secs(10),
         translator
             .lock()
             .await
-            .handle_diagnostics(lib_file.to_string_lossy().to_string()),
+            .handle_diagnostics(lib_file.to_string_lossy().to_string(), &notification_cache),
     )
     .await;
 
@@ -391,15 +460,16 @@ async fn test_diagnostics_no_errors() {
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Get diagnostics from types.rs (should have no errors)
+    let notification_cache = Mutex::new(NotificationCache::new());
     let result = timeout(
         Duration::from_secs(10),
-        translator
-            .lock()
-            .await
-            .handle_diagnostics(types_file.to_string_lossy().to_string()),
+        translator.lock().await.handle_diagnostics(
+            types_file.to_string_lossy().to_string(),
+            &notification_cache,
+        ),
     )
     .await;
 
@@ -436,7 +506,7 @@ async fn test_document_symbols() {
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Get document symbols from lib.rs
     let result = timeout(
@@ -493,7 +563,7 @@ async fn test_document_symbols_types_file() {
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Get document symbols from types.rs
     let result = timeout(
@@ -539,7 +609,7 @@ async fn test_completions_basic() {
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Get completions in functions.rs
     // Position after "repo." on line 23 (repo.get_owner().name)
@@ -548,7 +618,7 @@ async fn test_completions_basic() {
         translator.lock().await.handle_completions(
             functions_file.to_string_lossy().to_string(),
             23,
-            10, // Position after "repo."
+            11, // Position after "repo."
             None,
         ),
     )
@@ -557,14 +627,17 @@ async fn test_completions_basic() {
     assert!(result.is_ok(), "Should not timeout");
     let completions_result = result.unwrap();
 
-    // Completions might not always be available depending on timing
-    if completions_result.is_ok() {
-        let completions_json = completions_result.unwrap();
+    // Completions might not always be available depending on timing, so only assert
+    // on content when the call actually succeeded.
+    if let Ok(completions_json) = completions_result {
         let completions_str = serde_json::to_string(&completions_json).unwrap();
-
-        // If we got completions, they should include Repository fields/methods
-        // This is a soft check since completion can be timing-sensitive
-        println!("Completions: {}", completions_str);
+        assert!(
+            completions_str.contains("get_owner")
+                || completions_str.contains("name")
+                || completions_str.contains("stars"),
+            "Completions should include Repository fields/methods, got: {}",
+            completions_str
+        );
     }
 }
 
@@ -580,7 +653,7 @@ async fn test_format_document() {
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Request document formatting
     let result = timeout(
@@ -647,8 +720,6 @@ async fn test_invalid_file_path() {
 
     let translator = setup_rust_analyzer().await;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
     // Try to get hover on non-existent file
     let result = translator
         .lock()
@@ -672,7 +743,7 @@ async fn test_out_of_bounds_position() {
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Try to get hover at an extremely large line number
     let result = timeout(
@@ -706,7 +777,7 @@ async fn test_workspace_symbol_search_basic() {
     let translator = setup_rust_analyzer().await;
 
     // Give rust-analyzer time to index the workspace
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Search for "User" struct
     let result = timeout(
@@ -751,7 +822,7 @@ async fn test_workspace_symbol_search_with_kind_filter() {
 
     let translator = setup_rust_analyzer().await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Search for symbols and filter by Struct kind
     let result = timeout(
@@ -790,7 +861,7 @@ async fn test_workspace_symbol_search_max_results() {
 
     let translator = setup_rust_analyzer().await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Search with very low limit
     let result = timeout(
@@ -824,7 +895,7 @@ async fn test_workspace_symbol_search_function() {
 
     let translator = setup_rust_analyzer().await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
     // Search for function symbols
     let result = timeout(

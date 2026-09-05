@@ -8,22 +8,64 @@
 //! 5. Graceful shutdown sequence
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::str::FromStr;
 
 use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
-    InitializedParams, PositionEncodingKind, ServerCapabilities, Uri, WorkspaceFolder,
+    InitializedParams, PositionEncodingKind, ServerCapabilities, WorkspaceFolder,
 };
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::config::LspServerConfig;
+use crate::bridge::try_path_to_uri;
+use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::LspClient;
 use crate::lsp::transport::LspTransport;
+use crate::lsp::types::LspNotification;
+
+/// Environment variables passed through to a spawned LSP server even though
+/// its environment is otherwise cleared.
+///
+/// `PATH` lets the server resolve its own toolchain (e.g. rustup shims, venv
+/// binaries); `HOME`/`USERPROFILE` and `TMPDIR`/`TEMP`/`TMP` let it find user
+/// config/cache and scratch directories.
+///
+/// This list is not exhaustive: session-specific values that cannot be
+/// hardcoded into a static [`LspServerConfig::env`] table (e.g.
+/// `SSH_AUTH_SOCK`, which changes every login session) have no way through
+/// today. See [`LspServerConfig::env`] for the config-level override/addition
+/// mechanism this list feeds into.
+const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"];
+
+/// Upper bound [`LspServer::shutdown`] waits for the child process to exit on
+/// its own after sending the LSP `exit` notification, before falling back to
+/// `kill_on_drop`.
+const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// Windows-only additions to [`ENV_PASSTHROUGH`].
+///
+/// `SystemRoot`/`SystemDrive`/`windir` are required by the Windows process
+/// loader itself; `APPDATA`/`LOCALAPPDATA` are read by the Node-based default
+/// servers (pyright, typescript-language-server) for global config and
+/// cache; the rest are conventionally expected by Windows child processes.
+#[cfg(windows)]
+const ENV_PASSTHROUGH_WINDOWS: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "COMSPEC",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "USERNAME",
+];
 
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +105,27 @@ pub struct ServerInitConfig {
     pub workspace_roots: Vec<PathBuf>,
     /// Initialization options (server-specific JSON).
     pub initialization_options: Option<serde_json::Value>,
+    /// Position encoding preference order from
+    /// [`crate::config::WorkspaceConfig::position_encodings`].
+    ///
+    /// Sent as `capabilities.general.positionEncodings` during [`LspServer::spawn`]'s
+    /// `initialize` handshake, in the configured order. Values that don't parse
+    /// as a valid [`PositionEncodingKind`] are skipped with a warning rather than
+    /// failing the handshake: `serve`/`serve_with` validate the top-level
+    /// `ServerConfig` via [`crate::config::ServerConfig::validate`] before this
+    /// is ever built, but `LspServer::spawn`/`spawn_batch` are `pub` and
+    /// reachable directly by a library embedder bypassing that validation
+    /// entirely (same reasoning as the `initialize` timeout clamp below), so
+    /// this can't assume the value was already checked. If nothing parses,
+    /// falls back to `config::default_position_encodings()`'s default.
+    pub position_encodings: Vec<String>,
+    /// Optional channel for forwarding LSP notifications to the notification cache.
+    ///
+    /// When `Some`, the spawned LSP client sends every notification it receives
+    /// (publishDiagnostics, logMessage, showMessage, …) through this sender.
+    /// The caller is responsible for draining the corresponding receiver and
+    /// storing entries in [`crate::bridge::NotificationCache`].
+    pub notification_tx: Option<mpsc::Sender<LspNotification>>,
 }
 
 /// Result of attempting to spawn multiple LSP servers.
@@ -90,8 +153,8 @@ pub struct ServerInitConfig {
 /// ```
 #[derive(Debug)]
 pub struct ServerInitResult {
-    /// Successfully initialized servers (`language_id` -> server).
-    pub servers: HashMap<String, LspServer>,
+    /// Successfully initialized servers, keyed by routing identity.
+    pub servers: HashMap<ServerId, LspServer>,
     /// Failures that occurred during spawn attempts.
     pub failures: Vec<ServerSpawnFailure>,
 }
@@ -139,15 +202,15 @@ impl ServerInitResult {
 
     /// Get the number of failures.
     #[must_use]
-    pub fn failure_count(&self) -> usize {
+    pub const fn failure_count(&self) -> usize {
         self.failures.len()
     }
 
     /// Add a successful server.
     ///
-    /// If a server with the same `language_id` already exists, it will be replaced.
-    pub fn add_server(&mut self, language_id: String, server: LspServer) {
-        self.servers.insert(language_id, server);
+    /// If a server with the same [`ServerId`] already exists, it will be replaced.
+    pub fn add_server(&mut self, id: impl Into<ServerId>, server: LspServer) {
+        self.servers.insert(id.into(), server);
     }
 
     /// Add a failure.
@@ -167,9 +230,17 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
-    /// Child process handle. Kept alive for process lifetime management.
-    /// When dropped, the process is terminated via SIGKILL (`kill_on_drop`).
-    _child: tokio::process::Child,
+    /// Receiver for push notifications from the LSP server.
+    ///
+    /// Extract this before registering the server to receive real-time
+    /// notifications (e.g., `textDocument/publishDiagnostics`, `$/progress`).
+    pub notification_rx: mpsc::Receiver<LspNotification>,
+    /// Child process handle. Kept alive for process lifetime management and
+    /// queried by [`Self::has_exited`] to detect a crash. [`LspServer::shutdown`]
+    /// waits for it to exit after sending `exit`; otherwise, or if that wait
+    /// times out, dropping it terminates the process via SIGKILL
+    /// (`kill_on_drop`).
+    child: tokio::process::Child,
 }
 
 impl std::fmt::Debug for LspServer {
@@ -178,12 +249,23 @@ impl std::fmt::Debug for LspServer {
             .field("client", &self.client)
             .field("capabilities", &self.capabilities)
             .field("position_encoding", &self.position_encoding)
-            .field("_child", &"<process>")
+            .field("notification_rx", &"<channel>")
+            .field("child", &"<process>")
             .finish()
     }
 }
 
 impl LspServer {
+    /// Take the notification receiver out of this server, replacing it with a dummy channel.
+    ///
+    /// Use this to extract the receiver for a background pump task before registering
+    /// the server with the translator. After this call, the server's `notification_rx`
+    /// will never receive messages.
+    pub fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
+        let (_, dummy) = tokio::sync::mpsc::channel(1);
+        std::mem::replace(&mut self.notification_rx, dummy)
+    }
+
     /// Spawn and initialize LSP server.
     ///
     /// This performs the complete initialization sequence:
@@ -204,17 +286,36 @@ impl LspServer {
             config.server_config.command, config.server_config.args
         );
 
-        let mut child = Command::new(&config.server_config.command)
-            .args(&config.server_config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| Error::ServerSpawnFailed {
-                command: config.server_config.command.clone(),
-                source: e,
-            })?;
+        let mut command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
+
+        // Log allowlist presence and an override count only — never the
+        // configured keys themselves, since `config.server_config.env` may
+        // hold secret-bearing names (e.g. `AWS_SECRET_ACCESS_KEY`) whose
+        // mere presence in a debug log would be its own disclosure.
+        let passthrough_present = {
+            let base = ENV_PASSTHROUGH
+                .iter()
+                .filter(|key| std::env::var_os(key).is_some())
+                .count();
+            #[cfg(windows)]
+            let windows = ENV_PASSTHROUGH_WINDOWS
+                .iter()
+                .filter(|key| std::env::var_os(key).is_some())
+                .count();
+            #[cfg(not(windows))]
+            let windows = 0;
+            base + windows
+        };
+        debug!(
+            "Effective LSP server env: {passthrough_present} allowlisted key(s) present, \
+             {} configured override(s) applied",
+            config.server_config.env.len()
+        );
+
+        let mut child = command.spawn().map_err(|e| Error::ServerSpawnFailed {
+            command: config.server_config.command.clone(),
+            source: e,
+        })?;
 
         let stdin = child
             .stdin
@@ -226,7 +327,12 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
-        let client = LspClient::from_transport(config.server_config.clone(), transport);
+        let (notification_tx, notification_rx) = mpsc::channel(64);
+        let client = LspClient::from_transport_with_notifications(
+            config.server_config.clone(),
+            transport,
+            notification_tx,
+        );
 
         let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
 
@@ -236,13 +342,53 @@ impl LspServer {
             client,
             capabilities,
             position_encoding,
-            _child: child,
+            notification_rx,
+            child,
         })
+    }
+
+    /// Build the child `Command` for a spawned LSP server, without spawning it.
+    ///
+    /// The child's environment is cleared, then [`ENV_PASSTHROUGH`] (plus
+    /// [`ENV_PASSTHROUGH_WINDOWS`] under `cfg(windows)`) is copied in from
+    /// `parent_env` for whichever of those keys it returns `Some` for, then
+    /// `config.env` is applied last so it can override any passthrough
+    /// value. `parent_env` is injected (production passes
+    /// `std::env::var_os`) so tests can supply a fixed environment without
+    /// racing on real process-global state.
+    fn build_command(
+        config: &LspServerConfig,
+        parent_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Command {
+        let mut command = Command::new(&config.command);
+        command.args(&config.args).env_clear();
+
+        for key in ENV_PASSTHROUGH {
+            if let Some(value) = parent_env(key) {
+                command.env(key, value);
+            }
+        }
+        #[cfg(windows)]
+        for key in ENV_PASSTHROUGH_WINDOWS {
+            if let Some(value) = parent_env(key) {
+                command.env(key, value);
+            }
+        }
+
+        command
+            .envs(&config.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        command
     }
 
     /// Perform LSP initialization handshake.
     ///
     /// Sends initialize request and waits for response, then sends initialized notification.
+    #[allow(clippy::too_many_lines)]
     async fn initialize(
         client: &LspClient,
         config: &ServerInitConfig,
@@ -252,29 +398,7 @@ impl LspServer {
         let workspace_folders: Vec<WorkspaceFolder> = config
             .workspace_roots
             .iter()
-            .map(|root| {
-                let path_str = root.to_str().ok_or_else(|| {
-                    let root_display = root.display();
-                    Error::InvalidUri(format!("Invalid UTF-8 in path: {root_display}"))
-                })?;
-                let uri_str = if cfg!(windows) {
-                    format!("file:///{}", path_str.replace('\\', "/"))
-                } else {
-                    format!("file://{path_str}")
-                };
-                let uri = Uri::from_str(&uri_str).map_err(|_| {
-                    let root_display = root.display();
-                    Error::InvalidUri(format!("Invalid workspace root: {root_display}"))
-                })?;
-                Ok(WorkspaceFolder {
-                    uri,
-                    name: root
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("workspace")
-                        .to_string(),
-                })
-            })
+            .map(|root| workspace_folder(root))
             .collect::<Result<Vec<_>>>()?;
 
         let params = InitializeParams {
@@ -284,10 +408,9 @@ impl LspServer {
             initialization_options: config.initialization_options.clone(),
             capabilities: ClientCapabilities {
                 general: Some(GeneralClientCapabilities {
-                    position_encodings: Some(vec![
-                        PositionEncodingKind::UTF8,
-                        PositionEncodingKind::UTF16,
-                    ]),
+                    position_encodings: Some(resolve_position_encodings(
+                        &config.position_encodings,
+                    )),
                     ..Default::default()
                 }),
                 text_document: Some(lsp_types::TextDocumentClientCapabilities {
@@ -310,6 +433,33 @@ impl LspServer {
                     references: Some(lsp_types::ReferenceClientCapabilities {
                         dynamic_registration: Some(false),
                     }),
+                    code_action: Some(lsp_types::CodeActionClientCapabilities {
+                        dynamic_registration: Some(false),
+                        data_support: Some(true),
+                        resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
+                            properties: vec!["edit".to_string()],
+                        }),
+                        // Declare supported action kinds so the server returns
+                        // CodeAction objects (not just legacy Command objects).
+                        code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
+                            code_action_kind: lsp_types::CodeActionKindLiteralSupport {
+                                value_set: [
+                                    lsp_types::CodeActionKind::EMPTY,
+                                    lsp_types::CodeActionKind::QUICKFIX,
+                                    lsp_types::CodeActionKind::REFACTOR,
+                                    lsp_types::CodeActionKind::REFACTOR_EXTRACT,
+                                    lsp_types::CodeActionKind::REFACTOR_INLINE,
+                                    lsp_types::CodeActionKind::REFACTOR_REWRITE,
+                                    lsp_types::CodeActionKind::SOURCE,
+                                    lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                                ]
+                                .iter()
+                                .map(|k| k.as_str().to_string())
+                                .collect(),
+                            },
+                        }),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
@@ -326,8 +476,29 @@ impl LspServer {
             ..Default::default()
         };
 
+        // Use the server's configured timeout for the initialize handshake too,
+        // not a hardcoded 30s: large solutions (e.g. a 130-project Unity .sln via
+        // OmniSharp) take minutes to respond to `initialize`.
         let result: InitializeResult = client
-            .request("initialize", params, Duration::from_secs(30))
+            .request(
+                "initialize",
+                params,
+                // Clamped for the same reason as `LspClient::request_timeout`:
+                // `serve()`/`serve_with()` now validate the top-level
+                // `ServerConfig` via `ServerConfig::validate()`, but this call
+                // operates on the per-server `config.server_config` reached
+                // through `LspServer::spawn`/`spawn_batch`, which bypass that
+                // top-level validation entirely, so an out-of-range value (0,
+                // or an unbounded one that would silently disable the timeout
+                // via tokio's `Instant::far_future()` fallback) is still
+                // reachable here and needs a last-line-of-defense clamp.
+                Duration::from_secs(
+                    config
+                        .server_config
+                        .timeout_seconds
+                        .clamp(1, crate::config::MAX_TIMEOUT_SECONDS),
+                ),
+            )
             .await
             .map_err(|e| Error::LspInitFailed {
                 message: format!("Initialize request failed: {e}"),
@@ -372,25 +543,68 @@ impl LspServer {
         &self.client
     }
 
-    /// Shutdown server gracefully.
+    /// Non-blocking check for whether the child process has already exited.
     ///
-    /// Sends shutdown request, waits for response, then sends exit notification.
+    /// Uses [`tokio::process::Child::try_wait`], which never blocks waiting
+    /// for the process: `true` means it is gone (crashed, killed, or exited
+    /// on its own), and any [`LspClient`] obtained from [`Self::client`] is
+    /// now permanently disconnected -- new requests through it fail with
+    /// [`crate::error::Error::ServerTerminated`]. Callers that want to
+    /// recover substitute a freshly [`Self::spawn`]ed replacement.
     ///
     /// # Errors
     ///
-    /// Returns an error if shutdown sequence fails.
+    /// Returns an error if the OS fails to report the process's status.
+    pub fn has_exited(&mut self) -> Result<bool> {
+        Ok(self.child.try_wait()?.is_some())
+    }
+
+    /// Shutdown server gracefully.
+    ///
+    /// Sends the LSP `shutdown` request, waits for the response, sends the
+    /// `exit` notification, then waits up to a fixed grace period for the
+    /// child process to exit on its own. If it hasn't by then, or if the
+    /// `shutdown`/`exit` handshake itself fails, the child is simply dropped
+    /// here — `kill_on_drop` terminates it via SIGKILL (a no-op if it has
+    /// already exited).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `shutdown`/`exit` handshake fails. The child
+    /// process is still torn down (gracefully if it exits in time, killed
+    /// otherwise) regardless of whether this returns `Ok` or `Err`.
     pub async fn shutdown(self) -> Result<()> {
         debug!("Shutting down LSP server");
 
-        let _: serde_json::Value = self
-            .client
-            .request("shutdown", serde_json::Value::Null, Duration::from_secs(5))
-            .await?;
+        let handshake: Result<()> = async move {
+            let _: serde_json::Value = self
+                .client
+                .request("shutdown", serde_json::Value::Null, Duration::from_secs(5))
+                .await?;
+            self.client.notify("exit", serde_json::Value::Null).await?;
+            self.client.shutdown().await
+        }
+        .await;
 
-        self.client.notify("exit", serde_json::Value::Null).await?;
+        let mut child = self.child;
+        match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
+            Ok(Ok(status)) => {
+                debug!(
+                    ?status,
+                    "LSP server process exited after `exit` notification"
+                );
+            }
+            Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
+            Err(_) => warn!(
+                timeout = ?CHILD_EXIT_GRACE,
+                "LSP server process did not exit within grace period after `exit` \
+                 notification, killing it"
+            ),
+        }
+        // `child` drops here: `kill_on_drop` kills it if still running, and is a
+        // no-op if `wait()` above already reaped it.
 
-        self.client.shutdown().await?;
-
+        handshake?;
         info!("LSP server shut down successfully");
         Ok(())
     }
@@ -422,11 +636,15 @@ impl LspServer {
     ///         server_config: LspServerConfig::rust_analyzer(),
     ///         workspace_roots: vec![PathBuf::from("/workspace")],
     ///         initialization_options: None,
+    ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+    ///         notification_tx: None,
     ///     },
     ///     ServerInitConfig {
     ///         server_config: LspServerConfig::pyright(),
     ///         workspace_roots: vec![PathBuf::from("/workspace")],
     ///         initialization_options: None,
+    ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+    ///         notification_tx: None,
     ///     },
     /// ];
     ///
@@ -445,6 +663,7 @@ impl LspServer {
         let mut result = ServerInitResult::new();
 
         for config in configs {
+            let server_id = config.server_config.id();
             let language_id = config.server_config.language_id.clone();
             let command = config.server_config.command.clone();
 
@@ -452,18 +671,19 @@ impl LspServer {
                 Ok(server) => {
                     info!(
                         "Successfully spawned LSP server: {} ({})",
-                        language_id, command
+                        server_id, command
                     );
-                    result.add_server(language_id, server);
+                    result.add_server(server_id, server);
                 }
                 Err(e) => {
                     tracing::error!(
                         "Failed to spawn LSP server: {} ({}): {}",
-                        language_id,
+                        server_id,
                         command,
                         e
                     );
                     result.add_failure(ServerSpawnFailure {
+                        server_id,
                         language_id,
                         command,
                         message: e.to_string(),
@@ -476,10 +696,185 @@ impl LspServer {
     }
 }
 
+/// Convert configured position-encoding strings into the ordered
+/// [`PositionEncodingKind`] list offered during the `initialize` handshake.
+///
+/// Values that don't parse are skipped with a warning instead of failing the
+/// handshake (see [`ServerInitConfig::position_encodings`] for why this can't
+/// assume [`crate::config::ServerConfig::validate`] already ran). Falls back
+/// to `config::default_position_encodings()` -- the same default used when
+/// nothing is configured at all -- if no configured value parses.
+fn resolve_position_encodings(configured: &[String]) -> Vec<PositionEncodingKind> {
+    let encodings: Vec<PositionEncodingKind> = configured
+        .iter()
+        .filter_map(|value| {
+            let kind = crate::config::parse_position_encoding(value);
+            if kind.is_none() {
+                warn!(value = %value, "ignoring invalid configured position encoding");
+            }
+            kind
+        })
+        .collect();
+
+    if encodings.is_empty() {
+        crate::config::default_position_encodings()
+            .iter()
+            .filter_map(|value| crate::config::parse_position_encoding(value))
+            .collect()
+    } else {
+        encodings
+    }
+}
+
+/// Build the `workspace/workspaceFolders` entry for one configured root.
+///
+/// Reserved characters have to be percent-encoded here: an unencoded `#`
+/// would truncate the path into a URI fragment, and `[` / `]` are rejected
+/// outright by `Uri`.
+fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
+    let uri = try_path_to_uri(root).ok_or_else(|| {
+        let root_display = root.display();
+        Error::InvalidUri(format!("Invalid workspace root: {root_display}"))
+    })?;
+    Ok(WorkspaceFolder {
+        uri,
+        name: root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace")
+            .to_string(),
+    })
+}
+
+/// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so it
+/// can be registered without a real language server.
+///
+/// `pub` rather than private to this module's own `tests` (`lifecycle` is a
+/// private module, so this stays crate-scoped in practice, per the
+/// `redundant_pub_crate` clippy lint): it constructs `LspServer` via a
+/// struct literal, which only code inside this module can do (all its
+/// fields are private), so this is the one place other modules'
+/// shutdown-path tests (`bridge::translator`, `lib.rs`) can get a real,
+/// registerable `LspServer` from.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub fn fake_lsp_server() -> LspServer {
+    let mock_child = tokio::process::Command::new("echo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mock_stdin = tokio::process::Command::new("cat")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .stdin
+        .take()
+        .unwrap();
+    let mock_stdout = tokio::process::Command::new("echo")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .stdout
+        .take()
+        .unwrap();
+    let transport = LspTransport::new(mock_stdin, mock_stdout);
+    let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
+    let (_, mock_notification_rx) = mpsc::channel(1);
+    LspServer {
+        client,
+        capabilities: lsp_types::ServerCapabilities::default(),
+        position_encoding: PositionEncodingKind::UTF8,
+        notification_rx: mock_notification_rx,
+        child: mock_child,
+    }
+}
+
+#[cfg(test)]
+impl LspServer {
+    /// Construct an `LspServer` fixture carrying the given capabilities, for
+    /// tests elsewhere in the crate that need to drive capability-gated
+    /// dispatch paths in `Translator` without spawning a real language server.
+    ///
+    /// The underlying client and child process are inert placeholders — only
+    /// `capabilities()` is meaningful on the returned value.
+    ///
+    /// Uses `LspClient::new` (uninitialized, no background task) rather than
+    /// `LspClient::from_transport`, so this does not depend on the Tokio
+    /// message loop — only `child`'s spawn needs a Tokio runtime, i.e. an
+    /// async test context (`#[tokio::test]`).
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn new_for_test(capabilities: ServerCapabilities) -> Self {
+        Self::new_for_test_with_encoding(capabilities, PositionEncodingKind::UTF16)
+    }
+
+    /// As [`Self::new_for_test`], but with a caller-chosen negotiated
+    /// encoding -- for tests exercising a non-UTF-16 conversion path (e.g.
+    /// `EncodingCtx`-driven range conversion) without spawning a real
+    /// process.
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn new_for_test_with_encoding(
+        capabilities: ServerCapabilities,
+        position_encoding: PositionEncodingKind,
+    ) -> Self {
+        let child = Command::new("echo")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let client = LspClient::new(LspServerConfig::rust_analyzer());
+        let (_, notification_rx) = mpsc::channel(1);
+
+        Self {
+            client,
+            capabilities,
+            position_encoding,
+            notification_rx,
+            child,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_position_encodings_preserves_configured_order() {
+        let result = resolve_position_encodings(&["utf-32".to_string(), "utf-8".to_string()]);
+        assert_eq!(
+            result,
+            vec![PositionEncodingKind::UTF32, PositionEncodingKind::UTF8]
+        );
+    }
+
+    #[test]
+    fn test_resolve_position_encodings_skips_invalid_and_keeps_valid() {
+        let result = resolve_position_encodings(&["utf-7".to_string(), "utf-16".to_string()]);
+        assert_eq!(result, vec![PositionEncodingKind::UTF16]);
+    }
+
+    #[test]
+    fn test_resolve_position_encodings_falls_back_when_all_invalid() {
+        let result = resolve_position_encodings(&["utf-7".to_string(), "bogus".to_string()]);
+        assert_eq!(
+            result,
+            vec![PositionEncodingKind::UTF8, PositionEncodingKind::UTF16]
+        );
+    }
+
+    #[test]
+    fn test_resolve_position_encodings_falls_back_when_empty() {
+        let result = resolve_position_encodings(&[]);
+        assert_eq!(
+            result,
+            vec![PositionEncodingKind::UTF8, PositionEncodingKind::UTF16]
+        );
+    }
 
     #[test]
     fn test_server_state_ready() {
@@ -497,6 +892,52 @@ mod tests {
     fn test_server_state_initializing() {
         assert!(!ServerState::Initializing.is_ready());
         assert!(!ServerState::Initializing.can_accept_requests());
+    }
+
+    #[test]
+    fn test_workspace_folder_encodes_fragment_char() {
+        // An unencoded `#` parses as a fragment, silently handing the server
+        // the parent directory as its root.
+        #[cfg(windows)]
+        let (root, expected) = (
+            Path::new(r"C:\home\me\dev\#work"),
+            "file:///C:/home/me/dev/%23work",
+        );
+        #[cfg(not(windows))]
+        let (root, expected) = (
+            Path::new("/home/me/dev/#work"),
+            "file:///home/me/dev/%23work",
+        );
+
+        let folder = workspace_folder(root).unwrap();
+
+        assert_eq!(folder.uri.as_str(), expected);
+        assert_eq!(folder.name, "#work");
+    }
+
+    #[test]
+    fn test_workspace_folder_encodes_bracket_chars() {
+        #[cfg(windows)]
+        let (root, expected) = (
+            Path::new(r"C:\home\me\dev\[env]"),
+            "file:///C:/home/me/dev/%5Benv%5D",
+        );
+        #[cfg(not(windows))]
+        let (root, expected) = (
+            Path::new("/home/me/dev/[env]"),
+            "file:///home/me/dev/%5Benv%5D",
+        );
+
+        let folder = workspace_folder(root).unwrap();
+
+        assert_eq!(folder.uri.as_str(), expected);
+        assert_eq!(folder.name, "[env]");
+    }
+
+    #[test]
+    fn test_workspace_folder_rejects_relative_root() {
+        let err = workspace_folder(Path::new("relative/root")).unwrap_err();
+        assert!(matches!(err, Error::InvalidUri(_)), "got {err:?}");
     }
 
     #[test]
@@ -538,6 +979,8 @@ mod tests {
             server_config: LspServerConfig::rust_analyzer(),
             workspace_roots: vec![PathBuf::from("/tmp/workspace")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            notification_tx: None,
         };
 
         #[allow(clippy::redundant_clone)]
@@ -552,6 +995,8 @@ mod tests {
             server_config: LspServerConfig::pyright(),
             workspace_roots: vec![],
             initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            notification_tx: None,
         };
 
         let debug_str = format!("{config:?}");
@@ -585,10 +1030,15 @@ mod tests {
                 file_patterns: vec!["**/*.py".to_string()],
                 initialization_options: Some(init_opts.clone()),
                 timeout_seconds: 10,
+                request_timeout_seconds: 10,
                 heuristics: None,
+                name: None,
+                handles: None,
             },
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            notification_tx: None,
         };
 
         assert!(config.initialization_options.is_some());
@@ -601,6 +1051,8 @@ mod tests {
             server_config: LspServerConfig::typescript(),
             workspace_roots: vec![],
             initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            notification_tx: None,
         };
 
         assert!(config.workspace_roots.is_empty());
@@ -616,9 +1068,59 @@ mod tests {
                 PathBuf::from("/workspace3"),
             ],
             initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            notification_tx: None,
         };
 
         assert_eq!(config.workspace_roots.len(), 3);
+    }
+
+    /// #249: `has_exited` must distinguish a live child from one that has
+    /// already exited, since this is the signal the respawn path relies on
+    /// to detect a crashed LSP server.
+    ///
+    /// Unix-only: spawns a real `sleep` subprocess, which is unavailable on
+    /// the Windows CI runner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_has_exited_reflects_child_process_state() {
+        use lsp_types::ServerCapabilities;
+
+        let mut mock_child = tokio::process::Command::new("sleep")
+            .arg("2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mock_stdin = mock_child.stdin.take().unwrap();
+        let mock_stdout = mock_child.stdout.take().unwrap();
+
+        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let (_, mock_notification_rx) = mpsc::channel(1);
+
+        let mut server = LspServer {
+            client,
+            capabilities: ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            notification_rx: mock_notification_rx,
+            child: mock_child,
+        };
+
+        assert!(
+            !server.has_exited().unwrap(),
+            "freshly spawned `sleep 2` should still be running"
+        );
+
+        server.child.kill().await.unwrap();
+        // `kill().await` waits for the process to actually exit, so the
+        // very next `try_wait` reliably observes it as gone.
+        assert!(
+            server.has_exited().unwrap(),
+            "killed child must report as exited"
+        );
     }
 
     #[tokio::test]
@@ -650,12 +1152,14 @@ mod tests {
 
         let transport = LspTransport::new(mock_stdin, mock_stdout);
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let (_, mock_notification_rx) = mpsc::channel(1);
 
         let server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            _child: mock_child,
+            notification_rx: mock_notification_rx,
+            child: mock_child,
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -689,12 +1193,14 @@ mod tests {
         let mut result = ServerInitResult::new();
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
             message: "not found".to_string(),
         });
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "permission denied".to_string(),
@@ -736,12 +1242,14 @@ mod tests {
 
         let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
+        let (_, mock_notification_rx1) = mpsc::channel(1);
 
         let server1 = LspServer {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            _child: mock_child1,
+            notification_rx: mock_notification_rx1,
+            child: mock_child1,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -782,17 +1290,20 @@ mod tests {
 
         let transport = LspTransport::new(mock_stdin, mock_stdout);
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let (_, mock_notification_rx) = mpsc::channel(1);
 
         let server = LspServer {
             client,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            _child: mock_child,
+            notification_rx: mock_notification_rx,
+            child: mock_child,
         };
 
         result.add_server("rust".to_string(), server);
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "not found".to_string(),
@@ -842,12 +1353,14 @@ mod tests {
                 LspServerConfig::typescript()
             };
             let client = LspClient::from_transport(config.clone(), transport);
+            let (_, mock_notification_rx) = mpsc::channel(1);
 
             let server = LspServer {
                 client,
                 capabilities: lsp_types::ServerCapabilities::default(),
                 position_encoding: PositionEncodingKind::UTF8,
-                _child: mock_child,
+                notification_rx: mock_notification_rx,
+                child: mock_child,
             };
 
             result.add_server(config.language_id, server);
@@ -889,12 +1402,14 @@ mod tests {
 
         let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
+        let (_, mock_notification_rx1) = mpsc::channel(1);
 
         let server1 = LspServer {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            _child: mock_child1,
+            notification_rx: mock_notification_rx1,
+            child: mock_child1,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -925,12 +1440,14 @@ mod tests {
 
         let transport2 = LspTransport::new(mock_stdin2, mock_stdout2);
         let client2 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport2);
+        let (_, mock_notification_rx2) = mpsc::channel(1);
 
         let server2 = LspServer {
             client: client2,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF16,
-            _child: mock_child2,
+            notification_rx: mock_notification_rx2,
+            child: mock_child2,
         };
 
         result.add_server("rust".to_string(), server2);
@@ -942,6 +1459,7 @@ mod tests {
         let mut result = ServerInitResult::new();
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
             message: "not found".to_string(),
@@ -956,12 +1474,14 @@ mod tests {
         let mut result = ServerInitResult::new();
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "not found".to_string(),
         });
 
         result.add_failure(ServerSpawnFailure {
+            server_id: ServerId::from("typescript"),
             language_id: "typescript".to_string(),
             command: "tsserver".to_string(),
             message: "command not found".to_string(),
@@ -996,10 +1516,15 @@ mod tests {
                 file_patterns: vec!["**/*.rs".to_string()],
                 initialization_options: None,
                 timeout_seconds: 10,
+                request_timeout_seconds: 10,
                 heuristics: None,
+                name: None,
+                handles: None,
             },
             workspace_roots: vec![],
             initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            notification_tx: None,
         }];
 
         let result = LspServer::spawn_batch(&configs).await;
@@ -1028,10 +1553,15 @@ mod tests {
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
@@ -1042,10 +1572,15 @@ mod tests {
                     file_patterns: vec!["**/*.py".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
@@ -1056,10 +1591,15 @@ mod tests {
                     file_patterns: vec!["**/*.ts".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
             },
         ];
 
@@ -1093,10 +1633,15 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
@@ -1107,10 +1652,15 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
             },
         ];
 
@@ -1125,6 +1675,175 @@ mod tests {
         assert_eq!(result.failures[1].command, "cmd2-nonexistent");
     }
 
+    /// Wire-level regression test for #287: proves the *configured*
+    /// `position_encodings` (not the old hardcoded `[UTF8, UTF16]`) actually
+    /// reaches `capabilities.general.positionEncodings` in the `initialize`
+    /// request body, by capturing the real bytes `LspServer::initialize`
+    /// writes over a piped `cat` subprocess standing in for the LSP server.
+    /// Mirrors the `fake_lsp_client`/`FakeServer` pattern in
+    /// `client.rs::tests::retry_behavior`.
+    mod initialize_wire {
+        use std::process::Stdio;
+
+        use serde_json::Value;
+        use tempfile::TempDir;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+        use super::*;
+        use crate::lsp::client::LspClient;
+
+        struct FakeServer {
+            _write_half: Child,
+            _read_half: Child,
+            read_half_stdin: ChildStdin,
+            write_stdout: ChildStdout,
+        }
+
+        fn fake_lsp_client() -> (LspClient, FakeServer) {
+            let mut write_half = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let write_stdin = write_half.stdin.take().unwrap();
+            let write_stdout = write_half.stdout.take().unwrap();
+
+            let mut read_half = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let read_stdout = read_half.stdout.take().unwrap();
+            let read_stdin = read_half.stdin.take().unwrap();
+
+            let transport = LspTransport::new(write_stdin, read_stdout);
+            let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+
+            (
+                client,
+                FakeServer {
+                    _write_half: write_half,
+                    _read_half: read_half,
+                    read_half_stdin: read_stdin,
+                    write_stdout,
+                },
+            )
+        }
+
+        /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
+        async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> Value {
+            let mut content_length = None;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((key, value)) = line.trim_end().split_once(':')
+                    && key.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut buf = vec![0u8; content_length.unwrap()];
+            reader.read_exact(&mut buf).await.unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        }
+
+        /// Writes a framed JSON-RPC success response.
+        async fn write_success_response(stdin: &mut ChildStdin, id: &Value, result: Value) {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            });
+            let content = serde_json::to_string(&response).unwrap();
+            let header = format!("Content-Length: {}\r\n\r\n", content.len());
+            stdin.write_all(header.as_bytes()).await.unwrap();
+            stdin.write_all(content.as_bytes()).await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_initialize_sends_configured_position_encodings() {
+            let (client, mut server) = fake_lsp_client();
+
+            let config = ServerInitConfig {
+                server_config: LspServerConfig::rust_analyzer(),
+                workspace_roots: vec![],
+                initialization_options: None,
+                position_encodings: vec!["utf-32".to_string(), "utf-8".to_string()],
+                notification_tx: None,
+            };
+
+            let init_task =
+                tokio::spawn(async move { LspServer::initialize(&client, &config).await });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+
+            assert_eq!(request["method"], "initialize");
+            assert_eq!(
+                request["params"]["capabilities"]["general"]["positionEncodings"],
+                serde_json::json!(["utf-32", "utf-8"]),
+                "initialize request must carry the configured encoding order, not the \
+                 hardcoded [UTF8, UTF16] default"
+            );
+
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                serde_json::json!({ "capabilities": {} }),
+            )
+            .await;
+
+            // The response written above must let `initialize` complete successfully.
+            init_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_initialize_accepts_resolved_dot_workspace_root() {
+            let temp_dir = TempDir::new().unwrap();
+            let base = dunce::canonicalize(temp_dir.path()).unwrap();
+            let workspace_roots =
+                crate::resolve_workspace_roots(&[PathBuf::from(".")], &base).unwrap();
+            assert_eq!(workspace_roots, vec![base.clone()]);
+
+            let (client, mut server) = fake_lsp_client();
+            let config = ServerInitConfig {
+                server_config: LspServerConfig::rust_analyzer(),
+                workspace_roots,
+                initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
+            };
+
+            let init_task =
+                tokio::spawn(async move { LspServer::initialize(&client, &config).await });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let expected_uri = try_path_to_uri(&base).unwrap();
+            assert_eq!(
+                request["params"]["workspaceFolders"][0]["uri"],
+                expected_uri.as_str()
+            );
+
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                serde_json::json!({ "capabilities": {} }),
+            )
+            .await;
+
+            init_task.await.unwrap().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn test_spawn_batch_logs_each_failure() {
         let configs = vec![
@@ -1137,10 +1856,15 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
             },
             ServerInitConfig {
                 server_config: LspServerConfig {
@@ -1151,10 +1875,15 @@ mod tests {
                     file_patterns: vec![],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
             },
         ];
 
@@ -1163,5 +1892,189 @@ mod tests {
         assert_eq!(result.failure_count(), 2);
         assert_eq!(result.failures[0].language_id, "test1");
         assert_eq!(result.failures[1].language_id, "test2");
+    }
+
+    /// Minimal [`LspServerConfig`] for `build_command` tests, where only
+    /// `command`/`args`/`env` matter.
+    fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
+        LspServerConfig {
+            language_id: "test".to_string(),
+            command: "irrelevant-for-build-command".to_string(),
+            args: vec![],
+            env,
+            file_patterns: vec![],
+            initialization_options: None,
+            timeout_seconds: 5,
+            request_timeout_seconds: 5,
+            heuristics: None,
+            name: None,
+            handles: None,
+        }
+    }
+
+    /// Collects the env vars a `Command` would set, resolving `env_clear`
+    /// removals (`None` values from `get_envs`) away so the map reflects
+    /// what the child process would actually see.
+    fn effective_envs(command: &Command) -> HashMap<String, String> {
+        command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Regression test for #236/#246: a spawned LSP server used to inherit
+    /// mcpls's entire environment. `build_command` must only pass through
+    /// `ENV_PASSTHROUGH` keys from `parent_env`, not arbitrary ones.
+    #[test]
+    fn test_build_command_excludes_non_allowlisted_parent_env_vars() {
+        let config = bare_server_config(HashMap::new());
+        let command = LspServer::build_command(&config, |key| match key {
+            "PATH" => Some("/parent/bin".into()),
+            "MCPLS_TEST_LEAK_CANARY" => Some("should-not-reach-child".into()),
+            _ => None,
+        });
+
+        let envs = effective_envs(&command);
+
+        assert!(
+            !envs.contains_key("MCPLS_TEST_LEAK_CANARY"),
+            "non-allowlisted parent env var leaked into child command: {envs:?}"
+        );
+
+        // The assertion above is provably vacuous on its own:
+        // `Command::get_envs()` only reports explicit `.env()`/`.envs()`
+        // modifications and is blind to whether `.env_clear()` was called,
+        // and `build_command`'s passthrough loop never even queries
+        // `parent_env` for a key outside `ENV_PASSTHROUGH`, so it would
+        // pass unchanged even if `.env_clear()` were deleted from
+        // `build_command` entirely. `std::process::Command`'s `Debug` impl
+        // does encode clearing, prefixing the formatted command with
+        // `env -i ` on Unix once `.env_clear()` has run; assert on that to
+        // actually guard against the clear being removed.
+        #[cfg(unix)]
+        assert!(
+            format!("{:?}", command.as_std()).starts_with("env -i "),
+            "build_command must call .env_clear() so the child doesn't inherit the full parent environment"
+        );
+    }
+
+    /// Regression test for #236/#246: allowlisted vars present in the parent
+    /// (e.g. `PATH`) must still reach the child.
+    #[test]
+    fn test_build_command_passes_through_allowlisted_env_vars() {
+        let config = bare_server_config(HashMap::new());
+        let command =
+            LspServer::build_command(&config, |key| (key == "PATH").then(|| "/parent/bin".into()));
+
+        let envs = effective_envs(&command);
+
+        assert_eq!(envs.get("PATH"), Some(&"/parent/bin".to_string()));
+    }
+
+    /// Regression test for #247: `LspServerConfig::env` entries must reach
+    /// the spawned child (previously dead configuration).
+    #[test]
+    fn test_build_command_includes_configured_env_vars() {
+        let mut env = HashMap::new();
+        env.insert(
+            "MCPLS_TEST_CONFIGURED".to_string(),
+            "from-server-config".to_string(),
+        );
+        let config = bare_server_config(env);
+        let command = LspServer::build_command(&config, |_| None);
+
+        let envs = effective_envs(&command);
+
+        assert_eq!(
+            envs.get("MCPLS_TEST_CONFIGURED"),
+            Some(&"from-server-config".to_string())
+        );
+    }
+
+    /// Regression test for #247: a `LspServerConfig::env` entry must be able
+    /// to override an allowlisted passthrough value, since `config.env` is
+    /// applied after the passthrough loop in `build_command`.
+    #[test]
+    fn test_build_command_configured_env_overrides_allowlisted_var() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/configured/override/path".to_string());
+        let config = bare_server_config(env);
+        let command =
+            LspServer::build_command(&config, |key| (key == "PATH").then(|| "/parent/bin".into()));
+
+        let envs = effective_envs(&command);
+
+        assert_eq!(
+            envs.get("PATH"),
+            Some(&"/configured/override/path".to_string())
+        );
+    }
+
+    /// #174 §8/S2 regression: `register_servers`'s diagnostics-cache flags
+    /// must be computed from the *rebound* router, not the pre-rebind view.
+    /// Sets up a `python` config where a narrow "diagnostics-only" server
+    /// (`pyright-diag`) is configured but never actually registers (as if
+    /// it failed to spawn), leaving only a catch-all (`pylsp`) live. Before
+    /// the fix, computing the flags from the pre-rebind router would resolve
+    /// `Diagnostics` to the dead `pyright-diag` for every survivor, so
+    /// `pylsp` would be flagged `false` and the diagnostics cache would go
+    /// silently dark for `python` despite a live server being available.
+    #[tokio::test]
+    async fn test_register_servers_computes_diagnostics_flags_from_rebound_router() {
+        use crate::bridge::Translator;
+        use crate::config::{ServerId, ToolKind, ToolRouter};
+
+        let pylsp_id = ServerId::from("pylsp");
+        let configs = vec![
+            LspServerConfig {
+                language_id: "python".to_string(),
+                command: "pyright-langserver".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 30,
+                request_timeout_seconds: 30,
+                heuristics: None,
+                name: Some("pyright-diag".to_string()),
+                handles: Some(vec![ToolKind::Diagnostics]),
+            },
+            LspServerConfig {
+                language_id: "python".to_string(),
+                command: "pylsp".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 30,
+                request_timeout_seconds: 30,
+                heuristics: None,
+                name: Some("pylsp".to_string()),
+                handles: None,
+            },
+        ];
+        let router = ToolRouter::from_configs(&configs).unwrap();
+        let translator = Translator::new().with_router(router);
+
+        // Only pylsp actually registers; pyright-diag never spawned.
+        let mut result = ServerInitResult::new();
+        result.add_server(pylsp_id.clone(), fake_lsp_server());
+
+        let registered = crate::register_servers(result, &translator, &HashMap::new());
+
+        assert_eq!(
+            registered.diagnostics_flags.get(&pylsp_id),
+            Some(&true),
+            "pylsp must inherit the diagnostics route once pyright-diag is \
+             known dead, and the flag must reflect that post-rebind state"
+        );
     }
 }

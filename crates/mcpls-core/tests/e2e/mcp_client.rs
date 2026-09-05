@@ -29,6 +29,9 @@ pub struct McpClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     request_id: i64,
+    /// Server-pushed notifications (no matching request `id`) collected while
+    /// waiting for a request/response round-trip. Drained via `take_notifications`.
+    pending_notifications: Vec<Value>,
 }
 
 impl McpClient {
@@ -103,7 +106,19 @@ impl McpClient {
             stdin,
             stdout: BufReader::new(stdout),
             request_id: 0,
+            pending_notifications: Vec::new(),
         })
+    }
+
+    /// Drain and return server-pushed notifications collected so far (e.g.
+    /// `notifications/resources/updated`).
+    ///
+    /// Notifications have no JSON-RPC `id` and may arrive interleaved with
+    /// request/response traffic on the same stdout stream; `send_request` queues
+    /// them here instead of misinterpreting them as the response it is waiting for.
+    #[allow(dead_code)]
+    pub fn take_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.pending_notifications)
     }
 
     /// Send MCP initialize request.
@@ -149,6 +164,7 @@ impl McpClient {
     /// - The request cannot be sent
     /// - The response cannot be read or parsed
     /// - The server returns an error response
+    #[allow(dead_code)]
     pub fn list_tools(&mut self) -> Result<Value> {
         let request = json!({
             "jsonrpc": "2.0",
@@ -189,7 +205,75 @@ impl McpClient {
         self.send_request(&request)
     }
 
+    /// List MCP resources (`resources/list`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server returns an error.
+    #[allow(dead_code)]
+    pub fn list_resources(&mut self) -> Result<Value> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "resources/list",
+            "params": {}
+        });
+        self.send_request(&request)
+    }
+
+    /// Read an MCP resource by URI (`resources/read`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server returns an error.
+    #[allow(dead_code)]
+    pub fn read_resource(&mut self, uri: &str) -> Result<Value> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "resources/read",
+            "params": { "uri": uri }
+        });
+        self.send_request(&request)
+    }
+
+    /// Subscribe to a resource (`resources/subscribe`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server returns an error.
+    #[allow(dead_code)]
+    pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "resources/subscribe",
+            "params": { "uri": uri }
+        });
+        self.send_request(&request)
+    }
+
+    /// Unsubscribe from a resource (`resources/unsubscribe`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server returns an error.
+    #[allow(dead_code)]
+    pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "resources/unsubscribe",
+            "params": { "uri": uri }
+        });
+        self.send_request(&request)
+    }
+
     /// Send a raw JSON-RPC request and return the response.
+    ///
+    /// The server may push notifications (e.g. `notifications/resources/updated`)
+    /// on the same stdout stream before writing the response; those are queued into
+    /// `pending_notifications` rather than being mistaken for the response.
     ///
     /// # Errors
     ///
@@ -202,16 +286,37 @@ impl McpClient {
         writeln!(self.stdin, "{request_str}")?;
         self.stdin.flush()?;
 
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .context("failed to read response from mcpls")?;
+        let expected_id = request.get("id").cloned();
 
-        let response: Value =
-            serde_json::from_str(&line).context("failed to parse JSON-RPC response")?;
+        let response = loop {
+            let mut line = String::new();
+            self.stdout
+                .read_line(&mut line)
+                .context("failed to read response from mcpls")?;
+
+            let value: Value =
+                serde_json::from_str(&line).context("failed to parse JSON-RPC message")?;
+
+            if value.get("id") == expected_id.as_ref() {
+                break value;
+            }
+            self.pending_notifications.push(value);
+        };
 
         if let Some(error) = response.get("error") {
             anyhow::bail!("MCP error: {error:?}");
+        }
+
+        // rmcp 1.8.0+: deserialization failures return isError=true inside a successful
+        // tools/call result instead of a JSON-RPC error (PR #894).
+        if response
+            .get("result")
+            .and_then(|r| r.get("isError"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let content = response["result"]["content"].to_string();
+            anyhow::bail!("MCP tool error (isError=true): {content}");
         }
 
         Ok(response)
@@ -243,6 +348,22 @@ impl McpClient {
     fn next_id(&mut self) -> i64 {
         self.request_id += 1;
         self.request_id
+    }
+
+    /// Return the OS process ID of the spawned mcpls process.
+    #[allow(dead_code)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.process.id()
+    }
+
+    /// Non-blocking check for whether the process has exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS query for the process status fails.
+    #[allow(dead_code)]
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.process.try_wait()
     }
 }
 

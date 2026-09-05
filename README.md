@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/mcpls-core?label=mcpls-core)](https://docs.rs/mcpls-core)
 [![CI](https://img.shields.io/github/actions/workflow/status/bug-ops/mcpls/ci.yml?branch=main)](https://github.com/bug-ops/mcpls/actions)
 [![codecov](https://codecov.io/gh/bug-ops/mcpls/graph/badge.svg?token=FQEDLNF2GS)](https://codecov.io/gh/bug-ops/mcpls)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](https://blog.rust-lang.org/2025/05/15/Rust-1.88.0.html)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
 **Stop treating code as text. Give your AI agent a compiler's understanding.**
@@ -28,22 +28,41 @@ AI coding assistants are remarkably capable, but they're working blind. They see
 
 ## Installation
 
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.ps1 | iex
+```
+
+Both scripts detect your OS/architecture, download the matching release archive, verify its SHA256 checksum, and install `mcpls` to a per-user directory (`~/.local/bin` on Linux/macOS, `$HOME\.local\bin` on Windows) — no `sudo`/admin rights required.
+
+<details>
+<summary><strong>Cargo, pre-built binaries & other methods</strong></summary>
+
+**Cargo:**
+
 ```bash
 cargo install mcpls
 ```
 
-<details>
-<summary><strong>Pre-built binaries & other methods</strong></summary>
+**Manual download:**
 
-Download from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest):
+Download the archive matching your platform from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest). Each archive has a corresponding `.sha256` checksum file published alongside it — the install scripts above verify this automatically; verify manually if downloading by hand.
 
-| Platform | Architecture | Download |
-|----------|--------------|----------|
-| Linux | x86_64 | [mcpls-linux-x86_64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
-| Linux | x86_64 (static) | [mcpls-linux-x86_64-musl.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
-| macOS | Intel | [mcpls-macos-x86_64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
-| macOS | Apple Silicon | [mcpls-macos-aarch64.tar.gz](https://github.com/bug-ops/mcpls/releases/latest) |
-| Windows | x86_64 | [mcpls-windows-x86_64.zip](https://github.com/bug-ops/mcpls/releases/latest) |
+| Platform | Architecture | Archive |
+|----------|--------------|---------|
+| Linux | x86_64 | `mcpls-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux | aarch64 | `mcpls-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS | Intel | `mcpls-x86_64-apple-darwin.tar.gz` |
+| macOS | Apple Silicon | `mcpls-aarch64-apple-darwin.tar.gz` |
+| Windows | x86_64 | `mcpls-x86_64-pc-windows-msvc.zip` |
+| Windows | ARM64 | `mcpls-aarch64-pc-windows-msvc.zip` |
 
 **From source:**
 
@@ -66,9 +85,14 @@ rustup component add rust-analyzer
 # Or: brew install rust-analyzer (macOS)
 ```
 
-**Python (pyright):**
+**Python (pyright, built-in default):**
 ```bash
 npm install -g pyright
+```
+
+**Python ([ty](https://docs.astral.sh/ty/), with custom configuration):**
+```bash
+uv tool install ty@latest
 ```
 
 **TypeScript:**
@@ -132,6 +156,10 @@ Claude: [get_references] Found 4 matches:
 | `get_completions` | Context-aware suggestions that respect types and scope |
 | `get_document_symbols` | Structured outline — functions, types, constants, imports |
 | `workspace_symbol_search` | Find symbols by name across the entire workspace |
+| `get_signature_help` | Parameter info and active signature while typing a call |
+| `go_to_implementation` | Jump to implementations of a trait method or interface member |
+| `go_to_type_definition` | Jump to the type definition of an expression, distinct from `get_definition` for variable bindings |
+| `get_inlay_hints` | Inferred type/parameter annotations an editor would render inline |
 
 </details>
 
@@ -207,16 +235,27 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MCPLS_CONFIG` | Path to configuration file | Auto-detected |
+| `MCPLS_TRUST_PROJECT_CONFIG` | Load a `./mcpls.toml` found in the current directory | `false` |
 | `MCPLS_LOG` | Log level (trace, debug, info, warn, error) | `info` |
 | `MCPLS_LOG_JSON` | Output logs as JSON | `false` |
+
+> [!NOTE]
+> The two boolean flags above accept `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).
 
 **Config file locations:**
 
 | Platform | Default Location |
 |----------|-----------------|
-| Linux | `~/.config/mcpls/mcpls.toml` |
-| macOS | `~/.config/mcpls/mcpls.toml` or `~/Library/Application Support/mcpls/` |
+| Linux | `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml` |
+| macOS | `~/Library/Application Support/mcpls/mcpls.toml` |
 | Windows | `%APPDATA%\mcpls\mcpls.toml` |
+
+> [!WARNING]
+> A `./mcpls.toml` in the current directory is **not** loaded automatically: it
+> can control which command mcpls spawns as an LSP server, so running mcpls
+> against an untrusted checkout must not execute commands from that checkout
+> without explicit consent. Pass `--trust-project-config` (or set
+> `MCPLS_TRUST_PROJECT_CONFIG=true`) only for repositories you trust.
 
 </details>
 
@@ -227,6 +266,8 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 [workspace]
 roots = ["/path/to/project"]
 heuristics_max_depth = 10
+max_documents = 100    # 0 = unlimited
+max_file_size = 10485760  # bytes, 0 = unlimited
 
 [[lsp_servers]]
 language_id = "rust"
@@ -234,6 +275,7 @@ command = "rust-analyzer"
 args = []
 file_patterns = ["**/*.rs"]
 timeout_seconds = 30
+request_timeout_seconds = 30
 
 [lsp_servers.heuristics]
 project_markers = ["Cargo.toml", "rust-toolchain.toml"]
@@ -261,7 +303,7 @@ mcpls works with any LSP 3.17 compliant server. Battle-tested with:
 | Language | Server | Notes |
 |----------|--------|-------|
 | Rust | rust-analyzer | Zero-config, built-in support |
-| Python | pyright | Full type inference |
+| Python | pyright (default), ty | Full type inference |
 | TypeScript/JS | typescript-language-server | JSX/TSX support |
 | Go | gopls | Modules and workspaces |
 | C/C++ | clangd | compile_commands.json |
@@ -313,6 +355,7 @@ flowchart TB
 - [Configuration Reference](docs/user-guide/configuration.md)
 - [Tools Reference](docs/user-guide/tools-reference.md)
 - [Troubleshooting](docs/user-guide/troubleshooting.md)
+- [Agent Skill](skills/mcpls/) — packaged [Agent Skill](https://agentskills.io/specification) teaching an AI coding agent to install, configure, and run the mcpls CLI
 
 ## Development
 
@@ -322,7 +365,7 @@ cargo nextest run        # Test
 cargo run -- --log-level debug  # Run locally
 ```
 
-**Requirements:** Rust 1.85+ (Edition 2024)
+**Requirements:** Rust 1.88+ (Edition 2024)
 
 ## Contributing
 

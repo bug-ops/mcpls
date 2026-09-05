@@ -6,6 +6,8 @@ use std::path::Path;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
+use super::routing::{ServerId, ToolKind};
+
 /// Default max depth for recursive marker search.
 pub const DEFAULT_HEURISTICS_MAX_DEPTH: usize = 10;
 
@@ -118,12 +120,11 @@ impl ServerHeuristics {
             .standard_filters(false)
             .filter_entry(|entry| {
                 // Skip excluded directories entirely (prevents descending into them)
-                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if EXCLUDED_DIRECTORIES.contains(&name) {
-                            return false;
-                        }
-                    }
+                if entry.file_type().is_some_and(|ft| ft.is_dir())
+                    && let Some(name) = entry.file_name().to_str()
+                    && EXCLUDED_DIRECTORIES.contains(&name)
+                {
+                    return false;
                 }
                 true
             });
@@ -132,10 +133,10 @@ impl ServerHeuristics {
             let path = entry.path();
 
             // Check if this entry matches any marker
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                if self.project_markers.iter().any(|m| m == file_name) {
-                    return true;
-                }
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                && self.project_markers.iter().any(|m| m == file_name)
+            {
+                return true;
             }
         }
 
@@ -169,19 +170,79 @@ pub struct LspServerConfig {
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
 
-    /// Request timeout in seconds.
+    /// Handshake timeout in seconds: bounds the `initialize` request during
+    /// server startup. Does not affect individual tool-call requests sent
+    /// after initialization; see [`Self::request_timeout_seconds`] for that.
+    /// The LSP server's `shutdown` request during teardown uses a separate,
+    /// fixed 5-second timeout that is not configurable by this field.
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+
+    /// Per-request timeout in seconds, applied to each LSP request issued
+    /// while translating an MCP tool call (hover, definition, references, etc.).
+    ///
+    /// This bounds a single request attempt, not a whole tool call: on a
+    /// `-32802` (content modified) response, [`crate::lsp::LspClient::request`]
+    /// retries up to 4 attempts with backoff, so the worst-case latency for one
+    /// tool call is `4 * request_timeout_seconds + 3.5` seconds. Completion
+    /// requests are further capped at 10 seconds regardless of this value; see
+    /// [`crate::lsp::LspClient::completion_timeout`].
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_seconds: u64,
 
     /// Heuristics for determining if this server should be spawned.
     /// If not specified, the server will always attempt to spawn.
     #[serde(default)]
     pub heuristics: Option<ServerHeuristics>,
+
+    /// Human-readable server identity used as the routing key.
+    ///
+    /// Defaults to `language_id` when omitted (see [`Self::id`]). Must be
+    /// unique across all applicable servers in a workspace, regardless of
+    /// language: this is what lets two servers share one `language_id`
+    /// (e.g. pyright and pylsp both for `python`) without one silently
+    /// overwriting the other in the maps keyed by [`ServerId`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Tools this server handles.
+    ///
+    /// `None` means this server is a catch-all: it serves every tool not
+    /// explicitly claimed by another server for the same language.
+    /// `Some(list)` restricts the server to exactly those tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handles: Option<Vec<ToolKind>>,
 }
 
 const fn default_timeout() -> u64 {
     30
 }
+
+const fn default_request_timeout() -> u64 {
+    30
+}
+
+/// Maximum allowed value, in seconds, for both [`LspServerConfig::timeout_seconds`]
+/// and [`LspServerConfig::request_timeout_seconds`].
+///
+/// Both fields are passed straight into `Duration::from_secs` — `timeout_seconds`
+/// in the `initialize` handshake (`lsp::lifecycle::LspServer::initialize`),
+/// `request_timeout_seconds` in [`crate::lsp::LspClient::request_timeout`].
+/// tokio's `timeout`/`sleep` fall back to `Instant::far_future()` for
+/// astronomically large durations instead of panicking, so an unbounded value
+/// on either field (misconfiguration or typo) would silently disable the
+/// timeout rather than fail with a diagnosable error. One shared constant
+/// bounds both, since the underlying defect and fix are identical for each.
+///
+/// Set to 900 (15 minutes), not a rounder 3600 (1 hour): [`LspClient::request`]
+/// retries a request up to 4 times total on a `-32802` (`ServerCancelled`)
+/// response, so the worst-case latency for a single call bounded by this
+/// value is `4 * 900 + 3.5s` ≈ 1 hour, not 4 hours — this constant bounds one
+/// attempt, so it is chosen such that the actually-experienced worst case
+/// (the retried total) stays within about an hour.
+///
+/// [`LspClient::request`]: crate::lsp::LspClient::request
+pub const MAX_TIMEOUT_SECONDS: u64 = 900;
 
 impl LspServerConfig {
     /// Check if this server should be spawned for the given workspace.
@@ -199,119 +260,122 @@ impl LspServerConfig {
             .is_none_or(|h| h.is_applicable_recursive(workspace_root, max_depth))
     }
 
+    /// The routing identity of this server: `name` if set, otherwise `language_id`.
+    ///
+    /// This is the key used across `Translator`'s client/server maps, so two
+    /// servers for the same language must set distinct `name`s or they
+    /// collide (see `ToolRouter::from_configs` for the enforcement).
+    #[must_use]
+    pub fn id(&self) -> ServerId {
+        self.name
+            .clone()
+            .map_or_else(|| ServerId::from(self.language_id.clone()), ServerId::from)
+    }
+
+    /// Build a built-in server config, filling in every field not passed as
+    /// a parameter.
+    fn builtin(
+        language_id: &str,
+        command: &str,
+        args: &[&str],
+        file_patterns: &[&str],
+        markers: impl IntoIterator<Item = &'static str>,
+    ) -> Self {
+        Self {
+            language_id: language_id.to_string(),
+            command: command.to_string(),
+            args: args.iter().map(ToString::to_string).collect(),
+            env: HashMap::new(),
+            file_patterns: file_patterns.iter().map(ToString::to_string).collect(),
+            initialization_options: None,
+            timeout_seconds: default_timeout(),
+            request_timeout_seconds: default_request_timeout(),
+            heuristics: Some(ServerHeuristics::with_markers(markers)),
+            name: None,
+            handles: None,
+        }
+    }
+
     /// Create a default configuration for rust-analyzer.
     #[must_use]
     pub fn rust_analyzer() -> Self {
-        Self {
-            language_id: "rust".to_string(),
-            command: "rust-analyzer".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.rs".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
-                "Cargo.toml",
-                "rust-toolchain.toml",
-            ])),
-        }
+        Self::builtin(
+            "rust",
+            "rust-analyzer",
+            &[],
+            &["**/*.rs"],
+            ["Cargo.toml", "rust-toolchain.toml"],
+        )
     }
 
     /// Create a default configuration for pyright.
     #[must_use]
     pub fn pyright() -> Self {
-        Self {
-            language_id: "python".to_string(),
-            command: "pyright-langserver".to_string(),
-            args: vec!["--stdio".to_string()],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.py".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
+        Self::builtin(
+            "python",
+            "pyright-langserver",
+            &["--stdio"],
+            &["**/*.py"],
+            [
                 "pyproject.toml",
                 "setup.py",
                 "requirements.txt",
                 "pyrightconfig.json",
-            ])),
-        }
+            ],
+        )
     }
 
     /// Create a default configuration for TypeScript language server.
     #[must_use]
     pub fn typescript() -> Self {
-        Self {
-            language_id: "typescript".to_string(),
-            command: "typescript-language-server".to_string(),
-            args: vec!["--stdio".to_string()],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
-                "package.json",
-                "tsconfig.json",
-                "jsconfig.json",
-            ])),
-        }
+        Self::builtin(
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
+            &["**/*.ts", "**/*.tsx"],
+            ["package.json", "tsconfig.json", "jsconfig.json"],
+        )
     }
 
     /// Create a default configuration for gopls.
     #[must_use]
     pub fn gopls() -> Self {
-        Self {
-            language_id: "go".to_string(),
-            command: "gopls".to_string(),
-            args: vec!["serve".to_string()],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.go".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers(["go.mod", "go.sum"])),
-        }
+        Self::builtin(
+            "go",
+            "gopls",
+            &["serve"],
+            &["**/*.go"],
+            ["go.mod", "go.sum"],
+        )
     }
 
     /// Create a default configuration for clangd.
     #[must_use]
     pub fn clangd() -> Self {
-        Self {
-            language_id: "cpp".to_string(),
-            command: "clangd".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            file_patterns: vec![
-                "**/*.c".to_string(),
-                "**/*.cpp".to_string(),
-                "**/*.h".to_string(),
-                "**/*.hpp".to_string(),
-            ],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
+        Self::builtin(
+            "cpp",
+            "clangd",
+            &[],
+            &["**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp"],
+            [
                 "CMakeLists.txt",
                 "compile_commands.json",
                 "Makefile",
                 ".clangd",
-            ])),
-        }
+            ],
+        )
     }
 
     /// Create a default configuration for zls.
     #[must_use]
     pub fn zls() -> Self {
-        Self {
-            language_id: "zig".to_string(),
-            command: "zls".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            file_patterns: vec!["**/*.zig".to_string()],
-            initialization_options: None,
-            timeout_seconds: default_timeout(),
-            heuristics: Some(ServerHeuristics::with_markers([
-                "build.zig",
-                "build.zig.zon",
-            ])),
-        }
+        Self::builtin(
+            "zig",
+            "zls",
+            &[],
+            &["**/*.zig"],
+            ["build.zig", "build.zig.zon"],
+        )
     }
 }
 
@@ -379,7 +443,10 @@ mod tests {
             file_patterns: vec!["**/*.custom".to_string()],
             initialization_options: Some(serde_json::json!({"key": "value"})),
             timeout_seconds: 60,
+            request_timeout_seconds: 45,
             heuristics: None,
+            name: None,
+            handles: None,
         };
 
         assert_eq!(config.language_id, "custom");
@@ -402,6 +469,15 @@ mod tests {
         assert_eq!(deserialized.command, original.command);
         assert_eq!(deserialized.args, original.args);
         assert_eq!(deserialized.timeout_seconds, original.timeout_seconds);
+        assert_eq!(
+            deserialized.request_timeout_seconds,
+            original.request_timeout_seconds
+        );
+    }
+
+    #[test]
+    fn test_default_request_timeout() {
+        assert_eq!(default_request_timeout(), 30);
     }
 
     #[test]
@@ -485,7 +561,10 @@ mod tests {
             file_patterns: vec![],
             initialization_options: None,
             timeout_seconds: 30,
+            request_timeout_seconds: 30,
             heuristics: None,
+            name: None,
+            handles: None,
         };
 
         let tmp = TempDir::new().unwrap();

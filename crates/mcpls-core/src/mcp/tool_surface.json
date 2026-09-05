@@ -1,0 +1,719 @@
+[
+  {
+    "name": "format_document",
+    "title": "Format Document",
+    "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "insert_spaces": {
+          "default": true,
+          "description": "Whether to use spaces instead of tabs (default: true).",
+          "type": "boolean"
+        },
+        "tab_size": {
+          "default": 4,
+          "description": "Tab size for formatting (default: 4).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Format Document",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_cached_diagnostics",
+    "title": "Cached Diagnostics",
+    "description": "Cached diagnostics from server notifications. Faster than get_diagnostics, no new analysis.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Cached Diagnostics",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_code_actions",
+    "title": "Code Actions",
+    "description": "Code actions for range. Returns quick fixes, refactorings, and source actions with edits.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "end_character": {
+          "description": "End character (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "end_line": {
+          "description": "End line (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "kind_filter": {
+          "description": "Optional filter by action kind (quickfix, refactor, source, etc.).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "start_character": {
+          "description": "Start character (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_line": {
+          "description": "Start line (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "start_line",
+        "start_character",
+        "end_line",
+        "end_character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Code Actions",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_completions",
+    "title": "Completions",
+    "description": "Completion suggestions at position. Returns methods, functions, variables, types, and snippets.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trigger": {
+          "description": "Optional trigger character (e.g., '.', ':', '->').",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Completions",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_definition",
+    "title": "Go to Definition",
+    "description": "Definition location of symbol at position. Returns file path, line, and character where declared.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Go to Definition",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_diagnostics",
+    "title": "Diagnostics",
+    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Diagnostics",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_document_symbols",
+    "title": "Document Symbols",
+    "description": "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Document Symbols",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_hover",
+    "title": "Hover",
+    "description": "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Hover",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_incoming_calls",
+    "title": "Incoming Calls",
+    "description": "Functions calling the specified item. Takes call hierarchy item, returns all callers.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "description": "The call hierarchy item to get calls for (from prepare response)."
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Incoming Calls",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_inlay_hints",
+    "title": "Inlay Hints",
+    "description": "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "end_character": {
+          "description": "End character (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "end_line": {
+          "description": "End line (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "start_character": {
+          "description": "Start character (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_line": {
+          "description": "Start line (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "start_line",
+        "start_character",
+        "end_line",
+        "end_character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Inlay Hints",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_outgoing_calls",
+    "title": "Outgoing Calls",
+    "description": "Functions called by the specified item. Takes call hierarchy item, returns all callees.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "description": "The call hierarchy item to get calls for (from prepare response)."
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Outgoing Calls",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_references",
+    "title": "Find References",
+    "description": "All references to symbol at position. Returns locations across workspace where symbol is used.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "include_declaration": {
+          "default": false,
+          "description": "Whether to include the declaration in the results.",
+          "type": "boolean"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Find References",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_server_logs",
+    "title": "Server Logs",
+    "description": "Recent server log messages. Filter by level (error, warning, info, debug) for debugging.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "default": 50,
+          "description": "Maximum number of log entries to return (default: 50).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_level": {
+          "description": "Minimum log level to include: error, warning, info, debug.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Server Logs",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_server_messages",
+    "title": "Server Messages",
+    "description": "Recent server messages (showMessage notifications). User-facing prompts and status updates.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "default": 20,
+          "description": "Maximum number of messages to return (default: 20).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Server Messages",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_signature_help",
+    "title": "Signature Help",
+    "description": "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Signature Help",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "go_to_implementation",
+    "title": "Go to Implementation",
+    "description": "Implementation locations of trait method or interface member at position.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Go to Implementation",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "go_to_type_definition",
+    "title": "Go to Type Definition",
+    "description": "Type definition location of expression at position. Distinct from go-to-definition for variable bindings.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Go to Type Definition",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "prepare_call_hierarchy",
+    "title": "Prepare Call Hierarchy",
+    "description": "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Prepare Call Hierarchy",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "rename_symbol",
+    "title": "Rename Symbol",
+    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "new_name": {
+          "description": "New name for the symbol.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character",
+        "new_name"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Rename Symbol",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "workspace_symbol_search",
+    "title": "Workspace Symbol Search",
+    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "kind_filter": {
+          "description": "Optional filter by symbol kind (function, class, variable, etc.).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": 100,
+          "description": "Maximum results to return (default: 100).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "query": {
+          "description": "Search query for symbol names (supports partial matching).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Workspace Symbol Search",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  }
+]

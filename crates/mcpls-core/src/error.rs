@@ -5,9 +5,13 @@
 
 use std::path::PathBuf;
 
+use crate::config::{ServerId, ToolKind};
+
 /// Details of a single server spawn failure.
 #[derive(Debug, Clone)]
 pub struct ServerSpawnFailure {
+    /// Routing identity of the failed server.
+    pub server_id: ServerId,
     /// Language ID of the failed server.
     pub language_id: String,
     /// Command that was attempted.
@@ -20,14 +24,19 @@ impl std::fmt::Display for ServerSpawnFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} ({}): {}",
-            self.language_id, self.command, self.message
+            "{} [{}] ({}): {}",
+            self.server_id, self.language_id, self.command, self.message
         )
     }
 }
 
 /// The main error type for mcpls-core operations.
+///
+/// This enum is `#[non_exhaustive]`: downstream crates that match on it must
+/// include a wildcard arm. New variants (such as [`Error::ServerInitializing`])
+/// can then be added without further breaking changes.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// LSP server failed to initialize.
     #[error("LSP server initialization failed: {message}")]
@@ -43,6 +52,8 @@ pub enum Error {
         code: i32,
         /// Error message from the server.
         message: String,
+        /// Optional additional data from the JSON-RPC error object.
+        data: Option<serde_json::Value>,
     },
 
     /// MCP server error.
@@ -57,9 +68,50 @@ pub enum Error {
     #[error("no LSP server configured for language: {0}")]
     NoServerForLanguage(String),
 
+    /// A server is configured for the language, but no server claims this
+    /// specific tool (either no server lists it in `handles` and there is no
+    /// catch-all, or the server that claimed it failed to spawn with no live
+    /// catch-all to rebind to).
+    #[error("no server handles tool '{tool}' for language '{language_id}'")]
+    NoServerForTool {
+        /// Language ID the request was for.
+        language_id: String,
+        /// Tool that no server claims.
+        tool: ToolKind,
+    },
+
+    /// LSP server for the language is configured but still initializing.
+    #[error(
+        "LSP server '{server_id}' is still initializing (large project load in progress); wait and retry the request (this may take a few minutes on large projects)"
+    )]
+    ServerInitializing {
+        /// Routing identity of the server that has not yet registered.
+        server_id: ServerId,
+    },
+
+    /// A workspace-wide tool (one with no file to resolve a language from,
+    /// e.g. `workspace_symbol_search`) could not be routed because at least
+    /// one expected LSP server has not registered yet. Unlike
+    /// [`Error::ServerInitializing`], resolution never narrowed down to a
+    /// single candidate server, so no `server_id` is available.
+    #[error(
+        "LSP servers are still initializing (large project load in progress); wait and retry the request (this may take a few minutes on large projects)"
+    )]
+    WorkspaceServersInitializing,
+
     /// No LSP server is currently configured.
     #[error("no LSP server configured")]
     NoServerConfigured,
+
+    /// At least one server is configured somewhere in the workspace, but
+    /// none of them claims a workspace-wide tool that has no file to
+    /// resolve a language from (e.g. `workspace_symbol_search`). The
+    /// language-less counterpart of [`Error::NoServerForTool`].
+    #[error("no server handles tool '{tool}' (no server's `handles` list or catch-all claims it)")]
+    NoServerForWorkspaceTool {
+        /// Tool that no server claims anywhere in the workspace.
+        tool: ToolKind,
+    },
 
     /// Configuration error.
     #[error("configuration error: {0}")]
@@ -127,6 +179,20 @@ pub enum Error {
     #[error("LSP server process terminated unexpectedly")]
     ServerTerminated,
 
+    /// A crashed server could not be automatically respawned.
+    ///
+    /// Distinct from [`Self::ServerTerminated`] so a caller (or a log
+    /// reader) can tell "the connection just died" apart from "mcpls tried
+    /// to bring it back and could not" -- e.g. no respawn config was ever
+    /// registered for it, or it is crash-looping and is being backed off.
+    #[error("LSP server '{server_id}' is unavailable: {reason}")]
+    ServerUnavailable {
+        /// Routing identity of the server that could not be respawned.
+        server_id: ServerId,
+        /// Human-readable reason the respawn did not proceed.
+        reason: String,
+    },
+
     /// Invalid tool parameters provided.
     #[error("invalid tool parameters: {0}")]
     InvalidToolParams(String),
@@ -146,7 +212,9 @@ pub enum Error {
     PathOutsideWorkspace(PathBuf),
 
     /// Document limit exceeded.
-    #[error("document limit exceeded: {current}/{max}")]
+    #[error(
+        "document limit exceeded: {current}/{max} (raise workspace.max_documents in config to increase this)"
+    )]
     DocumentLimitExceeded {
         /// Current number of documents.
         current: usize,
@@ -155,7 +223,9 @@ pub enum Error {
     },
 
     /// File size limit exceeded.
-    #[error("file size limit exceeded: {size} bytes (max: {max} bytes)")]
+    #[error(
+        "file size limit exceeded: {size} bytes, max {max} bytes (raise workspace.max_file_size in config to increase this)"
+    )]
     FileSizeLimitExceeded {
         /// Actual file size.
         size: u64,
@@ -186,6 +256,17 @@ pub enum Error {
     /// No LSP servers available (none configured or all failed).
     #[error("{0}")]
     NoServersAvailable(String),
+
+    /// The server routed for this request does not advertise support for the
+    /// requested LSP capability (e.g. no `renameProvider` in its
+    /// `ServerCapabilities`).
+    #[error("server '{server_id}' does not support capability '{capability}'")]
+    CapabilityNotSupported {
+        /// Routing identity of the server that lacks the capability.
+        server_id: ServerId,
+        /// Name of the missing LSP capability field (e.g. `"renameProvider"`).
+        capability: &'static str,
+    },
 }
 
 /// A specialized Result type for mcpls-core operations.
@@ -211,6 +292,7 @@ mod tests {
         let err = Error::LspServerError {
             code: -32600,
             message: "Invalid request".to_string(),
+            data: None,
         };
         assert_eq!(
             err.to_string(),
@@ -235,6 +317,21 @@ mod tests {
     }
 
     #[test]
+    fn test_error_display_workspace_servers_initializing() {
+        let err = Error::WorkspaceServersInitializing;
+        assert!(err.to_string().contains("still initializing"));
+    }
+
+    #[test]
+    fn test_error_display_no_server_for_workspace_tool() {
+        let err = Error::NoServerForWorkspaceTool {
+            tool: crate::config::ToolKind::WorkspaceSymbols,
+        };
+        assert!(err.to_string().contains("workspace_symbols"));
+        assert!(err.to_string().contains("no server's `handles` list"));
+    }
+
+    #[test]
     fn test_error_display_timeout() {
         let err = Error::Timeout(30);
         assert_eq!(err.to_string(), "request timed out after 30 seconds");
@@ -246,7 +343,10 @@ mod tests {
             current: 150,
             max: 100,
         };
-        assert_eq!(err.to_string(), "document limit exceeded: 150/100");
+        assert_eq!(
+            err.to_string(),
+            "document limit exceeded: 150/100 (raise workspace.max_documents in config to increase this)"
+        );
     }
 
     #[test]
@@ -255,7 +355,10 @@ mod tests {
             size: 20_000_000,
             max: 10_000_000,
         };
-        assert!(err.to_string().contains("file size limit exceeded"));
+        assert_eq!(
+            err.to_string(),
+            "file size limit exceeded: 20000000 bytes, max 10000000 bytes (raise workspace.max_file_size in config to increase this)"
+        );
     }
 
     #[test]
@@ -311,19 +414,21 @@ mod tests {
     #[test]
     fn test_server_spawn_failure_display() {
         let failure = ServerSpawnFailure {
+            server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
             message: "No such file or directory".to_string(),
         };
         assert_eq!(
             failure.to_string(),
-            "rust (rust-analyzer): No such file or directory"
+            "rust [rust] (rust-analyzer): No such file or directory"
         );
     }
 
     #[test]
     fn test_server_spawn_failure_debug() {
         let failure = ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "command not found".to_string(),
@@ -337,6 +442,7 @@ mod tests {
     #[test]
     fn test_server_spawn_failure_clone() {
         let failure = ServerSpawnFailure {
+            server_id: ServerId::from("typescript"),
             language_id: "typescript".to_string(),
             command: "tsserver".to_string(),
             message: "failed to start".to_string(),
@@ -376,11 +482,13 @@ mod tests {
     fn test_error_all_servers_failed_with_failures() {
         let failures = vec![
             ServerSpawnFailure {
+                server_id: ServerId::from("rust"),
                 language_id: "rust".to_string(),
                 command: "rust-analyzer".to_string(),
                 message: "not found".to_string(),
             },
             ServerSpawnFailure {
+                server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
                 message: "permission denied".to_string(),
@@ -396,6 +504,7 @@ mod tests {
     #[test]
     fn test_error_partial_server_init_with_failures() {
         let failures = vec![ServerSpawnFailure {
+            server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
             message: "not found".to_string(),
@@ -426,5 +535,17 @@ mod tests {
         let custom_msg = "none configured or all failed to initialize";
         let err = Error::NoServersAvailable(custom_msg.to_string());
         assert_eq!(err.to_string(), custom_msg);
+    }
+
+    #[test]
+    fn test_error_display_capability_not_supported() {
+        let err = Error::CapabilityNotSupported {
+            server_id: ServerId::from("rust"),
+            capability: "renameProvider",
+        };
+        assert_eq!(
+            err.to_string(),
+            "server 'rust' does not support capability 'renameProvider'"
+        );
     }
 }

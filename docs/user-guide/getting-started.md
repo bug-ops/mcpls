@@ -34,7 +34,6 @@ cargo install --path crates/mcpls-cli
 
 ```bash
 mcpls --version
-# Should output: mcpls 0.1.0
 ```
 
 ## Quick Start with Claude Code
@@ -43,8 +42,8 @@ mcpls --version
 
 Add mcpls to your Claude Code MCP configuration file:
 
-**macOS/Linux**: `~/.claude/mcp.json`
-**Windows**: `%APPDATA%\Claude\mcp.json`
+**macOS/Linux**: `~/.claude/claude_desktop_config.json`
+**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
@@ -65,15 +64,14 @@ After adding the configuration, restart Claude Code to load mcpls.
 
 Ask Claude: "What tools are available?"
 
-You should see 8 mcpls tools:
-- get_hover
-- get_definition
-- get_references
-- get_diagnostics
-- rename_symbol
-- get_completions
-- get_document_symbols
-- format_document
+You should see 20 mcpls tools, including:
+- get_hover, get_definition, get_references, get_completions
+- get_diagnostics, get_cached_diagnostics
+- get_document_symbols, workspace_symbol_search
+- rename_symbol, format_document, get_code_actions
+- get_signature_help, go_to_implementation, go_to_type_definition, get_inlay_hints
+- prepare_call_hierarchy, get_incoming_calls, get_outgoing_calls
+- get_server_logs, get_server_messages
 
 ### 4. Try It Out
 
@@ -92,12 +90,16 @@ mcpls works zero-config for Rust projects (uses rust-analyzer by default). For o
 mcpls searches for configuration in:
 1. Path specified by `--config` flag
 2. `$MCPLS_CONFIG` environment variable
-3. `./mcpls.toml` (current directory)
-4. `~/.config/mcpls/mcpls.toml`
+3. `./mcpls.toml` (current directory) — requires `--trust-project-config` (see
+   [Configuration Reference](configuration.md#trusting-a-project-local-config))
+4. Platform user-config directory:
+   - Linux: `$XDG_CONFIG_HOME/mcpls/mcpls.toml`, else `~/.config/mcpls/mcpls.toml`
+   - macOS: `~/Library/Application Support/mcpls/mcpls.toml`
+   - Windows: `%APPDATA%\mcpls\mcpls.toml`
 
 ### Example Configuration
 
-Create `~/.config/mcpls/mcpls.toml`:
+Create a configuration file in your platform's config directory (e.g., `~/.config/mcpls/mcpls.toml` on Linux or `~/Library/Application Support/mcpls/mcpls.toml` on macOS):
 
 ```toml
 [workspace]

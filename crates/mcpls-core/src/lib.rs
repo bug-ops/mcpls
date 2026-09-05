@@ -18,12 +18,20 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use mcpls_core::{serve, ServerConfig};
+//! use mcpls_core::{serve, serve_with, Transport, ServerConfig};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), mcpls_core::Error> {
-//!     let config = ServerConfig::load()?;
-//!     serve(config).await
+//! async fn main() {
+//!     let config = ServerConfig::load().expect("failed to load config");
+//!     // Stdio (default):
+//!     let result = serve(config).await;
+//!     // HTTP (requires `transport-http` feature):
+//!     // let http = mcpls_core::HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp");
+//!     // let result = serve_with(config, Transport::Http(http)).await;
+//!
+//!     // See `serve`/`serve_with`'s "Shutdown" docs: process::exit avoids a
+//!     // runtime-shutdown hang under the stdio transport.
+//!     std::process::exit(if result.is_ok() { 0 } else { 1 });
 //! }
 //! ```
 
@@ -32,68 +40,403 @@ pub mod config;
 pub mod error;
 pub mod lsp;
 pub mod mcp;
+pub mod transport;
+mod util;
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use bridge::Translator;
-pub use config::ServerConfig;
+use bridge::resources::make_uri;
+use bridge::{NotificationCache, ResourceSubscriptions, Translator};
+pub use config::{ProjectConfigTrust, ServerConfig};
+use config::{ServerId, ToolRouter};
 pub use error::Error;
-use lsp::{LspServer, ServerInitConfig};
-use rmcp::ServiceExt;
-use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use lsp::{LspNotification, LspServer, ServerInitConfig};
+use lsp_types::Uri;
+use rmcp::model::ResourceUpdatedNotificationParam;
+use tokio::sync::{Mutex, OnceCell};
+use tokio::task::{JoinHandle, JoinSet};
+use tracing::{debug, error, info, warn};
+#[cfg(feature = "transport-http")]
+pub use transport::HttpConfig;
+pub use transport::Transport;
+#[cfg(feature = "transport-http")]
+use transport::run_http;
+use transport::{ShutdownSignal, run_stdio};
 
-/// Resolve workspace roots from config or current directory.
+/// Whether `uri` falls within one of `workspace_roots`.
 ///
-/// If no workspace roots are provided in the configuration, this function
-/// will use the current working directory, canonicalized for security.
+/// Used to reject diagnostics for out-of-workspace URIs before caching them:
+/// a misbehaving or compromised LSP server could otherwise publish
+/// diagnostics for an unbounded number of fabricated (often non-existent)
+/// URIs, defeating `MAX_DIAGNOSTIC_ENTRIES`'s FIFO cap by flushing every
+/// legitimate entry out of the cache before it (see #234). Deliberately does
+/// not canonicalize -- this runs per incoming notification, and LSP servers
+/// report already-resolved canonical paths, so a prefix check is enough to
+/// reject URIs a legitimate server would never publish for, without a
+/// filesystem syscall on every diagnostic.
 ///
-/// # Returns
+/// # Preconditions
 ///
-/// A vector of workspace root paths. If config roots are provided, they are
-/// returned as-is. Otherwise, returns the canonicalized current directory,
-/// falling back to relative "." if canonicalization fails.
-fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
-    if config_roots.is_empty() {
-        match std::env::current_dir() {
-            Ok(cwd) => {
-                // current_dir() always returns an absolute path
-                match cwd.canonicalize() {
-                    Ok(canonical) => {
-                        info!(
-                            "Using current directory as workspace root: {}",
-                            canonical.display()
-                        );
-                        vec![canonical]
-                    }
-                    Err(e) => {
-                        // Canonicalization can fail if directory was deleted or permissions changed
-                        // but cwd itself is still absolute
-                        warn!(
-                            "Failed to canonicalize current directory: {e}, using non-canonical path"
-                        );
-                        vec![cwd]
-                    }
+/// `workspace_roots` must itself already be canonical, or every diagnostic
+/// silently fails to match and gets dropped (a raw `[[lsp_servers]]`-derived
+/// or relative root will never `starts_with`-match a canonical LSP path).
+/// `serve_with` guarantees this by passing `workspace_roots_snapshot`, which
+/// clones the roots already normalized by [`resolve_workspace_roots`].
+///
+/// An empty `workspace_roots` (no workspace configured) allows any URI,
+/// matching `validate_path_against_roots`'s "no roots = no restriction"
+/// behavior.
+fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &[PathBuf]) -> bool {
+    if workspace_roots.is_empty() {
+        return true;
+    }
+    let Some(path) = bridge::uri_to_path(uri) else {
+        return false;
+    };
+    // `Path::starts_with` compares components lexically and does not resolve
+    // `.`/`..`, so `/workspace/../etc/passwd` would otherwise pass the
+    // `/workspace` prefix check despite pointing outside it. A legitimate LSP
+    // server never publishes such a path (canonical paths never contain
+    // `.`/`..` components), so rejecting them outright costs nothing and
+    // closes the bypass for a server that deliberately crafts one.
+    if path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return false;
+    }
+    workspace_roots.iter().any(|root| path.starts_with(root))
+}
+
+/// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
+/// `serve_with` run, factored out of `diagnostics_pump`'s parameter list to
+/// keep it under clippy's argument-count lint. `Clone` is cheap (`Arc`
+/// clones only).
+#[derive(Clone)]
+pub(crate) struct PumpShared {
+    pub(crate) notification_cache: Arc<Mutex<NotificationCache>>,
+    pub(crate) subs: Arc<ResourceSubscriptions>,
+    pub(crate) peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
+    /// Used to reject diagnostics for out-of-workspace URIs; see
+    /// `diagnostic_path_in_workspace`.
+    pub(crate) workspace_roots: Arc<[PathBuf]>,
+}
+
+/// Background task that drains LSP notifications, writes them to the cache,
+/// and forwards `resources/updated` to the MCP peer when subscribed.
+///
+/// The task operates in two phases without explicit state:
+/// - **Phase A** (before peer is set): caches every notification, skips peer notify.
+/// - **Phase B** (after peer is set): additionally fires `notify_resource_updated`
+///   for subscribed `PublishDiagnostics` URIs.
+///
+/// The task exits when:
+/// - The LSP notification channel closes (`rx.recv()` returns `None`).
+/// - The cancellation watch fires (or the sender is dropped).
+/// - `notify_resource_updated` returns an error (peer disconnect / transport closed).
+///
+/// # Lock independence
+/// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock entirely
+/// separate from `translator`'s own internal locks (`Arc<Translator>` has no
+/// outer mutex; each field manages its own short-lived, independent lock).
+/// Neither an in-flight LSP round-trip (e.g. `textDocument/diagnostic`) nor
+/// any other translator-side work holds the notification-cache lock, so this
+/// pump is never blocked by tool-call activity: a `publishDiagnostics`
+/// notification arriving mid-request is cached immediately instead of being
+/// silently dropped. This matters because the LSP transport forwards
+/// notifications via `mpsc::Sender::try_send`, which drops on a full channel
+/// rather than blocking — a pump stalled behind someone else's lock would
+/// previously lose notifications under sustained push traffic.
+pub(crate) async fn diagnostics_pump(
+    server_id: ServerId,
+    mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    caches_diagnostics: bool,
+    shared: PumpShared,
+) {
+    let PumpShared {
+        notification_cache,
+        subs,
+        peer_cell,
+        workspace_roots,
+    } = shared;
+    loop {
+        tokio::select! {
+            // Exit when cancellation is requested or the sender is dropped.
+            result = cancel_rx.changed() => {
+                // Err means the sender was dropped; treat as cancellation.
+                if result.is_err() || *cancel_rx.borrow() {
+                    break;
                 }
             }
-            Err(e) => {
-                // This is extremely rare - only happens if cwd was deleted or unlinked
-                // In this case, we have no choice but to use a relative path
-                warn!("Failed to get current directory: {e}, using fallback");
-                vec![PathBuf::from(".")]
+            msg = rx.recv() => {
+                let Some(notif) = msg else { break };
+                match notif {
+                    LspNotification::PublishDiagnostics(p) => {
+                        // Only the server the router resolves `Diagnostics` to for
+                        // this notification's language caches (and notifies
+                        // subscribers of) it -- see #174 §8. A server that was
+                        // never the diagnostics route, or lost it without a live
+                        // catch-all to rebind to, is not the authoritative source
+                        // for this language's diagnostics; skip publishing so it
+                        // doesn't overwrite (or spuriously notify about) another
+                        // server's cache entry.
+                        if !caches_diagnostics {
+                            continue;
+                        }
+                        if !diagnostic_path_in_workspace(&p.uri, &workspace_roots) {
+                            debug!(
+                                "dropping diagnostics for out-of-workspace URI: {}",
+                                p.uri.as_str()
+                            );
+                            continue;
+                        }
+                        {
+                            let mut cache = notification_cache.lock().await;
+                            cache.store_diagnostics(&server_id, &p.uri, p.version, p.diagnostics);
+                        }
+
+                        // Fast path: skip URI construction when nothing is subscribed.
+                        if subs.is_empty().await {
+                            continue;
+                        }
+
+                        // Notify only when peer is ready and URI is subscribed.
+                        let Some(peer) = peer_cell.get() else { continue };
+                        let Some(path) = bridge::uri_to_path(&p.uri) else { continue };
+                        let Ok(mcp_uri) = make_uri(&path) else { continue };
+
+                        if !subs.contains(&mcp_uri).await {
+                            continue;
+                        }
+
+                        if peer
+                            .notify_resource_updated(ResourceUpdatedNotificationParam::new(
+                                mcp_uri,
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            // Peer disconnected; stop the pump.
+                            break;
+                        }
+                    }
+                    LspNotification::LogMessage(m) => {
+                        let mut cache = notification_cache.lock().await;
+                        cache.store_log(m.typ.into(), m.message);
+                    }
+                    LspNotification::ShowMessage(m) => {
+                        let mut cache = notification_cache.lock().await;
+                        cache.store_message(m.typ.into(), m.message);
+                    }
+                    LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
+                }
             }
         }
-    } else {
-        config_roots.to_vec()
     }
 }
 
-/// Start the MCPLS server with the given configuration.
+/// Result of [`register_servers`]: everything the caller needs to start the
+/// per-server diagnostics pump tasks.
+pub(crate) struct RegisteredServers {
+    /// Notification receivers extracted from each server before registration.
+    pub(crate) receivers: HashMap<ServerId, tokio::sync::mpsc::Receiver<lsp::LspNotification>>,
+    /// Whether each server is the one the (rebound) router resolves
+    /// `ToolKind::Diagnostics` to for its language -- see #174 §8. Computed
+    /// here, right after the rebind, so it always reflects the post-rebind
+    /// router rather than a stale pre-rebind view.
+    pub(crate) diagnostics_flags: HashMap<ServerId, bool>,
+}
+
+/// Register initialized LSP servers with the translator, rebind the router to
+/// the set that actually registered, and extract notification receivers.
 ///
-/// This is the primary entry point for running the MCP-LSP bridge.
-/// Implements graceful degradation: if some but not all LSP servers fail
-/// to initialize, the service continues with available servers.
+/// Takes ownership of the `ServerInitResult`, extracts `notification_rx` from
+/// each server before registration. Registration itself is a sequence of
+/// short, independently-locked map inserts (see `Translator`'s field docs),
+/// so no external synchronization is required here; the rebind that follows
+/// relies only on all of *this* function's inserts having completed, which
+/// the sequential code below guarantees.
+///
+/// `configs` supplies the `ServerInitConfig` each surviving server was
+/// spawned from, keyed by routing identity, so the translator can respawn it
+/// later if its process dies (see `Translator::respawn_if_dead`).
+pub(crate) fn register_servers(
+    mut result: lsp::ServerInitResult,
+    translator: &bridge::Translator,
+    configs: &HashMap<ServerId, ServerInitConfig>,
+) -> RegisteredServers {
+    let mut receivers = HashMap::new();
+    for (id, server) in &mut result.servers {
+        receivers.insert(id.clone(), server.take_notification_rx());
+    }
+
+    let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
+
+    let mut language_by_id = HashMap::new();
+    for (id, server) in result.servers {
+        let client = server.client().clone();
+        language_by_id.insert(id.clone(), client.language_id().to_string());
+        translator.register_client(id.clone(), client);
+        if let Some(config) = configs.get(&id) {
+            translator.register_server_config(id.clone(), config.clone());
+        } else {
+            // Would silently turn auto-respawn into a no-op for this server
+            // (surfacing as `Error::ServerUnavailable` instead of actually
+            // recovering) -- the keys are derived identically on both sides
+            // (`LspServerConfig::id()`), so this should never happen; warn
+            // rather than fail, since the server is otherwise usable.
+            warn!(
+                "No respawn config registered for LSP server '{id}'; auto-respawn on crash will be unavailable for it"
+            );
+        }
+        translator.register_server(id, server);
+    }
+
+    translator.rebind_router(&registered);
+
+    let diagnostics_flags = language_by_id
+        .into_iter()
+        .map(|(id, language)| {
+            let is_diagnostics_server = translator.is_diagnostics_route(&language, &id);
+            (id, is_diagnostics_server)
+        })
+        .collect();
+
+    RegisteredServers {
+        receivers,
+        diagnostics_flags,
+    }
+}
+
+/// Resolve workspace roots against an absolute base directory.
+///
+/// If no workspace roots are provided, the base directory itself is used.
+/// Configured relative roots are joined to the base directory. Every existing
+/// path is canonicalized before it can reach workspace heuristics, LSP
+/// initialization, path validation, or diagnostics filtering.
+///
+/// # Returns
+///
+/// A vector of absolute workspace root paths. A relative root that cannot be
+/// canonicalized is rejected as invalid configuration rather than being left
+/// to fail later during `file://` URI conversion. An absolute root retains the
+/// previous fallback behavior and is kept as-is if canonicalization fails.
+fn resolve_workspace_roots(
+    config_roots: &[PathBuf],
+    base_dir: &Path,
+) -> Result<Vec<PathBuf>, Error> {
+    if !base_dir.is_absolute() {
+        return Err(Error::InvalidConfig(format!(
+            "workspace root base must be absolute: {}",
+            base_dir.display()
+        )));
+    }
+
+    if config_roots.is_empty() {
+        let root = match dunce::canonicalize(base_dir) {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                warn!(
+                    "Failed to canonicalize workspace base directory {}: {e}, using non-canonical absolute path",
+                    base_dir.display()
+                );
+                base_dir.to_path_buf()
+            }
+        };
+        info!("Using workspace base directory as root: {}", root.display());
+        Ok(vec![root])
+    } else {
+        canonicalize_workspace_roots(config_roots, base_dir)
+    }
+}
+
+/// Resolve and canonicalize each configured workspace root.
+///
+/// Relative roots are resolved against `base_dir` and must exist. Absolute
+/// roots keep the historical fallback behavior: if canonicalization fails
+/// (for example because the directory is created after startup), the original
+/// absolute path is retained.
+///
+/// Uses [`dunce::canonicalize`] rather than [`Path::canonicalize`]: on
+/// Windows, the latter returns the `\\?\`-prefixed verbatim form (e.g.
+/// `\\?\C:\...`), which a URI-derived path from `Url::to_file_path` (never
+/// verbatim-prefixed) can never `starts_with`-match, silently dropping every
+/// diagnostic. `dunce::canonicalize` resolves symlinks identically but
+/// returns the ordinary `C:\...` form when the result doesn't require the
+/// verbatim syntax (i.e. essentially always, for realistic workspace paths).
+fn canonicalize_workspace_roots(roots: &[PathBuf], base_dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    roots
+        .iter()
+        .map(|root| {
+            let is_relative = root.is_relative();
+            let resolved = if is_relative {
+                join_relative_root(base_dir, root)
+            } else {
+                root.clone()
+            };
+
+            match dunce::canonicalize(&resolved) {
+                Ok(canonical) => Ok(canonical),
+                Err(source) if is_relative => Err(Error::InvalidConfig(format!(
+                    "workspace root '{}' resolved relative to '{}' as '{}' could not be canonicalized: {source}",
+                    root.display(),
+                    base_dir.display(),
+                    resolved.display()
+                ))),
+                Err(source) => {
+                    warn!(
+                        "Failed to canonicalize absolute workspace root {}: {source}, using non-canonical path",
+                        resolved.display()
+                    );
+                    Ok(resolved)
+                }
+            }
+        })
+        .collect()
+}
+
+/// Join a relative `root` onto `base_dir`, correctly handling a root that
+/// [`Path::is_relative`] classifies `true` yet still carries a leading
+/// [`Component::Prefix`] and/or [`Component::RootDir`] -- on Windows,
+/// `is_absolute()` requires *both* a prefix and a root, so two distinct
+/// shapes are `is_relative() == true` despite being (partially) rooted:
+/// - no prefix, has root (e.g. `\workspace`) -- rooted on whichever drive is
+///   current.
+/// - has prefix, no root (e.g. `C:workspace`) -- drive-relative, resolved
+///   against that drive's own current directory.
+///
+/// Plain `base_dir.join(root)` would hit [`PathBuf::push`]'s documented
+/// special cases for both shapes, each discarding some or all of `base_dir`
+/// (e.g. `C:\proj\.agents`.join(`\workspace`) -> `C:\workspace`, and
+/// `C:\proj\.agents`.join(`C:workspace`) -> `C:workspace` -- `proj\.agents`
+/// is silently dropped either way). Skipping any leading `Prefix`/`RootDir`
+/// components before joining sidesteps both: only the ordinary relative tail
+/// (`Normal`/`CurDir`/`ParentDir` components) is ever appended to `base_dir`.
+/// For an already-ordinary relative root (the common case, no such leading
+/// components), this is equivalent to `base_dir.join(root)` up to a trailing
+/// separator (`.join` preserves one from a trailing empty/`CurDir`
+/// component; `.extend` does not -- immaterial after canonicalization, and
+/// the one case where it mattered, an empty root, is now rejected by
+/// `validate()`). Detected via `Component` iteration (not
+/// `#[cfg(windows)]`), so the logic itself is exercised by a unit test on
+/// any host -- see `#348`.
+fn join_relative_root(base_dir: &Path, root: &Path) -> PathBuf {
+    let mut joined = base_dir.to_path_buf();
+    joined.extend(
+        root.components()
+            .skip_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir)),
+    );
+    joined
+}
+
+/// Start the MCPLS server with the given configuration over stdio.
+///
+/// This is the backward-compatible entry point. It is equivalent to calling
+/// `serve_with(config, Transport::Stdio)`.
 ///
 /// # Errors
 ///
@@ -107,17 +450,127 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
 /// - **All servers succeed**: Service runs normally
 /// - **Partial success**: Logs warnings for failures, continues with available servers
 /// - **All servers fail**: Returns `Error::AllServersFailedToInit` with details
+///
+/// # Shutdown
+///
+/// See [`serve_with`]'s "Shutdown" section — this function uses
+/// [`Transport::Stdio`], so the same `std::process::exit` requirement
+/// applies to callers.
 pub async fn serve(config: ServerConfig) -> Result<(), Error> {
+    serve_with(config, Transport::Stdio).await
+}
+
+/// Start the MCPLS server with an explicit transport.
+///
+/// Performs all shared setup (workspace discovery, LSP spawning, translator
+/// initialization, diagnostic pump tasks) and then delegates to the
+/// appropriate transport runner.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - All LSP servers fail to initialize
+/// - The MCP server or transport fails to start
+/// - Configuration is invalid, including two applicable `[[lsp_servers]]`
+///   entries whose per-tool routing is ambiguous in this workspace (shared
+///   routing identity, two catch-alls, or the same tool claimed by both) --
+///   see `config::ToolRouter::from_configs`
+///
+/// # DNS rebinding protection (HTTP transport)
+///
+/// When using `Transport::Http`, the underlying rmcp service validates the
+/// inbound `Host` header against an allowlist that defaults to loopback
+/// addresses only (`localhost`, `127.0.0.1`, `::1`). Requests with any other
+/// `Host` value are rejected with `421 Misdirected Request`.
+///
+/// If you bind to a non-loopback address (e.g. `0.0.0.0:3000`) and expose the
+/// service through a reverse proxy, the proxy must forward `Host: localhost`
+/// (or another loopback alias) to the mcpls process. Direct non-loopback
+/// access is intentionally blocked to prevent DNS-rebinding attacks.
+///
+/// # Shutdown
+///
+/// [`Transport::Stdio`] is backed by `tokio::io::stdin()`, which internally
+/// parks an uncancellable blocking-pool thread in a raw `read()` syscall
+/// that only returns on more input or EOF. If your `main` uses
+/// `#[tokio::main]` and simply returns after awaiting this function, the
+/// macro-generated runtime-shutdown wrapper blocks waiting for that thread
+/// -- hanging indefinitely on `SIGTERM`/`SIGINT` as long as the MCP
+/// client's stdin write end is still open, since that never triggers EOF.
+/// Call `std::process::exit` right after this function resolves instead of
+/// returning normally from `main`, as in the example below (see mcpls's own
+/// `mcpls-cli` binary; tracked as #308). This does not apply to
+/// [`Transport::Http`], which never touches `tokio::io::stdin()`.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use mcpls_core::{serve_with, Transport, ServerConfig};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let config = ServerConfig::load().expect("failed to load config");
+///     let exit_code = match serve_with(config, Transport::Stdio).await {
+///         Ok(()) => 0,
+///         Err(_) => 1,
+///     };
+///     // See "Shutdown" above: process::exit avoids a runtime-shutdown hang.
+///     std::process::exit(exit_code);
+/// }
+/// ```
+pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
-    let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
-    let extension_map = config.workspace.build_extension_map();
+    // Registered before any other startup work -- including
+    // `spawn_lsp_servers_background` below, which spawns LSP child processes
+    // concurrently on another worker thread -- so a `SIGTERM`/`SIGINT`
+    // arriving during config validation, workspace-root heuristics, or LSP
+    // spawning is caught rather than hitting the OS's default disposition
+    // (immediate termination, orphaning any LSP child mid-spawn; see #270)
+    // and skipping the `shutdown()` cleanup below entirely. See
+    // `ShutdownSignal`'s docs for why this must be a single instance carried
+    // through by value rather than re-registered later.
+    let shutdown_signal = ShutdownSignal::new();
+
+    // `ServerConfig::load`/`load_from` already validate the TOML-loading
+    // path; this covers the other one -- a caller building `ServerConfig`
+    // programmatically (e.g. a library embedder) previously hit no
+    // diagnosable error here, only silent clamping at accessor level (e.g.
+    // `LspClient::request_timeout`). `serve` delegates to this function, so
+    // one call site here covers both public entry points (`serve` and
+    // `serve_with`); note this does mean a config loaded via the CLI's
+    // `load_from` -> `serve` path is validated twice (harmless -- `validate`
+    // is a pure check with no side effects beyond a `tracing::warn!` for a
+    // non-fatal duplicate-name case, which will simply log twice).
+    //
+    // Considered wrapping this in a `Validated<ServerConfig>` marker type to
+    // make "already validated" a compile-time guarantee instead of a runtime
+    // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
+    config.validate()?;
+
+    let project_config_ignored = config.project_config_ignored;
+    // `current_dir()` always returns an absolute path. Configs loaded from a
+    // TOML file have already had relative roots rebased to that file's
+    // directory in `ServerConfig::load_from`; this second pass covers
+    // caller-built `ServerConfig`s, whose relative roots are defined against
+    // the process cwd. Only actually called when a root needs it (empty
+    // `roots`, which defaults to cwd, or at least one relative root): a
+    // fully-absolute `workspace.roots` must not fail startup just because
+    // cwd happens to be unreadable/removed (#348).
+    let workspace_roots = if config.workspace.roots.is_empty()
+        || config.workspace.roots.iter().any(|root| root.is_relative())
+    {
+        let workspace_base = std::env::current_dir().map_err(Error::Io)?;
+        resolve_workspace_roots(&config.workspace.roots, &workspace_base)?
+    } else {
+        // Every root is absolute already, so `base_dir` is never joined
+        // against inside `canonicalize_workspace_roots` -- pass an
+        // arbitrary placeholder rather than paying for `current_dir()`.
+        canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
+    };
+    let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
-    let mut translator = Translator::new().with_extensions(extension_map);
-    translator.set_workspace_roots(workspace_roots.clone());
-
-    // Build configurations for batch spawning with heuristics filtering
     let applicable_configs: Vec<ServerInitConfig> = config
         .lsp_servers
         .iter()
@@ -138,6 +591,8 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
                 server_config: lsp_config.clone(),
                 workspace_roots: workspace_roots.clone(),
                 initialization_options: lsp_config.initialization_options.clone(),
+                position_encodings: config.workspace.position_encodings.clone(),
+                notification_tx: None,
             })
         })
         .collect();
@@ -147,75 +602,665 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
         applicable_configs.len()
     );
 
-    // Spawn all servers with graceful degradation
-    let result = LspServer::spawn_batch(&applicable_configs).await;
+    // Built over the applicable (post-heuristics) configs only: this is where
+    // #174's workspace-scoped routing rules (duplicate ServerId, conflicting
+    // `handles` claims) are enforced -- a startup error naming the
+    // conflicting `[[lsp_servers]]` entries, not a silent drop.
+    let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
 
-    // Handle the three possible outcomes
-    if result.all_failed() {
-        return Err(Error::AllServersFailedToInit {
-            count: result.failure_count(),
-            failures: result.failures,
-        });
+    // Built here (rather than alongside `subscriptions`/`peer_cell` below) so
+    // it can be handed to the translator, which uses it to invalidate a
+    // respawned server's stale cached diagnostics -- see
+    // `Translator::with_notification_cache`. Independent of `translator`
+    // itself, which holds no outer lock: the pump only ever locks this
+    // cache, so it never contends with a request handler running an
+    // in-flight LSP round-trip.
+    let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+
+    let mut translator = Translator::new()
+        .with_resource_limits(config.workspace.resource_limits())
+        .with_extensions(extension_map)
+        .with_router(router)
+        .with_notification_cache(Arc::clone(&notification_cache));
+    translator.set_workspace_roots(workspace_roots.clone());
+
+    // Mark applicable servers as "expected" so a tool call that arrives while
+    // its server is still initializing gets a clear "still initializing" error
+    // (instead of "no server configured"), telling the caller to wait and retry.
+    let expected_servers: HashSet<ServerId> = applicable_configs
+        .iter()
+        .map(|c| c.server_config.id())
+        .collect();
+    translator.set_expected_servers(expected_servers);
+
+    // Shared state, built BEFORE LSP initialization so the MCP server can answer
+    // `initialize` immediately. LSP servers (which can take minutes to initialize
+    // on a large solution, e.g. a 130-project Unity .sln via OmniSharp) are spawned
+    // in a background task and registered into this shared translator once ready.
+    // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
+    // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
+    // Fixed for the server's lifetime: shared as a lock-free snapshot so
+    // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
+    // validate a path without locking `translator` below.
+    //
+    // `resolve_workspace_roots` canonicalizes before any consumer sees these
+    // paths. The snapshot can therefore stay allocation-only while preserving
+    // `diagnostic_path_in_workspace`'s canonical-root precondition and avoiding
+    // filesystem I/O on the hot per-notification path.
+    let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
+
+    let translator = Arc::new(translator);
+    let subscriptions = Arc::new(ResourceSubscriptions::new());
+    // Peer cell is populated after the MCP transport is established (Phase B).
+    let peer_cell = Arc::new(OnceCell::new());
+
+    // Cancellation for pump tasks: send `true` to request shutdown.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    let lsp_init_handle = if applicable_configs.is_empty() {
+        warn!("No applicable LSP servers configured — starting in protocol-only mode");
+        None
+    } else {
+        info!(
+            "Spawning {} LSP server(s) in the background...",
+            applicable_configs.len()
+        );
+        Some(spawn_lsp_servers_background(
+            applicable_configs,
+            Arc::clone(&translator),
+            Arc::clone(&notification_cache),
+            Arc::clone(&subscriptions),
+            Arc::clone(&peer_cell),
+            cancel_rx.clone(),
+            Arc::clone(&workspace_roots_snapshot),
+        ))
+    };
+
+    info!("Starting MCP server with rmcp...");
+    let mcp_server = mcp::McplsServer::new(
+        Arc::clone(&translator),
+        Arc::clone(&notification_cache),
+        Arc::clone(&workspace_roots_snapshot),
+        Arc::clone(&subscriptions),
+        project_config_ignored,
+    );
+    info!("MCPLS server initialized successfully");
+
+    let result = match transport {
+        Transport::Stdio => {
+            info!("Listening for MCP requests on stdio...");
+            run_stdio(mcp_server, &peer_cell, shutdown_signal).await
+        }
+        #[cfg(feature = "transport-http")]
+        Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
+    };
+
+    shutdown(&cancel_tx, &translator, lsp_init_handle).await;
+
+    info!("MCPLS server shutting down");
+    result
+}
+
+/// Bounds how long [`shutdown`] waits for the background LSP init task
+/// (see [`spawn_lsp_servers_background`]) to finish after cancellation is
+/// signaled. Deliberately shorter than [`Translator`]'s own per-server
+/// shutdown timeout: by the time `shutdown_servers` returns, every
+/// registered server's notification channel has closed, so the init task's
+/// diagnostics pumps should already be draining. This bound only matters
+/// for the rarer case where the init task is still mid-`initialize` (never
+/// registered anything for `shutdown_servers` to act on).
+const LSP_INIT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Awaits the background LSP init task's `JoinHandle` with a bounded
+/// `timeout`, logging a panic at `error` level (previously dropped
+/// silently, see #196) or an unresponsive task at `warn` level instead of
+/// letting either go unnoticed.
+///
+/// `timeout` is a parameter (rather than always
+/// [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`]) so tests can exercise the timeout
+/// branch without waiting out the real bound. Awaits `handle` by `&mut`
+/// (not by value): dropping an *owned* `JoinHandle` on timeout would only
+/// detach the task — it keeps running rather than stopping, contradicting
+/// the warning logged below. Retaining ownership lets `abort()` make that
+/// message true.
+///
+/// `abort()` only *requests* cancellation; the task's locals (which may own
+/// not-yet-registered `tokio::process::Child` handles for LSP servers
+/// [`spawn_lsp_servers_background`] is still spawning via `spawn_batch`,
+/// relying entirely on `kill_on_drop` to terminate them) are only actually
+/// dropped once the runtime polls the task to completion. `mcpls-cli`'s
+/// `main` calls `std::process::exit` right after `serve_with` returns (see
+/// #308), which skips the executor's own task teardown that used to do this
+/// polling implicitly — so this function awaits the aborted handle again,
+/// bounded, to drive that drop here instead of leaving it to chance.
+/// Otherwise a `SIGTERM` arriving mid-`spawn_batch` could orphan those LSP
+/// child processes, the exact failure mode #270 was filed to prevent.
+async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => error!("Background LSP initialization task failed: {err}"),
+        Err(_) => {
+            warn!("Timed out waiting for background LSP initialization task to stop");
+            handle.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        }
+    }
+}
+
+/// Aborts the wrapped [`JoinHandle`] when dropped, including on an unwind out
+/// of the enclosing scope — unlike a bare `.abort()` call placed at the end
+/// of a function body, which is skipped if that scope is left early (a
+/// panic, or a future `?` added above it).
+struct AbortOnDrop<'a, T>(&'a JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<'_, T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Whether a shutdown signal caught during [`shutdown`]'s cleanup window
+/// should force an immediate `std::process::exit`, given how many such
+/// signals (including this one) have been received so far.
+///
+/// Extracted as a pure function, rather than inlined into the loop that
+/// calls it, so the threshold is unit-testable without actually invoking
+/// `std::process::exit` — which would tear down the test process itself
+/// under `cargo nextest` before any assertion could run.
+const fn should_escalate(repeat_signals: u32) -> bool {
+    repeat_signals >= 1
+}
+
+/// Post-transport shutdown sequence, run once the transport future
+/// (`run_stdio`/`run_http`) returns — whether that's because of a
+/// `SIGTERM`/`SIGINT`, stdio EOF, or (for HTTP) its own graceful shutdown.
+///
+/// Signals background pump tasks to exit, then gracefully shuts down every
+/// LSP server registered on `translator` (see
+/// [`Translator::shutdown_servers`] for what "gracefully" bounds and falls
+/// back to). Finally, if the background LSP init task (see
+/// [`spawn_lsp_servers_background`]) is still running, awaits it via
+/// [`await_lsp_init_handle`], giving its diagnostics pump tasks a chance to
+/// finish draining before `serve_with` returns. Extracted from
+/// [`serve_with`] so this sequence is exercised directly in tests without
+/// needing a full stdio/HTTP transport round trip.
+///
+/// # Signal handling during cleanup (#329)
+///
+/// The OS-level `SIGTERM`/`SIGINT` handler installed by [`ShutdownSignal::new`]
+/// stays installed for the rest of the process's life once registered —
+/// `tokio::signal` never uninstalls it, regardless of how many [`ShutdownSignal`]
+/// values are constructed or dropped. So dropping the instance built in
+/// `serve_with` and moved into `run_stdio`/`run_http` (which happens as soon
+/// as that transport function returns, right before this function runs)
+/// does *not* reopen a window where a repeat signal could hit the OS's
+/// default disposition. What it does instead: with no live [`ShutdownSignal`]
+/// subscribed, a signal delivered during `shutdown_servers`/
+/// `await_lsp_init_handle` (bounded by [`Translator::shutdown_servers`]'s own
+/// per-server timeout and [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst
+/// case) is recorded and then silently discarded — there is no receiver to
+/// broadcast it to. Before this fix, that made cleanup **uninterruptible**:
+/// an operator's repeat `Ctrl-C`/`SIGTERM` during that window was a no-op
+/// short of `SIGKILL`.
+///
+/// This function re-registers a fresh `ShutdownSignal` first thing to give
+/// cleanup a listener again, restoring the ability to force-quit a stuck
+/// cleanup on request. A brief gap remains between the old registration's
+/// last live receiver dropping and this one subscribing, in which a signal
+/// can still be discarded the same way as before the fix — see the
+/// escalation behavior below for how that's bounded.
+///
+/// A signal caught here means "the operator wants out": the first one during
+/// cleanup ([`should_escalate`]) is logged and forces an immediate
+/// `std::process::exit(1)`, since the graceful default (waiting out
+/// `shutdown_servers`'s bounded timeouts) already had its chance before the
+/// operator intervened. This is deliberately not lenient — because a signal
+/// in the re-registration gap above is silently dropped rather than
+/// counted, requiring a second repeat before acting would let an unlucky
+/// operator's second press go unnoticed too. `exit(1)` skips unwinding, so
+/// it forfeits `Drop` (`kill_on_drop` on any still-running LSP child)
+/// exactly like the pre-existing panic/abort gap documented on
+/// [`Translator::shutdown_servers`]'s "Limitations" section — an explicit
+/// trade the operator is asking for, not a case this fix silently
+/// regresses.
+async fn shutdown(
+    cancel_tx: &tokio::sync::watch::Sender<bool>,
+    translator: &Translator,
+    lsp_init_handle: Option<JoinHandle<()>>,
+) {
+    let _ = cancel_tx.send(true);
+
+    let mut cleanup_signal = ShutdownSignal::new();
+    let force_exit_on_signal = tokio::spawn(async move {
+        let mut repeat_signals = 0u32;
+        loop {
+            cleanup_signal.recv().await;
+            repeat_signals += 1;
+            if should_escalate(repeat_signals) {
+                error!("shutdown signal received during cleanup, forcing immediate exit");
+                std::process::exit(1);
+            }
+        }
+    });
+    // Aborts `force_exit_on_signal` on every exit from this scope, including
+    // an unwind out of `shutdown_servers().await` below (debug builds only;
+    // release uses `panic = "abort"`) — otherwise that path would merely
+    // detach the task instead of stopping it, unlike the equivalent
+    // abort-on-timeout handling in `await_lsp_init_handle`.
+    let _abort_force_exit_on_signal = AbortOnDrop(&force_exit_on_signal);
+
+    info!("Shutting down LSP servers...");
+    translator.shutdown_servers().await;
+
+    if let Some(handle) = lsp_init_handle {
+        await_lsp_init_handle(handle, LSP_INIT_TASK_SHUTDOWN_TIMEOUT).await;
+    }
+}
+
+/// Spawn the applicable LSP servers in a background task and register them into
+/// the shared `translator` once ready.
+///
+/// This intentionally does NOT block the caller: `serve_with` starts the MCP
+/// server immediately so its `initialize` handshake returns before slow language
+/// servers (e.g. `OmniSharp` on a large Unity solution, which can take minutes to
+/// load) finish initializing. Tool calls that arrive before a server has
+/// registered return a `ServerInitializing` error telling the caller to wait and
+/// retry. If every server fails, the "expected servers" set is cleared so those
+/// calls fall back to a plain "no server configured" error instead.
+///
+/// Returns the task's `JoinHandle` so [`shutdown`] can await it: previously
+/// this handle was dropped, silently swallowing panics from
+/// `LspServer::spawn_batch`, `register_servers`, or a diagnostics pump task
+/// (see #196).
+fn spawn_lsp_servers_background(
+    applicable_configs: Vec<ServerInitConfig>,
+    translator: Arc<Translator>,
+    notification_cache: Arc<Mutex<NotificationCache>>,
+    subscriptions: Arc<ResourceSubscriptions>,
+    peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    workspace_roots: Arc<[PathBuf]>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
+            .iter()
+            .map(|c| (c.server_config.id(), c.clone()))
+            .collect();
+        let result = LspServer::spawn_batch(&applicable_configs).await;
+
+        if result.all_failed() {
+            error!(
+                "All {} configured LSP server(s) failed to initialize",
+                result.failure_count()
+            );
+            for failure in &result.failures {
+                error!("Server initialization failed: {}", failure);
+            }
+            // No server will register: rebind against an empty registered
+            // set so every route drops (one rule, no special case -- see
+            // `ToolRouter::rebind_to_registered`), then stop reporting
+            // "still initializing". This path returns before
+            // `register_servers` ever runs, so it needs its own rebind call;
+            // skipping it would leave every route pointed at a dead server.
+            translator.rebind_router(&HashSet::new());
+            translator.clear_expected_servers();
+            return;
+        }
+
+        if result.partial_success() {
+            warn!(
+                "Partial server initialization: {} succeeded, {} failed",
+                result.server_count(),
+                result.failure_count()
+            );
+            for failure in &result.failures {
+                error!("Server initialization failed: {}", failure);
+            }
+        }
+
+        let server_count = result.server_count();
+        let registered = register_servers(result, &translator, &configs_by_id);
+        // Background initialization has completed; stop reporting "still
+        // initializing" (especially for servers that failed to spawn on
+        // partial success, which would otherwise return ServerInitializing
+        // forever instead of NoServerForLanguage/Tool).
+        translator.clear_expected_servers();
+        info!("Proceeding with {} LSP server(s)", server_count);
+
+        // Give each diagnostics-route server a fair share of the shared
+        // diagnostics cache budget now that the full set is known -- see
+        // `NotificationCache::set_diagnostics_route_count` (#266).
+        let diagnostics_route_count = registered
+            .diagnostics_flags
+            .values()
+            .filter(|&&is_route| is_route)
+            .count();
+        notification_cache
+            .lock()
+            .await
+            .set_diagnostics_route_count(diagnostics_route_count);
+
+        // Start diagnostics pump tasks now that servers are registered.
+        let pump_shared = PumpShared {
+            notification_cache,
+            subs: subscriptions,
+            peer_cell,
+            workspace_roots,
+        };
+        let mut pumps: JoinSet<()> = JoinSet::new();
+        for (id, rx) in registered.receivers {
+            let caches_diagnostics = registered
+                .diagnostics_flags
+                .get(&id)
+                .copied()
+                .unwrap_or(false);
+            pumps.spawn(diagnostics_pump(
+                id,
+                rx,
+                cancel_rx.clone(),
+                caches_diagnostics,
+                pump_shared.clone(),
+            ));
+        }
+        while pumps.join_next().await.is_some() {}
+    })
+}
+
+/// Shared by any `#[cfg(test)]` module in this crate that needs to mutate
+/// the process-wide working directory (`std::env::set_current_dir`). Such
+/// tests must not run concurrently with each other or with any other test
+/// that relies on cwd -- nextest runs each test in its own process, so this
+/// only matters under a plain `cargo test`, but a single shared lock is what
+/// makes that true across every module's tests in this crate, not just
+/// within one module (#348).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that serializes CWD-mutating tests behind [`CWD_LOCK`] and
+    /// switches into `dir` for the guard's lifetime, restoring the original
+    /// working directory on drop — including on an early return or panic.
+    ///
+    /// `pub`, not `pub(crate)`: this module is itself private (unexported),
+    /// so `pub(crate)` on its items would be redundant -- see
+    /// `clippy::redundant_pub_crate`. Still only reachable crate-internally
+    /// via `crate::test_support::CwdGuard`, since the module isn't `pub`.
+    pub struct CwdGuard {
+        _lock: MutexGuard<'static, ()>,
+        original_dir: PathBuf,
     }
 
-    if result.partial_success() {
-        warn!(
-            "Partial server initialization: {} succeeded, {} failed",
-            result.server_count(),
-            result.failure_count()
-        );
-        for failure in &result.failures {
-            error!("Server initialization failed: {}", failure);
+    impl CwdGuard {
+        pub fn enter(dir: &Path) -> Self {
+            let lock = CWD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            let original_dir = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self {
+                _lock: lock,
+                original_dir,
+            }
         }
     }
 
-    // Check if at least one server successfully initialized
-    if !result.has_servers() {
-        return Err(Error::NoServersAvailable(
-            "none configured or all failed to initialize".to_string(),
-        ));
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let restored = std::env::set_current_dir(&self.original_dir);
+            // A failure here during an already-unwinding panic must not
+            // panic again (double panic aborts the process, losing the
+            // original failure's message). On the normal path, though,
+            // silently swallowing this would leave the process cwd wrong
+            // for every subsequent test with no diagnostic — panic loudly
+            // instead, since that's exactly the failure mode this guard
+            // exists to prevent.
+            if !std::thread::panicking() {
+                #[allow(clippy::expect_used)]
+                restored.expect("CwdGuard failed to restore original working directory");
+            }
+        }
     }
 
-    // Register all successfully initialized servers
-    let server_count = result.server_count();
-    for (language_id, server) in result.servers {
-        let client = server.client().clone();
-        translator.register_client(language_id.clone(), client);
-        translator.register_server(language_id.clone(), server);
+    #[cfg(test)]
+    mod tests {
+        use super::CwdGuard;
+
+        #[test]
+        fn test_cwd_guard_restores_cwd_on_panic() {
+            let original_dir = std::env::current_dir().unwrap();
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = CwdGuard::enter(tmp_dir.path());
+                panic!("boom");
+            }));
+
+            assert!(result.is_err());
+            assert_eq!(std::env::current_dir().unwrap(), original_dir);
+        }
     }
-
-    info!("Proceeding with {} LSP server(s)", server_count);
-
-    let translator = Arc::new(Mutex::new(translator));
-
-    info!("Starting MCP server with rmcp...");
-    let mcp_server = mcp::McplsServer::new(translator);
-
-    info!("MCPLS server initialized successfully");
-    info!("Listening for MCP requests on stdio...");
-
-    let service = mcp_server
-        .serve(rmcp::transport::stdio())
-        .await
-        .map_err(|e| Error::McpServer(format!("Failed to start MCP server: {e}")))?;
-
-    service
-        .waiting()
-        .await
-        .map_err(|e| Error::McpServer(format!("MCP server error: {e}")))?;
-
-    info!("MCPLS server shutting down");
-    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
+
     use super::*;
 
     #[test]
+    fn test_diagnostic_path_in_workspace_empty_roots_allows_any_uri() {
+        let uri: Uri = "file:///anywhere/at/all.rs".parse().unwrap();
+        assert!(diagnostic_path_in_workspace(&uri, &[]));
+    }
+
+    #[test]
+    fn test_diagnostic_path_in_workspace_accepts_uri_under_root() {
+        // `Url::to_file_path` on Windows requires the URL's first path
+        // segment to be a drive letter; a Unix-style path with no drive
+        // letter fails to convert at all (`uri_to_path` returns `None`),
+        // trivially satisfying this assertion for the wrong reason. Use a
+        // drive-letter path so the test actually exercises the prefix check
+        // on every platform.
+        #[cfg(windows)]
+        let (root, uri_str) = (
+            PathBuf::from(r"C:\workspace\project"),
+            "file:///C:/workspace/project/src/main.rs",
+        );
+        #[cfg(not(windows))]
+        let (root, uri_str) = (
+            PathBuf::from("/workspace/project"),
+            "file:///workspace/project/src/main.rs",
+        );
+        let uri: Uri = uri_str.parse().unwrap();
+        assert!(diagnostic_path_in_workspace(&uri, &[root]));
+    }
+
+    #[test]
+    fn test_diagnostic_path_in_workspace_rejects_uri_outside_roots() {
+        #[cfg(windows)]
+        let (root, uri_str) = (
+            PathBuf::from(r"C:\workspace\project"),
+            "file:///C:/etc/passwd",
+        );
+        #[cfg(not(windows))]
+        let (root, uri_str) = (PathBuf::from("/workspace/project"), "file:///etc/passwd");
+        let uri: Uri = uri_str.parse().unwrap();
+        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+    }
+
+    #[test]
+    fn test_diagnostic_path_in_workspace_rejects_non_file_uri() {
+        let root = PathBuf::from("/workspace/project");
+        let uri: Uri = "untitled:Untitled-1".parse().unwrap();
+        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+    }
+
+    /// `Path::starts_with` is a lexical, component-wise comparison that does
+    /// not resolve `.`/`..` — without an explicit check, a URI like
+    /// `file:///workspace/project/../../etc/passwd` would lexically "start
+    /// with" `/workspace/project` despite pointing outside it.
+    #[test]
+    fn test_diagnostic_path_in_workspace_rejects_parent_dir_traversal() {
+        #[cfg(windows)]
+        let (root, uri_str) = (
+            PathBuf::from(r"C:\workspace\project"),
+            "file:///C:/workspace/project/../../etc/passwd",
+        );
+        #[cfg(not(windows))]
+        let (root, uri_str) = (
+            PathBuf::from("/workspace/project"),
+            "file:///workspace/project/../../etc/passwd",
+        );
+        let uri: Uri = uri_str.parse().unwrap();
+        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+    }
+
+    #[test]
+    fn test_canonicalize_workspace_roots_falls_back_on_nonexistent_absolute_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let missing = base.join("missing");
+        let result = canonicalize_workspace_roots(std::slice::from_ref(&missing), &base).unwrap();
+        assert_eq!(result, vec![missing]);
+    }
+
+    #[test]
+    fn test_canonicalize_workspace_roots_rejects_nonexistent_relative_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let missing = PathBuf::from("missing");
+
+        let err = canonicalize_workspace_roots(std::slice::from_ref(&missing), &base).unwrap_err();
+
+        let Error::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(message.contains("workspace root 'missing'"));
+        assert!(message.contains(&base.display().to_string()));
+    }
+
+    /// #234 round-3 regression: a symlinked workspace root must canonicalize
+    /// to its real path, matching what LSP servers report in diagnostics --
+    /// otherwise `diagnostic_path_in_workspace`'s uncanonicalized prefix check
+    /// would silently drop every diagnostic for that workspace.
+    #[test]
+    #[cfg(unix)]
+    fn test_canonicalize_workspace_roots_resolves_symlink() {
+        use std::os::unix::fs::symlink;
+
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let real_dir = base.join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link_dir = base.join("link");
+        symlink(&real_dir, &link_dir).unwrap();
+
+        let result = canonicalize_workspace_roots(&[link_dir], &base).unwrap();
+        assert_eq!(result, vec![real_dir]);
+    }
+
+    /// #348 case 3 (S2): direct, platform-independent test of
+    /// `join_relative_root`'s `Component`-stripping logic. The bug it fixes
+    /// (a root that's rooted-without-prefix, e.g. `\workspace`) only makes
+    /// `Path::is_relative()` return `true` on Windows, so the end-to-end
+    /// `#[cfg(windows)]` test below is the only one that reproduces the
+    /// actual failure through the public call path -- but the underlying
+    /// `Component` shape it strips (a leading `RootDir` with no preceding
+    /// `Prefix`) is reproducible on any OS by calling the helper directly,
+    /// bypassing the `is_relative()` gate that would otherwise route such
+    /// input elsewhere on non-Windows hosts.
+    #[test]
+    fn test_join_relative_root_strips_leading_root_and_prefix_components() {
+        let base = Path::new("/base/dir");
+
+        assert_eq!(
+            join_relative_root(base, Path::new("/workspace")),
+            PathBuf::from("/base/dir/workspace")
+        );
+        assert_eq!(
+            join_relative_root(base, Path::new("/workspace/sub")),
+            PathBuf::from("/base/dir/workspace/sub")
+        );
+        // An ordinary relative root (no leading `Prefix`/`RootDir`) is
+        // unaffected -- equivalent to a plain `base_dir.join(root)`.
+        assert_eq!(
+            join_relative_root(base, Path::new("workspace")),
+            PathBuf::from("/base/dir/workspace")
+        );
+        assert_eq!(
+            join_relative_root(base, Path::new("..")),
+            PathBuf::from("/base/dir/..")
+        );
+    }
+
+    /// #348 case 3: a configured root with no drive/UNC prefix (e.g.
+    /// `\workspace`) is `Path::is_relative() == true` on Windows despite
+    /// being rooted (`is_absolute()` requires a prefix there). Plain
+    /// `base_dir.join(root)` would hit `PathBuf::push`'s "root without
+    /// prefix" behavior and silently discard everything in `base_dir` past
+    /// its own prefix -- only reproducible on Windows, since elsewhere a
+    /// leading `/` either makes the root absolute (Unix) or isn't a
+    /// separator at all.
+    #[test]
+    #[cfg(windows)]
+    fn test_canonicalize_workspace_roots_windows_root_without_prefix() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let nested = base.join("workspace");
+        std::fs::create_dir(&nested).unwrap();
+
+        let root = PathBuf::from(r"\workspace");
+        assert!(root.is_relative());
+
+        let result = canonicalize_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
+        assert_eq!(result, vec![nested]);
+    }
+
+    /// #348 M2: a Windows drive-relative root (`C:workspace` -- a leading
+    /// `Component::Prefix` with no `RootDir`) is also `is_relative() ==
+    /// true`. Plain `base_dir.join(root)` would hit `PathBuf::push`'s
+    /// "has a prefix" special case and discard `base_dir` entirely instead
+    /// of joining under it -- the same class of failure as the
+    /// rooted-without-prefix case above, via a prefix instead of a root
+    /// separator. `join_relative_root` deliberately does not replicate
+    /// native Windows drive-relative resolution (which resolves against
+    /// that drive's own current directory); it joins under `base_dir`
+    /// instead, consistent with every other relative root.
+    #[test]
+    #[cfg(windows)]
+    fn test_canonicalize_workspace_roots_windows_drive_relative_root() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let nested = base.join("workspace");
+        std::fs::create_dir(&nested).unwrap();
+
+        // Built from `base`'s own drive prefix so the test doesn't depend on
+        // which drive CI happens to check the repo out onto.
+        let drive_prefix = base
+            .components()
+            .find_map(|c| match c {
+                Component::Prefix(p) => Some(p.as_os_str().to_owned()),
+                _ => None,
+            })
+            .expect("temp dir path should have a Windows drive prefix");
+        let mut root = drive_prefix;
+        root.push("workspace");
+        let root = PathBuf::from(root);
+        assert!(root.is_relative());
+
+        let result = canonicalize_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
+        assert_eq!(result, vec![nested]);
+    }
+
+    #[test]
     fn test_resolve_workspace_roots_empty_config() {
-        let roots = resolve_workspace_roots(&[]);
+        let cwd = std::env::current_dir().unwrap();
+        let roots = resolve_workspace_roots(&[], &cwd).unwrap();
         assert_eq!(roots.len(), 1);
         assert!(
             roots[0].is_absolute(),
@@ -225,109 +1270,171 @@ mod tests {
 
     #[test]
     fn test_resolve_workspace_roots_with_config() {
-        let config_roots = vec![PathBuf::from("/test/root")];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots, config_roots);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+
+        let roots = resolve_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
+        assert_eq!(roots, vec![root]);
     }
 
     #[test]
     fn test_resolve_workspace_roots_multiple_paths() {
-        let config_roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
-        let roots = resolve_workspace_roots(&config_roots);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let config_roots = vec![base.join("root1"), base.join("root2")];
+        for root in &config_roots {
+            std::fs::create_dir(root).unwrap();
+        }
+
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
         assert_eq!(roots, config_roots);
         assert_eq!(roots.len(), 2);
     }
 
     #[test]
     fn test_resolve_workspace_roots_preserves_order() {
-        let config_roots = vec![
-            PathBuf::from("/workspace/alpha"),
-            PathBuf::from("/workspace/beta"),
-            PathBuf::from("/workspace/gamma"),
-        ];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots[0], PathBuf::from("/workspace/alpha"));
-        assert_eq!(roots[1], PathBuf::from("/workspace/beta"));
-        assert_eq!(roots[2], PathBuf::from("/workspace/gamma"));
-    }
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let config_roots = vec![base.join("alpha"), base.join("beta"), base.join("gamma")];
+        for root in &config_roots {
+            std::fs::create_dir(root).unwrap();
+        }
 
-    #[test]
-    fn test_resolve_workspace_roots_single_path() {
-        let config_roots = vec![PathBuf::from("/single/workspace")];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0], PathBuf::from("/single/workspace"));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_empty_returns_cwd() {
-        let roots = resolve_workspace_roots(&[]);
-        assert!(
-            !roots.is_empty(),
-            "Should return at least one workspace root"
-        );
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_relative_paths() {
-        let config_roots = vec![
-            PathBuf::from("relative/path1"),
-            PathBuf::from("relative/path2"),
-        ];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], PathBuf::from("relative/path1"));
-        assert_eq!(roots[1], PathBuf::from("relative/path2"));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_mixed_paths() {
-        let config_roots = vec![
-            PathBuf::from("/absolute/path"),
-            PathBuf::from("relative/path"),
-        ];
-        let roots = resolve_workspace_roots(&config_roots);
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], PathBuf::from("/absolute/path"));
-        assert_eq!(roots[1], PathBuf::from("relative/path"));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_with_dot_path() {
-        let config_roots = vec![PathBuf::from(".")];
-        let roots = resolve_workspace_roots(&config_roots);
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
         assert_eq!(roots, config_roots);
     }
 
     #[test]
-    fn test_resolve_workspace_roots_with_parent_path() {
-        let config_roots = vec![PathBuf::from("..")];
-        let roots = resolve_workspace_roots(&config_roots);
+    fn test_resolve_workspace_roots_single_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let root = base.join("workspace");
+        std::fs::create_dir(&root).unwrap();
+
+        let roots = resolve_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
         assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0], PathBuf::from(".."));
+        assert_eq!(roots[0], root);
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_empty_returns_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let roots = resolve_workspace_roots(&[], &cwd).unwrap();
+        assert_eq!(roots, vec![dunce::canonicalize(cwd).unwrap()]);
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_relative_paths() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let config_roots = vec![
+            PathBuf::from("relative/path1"),
+            PathBuf::from("relative/path2"),
+        ];
+        for root in &config_roots {
+            std::fs::create_dir_all(base.join(root)).unwrap();
+        }
+
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
+        assert_eq!(
+            roots,
+            vec![base.join("relative/path1"), base.join("relative/path2")]
+        );
+        assert!(roots.iter().all(|root| root.is_absolute()));
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_mixed_paths() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let absolute = base.join("absolute");
+        let relative = PathBuf::from("relative/path");
+        std::fs::create_dir(&absolute).unwrap();
+        std::fs::create_dir_all(base.join(&relative)).unwrap();
+        let config_roots = vec![absolute.clone(), relative];
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], absolute);
+        assert_eq!(roots[1], base.join("relative/path"));
+        assert!(roots.iter().all(|root| root.is_absolute()));
+    }
+
+    /// #348 case 1: `serve_with` skips `std::env::current_dir()` entirely
+    /// for a fully-absolute `workspace.roots`, passing an unused placeholder
+    /// base directory straight to `canonicalize_workspace_roots` instead of
+    /// `resolve_workspace_roots`. Confirms that placeholder is never
+    /// dereferenced when every root is already absolute.
+    #[test]
+    fn test_canonicalize_workspace_roots_ignores_base_dir_when_all_absolute() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+
+        let result =
+            canonicalize_workspace_roots(std::slice::from_ref(&root), Path::new("")).unwrap();
+        assert_eq!(result, vec![root]);
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_with_dot_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let config_roots = vec![PathBuf::from(".")];
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
+        assert_eq!(roots, vec![base]);
+        assert!(roots[0].is_absolute());
+    }
+
+    #[test]
+    fn test_resolve_workspace_roots_with_parent_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let parent = dunce::canonicalize(temp_dir.path()).unwrap();
+        let base = parent.join("nested");
+        std::fs::create_dir(&base).unwrap();
+        let config_roots = vec![PathBuf::from("..")];
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], parent);
+        assert!(roots[0].is_absolute());
     }
 
     #[test]
     fn test_resolve_workspace_roots_unicode_paths() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
         let config_roots = vec![
-            PathBuf::from("/workspace/テスト"),
-            PathBuf::from("/workspace/тест"),
+            PathBuf::from("workspace/テスト"),
+            PathBuf::from("workspace/тест"),
         ];
-        let roots = resolve_workspace_roots(&config_roots);
+        for root in &config_roots {
+            std::fs::create_dir_all(base.join(root)).unwrap();
+        }
+
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
         assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], PathBuf::from("/workspace/テスト"));
-        assert_eq!(roots[1], PathBuf::from("/workspace/тест"));
+        assert_eq!(roots[0], base.join("workspace/テスト"));
+        assert_eq!(roots[1], base.join("workspace/тест"));
     }
 
     #[test]
     fn test_resolve_workspace_roots_spaces_in_paths() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
         let config_roots = vec![
-            PathBuf::from("/workspace/path with spaces"),
-            PathBuf::from("/another path/workspace"),
+            PathBuf::from("workspace/path with spaces"),
+            PathBuf::from("another path/workspace"),
         ];
-        let roots = resolve_workspace_roots(&config_roots);
+        for root in &config_roots {
+            std::fs::create_dir_all(base.join(root)).unwrap();
+        }
+
+        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
         assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], PathBuf::from("/workspace/path with spaces"));
+        assert_eq!(roots[0], base.join("workspace/path with spaces"));
+        assert_eq!(roots[1], base.join("another path/workspace"));
     }
 
     // Tests for graceful degradation behavior
@@ -340,11 +1447,13 @@ mod tests {
         fn test_all_servers_failed_error_handling() {
             let mut result = ServerInitResult::new();
             result.add_failure(ServerSpawnFailure {
+                server_id: ServerId::from("rust"),
                 language_id: "rust".to_string(),
                 command: "rust-analyzer".to_string(),
                 message: "not found".to_string(),
             });
             result.add_failure(ServerSpawnFailure {
+                server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
                 message: "not found".to_string(),
@@ -363,6 +1472,7 @@ mod tests {
             // Simulate one success and one failure
             result.servers = HashMap::new(); // Would have a real server in production
             result.add_failure(ServerSpawnFailure {
+                server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
                 message: "not found".to_string(),
@@ -389,11 +1499,13 @@ mod tests {
         fn test_all_servers_failed_to_init_error() {
             let failures = vec![
                 ServerSpawnFailure {
+                    server_id: ServerId::from("rust"),
                     language_id: "rust".to_string(),
                     command: "rust-analyzer".to_string(),
                     message: "command not found".to_string(),
                 },
                 ServerSpawnFailure {
+                    server_id: ServerId::from("python"),
                     language_id: "python".to_string(),
                     command: "pyright".to_string(),
                     message: "permission denied".to_string(),
@@ -431,6 +1543,7 @@ mod tests {
         #[test]
         fn test_server_spawn_failure_display() {
             let failure = ServerSpawnFailure {
+                server_id: ServerId::from("typescript"),
                 language_id: "typescript".to_string(),
                 command: "tsserver".to_string(),
                 message: "executable not found in PATH".to_string(),
@@ -453,6 +1566,7 @@ mod tests {
 
             // Add a failure
             result.add_failure(ServerSpawnFailure {
+                server_id: ServerId::from("go"),
                 language_id: "go".to_string(),
                 command: "gopls".to_string(),
                 message: "error".to_string(),
@@ -464,16 +1578,26 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_serve_fails_with_no_servers_available() {
+        async fn test_serve_degrades_when_all_servers_fail_to_spawn() {
             use crate::config::{LspServerConfig, WorkspaceConfig};
 
-            // Create a config with an invalid server (guaranteed to fail)
+            // A configured server whose command cannot spawn used to make serve()
+            // fail synchronously with NoServersAvailable / AllServersFailedToInit.
+            // LSP initialization now runs in a background task so the MCP
+            // `initialize` handshake is never blocked, which means the spawn
+            // failure is handled in the background instead: serve() starts the MCP
+            // server in degraded mode (mirroring `test_serve_starts_with_empty_config`)
+            // rather than failing fast. Any error it surfaces must therefore be a
+            // transport/MCP error from the closed test connection, NOT a fail-fast
+            // server-availability error.
             let config = ServerConfig {
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    max_documents: DEFAULT_MAX_DOCUMENTS,
+                    max_file_size: DEFAULT_MAX_FILE_SIZE,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -483,53 +1607,677 @@ mod tests {
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     timeout_seconds: 10,
+                    request_timeout_seconds: 10,
                     heuristics: None,
+                    name: None,
+                    handles: None,
                 }],
+                project_config_ignored: false,
             };
 
-            let result = serve(config).await;
+            // serve() proceeds to run the MCP server and blocks on the stdio
+            // transport until EOF; bound it so the test can't hang if stdin stays
+            // open (e.g. under multi-threaded `cargo test`, where several serve()
+            // tests share the process stdin).
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(2), serve(config)).await;
 
-            assert!(result.is_err());
-            let err = result.unwrap_err();
-
-            // The serve function should now return NoServersAvailable error
-            // because all servers failed, but has_servers() returned false
-            assert!(
-                matches!(err, Error::NoServersAvailable(_))
-                    || matches!(err, Error::AllServersFailedToInit { .. }),
-                "Expected NoServersAvailable or AllServersFailedToInit error, got: {err:?}"
-            );
+            match outcome {
+                // Still serving after the deadline => it did not fail fast. Good.
+                Err(_elapsed) => {}
+                // Transport closed cleanly. Also fine.
+                Ok(Ok(())) => {}
+                // It returned an error: it must not be a fail-fast availability error.
+                Ok(Err(err)) => assert!(
+                    !matches!(err, Error::NoServersAvailable(_))
+                        && !matches!(err, Error::AllServersFailedToInit { .. }),
+                    "serve() must not fail fast now that LSP init is backgrounded; got: {err:?}"
+                ),
+            }
         }
 
         #[tokio::test]
-        async fn test_serve_fails_with_empty_config() {
+        async fn test_serve_starts_with_empty_config() {
             use crate::config::WorkspaceConfig;
 
-            // Create a config with no servers
+            // Server starts in protocol-only mode when no LSP servers are configured.
+            // serve() blocks until the MCP transport closes, so it will error with a
+            // connection/transport error — not NoServersAvailable.
             let config = ServerConfig {
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
+                    max_documents: DEFAULT_MAX_DOCUMENTS,
+                    max_file_size: DEFAULT_MAX_FILE_SIZE,
                 },
                 lsp_servers: vec![],
+                project_config_ignored: false,
             };
 
             let result = serve(config).await;
 
-            assert!(result.is_err());
-            let err = result.unwrap_err();
-
-            // Should return NoServersAvailable because no servers were configured
-            assert!(
-                matches!(err, Error::NoServersAvailable(_)),
-                "Expected NoServersAvailable error, got: {err:?}"
-            );
-
-            if let Error::NoServersAvailable(msg) = err {
-                assert!(msg.contains("none configured"));
+            // serve() may succeed or fail with a transport error, but must NOT
+            // return NoServersAvailable when the config simply has no servers.
+            if let Err(ref err) = result {
+                assert!(
+                    !matches!(err, Error::NoServersAvailable(_)),
+                    "serve() must not return NoServersAvailable for empty lsp_servers config"
+                );
             }
+        }
+
+        /// #348 case 1 (tester-flagged coverage gap): proves `serve_with`
+        /// itself skips `current_dir()` for an all-absolute
+        /// `workspace.roots`, not just that `canonicalize_workspace_roots`
+        /// tolerates an unused base when called directly (see
+        /// `test_canonicalize_workspace_roots_ignores_base_dir_when_all_absolute`
+        /// in the outer `tests` module, which never exercises `serve_with`'s
+        /// branch selection and would still pass if that `if` were inverted
+        /// or deleted). Mutates the process cwd (chdir into a directory,
+        /// then remove it -- `current_dir()` reliably fails afterward on
+        /// Unix), so it uses the crate-shared `test_support::CwdGuard` --
+        /// the same lock/restore-on-drop `config::tests` uses -- rather than
+        /// a one-off guard, since both modules' tests mutate cwd and compile
+        /// into one binary. Unix-only since removing a directory that is
+        /// still a live process's cwd is a Windows-specific error case, not
+        /// the same reproducible `current_dir()` failure.
+        #[tokio::test]
+        #[cfg(unix)]
+        async fn test_serve_with_all_absolute_roots_skips_current_dir() {
+            use crate::config::WorkspaceConfig;
+            use crate::test_support::CwdGuard;
+
+            // Kept alive for the whole test so the configured workspace root
+            // stays a valid, existing absolute directory distinct from the
+            // cwd this test is about to remove.
+            let workspace_root_dir = tempfile::TempDir::new().unwrap();
+            let workspace_root = dunce::canonicalize(workspace_root_dir.path()).unwrap();
+
+            let doomed_cwd = tempfile::TempDir::new().unwrap();
+            let _guard = CwdGuard::enter(doomed_cwd.path());
+            doomed_cwd.close().unwrap();
+
+            let config = ServerConfig {
+                workspace: WorkspaceConfig {
+                    roots: vec![workspace_root],
+                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    language_extensions: vec![],
+                    heuristics_max_depth: 10,
+                    max_documents: DEFAULT_MAX_DOCUMENTS,
+                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                },
+                lsp_servers: vec![],
+                project_config_ignored: false,
+            };
+
+            // serve() with no LSP servers configured blocks on the stdio
+            // transport, same as `test_serve_starts_with_empty_config`;
+            // bound it so the test can't hang.
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(2), serve(config)).await;
+
+            match outcome {
+                // Still serving after the deadline => it did not fail fast. Good.
+                Err(_elapsed) => {}
+                // Transport closed cleanly. Also fine.
+                Ok(Ok(())) => {}
+                // It returned an error: it must not be the `current_dir()`
+                // failure this test set up (`ErrorKind::NotFound` from the
+                // removed cwd). Narrowed to that specific `io::ErrorKind`
+                // rather than any `Error::Io`, since the latter would also
+                // match an unrelated IO error from the stdio transport
+                // within the timeout window.
+                Ok(Err(err)) => assert!(
+                    !matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+                    "serve() must not need a working process cwd for an all-absolute \
+                     workspace.roots; got: {err:?}"
+                ),
+            }
+        }
+
+        /// #282: a `ServerConfig` built programmatically (not via `load`/
+        /// `load_from`, which already run `validate()`) previously skipped
+        /// validation entirely, so `serve`/`serve_with` never rejected it —
+        /// misconfiguration only surfaced later as silent accessor-level
+        /// clamping. `serve` delegates straight to `serve_with`, so
+        /// exercising it here also covers `serve_with`'s own `validate()`
+        /// call. `validate()` runs before any LSP spawn or transport setup,
+        /// so this returns immediately without needing a timeout guard.
+        #[tokio::test]
+        async fn test_serve_rejects_invalid_caller_supplied_config() {
+            use crate::config::{LspServerConfig, WorkspaceConfig};
+
+            let config = ServerConfig {
+                workspace: WorkspaceConfig {
+                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    language_extensions: vec![],
+                    heuristics_max_depth: 10,
+                    max_documents: DEFAULT_MAX_DOCUMENTS,
+                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                },
+                lsp_servers: vec![LspServerConfig {
+                    language_id: "rust".to_string(),
+                    command: String::new(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec!["**/*.rs".to_string()],
+                    initialization_options: None,
+                    timeout_seconds: 10,
+                    request_timeout_seconds: 10,
+                    heuristics: None,
+                    name: None,
+                    handles: None,
+                }],
+                project_config_ignored: false,
+            };
+
+            // `validate()` runs before any spawn/transport work and should
+            // return immediately; bound it anyway so a regression that lets
+            // an invalid config reach the stdio transport fails fast with a
+            // clear timeout instead of hanging nextest for the default 120s
+            // (mirroring the guard on `test_serve_degrades_when_all_servers_fail_to_spawn`).
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(2), serve(config)).await;
+
+            match outcome {
+                Err(elapsed) => panic!(
+                    "serve() must reject the invalid config immediately, not hang until \
+                     timeout: {elapsed}"
+                ),
+                Ok(result) => assert!(
+                    matches!(result, Err(Error::InvalidConfig(_))),
+                    "serve() must reject a caller-supplied config with an empty `command` via \
+                     Error::InvalidConfig, matching the load_from path; got: {result:?}"
+                ),
+            }
+        }
+
+        /// #241: `serve_with`'s post-transport shutdown sequence must drain
+        /// registered LSP servers rather than orphaning them. Exercises
+        /// `shutdown()` directly (the exact code `serve_with` runs after its
+        /// transport future returns) against a `Translator` with a real,
+        /// registered `LspServer` — `serve_with` itself can't be driven
+        /// through this path in a portable unit test, since it only
+        /// registers a server after a successful LSP `initialize` handshake,
+        /// which requires a real language server binary.
+        #[tokio::test]
+        async fn test_shutdown_drains_registered_lsp_server() {
+            let translator = Translator::new();
+            translator.register_server("fake-server", crate::lsp::fake_lsp_server());
+            assert_eq!(translator.registered_server_count(), 1);
+
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                super::super::shutdown(&cancel_tx, &translator, None),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "shutdown must not hang against a non-responsive mock LSP server"
+            );
+            assert_eq!(
+                translator.registered_server_count(),
+                0,
+                "shutdown must drain every registered LSP server"
+            );
+            assert!(
+                *cancel_rx.borrow(),
+                "shutdown must signal background pump tasks to exit"
+            );
+        }
+
+        /// #196: `shutdown` must await the background LSP init task's
+        /// `JoinHandle` (rather than leaving it detached) so a panic inside
+        /// it surfaces as an `error!` log instead of being silently dropped.
+        #[tokio::test]
+        async fn test_shutdown_awaits_background_init_task() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let translator = Translator::new();
+            let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+
+            let completed = Arc::new(AtomicBool::new(false));
+            let completed_clone = Arc::clone(&completed);
+            let handle = tokio::spawn(async move {
+                completed_clone.store(true, Ordering::SeqCst);
+            });
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::super::shutdown(&cancel_tx, &translator, Some(handle)),
+            )
+            .await;
+
+            assert!(result.is_ok(), "shutdown must not hang on a live handle");
+            assert!(
+                completed.load(Ordering::SeqCst),
+                "shutdown must await the background init task before returning"
+            );
+        }
+
+        /// A timed-out background init task must actually be stopped
+        /// (`JoinHandle::abort`), not merely detached: awaiting the handle
+        /// *by value* inside `tokio::time::timeout` would drop only the
+        /// `JoinHandle` on timeout, which detaches the task without
+        /// cancelling it — it keeps running (and its future is never
+        /// dropped) despite the "timed out waiting ... to stop" log.
+        ///
+        /// Tests `await_lsp_init_handle` directly with a millisecond-scale
+        /// `timeout` (rather than going through `shutdown` with the real
+        /// multi-second `LSP_INIT_TASK_SHUTDOWN_TIMEOUT`) so this stays
+        /// fast. A `completed`-style flag set at the end of the task
+        /// couldn't tell "aborted" from "merely detached" apart here either
+        /// way, since the task hasn't finished its (deliberately long)
+        /// sleep yet in both cases — so this uses a `Drop`-signaling guard
+        /// held across the `.await` instead: `abort()` drops the task's
+        /// future promptly (well inside the grace period below), while a
+        /// detached-but-still-running task would only drop it once its
+        /// sleep actually finishes.
+        #[tokio::test]
+        async fn test_await_lsp_init_handle_aborts_on_timeout() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            struct DropFlag(Arc<AtomicBool>);
+            impl Drop for DropFlag {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            let future_dropped = Arc::new(AtomicBool::new(false));
+            let guard = DropFlag(Arc::clone(&future_dropped));
+            let handle = tokio::spawn(async move {
+                let _guard = guard;
+                // Far longer than the timeout below, so it only elapses if
+                // the task is genuinely aborted rather than left running.
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            });
+
+            super::super::await_lsp_init_handle(handle, std::time::Duration::from_millis(20)).await;
+
+            // Give the just-aborted task's cancellation a moment to land.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                future_dropped.load(Ordering::SeqCst),
+                "timed-out background init task's future must be dropped via abort(), \
+                 not left running detached until its own sleep completes"
+            );
+        }
+
+        /// #196: a panicking background init task must not hang or crash
+        /// `shutdown`, and the panic must actually be logged (not merely
+        /// swallowed while `shutdown` happens not to hang for other
+        /// reasons) — asserted via a captured `tracing` event rather than
+        /// just checking completion.
+        #[tokio::test]
+        async fn test_await_lsp_init_handle_logs_panic() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let handle = tokio::spawn(async {
+                panic!("simulated background LSP init panic");
+            });
+
+            let captured = CapturedMessages::default();
+            let subscriber = tracing_subscriber::registry().with(captured.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+
+            super::super::await_lsp_init_handle(handle, std::time::Duration::from_secs(5)).await;
+
+            drop(guard);
+
+            let messages = captured.0.lock().unwrap().clone();
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("Background LSP initialization task failed")),
+                "expected an error! log for the panicking background init task, got: {messages:?}"
+            );
+        }
+
+        /// Captures `tracing` events emitted while a closure runs. Mirrors
+        /// `transport::tests::http_tests::CapturedMessages` — duplicated
+        /// rather than shared since this crate has no common test-support
+        /// module and the two live in separate, non-`pub` test submodules.
+        #[derive(Clone, Default)]
+        struct CapturedMessages(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedMessages {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct MessageVisitor(String);
+                impl tracing::field::Visit for MessageVisitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut visitor = MessageVisitor(String::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // diagnostics_pump unit tests
+    // ------------------------------------------------------------------
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod pump_tests {
+        use lsp_types::{PublishDiagnosticsParams, Uri};
+        use tokio::sync::{mpsc, watch};
+
+        use super::*;
+
+        fn make_cache() -> Arc<Mutex<NotificationCache>> {
+            Arc::new(Mutex::new(NotificationCache::new()))
+        }
+
+        fn make_subs() -> Arc<ResourceSubscriptions> {
+            Arc::new(ResourceSubscriptions::new())
+        }
+
+        type PeerCell = Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>;
+
+        fn make_peer_cell() -> PeerCell {
+            Arc::new(OnceCell::new())
+        }
+
+        /// Empty workspace roots: `diagnostic_path_in_workspace` allows any
+        /// URI in this mode, matching `validate_path_against_roots`, so these
+        /// pump-mechanics tests don't need to construct real workspace paths.
+        fn no_workspace_roots() -> Arc<[PathBuf]> {
+            Arc::from([])
+        }
+
+        /// `PublishDiagnostics` is cached even when the peer is not yet connected.
+        #[tokio::test]
+        async fn test_pump_caches_before_peer_set() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (tx, rx) = mpsc::channel(8);
+            // Keep _cancel_tx alive: dropping it causes cancel_rx.changed() to return Err,
+            // which makes the pump exit before processing any messages.
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            let c = Arc::clone(&cache);
+            tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: c,
+                    subs: Arc::clone(&subs),
+                    peer_cell: Arc::clone(&peer_cell),
+                    workspace_roots: no_workspace_roots(),
+                },
+            ));
+
+            let uri: Uri = "file:///test/main.rs".parse().unwrap();
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            // Poll until the pump processes the message or we time out.
+            let cached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    tokio::task::yield_now().await;
+                    let found = {
+                        let guard = cache.lock().await;
+                        guard.get_diagnostics(uri.as_str()).is_some()
+                    };
+                    if found {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("pump did not cache diagnostics within 5 s");
+            assert!(cached, "diagnostics should be cached before peer is set");
+        }
+
+        /// #234 (S1 hardening): diagnostics for URIs outside the configured
+        /// workspace roots must be dropped rather than cached, closing the
+        /// vector where a misbehaving server floods the FIFO-bounded cache
+        /// with fabricated URIs to evict every legitimate entry.
+        #[tokio::test]
+        async fn test_pump_drops_diagnostics_outside_workspace_roots() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            // See `test_diagnostic_path_in_workspace_accepts_uri_under_root`
+            // for why Windows needs a drive-letter path here.
+            #[cfg(windows)]
+            let (workspace_root, outside_uri_str, inside_uri_str) = (
+                PathBuf::from(r"C:\workspace"),
+                "file:///C:/etc/passwd",
+                "file:///C:/workspace/src/main.rs",
+            );
+            #[cfg(not(windows))]
+            let (workspace_root, outside_uri_str, inside_uri_str) = (
+                PathBuf::from("/workspace"),
+                "file:///etc/passwd",
+                "file:///workspace/src/main.rs",
+            );
+            let workspace_roots: Arc<[PathBuf]> = Arc::from([workspace_root]);
+
+            tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs: Arc::clone(&subs),
+                    peer_cell: Arc::clone(&peer_cell),
+                    workspace_roots,
+                },
+            ));
+
+            let outside_uri: Uri = outside_uri_str.parse().unwrap();
+            let inside_uri: Uri = inside_uri_str.parse().unwrap();
+
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: outside_uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: inside_uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            // Poll until the (later-sent) in-workspace sentinel is cached --
+            // proves the pump already processed the earlier out-of-workspace
+            // message too, since the channel preserves send order.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    {
+                        let guard = cache.lock().await;
+                        if guard.get_diagnostics(inside_uri.as_str()).is_some() {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("pump did not cache in-workspace diagnostics within 5 s");
+
+            let found_outside = cache
+                .lock()
+                .await
+                .get_diagnostics(outside_uri.as_str())
+                .is_some();
+            assert!(
+                !found_outside,
+                "diagnostics for a URI outside workspace roots must not be cached"
+            );
+        }
+
+        /// Pump exits cleanly when the cancel watch sends `true`.
+        #[tokio::test]
+        async fn test_pump_exits_on_cancel() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
+            ));
+
+            cancel_tx.send(true).unwrap();
+            // Pump must finish within a short time after cancellation.
+            tokio::time::timeout(std::time::Duration::from_millis(200), handle)
+                .await
+                .expect("pump did not exit within timeout")
+                .unwrap();
+        }
+
+        /// Pump exits when the cancel sender is dropped (Err branch).
+        #[tokio::test]
+        async fn test_pump_exits_when_cancel_sender_dropped() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
+            ));
+
+            drop(cancel_tx); // triggers Err in cancel_rx.changed()
+            tokio::time::timeout(std::time::Duration::from_millis(200), handle)
+                .await
+                .expect("pump did not exit within timeout")
+                .unwrap();
+        }
+
+        /// Regression test for #104: the pump must cache a notification promptly
+        /// even while another task holds the translator lock for far longer than
+        /// any acceptable pump latency. Before the `NotificationCache` split, the
+        /// pump locked `Arc<Mutex<Translator>>` to cache diagnostics, so it would
+        /// have stalled here until the holder released the lock.
+        #[tokio::test]
+        async fn test_pump_makes_progress_while_translator_lock_held() {
+            let translator = Arc::new(Mutex::new(Translator::new()));
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+            // Simulate a slow in-flight MCP request (e.g. `pull_diagnostics`)
+            // holding the translator lock across an LSP round-trip.
+            let lock_acquired = Arc::new(tokio::sync::Notify::new());
+            let notify = Arc::clone(&lock_acquired);
+            let holder = tokio::spawn(async move {
+                let _guard = translator.lock().await;
+                notify.notify_one();
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            });
+            lock_acquired.notified().await;
+
+            tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
+            ));
+
+            let uri: Uri = "file:///test/locked.rs".parse().unwrap();
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+            drop(tx);
+
+            // Well within the 2 s translator lock hold: a translator-locking
+            // pump would still be blocked at this point.
+            tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                loop {
+                    {
+                        let guard = cache.lock().await;
+                        if guard.get_diagnostics(uri.as_str()).is_some() {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("pump stalled behind translator lock");
+
+            holder.await.unwrap();
         }
     }
 }
