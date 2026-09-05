@@ -46,7 +46,7 @@ pub(super) fn test_ctx_with(encoding: PositionEncoding) -> EncodingCtx {
 }
 
 pub(super) fn test_uri() -> lsp_types::Uri {
-    "file:///test.rs".parse().unwrap()
+    lsp_types::Uri::from("file:///test.rs")
 }
 
 /// A fresh, empty `DocumentTracker` for tests that call
@@ -76,8 +76,8 @@ pub(super) fn lsp_diag(
             },
         },
         severity: Some(severity),
-        message: message.to_string(),
-        code: code.map(|c| lsp_types::NumberOrString::String(c.to_string())),
+        message: message.to_string().into(),
+        code: code.map(|c| lsp_types::Code::String(c.to_string())),
         source: None,
         code_description: None,
         related_information: None,
@@ -88,7 +88,7 @@ pub(super) fn lsp_diag(
 
 pub(super) fn diag_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticInfo {
     DiagnosticInfo {
-        uri: "file:///test.rs".parse().unwrap(),
+        uri: lsp_types::Uri::from("file:///test.rs"),
         version: Some(1),
         diagnostics,
     }

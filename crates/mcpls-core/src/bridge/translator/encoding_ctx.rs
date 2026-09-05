@@ -68,7 +68,7 @@ impl EncodingCtx {
             let text = read_line_text(uri, line.saturating_sub(1), &self.tracker).await;
             if text.is_none() {
                 tracing::warn!(
-                    uri = uri.as_str(),
+                    uri = uri.as_ref(),
                     line,
                     encoding = self.encoding.to_lsp(),
                     "could not resolve line text for position conversion; passing MCP column \
@@ -93,7 +93,7 @@ impl EncodingCtx {
             let text = read_line_text(uri, pos.line, &self.tracker).await;
             if text.is_none() {
                 tracing::warn!(
-                    uri = uri.as_str(),
+                    uri = uri.as_ref(),
                     line = pos.line,
                     encoding = self.encoding.to_lsp(),
                     "could not resolve line text for position conversion; passing server \

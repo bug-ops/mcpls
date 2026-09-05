@@ -1,7 +1,7 @@
 //! Completions, signature help, and inlay hints handlers.
 
 use lsp_types::{
-    CompletionParams, CompletionTriggerKind, InlayHintLabel, InlayHintParams, PartialResultParams,
+    CompletionParams, CompletionTriggerKind, InlayHintParams, PartialResultParams,
     SignatureHelpParams as LspSignatureHelpParams, TextDocumentIdentifier,
     TextDocumentPositionParams, WorkDoneProgressParams,
 };
@@ -78,12 +78,12 @@ impl Translator {
             .await;
 
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
-            trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+            trigger_kind: CompletionTriggerKind::TriggerCharacter,
             trigger_character: Some(trigger_char),
         });
 
         let params = CompletionParams {
-            text_document_position: TextDocumentPositionParams {
+            text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
                 position: lsp_position,
             },
@@ -92,17 +92,13 @@ impl Translator {
             context,
         };
 
-        let response: Option<lsp_types::CompletionResponse> = client
-            .request(
-                "textDocument/completion",
-                params,
-                client.completion_timeout(),
-            )
+        let response = client
+            .request_typed::<lsp_types::CompletionRequest>(params, client.completion_timeout())
             .await?;
 
         let items = match response {
-            Some(lsp_types::CompletionResponse::Array(items)) => items,
-            Some(lsp_types::CompletionResponse::List(list)) => list.items,
+            Some(lsp_types::CompletionResponse::CompletionItemList(items)) => items,
+            Some(lsp_types::CompletionResponse::CompletionList(list)) => list.items,
             None => vec![],
         };
 
@@ -161,12 +157,8 @@ impl Translator {
             context: None,
         };
 
-        let response: Option<lsp_types::SignatureHelp> = client
-            .request(
-                "textDocument/signatureHelp",
-                params,
-                client.request_timeout(),
-            )
+        let response = client
+            .request_typed::<lsp_types::SignatureHelpRequest>(params, client.request_timeout())
             .await?;
 
         let result = match response {
@@ -183,8 +175,8 @@ impl Translator {
                             .into_iter()
                             .map(|p| SignatureParameter {
                                 label: match p.label {
-                                    lsp_types::ParameterLabel::Simple(s) => s,
-                                    lsp_types::ParameterLabel::LabelOffsets([start, end]) => {
+                                    lsp_types::ParameterInformationLabel::String(s) => s,
+                                    lsp_types::ParameterInformationLabel::Tuple((start, end)) => {
                                         format!("[{start},{end}]")
                                     }
                                 },
@@ -194,7 +186,10 @@ impl Translator {
                     })
                     .collect(),
                 active_signature: sig_help.active_signature,
-                active_parameter: sig_help.active_parameter,
+                active_parameter: sig_help.active_parameter.and_then(|ap| match ap {
+                    lsp_types::ActiveParameter::Int(n) => Some(n),
+                    lsp_types::ActiveParameter::Null => None,
+                }),
             },
             None => SignatureHelpResult {
                 signatures: vec![],
@@ -229,7 +224,11 @@ impl Translator {
                 |caps| {
                     matches!(
                         caps.inlay_hint_provider,
-                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                        Some(
+                            lsp_types::InlayHintProvider::Bool(true)
+                                | lsp_types::InlayHintProvider::InlayHintOptions(_)
+                                | lsp_types::InlayHintProvider::InlayHintRegistrationOptions(_)
+                        )
                     )
                 },
             )
@@ -249,24 +248,24 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let response: Option<Vec<lsp_types::InlayHint>> = client
-            .request("textDocument/inlayHint", params, client.request_timeout())
+        let response = client
+            .request_typed::<lsp_types::InlayHintRequest>(params, client.request_timeout())
             .await?;
 
         let mut hints = Vec::new();
         for hint in response.unwrap_or_default() {
             let position = ctx.to_mcp(&response_uri, hint.position).await;
             let label = match hint.label {
-                InlayHintLabel::String(s) => s,
-                InlayHintLabel::LabelParts(parts) => parts
+                lsp_types::Label::String(s) => s,
+                lsp_types::Label::InlayHintLabelPartList(parts) => parts
                     .into_iter()
                     .map(|p| p.value)
                     .collect::<Vec<_>>()
                     .concat(),
             };
             let tooltip = hint.tooltip.map(|t| match t {
-                lsp_types::InlayHintTooltip::String(s) => s,
-                lsp_types::InlayHintTooltip::MarkupContent(m) => m.value,
+                lsp_types::Tooltip::String(s) => s,
+                lsp_types::Tooltip::MarkupContent(m) => m.value,
             });
             hints.push(InlayHintEntry {
                 position,

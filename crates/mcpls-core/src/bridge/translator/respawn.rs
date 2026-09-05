@@ -811,10 +811,11 @@ fi
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
 
-            let synced_uri: lsp_types::Uri = "file:///workspace/opened.rs".parse().unwrap();
+            let synced_uri: lsp_types::Uri = lsp_types::Uri::from("file:///workspace/opened.rs");
             let never_opened_uri: lsp_types::Uri =
-                "file:///workspace/never_opened.rs".parse().unwrap();
-            let other_language_uri: lsp_types::Uri = "file:///workspace/main.py".parse().unwrap();
+                lsp_types::Uri::from("file:///workspace/never_opened.rs");
+            let other_language_uri: lsp_types::Uri =
+                lsp_types::Uri::from("file:///workspace/main.py");
             cache
                 .lock()
                 .await
@@ -840,17 +841,17 @@ fi
 
             let guard = cache.lock().await;
             assert!(
-                guard.get_diagnostics(synced_uri.as_str()).is_none(),
+                guard.get_diagnostics(synced_uri.as_ref()).is_none(),
                 "diagnostics attributed to the crashed connection must be \
                  invalidated on respawn, not served as current"
             );
             assert!(
-                guard.get_diagnostics(never_opened_uri.as_str()).is_none(),
+                guard.get_diagnostics(never_opened_uri.as_ref()).is_none(),
                 "workspace-wide diagnostics for a file mcpls never opened \
                  must also be invalidated, not just synced documents"
             );
             assert!(
-                guard.get_diagnostics(other_language_uri.as_str()).is_some(),
+                guard.get_diagnostics(other_language_uri.as_ref()).is_some(),
                 "a different diagnostics-route server's entries must survive \
                  an unrelated server's respawn-triggered cache clear"
             );
@@ -923,7 +924,7 @@ fi
             translator.register_server(hover_id.clone(), seed);
 
             let owned_by_healthy_server: lsp_types::Uri =
-                "file:///workspace/still_healthy.rs".parse().unwrap();
+                lsp_types::Uri::from("file:///workspace/still_healthy.rs");
             cache
                 .lock()
                 .await
@@ -947,7 +948,7 @@ fi
                 cache
                     .lock()
                     .await
-                    .get_diagnostics(owned_by_healthy_server.as_str())
+                    .get_diagnostics(owned_by_healthy_server.as_ref())
                     .is_some(),
                 "respawning a non-diagnostics-route server must not clear \
                  the diagnostics-route server's cache entries"

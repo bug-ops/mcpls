@@ -6,6 +6,7 @@ use std::borrow::Cow;
 pub use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParams};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::debug;
 
 /// JSON-RPC 2.0 request message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,8 +130,7 @@ impl LspNotification {
     ///
     /// match notification {
     ///     LspNotification::LogMessage(log) => {
-    ///         // lsp_types uses `typ` field with MessageType struct
-    ///         assert_eq!(log.typ, lsp_types::MessageType::INFO);
+    ///         assert_eq!(log.kind, lsp_types::MessageType::Info);
     ///         assert_eq!(log.message, "Server started");
     ///     }
     ///     _ => panic!("Expected LogMessage variant"),
@@ -140,10 +140,11 @@ impl LspNotification {
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
         match method {
             "textDocument/publishDiagnostics" => {
-                if let Some(p) = params
-                    && let Ok(parsed) = serde_json::from_value(p)
-                {
-                    return Self::PublishDiagnostics(parsed);
+                if let Some(p) = params {
+                    match serde_json::from_value(p) {
+                        Ok(parsed) => return Self::PublishDiagnostics(parsed),
+                        Err(e) => debug!(method, error = %e, "failed to parse notification params"),
+                    }
                 }
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
@@ -151,10 +152,11 @@ impl LspNotification {
                 }
             }
             "window/logMessage" => {
-                if let Some(p) = params
-                    && let Ok(parsed) = serde_json::from_value(p)
-                {
-                    return Self::LogMessage(parsed);
+                if let Some(p) = params {
+                    match serde_json::from_value(p) {
+                        Ok(parsed) => return Self::LogMessage(parsed),
+                        Err(e) => debug!(method, error = %e, "failed to parse notification params"),
+                    }
                 }
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
@@ -162,10 +164,11 @@ impl LspNotification {
                 }
             }
             "window/showMessage" => {
-                if let Some(p) = params
-                    && let Ok(parsed) = serde_json::from_value(p)
-                {
-                    return Self::ShowMessage(parsed);
+                if let Some(p) = params {
+                    match serde_json::from_value(p) {
+                        Ok(parsed) => return Self::ShowMessage(parsed),
+                        Err(e) => debug!(method, error = %e, "failed to parse notification params"),
+                    }
                 }
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
@@ -307,8 +310,8 @@ mod tests {
 
         match notification {
             super::LspNotification::LogMessage(log) => {
-                // lsp_types uses `typ` field with MessageType struct
-                assert_eq!(log.typ, lsp_types::MessageType::INFO);
+                // lsp_types uses `kind` field with MessageType struct
+                assert_eq!(log.kind, lsp_types::MessageType::Info);
                 assert_eq!(log.message, "Server started successfully");
             }
             _ => panic!("Expected LogMessage variant"),
@@ -326,8 +329,8 @@ mod tests {
 
         match notification {
             super::LspNotification::ShowMessage(msg) => {
-                // lsp_types uses `typ` field with MessageType struct
-                assert_eq!(msg.typ, lsp_types::MessageType::ERROR);
+                // lsp_types uses `kind` field with MessageType struct
+                assert_eq!(msg.kind, lsp_types::MessageType::Error);
                 assert_eq!(msg.message, "Error occurred");
             }
             _ => panic!("Expected ShowMessage variant"),
@@ -359,7 +362,10 @@ mod tests {
                 assert_eq!(diag.uri.to_string(), "file:///test.rs");
                 assert_eq!(diag.version, Some(1));
                 assert_eq!(diag.diagnostics.len(), 1);
-                assert_eq!(diag.diagnostics[0].message, "unused variable");
+                assert_eq!(
+                    diag.diagnostics[0].message,
+                    lsp_types::Message::String("unused variable".to_string())
+                );
             }
             _ => panic!("Expected PublishDiagnostics variant"),
         }

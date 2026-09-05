@@ -16,6 +16,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::routing::validate_path_against_roots;
 use crate::bridge::encoding::PositionEncoding;
+use crate::bridge::notifications::message_as_str;
 use crate::bridge::{DiagnosticInfo, DocumentTracker, NotificationCache, path_to_uri};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
@@ -44,6 +45,28 @@ fn diagnostic_request_params(text_document: TextDocumentIdentifier) -> Diagnosti
     }
 }
 
+/// Hand-rolled union of `textDocument/diagnostic`'s two possible result
+/// shapes.
+///
+/// `gen-lsp-types` types `DocumentDiagnosticRequest::Result` as the
+/// non-nullable `DocumentDiagnosticReport` alone, splitting the streaming
+/// `Partial` shape off into `RequestWithPartialResults::PartialResult`
+/// (`DocumentDiagnosticReportProgress`) -- binding this call to that typed
+/// result via `LspClient::request_typed` would turn a partial response into
+/// a deserialization error where today it degrades to an empty diagnostics
+/// list. This preserves the union gluon's `DocumentDiagnosticReportResult`
+/// used to provide, via the untyped `LspClient::request`.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum DocumentDiagnosticReportResult {
+    Report(lsp_types::DocumentDiagnosticReport),
+    // The partial shape's content is never read -- matching this variant at
+    // all (rather than failing to deserialize) is the only thing that
+    // matters, so today's behavior of degrading to an empty diagnostics list
+    // is preserved.
+    Partial(#[allow(dead_code)] lsp_types::DocumentDiagnosticReportPartialResult),
+}
+
 /// Convert an LSP diagnostic into the MCP-facing `Diagnostic` shape.
 ///
 /// Shared by both the pull-model (`handle_diagnostics`) and cache-derived
@@ -58,16 +81,16 @@ pub(super) async fn diagnostic_to_mcp(
     Diagnostic {
         range: ctx.normalize_range(uri, diag.range).await,
         severity: match diag.severity {
-            Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-            Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
-            Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
+            Some(lsp_types::DiagnosticSeverity::Error) => DiagnosticSeverity::Error,
+            Some(lsp_types::DiagnosticSeverity::Warning) => DiagnosticSeverity::Warning,
+            Some(lsp_types::DiagnosticSeverity::Hint) => DiagnosticSeverity::Hint,
             // INFORMATION and None (no severity reported) both fall here.
             _ => DiagnosticSeverity::Information,
         },
-        message: diag.message.clone(),
+        message: message_as_str(&diag.message).to_string(),
         code: diag.code.as_ref().map(|c| match c {
-            lsp_types::NumberOrString::Number(n) => n.to_string(),
-            lsp_types::NumberOrString::String(s) => s.clone(),
+            lsp_types::Code::Int(n) => n.to_string(),
+            lsp_types::Code::String(s) => s.clone(),
         }),
     }
 }
@@ -132,25 +155,27 @@ impl Translator {
 
         let params = diagnostic_request_params(TextDocumentIdentifier { uri: uri.clone() });
 
-        let pull_response: Result<lsp_types::DocumentDiagnosticReportResult> = client
+        let pull_response: Result<DocumentDiagnosticReportResult> = client
             .request("textDocument/diagnostic", params, client.request_timeout())
             .await;
 
         let diag_info = {
             let cache = notification_cache.lock().await;
-            cache.get_diagnostics(uri.as_str()).cloned()
+            cache.get_diagnostics(uri.as_ref()).cloned()
         };
 
         match pull_response {
             Ok(response) => {
                 let items = match response {
-                    lsp_types::DocumentDiagnosticReportResult::Report(report) => match report {
-                        lsp_types::DocumentDiagnosticReport::Full(full) => {
-                            full.full_document_diagnostic_report.items
-                        }
-                        lsp_types::DocumentDiagnosticReport::Unchanged(_) => vec![],
+                    DocumentDiagnosticReportResult::Report(report) => match report {
+                        lsp_types::DocumentDiagnosticReport::RelatedFullDocumentDiagnosticReport(
+                            full,
+                        ) => full.full_document_diagnostic_report.items,
+                        lsp_types::DocumentDiagnosticReport::RelatedUnchangedDocumentDiagnosticReport(
+                            _,
+                        ) => vec![],
                     },
-                    lsp_types::DocumentDiagnosticReportResult::Partial(_) => vec![],
+                    DocumentDiagnosticReportResult::Partial(_) => vec![],
                 };
                 let mut diagnostics = Vec::with_capacity(items.len());
                 for d in &items {
@@ -379,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_request_params_omit_optional_null_fields() {
-        let uri = "file:///test.ts".parse().unwrap();
+        let uri = lsp_types::Uri::from("file:///test.ts");
         let params = diagnostic_request_params(TextDocumentIdentifier { uri });
         let value = serde_json::to_value(params).unwrap();
 
@@ -483,11 +508,8 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
-            .unwrap()
-            .as_str()
-            .parse()
-            .unwrap();
+        let uri: lsp_types::Uri =
+            lsp_types::Uri::from(Url::from_file_path(&canonical_path).unwrap().as_str());
         let diagnostic = lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -499,9 +521,9 @@ mod tests {
                     character: 5,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message: "test error".to_string(),
-            code: Some(lsp_types::NumberOrString::String("E001".to_string())),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
+            message: "test error".to_string().into(),
+            code: Some(lsp_types::Code::String("E001".to_string())),
             source: None,
             code_description: None,
             related_information: None,
@@ -540,11 +562,8 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
-            .unwrap()
-            .as_str()
-            .parse()
-            .unwrap();
+        let uri: lsp_types::Uri =
+            lsp_types::Uri::from(Url::from_file_path(&canonical_path).unwrap().as_str());
         let diagnostics = vec![
             lsp_types::Diagnostic {
                 range: lsp_types::Range {
@@ -557,8 +576,8 @@ mod tests {
                         character: 5,
                     },
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-                message: "error".to_string(),
+                severity: Some(lsp_types::DiagnosticSeverity::Error),
+                message: "error".to_string().into(),
                 code: None,
                 source: None,
                 code_description: None,
@@ -577,8 +596,8 @@ mod tests {
                         character: 5,
                     },
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
-                message: "warning".to_string(),
+                severity: Some(lsp_types::DiagnosticSeverity::Warning),
+                message: "warning".to_string().into(),
                 code: None,
                 source: None,
                 code_description: None,
@@ -597,8 +616,8 @@ mod tests {
                         character: 5,
                     },
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::INFORMATION),
-                message: "info".to_string(),
+                severity: Some(lsp_types::DiagnosticSeverity::Information),
+                message: "info".to_string().into(),
                 code: None,
                 source: None,
                 code_description: None,
@@ -617,8 +636,8 @@ mod tests {
                         character: 5,
                     },
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::HINT),
-                message: "hint".to_string(),
+                severity: Some(lsp_types::DiagnosticSeverity::Hint),
+                message: "hint".to_string().into(),
                 code: None,
                 source: None,
                 code_description: None,
@@ -666,11 +685,8 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
-            .unwrap()
-            .as_str()
-            .parse()
-            .unwrap();
+        let uri: lsp_types::Uri =
+            lsp_types::Uri::from(Url::from_file_path(&canonical_path).unwrap().as_str());
         let diagnostic = lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -682,9 +698,9 @@ mod tests {
                     character: 5,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message: "test error".to_string(),
-            code: Some(lsp_types::NumberOrString::Number(42)),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
+            message: "test error".to_string().into(),
+            code: Some(lsp_types::Code::Int(42)),
             source: None,
             code_description: None,
             related_information: None,
@@ -721,7 +737,7 @@ mod tests {
         let cache = diag_info(vec![lsp_diag(
             0,
             10,
-            lsp_types::DiagnosticSeverity::WARNING,
+            lsp_types::DiagnosticSeverity::Warning,
             "unused import: `std::fmt`",
             None,
         )]);
@@ -767,7 +783,7 @@ mod tests {
         let cache = diag_info(vec![lsp_diag(
             0,
             10,
-            lsp_types::DiagnosticSeverity::ERROR,
+            lsp_types::DiagnosticSeverity::Error,
             "mismatched types",
             Some("E0308"),
         )]);
@@ -821,14 +837,14 @@ mod tests {
             lsp_diag(
                 0,
                 10,
-                lsp_types::DiagnosticSeverity::WARNING,
+                lsp_types::DiagnosticSeverity::Warning,
                 "unused import: `std::fmt`",
                 None,
             ),
             lsp_diag(
                 5,
                 8,
-                lsp_types::DiagnosticSeverity::WARNING,
+                lsp_types::DiagnosticSeverity::Warning,
                 "function `helper` is never used",
                 None,
             ),
@@ -882,7 +898,7 @@ mod tests {
         let cache = diag_info(vec![lsp_diag(
             0,
             10,
-            lsp_types::DiagnosticSeverity::ERROR,
+            lsp_types::DiagnosticSeverity::Error,
             "expected `i32`, found `&str`",
             None,
         )]);
@@ -931,7 +947,7 @@ mod tests {
         let cache = diag_info(vec![lsp_diag(
             94,
             31,
-            lsp_types::DiagnosticSeverity::ERROR,
+            lsp_types::DiagnosticSeverity::Error,
             "not all trait items implemented, missing: `hello`\nmissing `hello` in implementation",
             Some("E0046"),
         )]);
@@ -989,7 +1005,7 @@ mod tests {
         let cache = diag_info(vec![lsp_diag(
             49,
             22,
-            lsp_types::DiagnosticSeverity::ERROR,
+            lsp_types::DiagnosticSeverity::Error,
             "mismatched types: expected `String`, found `Vec<u8>`",
             Some("E0308"),
         )]);
@@ -1230,7 +1246,7 @@ mod tests {
                 vec![lsp_diag(
                     0,
                     4,
-                    lsp_types::DiagnosticSeverity::WARNING,
+                    lsp_types::DiagnosticSeverity::Warning,
                     "unused import: `std::fmt`",
                     None,
                 )],
@@ -1270,6 +1286,76 @@ mod tests {
         assert_eq!(
             diagnostics.diagnostics[0].message,
             "unused import: `std::fmt`"
+        );
+    }
+
+    /// S4 lock-in for critic finding N1: `textDocument/diagnostic` keeps an
+    /// untyped `LspClient::request` bound to the hand-rolled
+    /// `DocumentDiagnosticReportResult` union specifically so that a
+    /// streaming `Partial` response (the shape
+    /// `DocumentDiagnosticRequest`'s typed `Result` cannot represent)
+    /// degrades to an empty diagnostics list instead of a deserialization
+    /// error. This test drives that exact response shape through the real
+    /// `handle_diagnostics` handler.
+    #[tokio::test]
+    async fn test_handle_diagnostics_partial_response_degrades_to_empty_result() {
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("rs".to_string(), "rust".to_string());
+
+        let mut translator =
+            Translator::new()
+                .with_extensions(extensions)
+                .with_router(ToolRouter::catch_all([(
+                    ServerId::from("rust"),
+                    "rust".to_string(),
+                )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client, mut server) = fake_lsp_client();
+        translator.register_client("rust".to_string(), client);
+
+        let path = dir.path().join("lib.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let notification_cache = Mutex::new(NotificationCache::new());
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_diagnostics(path_str, &notification_cache)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let diag_request = read_framed_message(&mut wire).await;
+        assert_eq!(diag_request["method"], "textDocument/diagnostic");
+
+        // A `DocumentDiagnosticReportPartialResult`: no `kind` field (so it
+        // cannot be a `Report`), only `relatedDocuments`.
+        write_response(
+            &mut server.read_half_stdin,
+            &diag_request["id"],
+            serde_json::json!({ "relatedDocuments": {} }),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap();
+
+        let diagnostics =
+            result.expect("a Partial response must degrade to Ok(empty), not an error");
+        assert!(
+            diagnostics.diagnostics.is_empty(),
+            "expected no diagnostics from a Partial response, got {diagnostics:?}"
         );
     }
 

@@ -828,7 +828,7 @@ impl ServerHandler for McplsServer {
                 .is_some_and(|id| cache.is_push_degraded(id));
             build_resource_diagnostics_response(
                 self.context.translator.is_document_open(&validated_path),
-                cache.get_diagnostics(lsp_uri.as_str()),
+                cache.get_diagnostics(lsp_uri.as_ref()),
                 push_degraded,
             )
         };
@@ -883,7 +883,7 @@ impl ServerHandler for McplsServer {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let has_cached_diagnostics = {
             let cache = self.context.notification_cache.lock().await;
-            cache.get_diagnostics(lsp_uri.as_str()).is_some()
+            cache.get_diagnostics(lsp_uri.as_ref()).is_some()
         };
 
         if has_cached_diagnostics
@@ -1320,11 +1320,8 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
-            .unwrap()
-            .as_str()
-            .parse()
-            .unwrap();
+        let uri: lsp_types::Uri =
+            lsp_types::Uri::from(Url::from_file_path(&canonical_path).unwrap().as_str());
         let diagnostic = lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -1336,11 +1333,11 @@ mod tests {
                     character: 1,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
             code: None,
             code_description: None,
             source: None,
-            message: "cached error".to_string(),
+            message: "cached error".to_string().into(),
             related_information: None,
             tags: None,
             data: None,
@@ -1401,11 +1398,8 @@ mod tests {
         fs::write(&test_file, "héllo").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
-            .unwrap()
-            .as_str()
-            .parse()
-            .unwrap();
+        let uri: lsp_types::Uri =
+            lsp_types::Uri::from(Url::from_file_path(&canonical_path).unwrap().as_str());
         let diagnostic = lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -1417,11 +1411,11 @@ mod tests {
                     character: 3,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
             code: None,
             code_description: None,
             source: None,
-            message: "multibyte range".to_string(),
+            message: "multibyte range".to_string().into(),
             related_information: None,
             tags: None,
             data: None,
@@ -1467,11 +1461,8 @@ mod tests {
         fs::write(&test_file, "héllo").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
-            .unwrap()
-            .as_str()
-            .parse()
-            .unwrap();
+        let uri: lsp_types::Uri =
+            lsp_types::Uri::from(Url::from_file_path(&canonical_path).unwrap().as_str());
         let diagnostic = lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -1483,11 +1474,11 @@ mod tests {
                     character: 3,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
             code: None,
             code_description: None,
             source: None,
-            message: "multibyte range".to_string(),
+            message: "multibyte range".to_string().into(),
             related_information: None,
             tags: None,
             data: None,
@@ -1555,11 +1546,8 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
-        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
-            .unwrap()
-            .as_str()
-            .parse()
-            .unwrap();
+        let uri: lsp_types::Uri =
+            lsp_types::Uri::from(Url::from_file_path(&canonical_path).unwrap().as_str());
         {
             let mut cache = notification_cache.lock().await;
             cache.store_diagnostics(&owner, &uri, Some(1), vec![]);
@@ -2157,11 +2145,8 @@ sleep 0.3
     fn sample_diagnostic_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticInfo {
         use url::Url;
 
-        let uri: lsp_types::Uri = Url::parse("file:///sample.rs")
-            .unwrap()
-            .as_str()
-            .parse()
-            .unwrap();
+        let uri: lsp_types::Uri =
+            lsp_types::Uri::from(Url::parse("file:///sample.rs").unwrap().as_str());
         DiagnosticInfo {
             uri,
             version: Some(1),
@@ -2209,11 +2194,11 @@ sleep 0.3
                     character: 1,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
             code: None,
             code_description: None,
             source: None,
-            message: "boom".to_string(),
+            message: "boom".to_string().into(),
             related_information: None,
             tags: None,
             data: None,
@@ -2222,7 +2207,7 @@ sleep 0.3
         assert!(response.tracked);
         assert_eq!(response.version, Some(1));
         assert_eq!(response.diagnostics.len(), 1);
-        assert_eq!(response.diagnostics[0].message, "boom");
+        assert_eq!(response.diagnostics[0].message, "boom".into());
 
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["tracked"], true);
@@ -2275,11 +2260,11 @@ sleep 0.3
                     character: 1,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            severity: Some(lsp_types::DiagnosticSeverity::Warning),
             code: None,
             code_description: None,
             source: None,
-            message: "transitively analyzed".to_string(),
+            message: "transitively analyzed".to_string().into(),
             related_information: None,
             tags: None,
             data: None,

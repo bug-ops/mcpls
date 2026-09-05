@@ -138,9 +138,9 @@ const DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES: usize = 1024;
 /// This maps explicitly instead of relying on either.
 const fn diagnostic_severity_rank(diagnostic: &LspDiagnostic) -> u8 {
     match diagnostic.severity {
-        Some(lsp_types::DiagnosticSeverity::ERROR) => 0,
-        Some(lsp_types::DiagnosticSeverity::WARNING) => 1,
-        Some(lsp_types::DiagnosticSeverity::INFORMATION) => 2,
+        Some(lsp_types::DiagnosticSeverity::Error) => 0,
+        Some(lsp_types::DiagnosticSeverity::Warning) => 1,
+        Some(lsp_types::DiagnosticSeverity::Information) => 2,
         // An unrecognized (future) severity value is treated the same as
         // no severity at all: least important, not most.
         Some(_) | None => 3,
@@ -171,6 +171,28 @@ fn largest_fitting_prefix(
         }
     }
     lo
+}
+
+/// Borrows a diagnostic's free-form `message` as plain text, regardless of
+/// whether the server sent it as a plain string or (per LSP 3.18)
+/// `MarkupContent`.
+pub fn message_as_str(message: &lsp_types::Message) -> &str {
+    match message {
+        lsp_types::Message::String(s) => s,
+        lsp_types::Message::MarkupContent(m) => &m.value,
+    }
+}
+
+/// Truncates a diagnostic's free-form `message` to at most `max_bytes`,
+/// regardless of whether it is a plain string or `MarkupContent`.
+fn truncate_message(message: lsp_types::Message, max_bytes: usize) -> lsp_types::Message {
+    match message {
+        lsp_types::Message::String(s) => lsp_types::Message::String(truncate_string(s, max_bytes)),
+        lsp_types::Message::MarkupContent(mut m) => {
+            m.value = truncate_string(m.value, max_bytes);
+            lsp_types::Message::MarkupContent(m)
+        }
+    }
 }
 
 /// Bounds `diagnostics`' serialized size to at most
@@ -236,10 +258,10 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
         let estimated: usize = diagnostics
             .iter()
             .map(|d| {
-                let raw_string_bytes = d.message.len()
+                let raw_string_bytes = message_as_str(&d.message).len()
                     + d.source.as_deref().map_or(0, str::len)
                     + match &d.code {
-                        Some(lsp_types::NumberOrString::String(s)) => s.len(),
+                        Some(lsp_types::Code::String(s)) => s.len(),
                         _ => 0,
                     };
                 raw_string_bytes * JSON_ESCAPE_WORST_CASE_FACTOR
@@ -272,7 +294,7 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
         warn!(
             "diagnostics for {} exceeded the {MAX_DIAGNOSTICS_ENTRY_BYTES}-byte cache cap; kept \
              the {} highest-severity of {original_count} diagnostics",
-            uri.as_str(),
+            uri.as_ref(),
             diagnostics.len(),
         );
     }
@@ -289,7 +311,7 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
         warn!(
             "diagnostic for {} exceeded the cache cap; dropped its data/code_description/\
              related_information/tags fields{}",
-            uri.as_str(),
+            uri.as_ref(),
             if had_data {
                 " (a later code-action request for this diagnostic may not resolve its quick fix)"
             } else {
@@ -306,8 +328,8 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
         if let Some(source) = &diagnostic.source {
             diagnostic.source = Some(truncate_str(source, MAX_ENTRY_TEXT_BYTES));
         }
-        if let Some(lsp_types::NumberOrString::String(code)) = &diagnostic.code {
-            diagnostic.code = Some(lsp_types::NumberOrString::String(truncate_str(
+        if let Some(lsp_types::Code::String(code)) = &diagnostic.code {
+            diagnostic.code = Some(lsp_types::Code::String(truncate_str(
                 code,
                 MAX_ENTRY_TEXT_BYTES,
             )));
@@ -320,8 +342,9 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
     if !fits(diagnostics) {
         diagnostics.truncate(1);
         if let Some(diagnostic) = diagnostics.first_mut() {
-            diagnostic.message = truncate_str(
-                &diagnostic.message,
+            let placeholder = lsp_types::Message::String(String::new());
+            diagnostic.message = truncate_message(
+                std::mem::replace(&mut diagnostic.message, placeholder),
                 DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES,
             );
             diagnostic.source = None;
@@ -335,7 +358,7 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
             "diagnostic for {} still exceeded the cache cap after every other mitigation; \
              truncated its message to {DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES} bytes and \
              cleared all other fields",
-            uri.as_str(),
+            uri.as_ref(),
         );
     }
 }
@@ -379,9 +402,9 @@ pub enum LogLevel {
 impl From<lsp_types::MessageType> for LogLevel {
     fn from(msg_type: lsp_types::MessageType) -> Self {
         match msg_type {
-            lsp_types::MessageType::ERROR => Self::Error,
-            lsp_types::MessageType::WARNING => Self::Warning,
-            lsp_types::MessageType::INFO => Self::Info,
+            lsp_types::MessageType::Error => Self::Error,
+            lsp_types::MessageType::Warning => Self::Warning,
+            lsp_types::MessageType::Info => Self::Info,
             // LOG and unknown message types default to Debug
             _ => Self::Debug,
         }
@@ -416,9 +439,9 @@ pub enum MessageType {
 impl From<lsp_types::MessageType> for MessageType {
     fn from(msg_type: lsp_types::MessageType) -> Self {
         match msg_type {
-            lsp_types::MessageType::ERROR => Self::Error,
-            lsp_types::MessageType::WARNING => Self::Warning,
-            lsp_types::MessageType::INFO => Self::Info,
+            lsp_types::MessageType::Error => Self::Error,
+            lsp_types::MessageType::Warning => Self::Warning,
+            lsp_types::MessageType::Info => Self::Info,
             // LOG and unknown message types default to Log
             _ => Self::Log,
         }
@@ -611,9 +634,9 @@ impl NotificationCache {
     ///
     /// let mut cache = NotificationCache::new();
     /// let server: ServerId = "rust-analyzer".into();
-    /// let uri: Uri = "file:///main.rs".parse().unwrap();
+    /// let uri: Uri = Uri::from("file:///main.rs");
     /// cache.store_diagnostics(&server, &uri, Some(1), vec![]);
-    /// assert!(cache.get_diagnostics(uri.as_str()).is_some());
+    /// assert!(cache.get_diagnostics(uri.as_ref()).is_some());
     /// ```
     pub fn store_diagnostics(
         &mut self,
@@ -627,8 +650,9 @@ impl NotificationCache {
         // extra clone on the common (already-under-limit) path, since
         // `message` is already an owned `String` here.
         for diagnostic in &mut diagnostics {
-            diagnostic.message = truncate_string(
-                std::mem::take(&mut diagnostic.message),
+            let placeholder = lsp_types::Message::String(String::new());
+            diagnostic.message = truncate_message(
+                std::mem::replace(&mut diagnostic.message, placeholder),
                 MAX_ENTRY_TEXT_BYTES,
             );
         }
@@ -636,7 +660,7 @@ impl NotificationCache {
         // `MAX_DIAGNOSTICS_ENTRY_BYTES`.
         cap_diagnostics_entry_size(uri, &mut diagnostics);
 
-        let key = uri_cache_key(uri.as_str()).into_owned();
+        let key = uri_cache_key(uri.as_ref()).into_owned();
         let info = DiagnosticInfo {
             uri: uri.clone(),
             version,
@@ -786,15 +810,15 @@ impl NotificationCache {
     /// let mut cache = NotificationCache::new();
     /// let crashed: ServerId = "pyright".into();
     /// let healthy: ServerId = "rust-analyzer".into();
-    /// let crashed_uri: Uri = "file:///main.py".parse().unwrap();
-    /// let healthy_uri: Uri = "file:///main.rs".parse().unwrap();
+    /// let crashed_uri: Uri = Uri::from("file:///main.py");
+    /// let healthy_uri: Uri = Uri::from("file:///main.rs");
     /// cache.store_diagnostics(&crashed, &crashed_uri, Some(1), vec![]);
     /// cache.store_diagnostics(&healthy, &healthy_uri, Some(1), vec![]);
     ///
     /// cache.clear_server_diagnostics(&crashed);
     ///
-    /// assert!(cache.get_diagnostics(crashed_uri.as_str()).is_none());
-    /// assert!(cache.get_diagnostics(healthy_uri.as_str()).is_some());
+    /// assert!(cache.get_diagnostics(crashed_uri.as_ref()).is_none());
+    /// assert!(cache.get_diagnostics(healthy_uri.as_ref()).is_some());
     /// ```
     pub fn clear_server_diagnostics(&mut self, server_id: &ServerId) {
         let Some(order) = self.diagnostic_order.remove(server_id) else {
@@ -903,7 +927,7 @@ mod tests {
     #[test]
     fn test_store_and_get_diagnostics() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let diagnostic = LspDiagnostic {
             range: Range {
@@ -916,8 +940,8 @@ mod tests {
                     character: 5,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message: "test error".to_string(),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
+            message: "test error".to_string().into(),
             code: None,
             source: None,
             code_description: None,
@@ -928,11 +952,14 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.uri, uri);
         assert_eq!(stored.version, Some(1));
         assert_eq!(stored.diagnostics.len(), 1);
-        assert_eq!(stored.diagnostics[0].message, "test error");
+        assert_eq!(
+            stored.diagnostics[0].message,
+            lsp_types::Message::String("test error".to_string())
+        );
     }
 
     /// #311: a single diagnostic's `message` must be bounded independently
@@ -940,7 +967,7 @@ mod tests {
     #[test]
     fn test_store_diagnostics_truncates_oversized_message() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
         let oversized = "a".repeat(MAX_ENTRY_TEXT_BYTES + 100);
 
         let diagnostic = LspDiagnostic {
@@ -954,8 +981,8 @@ mod tests {
                     character: 5,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message: oversized.clone(),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
+            message: oversized.clone().into(),
             code: None,
             source: None,
             code_description: None,
@@ -966,7 +993,8 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics[0].message;
+        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = message_as_str(&stored.diagnostics[0].message);
         assert!(stored.len() < oversized.len());
         assert!(stored.ends_with("... (truncated)"));
     }
@@ -985,8 +1013,8 @@ mod tests {
                     character: 5,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message,
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
+            message: message.into(),
             code: None,
             source: None,
             code_description: None,
@@ -1002,7 +1030,7 @@ mod tests {
     #[test]
     fn test_store_diagnostics_caps_aggregate_size_for_many_small_diagnostics() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         // Each diagnostic is far under MAX_ENTRY_TEXT_BYTES individually,
         // but 5000 of them comfortably exceeds MAX_DIAGNOSTICS_ENTRY_BYTES
@@ -1019,7 +1047,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert!(
             stored.len() < original_count,
             "aggregate cap must trim the list, kept {} of {original_count}",
@@ -1039,7 +1067,7 @@ mod tests {
     #[test]
     fn test_store_diagnostics_truncation_keeps_largest_fitting_prefix() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         // Each diagnostic serializes to roughly 300 bytes; ~3800 of them
         // fit under the 1 MiB cap, well over half of the 5000 published --
@@ -1050,7 +1078,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert!(
             stored.len() > 2600,
             "largest-fitting-prefix search must keep far more than half, kept {}",
@@ -1078,24 +1106,26 @@ mod tests {
     #[test]
     fn test_store_diagnostics_truncation_prefers_higher_severity() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let mut diagnostics: Vec<LspDiagnostic> = (0..5000)
             .map(|i| {
                 let mut d = minimal_diagnostic(format!("hint {i}: {}", "x".repeat(200)));
-                d.severity = Some(lsp_types::DiagnosticSeverity::HINT);
+                d.severity = Some(lsp_types::DiagnosticSeverity::Hint);
                 d
             })
             .collect();
         let mut trailing_error = minimal_diagnostic("the one real error".to_string());
-        trailing_error.severity = Some(lsp_types::DiagnosticSeverity::ERROR);
+        trailing_error.severity = Some(lsp_types::DiagnosticSeverity::Error);
         diagnostics.push(trailing_error);
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert!(
-            stored.iter().any(|d| d.message == "the one real error"),
+            stored
+                .iter()
+                .any(|d| message_as_str(&d.message) == "the one real error"),
             "the trailing ERROR diagnostic must survive truncation over leading HINT noise"
         );
     }
@@ -1138,7 +1168,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
         let diagnostics: Vec<LspDiagnostic> = (0..5000)
             .map(|i| minimal_diagnostic(format!("diagnostic {i}: {}", "x".repeat(250))))
             .collect();
@@ -1166,7 +1196,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
         let mut diagnostic = minimal_diagnostic("small message".to_string());
         diagnostic.data = Some(serde_json::json!({
             "blob": "x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000),
@@ -1192,7 +1222,7 @@ mod tests {
     #[test]
     fn test_store_diagnostics_drops_oversized_data_blob_on_single_diagnostic() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let mut diagnostic = minimal_diagnostic("small message".to_string());
         diagnostic.data = Some(serde_json::json!({
@@ -1201,9 +1231,12 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].message, "small message");
+        assert_eq!(
+            stored[0].message,
+            lsp_types::Message::String("small message".to_string())
+        );
         assert!(
             stored[0].data.is_none(),
             "oversized data blob must be dropped"
@@ -1222,16 +1255,19 @@ mod tests {
     #[test]
     fn test_store_diagnostics_truncates_oversized_source_on_single_diagnostic() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let mut diagnostic = minimal_diagnostic("small message".to_string());
         diagnostic.source = Some("x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000));
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].message, "small message");
+        assert_eq!(
+            stored[0].message,
+            lsp_types::Message::String("small message".to_string())
+        );
         let serialized_len = serde_json::to_vec(stored).unwrap().len();
         assert!(
             serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
@@ -1248,7 +1284,7 @@ mod tests {
     #[test]
     fn test_store_diagnostics_caps_single_diagnostic_with_every_field_maxed_out() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         // Each field individually exceeds MAX_ENTRY_TEXT_BYTES (so
         // source/code truncation is exercised) and the combination exceeds
@@ -1256,11 +1292,11 @@ mod tests {
         // megabytes per field just to prove the same point.
         let mut diagnostic = minimal_diagnostic("x".repeat(MAX_ENTRY_TEXT_BYTES + 1000));
         diagnostic.source = Some("x".repeat(MAX_ENTRY_TEXT_BYTES + 1000));
-        diagnostic.code = Some(lsp_types::NumberOrString::String(
+        diagnostic.code = Some(lsp_types::Code::String(
             "x".repeat(MAX_ENTRY_TEXT_BYTES + 1000),
         ));
         diagnostic.data = Some(serde_json::json!({ "blob": "x".repeat(MAX_ENTRY_TEXT_BYTES) }));
-        diagnostic.tags = Some(vec![lsp_types::DiagnosticTag::UNNECESSARY; 50]);
+        diagnostic.tags = Some(vec![lsp_types::DiagnosticTag::Unnecessary; 50]);
         diagnostic.related_information = Some(vec![
             lsp_types::DiagnosticRelatedInformation {
                 location: lsp_types::Location {
@@ -1274,7 +1310,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         let serialized_len = serde_json::to_vec(stored).unwrap().len();
         assert!(
@@ -1293,7 +1329,7 @@ mod tests {
     /// by the terminal step, not left to slip through.
     #[test]
     fn test_cap_diagnostics_entry_size_terminal_fallback_bounds_untruncated_message() {
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
         let mut diagnostics = vec![minimal_diagnostic(
             "x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000),
         )];
@@ -1302,9 +1338,10 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert!(
-            diagnostics[0].message.len() <= DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES + 20,
+            message_as_str(&diagnostics[0].message).len()
+                <= DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES + 20,
             "terminal fallback must truncate the message itself, got {} bytes",
-            diagnostics[0].message.len()
+            message_as_str(&diagnostics[0].message).len()
         );
         let serialized_len = serde_json::to_vec(&diagnostics).unwrap().len();
         assert!(
@@ -1320,16 +1357,19 @@ mod tests {
     #[test]
     fn test_store_diagnostics_cheap_path_leaves_small_diagnostics_untouched() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let mut diagnostic = minimal_diagnostic("a small, ordinary diagnostic message".to_string());
         diagnostic.source = Some("rustc".to_string());
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].message, "a small, ordinary diagnostic message");
+        assert_eq!(
+            stored[0].message,
+            lsp_types::Message::String("a small, ordinary diagnostic message".to_string())
+        );
         assert_eq!(stored[0].source.as_deref(), Some("rustc"));
     }
 
@@ -1345,7 +1385,7 @@ mod tests {
     #[test]
     fn test_store_diagnostics_cheap_path_escape_safe_for_control_character_heavy_message() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let nul_heavy_message = "\0".repeat(MAX_ENTRY_TEXT_BYTES);
         let diagnostics: Vec<LspDiagnostic> = (0..3)
@@ -1354,7 +1394,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.get_diagnostics(uri.as_str()).unwrap().diagnostics;
+        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
         let serialized_len = serde_json::to_vec(stored).unwrap().len();
         assert!(
             serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
@@ -1366,7 +1406,7 @@ mod tests {
     #[test]
     fn test_store_diagnostics_replaces_existing() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
@@ -1374,19 +1414,19 @@ mod tests {
         cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
 
-        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.version, Some(2));
     }
 
     #[test]
     fn test_clear_diagnostics() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
 
-        let cleared = cache.clear_diagnostics(uri.as_str());
+        let cleared = cache.clear_diagnostics(uri.as_ref());
         assert!(cleared.is_some());
         assert_eq!(cache.diagnostics_count(), 0);
     }
@@ -1394,8 +1434,8 @@ mod tests {
     #[test]
     fn test_clear_all_diagnostics() {
         let mut cache = NotificationCache::new();
-        let uri1: Uri = "file:///test1.rs".parse().unwrap();
-        let uri2: Uri = "file:///test2.rs".parse().unwrap();
+        let uri1: Uri = Uri::from("file:///test1.rs");
+        let uri2: Uri = Uri::from("file:///test2.rs");
 
         cache.store_diagnostics(&test_server(), &uri1, Some(1), vec![]);
         cache.store_diagnostics(&test_server(), &uri2, Some(1), vec![]);
@@ -1580,7 +1620,7 @@ mod tests {
     #[test]
     fn test_store_diagnostics_empty_list() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let diagnostic = LspDiagnostic {
             range: Range {
@@ -1593,8 +1633,8 @@ mod tests {
                     character: 5,
                 },
             },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message: "test error".to_string(),
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
+            message: "test error".to_string().into(),
             code: None,
             source: None,
             code_description: None,
@@ -1606,7 +1646,7 @@ mod tests {
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
         assert_eq!(
             cache
-                .get_diagnostics(uri.as_str())
+                .get_diagnostics(uri.as_ref())
                 .unwrap()
                 .diagnostics
                 .len(),
@@ -1614,7 +1654,7 @@ mod tests {
         );
 
         cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
-        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.diagnostics.len(), 0);
         assert_eq!(stored.version, Some(2));
     }
@@ -1622,7 +1662,7 @@ mod tests {
     #[test]
     fn test_store_many_diagnostics_single_file() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let diagnostics: Vec<LspDiagnostic> = (0..100)
             .map(|i| LspDiagnostic {
@@ -1636,8 +1676,8 @@ mod tests {
                         character: 10,
                     },
                 },
-                message: format!("Error {i}"),
-                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: format!("Error {i}").into(),
+                severity: Some(lsp_types::DiagnosticSeverity::Error),
                 code: None,
                 source: None,
                 code_description: None,
@@ -1649,7 +1689,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.diagnostics.len(), 100);
     }
 
@@ -1686,25 +1726,23 @@ mod tests {
         let mut cache = NotificationCache::new();
 
         for i in 0..MAX_DIAGNOSTIC_ENTRIES + 10 {
-            let uri: Uri = format!("file:///test{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///test{i}.rs"));
             cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         }
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
 
         // Oldest entries should be evicted (FIFO).
-        let evicted: Uri = "file:///test0.rs".parse().unwrap();
-        assert!(cache.get_diagnostics(evicted.as_str()).is_none());
-        let newest: Uri = format!("file:///test{}.rs", MAX_DIAGNOSTIC_ENTRIES + 9)
-            .parse()
-            .unwrap();
-        assert!(cache.get_diagnostics(newest.as_str()).is_some());
+        let evicted: Uri = Uri::from("file:///test0.rs");
+        assert!(cache.get_diagnostics(evicted.as_ref()).is_none());
+        let newest: Uri = Uri::from(format!("file:///test{}.rs", MAX_DIAGNOSTIC_ENTRIES + 9));
+        assert!(cache.get_diagnostics(newest.as_ref()).is_some());
     }
 
     #[test]
     fn test_diagnostics_replacing_existing_uri_does_not_trigger_eviction() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///stable.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///stable.rs");
 
         for i in 0..MAX_DIAGNOSTIC_ENTRIES {
             cache.store_diagnostics(
@@ -1715,7 +1753,7 @@ mod tests {
             );
         }
         assert_eq!(cache.diagnostics_count(), 1);
-        assert!(cache.get_diagnostics(uri.as_str()).is_some());
+        assert!(cache.get_diagnostics(uri.as_ref()).is_some());
     }
 
     #[test]
@@ -1724,12 +1762,12 @@ mod tests {
         // on every keystroke, must not be evicted ahead of a file that was
         // merely opened once and never touched again.
         let mut cache = NotificationCache::new();
-        let actively_edited: Uri = "file:///keep.rs".parse().unwrap();
+        let actively_edited: Uri = Uri::from("file:///keep.rs");
         cache.store_diagnostics(&test_server(), &actively_edited, Some(1), vec![]);
 
         // Fill the rest of the cache with untouched entries.
         for i in 0..MAX_DIAGNOSTIC_ENTRIES - 1 {
-            let uri: Uri = format!("file:///untouched{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///untouched{i}.rs"));
             cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         }
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
@@ -1741,39 +1779,39 @@ mod tests {
 
         // One more new URI arrives, exceeding the cap by one: the oldest
         // *untouched* entry must be evicted, not the republished one.
-        let overflow: Uri = "file:///overflow.rs".parse().unwrap();
+        let overflow: Uri = Uri::from("file:///overflow.rs");
         cache.store_diagnostics(&test_server(), &overflow, Some(1), vec![]);
 
         assert!(
-            cache.get_diagnostics(actively_edited.as_str()).is_some(),
+            cache.get_diagnostics(actively_edited.as_ref()).is_some(),
             "republished entry must survive eviction after being refreshed"
         );
-        let oldest_untouched: Uri = "file:///untouched0.rs".parse().unwrap();
+        let oldest_untouched: Uri = Uri::from("file:///untouched0.rs");
         assert!(
-            cache.get_diagnostics(oldest_untouched.as_str()).is_none(),
+            cache.get_diagnostics(oldest_untouched.as_ref()).is_none(),
             "the oldest never-republished entry must be evicted instead"
         );
-        assert!(cache.get_diagnostics(overflow.as_str()).is_some());
+        assert!(cache.get_diagnostics(overflow.as_ref()).is_some());
     }
 
     #[test]
     fn test_clear_diagnostics_then_refill_does_not_evict_early() {
         let mut cache = NotificationCache::new();
-        let first: Uri = "file:///first.rs".parse().unwrap();
+        let first: Uri = Uri::from("file:///first.rs");
         cache.store_diagnostics(&test_server(), &first, Some(1), vec![]);
-        cache.clear_diagnostics(first.as_str());
+        cache.clear_diagnostics(first.as_ref());
         assert_eq!(cache.diagnostics_count(), 0);
 
         for i in 0..MAX_DIAGNOSTIC_ENTRIES {
-            let uri: Uri = format!("file:///test{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///test{i}.rs"));
             cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         }
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
         // Every entry from this batch must still be present -- the earlier
         // clear must not have left a stale `diagnostic_order` entry that
         // causes a premature eviction here.
-        let first_of_batch: Uri = "file:///test0.rs".parse().unwrap();
-        assert!(cache.get_diagnostics(first_of_batch.as_str()).is_some());
+        let first_of_batch: Uri = Uri::from("file:///test0.rs");
+        assert!(cache.get_diagnostics(first_of_batch.as_ref()).is_some());
     }
 
     #[test]
@@ -1786,10 +1824,10 @@ mod tests {
     #[test]
     fn test_store_diagnostics_no_version() {
         let mut cache = NotificationCache::new();
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&test_server(), &uri, None, vec![]);
-        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.version, None);
     }
 
@@ -1805,7 +1843,7 @@ mod tests {
         let noisy = ServerId::from("noisy");
         let quiet = ServerId::from("quiet");
 
-        let quiet_uri: Uri = "file:///quiet/only_file.rs".parse().unwrap();
+        let quiet_uri: Uri = Uri::from("file:///quiet/only_file.rs");
         cache.store_diagnostics(&quiet, &quiet_uri, Some(1), vec![]);
 
         // Drive the noisy server well past the aggregate cap -- it must be
@@ -1813,19 +1851,19 @@ mod tests {
         // the rest unused (#276), and once the aggregate is full it must
         // only evict its own oldest entries.
         for i in 0..MAX_DIAGNOSTIC_ENTRIES + 50 {
-            let uri: Uri = format!("file:///noisy/file{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///noisy/file{i}.rs"));
             cache.store_diagnostics(&noisy, &uri, Some(1), vec![]);
         }
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
         assert!(
-            cache.get_diagnostics(quiet_uri.as_str()).is_some(),
+            cache.get_diagnostics(quiet_uri.as_ref()).is_some(),
             "quiet server's only entry must survive the noisy server's overflow"
         );
 
-        let noisy_first: Uri = "file:///noisy/file0.rs".parse().unwrap();
+        let noisy_first: Uri = Uri::from("file:///noisy/file0.rs");
         assert!(
-            cache.get_diagnostics(noisy_first.as_str()).is_none(),
+            cache.get_diagnostics(noisy_first.as_ref()).is_none(),
             "noisy server's own oldest entries must be evicted once the aggregate cache is full"
         );
     }
@@ -1844,7 +1882,7 @@ mod tests {
         let equal_share = MAX_DIAGNOSTIC_ENTRIES / 4;
         let more_than_share = equal_share + 100;
         for i in 0..more_than_share {
-            let uri: Uri = format!("file:///file{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///file{i}.rs"));
             cache.store_diagnostics(&dominant, &uri, Some(1), vec![]);
         }
         assert_eq!(
@@ -1856,7 +1894,7 @@ mod tests {
         // The other three registered servers never write anything, so the
         // dominant server can keep growing all the way to the full budget.
         for i in more_than_share..MAX_DIAGNOSTIC_ENTRIES {
-            let uri: Uri = format!("file:///file{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///file{i}.rs"));
             cache.store_diagnostics(&dominant, &uri, Some(1), vec![]);
         }
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
@@ -1882,11 +1920,11 @@ mod tests {
         let a = ServerId::from("a");
         let b = ServerId::from("b");
         for i in 0..2 {
-            let uri: Uri = format!("file:///a/file{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
             cache.store_diagnostics(&a, &uri, Some(1), vec![]);
         }
         for i in 0..2 {
-            let uri: Uri = format!("file:///b/file{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///b/file{i}.rs"));
             cache.store_diagnostics(&b, &uri, Some(1), vec![]);
         }
 
@@ -1913,11 +1951,11 @@ mod tests {
         let a = ServerId::from("a");
         let b = ServerId::from("b");
         for i in 0..500 {
-            let uri: Uri = format!("file:///a/file{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
             cache.store_diagnostics(&a, &uri, Some(1), vec![]);
         }
         for i in 0..500 {
-            let uri: Uri = format!("file:///b/file{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///b/file{i}.rs"));
             cache.store_diagnostics(&b, &uri, Some(1), vec![]);
         }
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
@@ -1925,7 +1963,7 @@ mod tests {
         // `c` has never written before -- its very first write hits a full,
         // entirely-in-share aggregate.
         let c = ServerId::from("c");
-        let new_uri: Uri = "file:///c/first.rs".parse().unwrap();
+        let new_uri: Uri = Uri::from("file:///c/first.rs");
         cache.store_diagnostics(&c, &new_uri, Some(1), vec![]);
 
         assert_eq!(
@@ -1933,14 +1971,14 @@ mod tests {
             MAX_DIAGNOSTIC_ENTRIES,
             "the aggregate cap must still be enforced even when every existing server is within share"
         );
-        assert!(cache.get_diagnostics(new_uri.as_str()).is_some());
+        assert!(cache.get_diagnostics(new_uri.as_ref()).is_some());
 
         // `a` and `b` are tied at 500 entries each; the deterministic
         // tie-break in `server_to_evict_from` picks `b`, so `b`'s oldest
         // entry is the one evicted, not `a`'s.
-        let b_oldest: Uri = "file:///b/file0.rs".parse().unwrap();
+        let b_oldest: Uri = Uri::from("file:///b/file0.rs");
         assert!(
-            cache.get_diagnostics(b_oldest.as_str()).is_none(),
+            cache.get_diagnostics(b_oldest.as_ref()).is_none(),
             "the largest in-share server (tie-broken to b) must lose its oldest entry"
         );
         assert!(
@@ -1955,7 +1993,7 @@ mod tests {
     fn test_repeated_writes_same_owner_do_not_grow_order_map() {
         let mut cache = NotificationCache::new();
         let server = ServerId::from("server");
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         let max_version = i32::try_from(MAX_DIAGNOSTIC_ENTRIES).unwrap() + 10;
         for version in 0..max_version {
@@ -1963,7 +2001,7 @@ mod tests {
         }
 
         assert_eq!(cache.diagnostics_count(), 1);
-        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.version, Some(max_version - 1));
     }
 
@@ -1975,23 +2013,23 @@ mod tests {
         let mut cache = NotificationCache::new();
         let old_owner = ServerId::from("old");
         let new_owner = ServerId::from("new");
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&old_owner, &uri, Some(1), vec![]);
         cache.store_diagnostics(&new_owner, &uri, Some(2), vec![]);
 
         assert_eq!(cache.diagnostics_count(), 1);
-        let stored = cache.get_diagnostics(uri.as_str()).unwrap();
+        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.version, Some(2));
 
         // The old owner's order map must no longer reference this URI:
         // filling the old owner's budget with fresh entries must not evict
         // this URI a second time (it's not there to evict) nor corrupt state.
         for i in 0..MAX_DIAGNOSTIC_ENTRIES + 5 {
-            let other: Uri = format!("file:///old/file{i}.rs").parse().unwrap();
+            let other: Uri = Uri::from(format!("file:///old/file{i}.rs"));
             cache.store_diagnostics(&old_owner, &other, Some(1), vec![]);
         }
-        assert!(cache.get_diagnostics(uri.as_str()).is_some());
+        assert!(cache.get_diagnostics(uri.as_ref()).is_some());
     }
 
     /// #290: `diagnostics_owner` is what a cache-only read (e.g.
@@ -2002,19 +2040,19 @@ mod tests {
     fn test_diagnostics_owner_returns_publisher_after_store() {
         let mut cache = NotificationCache::new();
         let server = ServerId::from("rust");
-        let uri: Uri = "file:///main.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///main.rs");
 
         cache.store_diagnostics(&server, &uri, Some(1), vec![]);
 
-        assert_eq!(cache.diagnostics_owner(uri.as_str()), Some(&server));
+        assert_eq!(cache.diagnostics_owner(uri.as_ref()), Some(&server));
     }
 
     #[test]
     fn test_diagnostics_owner_none_for_untracked_uri() {
         let cache = NotificationCache::new();
-        let uri: Uri = "file:///never-seen.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///never-seen.rs");
 
-        assert_eq!(cache.diagnostics_owner(uri.as_str()), None);
+        assert_eq!(cache.diagnostics_owner(uri.as_ref()), None);
     }
 
     /// Reassigning ownership (see `test_store_diagnostics_reassigns_ownership`
@@ -2026,13 +2064,13 @@ mod tests {
         let mut cache = NotificationCache::new();
         let old_owner = ServerId::from("old");
         let new_owner = ServerId::from("new");
-        let uri: Uri = "file:///test.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&old_owner, &uri, Some(1), vec![]);
-        assert_eq!(cache.diagnostics_owner(uri.as_str()), Some(&old_owner));
+        assert_eq!(cache.diagnostics_owner(uri.as_ref()), Some(&old_owner));
 
         cache.store_diagnostics(&new_owner, &uri, Some(2), vec![]);
-        assert_eq!(cache.diagnostics_owner(uri.as_str()), Some(&new_owner));
+        assert_eq!(cache.diagnostics_owner(uri.as_ref()), Some(&new_owner));
     }
 
     /// #266 S2: clearing one server's diagnostics must not disturb another
@@ -2043,15 +2081,15 @@ mod tests {
         let crashed = ServerId::from("crashed");
         let healthy = ServerId::from("healthy");
 
-        let crashed_uri: Uri = "file:///crashed/main.py".parse().unwrap();
-        let healthy_uri: Uri = "file:///healthy/main.rs".parse().unwrap();
+        let crashed_uri: Uri = Uri::from("file:///crashed/main.py");
+        let healthy_uri: Uri = Uri::from("file:///healthy/main.rs");
         cache.store_diagnostics(&crashed, &crashed_uri, Some(1), vec![]);
         cache.store_diagnostics(&healthy, &healthy_uri, Some(1), vec![]);
 
         cache.clear_server_diagnostics(&crashed);
 
-        assert!(cache.get_diagnostics(crashed_uri.as_str()).is_none());
-        assert!(cache.get_diagnostics(healthy_uri.as_str()).is_some());
+        assert!(cache.get_diagnostics(crashed_uri.as_ref()).is_none());
+        assert!(cache.get_diagnostics(healthy_uri.as_ref()).is_some());
         assert_eq!(cache.diagnostics_count(), 1);
 
         // Idempotent / no-op for a server with no (or no longer any) entries.
@@ -2095,7 +2133,7 @@ mod tests {
         let server = ServerId::from("server");
 
         for i in 0..MAX_DIAGNOSTIC_ENTRIES {
-            let uri: Uri = format!("file:///file{i}.rs").parse().unwrap();
+            let uri: Uri = Uri::from(format!("file:///file{i}.rs"));
             cache.store_diagnostics(&server, &uri, Some(1), vec![]);
         }
         assert_eq!(
@@ -2112,14 +2150,14 @@ mod tests {
         // A different server's first write, once the aggregate is full,
         // evicts from `server` (now far over its shrunk share) instead.
         let other = ServerId::from("other");
-        let new_uri: Uri = "file:///other/new.rs".parse().unwrap();
+        let new_uri: Uri = Uri::from("file:///other/new.rs");
         cache.store_diagnostics(&other, &new_uri, Some(1), vec![]);
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
-        assert!(cache.get_diagnostics(new_uri.as_str()).is_some());
-        let server_oldest: Uri = "file:///file0.rs".parse().unwrap();
+        assert!(cache.get_diagnostics(new_uri.as_ref()).is_some());
+        let server_oldest: Uri = Uri::from("file:///file0.rs");
         assert!(
-            cache.get_diagnostics(server_oldest.as_str()).is_none(),
+            cache.get_diagnostics(server_oldest.as_ref()).is_none(),
             "the pre-existing server's oldest entry, now far over its shrunk share, must be evicted"
         );
     }

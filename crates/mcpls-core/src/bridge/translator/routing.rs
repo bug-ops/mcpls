@@ -308,7 +308,7 @@ impl Translator {
     /// - The URI doesn't have a file:// scheme
     /// - The path is outside workspace boundaries
     pub(super) fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
-        let uri_str = uri.as_str();
+        let uri_str = uri.as_ref();
 
         // Validate file:// scheme
         if !uri_str.starts_with("file://") {
@@ -444,7 +444,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_file_uri_invalid_scheme() {
         let translator = Translator::new();
-        let uri: lsp_types::Uri = "http://example.com/file.rs".parse().unwrap();
+        let uri: lsp_types::Uri = lsp_types::Uri::from("http://example.com/file.rs");
         let result = translator.parse_file_uri(&uri);
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
@@ -458,7 +458,7 @@ mod tests {
 
         // Use url crate for cross-platform file URI creation
         let file_url = Url::from_file_path(&test_file).unwrap();
-        let uri: lsp_types::Uri = file_url.as_str().parse().unwrap();
+        let uri: lsp_types::Uri = lsp_types::Uri::from(file_url.as_str());
         let result = translator.parse_file_uri(&uri);
         assert!(result.is_ok());
     }
@@ -1007,7 +1007,7 @@ mod tests {
         let translator = Translator::new();
         let server_id = ServerId::from("rust");
         let caps = lsp_types::ServerCapabilities {
-            rename_provider: Some(lsp_types::OneOf::Left(true)),
+            rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
             ..Default::default()
         };
         translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
@@ -1015,7 +1015,10 @@ mod tests {
         let result = translator.require_capability(&server_id, "renameProvider", |c| {
             matches!(
                 c.rename_provider,
-                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                Some(
+                    lsp_types::RenameProvider::Bool(true)
+                        | lsp_types::RenameProvider::RenameOptions(_)
+                )
             )
         });
         assert!(result.is_ok());
@@ -1031,7 +1034,10 @@ mod tests {
         let result = translator.require_capability(&server_id, "renameProvider", |c| {
             matches!(
                 c.rename_provider,
-                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                Some(
+                    lsp_types::RenameProvider::Bool(true)
+                        | lsp_types::RenameProvider::RenameOptions(_)
+                )
             )
         });
         assert!(matches!(
@@ -1605,7 +1611,7 @@ mod tests {
         ));
     }
 
-    /// Explicit `Some(OneOf::Left(false))` -- as distinct from an absent
+    /// Explicit `Some(RenameProvider::Bool(false))` -- as distinct from an absent
     /// (`None`) field -- must also be rejected: some servers advertise a
     /// provider field with an explicit `false` rather than omitting it.
     #[tokio::test]
@@ -1613,7 +1619,7 @@ mod tests {
         let translator = Translator::new();
         let server_id = ServerId::from("rust");
         let caps = lsp_types::ServerCapabilities {
-            rename_provider: Some(lsp_types::OneOf::Left(false)),
+            rename_provider: Some(lsp_types::RenameProvider::Bool(false)),
             ..Default::default()
         };
         translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
@@ -1621,7 +1627,10 @@ mod tests {
         let result = translator.require_capability(&server_id, "renameProvider", |c| {
             matches!(
                 c.rename_provider,
-                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                Some(
+                    lsp_types::RenameProvider::Bool(true)
+                        | lsp_types::RenameProvider::RenameOptions(_)
+                )
             )
         });
         assert!(matches!(
@@ -1643,7 +1652,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let server_id = ServerId::from("rust");
         let caps = lsp_types::ServerCapabilities {
-            rename_provider: Some(lsp_types::OneOf::Left(true)),
+            rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
             ..Default::default()
         };
         let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);

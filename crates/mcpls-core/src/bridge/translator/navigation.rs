@@ -2,9 +2,8 @@
 //! handlers.
 
 use lsp_types::{
-    GotoDefinitionParams, Hover, HoverContents, HoverParams as LspHoverParams, MarkedString,
-    PartialResultParams, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, WorkDoneProgressParams,
+    HoverParams as LspHoverParams, PartialResultParams, ReferenceContext, ReferenceParams,
+    TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
 };
 
 use super::Translator;
@@ -15,26 +14,27 @@ use super::encoding_ctx::EncodingCtx;
 use crate::config::ToolKind;
 use crate::error::Result;
 
-/// Normalize a `GotoDefinitionResponse` into a flat list of MCP `Location` values.
-async fn goto_response_to_locations(
-    response: Option<lsp_types::GotoDefinitionResponse>,
-    ctx: &EncodingCtx,
-) -> Vec<Location> {
-    let lsp_locs: Vec<lsp_types::Location> = match response {
-        Some(lsp_types::GotoDefinitionResponse::Scalar(loc)) => vec![loc],
-        Some(lsp_types::GotoDefinitionResponse::Array(locs)) => locs,
-        Some(lsp_types::GotoDefinitionResponse::Link(links)) => links
-            .into_iter()
-            .map(|link| lsp_types::Location {
-                uri: link.target_uri,
-                range: link.target_selection_range,
-            })
-            .collect(),
-        None => vec![],
-    };
+/// Flattens a `Definition` (`Location` or `Location[]`) into an owned `Vec`.
+fn definition_to_locations(definition: lsp_types::Definition) -> Vec<lsp_types::Location> {
+    match definition {
+        lsp_types::Definition::Location(loc) => vec![loc],
+        lsp_types::Definition::LocationList(locs) => locs,
+    }
+}
 
-    let mut locations = Vec::with_capacity(lsp_locs.len());
-    for loc in lsp_locs {
+/// Converts a `DefinitionLink` into a plain `Location` pointing at its target.
+fn definition_link_to_location(link: lsp_types::DefinitionLink) -> lsp_types::Location {
+    lsp_types::Location {
+        uri: link.target_uri,
+        range: link.target_selection_range,
+    }
+}
+
+/// Converts raw LSP locations into MCP-facing `Location` values, normalizing
+/// each range into the caller's 1-based coordinate space.
+async fn lsp_locations_to_mcp(locs: Vec<lsp_types::Location>, ctx: &EncodingCtx) -> Vec<Location> {
+    let mut locations = Vec::with_capacity(locs.len());
+    for loc in locs {
         locations.push(Location {
             uri: loc.uri.to_string(),
             range: ctx.normalize_range(&loc.uri, loc.range).await,
@@ -43,23 +43,82 @@ async fn goto_response_to_locations(
     locations
 }
 
-fn extract_hover_contents(contents: HoverContents) -> String {
+/// Normalize a `textDocument/definition` response into a flat list of MCP
+/// `Location` values.
+async fn definition_response_to_locations(
+    response: Option<lsp_types::DefinitionResponse>,
+    ctx: &EncodingCtx,
+) -> Vec<Location> {
+    let lsp_locs = match response {
+        Some(lsp_types::DefinitionResponse::Definition(def)) => definition_to_locations(def),
+        Some(lsp_types::DefinitionResponse::DefinitionLinkList(links)) => {
+            links.into_iter().map(definition_link_to_location).collect()
+        }
+        None => vec![],
+    };
+    lsp_locations_to_mcp(lsp_locs, ctx).await
+}
+
+/// Normalize a `textDocument/implementation` response into a flat list of
+/// MCP `Location` values.
+async fn implementation_response_to_locations(
+    response: Option<lsp_types::ImplementationResponse>,
+    ctx: &EncodingCtx,
+) -> Vec<Location> {
+    let lsp_locs = match response {
+        Some(lsp_types::ImplementationResponse::Definition(def)) => definition_to_locations(def),
+        Some(lsp_types::ImplementationResponse::DefinitionLinkList(links)) => {
+            links.into_iter().map(definition_link_to_location).collect()
+        }
+        None => vec![],
+    };
+    lsp_locations_to_mcp(lsp_locs, ctx).await
+}
+
+/// Normalize a `textDocument/typeDefinition` response into a flat list of
+/// MCP `Location` values.
+async fn type_definition_response_to_locations(
+    response: Option<lsp_types::TypeDefinitionResponse>,
+    ctx: &EncodingCtx,
+) -> Vec<Location> {
+    let lsp_locs = match response {
+        Some(lsp_types::TypeDefinitionResponse::Definition(def)) => definition_to_locations(def),
+        Some(lsp_types::TypeDefinitionResponse::DefinitionLinkList(links)) => {
+            links.into_iter().map(definition_link_to_location).collect()
+        }
+        None => vec![],
+    };
+    lsp_locations_to_mcp(lsp_locs, ctx).await
+}
+
+/// Extracts hover contents as a plain string.
+///
+/// `MarkedString` is `#[deprecated]` in favor of `MarkupContent`, but LSP
+/// 3.17 servers may still send it inside `Hover.contents` -- dropping
+/// support would silently discard hover text from those servers, so this
+/// (and `marked_string_to_string`) carry a narrow, scoped allow rather than
+/// rewriting to `MarkupContent`-only.
+#[allow(deprecated)]
+fn extract_hover_contents(contents: lsp_types::Contents) -> String {
     match contents {
-        HoverContents::Scalar(marked_string) => marked_string_to_string(marked_string),
-        HoverContents::Array(marked_strings) => marked_strings
+        lsp_types::Contents::MarkedString(marked_string) => marked_string_to_string(marked_string),
+        lsp_types::Contents::MarkedStringList(marked_strings) => marked_strings
             .into_iter()
             .map(marked_string_to_string)
             .collect::<Vec<_>>()
             .join("\n\n"),
-        HoverContents::Markup(markup) => markup.value,
+        lsp_types::Contents::MarkupContent(markup) => markup.value,
     }
 }
 
 /// Convert a marked string to a plain string.
-fn marked_string_to_string(marked: MarkedString) -> String {
+#[allow(deprecated)]
+fn marked_string_to_string(marked: lsp_types::MarkedString) -> String {
     match marked {
-        MarkedString::String(s) => s,
-        MarkedString::LanguageString(ls) => format!("```{}\n{}\n```", ls.language, ls.value),
+        lsp_types::MarkedString::String(s) => s,
+        lsp_types::MarkedString::MarkedStringWithLanguage(ls) => {
+            format!("```{}\n{}\n```", ls.language, ls.value)
+        }
     }
 }
 
@@ -77,8 +136,8 @@ impl Translator {
                 matches!(
                     caps.hover_provider,
                     Some(
-                        lsp_types::HoverProviderCapability::Simple(true)
-                            | lsp_types::HoverProviderCapability::Options(_)
+                        lsp_types::HoverProvider::Bool(true)
+                            | lsp_types::HoverProvider::HoverOptions(_)
                     )
                 )
             })
@@ -95,8 +154,8 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let response: Option<Hover> = client
-            .request("textDocument/hover", params, client.request_timeout())
+        let response = client
+            .request_typed::<lsp_types::HoverRequest>(params, client.request_timeout())
             .await?;
 
         let result = match response {
@@ -137,7 +196,10 @@ impl Translator {
                 |caps| {
                     matches!(
                         caps.definition_provider,
-                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                        Some(
+                            lsp_types::DefinitionProvider::Bool(true)
+                                | lsp_types::DefinitionProvider::DefinitionOptions(_)
+                        )
                     )
                 },
             )
@@ -145,7 +207,7 @@ impl Translator {
         let ctx = self.encoding_ctx(&server_id);
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
-        let params = GotoDefinitionParams {
+        let params = lsp_types::DefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
                 position: lsp_position,
@@ -154,12 +216,12 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<lsp_types::GotoDefinitionResponse> = client
-            .request("textDocument/definition", params, client.request_timeout())
+        let response = client
+            .request_typed::<lsp_types::DefinitionRequest>(params, client.request_timeout())
             .await?;
 
         let result = DefinitionResult {
-            locations: goto_response_to_locations(response, &ctx).await,
+            locations: definition_response_to_locations(response, &ctx).await,
         };
 
         Ok(result)
@@ -186,7 +248,10 @@ impl Translator {
                 |caps| {
                     matches!(
                         caps.references_provider,
-                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                        Some(
+                            lsp_types::ReferencesProvider::Bool(true)
+                                | lsp_types::ReferencesProvider::ReferenceOptions(_)
+                        )
                     )
                 },
             )
@@ -195,7 +260,7 @@ impl Translator {
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
         let params = ReferenceParams {
-            text_document_position: TextDocumentPositionParams {
+            text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
                 position: lsp_position,
             },
@@ -206,8 +271,8 @@ impl Translator {
             },
         };
 
-        let response: Option<Vec<lsp_types::Location>> = client
-            .request("textDocument/references", params, client.request_timeout())
+        let response = client
+            .request_typed::<lsp_types::ReferencesRequest>(params, client.request_timeout())
             .await?;
 
         let locations = response.unwrap_or_default();
@@ -249,8 +314,9 @@ impl Translator {
                     matches!(
                         caps.implementation_provider,
                         Some(
-                            lsp_types::ImplementationProviderCapability::Simple(true)
-                                | lsp_types::ImplementationProviderCapability::Options(_)
+                            lsp_types::ImplementationProvider::Bool(true)
+                                | lsp_types::ImplementationProvider::ImplementationOptions(_)
+                                | lsp_types::ImplementationProvider::ImplementationRegistrationOptions(_)
                         )
                     )
                 },
@@ -259,7 +325,7 @@ impl Translator {
         let ctx = self.encoding_ctx(&server_id);
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
-        let params = GotoDefinitionParams {
+        let params = lsp_types::ImplementationParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
                 position: lsp_position,
@@ -268,16 +334,12 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<lsp_types::GotoDefinitionResponse> = client
-            .request(
-                "textDocument/implementation",
-                params,
-                client.request_timeout(),
-            )
+        let response = client
+            .request_typed::<lsp_types::ImplementationRequest>(params, client.request_timeout())
             .await?;
 
         Ok(LocationsResult {
-            locations: goto_response_to_locations(response, &ctx).await,
+            locations: implementation_response_to_locations(response, &ctx).await,
         })
     }
 
@@ -305,8 +367,9 @@ impl Translator {
                     matches!(
                         caps.type_definition_provider,
                         Some(
-                            lsp_types::TypeDefinitionProviderCapability::Simple(true)
-                                | lsp_types::TypeDefinitionProviderCapability::Options(_)
+                            lsp_types::TypeDefinitionProvider::Bool(true)
+                                | lsp_types::TypeDefinitionProvider::TypeDefinitionOptions(_)
+                                | lsp_types::TypeDefinitionProvider::TypeDefinitionRegistrationOptions(_)
                         )
                     )
                 },
@@ -315,7 +378,7 @@ impl Translator {
         let ctx = self.encoding_ctx(&server_id);
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
-        let params = GotoDefinitionParams {
+        let params = lsp_types::TypeDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
                 position: lsp_position,
@@ -324,40 +387,38 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<lsp_types::GotoDefinitionResponse> = client
-            .request(
-                "textDocument/typeDefinition",
-                params,
-                client.request_timeout(),
-            )
+        let response = client
+            .request_typed::<lsp_types::TypeDefinitionRequest>(params, client.request_timeout())
             .await?;
 
         Ok(LocationsResult {
-            locations: goto_response_to_locations(response, &ctx).await,
+            locations: type_definition_response_to_locations(response, &ctx).await,
         })
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_extract_hover_contents_string() {
         let marked_string = lsp_types::MarkedString::String("Test hover".to_string());
-        let contents = lsp_types::HoverContents::Scalar(marked_string);
+        let contents = lsp_types::Contents::MarkedString(marked_string);
         let result = extract_hover_contents(contents);
         assert_eq!(result, "Test hover");
     }
 
     #[test]
     fn test_extract_hover_contents_language_string() {
-        let marked_string = lsp_types::MarkedString::LanguageString(lsp_types::LanguageString {
-            language: "rust".to_string(),
-            value: "fn main() {}".to_string(),
-        });
-        let contents = lsp_types::HoverContents::Scalar(marked_string);
+        let marked_string = lsp_types::MarkedString::MarkedStringWithLanguage(
+            lsp_types::MarkedStringWithLanguage {
+                language: "rust".to_string(),
+                value: "fn main() {}".to_string(),
+            },
+        );
+        let contents = lsp_types::Contents::MarkedString(marked_string);
         let result = extract_hover_contents(contents);
         assert_eq!(result, "```rust\nfn main() {}\n```");
     }
@@ -368,7 +429,7 @@ mod tests {
             kind: lsp_types::MarkupKind::Markdown,
             value: "# Documentation".to_string(),
         };
-        let contents = lsp_types::HoverContents::Markup(markup);
+        let contents = lsp_types::Contents::MarkupContent(markup);
         let result = extract_hover_contents(contents);
         assert_eq!(result, "# Documentation");
     }

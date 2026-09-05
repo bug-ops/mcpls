@@ -48,32 +48,32 @@ const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Every symbol kind defined by LSP 3.17 and understood by mcpls.
 const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
-    SymbolKind::FILE,
-    SymbolKind::MODULE,
-    SymbolKind::NAMESPACE,
-    SymbolKind::PACKAGE,
-    SymbolKind::CLASS,
-    SymbolKind::METHOD,
-    SymbolKind::PROPERTY,
-    SymbolKind::FIELD,
-    SymbolKind::CONSTRUCTOR,
-    SymbolKind::ENUM,
-    SymbolKind::INTERFACE,
-    SymbolKind::FUNCTION,
-    SymbolKind::VARIABLE,
-    SymbolKind::CONSTANT,
-    SymbolKind::STRING,
-    SymbolKind::NUMBER,
-    SymbolKind::BOOLEAN,
-    SymbolKind::ARRAY,
-    SymbolKind::OBJECT,
-    SymbolKind::KEY,
-    SymbolKind::NULL,
-    SymbolKind::ENUM_MEMBER,
-    SymbolKind::STRUCT,
-    SymbolKind::EVENT,
-    SymbolKind::OPERATOR,
-    SymbolKind::TYPE_PARAMETER,
+    SymbolKind::File,
+    SymbolKind::Module,
+    SymbolKind::Namespace,
+    SymbolKind::Package,
+    SymbolKind::Class,
+    SymbolKind::Method,
+    SymbolKind::Property,
+    SymbolKind::Field,
+    SymbolKind::Constructor,
+    SymbolKind::Enum,
+    SymbolKind::Interface,
+    SymbolKind::Function,
+    SymbolKind::Variable,
+    SymbolKind::Constant,
+    SymbolKind::String,
+    SymbolKind::Number,
+    SymbolKind::Boolean,
+    SymbolKind::Array,
+    SymbolKind::Object,
+    SymbolKind::Key,
+    SymbolKind::Null,
+    SymbolKind::EnumMember,
+    SymbolKind::Struct,
+    SymbolKind::Event,
+    SymbolKind::Operator,
+    SymbolKind::TypeParameter,
 ];
 
 /// Windows-only additions to [`ENV_PASSTHROUGH`].
@@ -432,7 +432,7 @@ impl LspServer {
             .collect::<Result<Vec<_>>>()?;
 
         let params = InitializeParams {
-            process_id: Some(std::process::id()),
+            process_id: Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
             #[allow(deprecated)]
             root_uri: None,
             initialization_options: config.initialization_options.clone(),
@@ -446,7 +446,7 @@ impl LspServer {
                 text_document: Some(lsp_types::TextDocumentClientCapabilities {
                     document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
                         dynamic_registration: Some(false),
-                        symbol_kind: Some(lsp_types::SymbolKindCapability {
+                        symbol_kind: Some(lsp_types::ClientSymbolKindOptions {
                             value_set: Some(SUPPORTED_SYMBOL_KINDS.to_vec()),
                         }),
                         hierarchical_document_symbol_support: Some(true),
@@ -459,7 +459,7 @@ impl LspServer {
                             lsp_types::MarkupKind::PlainText,
                         ]),
                     }),
-                    definition: Some(lsp_types::GotoCapability {
+                    definition: Some(lsp_types::DefinitionClientCapabilities {
                         dynamic_registration: Some(false),
                         link_support: Some(true),
                     }),
@@ -469,28 +469,27 @@ impl LspServer {
                     code_action: Some(lsp_types::CodeActionClientCapabilities {
                         dynamic_registration: Some(false),
                         data_support: Some(true),
-                        resolve_support: Some(lsp_types::CodeActionCapabilityResolveSupport {
+                        resolve_support: Some(lsp_types::ClientCodeActionResolveOptions {
                             properties: vec!["edit".to_string()],
                         }),
                         // Declare supported action kinds so the server returns
                         // CodeAction objects (not just legacy Command objects).
-                        code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
-                            code_action_kind: lsp_types::CodeActionKindLiteralSupport {
-                                value_set: [
-                                    lsp_types::CodeActionKind::EMPTY,
-                                    lsp_types::CodeActionKind::QUICKFIX,
-                                    lsp_types::CodeActionKind::REFACTOR,
-                                    lsp_types::CodeActionKind::REFACTOR_EXTRACT,
-                                    lsp_types::CodeActionKind::REFACTOR_INLINE,
-                                    lsp_types::CodeActionKind::REFACTOR_REWRITE,
-                                    lsp_types::CodeActionKind::SOURCE,
-                                    lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                                ]
-                                .iter()
-                                .map(|k| k.as_str().to_string())
-                                .collect(),
+                        code_action_literal_support: Some(
+                            lsp_types::ClientCodeActionLiteralOptions {
+                                code_action_kind: lsp_types::ClientCodeActionKindOptions {
+                                    value_set: vec![
+                                        lsp_types::CodeActionKind::Empty,
+                                        lsp_types::CodeActionKind::QuickFix,
+                                        lsp_types::CodeActionKind::Refactor,
+                                        lsp_types::CodeActionKind::RefactorExtract,
+                                        lsp_types::CodeActionKind::RefactorInline,
+                                        lsp_types::CodeActionKind::RefactorRewrite,
+                                        lsp_types::CodeActionKind::Source,
+                                        lsp_types::CodeActionKind::SourceOrganizeImports,
+                                    ],
+                                },
                             },
-                        }),
+                        ),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -505,7 +504,11 @@ impl LspServer {
                 name: "mcpls".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
-            workspace_folders: Some(workspace_folders),
+            workspace_folders_initialize_params: lsp_types::WorkspaceFoldersInitializeParams {
+                workspace_folders: Some(lsp_types::WorkspaceFolders::WorkspaceFolderList(
+                    workspace_folders,
+                )),
+            },
             ..Default::default()
         };
 
@@ -944,7 +947,7 @@ mod tests {
 
         let folder = workspace_folder(root).unwrap();
 
-        assert_eq!(folder.uri.as_str(), expected);
+        assert_eq!(folder.uri.as_ref(), expected);
         assert_eq!(folder.name, "#work");
     }
 
@@ -963,7 +966,7 @@ mod tests {
 
         let folder = workspace_folder(root).unwrap();
 
-        assert_eq!(folder.uri.as_str(), expected);
+        assert_eq!(folder.uri.as_ref(), expected);
         assert_eq!(folder.name, "[env]");
     }
 
@@ -1908,7 +1911,7 @@ mod tests {
             let expected_uri = try_path_to_uri(&base).unwrap();
             assert_eq!(
                 request["params"]["workspaceFolders"][0]["uri"],
-                expected_uri.as_str()
+                expected_uri.as_ref()
             );
 
             write_success_response(
