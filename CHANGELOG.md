@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`DocumentTracker::update`** — Breaking change: now `async`, serializing against `ensure_open` for the same path. (#363)
 - Bump rmcp from 3.1.4 to 3.2.0; an `initialize` request naming `protocolVersion: 2026-07-28` now receives the server's negotiated legacy version in response instead of an echo of the requested version (rmcp behavior change) (#364)
 - Reorder `mcpls-core` `Cargo.toml` dependencies into alphabetical order (#364)
-- **`ToolKind`/`NoServerReason`** — Breaking change: both marked `#[non_exhaustive]`; `ToolKind::ALL` is now `&[ToolKind]` instead of a fixed-size array. (#310)
-- **`WorkspaceConfig::get_language_for_extension`** — Breaking change: renamed to `language_for_extension`. (#305)
+- **`ToolKind`/`NoServerReason`** — Breaking change: both marked `#[non_exhaustive]`; `ToolKind::ALL` is now `&[ToolKind]` instead of a fixed-size array. (#366)
+- **`WorkspaceConfig::get_language_for_extension`** — Breaking change: renamed to `language_for_extension`. (#366)
 
 ### Fixed
 
