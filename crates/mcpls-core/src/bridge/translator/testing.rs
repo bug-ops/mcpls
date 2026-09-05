@@ -101,6 +101,10 @@ pub(super) struct FakeServer {
     pub(super) write_stdout: ChildStdout,
 }
 
+// Spawns real `cat` subprocesses as a loopback mock rather than an
+// in-memory stream, which ties test scheduling to OS process contention
+// (see #374, mitigated via a nextest test-group; tracked for removal in #378
+// via `tokio::io::duplex`).
 pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
     let mut write_half = Command::new("cat")
         .stdin(Stdio::piped())

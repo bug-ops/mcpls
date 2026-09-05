@@ -13,6 +13,29 @@ fail-fast = false
 # Test threads configuration
 test-threads = "num-cpus"
 
+# `fake_lsp_client()`-style tests spawn real `cat`/`echo` child processes as
+# a loopback mock LSP server (bridge/translator/testing.rs, bridge/state.rs,
+# lsp/client.rs, lsp/lifecycle.rs); OS process contention from the
+# subprocess fan-out can either starve a test past nextest's 120s hard
+# timeout, or produce a spurious assertion failure that does not reproduce
+# on an isolated rerun (see #374). This mitigates by lowering collision
+# probability; it does not eliminate the underlying race (tracked as a
+# follow-up: replace the subprocess loopback with an in-memory
+# `tokio::io::duplex`, see #378). `max-threads` is set below the CI
+# matrix's smallest runner core count (3, macos-latest) — a cap at or
+# above the `test-threads` pool size never binds, since a test-group only
+# limits concurrency *within* the existing thread pool.
+[test-groups]
+subprocess-mock-pipe = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'test(bridge::translator::) + test(bridge::state::) + test(lsp::client::) + test(lsp::lifecycle::)'
+test-group = 'subprocess-mock-pipe'
+
+[[profile.ci.overrides]]
+filter = 'test(bridge::translator::) + test(bridge::state::) + test(lsp::client::) + test(lsp::lifecycle::)'
+test-group = 'subprocess-mock-pipe'
+
 # Timeout settings
 [profile.default.junit]
 path = "target/nextest/default/junit.xml"
