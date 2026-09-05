@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **`mcpls_core::mcp::{PositionParams, RangeParams, ReferencesParams, RenameParams, CompletionsParams, DocumentSymbolsParams, FormatDocumentParams, WorkspaceSymbolParams, CallHierarchyCallsParams, DiagnosticsParams}`** — Breaking change: `mcp::mod`'s `pub use tools::{...}` re-export block is removed entirely. This includes `PositionParams`, which a previous entry in this changelog (#302) told embedders to use directly after the position-only wrapper structs were collapsed into it — that guidance no longer applies. No in-tree caller ever named any of these types through `mcp::mod` (every tool handler in `server.rs` extracts them via `Parameters<T>` from `mcp::tools` directly), and MCP tool arguments are ordinary JSON matching each tool's published schema, not a Rust type a caller needs to name. No deprecation shim, per pre-1.0 policy. (#367)
+- **`mcpls_core::Error`** — Breaking change: removed four never-constructed variants (`Shutdown`, `Config`, `EncodingError`, `PartialServerInit`); their intent is already covered by `ServerTerminated`/`InvalidConfig`/`ConfigNotFound`/`AllServersFailedToInit`. No deprecation shim, per pre-1.0 policy.
 
 ### Fixed
 
