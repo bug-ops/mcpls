@@ -509,16 +509,18 @@ const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration:
 /// Enforcement lives here, at the `SessionManager` layer, rather than in Axum
 /// middleware sniffing request headers, because that is the only place
 /// guaranteed to run exactly when — and only when — a session is actually
-/// created. `rmcp` 3.1.0's `StreamableHttpService::handle_post` calls
-/// `create_session` solely on legacy-mode POSTs with no `Mcp-Session-Id`
-/// header (the `initialize` handshake); modern-protocol POSTs (SEP-2567,
-/// protocol `>= 2026-07-28`, which removes sessions entirely) and
-/// `server/discover` requests share that same header-less shape but take a
-/// stateless code path that never calls `create_session`. A header-based
-/// middleware heuristic can't tell these apart without duplicating `rmcp`'s
-/// internal protocol classification, so it either 429s traffic that never
-/// consumed a session slot, or — in an all-stateless deployment — never
-/// fires at all.
+/// created. `rmcp` 3.2.0's `StreamableHttpService::handle_post` classifies
+/// every `initialize` request as legacy and always calls `create_session`,
+/// whatever protocol version it names — the handshake only exists in
+/// revisions before `2026-07-28`, so a version named in its params never
+/// routes it to the stateless path. Only *non*-`initialize` requests that
+/// carry SEP-2575 per-request `_meta` (`io.modelcontextprotocol/protocolVersion`
+/// = `2026-07-28` plus the required `clientCapabilities` key), and
+/// `server/discover` requests, take the stateless discover-lifecycle path
+/// that never calls `create_session`. A header-based middleware heuristic
+/// can't tell these apart without duplicating `rmcp`'s internal protocol
+/// classification, so it either 429s traffic that never consumed a session
+/// slot, or — in an all-stateless deployment — never fires at all.
 ///
 /// `restore_session` and `event_store` deliberately use
 /// [`SessionManager`]'s trait defaults (`NotSupported` / `None`) instead of
@@ -1341,11 +1343,17 @@ mod tests {
             server_task.abort();
         }
 
-        /// S1 non-regression: a modern-protocol (`>= 2026-07-28`, SEP-2567
-        /// stateless) request never calls `SessionManager::create_session` —
-        /// `rmcp` serves it directly without touching the session table — so
-        /// it must not be rejected by the cap even while
-        /// `max_concurrent_sessions` legacy sessions are already active. This
+        /// S1 non-regression: a non-`initialize` request carrying SEP-2575
+        /// per-request `_meta` protocol-version metadata
+        /// (`io.modelcontextprotocol/protocolVersion` = `2026-07-28` plus the
+        /// required `clientCapabilities` key) takes rmcp 3.2.0's stateless
+        /// discover-lifecycle path and never calls
+        /// `SessionManager::create_session` — `rmcp` serves it directly
+        /// without touching the session table — so it must not be rejected
+        /// by the cap even while `max_concurrent_sessions` legacy sessions
+        /// are already active. (An `initialize` request is always
+        /// classified legacy in 3.2.0 regardless of the protocol version it
+        /// names, so it cannot be used to probe the stateless path.) This
         /// guards against a future refactor reintroducing request-header
         /// sniffing for the cap decision (the bug this design replaced).
         #[tokio::test]
@@ -1373,13 +1381,19 @@ mod tests {
                 "legacy initialize should succeed and consume the sole session slot, got: {legacy}"
             );
 
-            // A stateless request (protocolVersion >= 2026-07-28) never
-            // creates a session, so it must bypass the cap entirely even
-            // though the slot above is still held.
-            let stateless_initialize = br#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
-            let stateless = raw_http_post(addr, "/mcp", accept_headers, stateless_initialize).await;
+            // A non-`initialize` request carrying per-request `_meta`
+            // protocol-version metadata takes rmcp 3.2.0's stateless
+            // discover-lifecycle path and never creates a session, so it
+            // must bypass the cap entirely even though the slot above is
+            // still held. The `MCP-Protocol-Version` header must match the
+            // `_meta` value once the latter is present, and declaring
+            // `2026-07-28` also brings in SEP-2243's `Mcp-Method` header
+            // requirement.
+            let stateless_headers = "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: resources/list\r\n";
+            let stateless_request = br#"{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+            let stateless = raw_http_post(addr, "/mcp", stateless_headers, stateless_request).await;
             assert!(
-                !stateless.starts_with("HTTP/1.1 429"),
+                stateless.starts_with("HTTP/1.1 200"),
                 "stateless requests must bypass the session cap entirely, got: {stateless}"
             );
 
