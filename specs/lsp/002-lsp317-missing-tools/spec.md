@@ -1,8 +1,37 @@
+---
+aliases:
+  - LSP 3.17 Tools
+  - Signature Help, Implementation, Type Definition, Inlay Hints
+tags:
+  - sdd
+  - spec
+  - lsp
+  - mcp
+created: 2026-08-05
+status: implemented
+related:
+  - "[[testing/001-e2e-rust-analyzer-testing/spec]]"
+  - "[[lsp/004-lsp-318-draft-gaps/spec]]"
+---
+
 # Spec lsp/002: Add Missing LSP 3.17 Tools (Inlay Hints, Type Hierarchy, Signature Help)
+
+> [!info] Metadata
+> **Author**: filed from #368 migration follow-up
+> **Branch**: fix/369-stale-lsp317-spec-status
+> **Related issue**: #369 (staleness report), #116 (original tool request)
 
 **Type**: enhancement
 **Priority**: P3
-**Status**: draft
+**Status**: implemented
+
+> [!success] Resolution
+> Implemented by commit `87166fc` (PR #124), closing #116 and #115. All four tools
+> (`get_signature_help`, `go_to_implementation`, `go_to_type_definition`, `get_inlay_hints`)
+> are present in `crates/mcpls-core/src/mcp/server.rs` and exercised end-to-end by
+> `crates/mcpls-core/tests/ra_e2e.rs` and `crates/mcpls-core/tests/e2e/protocol_tests.rs`.
+> Each tool follows the existing 1-based MCP position convention and degrades gracefully when
+> the LSP server does not support the capability.
 
 ## Problem Statement
 

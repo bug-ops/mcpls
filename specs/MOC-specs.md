@@ -18,7 +18,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | # | Slug | Type | Priority | Status | Issue |
 |---|------|------|----------|--------|-------|
 | 001 | [[lsp/001-lsp-server-lifecycle-and-respawn/spec\|lsp-server-lifecycle-and-respawn]] | enhancement | P1 | implemented (retroactive) | — |
-| 002 | [[lsp/002-lsp317-missing-tools/spec\|lsp317-missing-tools]] | enhancement | P3 | draft (tools now implemented — see [[testing/001-e2e-rust-analyzer-testing/spec\|testing/001]]'s Resolution; this spec's own status is stale, see note below) | #116 |
+| 002 | [[lsp/002-lsp317-missing-tools/spec\|lsp317-missing-tools]] | enhancement | P3 | implemented (#124) | #116 |
 | 003 | [[lsp/003-lsp-types-unmaintained-migration/spec\|lsp-types-unmaintained-migration]] | research | P2 | draft | #297 |
 | 004 | [[lsp/004-lsp-318-draft-gaps/spec\|lsp-318-draft-gaps]] | research | P4 | draft | #299 (also #116; #290 resolved by #289/#291) |
 
@@ -80,13 +80,3 @@ subsystem.
 >
 > Numbers are **block-scoped**, not global: `bridge/001` and `lsp/001` are different, unrelated
 > specs. Always cite a spec with its block prefix (e.g. `bridge/001`, never bare `001`).
-
-> [!warning] Known staleness: lsp/002 (formerly 003) vs. shipped code
-> [[lsp/002-lsp317-missing-tools/spec|lsp/002]]'s own file still says `**Status**: draft`, but all
-> four tools it proposes (`get_signature_help`, `go_to_implementation`, `go_to_type_definition`,
-> `get_inlay_hints`) are already implemented in `crates/mcpls-core/src/mcp/server.rs` and exercised
-> by [[testing/001-e2e-rust-analyzer-testing/spec|testing/001]]'s e2e suite. This migration did not
-> rewrite lsp/002's content (out of scope for a migration/reorganization pass — see the migration
-> report), but a human reviewer should follow up with a proper Resolution callout identifying the
-> implementing PR(s), consistent with how `bridge/005`/`runtime/001`/`runtime/002` already document
-> their own resolutions.
