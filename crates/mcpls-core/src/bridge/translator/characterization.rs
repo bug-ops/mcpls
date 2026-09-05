@@ -148,30 +148,46 @@ fn test_goto_definition_response_array_json_is_flat_array_of_locations() {
 /// Non-ASCII filesystem path through the real conversion layer:
 /// `try_path_to_uri` must percent-encode it, and `uri_to_path` must recover
 /// the exact original `Path`.
+///
+/// Built on `std::env::temp_dir()` rather than a hardcoded `/tmp/...`
+/// literal: a Unix-style path has no drive letter on Windows, which
+/// `try_path_to_uri`'s Windows fallback (`windows_rooted_path_to_file_url`,
+/// for rooted-but-driveless paths) can still turn into a URI, but
+/// `uri_to_path`'s `Url::to_file_path()` cannot turn back into a path
+/// without a drive -- an asymmetry specific to that fallback branch, not
+/// something a real (drive-qualified) Windows path ever hits.
 #[test]
 fn test_try_path_to_uri_round_trips_non_ascii_path() {
-    let path = std::path::Path::new("/tmp/café/main.rs");
-    let uri = crate::bridge::try_path_to_uri(path).expect("valid absolute path");
+    let path = std::env::temp_dir().join("café").join("main.rs");
+    let uri = crate::bridge::try_path_to_uri(&path).expect("valid absolute path");
     assert!(
         uri.as_ref().contains("%C3%A9"),
         "non-ASCII byte must be percent-encoded, got {}",
         uri.as_ref()
     );
-    assert_eq!(crate::bridge::uri_to_path(&uri).as_deref(), Some(path));
+    assert_eq!(
+        crate::bridge::uri_to_path(&uri).as_deref(),
+        Some(path.as_path())
+    );
 }
 
 /// A space in a filesystem path through the real conversion layer: must be
 /// percent-encoded on the way out and recovered exactly on the way back.
+/// See the sibling non-ASCII test above for why this is built on
+/// `std::env::temp_dir()` rather than a hardcoded `/tmp/...` literal.
 #[test]
 fn test_try_path_to_uri_round_trips_space_in_path() {
-    let path = std::path::Path::new("/tmp/my file.rs");
-    let uri = crate::bridge::try_path_to_uri(path).expect("valid absolute path");
+    let path = std::env::temp_dir().join("my file.rs");
+    let uri = crate::bridge::try_path_to_uri(&path).expect("valid absolute path");
     assert!(
         uri.as_ref().contains("%20"),
         "space must be percent-encoded, got {}",
         uri.as_ref()
     );
-    assert_eq!(crate::bridge::uri_to_path(&uri).as_deref(), Some(path));
+    assert_eq!(
+        crate::bridge::uri_to_path(&uri).as_deref(),
+        Some(path.as_path())
+    );
 }
 
 /// R1 (documented behavior change, see the migration's CHANGELOG entry for
