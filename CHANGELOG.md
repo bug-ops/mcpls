@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Diagnostics push notifications no longer silently vanish after an LSP server respawn; `get_cached_diagnostics`/resource reads now flag when they're degraded. (#363)
 - `document_symbols` no longer redundantly recomputes the same range twice for flat (`SymbolInformation`) responses. (#361)
+- HTTP transport now catches a repeat shutdown signal received during the connection-drain window and cuts the drain short instead of waiting out the full timeout. (#349)
 
 ## [0.4.0] - 2026-09-05
 
