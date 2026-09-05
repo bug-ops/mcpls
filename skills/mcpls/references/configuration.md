@@ -5,6 +5,22 @@ for worked examples per language, see
 [Configuration Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md)
 and [Complete Examples](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md#complete-examples).
 
+## `[mcp]` fields
+
+Overrides the text mcpls reports about itself over MCP; every field is optional and
+independent, defaulting to mcpls's built-in text when omitted. `serverInfo.name`,
+`version`, and `website_url` are not configurable here.
+
+| Field | Type | Default | Max size | Notes |
+|---|---|---|---|---|
+| `title` | string | `"MCPLS - MCP to LSP Bridge"` | 128 bytes | Overrides `serverInfo.title`. |
+| `description` | string | crate's `Cargo.toml` description | 1024 bytes | Overrides `serverInfo.description`. |
+| `instructions` | string | built-in capability blurb | 4096 bytes | **Replaces** `ServerInfo.instructions` entirely — does not append to the built-in text. Read it at connection time instead of assuming the built-in blurb; see the note below. |
+
+Limits are UTF-8 bytes, not characters, and apply to the raw configured string,
+including surrounding whitespace — a whitespace-only value is rejected as empty
+rather than checked against the byte cap. `tool_prefix` is not implemented yet.
+
 ## `[workspace]` fields
 
 | Field | Type | Default | Notes |

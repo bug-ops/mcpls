@@ -603,6 +603,7 @@ mod tests {
         ];
 
         let config = crate::config::ServerConfig {
+            mcp: crate::config::McpConfig::default(),
             workspace: WorkspaceConfig {
                 roots: vec![PathBuf::from("/tmp/test-workspace")],
                 position_encodings: vec!["utf-8".to_string()],

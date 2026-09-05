@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+use crate::config::McpConfig;
 
 /// Shared context for all tool handlers.
 ///
@@ -46,6 +47,9 @@ pub struct BridgeContext {
     /// (stderr's `tracing::warn!` at load time is typically invisible to an
     /// MCP client).
     pub project_config_ignored: bool,
+    /// Configured `serverInfo`/`instructions` presentation overrides, read by
+    /// `McplsServer::get_info`.
+    pub mcp: McpConfig,
 }
 
 impl BridgeContext {
@@ -57,6 +61,7 @@ impl BridgeContext {
         workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_config_ignored: bool,
+        mcp: McpConfig,
     ) -> Self {
         Self {
             translator,
@@ -64,6 +69,7 @@ impl BridgeContext {
             workspace_roots,
             subscriptions,
             project_config_ignored,
+            mcp,
         }
     }
 }
@@ -85,6 +91,7 @@ mod tests {
             workspace_roots,
             subscriptions,
             false,
+            McpConfig::default(),
         );
         assert_eq!(Arc::strong_count(&context.translator), 1);
     }
