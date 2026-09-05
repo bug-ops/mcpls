@@ -13,7 +13,7 @@ use std::process::Stdio;
 
 use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
-    InitializedParams, PositionEncodingKind, ServerCapabilities, WorkspaceFolder,
+    InitializedParams, PositionEncodingKind, ServerCapabilities, SymbolKind, WorkspaceFolder,
 };
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -45,6 +45,36 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 /// its own after sending the LSP `exit` notification, before falling back to
 /// `kill_on_drop`.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// Every symbol kind defined by LSP 3.17 and understood by mcpls.
+const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
+    SymbolKind::FILE,
+    SymbolKind::MODULE,
+    SymbolKind::NAMESPACE,
+    SymbolKind::PACKAGE,
+    SymbolKind::CLASS,
+    SymbolKind::METHOD,
+    SymbolKind::PROPERTY,
+    SymbolKind::FIELD,
+    SymbolKind::CONSTRUCTOR,
+    SymbolKind::ENUM,
+    SymbolKind::INTERFACE,
+    SymbolKind::FUNCTION,
+    SymbolKind::VARIABLE,
+    SymbolKind::CONSTANT,
+    SymbolKind::STRING,
+    SymbolKind::NUMBER,
+    SymbolKind::BOOLEAN,
+    SymbolKind::ARRAY,
+    SymbolKind::OBJECT,
+    SymbolKind::KEY,
+    SymbolKind::NULL,
+    SymbolKind::ENUM_MEMBER,
+    SymbolKind::STRUCT,
+    SymbolKind::EVENT,
+    SymbolKind::OPERATOR,
+    SymbolKind::TYPE_PARAMETER,
+];
 
 /// Windows-only additions to [`ENV_PASSTHROUGH`].
 ///
@@ -414,6 +444,14 @@ impl LspServer {
                     ..Default::default()
                 }),
                 text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                    document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
+                        dynamic_registration: Some(false),
+                        symbol_kind: Some(lsp_types::SymbolKindCapability {
+                            value_set: Some(SUPPORTED_SYMBOL_KINDS.to_vec()),
+                        }),
+                        hierarchical_document_symbol_support: Some(true),
+                        ..Default::default()
+                    }),
                     hover: Some(lsp_types::HoverClientCapabilities {
                         dynamic_registration: Some(false),
                         content_format: Some(vec![
@@ -1670,12 +1708,10 @@ mod tests {
         assert_eq!(result.failures[1].command, "cmd2-nonexistent");
     }
 
-    /// Wire-level regression test for #287: proves the *configured*
-    /// `position_encodings` (not the old hardcoded `[UTF8, UTF16]`) actually
-    /// reaches `capabilities.general.positionEncodings` in the `initialize`
-    /// request body, by capturing the real bytes `LspServer::initialize`
-    /// writes over a piped `cat` subprocess standing in for the LSP server.
-    /// Mirrors the `fake_lsp_client`/`FakeServer` pattern in
+    /// Wire-level regressions for the `initialize` request. The tests capture
+    /// the real bytes `LspServer::initialize` writes over a piped `cat`
+    /// subprocess standing in for the LSP server. Mirrors the
+    /// `fake_lsp_client`/`FakeServer` pattern in
     /// `client.rs::tests::retry_behavior`.
     mod initialize_wire {
         use std::process::Stdio;
@@ -1797,6 +1833,53 @@ mod tests {
             .await;
 
             // The response written above must let `initialize` complete successfully.
+            init_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_initialize_advertises_hierarchical_document_symbols() {
+            let (client, mut server) = fake_lsp_client();
+
+            let config = ServerInitConfig {
+                server_config: LspServerConfig::rust_analyzer(),
+                workspace_roots: vec![],
+                initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
+            };
+
+            let init_task =
+                tokio::spawn(async move { LspServer::initialize(&client, &config).await });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let params: InitializeParams =
+                serde_json::from_value(request["params"].clone()).unwrap();
+            let document_symbol = params
+                .capabilities
+                .text_document
+                .unwrap()
+                .document_symbol
+                .unwrap();
+
+            assert_eq!(request["method"], "initialize");
+            assert_eq!(document_symbol.dynamic_registration, Some(false));
+            assert_eq!(
+                document_symbol.hierarchical_document_symbol_support,
+                Some(true)
+            );
+            assert_eq!(
+                document_symbol.symbol_kind.unwrap().value_set,
+                Some(SUPPORTED_SYMBOL_KINDS.to_vec())
+            );
+
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                serde_json::json!({ "capabilities": {} }),
+            )
+            .await;
+
             init_task.await.unwrap().unwrap();
         }
 
