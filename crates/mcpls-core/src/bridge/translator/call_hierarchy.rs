@@ -10,7 +10,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{
     CallHierarchyItemResult, CallHierarchyPrepareResult, IncomingCall, IncomingCallsResult,
-    OutgoingCall, OutgoingCallsResult,
+    OutgoingCall, OutgoingCallsResult, Position,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::MAX_POSITION_VALUE;
@@ -117,9 +117,9 @@ impl Translator {
     pub async fn handle_call_hierarchy_prepare(
         &self,
         file_path: String,
-        line: u32,
-        character: u32,
+        position: Position,
     ) -> Result<CallHierarchyPrepareResult> {
+        let Position { line, character } = position;
         // Validate position bounds
         if line < 1 || character < 1 {
             return Err(Error::InvalidToolParams(
@@ -319,7 +319,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::{Position2D, Range};
+    use crate::bridge::translator::dto::{Position, Position2D, Range};
     use crate::bridge::translator::testing::*;
     use crate::config::ServerId;
 
@@ -327,12 +327,24 @@ mod tests {
     async fn test_handle_call_hierarchy_prepare_invalid_position_zero() {
         let translator = Translator::new();
         let result = translator
-            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 0, 1)
+            .handle_call_hierarchy_prepare(
+                "/tmp/test.rs".to_string(),
+                Position {
+                    line: 0,
+                    character: 1,
+                },
+            )
             .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
 
         let result = translator
-            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1, 0)
+            .handle_call_hierarchy_prepare(
+                "/tmp/test.rs".to_string(),
+                Position {
+                    line: 1,
+                    character: 0,
+                },
+            )
             .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
@@ -341,12 +353,24 @@ mod tests {
     async fn test_handle_call_hierarchy_prepare_invalid_position_too_large() {
         let translator = Translator::new();
         let result = translator
-            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1_000_001, 1)
+            .handle_call_hierarchy_prepare(
+                "/tmp/test.rs".to_string(),
+                Position {
+                    line: 1_000_001,
+                    character: 1,
+                },
+            )
             .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
 
         let result = translator
-            .handle_call_hierarchy_prepare("/tmp/test.rs".to_string(), 1, 1_000_001)
+            .handle_call_hierarchy_prepare(
+                "/tmp/test.rs".to_string(),
+                Position {
+                    line: 1,
+                    character: 1_000_001,
+                },
+            )
             .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }

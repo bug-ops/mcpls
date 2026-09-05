@@ -10,7 +10,7 @@ use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
     CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, FormatDocumentResult,
-    RenameResult, TextEdit, WorkspaceEditDescription,
+    Position, RenameResult, TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
@@ -20,10 +20,8 @@ use crate::error::{Error, Result};
 /// Convert LSP range to MCP range (0-based to 1-based).
 /// Validate parameters for `handle_code_actions`.
 fn validate_code_action_params(
-    start_line: u32,
-    start_character: u32,
-    end_line: u32,
-    end_character: u32,
+    start: Position,
+    end: Position,
     kind_filter: Option<&str>,
 ) -> Result<()> {
     const VALID_ACTION_KINDS: &[&str] = &[
@@ -35,6 +33,15 @@ fn validate_code_action_params(
         "source",
         "source.organizeImports",
     ];
+
+    let Position {
+        line: start_line,
+        character: start_character,
+    } = start;
+    let Position {
+        line: end_line,
+        character: end_character,
+    } = end;
 
     if let Some(kind) = kind_filter
         && !VALID_ACTION_KINDS
@@ -173,10 +180,10 @@ impl Translator {
     pub async fn handle_rename(
         &self,
         file_path: String,
-        line: u32,
-        character: u32,
+        position: Position,
         new_name: String,
     ) -> Result<RenameResult> {
+        let Position { line, character } = position;
         validate_rename_params(&new_name)?;
 
         let (server_id, client, uri) = self
@@ -333,19 +340,11 @@ impl Translator {
     pub async fn handle_code_actions(
         &self,
         file_path: String,
-        start_line: u32,
-        start_character: u32,
-        end_line: u32,
-        end_character: u32,
+        start: Position,
+        end: Position,
         kind_filter: Option<String>,
     ) -> Result<CodeActionsResult> {
-        validate_code_action_params(
-            start_line,
-            start_character,
-            end_line,
-            end_character,
-            kind_filter.as_deref(),
-        )?;
+        validate_code_action_params(start, end, kind_filter.as_deref())?;
 
         let (server_id, client, uri) = self
             .prepare_gated_document(
@@ -367,8 +366,8 @@ impl Translator {
         let response_uri = uri.clone();
 
         let range = lsp_types::Range {
-            start: ctx.to_lsp(&uri, start_line, start_character).await,
-            end: ctx.to_lsp(&uri, end_line, end_character).await,
+            start: ctx.to_lsp(&uri, start.line, start.character).await,
+            end: ctx.to_lsp(&uri, end.line, end.character).await,
         };
 
         // Build context with optional kind filter
@@ -469,10 +468,14 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 "/tmp/test.rs".to_string(),
-                1,
-                1,
-                1,
-                10,
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Position {
+                    line: 1,
+                    character: 10,
+                },
                 Some("invalid_kind".to_string()),
             )
             .await;
@@ -491,10 +494,14 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 test_file.to_str().unwrap().to_string(),
-                1,
-                1,
-                1,
-                10,
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Position {
+                    line: 1,
+                    character: 10,
+                },
                 Some("quickfix".to_string()),
             )
             .await;
@@ -515,10 +522,14 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 test_file.to_str().unwrap().to_string(),
-                1,
-                1,
-                1,
-                10,
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Position {
+                    line: 1,
+                    character: 10,
+                },
                 Some("refactor".to_string()),
             )
             .await;
@@ -538,10 +549,14 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 test_file.to_str().unwrap().to_string(),
-                1,
-                1,
-                1,
-                10,
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Position {
+                    line: 1,
+                    character: 10,
+                },
                 Some("refactor.extract".to_string()),
             )
             .await;
@@ -561,10 +576,14 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 test_file.to_str().unwrap().to_string(),
-                1,
-                1,
-                1,
-                10,
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Position {
+                    line: 1,
+                    character: 10,
+                },
                 Some("source.organizeImports".to_string()),
             )
             .await;
@@ -576,7 +595,18 @@ mod tests {
     async fn test_handle_code_actions_invalid_range_zero() {
         let translator = Translator::new();
         let result = translator
-            .handle_code_actions("/tmp/test.rs".to_string(), 0, 1, 1, 10, None)
+            .handle_code_actions(
+                "/tmp/test.rs".to_string(),
+                Position {
+                    line: 0,
+                    character: 1,
+                },
+                Position {
+                    line: 1,
+                    character: 10,
+                },
+                None,
+            )
             .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
@@ -585,7 +615,18 @@ mod tests {
     async fn test_handle_code_actions_invalid_range_order() {
         let translator = Translator::new();
         let result = translator
-            .handle_code_actions("/tmp/test.rs".to_string(), 10, 5, 5, 1, None)
+            .handle_code_actions(
+                "/tmp/test.rs".to_string(),
+                Position {
+                    line: 10,
+                    character: 5,
+                },
+                Position {
+                    line: 5,
+                    character: 1,
+                },
+                None,
+            )
             .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
@@ -601,7 +642,18 @@ mod tests {
 
         // Empty range (same position) should be valid
         let result = translator
-            .handle_code_actions(test_file.to_str().unwrap().to_string(), 1, 5, 1, 5, None)
+            .handle_code_actions(
+                test_file.to_str().unwrap().to_string(),
+                Position {
+                    line: 1,
+                    character: 5,
+                },
+                Position {
+                    line: 1,
+                    character: 5,
+                },
+                None,
+            )
             .await;
         // Will fail due to no LSP server, but validates range is accepted
         assert!(result.is_err());

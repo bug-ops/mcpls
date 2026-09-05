@@ -12,6 +12,22 @@ pub struct Position2D {
     pub character: u32,
 }
 
+/// A 1-based MCP position taken as input by `Translator::handle_*` methods.
+///
+/// Kept distinct from [`Position2D`] (which carries an *output* position back
+/// to the caller) so passing a position into a handler always goes through a
+/// named-field struct literal (`Position { line, character }`) instead of two
+/// adjacent bare `u32` arguments -- a call site that swaps `line` and
+/// `character` no longer compiles instead of silently sending a wrong
+/// position to the LSP server (#322).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    /// Line number (1-based).
+    pub line: u32,
+    /// Character offset (1-based).
+    pub character: u32,
+}
+
 /// Range in a document (1-based for MCP).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {

@@ -26,8 +26,8 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    DiagnosticInfo, DiagnosticsResult, NotificationCache, PositionEncoding, ResourceSubscriptions,
-    Translator, validate_path_against_roots,
+    DiagnosticInfo, DiagnosticsResult, NotificationCache, Position, PositionEncoding,
+    ResourceSubscriptions, Translator, validate_path_against_roots,
 };
 use crate::config::McpConfig;
 
@@ -285,7 +285,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_hover(file_path, line, character)
+                .handle_hover(file_path, Position { line, character })
                 .await,
         )
     }
@@ -306,7 +306,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_definition(file_path, line, character)
+                .handle_definition(file_path, Position { line, character })
                 .await,
         )
     }
@@ -331,7 +331,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_references(file_path, line, character, include_declaration)
+                .handle_references(file_path, Position { line, character }, include_declaration)
                 .await,
         )
     }
@@ -378,7 +378,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_rename(file_path, line, character, new_name)
+                .handle_rename(file_path, Position { line, character }, new_name)
                 .await,
         )
     }
@@ -403,7 +403,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_completions(file_path, line, character, trigger)
+                .handle_completions(file_path, Position { line, character }, trigger)
                 .await,
         )
     }
@@ -495,10 +495,14 @@ impl McplsServer {
                 .translator
                 .handle_code_actions(
                     file_path,
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
+                    Position {
+                        line: start_line,
+                        character: start_character,
+                    },
+                    Position {
+                        line: end_line,
+                        character: end_character,
+                    },
                     kind_filter,
                 )
                 .await,
@@ -521,7 +525,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_call_hierarchy_prepare(file_path, line, character)
+                .handle_call_hierarchy_prepare(file_path, Position { line, character })
                 .await,
         )
     }
@@ -650,7 +654,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_signature_help(file_path, line, character)
+                .handle_signature_help(file_path, Position { line, character })
                 .await,
         )
     }
@@ -671,7 +675,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_implementation(file_path, line, character)
+                .handle_implementation(file_path, Position { line, character })
                 .await,
         )
     }
@@ -692,7 +696,7 @@ impl McplsServer {
         to_tool_result(
             self.context
                 .translator
-                .handle_type_definition(file_path, line, character)
+                .handle_type_definition(file_path, Position { line, character })
                 .await,
         )
     }
@@ -720,10 +724,14 @@ impl McplsServer {
                 .translator
                 .handle_inlay_hints(
                     file_path,
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
+                    Position {
+                        line: start_line,
+                        character: start_character,
+                    },
+                    Position {
+                        line: end_line,
+                        character: end_character,
+                    },
                 )
                 .await,
         )

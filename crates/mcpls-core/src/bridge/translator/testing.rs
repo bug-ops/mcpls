@@ -11,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use super::Translator;
+use super::dto::Position;
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
@@ -19,6 +20,11 @@ use crate::config::{LspServerConfig, ServerId, ToolRouter};
 use crate::lsp::{LspClient, LspServer, LspTransport};
 
 type JsonValue = serde_json::Value;
+
+/// Shorthand for building a [`Position`] test fixture.
+pub(super) const fn pos(line: u32, character: u32) -> Position {
+    Position { line, character }
+}
 
 /// A UTF-16 `EncodingCtx`, matching the pre-negotiation behavior: no
 /// disk reads, pure line/column offsetting.

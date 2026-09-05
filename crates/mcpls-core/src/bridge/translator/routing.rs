@@ -355,6 +355,7 @@ mod tests {
     use super::*;
     use crate::bridge::NotificationCache;
     use crate::bridge::translator::assist::MAX_TRIGGER_CHARACTER_BYTES;
+    use crate::bridge::translator::dto::Position;
     use crate::bridge::translator::edits::MAX_NEW_NAME_LENGTH;
     use crate::bridge::translator::testing::*;
     use crate::config::{LspServerConfig, ToolRouter};
@@ -739,7 +740,17 @@ mod tests {
         let slow = {
             let translator = Arc::clone(&translator);
             let path = path_a.to_string_lossy().to_string();
-            tokio::spawn(async move { translator.handle_hover(path, 1, 1).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_hover(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                    )
+                    .await
+            })
         };
 
         // Wait for the slow task to actually reach its LSP request (i.e. the
@@ -755,7 +766,17 @@ mod tests {
         let fast = {
             let translator = Arc::clone(&translator);
             let path = path_b.to_string_lossy().to_string();
-            tokio::spawn(async move { translator.handle_hover(path, 1, 1).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_hover(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                    )
+                    .await
+            })
         };
 
         let mut wire_b = BufReader::new(&mut server_b.write_stdout);
@@ -816,7 +837,17 @@ mod tests {
             .map(|_| {
                 let translator = Arc::clone(&translator);
                 let path_str = path_str.clone();
-                tokio::spawn(async move { translator.handle_hover(path_str, 1, 1).await })
+                tokio::spawn(async move {
+                    translator
+                        .handle_hover(
+                            path_str,
+                            Position {
+                                line: 1,
+                                character: 1,
+                            },
+                        )
+                        .await
+                })
             })
             .collect();
 
@@ -903,7 +934,7 @@ mod tests {
         // rename is claimed by neither server -> NoServerForTool, checked
         // first so it can't be masked by either server's wire state.
         let rename_result = translator
-            .handle_rename(path_str.clone(), 1, 1, "renamed".to_string())
+            .handle_rename(path_str.clone(), pos(1, 1), "renamed".to_string())
             .await;
         assert!(
             matches!(
@@ -920,7 +951,7 @@ mod tests {
         let hover = {
             let translator = Arc::clone(&translator);
             let path_str = path_str.clone();
-            tokio::spawn(async move { translator.handle_hover(path_str, 1, 1).await })
+            tokio::spawn(async move { translator.handle_hover(path_str, pos(1, 1)).await })
         };
         let mut wire_pyright = BufReader::new(&mut server_pyright.write_stdout);
         let opened = read_framed_message(&mut wire_pyright).await;
@@ -1020,7 +1051,14 @@ mod tests {
         let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
 
         let result = translator
-            .handle_rename("/main.rs".to_string(), 1, 1, new_name)
+            .handle_rename(
+                "/main.rs".to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                new_name,
+            )
             .await;
 
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
@@ -1042,8 +1080,10 @@ mod tests {
         let result = translator
             .handle_rename(
                 path.to_string_lossy().to_string(),
-                1,
-                1,
+                Position {
+                    line: 1,
+                    character: 1,
+                },
                 "renamed".to_string(),
             )
             .await;
@@ -1071,7 +1111,18 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_code_actions(path.to_string_lossy().to_string(), 1, 1, 1, 5, None)
+            .handle_code_actions(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Position {
+                    line: 1,
+                    character: 5,
+                },
+                None,
+            )
             .await;
 
         assert!(matches!(
@@ -1097,7 +1148,13 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_signature_help(path.to_string_lossy().to_string(), 1, 1)
+            .handle_signature_help(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+            )
             .await;
 
         assert!(matches!(
@@ -1230,7 +1287,13 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_call_hierarchy_prepare(path.to_string_lossy().to_string(), 1, 1)
+            .handle_call_hierarchy_prepare(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+            )
             .await;
 
         assert!(matches!(
@@ -1256,7 +1319,17 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_inlay_hints(path.to_string_lossy().to_string(), 1, 1, 10, 1)
+            .handle_inlay_hints(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Position {
+                    line: 10,
+                    character: 1,
+                },
+            )
             .await;
 
         assert!(matches!(
@@ -1282,7 +1355,13 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_hover(path.to_string_lossy().to_string(), 1, 1)
+            .handle_hover(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+            )
             .await;
 
         assert!(matches!(
@@ -1308,7 +1387,13 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_definition(path.to_string_lossy().to_string(), 1, 1)
+            .handle_definition(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+            )
             .await;
 
         assert!(matches!(
@@ -1334,7 +1419,14 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_references(path.to_string_lossy().to_string(), 1, 1, false)
+            .handle_references(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                false,
+            )
             .await;
 
         assert!(matches!(
@@ -1354,7 +1446,14 @@ mod tests {
         let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
 
         let result = translator
-            .handle_completions("/main.rs".to_string(), 1, 1, Some(trigger))
+            .handle_completions(
+                "/main.rs".to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Some(trigger),
+            )
             .await;
 
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
@@ -1374,7 +1473,14 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_completions(path.to_string_lossy().to_string(), 1, 1, None)
+            .handle_completions(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                None,
+            )
             .await;
 
         assert!(matches!(
@@ -1449,7 +1555,13 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_implementation(path.to_string_lossy().to_string(), 1, 1)
+            .handle_implementation(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+            )
             .await;
 
         assert!(matches!(
@@ -1475,7 +1587,13 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_type_definition(path.to_string_lossy().to_string(), 1, 1)
+            .handle_type_definition(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+            )
             .await;
 
         assert!(matches!(
@@ -1539,7 +1657,14 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_rename(path_str, 1, 1, "renamed".to_string())
+                    .handle_rename(
+                        path_str,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                        "renamed".to_string(),
+                    )
                     .await
             })
         };

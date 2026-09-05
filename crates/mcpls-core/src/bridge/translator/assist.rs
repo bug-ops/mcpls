@@ -8,7 +8,7 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, SignatureHelpResult,
+    Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, SignatureHelpResult,
     SignatureInfo, SignatureParameter,
 };
 use crate::config::ToolKind;
@@ -58,10 +58,10 @@ impl Translator {
     pub async fn handle_completions(
         &self,
         file_path: String,
-        line: u32,
-        character: u32,
+        position: Position,
         trigger: Option<String>,
     ) -> Result<CompletionsResult> {
+        let Position { line, character } = position;
         validate_completions_params(trigger.as_deref())?;
 
         let (server_id, client, uri) = self
@@ -136,9 +136,9 @@ impl Translator {
     pub async fn handle_signature_help(
         &self,
         file_path: String,
-        line: u32,
-        character: u32,
+        position: Position,
     ) -> Result<SignatureHelpResult> {
+        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -218,10 +218,8 @@ impl Translator {
     pub async fn handle_inlay_hints(
         &self,
         file_path: String,
-        start_line: u32,
-        start_character: u32,
-        end_line: u32,
-        end_character: u32,
+        start: Position,
+        end: Position,
     ) -> Result<InlayHintsResult> {
         let (server_id, client, uri) = self
             .prepare_gated_document(
@@ -239,8 +237,8 @@ impl Translator {
         let ctx = self.encoding_ctx(&server_id);
         let response_uri = uri.clone();
 
-        let lsp_start = ctx.to_lsp(&uri, start_line, start_character).await;
-        let lsp_end = ctx.to_lsp(&uri, end_line, end_character).await;
+        let lsp_start = ctx.to_lsp(&uri, start.line, start.character).await;
+        let lsp_end = ctx.to_lsp(&uri, end.line, end.character).await;
 
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
