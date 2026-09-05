@@ -20,9 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ToolKind`/`NoServerReason`** — Breaking change: both marked `#[non_exhaustive]`; `ToolKind::ALL` is now `&[ToolKind]` instead of a fixed-size array. (#366)
 - **`WorkspaceConfig::get_language_for_extension`** — Breaking change: renamed to `language_for_extension`. (#366)
 - **`Translator::handle_*` position-based methods** — Breaking change: now take a `Position { line, character }` struct instead of two adjacent bare `u32` arguments, so a call site can no longer swap `line`/`character` without a compile error. (#367)
-- Replace unmaintained `lsp-types` (gluon-lang) dependency with `gen-lsp-types` 0.11.0 (pinned); `lsp_types::` import paths are unchanged. (#297)
-- **`Uri` parsing** — Breaking change: `Uri` no longer validates its input, so a malformed MCP-supplied URI in `get_incoming_calls`/`get_outgoing_calls` now surfaces as a file-not-found error instead of an invalid-parameter error. (#297)
-- **`search_workspace_symbols`**/**`rename_symbol`** — Breaking change: symbols without a location range are now dropped instead of given a fabricated placeholder range, and LSP-3.18 snippet-shaped rename edits are now dropped instead of their literal placeholder syntax (e.g. `${1:name}`) being written into the file. (#297)
+- Replace unmaintained `lsp-types` (gluon-lang) dependency with `gen-lsp-types` 0.11.0 (pinned); `lsp_types::` import paths are unchanged. (#375)
+- **`Uri` parsing** — Breaking change: `Uri` no longer validates its input, so a malformed MCP-supplied URI in `get_incoming_calls`/`get_outgoing_calls` now surfaces as a file-not-found error instead of an invalid-parameter error. (#375)
+- **`search_workspace_symbols`**/**`rename_symbol`** — Breaking change: symbols without a location range are now dropped instead of given a fabricated placeholder range, and LSP-3.18 snippet-shaped rename edits are now dropped instead of their literal placeholder syntax (e.g. `${1:name}`) being written into the file. (#375)
 
 ### Removed
 

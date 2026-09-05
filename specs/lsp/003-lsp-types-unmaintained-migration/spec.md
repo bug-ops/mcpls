@@ -48,8 +48,7 @@ related:
 >
 > Landed in commits `8f61f56` (`build(deps): migrate lsp-types to gen-lsp-types
 > 0.11.0`) and `70a7635` (`fix(bridge): update rename test call site for Position
-> struct API`) on this branch, closing #297. A PR had not yet been opened at the
-> time this spec was updated.
+> struct API`) on this branch. Shipped in #375, closing #297.
 >
 > The dependency swap used Cargo's package-rename mechanism
 > (`lsp-types = { package = "gen-lsp-types", version = "=0.11.0" }`), so every
