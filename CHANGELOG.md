@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Relocated the SDD spec package from `.local/specs/` to repo-root `specs/`, reorganized into functional blocks (config/lsp/mcp/bridge/runtime/testing) with block-scoped numbering, and added retroactive specs for previously undocumented core subsystems (position encoding, config discovery, LSP lifecycle, document tracker sync, MCP tool routing). (#PR_NUMBER)
 - **`DocumentTracker::update`** — Breaking change: now `async`, serializing against `ensure_open` for the same path. (#363)
 - Bump rmcp from 3.1.4 to 3.2.0; an `initialize` request naming `protocolVersion: 2026-07-28` now receives the server's negotiated legacy version in response instead of an echo of the requested version (rmcp behavior change) (#364)
 - Reorder `mcpls-core` `Cargo.toml` dependencies into alphabetical order (#364)
