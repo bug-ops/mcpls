@@ -180,9 +180,10 @@ respectively). This differs from `--config`/`$MCPLS_CONFIG` itself, whose
 path is still resolved with native semantics.
 
 The empty default, `roots = []`, remains distinct: it selects the process cwd
-at startup. Absolute roots continue to work unchanged. A missing relative root
-is rejected as invalid configuration instead of reaching LSP initialization as
-an invalid `file://` URI.
+at startup. Absolute roots continue to work unchanged. An empty `workspace.roots`
+entry (e.g., `roots = [""]`) is rejected as invalid configuration with a clear
+error. A missing relative root is also rejected instead of reaching LSP
+initialization as an invalid `file://` URI.
 
 ### `workspace.position_encodings`
 

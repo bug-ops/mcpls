@@ -354,6 +354,31 @@ npm update -g pyright
 
 ---
 
+## Shutdown and Signal Handling
+
+### mcpls hangs during shutdown
+
+**Problem**: mcpls cleanup (closing LSP servers) takes a long time
+
+**Symptom**: First SIGTERM/SIGINT takes no effect
+
+**Solution**: Send a second SIGTERM or SIGINT signal to force-exit. When shutdown
+cleanup is stuck, mcpls now responds to a repeat signal by force-quitting instead
+of silently discarding it.
+
+```bash
+# First signal (attempts graceful shutdown)
+pkill -TERM mcpls
+
+# If it hangs, send again (force-quits)
+pkill -TERM mcpls
+```
+
+This prevents indefinite hangs during the server cleanup window. The first signal
+initiates graceful shutdown; a repeat signal escalates to immediate exit.
+
+---
+
 ## Configuration Issues
 
 ### "Configuration file not found"

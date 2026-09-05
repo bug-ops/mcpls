@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.9"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Andrei G. <k05h31@gmail.com>"]
@@ -26,7 +26,7 @@ dunce = "1.0.5"
 futures = "0.3"
 ignore = "0.4"
 lsp-types = "0.97"
-mcpls-core = { path = "crates/mcpls-core", version = "0.3.9" }
+mcpls-core = { path = "crates/mcpls-core", version = "0.4.0" }
 predicates = "3.1"
 rmcp = "3.1.0"
 rstest = "0.26"

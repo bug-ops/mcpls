@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-05
+
 ### Added
 
 - **Hierarchical document-symbol support** — advertise `textDocument.documentSymbol`, including every LSP symbol kind, during initialization so servers such as Pyrefly return document symbols. (#78)
@@ -15,10 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`McplsServer::new`/`BridgeContext::new` signatures** — Breaking change: both now take an additional `mcp: McpConfig` parameter, carrying the new `[mcp]` section (see Added) through to `get_info`. `ServerConfig`/`BridgeContext` (both `pub`, neither `#[non_exhaustive]`) also gain a public `mcp` field, breaking any downstream struct-literal construction. Acceptable pre-1.0. (#347)
+- Bump rmcp from 3.1.0 to 3.1.4 (#336, #341)
+- Bump clap from 4.6.5 to 4.6.6 (#335)
+- Bump thiserror from 2.0.19 to 2.0.20 (#334)
+- CI: bump mozilla-actions/sccache-action from 0.0.10 to 0.0.11 (#332)
+- CI: bump Swatinem/rust-cache pinned commit (#333, #340)
+- CI: bump lewagon/wait-on-check-action from 1.9.0 to 1.9.1 (#338)
+- CI: bump dorny/paths-filter from 4.0.2 to 4.0.3 (#339)
+- CI: bump cargo-bins/cargo-binstall from 1.21.1 to 1.22.0 (#342)
+- CI: bump softprops/action-gh-release from 3.0.2 to 3.0.3 (#346)
 
 ### Removed
 
-- **`async-trait` direct dependency** — dropped from the workspace and `mcpls-core`; unused now that no trait in the crate needs it, remains available transitively through `rmcp`'s own optional dependency when its `--all-features` build enables it.
+- **`async-trait` direct dependency** — dropped from the workspace and `mcpls-core`; unused now that no trait in the crate needs it, remains available transitively through `rmcp`'s own optional dependency when its `--all-features` build enables it. (#343)
 
 ### Fixed
 
@@ -678,7 +689,8 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.3.9...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/bug-ops/mcpls/compare/v0.3.9...v0.4.0
 [0.3.9]: https://github.com/bug-ops/mcpls/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/bug-ops/mcpls/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/bug-ops/mcpls/compare/v0.3.6...v0.3.7
