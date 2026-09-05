@@ -113,10 +113,6 @@ pub enum Error {
         tool: ToolKind,
     },
 
-    /// Configuration error.
-    #[error("configuration error: {0}")]
-    Config(String),
-
     /// Configuration file not found.
     #[error("configuration file not found: {0}")]
     ConfigNotFound(PathBuf),
@@ -149,10 +145,6 @@ pub enum Error {
     #[error("request timed out after {0} seconds")]
     Timeout(u64),
 
-    /// Server shutdown requested.
-    #[error("server shutdown requested")]
-    Shutdown,
-
     /// LSP server failed to spawn.
     #[error("failed to spawn LSP server '{command}': {source}")]
     ServerSpawnFailed {
@@ -170,10 +162,6 @@ pub enum Error {
     /// Invalid URI format.
     #[error("invalid URI: {0}")]
     InvalidUri(String),
-
-    /// Position encoding error.
-    #[error("position encoding error: {0}")]
-    EncodingError(String),
 
     /// Server process terminated unexpectedly.
     #[error("LSP server process terminated unexpectedly")]
@@ -231,17 +219,6 @@ pub enum Error {
         size: u64,
         /// Maximum allowed size.
         max: u64,
-    },
-
-    /// Partial server initialization - some servers failed but at least one succeeded.
-    #[error("some LSP servers failed to initialize: {failed_count}/{total_count} servers")]
-    PartialServerInit {
-        /// Number of servers that failed.
-        failed_count: usize,
-        /// Total number of configured servers.
-        total_count: usize,
-        /// Details of each failure.
-        failures: Vec<ServerSpawnFailure>,
     },
 
     /// All configured LSP servers failed to initialize.
@@ -389,7 +366,7 @@ mod tests {
     #[test]
     fn test_result_type_alias() {
         fn _returns_error() -> Result<i32> {
-            Err(Error::Config("test error".to_string()))
+            Err(Error::InvalidConfig("test error".to_string()))
         }
 
         let result: Result<i32> = Ok(42);
@@ -454,19 +431,6 @@ mod tests {
     }
 
     #[test]
-    fn test_error_display_partial_server_init() {
-        let err = Error::PartialServerInit {
-            failed_count: 2,
-            total_count: 3,
-            failures: vec![],
-        };
-        assert_eq!(
-            err.to_string(),
-            "some LSP servers failed to initialize: 2/3 servers"
-        );
-    }
-
-    #[test]
     fn test_error_display_all_servers_failed_to_init() {
         let err = Error::AllServersFailedToInit {
             count: 2,
@@ -499,25 +463,6 @@ mod tests {
 
         assert!(err.to_string().contains("all LSP servers failed"));
         assert!(err.to_string().contains("2 configured"));
-    }
-
-    #[test]
-    fn test_error_partial_server_init_with_failures() {
-        let failures = vec![ServerSpawnFailure {
-            server_id: ServerId::from("python"),
-            language_id: "python".to_string(),
-            command: "pyright".to_string(),
-            message: "not found".to_string(),
-        }];
-
-        let err = Error::PartialServerInit {
-            failed_count: 1,
-            total_count: 2,
-            failures,
-        };
-
-        assert!(err.to_string().contains("some LSP servers failed"));
-        assert!(err.to_string().contains("1/2"));
     }
 
     #[test]
