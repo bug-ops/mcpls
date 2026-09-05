@@ -22,9 +22,9 @@ related:
 > **Author**: architect (design doc `e2e-rust-analyzer.md`, Rev 2, 2026-04-29); folded into the
 > numbered spec package during the `.local/specs/` → `specs/` migration
 > **Branch**: originally implemented across several PRs (see Resolution)
-> **Source finding**: `MockLspServer`-based unit/integration tests exercise the MCP↔LSP
-> translation layer in isolation, but nothing in the test suite drives the full
-> MCP→mcpls→LSP→rust-analyzer path against a real language server, so a class of bugs
+> **Source finding**: protocol-level unit/integration tests (no real LSP server behind them)
+> exercise the MCP↔LSP translation layer in isolation, but nothing in the test suite drives the
+> full MCP→mcpls→LSP→rust-analyzer path against a real language server, so a class of bugs
 > (encoding negotiation, capability mismatches, real diagnostic timing/debounce) was only
 > ever caught live, not in CI
 
@@ -65,13 +65,15 @@ related:
 ### Problem Statement
 
 Before this suite existed, mcpls's test coverage for the MCP→LSP bridge was entirely
-`MockLspServer`-based (protocol-level unit/integration tests under `tests/e2e/protocol_tests.rs`
-and `tests/integration/`). A mock server can only ever respond the way its own stub logic says
-it should — it cannot catch bugs in the *real* negotiation between mcpls and an actual language
-server: capability mismatches, encoding negotiation (`bridge/encoding.rs`'s non-UTF-16 paths),
-real diagnostic push/pull timing (rust-analyzer's flycheck debounce), or any assumption baked
-into mcpls's LSP client that happens to hold against the mock but not against genuine
-rust-analyzer behavior.
+protocol-level unit/integration tests with no real LSP server behind them
+(`tests/e2e/protocol_tests.rs` exercising the MCP protocol layer alone, and
+`tests/integration/`/`src/config/` covering config and translator logic in isolation). A
+`MockLspServer` scaffold existed in `tests/common/mock_lsp.rs`, but no test ever wired it in
+(dead code since introduction; removed in #307). Neither approach can catch bugs in the *real*
+negotiation between mcpls and an actual language server: capability mismatches, encoding
+negotiation (`bridge/encoding.rs`'s non-UTF-16 paths), real diagnostic push/pull timing
+(rust-analyzer's flycheck debounce), or any assumption that happens to hold in isolation but not
+against genuine rust-analyzer behavior.
 
 `tests/integration/rust_analyzer_tests.rs` already exercises some real-rust-analyzer paths, but
 narrowly — not as a systematic, registry-driven walk of every MCP tool mcpls exposes.
@@ -86,8 +88,9 @@ per suite run regardless of how many tools are covered.
 
 ### Out of Scope
 
-- Replacing `MockLspServer`-based protocol-level unit tests — those remain the fast, deterministic
-  first line of coverage; this suite is a complementary, slower, real-server layer.
+- Replacing the existing protocol-level unit/integration tests (`tests/e2e/protocol_tests.rs`,
+  `tests/integration/`) — those remain the fast, deterministic first line of coverage; this suite
+  is a complementary, slower, real-server layer.
 - Performance benchmarking of rust-analyzer itself.
 - Multi-language e2e coverage (pyright, typescript-language-server, gopls, clangd, zls) — this
   suite is Rust/rust-analyzer only, per the original design's Non-Goals.

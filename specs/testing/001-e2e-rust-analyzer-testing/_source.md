@@ -24,7 +24,9 @@
 
 ## Non-Goals
 
-- Replacing `MockLspServer` for protocol-level unit tests.
+- Replacing `MockLspServer` for protocol-level unit tests. [Editorial note, preserved-verbatim
+  doc otherwise unchanged: `MockLspServer` was dead code no test ever wired in, and was removed
+  in #307 -- see [[spec#Out of Scope|spec.md]] for the corrected description.]
 - Performance benchmarks.
 - Multi-language coverage (Rust only).
 - New MCP tools (signature_help, type_definition, implementation, inlay_hint, etc. — not implemented in mcpls today; out of scope).
