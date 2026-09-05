@@ -8,7 +8,9 @@ use lsp_types::{
 };
 
 use super::Translator;
-use super::dto::{DefinitionResult, HoverResult, Location, LocationsResult, ReferencesResult};
+use super::dto::{
+    DefinitionResult, HoverResult, Location, LocationsResult, Position, ReferencesResult,
+};
 use super::encoding_ctx::EncodingCtx;
 use crate::config::ToolKind;
 use crate::error::Result;
@@ -68,12 +70,8 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
     /// or the routed server does not advertise `hoverProvider` support.
-    pub async fn handle_hover(
-        &self,
-        file_path: String,
-        line: u32,
-        character: u32,
-    ) -> Result<HoverResult> {
+    pub async fn handle_hover(&self, file_path: String, position: Position) -> Result<HoverResult> {
+        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(&file_path, ToolKind::Hover, "hoverProvider", |caps| {
                 matches!(
@@ -128,9 +126,9 @@ impl Translator {
     pub async fn handle_definition(
         &self,
         file_path: String,
-        line: u32,
-        character: u32,
+        position: Position,
     ) -> Result<DefinitionResult> {
+        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -176,10 +174,10 @@ impl Translator {
     pub async fn handle_references(
         &self,
         file_path: String,
-        line: u32,
-        character: u32,
+        position: Position,
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
+        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -239,9 +237,9 @@ impl Translator {
     pub async fn handle_implementation(
         &self,
         file_path: String,
-        line: u32,
-        character: u32,
+        position: Position,
     ) -> Result<LocationsResult> {
+        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -295,9 +293,9 @@ impl Translator {
     pub async fn handle_type_definition(
         &self,
         file_path: String,
-        line: u32,
-        character: u32,
+        position: Position,
     ) -> Result<LocationsResult> {
+        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,

@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reorder `mcpls-core` `Cargo.toml` dependencies into alphabetical order (#364)
 - **`ToolKind`/`NoServerReason`** — Breaking change: both marked `#[non_exhaustive]`; `ToolKind::ALL` is now `&[ToolKind]` instead of a fixed-size array. (#366)
 - **`WorkspaceConfig::get_language_for_extension`** — Breaking change: renamed to `language_for_extension`. (#366)
+- **`Translator::handle_*` position-based methods** — Breaking change: now take a `Position { line, character }` struct instead of two adjacent bare `u32` arguments, so a call site can no longer swap `line`/`character` without a compile error. (#367)
+
+### Removed
+
+- **`mcpls_core::mcp::{PositionParams, RangeParams, ReferencesParams, RenameParams, CompletionsParams, DocumentSymbolsParams, FormatDocumentParams, WorkspaceSymbolParams, CallHierarchyCallsParams, DiagnosticsParams}`** — Breaking change: `mcp::mod`'s `pub use tools::{...}` re-export block is removed entirely. This includes `PositionParams`, which a previous entry in this changelog (#302) told embedders to use directly after the position-only wrapper structs were collapsed into it — that guidance no longer applies. No in-tree caller ever named any of these types through `mcp::mod` (every tool handler in `server.rs` extracts them via `Parameters<T>` from `mcp::tools` directly), and MCP tool arguments are ordinary JSON matching each tool's published schema, not a Rust type a caller needs to name. No deprecation shim, per pre-1.0 policy. (#367)
 
 ### Fixed
 
