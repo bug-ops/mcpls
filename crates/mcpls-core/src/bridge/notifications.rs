@@ -75,7 +75,9 @@ const MAX_DIAGNOSTICS_ENTRY_BYTES: usize = 1024 * 1024;
 /// share is otherwise never touched (#266). A single active server can
 /// still use the full budget when other registered servers are idle (#276)
 /// instead of being capped at a static equal split regardless of how much
-/// of it they actually use.
+/// of it they actually use. Which single entry within the chosen server (or
+/// another over-share one) is actually removed is further refined by
+/// emptiness -- see the private `entry_to_evict` (#284).
 const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 
 /// Normalize a URI string to a stable cache key.
@@ -479,9 +481,31 @@ pub struct NotificationCache {
     /// entry still pending eviction.
     next_diagnostic_seq: u64,
     /// Number of registered diagnostics-route servers currently sharing the
-    /// `MAX_DIAGNOSTIC_ENTRIES` budget; see
+    /// `MAX_DIAGNOSTIC_ENTRIES` budget, explicitly configured via
     /// [`NotificationCache::set_diagnostics_route_count`].
-    diagnostics_route_count: usize,
+    ///
+    /// `None` until that setter is called -- `per_server_budget` then falls
+    /// back to the number of servers whose `diagnostic_order` entry is
+    /// non-empty (i.e. currently holds at least one entry) rather than
+    /// treating an unset count as `1`, which used to hand a single early
+    /// publisher the entire budget with no fair-share partitioning at all
+    /// (#283). The explicit setter remains the preferred path when the
+    /// caller knows it up front: it pre-accounts for servers that are
+    /// registered but have not published anything yet, avoiding a window
+    /// where an early publisher is temporarily over-allocated before a
+    /// slower server's first write grows `diagnostic_order`.
+    diagnostics_route_count: Option<usize>,
+
+    /// Count of entries in `diagnostics` whose diagnostics list is currently
+    /// empty (`[]`), i.e. an LSP server reporting a previously-tracked file
+    /// as now clean. A plain counter, not a duplicated key set, so `0` is an
+    /// `O(1)` signal that lets `entry_to_evict` skip its empty-entry search
+    /// entirely in the common steady state of a codebase full of real
+    /// diagnostics (#284) -- which entry is empty is still answered by
+    /// looking the key up in `diagnostics` itself (see the private
+    /// `is_empty_entry`), not by mirroring membership here. Kept in sync by
+    /// every method that adds or removes a `diagnostics` entry.
+    empty_diagnostics_count: usize,
     /// Recent log entries (FIFO queue with max size).
     logs: VecDeque<LogEntry>,
     /// Recent server messages (FIFO queue with max size).
@@ -515,7 +539,8 @@ impl NotificationCache {
             diagnostic_order: HashMap::new(),
             diagnostic_seq: HashMap::with_capacity(32),
             next_diagnostic_seq: 0,
-            diagnostics_route_count: 1,
+            diagnostics_route_count: None,
+            empty_diagnostics_count: 0,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
             push_degraded: HashSet::new(),
@@ -531,22 +556,46 @@ impl NotificationCache {
     /// `MAX_DIAGNOSTIC_ENTRIES` total -- it only decides, at that point,
     /// which server's oldest entry is the one that gets evicted. Call once
     /// after server registration completes and before diagnostics start
-    /// flowing. Defaults to `1` if never called (a single implicit server
-    /// owns the whole budget).
+    /// flowing, to pre-account for servers that are registered but have not
+    /// published anything yet. If never called, `per_server_budget` derives
+    /// the count from the number of servers currently holding at least one
+    /// entry instead (#283) -- a consumer that forgets to call this still
+    /// gets fair-share partitioning once more than one server has written an
+    /// entry, rather than silently handing the whole budget to a single
+    /// early publisher.
     pub fn set_diagnostics_route_count(&mut self, count: usize) {
-        self.diagnostics_route_count = count.max(1);
+        self.diagnostics_route_count = Some(count.max(1));
     }
 
     /// Current per-server fair share of `MAX_DIAGNOSTIC_ENTRIES`, divided
-    /// evenly across `diagnostics_route_count` servers and floored at 1 so a
+    /// evenly across the configured server count and floored at 1 so a
     /// large server count can never reduce a server's share to zero.
+    ///
+    /// Uses the explicit count from [`Self::set_diagnostics_route_count`]
+    /// when set; otherwise falls back to the number of servers whose
+    /// `diagnostic_order` entry is non-empty (#283) -- matching
+    /// `server_to_evict_from`'s own `!order.is_empty()` filter, so a server
+    /// that has been fully evicted or reassigned away from (an empty but
+    /// still-present order map) is not double-counted in the denominator.
+    /// Both are floored at 1 so a fresh cache with no entries and no
+    /// explicit count yet still yields a usable budget instead of dividing
+    /// by zero.
     ///
     /// This is a tie-breaker for eviction, not a hard per-server cap: a
     /// server may hold more than its fair share of entries at any time, as
     /// long as the aggregate across all servers stays within
     /// `MAX_DIAGNOSTIC_ENTRIES` (#276).
     fn per_server_budget(&self) -> usize {
-        (MAX_DIAGNOSTIC_ENTRIES / self.diagnostics_route_count.max(1)).max(1)
+        let count = self
+            .diagnostics_route_count
+            .unwrap_or_else(|| {
+                self.diagnostic_order
+                    .values()
+                    .filter(|order| !order.is_empty())
+                    .count()
+            })
+            .max(1);
+        (MAX_DIAGNOSTIC_ENTRIES / count).max(1)
     }
 
     /// Picks which server's oldest entry to evict once the aggregate cache
@@ -597,6 +646,86 @@ impl NotificationCache {
         largest.map(|(id, _)| id.clone())
     }
 
+    /// Whether the cached entry for `key` currently has an empty (`[]`)
+    /// diagnostics list, i.e. an LSP server reporting a previously-tracked
+    /// file as now clean. Derived directly from `diagnostics` rather than
+    /// from a separately maintained key set, so there is nothing else to
+    /// keep in sync (#284).
+    fn is_empty_entry(&self, key: &str) -> bool {
+        self.diagnostics
+            .get(key)
+            .is_some_and(|info| info.diagnostics.is_empty())
+    }
+
+    /// Oldest entry in `server`'s own order map whose diagnostics list is
+    /// empty, if it has one.
+    fn oldest_empty_entry_in(&self, server: &ServerId) -> Option<(u64, String)> {
+        let order = self.diagnostic_order.get(server)?;
+        order
+            .iter()
+            .find(|(_, key)| self.is_empty_entry(key))
+            .map(|(&seq, key)| (seq, key.clone()))
+    }
+
+    /// Which single entry to remove next when the aggregate cache is full
+    /// and a genuinely new URI needs room, returned as `(owner, seq, key)`
+    /// so the caller can remove it from every index it appears in.
+    ///
+    /// [`Self::server_to_evict_from`] decides which server is fairness's
+    /// primary target; this picks *which of that server's entries* to
+    /// actually remove, preferring an empty (`[]`) one over its
+    /// strictly-oldest entry wherever one can be found without disturbing a
+    /// server that is within its own fair share (#284):
+    ///
+    /// 1. If the chosen victim itself holds an empty entry, evict its oldest
+    ///    one -- a `[]` publish carries no diagnostic content to lose, so
+    ///    this lets an older, still-meaningful entry from the same server
+    ///    survive in its place.
+    /// 2. Otherwise, if some *other* server that also exceeds
+    ///    [`Self::per_server_budget`] holds an empty entry, evict that one
+    ///    instead of destroying the chosen victim's real diagnostics (S1):
+    ///    fairness only protects a server that is within its share, so an
+    ///    over-share server's own clean entry is fair game regardless of
+    ///    which over-share server `server_to_evict_from` happened to name.
+    ///    Ties use the same `(count, id)` key as `server_to_evict_from`, for
+    ///    the same determinism reason.
+    /// 3. Otherwise -- no empty entry exists anywhere over-budget -- falls
+    ///    back to the chosen victim's strictly-oldest entry, exactly as
+    ///    before #284.
+    ///
+    /// Step 1/2's search is skipped entirely when `empty_diagnostics_count`
+    /// is `0`, so the common steady state (a codebase full of real
+    /// diagnostics, no clean-file churn) pays no extra cost over a plain
+    /// oldest-first lookup (#284).
+    fn entry_to_evict(&self, writer: &ServerId) -> Option<(ServerId, u64, String)> {
+        let evict_from = self.server_to_evict_from(writer)?;
+
+        if self.empty_diagnostics_count > 0 {
+            if let Some((seq, key)) = self.oldest_empty_entry_in(&evict_from) {
+                return Some((evict_from, seq, key));
+            }
+
+            let budget = self.per_server_budget();
+            let cross_server_pick = self
+                .diagnostic_order
+                .iter()
+                .filter(|(id, order)| order.len() > budget && *id != &evict_from)
+                .filter_map(|(id, order)| {
+                    self.oldest_empty_entry_in(id)
+                        .map(|(seq, key)| (id, order.len(), seq, key))
+                })
+                .max_by_key(|(id, len, ..)| (*len, id.as_str()));
+
+            if let Some((id, _, seq, key)) = cross_server_pick {
+                return Some((id.clone(), seq, key));
+            }
+        }
+
+        let order = self.diagnostic_order.get(&evict_from)?;
+        let (&seq, key) = order.iter().next()?;
+        Some((evict_from, seq, key.clone()))
+    }
+
     /// Store diagnostics for a document published by `server_id`.
     ///
     /// Each diagnostic's `message` is truncated to `MAX_ENTRY_TEXT_BYTES`,
@@ -623,7 +752,8 @@ impl NotificationCache {
     /// documented there. This lets a single active server use the full
     /// aggregate budget while other registered servers are idle, instead of
     /// being capped at a static equal split regardless of how much of it
-    /// they actually use.
+    /// they actually use. Which exact entry is removed is further refined by
+    /// emptiness -- see the private `entry_to_evict` (#284).
     ///
     /// # Examples
     ///
@@ -685,15 +815,18 @@ impl NotificationCache {
 
         if is_new_entry {
             while self.diagnostics.len() >= MAX_DIAGNOSTIC_ENTRIES
-                && let Some(evict_from) = self.server_to_evict_from(server_id)
-                && let Some(order) = self.diagnostic_order.get_mut(&evict_from)
-                && let Some((&oldest_seq, oldest_key)) = order.iter().next()
+                && let Some((owner, seq, evict_key)) = self.entry_to_evict(server_id)
             {
-                let oldest_key = oldest_key.clone();
-                order.remove(&oldest_seq);
-                self.diagnostic_seq.remove(&oldest_key);
-                self.diagnostics_owners.remove(&oldest_key);
-                self.diagnostics.remove(&oldest_key);
+                if let Some(order) = self.diagnostic_order.get_mut(&owner) {
+                    order.remove(&seq);
+                }
+                self.diagnostic_seq.remove(&evict_key);
+                self.diagnostics_owners.remove(&evict_key);
+                if let Some(removed) = self.diagnostics.remove(&evict_key)
+                    && removed.diagnostics.is_empty()
+                {
+                    self.empty_diagnostics_count -= 1;
+                }
             }
         }
 
@@ -706,6 +839,19 @@ impl NotificationCache {
             .or_default()
             .insert(seq, key.clone());
         self.diagnostic_seq.insert(key.clone(), seq);
+
+        // Track the emptiness transition, if any, of the entry this store
+        // replaces (or creates) -- `self.diagnostics` still holds the old
+        // value at this point, since the `insert` below hasn't run yet
+        // (#284: derived from `diagnostics` itself, not a duplicated key
+        // set).
+        let was_empty = self.is_empty_entry(&key);
+        let is_empty_now = info.diagnostics.is_empty();
+        match (was_empty, is_empty_now) {
+            (false, true) => self.empty_diagnostics_count += 1,
+            (true, false) => self.empty_diagnostics_count -= 1,
+            _ => {}
+        }
         self.diagnostics.insert(key, info);
     }
 
@@ -791,7 +937,14 @@ impl NotificationCache {
         {
             order.remove(&seq);
         }
-        self.diagnostics.remove(&key)
+        let removed = self.diagnostics.remove(&key);
+        if removed
+            .as_ref()
+            .is_some_and(|info| info.diagnostics.is_empty())
+        {
+            self.empty_diagnostics_count -= 1;
+        }
+        removed
     }
 
     /// Clear all diagnostics owned by a single server.
@@ -825,7 +978,13 @@ impl NotificationCache {
             return;
         };
         for (_, key) in order {
-            self.diagnostics.remove(&key);
+            if self
+                .diagnostics
+                .remove(&key)
+                .is_some_and(|info| info.diagnostics.is_empty())
+            {
+                self.empty_diagnostics_count -= 1;
+            }
             self.diagnostics_owners.remove(&key);
             self.diagnostic_seq.remove(&key);
         }
@@ -868,6 +1027,7 @@ impl NotificationCache {
         self.diagnostics_owners.clear();
         self.diagnostic_order.clear();
         self.diagnostic_seq.clear();
+        self.empty_diagnostics_count = 0;
     }
 
     /// Clear all logs.
@@ -2160,5 +2320,242 @@ mod tests {
             cache.get_diagnostics(server_oldest.as_ref()).is_none(),
             "the pre-existing server's oldest entry, now far over its shrunk share, must be evicted"
         );
+    }
+
+    /// #283: an external `NotificationCache` consumer that never calls
+    /// `set_diagnostics_route_count` must still get fair-share partitioning
+    /// once more than one server has written an entry -- the pre-#266
+    /// regression this guards against is an unset count silently giving one
+    /// server the entire aggregate budget, letting it starve a quiet server.
+    #[test]
+    fn test_fair_share_applies_by_default_without_explicit_route_count() {
+        let mut cache = NotificationCache::new();
+        let noisy = ServerId::from("noisy");
+        let quiet = ServerId::from("quiet");
+
+        let quiet_uri: Uri = Uri::from("file:///quiet/only_file.rs");
+        cache.store_diagnostics(&quiet, &quiet_uri, Some(1), vec![]);
+
+        // `set_diagnostics_route_count` is deliberately never called here.
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES + 50 {
+            let uri: Uri = Uri::from(format!("file:///noisy/file{i}.rs"));
+            cache.store_diagnostics(&noisy, &uri, Some(1), vec![]);
+        }
+
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+        assert!(
+            cache.get_diagnostics(quiet_uri.as_ref()).is_some(),
+            "quiet server's only entry must survive even without ever calling \
+             set_diagnostics_route_count"
+        );
+        let noisy_first: Uri = Uri::from("file:///noisy/file0.rs");
+        assert!(
+            cache.get_diagnostics(noisy_first.as_ref()).is_none(),
+            "the noisy server, now auto-derived as one of two servers sharing the budget, \
+             must still lose its own oldest entries once over its fair share"
+        );
+    }
+
+    /// #283: with only one server ever writing, the auto-derived fair-share
+    /// count (from `diagnostic_order.len()`) must stay `1`, letting that
+    /// server use the whole aggregate budget -- the same as the old default
+    /// of `1` when the setter went uncalled, not a regression for the
+    /// common single-server case.
+    #[test]
+    fn test_single_server_gets_full_budget_without_explicit_route_count() {
+        let mut cache = NotificationCache::new();
+
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES {
+            let uri: Uri = Uri::from(format!("file:///file{i}.rs"));
+            cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
+        }
+
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+    }
+
+    /// #284: when the cache is full and a server's own entry must be
+    /// evicted, an entry with an empty (`[]`) diagnostics list -- a file
+    /// reported as now clean -- must be evicted ahead of an older entry that
+    /// still carries real diagnostics, even though the empty entry is not
+    /// that server's strictly-oldest entry.
+    #[test]
+    fn test_empty_diagnostics_entries_evicted_before_non_empty_ones() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+
+        let important: Uri = Uri::from("file:///important.rs");
+        cache.store_diagnostics(
+            &server,
+            &important,
+            Some(1),
+            vec![minimal_diagnostic("real error".to_string())],
+        );
+
+        // Fill the rest of the budget with empty ("file is clean") entries,
+        // all published after `important` and so all newer in eviction
+        // order.
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES - 1 {
+            let uri: Uri = Uri::from(format!("file:///clean{i}.rs"));
+            cache.store_diagnostics(&server, &uri, Some(1), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+
+        // One more new URI exceeds the cap: `important` is the strictly
+        // oldest entry, but it must survive in favor of the oldest *empty*
+        // entry instead.
+        let overflow: Uri = Uri::from("file:///overflow.rs");
+        cache.store_diagnostics(&server, &overflow, Some(1), vec![]);
+
+        assert!(
+            cache.get_diagnostics(important.as_ref()).is_some(),
+            "a non-empty entry must survive eviction over empty entries, even though it is older"
+        );
+        let oldest_clean: Uri = Uri::from("file:///clean0.rs");
+        assert!(
+            cache.get_diagnostics(oldest_clean.as_ref()).is_none(),
+            "the oldest empty entry must be evicted instead of the older non-empty one"
+        );
+        assert!(cache.get_diagnostics(overflow.as_ref()).is_some());
+    }
+
+    /// #284: storing an empty diagnostics list must still create a fully
+    /// tracked, cacheable entry -- eviction priority changes which entry is
+    /// removed once the cache is full, but does not change what gets stored
+    /// in the first place. See the `tracked` field semantics in
+    /// `mcp::server::ResourceDiagnosticsResponse` for why callers rely on
+    /// this: a `[]` publish for a previously-tracked URI must read back as
+    /// "tracked, zero diagnostics", not as untracked.
+    #[test]
+    fn test_empty_diagnostics_entry_is_still_tracked_until_evicted() {
+        let mut cache = NotificationCache::new();
+        let uri: Uri = Uri::from("file:///clean.rs");
+
+        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
+
+        let stored = cache.get_diagnostics(uri.as_ref());
+        assert!(
+            stored.is_some(),
+            "an empty-diagnostics entry must still be tracked"
+        );
+        assert_eq!(stored.unwrap().diagnostics.len(), 0);
+    }
+
+    /// #284 S1: an over-share server's own empty ("clean") entry must be
+    /// evicted before a *different* over-share server's real diagnostics are
+    /// destroyed, even when the fairness-selected victim (the largest
+    /// over-share server) itself holds no empty entry of its own.
+    #[test]
+    fn test_over_share_servers_empty_entry_evicted_before_a_different_servers_real_diagnostic() {
+        let mut cache = NotificationCache::new();
+        cache.set_diagnostics_route_count(3); // fair share = 333
+
+        let a = ServerId::from("a"); // over share, all real diagnostics
+        let b = ServerId::from("b"); // over share, all empty/clean
+        let c = ServerId::from("c"); // within share
+
+        for i in 0..500 {
+            let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
+            cache.store_diagnostics(
+                &a,
+                &uri,
+                Some(1),
+                vec![minimal_diagnostic(format!("error {i}"))],
+            );
+        }
+        for i in 0..400 {
+            let uri: Uri = Uri::from(format!("file:///b/file{i}.rs"));
+            cache.store_diagnostics(&b, &uri, Some(1), vec![]);
+        }
+        for i in 0..100 {
+            let uri: Uri = Uri::from(format!("file:///c/file{i}.rs"));
+            cache.store_diagnostics(&c, &uri, Some(1), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+
+        // One more write from `a` (the fairness-selected victim, being the
+        // largest over-share server) must not destroy any of `a`'s real
+        // diagnostics: `b`, also over its share, has an empty entry to give
+        // up instead.
+        let overflow: Uri = Uri::from("file:///a/overflow.rs");
+        cache.store_diagnostics(
+            &a,
+            &overflow,
+            Some(1),
+            vec![minimal_diagnostic("overflow error".to_string())],
+        );
+
+        for i in 0..500 {
+            let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
+            assert!(
+                cache.get_diagnostics(uri.as_ref()).is_some(),
+                "server a's real diagnostics must all survive; b has an empty entry to lose \
+                 instead"
+            );
+        }
+        let b_oldest: Uri = Uri::from("file:///b/file0.rs");
+        assert!(
+            cache.get_diagnostics(b_oldest.as_ref()).is_none(),
+            "b's oldest empty entry must be evicted instead of a's real diagnostics"
+        );
+        assert!(cache.get_diagnostics(overflow.as_ref()).is_some());
+    }
+
+    /// #284: a URI that transitions non-empty -> empty -> non-empty must not
+    /// be treated as still-empty for eviction priority after the second
+    /// transition -- emptiness tracking must reflect the *current* state,
+    /// not the URI's history.
+    #[test]
+    fn test_dirty_then_clean_then_dirty_again_updates_emptiness_tracking() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        let uri: Uri = Uri::from("file:///flapping.rs");
+
+        cache.store_diagnostics(
+            &server,
+            &uri,
+            Some(1),
+            vec![minimal_diagnostic("first error".to_string())],
+        );
+        cache.store_diagnostics(&server, &uri, Some(2), vec![]); // now clean
+        cache.store_diagnostics(
+            &server,
+            &uri,
+            Some(3),
+            vec![minimal_diagnostic("second error".to_string())],
+        ); // dirty again
+
+        // Fill the rest of the budget with genuinely empty entries -- if
+        // `uri` were still (wrongly) tracked as empty, one of these would be
+        // evicted in its place instead of `uri` being left alone.
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES - 1 {
+            let other: Uri = Uri::from(format!("file:///clean{i}.rs"));
+            cache.store_diagnostics(&server, &other, Some(1), vec![]);
+        }
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
+
+        let overflow: Uri = Uri::from("file:///overflow.rs");
+        cache.store_diagnostics(&server, &overflow, Some(1), vec![]);
+
+        let stored = cache.get_diagnostics(uri.as_ref());
+        assert!(
+            stored.is_some_and(|info| info.diagnostics.len() == 1),
+            "the re-dirtied entry must survive and keep its real diagnostic, not be mistaken \
+             for an empty entry"
+        );
+    }
+
+    /// `set_diagnostics_route_count(0)` must clamp to `1`, not panic via
+    /// division by zero in `per_server_budget`.
+    #[test]
+    fn test_set_diagnostics_route_count_zero_clamps_to_one() {
+        let mut cache = NotificationCache::new();
+        cache.set_diagnostics_route_count(0);
+
+        for i in 0..MAX_DIAGNOSTIC_ENTRIES + 5 {
+            let uri: Uri = Uri::from(format!("file:///file{i}.rs"));
+            cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
+        }
+
+        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
     }
 }
