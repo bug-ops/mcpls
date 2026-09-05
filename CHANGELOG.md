@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`DocumentTracker::update`** — Breaking change: now `async`, serializing against `ensure_open` for the same path. (#358)
+
 ## [0.4.0] - 2026-09-05
 
 ### Added

@@ -380,9 +380,23 @@ impl DocumentTracker {
     /// Returns `None` if the document is not open. The updated content has no
     /// known disk provenance, so the next `ensure_open` call on this path
     /// will always re-verify by content compare rather than trusting a stat.
-    // TODO(critic): `update`/`open` may race a concurrent `ensure_open` for
-    // the same path; see #304 review.
-    pub fn update(&self, path: &Path, content: String) -> Option<i32> {
+    ///
+    /// # Concurrency
+    ///
+    /// Takes the same per-path lock as [`Self::ensure_open`] (see
+    /// `lock_path`), so this can never interleave with an `ensure_open` call
+    /// for the same path -- closing the race where `ensure_open`'s disk
+    /// phase reads a `(uri, version, disk snapshot)` under a short-lived
+    /// lock and its sync phase later commits against that now-stale
+    /// snapshot after a concurrent `update` bumped the version in between.
+    ///
+    /// **Warning**: `lock_path`'s mutex is not reentrant. Never call `update`
+    /// from a task that already holds this same path's `lock_path` guard
+    /// (e.g. from within `ensure_open`/`disk_phase`/`sync_phase`, or any
+    /// future caller nested inside one) -- doing so self-deadlocks
+    /// permanently, with no panic and no timeout to signal it.
+    pub async fn update(&self, path: &Path, content: String) -> Option<i32> {
+        let _path_guard = self.lock_path(path).await;
         lock_std(&self.documents)
             .get_mut(path)
             .map(|state| state.apply_local_edit(content))
@@ -1024,8 +1038,8 @@ mod tests {
         assert_eq!(detect_language(Path::new("unknown.xyz"), &map), "plaintext");
     }
 
-    #[test]
-    fn test_document_tracker() {
+    #[tokio::test]
+    async fn test_document_tracker() {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
@@ -1044,7 +1058,9 @@ mod tests {
         assert_eq!(state.version(), 1);
         assert_eq!(state.language_id(), "rust");
 
-        let new_version = tracker.update(&path, "fn main() { println!() }".to_string());
+        let new_version = tracker
+            .update(&path, "fn main() { println!() }".to_string())
+            .await;
         assert_eq!(new_version, Some(2));
 
         tracker.close(&path);
@@ -1262,13 +1278,13 @@ mod tests {
         assert_eq!(cloned.content(), state.content());
     }
 
-    #[test]
-    fn test_update_nonexistent_document() {
+    #[tokio::test]
+    async fn test_update_nonexistent_document() {
         let map = HashMap::new();
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/nonexistent.rs");
 
-        let version = tracker.update(&path, "new content".to_string());
+        let version = tracker.update(&path, "new content".to_string()).await;
         assert_eq!(
             version, None,
             "Updating non-existent document should return None"
@@ -1325,8 +1341,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_document_version_increments() {
+    #[tokio::test]
+    async fn test_document_version_increments() {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
@@ -1336,13 +1352,13 @@ mod tests {
         tracker.open(path.clone(), "v1".to_string()).unwrap();
         assert_eq!(tracker.get(&path).unwrap().version(), 1);
 
-        tracker.update(&path, "v2".to_string());
+        tracker.update(&path, "v2".to_string()).await;
         assert_eq!(tracker.get(&path).unwrap().version(), 2);
 
-        tracker.update(&path, "v3".to_string());
+        tracker.update(&path, "v3".to_string()).await;
         assert_eq!(tracker.get(&path).unwrap().version(), 3);
 
-        tracker.update(&path, "v4".to_string());
+        tracker.update(&path, "v4".to_string()).await;
         assert_eq!(tracker.get(&path).unwrap().version(), 4);
     }
 
@@ -1581,8 +1597,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_document_tracker_concurrent_operations() {
+    #[tokio::test]
+    async fn test_document_tracker_concurrent_operations() {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());
 
@@ -1597,7 +1613,7 @@ mod tests {
         assert!(tracker.is_open(&path1));
         assert!(tracker.is_open(&path2));
 
-        tracker.update(&path1, "new content1".to_string());
+        tracker.update(&path1, "new content1".to_string()).await;
         assert_eq!(tracker.get(&path1).unwrap().content(), "new content1");
         assert_eq!(tracker.get(&path2).unwrap().content(), "content2");
 
@@ -2251,7 +2267,9 @@ mod tests {
             .unwrap();
         assert!(tracker.get(&path).unwrap().disk.is_some());
 
-        tracker.update(&path, "fn main() { updated(); }".to_string());
+        tracker
+            .update(&path, "fn main() { updated(); }".to_string())
+            .await;
         assert!(
             tracker.get(&path).unwrap().disk.is_none(),
             "update() must clear disk provenance so the next ensure_open re-verifies by content"
@@ -2550,6 +2568,90 @@ mod tests {
 
         handle_a.await.unwrap().unwrap();
         assert_eq!(tracker.get(&path_a).unwrap().content(), "fn a() {}");
+    }
+
+    /// Regression for #358: `update` must serialize against a concurrent
+    /// `ensure_open` for the *same* path via the shared per-path lock, not
+    /// just against other `ensure_open` calls.
+    ///
+    /// Uses the same FIFO-blocking idiom as
+    /// `test_ensure_open_different_paths_do_not_serialize`: opening a FIFO
+    /// for read blocks deterministically until a writer connects, so
+    /// `ensure_open`'s `disk_phase_new` (and, with it, the per-path lock
+    /// acquired by `ensure_open` before any disk I/O) is guaranteed to still
+    /// be held when `update` is attempted below. Before the #358 fix,
+    /// `update` took no per-path lock at all and would have raced straight
+    /// through instead of blocking.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_update_serializes_with_concurrent_ensure_open_same_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let (client, _server) = fake_lsp_client();
+        let tracker = Arc::new(DocumentTracker::new(
+            ResourceLimits::default(),
+            HashMap::new(),
+        ));
+
+        // Spawned so it can genuinely block on the FIFO's open() while the
+        // rest of this test proceeds concurrently on the same runtime.
+        let tracker_for_open = Arc::clone(&tracker);
+        let path_for_task = path.clone();
+        let handle_open = tokio::spawn(async move {
+            tracker_for_open
+                .ensure_open(&path_for_task, &ServerId::from("rust"), &client)
+                .await
+        });
+
+        // Give the spawned task a chance to actually reach the FIFO's
+        // blocking open() -- and, with it, acquire the per-path lock --
+        // before racing `update` against it below.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A successful (non-timeout) result here would mean `update` raced
+        // straight past `ensure_open`'s still-held per-path lock -- the
+        // exact regression #358 fixes.
+        let update_while_blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            tracker.update(&path, "raced content".to_string()),
+        )
+        .await;
+        assert!(
+            update_while_blocked.is_err(),
+            "update() must block while ensure_open holds the per-path lock for the same path"
+        );
+
+        // Unblock `ensure_open`: opening the FIFO for writing lets its
+        // open() proceed, and closing the write end (at the end of this
+        // call) delivers EOF to the read it's waiting to finish.
+        let path_writer = path.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(path_writer, "fn a() {}").unwrap();
+        })
+        .await
+        .unwrap();
+
+        handle_open.await.unwrap().unwrap();
+        assert_eq!(tracker.get(&path).unwrap().content(), "fn a() {}");
+        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+
+        // With the lock released, `update` must now proceed and observably
+        // apply on top of `ensure_open`'s committed state.
+        let new_version = tracker
+            .update(&path, "fn a() { updated(); }".to_string())
+            .await;
+        assert_eq!(new_version, Some(2));
+        assert_eq!(
+            tracker.get(&path).unwrap().content(),
+            "fn a() { updated(); }"
+        );
     }
 
     /// Regression for #227: N concurrent `ensure_open` calls for the same
