@@ -230,7 +230,7 @@ impl WorkspaceConfig {
         map
     }
 
-    /// Get the language ID for a file extension.
+    /// Returns the language ID for a file extension.
     ///
     /// # Arguments
     ///
@@ -240,7 +240,7 @@ impl WorkspaceConfig {
     ///
     /// The language ID if found, `None` otherwise.
     #[must_use]
-    pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
+    pub fn language_for_extension(&self, extension: &str) -> Option<String> {
         for mapping in &self.language_extensions {
             if mapping.extensions.contains(&extension.to_string()) {
                 return Some(mapping.language_id.clone());
@@ -1897,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_language_for_extension() {
+    fn test_language_for_extension() {
         let workspace = WorkspaceConfig {
             roots: vec![],
             position_encodings: vec![],
@@ -1917,18 +1917,18 @@ mod tests {
         };
 
         assert_eq!(
-            workspace.get_language_for_extension("hpp"),
+            workspace.language_for_extension("hpp"),
             Some("cpp".to_string())
         );
         assert_eq!(
-            workspace.get_language_for_extension("hh"),
+            workspace.language_for_extension("hh"),
             Some("cpp".to_string())
         );
         assert_eq!(
-            workspace.get_language_for_extension("py"),
+            workspace.language_for_extension("py"),
             Some("python".to_string())
         );
-        assert_eq!(workspace.get_language_for_extension("unknown"), None);
+        assert_eq!(workspace.language_for_extension("unknown"), None);
     }
 
     #[test]
@@ -1937,15 +1937,15 @@ mod tests {
         let map = workspace.build_extension_map();
         assert!(!map.is_empty());
         assert_eq!(
-            workspace.get_language_for_extension("rs"),
+            workspace.language_for_extension("rs"),
             Some("rust".to_string())
         );
         assert_eq!(
-            workspace.get_language_for_extension("py"),
+            workspace.language_for_extension("py"),
             Some("python".to_string())
         );
         assert_eq!(
-            workspace.get_language_for_extension("cpp"),
+            workspace.language_for_extension("cpp"),
             Some("cpp".to_string())
         );
     }

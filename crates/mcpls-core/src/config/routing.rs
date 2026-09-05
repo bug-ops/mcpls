@@ -80,6 +80,7 @@ impl From<&str> for ServerId {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ToolKind {
     /// `textDocument/hover`.
     Hover,
@@ -116,7 +117,7 @@ pub enum ToolKind {
 impl ToolKind {
     /// Every routable tool, in a fixed order. Used to compute the §5
     /// coverage warning and to build error messages that enumerate tools.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: &[Self] = &[
         Self::Hover,
         Self::Definition,
         Self::TypeDefinition,
@@ -198,6 +199,7 @@ struct LanguageRoutes {
 /// Why [`ToolRouter::resolve_any`] could not find a server for a
 /// workspace-wide tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NoServerReason {
     /// No server is registered in this workspace at all. Reflects what has
     /// *registered* (i.e. finished spawning), not what is configured in
@@ -771,6 +773,13 @@ mod tests {
         assert_eq!(ToolKind::Hover.as_str(), "hover");
         assert_eq!(ToolKind::CallHierarchy.as_str(), "call_hierarchy");
         assert_eq!(ToolKind::ALL.len(), 15);
+
+        // `ALL` is a slice now, so nothing pins its element count at compile
+        // time the way `[Self; 15]` used to -- guard against duplicate or
+        // missing entries at runtime instead.
+        let unique_names: std::collections::HashSet<&str> =
+            ToolKind::ALL.iter().map(ToolKind::as_str).collect();
+        assert_eq!(unique_names.len(), ToolKind::ALL.len());
     }
 
     #[test]
