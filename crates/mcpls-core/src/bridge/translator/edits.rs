@@ -490,7 +490,14 @@ mod tests {
             let path = file_path.to_str().unwrap().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_rename(path, 1, 4, "new_name".to_string())
+                    .handle_rename(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 4,
+                        },
+                        "new_name".to_string(),
+                    )
                     .await
             })
         };
