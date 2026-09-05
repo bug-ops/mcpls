@@ -116,6 +116,13 @@ pub struct McpConfig {
     /// after this value when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+
+    /// Prefixes every MCP tool name with `{tool_prefix}_`, so an MCP client
+    /// running multiple mcpls bridges concurrently (one per project) can
+    /// tell their tools apart. Omit to keep the default, unprefixed tool
+    /// names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_prefix: Option<ToolPrefix>,
 }
 
 /// Maximum byte length of a configured [`McpConfig::title`].
@@ -136,6 +143,139 @@ pub const MAX_MCP_DESCRIPTION_BYTES: usize = 1024;
 /// fixed-size built-in text and does not count against this budget. See
 /// [`MAX_MCP_TITLE_BYTES`].
 pub const MAX_MCP_INSTRUCTIONS_BYTES: usize = 4096;
+
+/// Maximum byte length of a configured [`McpConfig::tool_prefix`].
+///
+/// UTF-8 bytes, not chars -- but since [`ToolPrefix`]'s charset is
+/// ASCII-only, bytes and chars coincide here. Chosen well under rmcp's
+/// 128-byte `SHOULD`-level tool name limit (`joined = prefix + '_' +
+/// tool_name`), and conservatively under stricter tool-name limits some LLM
+/// client APIs have historically enforced (e.g. `^[a-zA-Z0-9_-]{1,64}$`),
+/// so a prefix accepted here is unlikely to be rejected downstream by the
+/// client. See `mcp::server::MAX_TOOL_NAME_BYTES` for the compile-time proof
+/// tying this constant to the longest currently-registered tool name.
+pub const MAX_MCP_TOOL_PREFIX_BYTES: usize = 32;
+
+/// A validated [`McpConfig::tool_prefix`] value.
+///
+/// Every mcpls tool name gains a `{prefix}_` prefix when this is configured,
+/// so an MCP client can tell apart tools exposed by multiple concurrently
+/// running mcpls bridges. A value must be non-empty, at most
+/// [`MAX_MCP_TOOL_PREFIX_BYTES`] bytes, contain only ASCII letters, digits,
+/// `_`, and `-`, and both start and end with an ASCII letter or digit --
+/// this last rule rejects (rather than silently strips) a trailing
+/// separator, so `"optics"` and `"optics_"` cannot become two spellings of
+/// the same configuration. The validator runs once, at construction, making
+/// an invalid prefix unrepresentable: there is no way to observe a
+/// `ToolPrefix` whose value doesn't already satisfy these rules.
+///
+/// This differs from `title`/`description`/`instructions`, whose invalid
+/// values surface as [`Error::InvalidConfig`] from [`ServerConfig::validate`]
+/// -- called explicitly, after loading. A malformed prefix is not merely
+/// cosmetic (it would put an invalid tool name on the wire, an MCP protocol
+/// violation), and [`McplsServer::new`](crate::mcp::McplsServer::new)
+/// is `pub` and infallible, so this type validates eagerly during
+/// deserialization instead and surfaces failures as [`Error::TomlDe`], which
+/// additionally carries the offending line from the TOML source.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::ToolPrefix;
+///
+/// let prefix: ToolPrefix = "optics".parse().unwrap();
+/// assert_eq!(prefix.as_str(), "optics");
+/// assert!("optics_".parse::<ToolPrefix>().is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolPrefix(String);
+
+impl ToolPrefix {
+    /// Returns the validated prefix as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ToolPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for ToolPrefix {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        validate_tool_prefix(s)?;
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolPrefix {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Shared validator behind [`ToolPrefix::from_str`] and its `Deserialize`
+/// impl, so a prefix constructed programmatically is held to the same rules
+/// as one loaded from TOML.
+fn validate_tool_prefix(value: &str) -> std::result::Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(
+            "mcp.tool_prefix cannot be empty (omit `tool_prefix` from the `[mcp]` section to \
+             use unprefixed tool names)"
+                .to_string(),
+        );
+    }
+    let len = value.len();
+    if len > MAX_MCP_TOOL_PREFIX_BYTES {
+        return Err(format!(
+            "mcp.tool_prefix exceeds the maximum of {MAX_MCP_TOOL_PREFIX_BYTES} bytes ({len} \
+             given)"
+        ));
+    }
+    if let Some(bad) = value
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        return Err(format!(
+            // `{bad:?}` (not `'{bad}'`): `char`'s `Debug` quotes and escapes
+            // control characters (e.g. ESC becomes `'\u{1b}'`), so a TOML
+            // value smuggling a raw control/ANSI-escape byte can't be
+            // echoed verbatim into this message and onward into a
+            // terminal via `tracing`.
+            "mcp.tool_prefix contains an invalid character {bad:?} (allowed: ASCII letters, \
+             digits, '_', and '-')"
+        ));
+    }
+    // `value.trim().is_empty()` above already rejected the empty string, so
+    // `next()`/`next_back()` never actually fall back here -- kept as a
+    // defensive default rather than an `unwrap()`, since `clippy::unwrap_used`
+    // is a workspace-wide warn-as-error (mirrors `validate_mcp_field` above).
+    let first = value.chars().next().unwrap_or_default();
+    let last = value.chars().next_back().unwrap_or_default();
+    if !first.is_ascii_alphanumeric() {
+        return Err(format!(
+            "mcp.tool_prefix cannot start with '{first}' (must start with an ASCII letter or \
+             digit)"
+        ));
+    }
+    if !last.is_ascii_alphanumeric() {
+        return Err(format!(
+            "mcp.tool_prefix cannot end with '{last}' (the '_' separator between the prefix \
+             and each tool name is inserted automatically by mcpls -- remove the trailing \
+             separator character)"
+        ));
+    }
+    Ok(())
+}
 
 /// Workspace-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2452,10 +2592,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("config.toml");
 
-        // `tool_prefix` is deliberately not implemented yet (deferred
-        // follow-up); `deny_unknown_fields` must reject it rather than
-        // silently ignoring it.
-        fs::write(&config_path, "[mcp]\ntool_prefix = \"x\"\n").unwrap();
+        fs::write(&config_path, "[mcp]\nbogus_field = \"x\"\n").unwrap();
 
         let result = ServerConfig::load_from(&config_path);
         assert!(matches!(result, Err(Error::TomlDe(_))));
@@ -2676,5 +2813,148 @@ mod tests {
 
         let result = ServerConfig::load_from(&config_path);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // ToolPrefix tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_tool_prefix_accepts_valid_and_round_trips() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+        fs::write(&config_path, "[mcp]\ntool_prefix = \"optics\"\n").unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.mcp.tool_prefix.as_ref().unwrap().as_str(), "optics");
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let round_tripped: ServerConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.mcp.tool_prefix, config.mcp.tool_prefix);
+    }
+
+    #[test]
+    fn test_tool_prefix_accepts_digits_and_mixed_case() {
+        let prefix: ToolPrefix = "Optics2".parse().unwrap();
+        assert_eq!(prefix.as_str(), "Optics2");
+    }
+
+    #[test]
+    fn test_tool_prefix_accepts_single_alphanumeric_char() {
+        assert!("x".parse::<ToolPrefix>().is_ok());
+        assert!("9".parse::<ToolPrefix>().is_ok());
+    }
+
+    #[test]
+    fn test_tool_prefix_rejects_empty() {
+        let err = "".parse::<ToolPrefix>().unwrap_err();
+        assert_eq!(
+            err,
+            "mcp.tool_prefix cannot be empty (omit `tool_prefix` from the `[mcp]` section to \
+             use unprefixed tool names)"
+        );
+    }
+
+    #[test]
+    fn test_tool_prefix_rejects_whitespace_only() {
+        let err = "   ".parse::<ToolPrefix>().unwrap_err();
+        assert!(err.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_tool_prefix_rejects_leading_separator() {
+        for bad in ["_optics", "-optics"] {
+            let err = bad.parse::<ToolPrefix>().unwrap_err();
+            assert!(
+                err.contains("cannot start with"),
+                "for input {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_prefix_rejects_trailing_separator() {
+        for bad in ["optics_", "optics-"] {
+            let err = bad.parse::<ToolPrefix>().unwrap_err();
+            assert!(err.contains("cannot end with"), "for input {bad:?}: {err}");
+            assert!(err.contains("inserted automatically"));
+        }
+    }
+
+    #[test]
+    fn test_tool_prefix_rejects_dot() {
+        let err = "op.tics".parse::<ToolPrefix>().unwrap_err();
+        assert!(err.contains("invalid character '.'"));
+    }
+
+    #[test]
+    fn test_tool_prefix_rejects_space() {
+        let err = "op tics".parse::<ToolPrefix>().unwrap_err();
+        assert!(err.contains("invalid character ' '"));
+    }
+
+    #[test]
+    fn test_tool_prefix_rejects_non_ascii_and_names_the_character() {
+        let err = "optiсs".parse::<ToolPrefix>().unwrap_err();
+        assert!(err.contains("invalid character 'с'"), "{err}");
+    }
+
+    #[test]
+    fn test_tool_prefix_rejects_over_length() {
+        let prefix = "a".repeat(MAX_MCP_TOOL_PREFIX_BYTES + 1);
+        let err = prefix.parse::<ToolPrefix>().unwrap_err();
+        assert!(err.contains(&format!(
+            "exceeds the maximum of {MAX_MCP_TOOL_PREFIX_BYTES} bytes"
+        )));
+    }
+
+    #[test]
+    fn test_tool_prefix_accepts_exact_length_cap() {
+        let prefix = "a".repeat(MAX_MCP_TOOL_PREFIX_BYTES);
+        assert!(prefix.parse::<ToolPrefix>().is_ok());
+    }
+
+    #[test]
+    fn test_tool_prefix_from_str_shares_config_validator() {
+        // Proves the programmatic path (`ToolPrefix::from_str`, used by
+        // `serve_with` callers that build `McpConfig` directly) is held to
+        // the same rules as the TOML deserialization path, not a separate,
+        // looser check.
+        assert!("optics_".parse::<ToolPrefix>().is_err());
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+        fs::write(&config_path, "[mcp]\ntool_prefix = \"optics_\"\n").unwrap();
+        assert!(matches!(
+            ServerConfig::load_from(&config_path),
+            Err(Error::TomlDe(_))
+        ));
+    }
+
+    /// Pins the actual behavior of a `serde::de::Error::custom` raised from
+    /// inside `ToolPrefix`'s hand-written `Deserialize` impl, since the
+    /// `toml` crate's line-reference attachment for such errors is not
+    /// guaranteed by its public API and must be verified empirically rather
+    /// than assumed (see [`ToolPrefix`]'s doc comment on the `Error::TomlDe`
+    /// vs `Error::InvalidConfig` trade-off).
+    #[test]
+    fn test_invalid_tool_prefix_error_names_field_and_offending_character() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+        fs::write(&config_path, "[mcp]\ntool_prefix = \"optics_\"\n").unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        let Err(Error::TomlDe(err)) = result else {
+            panic!("Expected TomlDe error, got {result:?}");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("mcp.tool_prefix"), "{msg}");
+        assert!(msg.contains("cannot end with"), "{msg}");
+        // Empirically confirmed (not merely assumed): `toml` attaches a
+        // "line N, column M" reference to a `serde::de::Error::custom`
+        // raised from within a field's `Deserialize` impl, giving this
+        // error strictly more location information than the sibling
+        // `Error::InvalidConfig` fields (`title`/`description`/
+        // `instructions`) get.
+        assert!(msg.contains("line 2"), "{msg}");
     }
 }

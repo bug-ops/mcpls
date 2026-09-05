@@ -30,6 +30,8 @@ This skill covers operating the **binary**: installing it, choosing CLI flags an
 environment variables, registering it with an MCP client, and writing `mcpls.toml`.
 It does not enumerate the 20 MCP tools themselves or their parameters — for that, see
 [Tools Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/tools-reference.md).
+If the bridge is configured with `mcp.tool_prefix`, every tool name listed there gains
+that prefix (`{tool_prefix}_{tool}`).
 
 ## Prerequisites
 

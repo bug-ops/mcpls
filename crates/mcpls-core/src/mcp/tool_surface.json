@@ -38,7 +38,7 @@
   {
     "name": "get_cached_diagnostics",
     "title": "Cached Diagnostics",
-    "description": "Cached diagnostics from server notifications. Faster than get_diagnostics, no new analysis.",
+    "description": "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

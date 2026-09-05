@@ -98,12 +98,14 @@ presentation text.
 | `mcp.title` | `serverInfo.title` | `"MCPLS - MCP to LSP Bridge"` | 128 bytes |
 | `mcp.description` | `serverInfo.description` | the crate's `Cargo.toml` description | 1024 bytes |
 | `mcp.instructions` | `ServerInfo.instructions` | built-in capability blurb | 4096 bytes |
+| `mcp.tool_prefix` | every tool name (`{tool_prefix}_{tool}`) | unprefixed tool names | 32 bytes |
 
 ```toml
 [mcp]
 title = "My Custom Bridge"
 description = "Internal LSP bridge for Acme Corp"
 instructions = "Use get_hover before get_definition."
+tool_prefix = "optics"
 ```
 
 > [!IMPORTANT]
@@ -117,7 +119,14 @@ instructions = "Use get_hover before get_definition."
 Every field's size limit is enforced in UTF-8 bytes, not characters. A
 whitespace-only value (e.g. `title = "   "`) is rejected as empty, the same
 as an actually-empty string — omit the field entirely to use the built-in
-default instead. `tool_prefix` is not implemented yet (tracked separately).
+default instead.
+
+`mcp.tool_prefix` prefixes every MCP tool name with `{tool_prefix}_`, useful
+when an MCP client runs multiple mcpls bridges concurrently (one per
+project) and needs to tell their tools apart. The prefix must contain only
+ASCII letters, digits, `_`, and `-`, and must start and end with a letter or
+digit — a trailing `_`/`-` is rejected rather than stripped, since the `_`
+separator before each tool name is inserted automatically by mcpls.
 
 ## Workspace Section
 

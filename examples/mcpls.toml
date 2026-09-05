@@ -12,6 +12,7 @@
 # title = "My Custom Bridge"
 # description = "Internal LSP bridge for Acme Corp"
 # instructions = "Use get_hover before get_definition."
+# tool_prefix = "optics"
 
 # Workspace settings
 [workspace]

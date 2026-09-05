@@ -3,6 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,7 +30,7 @@ use crate::bridge::{
     DiagnosticInfo, DiagnosticsResult, NotificationCache, Position, PositionEncoding,
     ResourceSubscriptions, Translator, validate_path_against_roots,
 };
-use crate::config::McpConfig;
+use crate::config::{McpConfig, ToolPrefix};
 
 /// Built-in `serverInfo.title`, used when `[mcp].title` is not configured.
 const DEFAULT_SERVER_TITLE: &str = "MCPLS - MCP to LSP Bridge";
@@ -46,6 +47,47 @@ const DEFAULT_INSTRUCTIONS: &str = concat!(
     "capabilities as MCP tools for semantic code intelligence. ",
     "Supports hover, definition, references, diagnostics, rename, ",
     "completions, symbols, and formatting."
+);
+
+/// Byte length of the longest tool name currently registered
+/// (`workspace_symbol_search`), used only to keep
+/// [`crate::config::MAX_MCP_TOOL_PREFIX_BYTES`] safe (see the compile-time
+/// assertion below). Bumping this when a longer tool name is added is
+/// always safe on its own; the assertion is what catches the case where
+/// that growth would no longer leave enough room for the configured prefix.
+const MAX_TOOL_NAME_BYTES: usize = 23;
+
+/// The stricter of the two ceilings a joined `{prefix}_{tool_name}` must fit
+/// under: not rmcp's own 128-byte `SHOULD`-level limit (see the second
+/// assertion below), but the tighter pattern some LLM client APIs have
+/// historically enforced for tool names (`^[a-zA-Z0-9_-]{1,64}$`). This is
+/// the actual binding constraint [`crate::config::MAX_MCP_TOOL_PREFIX_BYTES`]'s
+/// doc comment promises to stay under -- asserting against it, not just
+/// rmcp's 128, is what makes that promise machine-checked.
+const CLIENT_TOOL_NAME_BYTE_LIMIT: usize = 64;
+
+/// Ties [`crate::config::MAX_MCP_TOOL_PREFIX_BYTES`] to the longest
+/// currently-registered tool name and the stricter client-side tool name
+/// length ceiling ([`CLIENT_TOOL_NAME_BYTE_LIMIT`]). If a future tool name
+/// grows past what the current prefix budget allows, this fails to
+/// *compile* against `MAX_TOOL_NAME_BYTES`, not silently or at runtime
+/// against the user-facing, config-breaking `MAX_MCP_TOOL_PREFIX_BYTES`.
+const _: () = assert!(
+    crate::config::MAX_MCP_TOOL_PREFIX_BYTES + 1 + MAX_TOOL_NAME_BYTES
+        <= CLIENT_TOOL_NAME_BYTE_LIMIT,
+    "MAX_TOOL_NAME_BYTES has grown too large for the configured MAX_MCP_TOOL_PREFIX_BYTES \
+     budget under the stricter client-side tool name length limit"
+);
+
+/// Secondary check against rmcp's own tool name length ceiling (128 bytes,
+/// `SHOULD`-level per the MCP spec; see `tool_name_validation.rs` in the
+/// pinned rmcp version). Kept alongside the stricter assertion above so a
+/// future change to [`CLIENT_TOOL_NAME_BYTE_LIMIT`] can't accidentally drop
+/// below what rmcp itself requires.
+const _: () = assert!(
+    crate::config::MAX_MCP_TOOL_PREFIX_BYTES + 1 + MAX_TOOL_NAME_BYTES <= 128,
+    "MAX_TOOL_NAME_BYTES has grown too large for the configured MAX_MCP_TOOL_PREFIX_BYTES \
+     budget under rmcp's 128-byte tool name limit"
 );
 
 /// Response shape for the `get_cached_diagnostics` tool.
@@ -81,6 +123,14 @@ struct CachedDiagnosticsResponse {
 #[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
+
+    /// `Arc`-wrapped so `Clone` stays an `Arc` bump (as it is today via
+    /// `context`) rather than a deep clone of every registered
+    /// `ToolRoute` on each new session (see `transport.rs`'s per-session
+    /// factory closure). `#[tool_handler(router = self.tool_router)]`'s
+    /// generated `self.tool_router.call(..)` auto-derefs through the `Arc`,
+    /// so this is transparent to the macro-generated code.
+    tool_router: Arc<ToolRouter<Self>>,
 }
 
 /// Map a bridge-layer result to the MCP tool response shape shared by every `#[tool]` handler.
@@ -237,6 +287,7 @@ impl McplsServer {
         project_config_ignored: bool,
         mcp: McpConfig,
     ) -> Self {
+        let tool_router = Arc::new(Self::build_tool_router(mcp.tool_prefix.as_ref()));
         let context = Arc::new(BridgeContext::new(
             translator,
             notification_cache,
@@ -245,10 +296,15 @@ impl McplsServer {
             project_config_ignored,
             mcp,
         ));
-        Self { context }
+        Self {
+            context,
+            tool_router,
+        }
     }
 
-    /// Router for every MCP tool, with the read-only classification applied.
+    /// Router for every MCP tool, with the read-only classification applied
+    /// and, when `prefix` is configured, every tool name rewritten to
+    /// `{prefix}_{name}`.
     ///
     /// Every mcpls tool is a read-only LSP query: `rename_symbol`,
     /// `format_document` and `get_code_actions` return a *proposed*
@@ -258,13 +314,36 @@ impl McplsServer {
     /// `test_tool_annotation_classifications_match_intent` forces a future
     /// mutating tool to write down an explicit classification rather than
     /// inherit this default silently.
-    fn tool_router() -> ToolRouter<Self> {
+    ///
+    /// With `prefix: None` this returns byte-for-byte what it always has --
+    /// `test_tool_surface_matches_golden_snapshot` pins that as the
+    /// backward-compatibility guarantee for the default, unprefixed surface.
+    ///
+    /// The rename re-keys `router.map` via [`ToolRouter::add_route`] rather
+    /// than inserting directly, so it goes through rmcp's own
+    /// `validate_and_warn_tool_name` for defence-in-depth. It does **not**
+    /// re-key `ToolRouter`'s private `disabled` set -- inert today (mcpls
+    /// never calls `disable_route`/`with_disabled`, pinned by
+    /// `test_no_route_is_ever_disabled` below), but a latent bug the moment
+    /// that changes: any future `disable_route` call must name the
+    /// already-prefixed tool name and must run strictly after this rename.
+    fn build_tool_router(prefix: Option<&ToolPrefix>) -> ToolRouter<Self> {
         let mut router = Self::declared_tool_router();
         for route in router.map.values_mut() {
             let title = route.attr.title.clone();
             route.attr.annotations.get_or_insert_with(|| {
                 ToolAnnotations::from_raw(title, Some(true), Some(false), Some(true), None)
             });
+        }
+        if let Some(prefix) = prefix {
+            debug_assert!(router.map.keys().all(|name| router.has_route(name)));
+            let unprefixed = std::mem::take(&mut router.map);
+            let entry_count = unprefixed.len();
+            for (_, mut route) in unprefixed {
+                route.attr.name = Cow::Owned(format!("{prefix}_{}", route.attr.name));
+                router.add_route(route);
+            }
+            debug_assert_eq!(router.map.len(), entry_count);
         }
         router
     }
@@ -556,7 +635,7 @@ impl McplsServer {
 
     /// Get cached diagnostics for a file.
     #[tool(
-        description = "Cached diagnostics from server notifications. Faster than get_diagnostics, no new analysis.",
+        description = "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis.",
         title = "Cached Diagnostics"
     )]
     async fn get_cached_diagnostics(
@@ -742,7 +821,7 @@ impl McplsServer {
 // requires `async fn`; `#[tool_handler]` also expands other trait methods without
 // `.await`, so the lint is suppressed for the whole impl block.
 #[allow(clippy::unused_async_trait_impl)]
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for McplsServer {
     async fn list_resources(
         &self,
@@ -1048,6 +1127,7 @@ mod tests {
             title: Some("Custom Title".to_string()),
             description: Some("Custom description".to_string()),
             instructions: Some("Custom instructions.".to_string()),
+            tool_prefix: None,
         };
         let server = create_test_server_with_mcp_config(false, mcp);
         let info = server.get_info();
@@ -1072,6 +1152,7 @@ mod tests {
             title: None,
             description: None,
             instructions: Some(instructions.clone()),
+            tool_prefix: None,
         };
         let server = create_test_server_with_mcp_config(true, mcp);
         let info = server.get_info();
@@ -1927,9 +2008,9 @@ sleep 0.3
     /// Every registered tool must carry `ToolAnnotations` (plus the current-spec
     /// `Tool.title`) so MCP clients can decide when to skip confirmation dialogs
     /// (read-only tools) or must prompt the user (destructive tools) without
-    /// invoking the tool first. Sourced from `tool_router().list_all()` (not a
-    /// hand-written list of tool names). This test alone does not catch a
-    /// future *mutating* tool that omits `annotations(...)`: `tool_router()`'s
+    /// invoking the tool first. Sourced from `build_tool_router(None).list_all()`
+    /// (not a hand-written list of tool names). This test alone does not catch a
+    /// future *mutating* tool that omits `annotations(...)`: `build_tool_router()`'s
     /// central pass (see its doc comment) blanket-labels any such tool
     /// read-only rather than leaving it `None`, so the hint assertions above
     /// always pass. `test_tool_annotation_classifications_match_intent` below
@@ -1937,7 +2018,7 @@ sleep 0.3
     /// though it does not verify that classification is truthful.
     #[test]
     fn test_all_tools_carry_annotations() {
-        let tools = McplsServer::tool_router().list_all();
+        let tools = McplsServer::build_tool_router(None).list_all();
         assert!(!tools.is_empty(), "no tools registered");
 
         for tool in &tools {
@@ -1979,7 +2060,7 @@ sleep 0.3
     /// checked against the actual registered count.
     #[test]
     fn test_tool_annotation_classifications_match_intent() {
-        let tools = McplsServer::tool_router().list_all();
+        let tools = McplsServer::build_tool_router(None).list_all();
         let by_name: std::collections::HashMap<&str, &rmcp::model::ToolAnnotations> = tools
             .iter()
             .map(|tool| {
@@ -2407,18 +2488,18 @@ sleep 0.3
     #[test]
     #[ignore = "run manually to (re)generate tool_surface.json"]
     fn dump_tool_surface() {
-        let tools = McplsServer::tool_router().list_all();
+        let tools = McplsServer::build_tool_router(None).list_all();
         println!("{}", serde_json::to_string_pretty(&tools).unwrap());
     }
 
     /// Pins the client-visible tool surface (name, description, title,
-    /// annotations, input schema) exposed by `tool_router().list_all()`.
+    /// annotations, input schema) exposed by `build_tool_router(None).list_all()`.
     /// `serde_json::Value` comparison, not string comparison, so key
     /// order/whitespace drift doesn't cause false failures -- only an actual
     /// change to what an MCP client sees does.
     #[test]
     fn test_tool_surface_matches_golden_snapshot() {
-        let tools = McplsServer::tool_router().list_all();
+        let tools = McplsServer::build_tool_router(None).list_all();
         let actual = serde_json::to_value(&tools).unwrap();
         let expected: serde_json::Value =
             serde_json::from_str(include_str!("tool_surface.json")).unwrap();
@@ -2427,5 +2508,97 @@ sleep 0.3
             "client-visible tool surface changed -- update tool_surface.json only if the \
              change is intentional"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // tool_prefix tests
+    // ------------------------------------------------------------------
+
+    /// Pins that `ToolRouter::disable_route`/`with_disabled` are unreachable
+    /// today, which is what makes `build_tool_router`'s rename pass safe to
+    /// skip re-keying the private `disabled` set (see its doc comment). If
+    /// this ever fails, a `disable_route` call was added somewhere and the
+    /// rename pass needs to be updated to preserve disabled state across
+    /// the rekey.
+    #[test]
+    fn test_no_route_is_ever_disabled() {
+        let router = McplsServer::build_tool_router(None);
+        for name in router.map.keys() {
+            assert!(
+                !router.is_disabled(name),
+                "route {name} is unexpectedly disabled"
+            );
+        }
+    }
+
+    /// Every currently-registered tool name must fit within
+    /// `MAX_TOOL_NAME_BYTES`, the constant the `MAX_MCP_TOOL_PREFIX_BYTES`
+    /// safety margin is derived from (see the compile-time assertion next
+    /// to it). A future tool name that grows past this fails here, with a
+    /// clear pointer to `MAX_TOOL_NAME_BYTES`, rather than surfacing as a
+    /// confusing prefix-length failure far away in `config`.
+    #[test]
+    fn test_registered_tool_names_fit_max_tool_name_bytes() {
+        let router = McplsServer::build_tool_router(None);
+        for tool in router.list_all() {
+            assert!(
+                tool.name.len() <= MAX_TOOL_NAME_BYTES,
+                "tool `{}` is {} bytes, exceeding MAX_TOOL_NAME_BYTES ({MAX_TOOL_NAME_BYTES}); \
+                 bump MAX_TOOL_NAME_BYTES and re-check its compile-time assertion against \
+                 MAX_MCP_TOOL_PREFIX_BYTES",
+                tool.name,
+                tool.name.len()
+            );
+        }
+    }
+
+    /// A configured prefix rewrites only `name` -- every other field
+    /// (description, title, annotations, input schema) stays identical to
+    /// the unprefixed golden snapshot, and no route is gained or lost.
+    #[test]
+    fn test_build_tool_router_with_prefix_renames_only_name() {
+        let prefix: ToolPrefix = "optics".parse().unwrap();
+        let unprefixed = McplsServer::build_tool_router(None).list_all();
+        let prefixed = McplsServer::build_tool_router(Some(&prefix)).list_all();
+
+        assert_eq!(unprefixed.len(), prefixed.len());
+        for (before, after) in unprefixed.iter().zip(prefixed.iter()) {
+            assert_eq!(after.name, format!("optics_{}", before.name));
+            assert_eq!(after.description, before.description);
+            assert_eq!(after.title, before.title);
+            assert_eq!(after.annotations, before.annotations);
+            assert_eq!(after.input_schema, before.input_schema);
+        }
+    }
+
+    /// The map key for every route must equal its own `attr.name` --
+    /// `ToolRouter::call` dispatches by looking up `map` with the
+    /// requested name, so a mismatch here would silently break routing to
+    /// unreachable dead entries under their pre-rename key.
+    #[test]
+    fn test_build_tool_router_map_keys_match_route_names() {
+        let prefix: ToolPrefix = "optics".parse().unwrap();
+        let router = McplsServer::build_tool_router(Some(&prefix));
+        for (key, route) in &router.map {
+            assert_eq!(key.as_ref(), route.attr.name.as_ref());
+        }
+    }
+
+    /// The single test proving the prefix threads end-to-end from the
+    /// public `McplsServer::new` constructor, not just from calling
+    /// `build_tool_router` directly -- every other test above calls
+    /// `build_tool_router` in isolation, so this is the one that would
+    /// catch a wiring mistake in `new` (e.g. forgetting to read
+    /// `mcp.tool_prefix` before `mcp` is moved into `BridgeContext::new`).
+    #[tokio::test]
+    async fn test_new_threads_configured_tool_prefix_end_to_end() {
+        let mcp = McpConfig {
+            tool_prefix: Some("p".parse().unwrap()),
+            ..McpConfig::default()
+        };
+        let server = create_test_server_with_mcp_config(false, mcp);
+
+        assert!(server.get_tool("p_get_hover").is_some());
+        assert!(server.get_tool("get_hover").is_none());
     }
 }

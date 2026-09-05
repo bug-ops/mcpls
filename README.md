@@ -145,6 +145,9 @@ Claude: [get_references] Found 4 matches:
 
 ## MCP Tools
 
+Names below are the defaults; if the bridge is configured with `mcp.tool_prefix`, every tool
+name gains that prefix (`{tool_prefix}_{tool}`).
+
 <details>
 <summary><strong>Code Intelligence</strong></summary>
 
@@ -267,6 +270,7 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 title = "My Custom Bridge"
 description = "Internal LSP bridge for Acme Corp"
 instructions = "Use get_hover before get_definition."
+tool_prefix = "optics"
 
 [workspace]
 roots = ["/path/to/project"]
@@ -295,7 +299,7 @@ language_id = "nushell"
 ```
 
 > [!NOTE]
-> `[mcp]` is entirely optional — omitting it (or any of its three fields)
+> `[mcp]` is entirely optional — omitting it (or any of its four fields)
 > keeps mcpls's built-in `serverInfo`/`instructions` text unchanged. A
 > configured `instructions` **replaces** the built-in capability blurb
 > rather than appending to it.
