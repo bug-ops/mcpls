@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hierarchical document-symbol support** — advertise `textDocument.documentSymbol`, including every LSP symbol kind, during initialization so servers such as Pyrefly return document symbols. (#78)
+
 ### Removed
 
 - **`async-trait` direct dependency** — dropped from the workspace and `mcpls-core`; unused now that no trait in the crate needs it, remains available transitively through `rmcp`'s own optional dependency when its `--all-features` build enables it.
