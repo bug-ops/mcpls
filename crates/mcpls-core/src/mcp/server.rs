@@ -29,6 +29,24 @@ use crate::bridge::{
     DiagnosticInfo, NotificationCache, PositionEncoding, ResourceSubscriptions, Translator,
     validate_path_against_roots,
 };
+use crate::config::McpConfig;
+
+/// Built-in `serverInfo.title`, used when `[mcp].title` is not configured.
+const DEFAULT_SERVER_TITLE: &str = "MCPLS - MCP to LSP Bridge";
+
+/// Built-in `serverInfo.description`, used when `[mcp].description` is not
+/// configured. Sourced from the crate's own `Cargo.toml` `description` field.
+const DEFAULT_SERVER_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
+
+/// Built-in `ServerInfo.instructions` capability blurb, used when
+/// `[mcp].instructions` is not configured. A configured value replaces this
+/// text entirely rather than appending to it -- see [`McpConfig::instructions`].
+const DEFAULT_INSTRUCTIONS: &str = concat!(
+    "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
+    "capabilities as MCP tools for semantic code intelligence. ",
+    "Supports hover, definition, references, diagnostics, rename, ",
+    "completions, symbols, and formatting."
+);
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -160,7 +178,9 @@ impl McplsServer {
     /// `project_config_ignored` reports whether a CWD-discovered
     /// `./mcpls.toml` was skipped as untrusted when the active config was
     /// loaded (see [`ServerConfig::project_config_ignored`](crate::config::ServerConfig::project_config_ignored));
-    /// `get_info` surfaces it in [`ServerInfo::instructions`].
+    /// `get_info` surfaces it in [`ServerInfo::instructions`]. `mcp` carries
+    /// the configured `[mcp]` presentation overrides (see
+    /// [`crate::config::McpConfig`]), also read by `get_info`.
     #[must_use]
     pub fn new(
         translator: Arc<Translator>,
@@ -168,6 +188,7 @@ impl McplsServer {
         workspace_roots: Arc<[PathBuf]>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_config_ignored: bool,
+        mcp: McpConfig,
     ) -> Self {
         let context = Arc::new(BridgeContext::new(
             translator,
@@ -175,6 +196,7 @@ impl McplsServer {
             workspace_roots,
             subscriptions,
             project_config_ignored,
+            mcp,
         ));
         Self { context }
     }
@@ -817,8 +839,20 @@ impl ServerHandler for McplsServer {
 
     fn get_info(&self) -> ServerInfo {
         let mut implementation = Implementation::new("mcpls", env!("CARGO_PKG_VERSION"));
-        implementation.title = Some("MCPLS - MCP to LSP Bridge".to_string());
-        implementation.description = Some(env!("CARGO_PKG_DESCRIPTION").to_string());
+        implementation.title = Some(
+            self.context
+                .mcp
+                .title
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SERVER_TITLE.to_string()),
+        );
+        implementation.description = Some(
+            self.context
+                .mcp
+                .description
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SERVER_DESCRIPTION.to_string()),
+        );
         implementation.website_url = Some("https://github.com/bug-ops/mcpls".to_string());
 
         let capabilities = ServerCapabilities::builder()
@@ -828,13 +862,12 @@ impl ServerHandler for McplsServer {
             .build();
         let mut server_info = ServerInfo::new(capabilities);
         server_info.server_info = implementation;
-        let mut instructions = concat!(
-            "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
-            "capabilities as MCP tools for semantic code intelligence. ",
-            "Supports hover, definition, references, diagnostics, rename, ",
-            "completions, symbols, and formatting."
-        )
-        .to_string();
+        let mut instructions = self
+            .context
+            .mcp
+            .instructions
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
 
         if self.context.project_config_ignored {
             instructions.push_str(
@@ -860,6 +893,13 @@ mod tests {
     }
 
     fn create_test_server_with_ignored_flag(project_config_ignored: bool) -> McplsServer {
+        create_test_server_with_mcp_config(project_config_ignored, McpConfig::default())
+    }
+
+    fn create_test_server_with_mcp_config(
+        project_config_ignored: bool,
+        mcp: McpConfig,
+    ) -> McplsServer {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
@@ -870,6 +910,7 @@ mod tests {
             workspace_roots,
             subscriptions,
             project_config_ignored,
+            mcp,
         )
     }
 
@@ -899,6 +940,61 @@ mod tests {
         let instructions = info.instructions.unwrap();
         assert!(instructions.contains("ignored as untrusted"));
         assert!(instructions.contains("--trust-project-config"));
+    }
+
+    #[tokio::test]
+    async fn test_get_info_default_mcp_config_uses_built_in_text() {
+        let server = create_test_server_with_mcp_config(false, McpConfig::default());
+        let info = server.get_info();
+
+        assert_eq!(
+            info.server_info.title.as_deref(),
+            Some(DEFAULT_SERVER_TITLE)
+        );
+        assert_eq!(
+            info.server_info.description.as_deref(),
+            Some(DEFAULT_SERVER_DESCRIPTION)
+        );
+        assert_eq!(info.instructions.as_deref(), Some(DEFAULT_INSTRUCTIONS));
+    }
+
+    #[tokio::test]
+    async fn test_get_info_reflects_configured_mcp_fields() {
+        let mcp = McpConfig {
+            title: Some("Custom Title".to_string()),
+            description: Some("Custom description".to_string()),
+            instructions: Some("Custom instructions.".to_string()),
+        };
+        let server = create_test_server_with_mcp_config(false, mcp);
+        let info = server.get_info();
+
+        assert_eq!(info.server_info.title.as_deref(), Some("Custom Title"));
+        assert_eq!(
+            info.server_info.description.as_deref(),
+            Some("Custom description")
+        );
+        assert_eq!(info.instructions.as_deref(), Some("Custom instructions."));
+    }
+
+    /// Configured `instructions` replace the built-in blurb, but the
+    /// untrusted-project-config NOTE must still be appended afterward --
+    /// including when `instructions` sits exactly at
+    /// `MAX_MCP_INSTRUCTIONS_BYTES`, proving the NOTE is outside the user's
+    /// budget rather than truncated to make room for it.
+    #[tokio::test]
+    async fn test_get_info_appends_ignore_notice_after_configured_instructions_at_cap() {
+        let instructions = "a".repeat(crate::config::MAX_MCP_INSTRUCTIONS_BYTES);
+        let mcp = McpConfig {
+            title: None,
+            description: None,
+            instructions: Some(instructions.clone()),
+        };
+        let server = create_test_server_with_mcp_config(true, mcp);
+        let info = server.get_info();
+
+        let returned_instructions = info.instructions.unwrap();
+        assert!(returned_instructions.starts_with(&instructions));
+        assert!(returned_instructions.contains("ignored as untrusted"));
     }
 
     #[tokio::test]

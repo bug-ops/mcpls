@@ -787,13 +787,21 @@ mod tests {
         use tokio::sync::Mutex;
 
         use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+        use crate::config::McpConfig;
         use crate::mcp::McplsServer;
 
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subs = Arc::new(ResourceSubscriptions::new());
-        let server = McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
+        let server = McplsServer::new(
+            translator,
+            notification_cache,
+            workspace_roots,
+            subs,
+            false,
+            McpConfig::default(),
+        );
         let peer_cell = tokio::sync::OnceCell::new();
 
         let outcome = tokio::time::timeout(
@@ -886,14 +894,21 @@ mod tests {
             use tokio::sync::Mutex;
 
             use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::config::McpConfig;
             use crate::mcp::McplsServer;
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server =
-                McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
+            let server = McplsServer::new(
+                translator,
+                notification_cache,
+                workspace_roots,
+                subs,
+                false,
+                McpConfig::default(),
+            );
 
             // Bind port 0 so the OS assigns a free port.
             let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -983,6 +998,7 @@ mod tests {
             use tokio::sync::Mutex;
 
             use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::config::McpConfig;
             use crate::mcp::McplsServer;
 
             // Hold a listener to make the port unavailable.
@@ -993,8 +1009,14 @@ mod tests {
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server =
-                McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
+            let server = McplsServer::new(
+                translator,
+                notification_cache,
+                workspace_roots,
+                subs,
+                false,
+                McpConfig::default(),
+            );
 
             let cfg = HttpConfig::new(addr, "/mcp");
 
@@ -1017,13 +1039,21 @@ mod tests {
             use tokio::sync::Mutex;
 
             use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::config::McpConfig;
             use crate::mcp::McplsServer;
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            McplsServer::new(translator, notification_cache, workspace_roots, subs, false)
+            McplsServer::new(
+                translator,
+                notification_cache,
+                workspace_roots,
+                subs,
+                false,
+                McpConfig::default(),
+            )
         }
 
         /// Sends a raw HTTP/1.1 POST request over TCP and returns the raw response

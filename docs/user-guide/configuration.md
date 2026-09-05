@@ -20,7 +20,11 @@ mcpls uses TOML format for configuration. The file can be placed in several loca
 A `mcpls.toml` discovered in the current directory controls which command mcpls
 spawns as an LSP server (and other workspace settings), so mcpls does not load it
 automatically. Running `mcpls` inside an untrusted checkout must not execute
-commands from that checkout without explicit consent.
+commands from that checkout without explicit consent. Trusting it also confers
+authorship of the agent-facing `serverInfo.title`/`description`/`instructions`
+text (see [MCP Section](#mcp-section)) — a trusted config can replace that text
+wholesale, with no in-band marker distinguishing it from mcpls's own built-in
+wording.
 
 To load a project-local `mcpls.toml`, opt in explicitly:
 
@@ -55,6 +59,12 @@ itself the user's consent.
 ## Configuration Structure
 
 ```toml
+# Optional: MCP serverInfo/initialize presentation overrides
+[mcp]
+title = "My Custom Bridge"
+description = "Internal LSP bridge for Acme Corp"
+instructions = "Use get_hover before get_definition."
+
 # Workspace configuration
 [workspace]
 roots = ["/path/to/project1", "/path/to/project2"]
@@ -73,6 +83,41 @@ request_timeout_seconds = 30
 [lsp_servers.initialization_options]
 cargo.features = "all"
 ```
+
+## MCP Section
+
+Overrides the text mcpls reports about itself over MCP. Every field is
+optional and independent; omitting one keeps mcpls's built-in text for it.
+`serverInfo.name`, `version`, and `website_url` are not configurable —
+`name` is the MCP-spec machine identifier (asserted by clients that key off
+it), and `version`/`website_url` are project metadata rather than
+presentation text.
+
+| Field | Overrides | Default | Max size |
+|-------|-----------|---------|----------|
+| `mcp.title` | `serverInfo.title` | `"MCPLS - MCP to LSP Bridge"` | 128 bytes |
+| `mcp.description` | `serverInfo.description` | the crate's `Cargo.toml` description | 1024 bytes |
+| `mcp.instructions` | `ServerInfo.instructions` | built-in capability blurb | 4096 bytes |
+
+```toml
+[mcp]
+title = "My Custom Bridge"
+description = "Internal LSP bridge for Acme Corp"
+instructions = "Use get_hover before get_definition."
+```
+
+> [!IMPORTANT]
+> A configured `mcp.instructions` **replaces** the built-in capability
+> blurb entirely rather than appending to it — an AI agent that reads
+> `instructions` at connection time (per mcpls's own Agent Skill) will see
+> only your configured text. The untrusted-project-config NOTE (see
+> [Trusting a Project-Local Config](#trusting-a-project-local-config)) is
+> unrelated and is still appended after it when applicable.
+
+Every field's size limit is enforced in UTF-8 bytes, not characters. A
+whitespace-only value (e.g. `title = "   "`) is rejected as empty, the same
+as an actually-empty string — omit the field entirely to use the built-in
+default instead. `tool_prefix` is not implemented yet (tracked separately).
 
 ## Workspace Section
 

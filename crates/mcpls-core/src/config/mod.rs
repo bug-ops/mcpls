@@ -37,6 +37,10 @@ pub struct LanguageExtensionMapping {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// MCP `serverInfo`/`initialize` presentation overrides.
+    #[serde(default)]
+    pub mcp: McpConfig,
+
     /// Workspace configuration.
     #[serde(default)]
     pub workspace: WorkspaceConfig,
@@ -57,6 +61,81 @@ pub struct ServerConfig {
     #[serde(skip)]
     pub project_config_ignored: bool,
 }
+
+/// Optional overrides for the text mcpls reports about itself over MCP.
+///
+/// Every field is `None` by default, which keeps today's hardcoded
+/// `serverInfo.title`/`description` and built-in capability blurb
+/// unchanged. `serverInfo.name`, `version`, and `website_url` are not
+/// configurable here: `name` is the MCP-spec machine identifier asserted in
+/// integration tests, and `version`/`website_url` are project metadata, not
+/// presentation text.
+///
+/// A configured [`instructions`](Self::instructions) **replaces** the
+/// built-in capability blurb in `ServerInfo.instructions` rather than
+/// appending to it -- an agent that reads `instructions` at connection time
+/// (see `skills/mcpls/SKILL.md`) sees only the configured text, plus the
+/// unrelated untrusted-project-config NOTE (see
+/// [`ServerConfig::project_config_ignored`]), which is always appended
+/// afterward regardless of this field.
+///
+/// Every field reaches an MCP client verbatim on every `initialize`
+/// response, into what is typically an LLM context window -- this is why
+/// [`ServerConfig::validate`] enforces the `MAX_MCP_*` byte caps on all
+/// three.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::ServerConfig;
+///
+/// let toml = r#"
+///     [mcp]
+///     title = "My Custom Bridge"
+///     description = "Internal LSP bridge for Acme Corp"
+///     instructions = "Use get_hover before get_definition."
+/// "#;
+/// let config: ServerConfig = toml::from_str(toml).unwrap();
+/// assert_eq!(config.mcp.title.as_deref(), Some("My Custom Bridge"));
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Overrides `serverInfo.title`. Omit to keep the built-in title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    /// Overrides `serverInfo.description`. Omit to keep the built-in
+    /// description (`CARGO_PKG_DESCRIPTION`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Replaces the built-in `ServerInfo.instructions` capability blurb.
+    /// Omit to keep the built-in text. The untrusted-project-config NOTE
+    /// (see [`ServerConfig::project_config_ignored`]) is still appended
+    /// after this value when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Maximum byte length of a configured [`McpConfig::title`].
+///
+/// UTF-8 bytes, not chars, consistent with `MAX_CONFIG_FILE_BYTES`. Named
+/// so the limit can appear in the [`Error::InvalidConfig`] message it backs.
+pub const MAX_MCP_TITLE_BYTES: usize = 128;
+
+/// Maximum byte length of a configured [`McpConfig::description`].
+///
+/// UTF-8 bytes, not chars. See [`MAX_MCP_TITLE_BYTES`].
+pub const MAX_MCP_DESCRIPTION_BYTES: usize = 1024;
+
+/// Maximum byte length of a configured [`McpConfig::instructions`].
+///
+/// UTF-8 bytes, not chars. Applies to the raw configured string only -- the
+/// untrusted-project-config NOTE appended in `McplsServer::get_info` is
+/// fixed-size built-in text and does not count against this budget. See
+/// [`MAX_MCP_TITLE_BYTES`].
+pub const MAX_MCP_INSTRUCTIONS_BYTES: usize = 4096;
 
 /// Workspace-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,6 +829,8 @@ impl ServerConfig {
     /// assert!(config.validate().is_ok());
     /// ```
     pub fn validate(&self) -> Result<()> {
+        self.validate_mcp()?;
+
         if self.workspace.position_encodings.is_empty() {
             return Err(Error::InvalidConfig(
                 "workspace.position_encodings cannot be empty".to_string(),
@@ -860,11 +941,59 @@ impl ServerConfig {
         }
         Ok(())
     }
+
+    /// Validates the `[mcp]` section: each configured field is rejected if
+    /// whitespace-only or over its `MAX_MCP_*` byte cap. Split out of
+    /// [`Self::validate`] to keep that function under clippy's line count
+    /// threshold.
+    fn validate_mcp(&self) -> Result<()> {
+        validate_mcp_field(self.mcp.title.as_deref(), "mcp.title", MAX_MCP_TITLE_BYTES)?;
+        validate_mcp_field(
+            self.mcp.description.as_deref(),
+            "mcp.description",
+            MAX_MCP_DESCRIPTION_BYTES,
+        )?;
+        validate_mcp_field(
+            self.mcp.instructions.as_deref(),
+            "mcp.instructions",
+            MAX_MCP_INSTRUCTIONS_BYTES,
+        )
+    }
+}
+
+/// Validates one [`McpConfig`] string field: rejects a whitespace-only value
+/// before checking length, so `title = "   "` reports "cannot be empty"
+/// rather than a length error, and caps only the raw configured string --
+/// text appended later (e.g. the untrusted-project-config NOTE in
+/// `McplsServer::get_info`) is not part of `value` and is unaffected.
+fn validate_mcp_field(value: Option<&str>, field: &str, max_bytes: usize) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        // `rsplit('.').next()` always yields at least one item for any
+        // input (including one with no '.'), so `unwrap_or(field)` never
+        // actually falls back for the "mcp.<field>" strings this is called
+        // with -- kept as a defensive default rather than an `unwrap()`,
+        // since `clippy::unwrap_used` is a workspace-wide warn-as-error.
+        return Err(Error::InvalidConfig(format!(
+            "{field} cannot be empty (omit `{}` to use the built-in default)",
+            field.rsplit('.').next().unwrap_or(field)
+        )));
+    }
+    let len = value.len();
+    if len > max_bytes {
+        return Err(Error::InvalidConfig(format!(
+            "{field} exceeds the maximum of {max_bytes} bytes ({len} given)"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![
                 LspServerConfig::rust_analyzer(),
@@ -1666,6 +1795,7 @@ mod tests {
     #[test]
     fn test_build_effective_extension_map_overrides_with_file_patterns() {
         let config = ServerConfig {
+            mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: "cpp".to_string(),
@@ -1691,6 +1821,7 @@ mod tests {
     #[test]
     fn test_build_effective_extension_map_derives_tsx_language_id() {
         let config = ServerConfig {
+            mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: "typescript".to_string(),
@@ -1716,6 +1847,7 @@ mod tests {
     #[test]
     fn test_build_effective_extension_map_derives_jsx_language_id() {
         let config = ServerConfig {
+            mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: "javascript".to_string(),
@@ -1741,6 +1873,7 @@ mod tests {
     #[test]
     fn test_build_effective_extension_map_ignores_complex_patterns_without_extension() {
         let config = ServerConfig {
+            mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: "cpp".to_string(),
@@ -2032,6 +2165,7 @@ mod tests {
 
         let content = fs::read_to_string(&config_path).unwrap();
 
+        assert!(content.contains("[mcp]"));
         assert!(content.contains("[workspace]"));
         assert!(content.contains("[[workspace.language_extensions]]"));
         assert!(content.contains("[[lsp_servers]]"));
@@ -2214,5 +2348,274 @@ mod tests {
         );
         assert_eq!(round_tripped.max_documents, original.max_documents);
         assert_eq!(round_tripped.max_file_size, original.max_file_size);
+    }
+
+    #[test]
+    fn test_mcp_config_parses_from_toml_section() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = r#"
+            [mcp]
+            title = "Custom Title"
+            description = "Custom description"
+            instructions = "Custom instructions."
+        "#;
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.mcp.title.as_deref(), Some("Custom Title"));
+        assert_eq!(
+            config.mcp.description.as_deref(),
+            Some("Custom description")
+        );
+        assert_eq!(
+            config.mcp.instructions.as_deref(),
+            Some("Custom instructions.")
+        );
+    }
+
+    #[test]
+    fn test_mcp_config_defaults_to_none_when_section_absent() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        fs::write(&config_path, "[workspace]\nroots = []\n").unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.mcp.title, None);
+        assert_eq!(config.mcp.description, None);
+        assert_eq!(config.mcp.instructions, None);
+    }
+
+    #[test]
+    fn test_mcp_config_rejects_unknown_field() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        // `tool_prefix` is deliberately not implemented yet (deferred
+        // follow-up); `deny_unknown_fields` must reject it rather than
+        // silently ignoring it.
+        fs::write(&config_path, "[mcp]\ntool_prefix = \"x\"\n").unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(matches!(result, Err(Error::TomlDe(_))));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_mcp_title() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        fs::write(&config_path, "[mcp]\ntitle = \"\"\n").unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert_eq!(
+                msg,
+                "mcp.title cannot be empty (omit `title` to use the built-in default)"
+            );
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    /// A whitespace-only value must report as *empty*, not over-length --
+    /// the trim-empty check must run before the length check.
+    #[test]
+    fn test_validate_rejects_whitespace_only_mcp_title_as_empty() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        fs::write(&config_path, "[mcp]\ntitle = \"   \"\n").unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("cannot be empty"));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_mcp_description() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        fs::write(&config_path, "[mcp]\ndescription = \"\"\n").unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert_eq!(
+                msg,
+                "mcp.description cannot be empty (omit `description` to use the built-in \
+                 default)"
+            );
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_mcp_instructions() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        fs::write(&config_path, "[mcp]\ninstructions = \"\"\n").unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert_eq!(
+                msg,
+                "mcp.instructions cannot be empty (omit `instructions` to use the built-in \
+                 default)"
+            );
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_over_length_mcp_title() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let title = "a".repeat(MAX_MCP_TITLE_BYTES + 1);
+        fs::write(&config_path, format!("[mcp]\ntitle = \"{title}\"\n")).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert_eq!(
+                msg,
+                format!(
+                    "mcp.title exceeds the maximum of {MAX_MCP_TITLE_BYTES} bytes ({} given)",
+                    MAX_MCP_TITLE_BYTES + 1
+                )
+            );
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_mcp_title_at_exact_cap() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let title = "a".repeat(MAX_MCP_TITLE_BYTES);
+        fs::write(&config_path, format!("[mcp]\ntitle = \"{title}\"\n")).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_validate_rejects_over_length_mcp_description() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let description = "a".repeat(MAX_MCP_DESCRIPTION_BYTES + 1);
+        fs::write(
+            &config_path,
+            format!("[mcp]\ndescription = \"{description}\"\n"),
+        )
+        .unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("mcp.description exceeds the maximum"));
+            assert!(msg.contains(&(MAX_MCP_DESCRIPTION_BYTES + 1).to_string()));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_mcp_description_at_exact_cap() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let description = "a".repeat(MAX_MCP_DESCRIPTION_BYTES);
+        fs::write(
+            &config_path,
+            format!("[mcp]\ndescription = \"{description}\"\n"),
+        )
+        .unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    /// Pins the documented "bytes, not chars" contract: `é` is 1 char but 2
+    /// UTF-8 bytes, so a naive `.chars().count()` cap would accept both
+    /// cases below. `MAX_MCP_TITLE_BYTES` (128) is even, so 64 `é`s land
+    /// exactly at the byte cap and 65 land one byte over it.
+    #[test]
+    fn test_validate_rejects_multibyte_title_over_byte_cap_though_under_char_cap() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let title = "é".repeat(65);
+        assert_eq!(title.len(), MAX_MCP_TITLE_BYTES + 2);
+        assert_eq!(title.chars().count(), 65);
+        fs::write(&config_path, format!("[mcp]\ntitle = \"{title}\"\n")).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("mcp.title exceeds the maximum"));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_multibyte_title_at_exact_byte_cap() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let title = "é".repeat(64);
+        assert_eq!(title.len(), MAX_MCP_TITLE_BYTES);
+        fs::write(&config_path, format!("[mcp]\ntitle = \"{title}\"\n")).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_validate_rejects_over_length_mcp_instructions() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let instructions = "a".repeat(MAX_MCP_INSTRUCTIONS_BYTES + 1);
+        fs::write(
+            &config_path,
+            format!("[mcp]\ninstructions = \"{instructions}\"\n"),
+        )
+        .unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("mcp.instructions exceeds the maximum"));
+            assert!(msg.contains(&(MAX_MCP_INSTRUCTIONS_BYTES + 1).to_string()));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_mcp_instructions_at_exact_cap() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let instructions = "a".repeat(MAX_MCP_INSTRUCTIONS_BYTES);
+        fs::write(
+            &config_path,
+            format!("[mcp]\ninstructions = \"{instructions}\"\n"),
+        )
+        .unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 }

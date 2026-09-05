@@ -1,0 +1,8 @@
+# Configuration for E2E testing of the [mcp] section (#347).
+# No LSP servers configured - tests protocol only.
+
+[mcp]
+title = "E2E Custom Title"
+
+[workspace]
+roots = []
