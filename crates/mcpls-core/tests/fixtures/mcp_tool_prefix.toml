@@ -1,0 +1,8 @@
+# Configuration for E2E testing of `[mcp].tool_prefix` (#353).
+# No LSP servers configured - tests protocol only.
+
+[mcp]
+tool_prefix = "optics"
+
+[workspace]
+roots = []

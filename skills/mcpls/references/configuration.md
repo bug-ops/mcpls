@@ -16,10 +16,11 @@ independent, defaulting to mcpls's built-in text when omitted. `serverInfo.name`
 | `title` | string | `"MCPLS - MCP to LSP Bridge"` | 128 bytes | Overrides `serverInfo.title`. |
 | `description` | string | crate's `Cargo.toml` description | 1024 bytes | Overrides `serverInfo.description`. |
 | `instructions` | string | built-in capability blurb | 4096 bytes | **Replaces** `ServerInfo.instructions` entirely — does not append to the built-in text. Read it at connection time instead of assuming the built-in blurb; see the note below. |
+| `tool_prefix` | string | unprefixed tool names | 32 bytes | Prefixes every tool name with `{tool_prefix}_`, so a client running multiple mcpls bridges can tell their tools apart. Charset `[A-Za-z0-9_-]`, must start/end with a letter or digit. |
 
 Limits are UTF-8 bytes, not characters, and apply to the raw configured string,
 including surrounding whitespace — a whitespace-only value is rejected as empty
-rather than checked against the byte cap. `tool_prefix` is not implemented yet.
+rather than checked against the byte cap.
 
 ## `[workspace]` fields
 

@@ -80,6 +80,75 @@ fn test_e2e_initialize_reflects_configured_mcp_title() -> Result<()> {
     Ok(())
 }
 
+/// Test that a configured `[mcp].tool_prefix` reaches the real wiring end to
+/// end (#353): `tools/list` exposes only prefixed names, a `tools/call`
+/// using the prefixed name reaches the handler, and the same call with the
+/// bare (unprefixed) name is rejected as unknown. Unit tests in
+/// `mcp::server` already cover the surface exhaustively via
+/// `McplsServer::build_tool_router`/`::new` directly -- this is the one
+/// test proving the config value actually traverses `serve_with` ->
+/// `McplsServer::new` -> the real `ToolRouter`.
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_tool_prefix_reaches_real_wiring() -> Result<()> {
+    let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mcp_tool_prefix.toml");
+
+    let mut client = McpClient::spawn_with_args(&[
+        "--config",
+        config_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?,
+    ])?;
+
+    client.initialize()?;
+
+    let list_response = client.list_tools()?;
+    let names: Vec<&str> = list_response["result"]["tools"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tools/list did not return an array"))?
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+
+    assert!(
+        names.contains(&"optics_get_cached_diagnostics"),
+        "tools/list should expose the configured prefix: {names:?}"
+    );
+    assert!(
+        !names.contains(&"get_cached_diagnostics"),
+        "tools/list should not expose the unprefixed name once a prefix is configured: {names:?}"
+    );
+
+    // `get_cached_diagnostics` still fails for a nonexistent path (a file
+    // I/O error resolving its URI), but that error is distinct from
+    // `ToolRouter`'s "tool not found" -- reaching it proves the prefixed
+    // name was dispatched to the real handler, not rejected by routing.
+    let prefixed_result = client.call_tool(
+        "optics_get_cached_diagnostics",
+        &json!({ "file_path": "/nonexistent/file.rs" }),
+    );
+    if let Err(e) = &prefixed_result {
+        assert!(
+            !e.to_string().contains("tool not found"),
+            "prefixed tool call should reach the handler: {e}"
+        );
+    }
+
+    let bare_result = client.call_tool(
+        "get_cached_diagnostics",
+        &json!({ "file_path": "/nonexistent/file.rs" }),
+    );
+    match bare_result {
+        Ok(value) => {
+            panic!("bare tool name should be rejected once a prefix is configured, got: {value:?}")
+        }
+        Err(err) => assert!(err.to_string().contains("tool not found"), "{err}"),
+    }
+
+    Ok(())
+}
+
 /// Test listing all available MCP tools.
 ///
 /// Validates that:

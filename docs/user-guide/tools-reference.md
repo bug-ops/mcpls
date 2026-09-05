@@ -6,6 +6,10 @@ Complete reference for all 20 MCP tools provided by mcpls.
 
 mcpls exposes semantic code intelligence from Language Server Protocol (LSP) servers as MCP tools. Each tool corresponds to one or more LSP methods and provides rich code information to AI agents.
 
+Names below are the defaults; if the bridge is configured with `mcp.tool_prefix` (see
+[Configuration Reference](configuration.md#mcp-section)), every tool name gains that prefix
+(`{tool_prefix}_{tool}`).
+
 ## Tool Index
 
 ### Code Intelligence Tools
