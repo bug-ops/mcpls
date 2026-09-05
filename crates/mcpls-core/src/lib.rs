@@ -548,7 +548,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
     config.validate()?;
 
-    let (project_config_ignored, mcp) = (config.project_config_ignored, config.mcp.clone());
     // `current_dir()` always returns an absolute path. Configs loaded from a
     // TOML file have already had relative roots rebased to that file's
     // directory in `ServerConfig::load_from`; this second pass covers
@@ -622,6 +621,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         .with_extensions(extension_map)
         .with_router(router)
         .with_notification_cache(Arc::clone(&notification_cache));
+    // moved, not cloned -- `config`'s last use is above
+    let (project_config_ignored, mcp) = (config.project_config_ignored, config.mcp);
     translator.set_workspace_roots(workspace_roots.clone());
 
     // Mark applicable servers as "expected" so a tool call that arrives while

@@ -977,7 +977,7 @@ fn validate_mcp_field(value: Option<&str>, field: &str, max_bytes: usize) -> Res
         // with -- kept as a defensive default rather than an `unwrap()`,
         // since `clippy::unwrap_used` is a workspace-wide warn-as-error.
         return Err(Error::InvalidConfig(format!(
-            "{field} cannot be empty (omit `{}` to use the built-in default)",
+            "{field} cannot be empty (omit `{}` from the `[mcp]` section to use the built-in default)",
             field.rsplit('.').next().unwrap_or(field)
         )));
     }
@@ -2414,7 +2414,8 @@ mod tests {
         if let Err(Error::InvalidConfig(msg)) = result {
             assert_eq!(
                 msg,
-                "mcp.title cannot be empty (omit `title` to use the built-in default)"
+                "mcp.title cannot be empty (omit `title` from the `[mcp]` section to use the \
+                 built-in default)"
             );
         } else {
             panic!("Expected InvalidConfig error, got {result:?}");
@@ -2449,8 +2450,8 @@ mod tests {
         if let Err(Error::InvalidConfig(msg)) = result {
             assert_eq!(
                 msg,
-                "mcp.description cannot be empty (omit `description` to use the built-in \
-                 default)"
+                "mcp.description cannot be empty (omit `description` from the `[mcp]` section \
+                 to use the built-in default)"
             );
         } else {
             panic!("Expected InvalidConfig error, got {result:?}");
@@ -2468,8 +2469,8 @@ mod tests {
         if let Err(Error::InvalidConfig(msg)) = result {
             assert_eq!(
                 msg,
-                "mcp.instructions cannot be empty (omit `instructions` to use the built-in \
-                 default)"
+                "mcp.instructions cannot be empty (omit `instructions` from the `[mcp]` \
+                 section to use the built-in default)"
             );
         } else {
             panic!("Expected InvalidConfig error, got {result:?}");
