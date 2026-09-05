@@ -47,6 +47,37 @@ fn test_e2e_initialize_handshake() -> Result<()> {
     Ok(())
 }
 
+/// Test that a configured `[mcp].title` reaches the real `initialize`
+/// response, driving the actual `serve_with` -> `McplsServer::new` ->
+/// `get_info` path (#347) rather than constructing `McpConfig` in-process.
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_initialize_reflects_configured_mcp_title() -> Result<()> {
+    let config_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_config.toml");
+
+    let mut client = McpClient::spawn_with_args(&[
+        "--config",
+        config_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?,
+    ])?;
+
+    let response = client.initialize()?;
+    let result = &response["result"];
+
+    assert_eq!(
+        result["serverInfo"]["title"], "E2E Custom Title",
+        "Configured mcp.title should surface in serverInfo.title"
+    );
+    assert_eq!(
+        result["serverInfo"]["name"], "mcpls",
+        "serverInfo.name stays hardcoded regardless of [mcp] config"
+    );
+
+    Ok(())
+}
+
 /// Test listing all available MCP tools.
 ///
 /// Validates that:

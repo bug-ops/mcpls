@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Hierarchical document-symbol support** — advertise `textDocument.documentSymbol`, including every LSP symbol kind, during initialization so servers such as Pyrefly return document symbols. (#78)
+- **Optional `[mcp]` config section** — `title`, `description`, and `instructions` override `serverInfo.title`/`serverInfo.description`/`ServerInfo.instructions` in the MCP `initialize` response. All three default to the existing hardcoded text when omitted; `instructions` replaces the built-in capability blurb rather than appending to it. Each field is capped (128/1024/4096 UTF-8 bytes respectively), enforced by `ServerConfig::validate()`. (#347)
+
+### Changed
+
+- **`McplsServer::new`/`BridgeContext::new` signatures** — Breaking change: both now take an additional `mcp: McpConfig` parameter, carrying the new `[mcp]` section (see Added) through to `get_info`. `ServerConfig`/`BridgeContext` (both `pub`, neither `#[non_exhaustive]`) also gain a public `mcp` field, breaking any downstream struct-literal construction. Acceptable pre-1.0. (#347)
 
 ### Removed
 

@@ -263,6 +263,11 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 <summary><strong>Full Configuration Example</strong></summary>
 
 ```toml
+[mcp]
+title = "My Custom Bridge"
+description = "Internal LSP bridge for Acme Corp"
+instructions = "Use get_hover before get_definition."
+
 [workspace]
 roots = ["/path/to/project"]
 heuristics_max_depth = 10
@@ -288,6 +293,12 @@ checkOnSave.command = "clippy"
 extensions = ["nu"]
 language_id = "nushell"
 ```
+
+> [!NOTE]
+> `[mcp]` is entirely optional — omitting it (or any of its three fields)
+> keeps mcpls's built-in `serverInfo`/`instructions` text unchanged. A
+> configured `instructions` **replaces** the built-in capability blurb
+> rather than appending to it.
 
 See [Configuration Reference](docs/user-guide/configuration.md) for all options.
 

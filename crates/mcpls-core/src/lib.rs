@@ -548,7 +548,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
     config.validate()?;
 
-    let project_config_ignored = config.project_config_ignored;
     // `current_dir()` always returns an absolute path. Configs loaded from a
     // TOML file have already had relative roots rebased to that file's
     // directory in `ServerConfig::load_from`; this second pass covers
@@ -622,6 +621,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         .with_extensions(extension_map)
         .with_router(router)
         .with_notification_cache(Arc::clone(&notification_cache));
+    // moved, not cloned -- `config`'s last use is above
+    let (project_config_ignored, mcp) = (config.project_config_ignored, config.mcp);
     translator.set_workspace_roots(workspace_roots.clone());
 
     // Mark applicable servers as "expected" so a tool call that arrives while
@@ -683,6 +684,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Arc::clone(&workspace_roots_snapshot),
         Arc::clone(&subscriptions),
         project_config_ignored,
+        mcp,
     );
     info!("MCPLS server initialized successfully");
 
@@ -1591,6 +1593,7 @@ mod tests {
             // transport/MCP error from the closed test connection, NOT a fail-fast
             // server-availability error.
             let config = ServerConfig {
+                mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
@@ -1644,6 +1647,7 @@ mod tests {
             // serve() blocks until the MCP transport closes, so it will error with a
             // connection/transport error — not NoServersAvailable.
             let config = ServerConfig {
+                mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
@@ -1700,6 +1704,7 @@ mod tests {
             doomed_cwd.close().unwrap();
 
             let config = ServerConfig {
+                mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
                     roots: vec![workspace_root],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
@@ -1750,6 +1755,7 @@ mod tests {
             use crate::config::{LspServerConfig, WorkspaceConfig};
 
             let config = ServerConfig {
+                mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],

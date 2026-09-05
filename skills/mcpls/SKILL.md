@@ -190,6 +190,13 @@ populated by `McplsServer::get_info`). **Check the server instructions surfaced 
 connection time**: if you see a note about an ignored project config, the file wasn't
 malicious-by-default — it just needs an explicit trust decision.
 
+The rest of `instructions` is not guaranteed to be mcpls's built-in capability
+blurb: a configured `[mcp].instructions` (see [Configuration
+Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md#mcp-section))
+**replaces** that text entirely. Read whatever `instructions` actually contains at
+connection time rather than assuming the built-in wording — the ignored-config NOTE
+above is still appended after it regardless.
+
 ### Starter config
 
 A minimal `mcpls.toml` — expand per-language via
