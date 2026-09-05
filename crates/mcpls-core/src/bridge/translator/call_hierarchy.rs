@@ -1,8 +1,7 @@
 //! Call hierarchy prepare/incoming/outgoing handlers.
 
 use lsp_types::{
-    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
-    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
+    CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyOutgoingCallsParams,
     CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, PartialResultParams,
     TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
 };
@@ -25,8 +24,9 @@ const fn call_hierarchy_provider_supported(caps: &lsp_types::ServerCapabilities)
     matches!(
         caps.call_hierarchy_provider,
         Some(
-            lsp_types::CallHierarchyServerCapability::Simple(true)
-                | lsp_types::CallHierarchyServerCapability::Options(_)
+            lsp_types::CallHierarchyProvider::Bool(true)
+                | lsp_types::CallHierarchyProvider::CallHierarchyOptions(_)
+                | lsp_types::CallHierarchyProvider::CallHierarchyRegistrationOptions(_)
         )
     )
 }
@@ -50,9 +50,12 @@ fn parse_mcp_call_hierarchy_item(item: serde_json::Value) -> Result<ParsedCallHi
     let mcp: CallHierarchyItemResult = serde_json::from_value(item)
         .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
 
-    let uri = mcp.uri.parse::<lsp_types::Uri>().map_err(|e| {
-        Error::InvalidToolParams(format!("Invalid URI in call hierarchy item: {e}"))
-    })?;
+    // `gen-lsp-types`'s `Uri` is an opaque string wrapper with no validating
+    // parse, so constructing it is infallible -- the malformed-URI rejection
+    // this call used to provide is gone. Downstream consumers (e.g.
+    // `parse_file_uri`) still validate the `file://` scheme and reject what
+    // they can't use.
+    let uri = lsp_types::Uri::from(mcp.uri.as_str());
 
     Ok(ParsedCallHierarchyItem { uri, mcp })
 }
@@ -68,7 +71,7 @@ async fn call_hierarchy_item_to_lsp(
     // Round-trip via serde: `convert_call_hierarchy_item` stored the kind as a u32
     // by serialising `SymbolKind`; we reverse this to reconstruct the same value.
     let kind: lsp_types::SymbolKind = serde_json::from_value(serde_json::json!(mcp.kind))
-        .unwrap_or(lsp_types::SymbolKind::FUNCTION);
+        .unwrap_or(lsp_types::SymbolKind::Function);
     let range = ctx.denormalize_range(&uri, &mcp.range).await;
     let selection_range = ctx.denormalize_range(&uri, &mcp.selection_range).await;
 
@@ -152,9 +155,8 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let response: Option<Vec<CallHierarchyItem>> = client
-            .request(
-                "textDocument/prepareCallHierarchy",
+        let response = client
+            .request_typed::<lsp_types::CallHierarchyPrepareRequest>(
                 params,
                 client.request_timeout(),
             )
@@ -206,9 +208,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<Vec<CallHierarchyIncomingCall>> = client
-            .request(
-                "callHierarchy/incomingCalls",
+        let response = client
+            .request_typed::<lsp_types::CallHierarchyIncomingCallsRequest>(
                 params,
                 client.request_timeout(),
             )
@@ -275,9 +276,8 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<Vec<CallHierarchyOutgoingCall>> = client
-            .request(
-                "callHierarchy/outgoingCalls",
+        let response = client
+            .request_typed::<lsp_types::CallHierarchyOutgoingCallsRequest>(
                 params,
                 client.request_timeout(),
             )
@@ -391,14 +391,81 @@ mod tests {
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
 
+    /// S4 lock-in for the documented `Uri`-validation-loss behavior change
+    /// (see the CHANGELOG entry for #297): `parse_mcp_call_hierarchy_item`
+    /// can no longer reject a malformed `uri` field at construction time
+    /// (`gen-lsp-types`'s `Uri` has no validating parse). This drives a
+    /// structurally-valid item whose `uri` field is `file://`-prefixed (so
+    /// `parse_file_uri`'s scheme check still passes, same as before the
+    /// migration) but points at a path that does not exist on disk, through
+    /// the real `handle_incoming_calls`/`handle_outgoing_calls` handlers, and
+    /// pins the actual resulting error: `Error::FileIo` from
+    /// `validate_path`'s `canonicalize()` call, not the old construction-time
+    /// `Error::InvalidToolParams`.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
+    {
+        let translator = Translator::new();
+        let item = serde_json::json!({
+            "name": "foo",
+            "kind": 12,
+            "uri": "file:///this/path/does/not/exist/anywhere.rs",
+            "range": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 1}
+            },
+            "selectionRange": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 1}
+            }
+        });
+
+        let result = translator.handle_incoming_calls(item).await;
+
+        assert!(
+            matches!(result, Err(Error::FileIo { .. })),
+            "expected Error::FileIo from the canonicalize() failure now that Uri construction \
+             cannot itself reject a malformed uri, got {result:?}"
+        );
+    }
+
+    /// As above, through `handle_outgoing_calls` -- same
+    /// `parse_mcp_call_hierarchy_item` code path, different caller.
+    #[tokio::test]
+    async fn test_handle_outgoing_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
+    {
+        let translator = Translator::new();
+        let item = serde_json::json!({
+            "name": "foo",
+            "kind": 12,
+            "uri": "file:///this/path/does/not/exist/anywhere.rs",
+            "range": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 1}
+            },
+            "selectionRange": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 1}
+            }
+        });
+
+        let result = translator.handle_outgoing_calls(item).await;
+
+        assert!(
+            matches!(result, Err(Error::FileIo { .. })),
+            "expected Error::FileIo from the canonicalize() failure now that Uri construction \
+             cannot itself reject a malformed uri, got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_convert_call_hierarchy_item_kind_is_numeric() {
         let item = lsp_types::CallHierarchyItem {
             name: "my_fn".to_string(),
-            kind: lsp_types::SymbolKind::FUNCTION,
+            kind: lsp_types::SymbolKind::Function,
             tags: None,
             detail: None,
-            uri: "file:///tmp/test.rs".parse().unwrap(),
+            uri: lsp_types::Uri::from("file:///tmp/test.rs"),
             range: lsp_types::Range {
                 start: lsp_types::Position {
                     line: 0,
@@ -422,7 +489,7 @@ mod tests {
             data: None,
         };
         let result = convert_call_hierarchy_item(item, &test_ctx()).await;
-        // SymbolKind::FUNCTION is LSP integer 12
+        // SymbolKind::Function is LSP integer 12
         assert_eq!(result.kind, 12u32);
         assert_eq!(result.name, "my_fn");
     }
@@ -441,7 +508,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let server_id = ServerId::from("rust");
         let caps = lsp_types::ServerCapabilities {
-            call_hierarchy_provider: Some(lsp_types::CallHierarchyServerCapability::Simple(true)),
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
         };
         let (translator, mut server) = translator_with_capabilities_and_encoding(
@@ -547,7 +614,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let server_id = ServerId::from("rust");
         let caps = lsp_types::ServerCapabilities {
-            call_hierarchy_provider: Some(lsp_types::CallHierarchyServerCapability::Simple(true)),
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
         };
         let (translator, mut server) = translator_with_capabilities_and_encoding(

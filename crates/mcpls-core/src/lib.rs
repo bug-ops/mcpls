@@ -190,7 +190,7 @@ pub(crate) async fn diagnostics_pump(
                         if !diagnostic_path_in_workspace(&p.uri, &workspace_roots) {
                             debug!(
                                 "dropping diagnostics for out-of-workspace URI: {}",
-                                p.uri.as_str()
+                                p.uri.as_ref()
                             );
                             continue;
                         }
@@ -226,11 +226,11 @@ pub(crate) async fn diagnostics_pump(
                     }
                     LspNotification::LogMessage(m) => {
                         let mut cache = notification_cache.lock().await;
-                        cache.store_log(m.typ.into(), m.message);
+                        cache.store_log(m.kind.into(), m.message);
                     }
                     LspNotification::ShowMessage(m) => {
                         let mut cache = notification_cache.lock().await;
-                        cache.store_message(m.typ.into(), m.message);
+                        cache.store_message(m.kind.into(), m.message);
                     }
                     LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
                 }
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_path_in_workspace_empty_roots_allows_any_uri() {
-        let uri: Uri = "file:///anywhere/at/all.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///anywhere/at/all.rs");
         assert!(diagnostic_path_in_workspace(&uri, &[]));
     }
 
@@ -1076,7 +1076,7 @@ mod tests {
             PathBuf::from("/workspace/project"),
             "file:///workspace/project/src/main.rs",
         );
-        let uri: Uri = uri_str.parse().unwrap();
+        let uri: Uri = Uri::from(uri_str);
         assert!(diagnostic_path_in_workspace(&uri, &[root]));
     }
 
@@ -1089,14 +1089,14 @@ mod tests {
         );
         #[cfg(not(windows))]
         let (root, uri_str) = (PathBuf::from("/workspace/project"), "file:///etc/passwd");
-        let uri: Uri = uri_str.parse().unwrap();
+        let uri: Uri = Uri::from(uri_str);
         assert!(!diagnostic_path_in_workspace(&uri, &[root]));
     }
 
     #[test]
     fn test_diagnostic_path_in_workspace_rejects_non_file_uri() {
         let root = PathBuf::from("/workspace/project");
-        let uri: Uri = "untitled:Untitled-1".parse().unwrap();
+        let uri: Uri = Uri::from("untitled:Untitled-1");
         assert!(!diagnostic_path_in_workspace(&uri, &[root]));
     }
 
@@ -1116,7 +1116,7 @@ mod tests {
             PathBuf::from("/workspace/project"),
             "file:///workspace/project/../../etc/passwd",
         );
-        let uri: Uri = uri_str.parse().unwrap();
+        let uri: Uri = Uri::from(uri_str);
         assert!(!diagnostic_path_in_workspace(&uri, &[root]));
     }
 
@@ -2035,7 +2035,7 @@ mod tests {
                 },
             ));
 
-            let uri: Uri = "file:///test/main.rs".parse().unwrap();
+            let uri: Uri = Uri::from("file:///test/main.rs");
             tx.send(LspNotification::PublishDiagnostics(
                 PublishDiagnosticsParams {
                     uri: uri.clone(),
@@ -2053,7 +2053,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     let found = {
                         let guard = cache.lock().await;
-                        guard.get_diagnostics(uri.as_str()).is_some()
+                        guard.get_diagnostics(uri.as_ref()).is_some()
                     };
                     if found {
                         return true;
@@ -2107,8 +2107,8 @@ mod tests {
                 },
             ));
 
-            let outside_uri: Uri = outside_uri_str.parse().unwrap();
-            let inside_uri: Uri = inside_uri_str.parse().unwrap();
+            let outside_uri: Uri = Uri::from(outside_uri_str);
+            let inside_uri: Uri = Uri::from(inside_uri_str);
 
             tx.send(LspNotification::PublishDiagnostics(
                 PublishDiagnosticsParams {
@@ -2137,7 +2137,7 @@ mod tests {
                 loop {
                     {
                         let guard = cache.lock().await;
-                        if guard.get_diagnostics(inside_uri.as_str()).is_some() {
+                        if guard.get_diagnostics(inside_uri.as_ref()).is_some() {
                             return;
                         }
                     }
@@ -2150,7 +2150,7 @@ mod tests {
             let found_outside = cache
                 .lock()
                 .await
-                .get_diagnostics(outside_uri.as_str())
+                .get_diagnostics(outside_uri.as_ref())
                 .is_some();
             assert!(
                 !found_outside,
@@ -2255,7 +2255,7 @@ mod tests {
                 },
             ));
 
-            let uri: Uri = "file:///test/locked.rs".parse().unwrap();
+            let uri: Uri = Uri::from("file:///test/locked.rs");
             tx.send(LspNotification::PublishDiagnostics(
                 PublishDiagnosticsParams {
                     uri: uri.clone(),
@@ -2273,7 +2273,7 @@ mod tests {
                 loop {
                     {
                         let guard = cache.lock().await;
-                        if guard.get_diagnostics(uri.as_str()).is_some() {
+                        if guard.get_diagnostics(uri.as_ref()).is_some() {
                             return;
                         }
                     }

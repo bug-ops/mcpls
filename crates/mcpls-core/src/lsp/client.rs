@@ -405,6 +405,27 @@ impl LspClient {
         Err(Error::ServerTerminated)
     }
 
+    /// Send a typed LSP request, deriving both the method string and the
+    /// result type from `R`'s [`lsp_types::Request`] implementation so they
+    /// cannot drift independently -- unlike [`Self::request`], which takes
+    /// the method string and result type as two unchecked, hand-picked
+    /// values.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::request`].
+    pub async fn request_typed<R>(
+        &self,
+        params: R::Params,
+        timeout_duration: Duration,
+    ) -> Result<R::Result>
+    where
+        R: lsp_types::Request,
+    {
+        self.request(R::METHOD.as_str(), params, timeout_duration)
+            .await
+    }
+
     /// Returns true when the error data from a `ServerCancelled` (-32802) response
     /// indicates the server wants the client to retrigger the request.
     ///
@@ -617,7 +638,7 @@ impl LspClient {
                                 if let LspNotification::PublishDiagnostics(ref params) = typed {
                                     debug!(
                                         "Forwarding diagnostics for {}: {} items",
-                                        params.uri.as_str(),
+                                        params.uri.as_ref(),
                                         params.diagnostics.len()
                                     );
                                 } else {

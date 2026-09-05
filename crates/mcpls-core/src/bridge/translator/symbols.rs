@@ -118,7 +118,10 @@ impl Translator {
                 |caps| {
                     matches!(
                         caps.document_symbol_provider,
-                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                        Some(
+                            lsp_types::DocumentSymbolProvider::Bool(true)
+                                | lsp_types::DocumentSymbolProvider::DocumentSymbolOptions(_)
+                        )
                     )
                 },
             )
@@ -132,16 +135,12 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<lsp_types::DocumentSymbolResponse> = client
-            .request(
-                "textDocument/documentSymbol",
-                params,
-                client.request_timeout(),
-            )
+        let response = client
+            .request_typed::<lsp_types::DocumentSymbolRequest>(params, client.request_timeout())
             .await?;
 
         let symbols = match response {
-            Some(lsp_types::DocumentSymbolResponse::Flat(symbols)) => {
+            Some(lsp_types::DocumentSymbolResponse::SymbolInformationList(symbols)) => {
                 let mut result = Vec::with_capacity(symbols.len());
                 for sym in symbols {
                     let range = ctx
@@ -149,8 +148,8 @@ impl Translator {
                         .await;
                     let selection_range = range.clone();
                     result.push(Symbol {
-                        name: sym.name,
-                        kind: format!("{:?}", sym.kind),
+                        name: sym.base_symbol_information.name,
+                        kind: format!("{:?}", sym.base_symbol_information.kind),
                         range,
                         selection_range,
                         children: None,
@@ -158,7 +157,7 @@ impl Translator {
                 }
                 result
             }
-            Some(lsp_types::DocumentSymbolResponse::Nested(symbols)) => {
+            Some(lsp_types::DocumentSymbolResponse::DocumentSymbolList(symbols)) => {
                 let mut result = Vec::with_capacity(symbols.len());
                 for sym in symbols {
                     result.push(convert_document_symbol(sym, &ctx, &response_uri).await);
@@ -177,6 +176,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails, no server is configured, or
     /// the routed server does not advertise `workspaceSymbolProvider` support.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_workspace_symbol(
         &self,
         query: String,
@@ -223,7 +223,10 @@ impl Translator {
         self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
             matches!(
                 caps.workspace_symbol_provider,
-                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                Some(
+                    lsp_types::WorkspaceSymbolProvider::Bool(true)
+                        | lsp_types::WorkspaceSymbolProvider::WorkspaceSymbolOptions(_)
+                )
             )
         })?;
 
@@ -233,25 +236,54 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<Vec<lsp_types::SymbolInformation>> = client
-            .request("workspace/symbol", params, client.request_timeout())
+        let response = client
+            .request_typed::<lsp_types::WorkspaceSymbolRequest>(params, client.request_timeout())
             .await?;
 
         let ctx = self.encoding_ctx(&server_id);
         let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
-        for sym in response.unwrap_or_default() {
-            let range = ctx
-                .normalize_range(&sym.location.uri, sym.location.range)
-                .await;
-            symbols.push(WorkspaceSymbol {
-                name: sym.name,
-                kind: format!("{:?}", sym.kind),
-                location: Location {
-                    uri: sym.location.uri.to_string(),
-                    range,
-                },
-                container_name: sym.container_name,
-            });
+        match response {
+            Some(lsp_types::WorkspaceSymbolResponse::SymbolInformationList(list)) => {
+                for sym in list {
+                    let range = ctx
+                        .normalize_range(&sym.location.uri, sym.location.range)
+                        .await;
+                    symbols.push(WorkspaceSymbol {
+                        name: sym.base_symbol_information.name,
+                        kind: format!("{:?}", sym.base_symbol_information.kind),
+                        location: Location {
+                            uri: sym.location.uri.to_string(),
+                            range,
+                        },
+                        container_name: sym.base_symbol_information.container_name,
+                    });
+                }
+            }
+            Some(lsp_types::WorkspaceSymbolResponse::WorkspaceSymbolList(list)) => {
+                for sym in list {
+                    let (uri, range) = match sym.location {
+                        lsp_types::WorkspaceSymbolLocation::Location(loc) => {
+                            let range = ctx.normalize_range(&loc.uri, loc.range).await;
+                            (loc.uri.to_string(), range)
+                        }
+                        // `LocationUriOnly` carries no range -- the server
+                        // deliberately withheld it (e.g. to avoid computing it
+                        // eagerly for every workspace-search result). The MCP
+                        // `Location` DTO has no way to represent "no range", and
+                        // a fabricated range (e.g. line 1) would be
+                        // indistinguishable from a real symbol there, so the
+                        // symbol is dropped rather than inventing coordinates.
+                        lsp_types::WorkspaceSymbolLocation::LocationUriOnly(_) => continue,
+                    };
+                    symbols.push(WorkspaceSymbol {
+                        name: sym.base_symbol_information.name,
+                        kind: format!("{:?}", sym.base_symbol_information.kind),
+                        location: Location { uri, range },
+                        container_name: sym.base_symbol_information.container_name,
+                    });
+                }
+            }
+            None => {}
         }
 
         // Apply kind filter if specified
@@ -279,9 +311,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::bridge::translator::testing::{
-        read_framed_message, translator_with_capabilities, write_response,
-    };
+    use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
 
     #[tokio::test]
@@ -356,7 +386,7 @@ mod tests {
             &dir,
             &server_id,
             lsp_types::ServerCapabilities {
-                document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+                document_symbol_provider: Some(lsp_types::DocumentSymbolProvider::Bool(true)),
                 ..Default::default()
             },
         );
@@ -402,5 +432,78 @@ mod tests {
 
         assert_eq!(result.symbols.len(), 1);
         assert_eq!(result.symbols[0].range, result.symbols[0].selection_range);
+    }
+
+    /// S1/S4 regression: a `workspace/symbol` response in the newer
+    /// `WorkspaceSymbol[]` shape can mix `Location` (has a range) and
+    /// `LocationUriOnly` (no range) entries in the same response. The
+    /// range-less entry must be dropped, not given a fabricated coordinate
+    /// that would be indistinguishable from a real symbol at that position.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_drops_location_uri_only_entries() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_workspace_symbol("foo".to_string(), None, 100)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "workspace/symbol");
+
+        // Untagged `WorkspaceSymbolResponse` deserialization is all-or-nothing
+        // over the whole array: since `with_range`'s sibling below has no
+        // `location.range`, the array as a whole fails to deserialize as
+        // `Vec<SymbolInformation>` and falls through to `Vec<WorkspaceSymbol>`,
+        // where `with_range`'s location becomes `Location` and
+        // `without_range`'s becomes `LocationUriOnly`.
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([
+                {
+                    "name": "with_range",
+                    "kind": 12,
+                    "location": {
+                        "uri": "file:///a.rs",
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 5}
+                        }
+                    }
+                },
+                {
+                    "name": "without_range",
+                    "kind": 12,
+                    "location": { "uri": "file:///b.rs" }
+                }
+            ]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.symbols.len(),
+            1,
+            "the range-less LocationUriOnly symbol must be dropped, not fabricated"
+        );
+        assert_eq!(result.symbols[0].name, "with_range");
     }
 }

@@ -776,7 +776,7 @@ impl DocumentTracker {
                     DidOpenTextDocumentParams {
                         text_document: TextDocumentItem {
                             uri: uri.clone(),
-                            language_id,
+                            language_id: language_id.into(),
                             version: target_version,
                             text,
                         },
@@ -789,14 +789,16 @@ impl DocumentTracker {
                     "textDocument/didChange",
                     DidChangeTextDocumentParams {
                         text_document: VersionedTextDocumentIdentifier {
-                            uri: uri.clone(),
                             version: target_version,
+                            text_document_identifier: lsp_types::TextDocumentIdentifier {
+                                uri: uri.clone(),
+                            },
                         },
-                        content_changes: vec![TextDocumentContentChangeEvent {
-                            range: None,
-                            range_length: None,
-                            text,
-                        }],
+                        content_changes: vec![
+                            TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(
+                                lsp_types::TextDocumentContentChangeWholeDocument { text },
+                            ),
+                        ],
                     },
                 )
                 .await
@@ -939,7 +941,7 @@ pub fn path_to_uri(path: &Path) -> Result<Uri> {
 #[must_use]
 pub fn try_path_to_uri(path: &Path) -> Option<Uri> {
     let uri_string = encode_rfc3986_path_chars(&file_url(path)?);
-    uri_string.parse().ok()
+    Some(Uri::from(uri_string))
 }
 
 #[cfg(not(windows))]
@@ -994,7 +996,7 @@ pub(super) fn encode_rfc3986_path_chars(url: &Url) -> String {
 /// scheme, or contains percent-encoding that cannot map to a valid path.
 #[must_use]
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
-    let url = Url::parse(uri.as_str()).ok()?;
+    let url = Url::parse(uri.as_ref()).ok()?;
     if url.scheme() != "file" {
         return None;
     }
@@ -1262,7 +1264,7 @@ mod tests {
     #[test]
     fn test_document_state_clone() {
         let state = DocumentState {
-            uri: "file:///test.rs".parse().unwrap(),
+            uri: Uri::from("file:///test.rs"),
             language_id: "rust".to_string(),
             version: 5,
             content: "fn main() {}".to_string(),
@@ -1488,7 +1490,7 @@ mod tests {
             let path = Path::new("/home/user/project/main.rs");
             let uri = path_to_uri(path).unwrap();
             assert!(
-                uri.as_str()
+                uri.as_ref()
                     .starts_with("file:///home/user/project/main.rs")
             );
         }
@@ -1498,8 +1500,8 @@ mod tests {
     fn test_path_to_uri_with_special_chars() {
         let path = Path::new("/home/user/project-test/main.rs");
         let uri = path_to_uri(path).unwrap();
-        assert!(uri.as_str().starts_with("file://"));
-        assert!(uri.as_str().contains("project-test"));
+        assert!(uri.as_ref().starts_with("file://"));
+        assert!(uri.as_ref().contains("project-test"));
     }
 
     #[test]
@@ -1516,7 +1518,7 @@ mod tests {
         #[cfg(not(windows))]
         let expected = "file:///home/user/routes/api/%5B...%5D%5E%7C.ts";
 
-        assert_eq!(uri.as_str(), expected);
+        assert_eq!(uri.as_ref(), expected);
         assert_eq!(
             uri_to_path(&uri).as_deref(),
             Some(path),
@@ -1543,7 +1545,26 @@ mod tests {
     fn test_try_path_to_uri_encodes_synthetic_windows_root() {
         let uri = try_path_to_uri(Path::new("/home/user/#work %23")).unwrap();
 
-        assert_eq!(uri.as_str(), "file:///home/user/%23work%20%2523");
+        assert_eq!(uri.as_ref(), "file:///home/user/%23work%20%2523");
+    }
+
+    /// A rooted-but-not-absolute Windows path (`\foo`, no drive/UNC prefix)
+    /// satisfies `Path::has_root()` but not `Path::is_absolute()`.
+    /// `file_url`'s `#[cfg(windows)]` variant deliberately falls back to
+    /// `windows_rooted_path_to_file_url` on this exact case -- pinned here so
+    /// a future change to `try_path_to_uri` (e.g. swapping the fallible
+    /// `.parse()` this migration replaced for an `is_absolute()` guard)
+    /// cannot silently narrow this without failing a test.
+    #[cfg(windows)]
+    #[test]
+    fn test_try_path_to_uri_accepts_rooted_but_not_absolute_windows_path() {
+        let path = Path::new(r"\foo");
+        assert!(path.has_root());
+        assert!(!path.is_absolute());
+
+        let uri = try_path_to_uri(path).unwrap();
+
+        assert_eq!(uri.as_ref(), "file:///foo");
     }
 
     #[test]
@@ -1557,9 +1578,9 @@ mod tests {
         let uri = path_to_uri(path).unwrap();
 
         assert!(
-            uri.as_str().ends_with("%5Ba%5D.ts"),
+            uri.as_ref().ends_with("%5Ba%5D.ts"),
             "short path should percent-encode reserved chars, got {}",
-            uri.as_str()
+            uri.as_ref()
         );
         assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
     }
@@ -1575,7 +1596,7 @@ mod tests {
         let path = Path::new("/home/user/test[]^|{}`.ts");
 
         let uri = try_path_to_uri(path).unwrap();
-        let uri_str = uri.as_str();
+        let uri_str = uri.as_ref();
 
         for (raw, encoded) in [
             ('[', "%5B"),
@@ -1800,21 +1821,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_uri_to_path_file_scheme() {
-        let uri: Uri = "file:///home/user/main.rs".parse().unwrap();
+        let uri: Uri = Uri::from("file:///home/user/main.rs");
         let path = uri_to_path(&uri).unwrap();
         assert_eq!(path, PathBuf::from("/home/user/main.rs"));
     }
 
     #[test]
     fn test_uri_to_path_non_file_scheme_returns_none() {
-        let uri: Uri = "https://example.com/file.rs".parse().unwrap();
+        let uri: Uri = Uri::from("https://example.com/file.rs");
         assert!(uri_to_path(&uri).is_none());
     }
 
     #[test]
     fn test_uri_to_path_lsp_diagnostics_scheme_returns_none() {
         // Custom scheme must not be decoded by uri_to_path.
-        let uri: Uri = "lsp-diagnostics:///home/user/main.rs".parse().unwrap();
+        let uri: Uri = Uri::from("lsp-diagnostics:///home/user/main.rs");
         assert!(uri_to_path(&uri).is_none());
     }
 
@@ -1823,10 +1844,7 @@ mod tests {
         // Authority-bearing file URIs must be rejected (UNC path defence).
         // lsp_types::Uri may or may not accept this string; either way
         // uri_to_path should return None.
-        let result = "file://server/share/path.rs"
-            .parse::<Uri>()
-            .ok()
-            .and_then(|u| uri_to_path(&u));
+        let result = uri_to_path(&Uri::from("file://server/share/path.rs"));
         assert!(result.is_none());
     }
 

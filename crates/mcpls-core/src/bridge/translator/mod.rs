@@ -23,6 +23,8 @@ use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
 mod assist;
 mod call_hierarchy;
+#[cfg(test)]
+mod characterization;
 mod clock;
 mod diagnostics;
 mod dto;

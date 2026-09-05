@@ -3,7 +3,7 @@
 use lsp_types::{
     DocumentFormattingParams, FormattingOptions, PartialResultParams,
     RenameParams as LspRenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
-    WorkDoneProgressParams, WorkspaceEdit,
+    WorkDoneProgressParams,
 };
 
 use super::Translator;
@@ -161,7 +161,7 @@ async fn convert_code_action(
 
     CodeAction {
         title: action.title,
-        kind: action.kind.map(|k| k.as_str().to_string()),
+        kind: action.kind.map(String::from),
         diagnostics,
         edit,
         command,
@@ -190,7 +190,10 @@ impl Translator {
             .prepare_gated_document(&file_path, ToolKind::Rename, "renameProvider", |caps| {
                 matches!(
                     caps.rename_provider,
-                    Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                    Some(
+                        lsp_types::RenameProvider::Bool(true)
+                            | lsp_types::RenameProvider::RenameOptions(_)
+                    )
                 )
             })
             .await?;
@@ -198,7 +201,7 @@ impl Translator {
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
 
         let params = LspRenameParams {
-            text_document_position: TextDocumentPositionParams {
+            text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
                 position: lsp_position,
             },
@@ -206,8 +209,8 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let response: Option<WorkspaceEdit> = client
-            .request("textDocument/rename", params, client.request_timeout())
+        let response = client
+            .request_typed::<lsp_types::RenameRequest>(params, client.request_timeout())
             .await?;
 
         let changes = if let Some(edit) = response {
@@ -232,31 +235,43 @@ impl Translator {
 
             // Also handle `documentChanges` (array format returned by rust-analyzer).
             if result_changes.is_empty() {
-                let text_doc_edits = match edit.document_changes {
-                    Some(lsp_types::DocumentChanges::Edits(edits)) => edits,
-                    Some(lsp_types::DocumentChanges::Operations(ops)) => ops
-                        .into_iter()
-                        .filter_map(|op| match op {
-                            lsp_types::DocumentChangeOperation::Edit(e) => Some(e),
-                            lsp_types::DocumentChangeOperation::Op(_) => None,
-                        })
-                        .collect(),
-                    None => vec![],
-                };
+                let text_doc_edits: Vec<lsp_types::TextDocumentEdit> = edit
+                    .document_changes
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|change| match change {
+                        lsp_types::DocumentChange::TextDocumentEdit(e) => Some(e),
+                        lsp_types::DocumentChange::CreateFile(_)
+                        | lsp_types::DocumentChange::RenameFile(_)
+                        | lsp_types::DocumentChange::DeleteFile(_) => None,
+                    })
+                    .collect();
                 for tde in text_doc_edits {
-                    let edit_uri = &tde.text_document.uri;
+                    let edit_uri = &tde.text_document.text_document_identifier.uri;
                     let mut text_edits = Vec::with_capacity(tde.edits.len());
                     for one_of in tde.edits {
-                        text_edits.push(match one_of {
-                            lsp_types::OneOf::Left(te) => TextEdit {
+                        let text_edit = match one_of {
+                            lsp_types::Edit::TextEdit(te) => TextEdit {
                                 range: ctx.normalize_range(edit_uri, te.range).await,
                                 new_text: te.new_text,
                             },
-                            lsp_types::OneOf::Right(ate) => TextEdit {
+                            lsp_types::Edit::AnnotatedTextEdit(ate) => TextEdit {
                                 range: ctx.normalize_range(edit_uri, ate.text_edit.range).await,
                                 new_text: ate.text_edit.new_text,
                             },
-                        });
+                            // Snippet edits are an LSP 3.18 addition mcpls does not
+                            // advertise support for (`WorkspaceEditClientCapabilities`
+                            // carries no `snippetEditSupport`). A server can still send
+                            // one; its `new_text` would carry literal snippet
+                            // placeholder syntax (e.g. `${1:name}`), which would be
+                            // written into the user's file as-is if treated as plain
+                            // text -- this is the one tool that rewrites files, so the
+                            // edit is dropped instead, consistent with how
+                            // `CreateFile`/`RenameFile`/`DeleteFile` are already
+                            // dropped above rather than mistranslated.
+                            lsp_types::Edit::SnippetTextEdit(_) => continue,
+                        };
+                        text_edits.push(text_edit);
                     }
                     result_changes.push(DocumentChanges {
                         uri: edit_uri.to_string(),
@@ -293,7 +308,12 @@ impl Translator {
                 |caps| {
                     matches!(
                         caps.document_formatting_provider,
-                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                        Some(
+                            lsp_types::DocumentFormattingProvider::Bool(true)
+                                | lsp_types::DocumentFormattingProvider::DocumentFormattingOptions(
+                                    _
+                                )
+                        )
                     )
                 },
             )
@@ -311,8 +331,8 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let response: Option<Vec<lsp_types::TextEdit>> = client
-            .request("textDocument/formatting", params, client.request_timeout())
+        let response = client
+            .request_typed::<lsp_types::DocumentFormattingRequest>(params, client.request_timeout())
             .await?;
 
         let edits = response.unwrap_or_default();
@@ -355,8 +375,8 @@ impl Translator {
                     matches!(
                         caps.code_action_provider,
                         Some(
-                            lsp_types::CodeActionProviderCapability::Simple(true)
-                                | lsp_types::CodeActionProviderCapability::Options(_)
+                            lsp_types::CodeActionProvider::Bool(true)
+                                | lsp_types::CodeActionProvider::CodeActionOptions(_)
                         )
                     )
                 },
@@ -385,24 +405,24 @@ impl Translator {
             context: lsp_types::CodeActionContext {
                 diagnostics: context_diagnostics,
                 only,
-                trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
+                trigger_kind: Some(lsp_types::CodeActionTriggerKind::Invoked),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<lsp_types::CodeActionResponse> = client
-            .request("textDocument/codeAction", params, client.request_timeout())
+        let response = client
+            .request_typed::<lsp_types::CodeActionRequest>(params, client.request_timeout())
             .await?;
         let response_vec = response.unwrap_or_default();
         let mut actions = Vec::with_capacity(response_vec.len());
 
         for action_or_command in response_vec {
             let action = match action_or_command {
-                lsp_types::CodeActionOrCommand::CodeAction(action) => {
+                lsp_types::CodeActionResponse::CodeAction(action) => {
                     convert_code_action(action, &ctx, &response_uri).await
                 }
-                lsp_types::CodeActionOrCommand::Command(cmd) => {
+                lsp_types::CodeActionResponse::Command(cmd) => {
                     let arguments = cmd.arguments.unwrap_or_else(Vec::new);
                     CodeAction {
                         title: cmd.title.clone(),
@@ -433,6 +453,105 @@ mod tests {
     use super::*;
     use crate::bridge::translator::dto::DiagnosticSeverity;
     use crate::bridge::translator::testing::*;
+
+    /// S2/S4 regression: a `documentChanges` entry mixing a plain `TextEdit`
+    /// with an `Edit::SnippetTextEdit` (LSP 3.18, reachable even though mcpls
+    /// advertises no `snippetEditSupport`) must drop the snippet edit rather
+    /// than pass its literal placeholder syntax (`${1:...}`) through as
+    /// ordinary replacement text -- `handle_rename` is the one tool that
+    /// rewrites the user's files.
+    #[tokio::test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    async fn test_handle_rename_drops_snippet_text_edit_and_keeps_plain_edits() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::time::timeout;
+        use url::Url;
+
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let file_path = dir.path().join("main.rs");
+        fs::write(&file_path, "fn old_name() {}").unwrap();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = file_path.to_str().unwrap().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(path, 1, 4, "new_name".to_string())
+                    .await
+            })
+        };
+
+        let file_uri = Url::from_file_path(&file_path).unwrap().to_string();
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/rename");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!({
+                "documentChanges": [
+                    {
+                        "textDocument": { "uri": file_uri, "version": 1 },
+                        "edits": [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 3},
+                                    "end": {"line": 0, "character": 11}
+                                },
+                                "newText": "new_name"
+                            },
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 0}
+                                },
+                                "snippet": { "value": "${1:comment}\n", "kind": "snippet" }
+                            }
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(
+            result.changes[0].edits.len(),
+            1,
+            "the snippet edit must be dropped, not converted to literal text"
+        );
+        assert_eq!(result.changes[0].edits[0].new_text, "new_name");
+        assert!(
+            !result.changes[0]
+                .edits
+                .iter()
+                .any(|e| e.new_text.contains("${1:comment}")),
+            "snippet placeholder syntax must never appear as literal replacement text"
+        );
+    }
 
     /// #309: `new_name` has no inherent bound of its own and is forwarded to
     /// the LSP server as-is, so it must be rejected before that happens.
@@ -670,6 +789,7 @@ mod tests {
             command: None,
             is_preferred: None,
             disabled: None,
+            tags: None,
             data: None,
         };
 
@@ -697,9 +817,9 @@ mod tests {
                         character: 5,
                     },
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-                message: "Error message".to_string(),
-                code: Some(lsp_types::NumberOrString::Number(1)),
+                severity: Some(lsp_types::DiagnosticSeverity::Error),
+                message: "Error message".to_string().into(),
+                code: Some(lsp_types::Code::Int(1)),
                 source: None,
                 code_description: None,
                 related_information: None,
@@ -717,9 +837,9 @@ mod tests {
                         character: 5,
                     },
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
-                message: "Warning message".to_string(),
-                code: Some(lsp_types::NumberOrString::String("W001".to_string())),
+                severity: Some(lsp_types::DiagnosticSeverity::Warning),
+                message: "Warning message".to_string().into(),
+                code: Some(lsp_types::Code::String("W001".to_string())),
                 source: None,
                 code_description: None,
                 related_information: None,
@@ -737,8 +857,8 @@ mod tests {
                         character: 5,
                     },
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::INFORMATION),
-                message: "Info message".to_string(),
+                severity: Some(lsp_types::DiagnosticSeverity::Information),
+                message: "Info message".to_string().into(),
                 code: None,
                 source: None,
                 code_description: None,
@@ -757,8 +877,8 @@ mod tests {
                         character: 5,
                     },
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::HINT),
-                message: "Hint message".to_string(),
+                severity: Some(lsp_types::DiagnosticSeverity::Hint),
+                message: "Hint message".to_string().into(),
                 code: None,
                 source: None,
                 code_description: None,
@@ -770,12 +890,13 @@ mod tests {
 
         let lsp_action = lsp_types::CodeAction {
             title: "Fix all issues".to_string(),
-            kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+            kind: Some(lsp_types::CodeActionKind::QuickFix),
             diagnostics: Some(lsp_diagnostics),
             edit: None,
             command: None,
             is_preferred: None,
             disabled: None,
+            tags: None,
             data: None,
         };
 
@@ -805,9 +926,8 @@ mod tests {
     #[allow(clippy::mutable_key_type)]
     async fn test_convert_code_action_with_workspace_edit() {
         use std::collections::HashMap;
-        use std::str::FromStr;
 
-        let uri = lsp_types::Uri::from_str("file:///test.rs").unwrap();
+        let uri = lsp_types::Uri::from("file:///test.rs");
         let mut changes_map = HashMap::new();
         changes_map.insert(
             uri,
@@ -828,7 +948,7 @@ mod tests {
 
         let lsp_action = lsp_types::CodeAction {
             title: "Apply fix".to_string(),
-            kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+            kind: Some(lsp_types::CodeActionKind::QuickFix),
             diagnostics: None,
             edit: Some(lsp_types::WorkspaceEdit {
                 changes: Some(changes_map),
@@ -838,6 +958,7 @@ mod tests {
             command: None,
             is_preferred: Some(true),
             disabled: None,
+            tags: None,
             data: None,
         };
 
@@ -855,16 +976,18 @@ mod tests {
     async fn test_convert_code_action_with_command() {
         let lsp_action = lsp_types::CodeAction {
             title: "Run command".to_string(),
-            kind: Some(lsp_types::CodeActionKind::REFACTOR),
+            kind: Some(lsp_types::CodeActionKind::Refactor),
             diagnostics: None,
             edit: None,
             command: Some(lsp_types::Command {
                 title: "Execute refactor".to_string(),
                 command: "refactor.extract".to_string(),
                 arguments: Some(vec![serde_json::json!("arg1"), serde_json::json!(42)]),
+                tooltip: None,
             }),
             is_preferred: None,
             disabled: None,
+            tags: None,
             data: None,
         };
 
