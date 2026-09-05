@@ -92,6 +92,11 @@ pub trait Greet {
 pub struct CodeActionTarget;
 
 // split to multi-line so RA can offer "implement missing members" inside the block
+//
+// Also relied upon by `test_diagnostics_with_error` (rust_analyzer_tests.rs),
+// which asserts on the E0046 "not all trait items implemented" diagnostic
+// this empty impl produces. Don't fill in `hello()` without checking that
+// test first.
 impl Greet for CodeActionTarget {
 }
 
