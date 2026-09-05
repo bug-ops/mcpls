@@ -9,7 +9,7 @@ tags:
   - dependency-health
   - lsp
 created: 2026-08-05
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[bridge/001-position-encoding-layer/spec]]"
@@ -19,7 +19,7 @@ related:
 
 > [!info] Metadata
 > **Author**: rust-researcher (filed from dependency-health research cycle)
-> **Branch**: n/a (research spec — no implementation branch yet)
+> **Branch**: `feat/issue-297/lsp-types-upstream-gluon-lang`
 > **Type**: research / dependency-health
 > **Priority**: P2
 
@@ -28,6 +28,104 @@ related:
 > dependency) and the case for migrating to a maintained fork. It intentionally
 > does NOT prescribe a step-by-step migration plan — that belongs in a future
 > `/sdd plan` once the decision to migrate is confirmed and the API diff is known.
+> The research finding below (Sections 1-9) is kept exactly as originally written
+> per this project's spec-writing convention of preserving research history rather
+> than overwriting it. See the Resolution callout immediately below for what
+> actually happened, and Section 9 for how each original open question resolved.
+
+> [!success] Resolution
+> This spec's original target — migrating to `ls-types` — was **not** what shipped.
+> During the migration session (2026-09-05), further research found `ls-types`
+> itself archived and superseded (`gh api repos/tower-lsp-community/ls-types` →
+> `"archived": true`, last push 2026-08-15; its own README states *"This crate
+> was superseded by [gen-lsp-types]"*; `tower-lsp-server`'s own main branch had
+> already left `ls-types` for `gen-lsp-types`, even though its last tagged release
+> v0.23.0 still pinned `ls-types ^0.0`). The migration was retargeted mid-session
+> to **`gen-lsp-types` 0.11.0** (`ribru17/gen-lsp-types` — actively maintained, not
+> archived, MIT, LSP 3.18 metamodel-generated) instead, with maintainer approval
+> to proceed past this spec's original "research only, ask first" boundary
+> (Section 8).
+>
+> Landed in commits `8f61f56` (`build(deps): migrate lsp-types to gen-lsp-types
+> 0.11.0`) and `70a7635` (`fix(bridge): update rename test call site for Position
+> struct API`) on this branch, closing #297. A PR had not yet been opened at the
+> time this spec was updated.
+>
+> The dependency swap used Cargo's package-rename mechanism
+> (`lsp-types = { package = "gen-lsp-types", version = "=0.11.0" }`), so every
+> `lsp_types::` import path in the codebase is **unchanged** — this was confirmed
+> to work identically for both the rejected `ls-types` attempt and the final
+> `gen-lsp-types` landing (see Section 9, Open Questions, for the full resolution).
+>
+> The implementation went through a full architect-plan → critic-review (two
+> rounds) → developer-implementation → tester/security/critic-validation → fix
+> cycle before merge-readiness. The first plan draft mapped `GotoDefinitionResponse`
+> to the wrong `gen-lsp-types` type (`Definition` instead of the correct
+> `DefinitionResponse`), which would have silently broken goto-definition,
+> go-to-implementation, and go-to-type-definition at runtime with zero compile
+> errors — the revised plan closed this whole bug class by adding
+> `LspClient::request_typed<R: lsp_types::Request>`, a helper that binds both the
+> JSON-RPC method string and the expected result type to a single `Request` trait
+> implementation, so a call site can no longer pair a mismatched method and type.
+> A second critic round found one more real gap (the `textDocument/diagnostic`
+> `Partial`-response shape needed hand-rolled handling to preserve current
+> behavior, since binding it to `R::Result` alone would drop that arm) — the
+> implementation preserved it. Post-implementation validation (tester, security,
+> and an adversarial-critic pass run in parallel, followed by a fix pass) found
+> two further real gaps, both since fixed: `search_workspace_symbols` was
+> fabricating a `(1,1)` placeholder range for range-less server responses, and
+> `rename_symbol` could silently write literal LSP-3.18 snippet placeholder
+> syntax (e.g. `${1:name}`) into a user's file. Both are now dropped instead,
+> consistent with how `CreateFile`/`RenameFile`/`DeleteFile` are already dropped
+> elsewhere in the same conversion path.
+>
+> All gates were green both before and after rebasing onto main: `cargo +nightly
+> fmt --check`, `cargo clippy --all-targets --all-features --workspace -- -D
+> warnings`, `cargo nextest run --workspace --all-features --lib --bins` (758/758),
+> `cargo test --doc`, the rustdoc gate (`RUSTDOCFLAGS="--deny
+> rustdoc::broken_intra_doc_links" cargo doc --no-deps`), `cargo tree`, and
+> `cargo deny check`. A dedicated security audit found the migration
+> security-neutral-to-positive (net dependency reduction: `+gen-lsp-types`,
+> `-lsp-types`, `-fluent-uri`, `-bitflags 1.3.2`, `-serde_repr`; zero new
+> vulnerabilities; zero new `unsafe`) and empirically proved that the one
+> validation-related behavior change (see below) is not a security weakening.
+>
+> **This spec's own FR-003 ("pass the full existing test suite ... without
+> behavioral changes attributable to the type-library swap alone") was NOT fully
+> honored, and this is being stated plainly rather than glossed over.** Three
+> real, deliberate, user-visible behavior changes ship with this migration (full
+> wording in `CHANGELOG.md`'s `[Unreleased]` section):
+> 1. A malformed `uri` field in an MCP call-hierarchy request now surfaces as
+>    `Error::FileIo` instead of the old `InvalidToolParams` — because
+>    `gen-lsp-types`'s `Uri` is an opaque string with an infallible constructor
+>    (no validating parse), where `gluon-lang/lsp-types`'s `Uri` (via
+>    `fluent-uri`) rejected malformed strings at deserialization time. Judged
+>    acceptable: the security audit proved the old check was a character-class
+>    syntax check only — it never blocked path traversal, percent-encoded
+>    traversal, or authority confusion, and the real defenses
+>    (`validate_path_against_roots`'s `canonicalize()` + workspace-root
+>    containment, and `uri_to_path`'s strict `url::Url::parse`) are unchanged and
+>    run before any filesystem access.
+> 2. `search_workspace_symbols` now drops symbols the server reported without a
+>    location range, instead of fabricating a `(1,1)` placeholder location for
+>    them. Judged acceptable: `gluon-lang/lsp-types` could not even represent
+>    this shape (the equivalent pre-migration payload failed to deserialize), so
+>    dropping the entry is closer to the pre-migration failure mode than
+>    fabricating a coordinate a client cannot distinguish from a real one.
+> 3. `rename_symbol` now silently drops any LSP-3.18 snippet-shaped edit,
+>    instead of passing its literal placeholder syntax (e.g. `${1:name}`) through
+>    as plain replacement text. Judged acceptable: the same function already
+>    drops `CreateFile`/`RenameFile`/`DeleteFile` edits it cannot represent; this
+>    is the only one of three possible responses (keep as literal text, drop, or
+>    hard error) that cannot silently corrupt a user's file, and matches the
+>    existing drop precedent in the same conversion.
+>
+> By contrast, **FR-002 (preserve `bridge/encoding.rs` position-encoding behavior
+> with no regression) was fully honored** — this file, and the critical
+> position-encoding path it implements, is untouched by the migration diff
+> (independently re-verified twice: by static diff review and by a differential
+> JSON probe comparing `initialize` params byte-for-byte between the two
+> dependency versions).
 
 ## 1. Overview
 
@@ -213,10 +311,16 @@ outcome, not implementation completion.
 
 ## 9. Open Questions
 
+All four questions below are now resolved by the completed migration (2026-09-05); each original question is kept verbatim, with its resolution appended, per this project's convention of preserving research history rather than overwriting it.
+
 - [NEEDS CLARIFICATION: Exact API diff between `lsp-types 0.97.0` and the current `ls-types` release has not been performed. Needs a symbol-level comparison (types, trait impls, feature flags) scoped to what mcpls actually imports in `crates/mcpls-core/src/lsp/` and `crates/mcpls-core/src/bridge/` before any migration plan is written.]
+  **Resolved:** Performed twice — once against `ls-types 0.0.6` (before it was rejected as archived) and once against the final target `gen-lsp-types 0.11.0`. The `gen-lsp-types` diff found: 4 removed `pub` fields, 1 relocated struct (`WorkDoneProgressOptions`, unchanged shape), a `GotoDefinitionResponse` → `DefinitionResponse` rename with an inverted-but-compatible variant order, `WorkspaceEdit.document_changes`'s `DocumentChanges` enum collapsing into `Vec<DocumentChange>`, `HoverContents` → `Contents` with reordered (but disjoint) union variants, and several field/type renames not touched by mcpls's actual usage (`NotebookCellKind`, `ReferencesOptions`→`ReferenceOptions`, `WorkspaceClientCapabilities.diagnostic`→`.diagnostics`, `DeleteFileOptions.annotation_id`→`DeleteFile.annotation_id`). All were verified via `cargo check` against the real dependency, not documentation alone, and again via a differential runtime probe comparing serialized JSON between the two crate versions for mcpls's exact construction paths.
 - [NEEDS CLARIFICATION: Which `ls-types` version/tag should mcpls target? Not yet pinned down — needs checking crates.io or the `tower-lsp-community/ls-types` repo for its latest published release compatible with LSP 3.17 stable.]
+  **Resolved:** `ls-types` was not adopted at any version. `ls-types 0.0.6` (crates.io, last released 2026-03-08) was the first candidate, but review found the `tower-lsp-community/ls-types` GitHub repo itself archived (`"archived": true`, last push 2026-08-15) and its README stating it was superseded by `gen-lsp-types`. The migration instead targets `gen-lsp-types 0.11.0` (`ribru17/gen-lsp-types`, actively maintained, pushed 2026-09-02 at time of review), pinned exactly (`version = "=0.11.0"`, no optional features enabled).
 - [NEEDS CLARIFICATION: Does `ls-types` publish to crates.io under a different crate name (e.g. `ls-types`) requiring a rename of the `lsp_types::` import path throughout mcpls, or does it re-export under the same `lsp_types` namespace for easier swapping? This directly affects migration blast radius across `crates/mcpls-core/src/lsp/` and `crates/mcpls-core/src/bridge/`.]
+  **Resolved:** Neither `ls-types` nor `gen-lsp-types` re-exports under the `lsp_types` crate name; both publish under their own name. Cargo's package-rename syntax (`lsp-types = { package = "gen-lsp-types", version = "=0.11.0" }` in `Cargo.toml`) keeps every `use lsp_types::...` import path in the codebase unchanged, avoiding the blast radius this question anticipated. Confirmed working identically for both the rejected `ls-types` attempt and the final `gen-lsp-types` landing — this trick is not specific to either crate and would apply to a future re-migration the same way.
 - [NEEDS CLARIFICATION: Should this migration be bundled with any other dependency-health cleanup in the same PR, or land as an isolated, easily-revertible commit given it touches the critical position-encoding path? Recommend isolated, given the project's emphasis on graceful degradation and the sensitivity of `bridge/encoding.rs`.]
+  **Resolved:** Landed isolated, matching the original recommendation — two commits (`8f61f56`, `70a7635`) dedicated solely to this migration, no unrelated dependency-health cleanup bundled in. `bridge/encoding.rs` itself is untouched by the diff (verified both by static review and by a differential JSON probe of `initialize` params).
 
 ## 10. See Also
 
