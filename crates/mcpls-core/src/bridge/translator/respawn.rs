@@ -211,7 +211,16 @@ impl Translator {
     /// handle) live in `serve_with`'s scope, not the translator's, so
     /// reconnecting live push for a respawned server is out of scope for
     /// this fix -- it does not resume until the whole mcpls process
-    /// restarts, but stale data is no longer served as current.
+    /// restarts, but stale data is no longer served as current. For the
+    /// diagnostics-route server specifically (the only one whose push
+    /// notifications were ever cached to begin with -- see
+    /// `diagnostics_pump`'s `caches_diagnostics` gate), this is logged
+    /// (`tracing::warn!`) and recorded via
+    /// [`crate::bridge::NotificationCache::mark_push_degraded`] so
+    /// `get_cached_diagnostics`/`read_resource` can flag their result as
+    /// potentially stale rather than only being visible in logs (#359); a
+    /// respawned non-route server gets neither, since its notifications
+    /// were already discarded before this fix.
     ///
     /// A crash-looping server (repeated respawn failures) backs off
     /// exponentially (`RESPAWN_BACKOFF_BASE` up to `RESPAWN_BACKOFF_MAX`)
@@ -225,7 +234,7 @@ impl Translator {
     /// window. Returns whatever error `LspServer::spawn` produced (e.g. its
     /// command is no longer on `PATH`, or `initialize` fails again) if an
     /// actual respawn attempt failed.
-    pub(super) async fn respawn_if_dead(&self, id: &ServerId) -> Result<()> {
+    pub(crate) async fn respawn_if_dead(&self, id: &ServerId) -> Result<()> {
         if !self.is_server_dead(id) {
             return Ok(());
         }
@@ -304,7 +313,20 @@ impl Translator {
         if self.is_diagnostics_route(&language_id, id)
             && let Some(cache) = &self.notification_cache
         {
-            cache.lock().await.clear_server_diagnostics(id);
+            tracing::warn!(
+                "LSP server '{id}' (language '{language_id}') respawned; its diagnostics push \
+                 notifications are discarded rather than cached until the mcpls process is \
+                 restarted"
+            );
+            let mut cache = cache.lock().await;
+            cache.clear_server_diagnostics(id);
+            // The replacement's own push notifications are discarded (see
+            // the warn log above and this method's doc), so this server's
+            // cache entries can never be refreshed again by a push -- mark
+            // it degraded so callers like `get_cached_diagnostics` can flag
+            // a cache-only result as potentially stale instead of presenting
+            // it as current.
+            cache.mark_push_degraded(id);
         }
 
         if let Some(old_client) = old_client {
@@ -832,6 +854,15 @@ fi
                 "a different diagnostics-route server's entries must survive \
                  an unrelated server's respawn-triggered cache clear"
             );
+            assert!(
+                guard.is_push_degraded(&id),
+                "#359: the respawned diagnostics-route server must be marked as \
+                 push-degraded, since its replacement's notifications are discarded"
+            );
+            assert!(
+                !guard.is_push_degraded(&ServerId::from("python")),
+                "an unrelated, never-respawned server must not be marked degraded"
+            );
             drop(guard);
         }
 
@@ -920,6 +951,11 @@ fi
                     .is_some(),
                 "respawning a non-diagnostics-route server must not clear \
                  the diagnostics-route server's cache entries"
+            );
+            assert!(
+                !cache.lock().await.is_push_degraded(&hover_id),
+                "#359: respawning a server that is not the diagnostics route \
+                 must not mark it push-degraded either"
             );
         }
 

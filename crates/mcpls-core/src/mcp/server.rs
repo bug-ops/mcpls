@@ -3,7 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -26,8 +26,8 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    DiagnosticInfo, NotificationCache, PositionEncoding, ResourceSubscriptions, Translator,
-    validate_path_against_roots,
+    DiagnosticInfo, DiagnosticsResult, NotificationCache, PositionEncoding, ResourceSubscriptions,
+    Translator, validate_path_against_roots,
 };
 use crate::config::McpConfig;
 
@@ -47,6 +47,35 @@ const DEFAULT_INSTRUCTIONS: &str = concat!(
     "Supports hover, definition, references, diagnostics, rename, ",
     "completions, symbols, and formatting."
 );
+
+/// Response shape for the `get_cached_diagnostics` tool.
+///
+/// Wraps `DiagnosticsResult` (shared with the pull-model `get_diagnostics`
+/// handler) with a flag specific to the cache-only read: whether the file's
+/// *diagnostics-route* server (resolved via
+/// `Translator::diagnostics_route_id_for_path` from the file's detected
+/// language, independent of the cache entry's own `diagnostics_owner`)
+/// crashed and was respawned since it last published. `Translator::respawn_if_dead`
+/// discards a respawned server's push notifications rather than reconnecting
+/// them to a live `diagnostics_pump` (#359), so a cache entry from before
+/// the crash can never be refreshed by a later push -- this makes that
+/// degradation visible to the caller instead of only appearing in server
+/// logs. Deliberately not keyed on `diagnostics_owner`: a respawn clears
+/// that ownership record for the crashed server's entries in the same step
+/// that marks it degraded, so a flag derived from ownership would always
+/// read back `false` for the exact case it exists to catch.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedDiagnosticsResponse {
+    #[serde(flatten)]
+    result: DiagnosticsResult,
+    /// `true` if the file's diagnostics-route server's push notifications
+    /// are known to be dark (see
+    /// [`crate::bridge::NotificationCache::is_push_degraded`]); `false` both
+    /// when that server is healthy and when no route is configured for the
+    /// file's language at all.
+    push_notifications_degraded: bool,
+}
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -137,19 +166,32 @@ fn paginate_resource_paths<'a>(
 /// `None` both when untracked and when tracked but nothing has been
 /// published yet. `uri` is deliberately omitted: the caller already knows it
 /// (it's the resource they requested).
+///
+/// `push_notifications_degraded` mirrors `get_cached_diagnostics`'s field of
+/// the same name (#359): `true` when the file's diagnostics-route server
+/// crashed and was respawned, so `subscribe`'s replay and the pump's
+/// `notify_resource_updated` calls for it have gone dark until the whole
+/// mcpls process restarts, same as this cache-only read.
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ResourceDiagnosticsResponse {
     tracked: bool,
     version: Option<i32>,
     diagnostics: Vec<lsp_types::Diagnostic>,
+    push_notifications_degraded: bool,
 }
 
 impl ResourceDiagnosticsResponse {
-    fn new(tracked: bool, entry: Option<&DiagnosticInfo>) -> Self {
+    fn new(
+        tracked: bool,
+        entry: Option<&DiagnosticInfo>,
+        push_notifications_degraded: bool,
+    ) -> Self {
         Self {
             tracked,
             version: entry.and_then(|e| e.version),
             diagnostics: entry.map(|e| e.diagnostics.clone()).unwrap_or_default(),
+            push_notifications_degraded,
         }
     }
 }
@@ -166,8 +208,13 @@ impl ResourceDiagnosticsResponse {
 fn build_resource_diagnostics_response(
     document_open: bool,
     entry: Option<&DiagnosticInfo>,
+    push_notifications_degraded: bool,
 ) -> ResourceDiagnosticsResponse {
-    ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry)
+    ResourceDiagnosticsResponse::new(
+        document_open || entry.is_some(),
+        entry,
+        push_notifications_degraded,
+    )
 }
 
 #[tool_router(router = declared_tool_router)]
@@ -515,25 +562,41 @@ impl McplsServer {
         let result =
             match Translator::cached_diagnostics_uri(&self.context.workspace_roots, &file_path) {
                 Ok(uri) => {
+                    // Resolved independently of the cache lookup below: a
+                    // respawn clears `diagnostics_owner` for this server's
+                    // entries along with its stale diagnostics (#359), so
+                    // the degraded flag can't be keyed on ownership -- the
+                    // routing identity is what stays stable across a
+                    // respawn.
+                    let route_id = self
+                        .context
+                        .translator
+                        .diagnostics_route_id_for_path(Path::new(&file_path));
+
                     // Lock only long enough for the map lookup + clone: no
                     // canonicalize() or Vec mapping while `notification_cache`
                     // is held, since `diagnostics_pump` needs the same lock.
-                    let (diag_info, owner) = {
+                    let (diag_info, owner, push_degraded) = {
                         let cache = self.context.notification_cache.lock().await;
-                        (
-                            cache.get_diagnostics(&uri).cloned(),
-                            cache.diagnostics_owner(&uri).cloned(),
-                        )
+                        let owner = cache.diagnostics_owner(&uri).cloned();
+                        let push_degraded = route_id
+                            .as_ref()
+                            .is_some_and(|id| cache.is_push_degraded(id));
+                        (cache.get_diagnostics(&uri).cloned(), owner, push_degraded)
                     };
                     let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
                         self.context.translator.position_encoding_for(&server_id)
                     });
-                    Ok(Translator::diagnostics_from_cache_entry(
+                    let result = Translator::diagnostics_from_cache_entry(
                         diag_info.as_ref(),
                         encoding,
                         self.context.translator.document_tracker(),
                     )
-                    .await)
+                    .await;
+                    Ok(CachedDiagnosticsResponse {
+                        result,
+                        push_notifications_degraded: push_degraded,
+                    })
                 }
                 Err(e) => Err(e),
             };
@@ -737,15 +800,28 @@ impl ServerHandler for McplsServer {
         let lsp_uri = crate::bridge::path_to_uri(&validated_path)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
+        // Resolved independently of the cache lookup below -- see the same
+        // reasoning on `get_cached_diagnostics` (#359): a respawn clears
+        // `diagnostics_owner` for the crashed server's entries, so the
+        // degraded flag can't be keyed on cache ownership.
+        let route_id = self
+            .context
+            .translator
+            .diagnostics_route_id_for_path(&validated_path);
+
         // Built from a borrow of the cache entry rather than `.cloned()`-ing the
         // whole `DiagnosticInfo` first: `build_resource_diagnostics_response`
         // only ever needs `version` (Copy) and its own clone of `diagnostics`,
         // so cloning the entry up front would clone `diagnostics` twice.
         let response = {
             let cache = self.context.notification_cache.lock().await;
+            let push_degraded = route_id
+                .as_ref()
+                .is_some_and(|id| cache.is_push_degraded(id));
             build_resource_diagnostics_response(
                 self.context.translator.is_document_open(&validated_path),
                 cache.get_diagnostics(lsp_uri.as_str()),
+                push_degraded,
             )
         };
 
@@ -1429,6 +1505,210 @@ mod tests {
         );
     }
 
+    /// #359: `get_cached_diagnostics` must surface `pushNotificationsDegraded`
+    /// when the cached entry's owning server was marked degraded (respawned
+    /// with its push notifications discarded), so a caller can tell the
+    /// result may be stale rather than treating it as current.
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_flags_push_degraded_owner() {
+        use std::collections::HashMap;
+        use std::fs;
+
+        use tempfile::TempDir;
+        use url::Url;
+
+        use crate::config::{ServerId, ToolRouter};
+
+        // A router + extension map is required: the degraded flag is keyed
+        // on `Translator::diagnostics_route_id_for_path` (the file's
+        // *routed* server, resolved from its detected language), not on
+        // `NotificationCache::diagnostics_owner` -- see #359's C1 fix. This
+        // is a fast unit test of that wiring alone; the slower
+        // `..._after_real_respawn` test below covers the full path through
+        // an actual crash + respawn.
+        let owner = ServerId::from("rust");
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let translator = Arc::new(
+            Translator::new()
+                .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
+                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
+        );
+        let server = McplsServer::new(
+            translator,
+            Arc::clone(&notification_cache),
+            Arc::from(Vec::new()),
+            Arc::new(ResourceSubscriptions::new()),
+            false,
+            McpConfig::default(),
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let canonical_path = test_file.canonicalize().unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&canonical_path)
+            .unwrap()
+            .as_str()
+            .parse()
+            .unwrap();
+        {
+            let mut cache = notification_cache.lock().await;
+            cache.store_diagnostics(&owner, &uri, Some(1), vec![]);
+            cache.mark_push_degraded(&owner);
+        }
+
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: test_file.to_str().unwrap().to_string(),
+        });
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.get("pushNotificationsDegraded").unwrap(), true);
+    }
+
+    /// #359 regression: drives the *actual* `respawn_if_dead` path (not a
+    /// hand-ordered `store_diagnostics`-then-`mark_push_degraded` call
+    /// sequence, which a real respawn never produces, since
+    /// `clear_server_diagnostics` removes `diagnostics_owner` for the
+    /// crashed server before `mark_push_degraded` runs) and asserts through
+    /// the real `get_cached_diagnostics` MCP handler that
+    /// `pushNotificationsDegraded` comes back `true` afterward -- proving
+    /// the flag is actually reachable in production, keyed on the stable
+    /// routing identity rather than the cleared per-URI ownership map.
+    ///
+    /// `#[cfg(unix)]`: the fake LSP server is a hand-written `sh` script, no
+    /// equivalent on Windows -- mirrors the gating on the respawn tests in
+    /// `bridge::translator::respawn`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_flags_push_degraded_after_real_respawn() {
+        use std::collections::HashMap;
+        use std::fs;
+
+        use tempfile::TempDir;
+
+        use crate::config::{LspServerConfig, ServerId, ToolRouter};
+        use crate::lsp::{LspServer, ServerInitConfig};
+
+        let dir = TempDir::new().unwrap();
+        let script_path = dir.path().join("crash_after_init.sh");
+        // Answers the `initialize` handshake, then exits ~0.3s later --
+        // stands in for "was alive, then crashed" without a real language
+        // server binary (same shape as `respawn::tests::respawn_tests`'
+        // `write_crash_after_init_script`, duplicated here since that
+        // module's test helpers are private to it).
+        fs::write(
+            &script_path,
+            r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 0.3
+"#,
+        )
+        .unwrap();
+
+        let id = ServerId::from("rust");
+        let config = ServerInitConfig {
+            server_config: LspServerConfig {
+                language_id: "rust".to_string(),
+                command: "sh".to_string(),
+                args: vec![script_path.to_string_lossy().to_string()],
+                env: HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 5,
+                request_timeout_seconds: 5,
+                heuristics: None,
+                name: Some("rust".to_string()),
+                handles: None,
+            },
+            workspace_roots: vec![],
+            initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            notification_tx: None,
+        };
+
+        let seed = LspServer::spawn(config.clone()).await.unwrap();
+
+        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let translator = Arc::new(
+            Translator::new()
+                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_notification_cache(Arc::clone(&notification_cache))
+                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
+        );
+        translator.register_client(id.clone(), seed.client().clone());
+        translator.register_server(id.clone(), seed);
+        translator.register_server_config(id.clone(), config);
+
+        let server = McplsServer::new(
+            Arc::clone(&translator),
+            Arc::clone(&notification_cache),
+            Arc::from(Vec::new()),
+            Arc::new(ResourceSubscriptions::new()),
+            false,
+            McpConfig::default(),
+        );
+
+        // Drive real respawn attempts (a no-op while the seed is still
+        // alive) until one actually observes the crash and marks the
+        // diagnostics-route server degraded -- bounded so a broken script
+        // fails the test instead of hanging it.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        loop {
+            let _ = translator.respawn_if_dead(&id).await;
+            if notification_cache.lock().await.is_push_degraded(&id) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server was never observed dead and respawned within the deadline"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        let test_file = dir.path().join("main.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: test_file.to_str().unwrap().to_string(),
+        });
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            parsed.get("pushNotificationsDegraded").unwrap(),
+            true,
+            "a real respawn must be observable through the actual MCP handler, got: {parsed}"
+        );
+    }
+
+    /// Companion to the test above: an entry from a server that was never
+    /// marked degraded must report `pushNotificationsDegraded: false`.
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_reports_not_degraded_by_default() {
+        use tempfile::TempDir;
+
+        let server = create_test_server();
+
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn main() {}").unwrap();
+
+        let params = Parameters(CachedDiagnosticsParams {
+            file_path: test_file.to_str().unwrap().to_string(),
+        });
+        let result = server.get_cached_diagnostics(params).await;
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.get("pushNotificationsDegraded").unwrap(), false);
+    }
+
     #[tokio::test]
     async fn test_cached_diagnostics_tool_nonexistent_file() {
         let server = create_test_server();
@@ -1883,7 +2163,7 @@ mod tests {
 
     #[test]
     fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
-        let response = ResourceDiagnosticsResponse::new(false, None);
+        let response = ResourceDiagnosticsResponse::new(false, None, false);
         assert!(!response.tracked);
         assert!(response.version.is_none());
         assert!(response.diagnostics.is_empty());
@@ -1897,7 +2177,7 @@ mod tests {
 
     #[test]
     fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
-        let response = ResourceDiagnosticsResponse::new(true, None);
+        let response = ResourceDiagnosticsResponse::new(true, None, false);
         assert!(response.tracked);
         assert!(response.version.is_none());
         assert!(response.diagnostics.is_empty());
@@ -1930,7 +2210,7 @@ mod tests {
             tags: None,
             data: None,
         }]);
-        let response = ResourceDiagnosticsResponse::new(true, Some(&entry));
+        let response = ResourceDiagnosticsResponse::new(true, Some(&entry), false);
         assert!(response.tracked);
         assert_eq!(response.version, Some(1));
         assert_eq!(response.diagnostics.len(), 1);
@@ -1956,14 +2236,14 @@ mod tests {
 
     #[test]
     fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
-        let response = build_resource_diagnostics_response(false, None);
+        let response = build_resource_diagnostics_response(false, None, false);
         assert!(!response.tracked);
         assert!(response.diagnostics.is_empty());
     }
 
     #[test]
     fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
-        let response = build_resource_diagnostics_response(true, None);
+        let response = build_resource_diagnostics_response(true, None, false);
         assert!(response.tracked);
         assert!(response.diagnostics.is_empty());
     }
@@ -1997,13 +2277,25 @@ mod tests {
             data: None,
         }]);
 
-        let response = build_resource_diagnostics_response(false, Some(&entry));
+        let response = build_resource_diagnostics_response(false, Some(&entry), false);
         assert!(
             response.tracked,
             "a cached diagnostics entry must make the response tracked, \
              even for a file that was never explicitly opened"
         );
         assert_eq!(response.diagnostics.len(), 1);
+    }
+
+    /// #359 S2: `read_resource`'s response carries the same
+    /// `pushNotificationsDegraded` signal as `get_cached_diagnostics`, since
+    /// both serve the same cache and go dark the same way after a respawn.
+    #[test]
+    fn test_build_resource_diagnostics_response_flags_push_degraded() {
+        let response = build_resource_diagnostics_response(false, None, true);
+        assert!(response.push_notifications_degraded);
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["pushNotificationsDegraded"], true);
     }
 
     /// `parse_uri` rejects `file://` scheme — ensures `read_resource` would return an error.

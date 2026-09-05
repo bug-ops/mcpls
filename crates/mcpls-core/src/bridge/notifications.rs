@@ -2,7 +2,7 @@
 //!
 //! Stores diagnostics, log messages, and server messages received from LSP servers.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
@@ -463,6 +463,17 @@ pub struct NotificationCache {
     logs: VecDeque<LogEntry>,
     /// Recent server messages (FIFO queue with max size).
     messages: VecDeque<ServerMessage>,
+    /// Server ids whose `textDocument/publishDiagnostics` push notifications
+    /// are known to be dark: `Translator::respawn_if_dead` replaced a crashed
+    /// process for this id, and the replacement's notification receiver is
+    /// drained and discarded rather than wired into a running
+    /// `diagnostics_pump` (#249's documented trade-off -- the pump's
+    /// remaining dependencies live in `serve_with`'s scope, not
+    /// `Translator`'s). Once marked, an id is never unmarked here: only a
+    /// full mcpls process restart actually restores push diagnostics for
+    /// that server, so clearing this on a later respawn attempt would
+    /// misreport the cache as fresh again.
+    push_degraded: HashSet<ServerId>,
 }
 
 impl Default for NotificationCache {
@@ -484,6 +495,7 @@ impl NotificationCache {
             diagnostics_route_count: 1,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
+            push_degraded: HashSet::new(),
         }
     }
 
@@ -793,6 +805,37 @@ impl NotificationCache {
             self.diagnostics_owners.remove(&key);
             self.diagnostic_seq.remove(&key);
         }
+    }
+
+    /// Marks `server_id`'s push-based diagnostics as no longer live -- see
+    /// the `push_degraded` field doc for why this is permanent for the life
+    /// of the cache.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::NotificationCache;
+    /// use mcpls_core::config::ServerId;
+    ///
+    /// let mut cache = NotificationCache::new();
+    /// let id: ServerId = "rust-analyzer".into();
+    /// assert!(!cache.is_push_degraded(&id));
+    /// cache.mark_push_degraded(&id);
+    /// assert!(cache.is_push_degraded(&id));
+    /// ```
+    pub fn mark_push_degraded(&mut self, server_id: &ServerId) {
+        self.push_degraded.insert(server_id.clone());
+    }
+
+    /// Whether `server_id`'s push-based diagnostics are known to be
+    /// degraded (see [`Self::mark_push_degraded`]) -- callers such as
+    /// `get_cached_diagnostics` and `read_resource` use this to flag a
+    /// cache-only result as potentially stale rather than presenting it as
+    /// current.
+    #[inline]
+    #[must_use]
+    pub fn is_push_degraded(&self, server_id: &ServerId) -> bool {
+        self.push_degraded.contains(server_id)
     }
 
     /// Clear all diagnostics, for every server.
@@ -2014,6 +2057,29 @@ mod tests {
         // Idempotent / no-op for a server with no (or no longer any) entries.
         cache.clear_server_diagnostics(&crashed);
         assert_eq!(cache.diagnostics_count(), 1);
+    }
+
+    /// #359: `mark_push_degraded` must be scoped per server and, once set,
+    /// stay set -- there is no "unmark" operation, since only a full mcpls
+    /// process restart actually restores push diagnostics for a respawned
+    /// server.
+    #[test]
+    fn test_push_degraded_is_scoped_per_server_and_permanent() {
+        let mut cache = NotificationCache::new();
+        let degraded = ServerId::from("degraded");
+        let healthy = ServerId::from("healthy");
+
+        assert!(!cache.is_push_degraded(&degraded));
+        assert!(!cache.is_push_degraded(&healthy));
+
+        cache.mark_push_degraded(&degraded);
+
+        assert!(cache.is_push_degraded(&degraded));
+        assert!(!cache.is_push_degraded(&healthy));
+
+        // Marking again is idempotent.
+        cache.mark_push_degraded(&degraded);
+        assert!(cache.is_push_degraded(&degraded));
     }
 
     /// #276: `set_diagnostics_route_count` shrinking a server's fair share
