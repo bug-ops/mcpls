@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `NotificationCache` now derives the diagnostics cache fair-share budget automatically from the number of publishing servers when `set_diagnostics_route_count` is never called, instead of silently defaulting to an unpartitioned budget. (#379)
+- Cache eviction now prefers evicting empty ("file is clean") diagnostics entries over real ones, including across servers sharing the same eviction victim, so a stream of clean-file notifications can no longer displace actual diagnostics from the cache. (#379)
 - Diagnostics push notifications no longer silently vanish after an LSP server respawn; `get_cached_diagnostics`/resource reads now flag when they're degraded. (#363)
 - `document_symbols` no longer redundantly recomputes the same range twice for flat (`SymbolInformation`) responses. (#365)
 - HTTP transport now catches a repeat shutdown signal received during the connection-drain window and cuts the drain short instead of waiting out the full timeout. (#365)
