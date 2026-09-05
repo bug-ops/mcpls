@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`DocumentTracker::update`** — Breaking change: now `async`, serializing against `ensure_open` for the same path. (#363)
+
+### Fixed
+
+- Diagnostics push notifications no longer silently vanish after an LSP server respawn; `get_cached_diagnostics`/resource reads now flag when they're degraded. (#363)
+
 ## [0.4.0] - 2026-09-05
 
 ### Added

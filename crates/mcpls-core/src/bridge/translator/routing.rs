@@ -149,6 +149,33 @@ impl Translator {
         }
     }
 
+    /// Resolve the routing identity of the diagnostics-route server for
+    /// `path`'s detected language, without requiring that server to be
+    /// currently registered.
+    ///
+    /// Mirrors [`Self::get_client_for_file`]'s language-candidate order (the
+    /// detected language, then its React base language) but only queries the
+    /// router: a cache-only caller (`get_cached_diagnostics`) has no LSP
+    /// round trip to gate a resolved server's registration on, and only
+    /// needs the id to check [`crate::bridge::NotificationCache::is_push_degraded`]
+    /// (#359) -- the id itself is stable across a respawn (the routing
+    /// identity doesn't change, only the registered client behind it does),
+    /// unlike `NotificationCache::diagnostics_owner`, which a respawn clears
+    /// along with the crashed server's stale entries.
+    #[must_use]
+    pub(crate) fn diagnostics_route_id_for_path(&self, path: &Path) -> Option<ServerId> {
+        let language = detect_language(path, &self.extension_map);
+        let mut candidates: Vec<&str> = vec![language.as_str()];
+        if let Some(base) = base_language_id(&language) {
+            candidates.push(base);
+        }
+
+        let router = lock_std(&self.router);
+        candidates
+            .iter()
+            .find_map(|lang| router.resolve(lang, ToolKind::Diagnostics).cloned())
+    }
+
     /// Validate `file_path`, then resolve its routed client via
     /// [`Self::resolve_client_for_file`] (respawn-aware), without opening
     /// the document.
@@ -548,6 +575,46 @@ mod tests {
             .get_client_for_file(&test_file, ToolKind::Hover)
             .unwrap();
         assert_eq!(client.language_id(), "typescriptreact");
+    }
+
+    /// #359: `diagnostics_route_id_for_path` must resolve the same id
+    /// `is_diagnostics_route`/the router would, without requiring a
+    /// registered client -- `get_cached_diagnostics` relies on this to look
+    /// up `NotificationCache::is_push_degraded` even when the file's server
+    /// is currently down (mid-respawn or crash-looping).
+    #[test]
+    fn test_diagnostics_route_id_for_path_resolves_without_registered_client() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("main.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let mut extension_map = HashMap::new();
+        extension_map.insert("rs".to_string(), "rust".to_string());
+        let id = ServerId::from("rust");
+
+        let translator = Translator::new()
+            .with_extensions(extension_map)
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        // Deliberately no `register_client`/`register_server`: this must not
+        // require a live registration, unlike `get_client_for_file`.
+
+        assert_eq!(
+            translator.diagnostics_route_id_for_path(&test_file),
+            Some(id)
+        );
+    }
+
+    /// A file whose language has no configured route resolves to `None`
+    /// rather than panicking or falling back to some default server.
+    #[test]
+    fn test_diagnostics_route_id_for_path_returns_none_for_unrouted_language() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("unknown.xyz");
+        fs::write(&test_file, "content").unwrap();
+
+        let translator = Translator::new();
+
+        assert_eq!(translator.diagnostics_route_id_for_path(&test_file), None);
     }
 
     #[test]
