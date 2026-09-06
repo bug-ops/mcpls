@@ -29,6 +29,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 001 | [[mcp/001-mcp-tool-surface-and-routing/spec\|mcp-tool-surface-and-routing]] | enhancement | P1 | implemented (retroactive) | — |
 | 002 | [[mcp/002-mcp-resources-diagnostics/spec\|mcp-resources-diagnostics]] | enhancement | P3 | draft | #115 |
 | 003 | [[mcp/003-mcp-2026-stateless-adoption/spec\|mcp-2026-stateless-adoption]] | research | P3 | draft | #298 |
+| 004 | [[mcp/004-mcp-tasks-sep2663-adoption/spec\|mcp-tasks-sep2663-adoption]] | research | P4 | draft | #119 |
 
 ## bridge
 
