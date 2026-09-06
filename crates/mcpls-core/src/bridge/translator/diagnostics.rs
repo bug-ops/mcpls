@@ -4,8 +4,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use lsp_types::{PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams};
-use serde::Serialize;
+use lsp_types::{
+    DocumentDiagnosticParams, PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
+};
 use tokio::sync::Mutex;
 
 use super::Translator;
@@ -20,30 +21,6 @@ use crate::bridge::notifications::message_as_str;
 use crate::bridge::{DiagnosticInfo, DocumentTracker, NotificationCache, path_to_uri};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DiagnosticRequestParams {
-    text_document: TextDocumentIdentifier,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    identifier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_result_id: Option<String>,
-    #[serde(flatten)]
-    work_done_progress_params: WorkDoneProgressParams,
-    #[serde(flatten)]
-    partial_result_params: PartialResultParams,
-}
-
-fn diagnostic_request_params(text_document: TextDocumentIdentifier) -> DiagnosticRequestParams {
-    DiagnosticRequestParams {
-        text_document,
-        identifier: None,
-        previous_result_id: None,
-        work_done_progress_params: WorkDoneProgressParams::default(),
-        partial_result_params: PartialResultParams::default(),
-    }
-}
 
 /// Hand-rolled union of `textDocument/diagnostic`'s two possible result
 /// shapes.
@@ -153,7 +130,13 @@ impl Translator {
             .await?;
         let ctx = self.encoding_ctx(&server_id);
 
-        let params = diagnostic_request_params(TextDocumentIdentifier { uri: uri.clone() });
+        let params = DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
 
         let pull_response: Result<DocumentDiagnosticReportResult> = client
             .request("textDocument/diagnostic", params, client.request_timeout())
@@ -402,10 +385,21 @@ mod tests {
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
 
+    /// Pins the upstream `lsp_types::DocumentDiagnosticParams` serde
+    /// attributes (`skip_serializing_if` on both optionals) across future
+    /// `gen-lsp-types` version bumps -- this behavior was previously
+    /// guaranteed by a hand-rolled `DiagnosticRequestParams` (see #166),
+    /// dropped in favor of direct construction once verified byte-identical.
     #[test]
-    fn test_diagnostic_request_params_omit_optional_null_fields() {
+    fn test_document_diagnostic_params_omit_optional_null_fields() {
         let uri = lsp_types::Uri::from("file:///test.ts");
-        let params = diagnostic_request_params(TextDocumentIdentifier { uri });
+        let params = DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
         let value = serde_json::to_value(params).unwrap();
 
         assert_eq!(value["textDocument"]["uri"], "file:///test.ts");
