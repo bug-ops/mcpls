@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidated the duplicated `handle_definition`/`handle_implementation`/`handle_type_definition` go-to-X handlers and their response-flattening helpers in `bridge::translator::navigation` behind a shared generic path; behavior is unchanged. (#386)
 - **`NotificationCache::get_diagnostics`/`Translator::get_client_for_file` renamed to `diagnostics`/`client_for_file`** — Breaking change: drops the redundant `get_` prefix per Rust API guidelines C-GETTER, revisiting a previous entry in this changelog (#293) that had left `get_diagnostics` unchanged as a keyed lookup rather than a plain accessor. (#387)
 - **`LspTransport::new`** — now accepts any `AsyncWrite`/`AsyncRead` pair instead of only `ChildStdin`/`ChildStdout` (source-compatible for every existing caller), so tests can wire it to an in-memory `tokio::io::duplex` pipe instead of a real subprocess; `LspTransport`'s `Debug` output changed from a derived field dump to a fixed `LspTransport { .. }`. (#396)
+- **`Error::LspServerError`** — Breaking change: `Display` no longer forwards the upstream LSP server's raw error message verbatim when it matches rust-analyzer's internal "Invalid offset" out-of-range error, replacing it with a clean `"position out of range for this document"` message; a caller string-matching on the raw text of that specific error will no longer see it (the raw text is still available via the `message` field). (#395)
 
 ### Removed
 
