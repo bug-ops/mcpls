@@ -175,3 +175,56 @@ async fn write_framed(writer: &mut DuplexStream, message: &Value) {
     writer.write_all(content.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 }
+
+/// Captures `(level, message)` pairs for `tracing` events emitted while a
+/// closure runs, as a `tracing_subscriber::Layer`.
+///
+/// Shared here rather than duplicated per-module: `transport.rs`, `lib.rs`
+/// and `bridge/notifications.rs` each used to carry their own
+/// message-only `CapturedMessages` copy. This is a strict superset (it
+/// also records the event's [`tracing::Level`], needed to assert that a
+/// log line is or is not at `error!` severity, not just that it contains
+/// certain text) so it replaces all of them.
+#[derive(Clone, Default)]
+pub struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl CapturedLogs {
+    /// Snapshot of everything captured so far, as `(level, message)` pairs.
+    pub fn entries(&self) -> Vec<(tracing::Level, String)> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Snapshot of captured message text only, for callers that don't care
+    /// about severity.
+    pub fn messages(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, message)| message.clone())
+            .collect()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct MessageVisitor(String);
+        impl tracing::field::Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.0
+            .lock()
+            .unwrap()
+            .push((*event.metadata().level(), visitor.0));
+    }
+}

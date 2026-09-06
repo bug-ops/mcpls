@@ -861,6 +861,7 @@ mod tests {
         use std::net::SocketAddr;
 
         use super::super::{HttpConfig, Transport};
+        use crate::test_lsp::CapturedLogs;
 
         #[test]
         fn test_http_config_fields() {
@@ -1433,37 +1434,6 @@ mod tests {
             server_task.abort();
         }
 
-        /// Captures `tracing` events emitted while a closure runs, since this
-        /// codebase has no existing `tracing_test`-style capture helper to
-        /// reuse (only `mcpls-cli/src/logging.rs` sets up a real/global
-        /// subscriber, which isn't suitable for assertions).
-        #[derive(Clone, Default)]
-        struct CapturedMessages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedMessages {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct MessageVisitor(String);
-                impl tracing::field::Visit for MessageVisitor {
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        if field.name() == "message" {
-                            self.0 = format!("{value:?}");
-                        }
-                    }
-                }
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                self.0.lock().unwrap().push(visitor.0);
-            }
-        }
-
         /// #233: binding to a non-loopback address must log a warning that
         /// tells operators to put the endpoint behind a reverse proxy that
         /// *enforces* authentication (not the inverted "ensure no
@@ -1475,7 +1445,7 @@ mod tests {
             let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
             let cfg = HttpConfig::new(addr, "/mcp");
 
-            let captured = CapturedMessages::default();
+            let captured = CapturedLogs::default();
             let subscriber = tracing_subscriber::registry().with(captured.clone());
             let guard = tracing::subscriber::set_default(subscriber);
 
@@ -1490,7 +1460,7 @@ mod tests {
 
             drop(guard);
 
-            let messages = captured.0.lock().unwrap().clone();
+            let messages = captured.messages();
             assert!(
                 messages.iter().any(|m| m.contains(
                     "place this endpoint behind a reverse proxy that enforces authentication"

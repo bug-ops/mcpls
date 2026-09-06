@@ -1929,11 +1929,13 @@ mod tests {
         async fn test_await_lsp_init_handle_logs_panic() {
             use tracing_subscriber::layer::SubscriberExt as _;
 
+            use crate::test_lsp::CapturedLogs;
+
             let handle = tokio::spawn(async {
                 panic!("simulated background LSP init panic");
             });
 
-            let captured = CapturedMessages::default();
+            let captured = CapturedLogs::default();
             let subscriber = tracing_subscriber::registry().with(captured.clone());
             let guard = tracing::subscriber::set_default(subscriber);
 
@@ -1941,44 +1943,13 @@ mod tests {
 
             drop(guard);
 
-            let messages = captured.0.lock().unwrap().clone();
+            let messages = captured.messages();
             assert!(
                 messages
                     .iter()
                     .any(|m| m.contains("Background LSP initialization task failed")),
                 "expected an error! log for the panicking background init task, got: {messages:?}"
             );
-        }
-
-        /// Captures `tracing` events emitted while a closure runs. Mirrors
-        /// `transport::tests::http_tests::CapturedMessages` — duplicated
-        /// rather than shared since this crate has no common test-support
-        /// module and the two live in separate, non-`pub` test submodules.
-        #[derive(Clone, Default)]
-        struct CapturedMessages(Arc<std::sync::Mutex<Vec<String>>>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedMessages {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct MessageVisitor(String);
-                impl tracing::field::Visit for MessageVisitor {
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        if field.name() == "message" {
-                            self.0 = format!("{value:?}");
-                        }
-                    }
-                }
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                self.0.lock().unwrap().push(visitor.0);
-            }
         }
     }
 
