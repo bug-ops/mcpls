@@ -242,7 +242,7 @@ None — this is a retroactive spec documenting stable, already-shipped, well-te
 
 ## 10. See Also
 
-- [[constitution]] — project principles (not yet created for this project)
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [[runtime/002-sigterm-stdin-blocking-pool-hang/spec|spec runtime/002]] — the OS-process-exit half of shutdown
   this spec's `Translator::shutdown_servers`/`LspServer::shutdown` step feeds into

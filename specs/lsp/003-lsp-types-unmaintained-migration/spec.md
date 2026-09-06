@@ -323,7 +323,7 @@ All four questions below are now resolved by the completed migration (2026-09-05
 
 ## 10. See Also
 
-- [[constitution]] — project principles (not yet created for this project)
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [gluon-lang/lsp-types](https://github.com/gluon-lang/lsp-types) — current upstream dependency, unmaintained since 2024-06-04
 - [tower-lsp-community/ls-types](https://github.com/tower-lsp-community/ls-types) — proposed replacement, maintained fork

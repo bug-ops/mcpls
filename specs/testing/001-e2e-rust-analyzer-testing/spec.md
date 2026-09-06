@@ -236,7 +236,7 @@ Not a data-model feature — the relevant "entities" are test-harness constructs
 ## 10. See Also
 
 - [[plan|plan.md]] — architecture and rollout of this suite, adapted from the original Rev 2 design doc
-- [[constitution]] — project principles (not yet created for this project)
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [[mcp/002-mcp-resources-diagnostics/spec|spec mcp/002]] — MCP resources design this suite's `sc_list_resources`/`sc_read_resource`/`sc_subscribe_unsubscribe_resource` sub-cases exercise
 - [[lsp/002-lsp317-missing-tools/spec|spec lsp/002]] — LSP 3.17 tools this suite's `sc_get_signature_help`/`sc_go_to_implementation`/`sc_go_to_type_definition`/`sc_get_inlay_hints` sub-cases exercise

@@ -59,6 +59,10 @@ subsystem.
 |---|------|------|----------|--------|-------|
 | 001 | [[testing/001-e2e-rust-analyzer-testing/spec\|e2e-rust-analyzer-testing]] | enhancement | P2 | implemented (#125, #126, #139, #225) | — |
 
+## Project Foundation
+
+- [[constitution]] — non-negotiable project principles governing all specs
+
 > [!note] Block assignment and numbering rationale
 > Every spec was reassigned to the block its subject matter is *most fundamentally about*, not
 > necessarily where its implementation happens to live in the crate tree. Two calls worth flagging:

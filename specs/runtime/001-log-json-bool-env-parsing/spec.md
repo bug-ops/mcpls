@@ -217,7 +217,7 @@ No new domain entities. This is a parsing-behavior change on two existing CLI/en
 
 ## 10. See Also
 
-- [[constitution]] — project principles (not yet created for this project)
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - PR #285 (commit c25d756) — introduced `MCPLS_LOG_JSON` wiring into `logging::init`, source of the regression
 - Issue #279 — original request for `--log-json` support

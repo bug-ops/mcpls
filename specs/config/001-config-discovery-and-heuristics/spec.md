@@ -229,7 +229,7 @@ None — this is a retroactive spec documenting stable, already-shipped, well-te
 
 ## 10. See Also
 
-- [[constitution]] — project principles (not yet created for this project)
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [[bridge/005-expose-document-tracker-limits/spec|spec bridge/005]] — `workspace.max_documents`/`max_file_size`,
   fields on the same `WorkspaceConfig` this spec documents

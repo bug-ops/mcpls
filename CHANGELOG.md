@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `specs/constitution.md` documenting project-wide principles for the SDD spec package; resolves the `[[constitution]]` wikilink dangling across all specs. (#394)
 - Added end-to-end and TOML parse-error test coverage for `workspace.max_documents`/`max_file_size` resource-limit config. (#376)
 - `[mcp].tool_prefix` config option: prefixes every MCP tool name with `{tool_prefix}_`, letting a client tell apart tools from multiple concurrently running mcpls bridges. (#377)
 
 ### Changed
 
+- Modernized `specs/bridge/003-rwlock-translator` and `specs/mcp/002-mcp-resources-diagnostics` to the current spec template (YAML frontmatter, numbered sections, FR/NFR tables). (#394)
 - **`McpConfig`** — Breaking change: gained a `tool_prefix` field; exhaustive struct-literal construction of `McpConfig` no longer compiles. (#377)
 - Relocated the SDD spec package from `.local/specs/` to repo-root `specs/`, reorganized into functional blocks (config/lsp/mcp/bridge/runtime/testing) with block-scoped numbering, and added retroactive specs for previously undocumented core subsystems (position encoding, config discovery, LSP lifecycle, document tracker sync, MCP tool routing). (#368)
 - **`DocumentTracker::update`** — Breaking change: now `async`, serializing against `ensure_open` for the same path. (#363)
