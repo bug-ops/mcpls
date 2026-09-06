@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- README now documents that the HTTP transport (`--listen`) has no built-in authentication and requires a reverse proxy for non-loopback binding. (#391)
 - Modernized `specs/bridge/003-rwlock-translator` and `specs/mcp/002-mcp-resources-diagnostics` to the current spec template (YAML frontmatter, numbered sections, FR/NFR tables). (#394)
 - **`McpConfig`** — Breaking change: gained a `tool_prefix` field; exhaustive struct-literal construction of `McpConfig` no longer compiles. (#377)
 - Relocated the SDD spec package from `.local/specs/` to repo-root `specs/`, reorganized into functional blocks (config/lsp/mcp/bridge/runtime/testing) with block-scoped numbering, and added retroactive specs for previously undocumented core subsystems (position encoding, config discovery, LSP lifecycle, document tracker sync, MCP tool routing). (#368)
