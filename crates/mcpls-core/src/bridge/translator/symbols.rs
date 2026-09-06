@@ -174,7 +174,7 @@ impl Translator {
                 // covers a server that is configured but has not finished
                 // spawning yet -- check `expected_servers` (unavailable to
                 // `ToolRouter` itself) to tell the two apart, mirroring
-                // `get_client_for_file`'s `ServerInitializing` check below.
+                // `client_for_file`'s `ServerInitializing` check below.
                 NoServerReason::NothingRegistered => {
                     if lock_std(&self.expected_servers).is_empty() {
                         Error::NoServerConfigured

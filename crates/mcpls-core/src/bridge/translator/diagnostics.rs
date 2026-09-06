@@ -144,7 +144,7 @@ impl Translator {
 
         let diag_info = {
             let cache = notification_cache.lock().await;
-            cache.get_diagnostics(uri.as_ref()).cloned()
+            cache.diagnostics(uri.as_ref()).cloned()
         };
 
         match pull_response {
@@ -416,7 +416,7 @@ mod tests {
 
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
-        let diag_info = cache.get_diagnostics(&cache_key).cloned();
+        let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
             PositionEncoding::Utf16,
@@ -529,7 +529,7 @@ mod tests {
 
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
-        let diag_info = cache.get_diagnostics(&cache_key).cloned();
+        let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
             PositionEncoding::Utf16,
@@ -645,7 +645,7 @@ mod tests {
 
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
-        let diag_info = cache.get_diagnostics(&cache_key).cloned();
+        let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
             PositionEncoding::Utf16,
@@ -706,7 +706,7 @@ mod tests {
 
         let cache_key =
             Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
-        let diag_info = cache.get_diagnostics(&cache_key).cloned();
+        let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
             PositionEncoding::Utf16,

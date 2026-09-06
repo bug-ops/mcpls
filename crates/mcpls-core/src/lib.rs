@@ -2053,7 +2053,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     let found = {
                         let guard = cache.lock().await;
-                        guard.get_diagnostics(uri.as_ref()).is_some()
+                        guard.diagnostics(uri.as_ref()).is_some()
                     };
                     if found {
                         return true;
@@ -2137,7 +2137,7 @@ mod tests {
                 loop {
                     {
                         let guard = cache.lock().await;
-                        if guard.get_diagnostics(inside_uri.as_ref()).is_some() {
+                        if guard.diagnostics(inside_uri.as_ref()).is_some() {
                             return;
                         }
                     }
@@ -2150,7 +2150,7 @@ mod tests {
             let found_outside = cache
                 .lock()
                 .await
-                .get_diagnostics(outside_uri.as_ref())
+                .diagnostics(outside_uri.as_ref())
                 .is_some();
             assert!(
                 !found_outside,
@@ -2273,7 +2273,7 @@ mod tests {
                 loop {
                     {
                         let guard = cache.lock().await;
-                        if guard.get_diagnostics(uri.as_ref()).is_some() {
+                        if guard.diagnostics(uri.as_ref()).is_some() {
                             return;
                         }
                     }

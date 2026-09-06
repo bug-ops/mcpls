@@ -733,7 +733,7 @@ impl NotificationCache {
     /// serialized bytes, before storing (#311). When that bound requires
     /// dropping diagnostics, the *survivors* come back sorted by severity
     /// (`diagnostic_severity_rank`: `ERROR` first), not in the original
-    /// publish/file-position order -- see [`Self::get_diagnostics`].
+    /// publish/file-position order -- see [`Self::diagnostics`].
     ///
     /// If diagnostics already exist for the URI, they are replaced and the
     /// entry is repositioned to the back of its owner's eviction order, so
@@ -766,7 +766,7 @@ impl NotificationCache {
     /// let server: ServerId = "rust-analyzer".into();
     /// let uri: Uri = Uri::from("file:///main.rs");
     /// cache.store_diagnostics(&server, &uri, Some(1), vec![]);
-    /// assert!(cache.get_diagnostics(uri.as_ref()).is_some());
+    /// assert!(cache.diagnostics(uri.as_ref()).is_some());
     /// ```
     pub fn store_diagnostics(
         &mut self,
@@ -898,7 +898,7 @@ impl NotificationCache {
     /// it after a cap-triggered truncation.
     #[inline]
     #[must_use]
-    pub fn get_diagnostics(&self, uri: &str) -> Option<&DiagnosticInfo> {
+    pub fn diagnostics(&self, uri: &str) -> Option<&DiagnosticInfo> {
         self.diagnostics.get(uri_cache_key(uri).as_ref())
     }
 
@@ -970,8 +970,8 @@ impl NotificationCache {
     ///
     /// cache.clear_server_diagnostics(&crashed);
     ///
-    /// assert!(cache.get_diagnostics(crashed_uri.as_ref()).is_none());
-    /// assert!(cache.get_diagnostics(healthy_uri.as_ref()).is_some());
+    /// assert!(cache.diagnostics(crashed_uri.as_ref()).is_none());
+    /// assert!(cache.diagnostics(healthy_uri.as_ref()).is_some());
     /// ```
     pub fn clear_server_diagnostics(&mut self, server_id: &ServerId) {
         let Some(order) = self.diagnostic_order.remove(server_id) else {
@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn test_store_and_get_diagnostics() {
+    fn test_store_and_diagnostics() {
         let mut cache = NotificationCache::new();
         let uri: Uri = Uri::from("file:///test.rs");
 
@@ -1112,7 +1112,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.uri, uri);
         assert_eq!(stored.version, Some(1));
         assert_eq!(stored.diagnostics.len(), 1);
@@ -1153,7 +1153,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(uri.as_ref()).unwrap();
         let stored = message_as_str(&stored.diagnostics[0].message);
         assert!(stored.len() < oversized.len());
         assert!(stored.ends_with("... (truncated)"));
@@ -1207,7 +1207,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert!(
             stored.len() < original_count,
             "aggregate cap must trim the list, kept {} of {original_count}",
@@ -1238,7 +1238,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert!(
             stored.len() > 2600,
             "largest-fitting-prefix search must keep far more than half, kept {}",
@@ -1281,7 +1281,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert!(
             stored
                 .iter()
@@ -1391,7 +1391,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         assert_eq!(
             stored[0].message,
@@ -1422,7 +1422,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         assert_eq!(
             stored[0].message,
@@ -1470,7 +1470,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         let serialized_len = serde_json::to_vec(stored).unwrap().len();
         assert!(
@@ -1524,7 +1524,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         assert_eq!(
             stored[0].message,
@@ -1554,7 +1554,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.get_diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
         let serialized_len = serde_json::to_vec(stored).unwrap().len();
         assert!(
             serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
@@ -1574,7 +1574,7 @@ mod tests {
         cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
 
-        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.version, Some(2));
     }
 
@@ -1805,16 +1805,12 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
         assert_eq!(
-            cache
-                .get_diagnostics(uri.as_ref())
-                .unwrap()
-                .diagnostics
-                .len(),
+            cache.diagnostics(uri.as_ref()).unwrap().diagnostics.len(),
             1
         );
 
         cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
-        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.diagnostics.len(), 0);
         assert_eq!(stored.version, Some(2));
     }
@@ -1849,7 +1845,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.diagnostics.len(), 100);
     }
 
@@ -1894,9 +1890,9 @@ mod tests {
 
         // Oldest entries should be evicted (FIFO).
         let evicted: Uri = Uri::from("file:///test0.rs");
-        assert!(cache.get_diagnostics(evicted.as_ref()).is_none());
+        assert!(cache.diagnostics(evicted.as_ref()).is_none());
         let newest: Uri = Uri::from(format!("file:///test{}.rs", MAX_DIAGNOSTIC_ENTRIES + 9));
-        assert!(cache.get_diagnostics(newest.as_ref()).is_some());
+        assert!(cache.diagnostics(newest.as_ref()).is_some());
     }
 
     #[test]
@@ -1913,7 +1909,7 @@ mod tests {
             );
         }
         assert_eq!(cache.diagnostics_count(), 1);
-        assert!(cache.get_diagnostics(uri.as_ref()).is_some());
+        assert!(cache.diagnostics(uri.as_ref()).is_some());
     }
 
     #[test]
@@ -1943,15 +1939,15 @@ mod tests {
         cache.store_diagnostics(&test_server(), &overflow, Some(1), vec![]);
 
         assert!(
-            cache.get_diagnostics(actively_edited.as_ref()).is_some(),
+            cache.diagnostics(actively_edited.as_ref()).is_some(),
             "republished entry must survive eviction after being refreshed"
         );
         let oldest_untouched: Uri = Uri::from("file:///untouched0.rs");
         assert!(
-            cache.get_diagnostics(oldest_untouched.as_ref()).is_none(),
+            cache.diagnostics(oldest_untouched.as_ref()).is_none(),
             "the oldest never-republished entry must be evicted instead"
         );
-        assert!(cache.get_diagnostics(overflow.as_ref()).is_some());
+        assert!(cache.diagnostics(overflow.as_ref()).is_some());
     }
 
     #[test]
@@ -1971,7 +1967,7 @@ mod tests {
         // clear must not have left a stale `diagnostic_order` entry that
         // causes a premature eviction here.
         let first_of_batch: Uri = Uri::from("file:///test0.rs");
-        assert!(cache.get_diagnostics(first_of_batch.as_ref()).is_some());
+        assert!(cache.diagnostics(first_of_batch.as_ref()).is_some());
     }
 
     #[test]
@@ -1987,7 +1983,7 @@ mod tests {
         let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&test_server(), &uri, None, vec![]);
-        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.version, None);
     }
 
@@ -2017,13 +2013,13 @@ mod tests {
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
         assert!(
-            cache.get_diagnostics(quiet_uri.as_ref()).is_some(),
+            cache.diagnostics(quiet_uri.as_ref()).is_some(),
             "quiet server's only entry must survive the noisy server's overflow"
         );
 
         let noisy_first: Uri = Uri::from("file:///noisy/file0.rs");
         assert!(
-            cache.get_diagnostics(noisy_first.as_ref()).is_none(),
+            cache.diagnostics(noisy_first.as_ref()).is_none(),
             "noisy server's own oldest entries must be evicted once the aggregate cache is full"
         );
     }
@@ -2131,18 +2127,18 @@ mod tests {
             MAX_DIAGNOSTIC_ENTRIES,
             "the aggregate cap must still be enforced even when every existing server is within share"
         );
-        assert!(cache.get_diagnostics(new_uri.as_ref()).is_some());
+        assert!(cache.diagnostics(new_uri.as_ref()).is_some());
 
         // `a` and `b` are tied at 500 entries each; the deterministic
         // tie-break in `server_to_evict_from` picks `b`, so `b`'s oldest
         // entry is the one evicted, not `a`'s.
         let b_oldest: Uri = Uri::from("file:///b/file0.rs");
         assert!(
-            cache.get_diagnostics(b_oldest.as_ref()).is_none(),
+            cache.diagnostics(b_oldest.as_ref()).is_none(),
             "the largest in-share server (tie-broken to b) must lose its oldest entry"
         );
         assert!(
-            cache.get_diagnostics("file:///a/file0.rs").is_some(),
+            cache.diagnostics("file:///a/file0.rs").is_some(),
             "the other in-share server must be untouched"
         );
     }
@@ -2161,7 +2157,7 @@ mod tests {
         }
 
         assert_eq!(cache.diagnostics_count(), 1);
-        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.version, Some(max_version - 1));
     }
 
@@ -2179,7 +2175,7 @@ mod tests {
         cache.store_diagnostics(&new_owner, &uri, Some(2), vec![]);
 
         assert_eq!(cache.diagnostics_count(), 1);
-        let stored = cache.get_diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(uri.as_ref()).unwrap();
         assert_eq!(stored.version, Some(2));
 
         // The old owner's order map must no longer reference this URI:
@@ -2189,7 +2185,7 @@ mod tests {
             let other: Uri = Uri::from(format!("file:///old/file{i}.rs"));
             cache.store_diagnostics(&old_owner, &other, Some(1), vec![]);
         }
-        assert!(cache.get_diagnostics(uri.as_ref()).is_some());
+        assert!(cache.diagnostics(uri.as_ref()).is_some());
     }
 
     /// #290: `diagnostics_owner` is what a cache-only read (e.g.
@@ -2248,8 +2244,8 @@ mod tests {
 
         cache.clear_server_diagnostics(&crashed);
 
-        assert!(cache.get_diagnostics(crashed_uri.as_ref()).is_none());
-        assert!(cache.get_diagnostics(healthy_uri.as_ref()).is_some());
+        assert!(cache.diagnostics(crashed_uri.as_ref()).is_none());
+        assert!(cache.diagnostics(healthy_uri.as_ref()).is_some());
         assert_eq!(cache.diagnostics_count(), 1);
 
         // Idempotent / no-op for a server with no (or no longer any) entries.
@@ -2314,10 +2310,10 @@ mod tests {
         cache.store_diagnostics(&other, &new_uri, Some(1), vec![]);
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
-        assert!(cache.get_diagnostics(new_uri.as_ref()).is_some());
+        assert!(cache.diagnostics(new_uri.as_ref()).is_some());
         let server_oldest: Uri = Uri::from("file:///file0.rs");
         assert!(
-            cache.get_diagnostics(server_oldest.as_ref()).is_none(),
+            cache.diagnostics(server_oldest.as_ref()).is_none(),
             "the pre-existing server's oldest entry, now far over its shrunk share, must be evicted"
         );
     }
@@ -2344,13 +2340,13 @@ mod tests {
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
         assert!(
-            cache.get_diagnostics(quiet_uri.as_ref()).is_some(),
+            cache.diagnostics(quiet_uri.as_ref()).is_some(),
             "quiet server's only entry must survive even without ever calling \
              set_diagnostics_route_count"
         );
         let noisy_first: Uri = Uri::from("file:///noisy/file0.rs");
         assert!(
-            cache.get_diagnostics(noisy_first.as_ref()).is_none(),
+            cache.diagnostics(noisy_first.as_ref()).is_none(),
             "the noisy server, now auto-derived as one of two servers sharing the budget, \
              must still lose its own oldest entries once over its fair share"
         );
@@ -2407,15 +2403,15 @@ mod tests {
         cache.store_diagnostics(&server, &overflow, Some(1), vec![]);
 
         assert!(
-            cache.get_diagnostics(important.as_ref()).is_some(),
+            cache.diagnostics(important.as_ref()).is_some(),
             "a non-empty entry must survive eviction over empty entries, even though it is older"
         );
         let oldest_clean: Uri = Uri::from("file:///clean0.rs");
         assert!(
-            cache.get_diagnostics(oldest_clean.as_ref()).is_none(),
+            cache.diagnostics(oldest_clean.as_ref()).is_none(),
             "the oldest empty entry must be evicted instead of the older non-empty one"
         );
-        assert!(cache.get_diagnostics(overflow.as_ref()).is_some());
+        assert!(cache.diagnostics(overflow.as_ref()).is_some());
     }
 
     /// #284: storing an empty diagnostics list must still create a fully
@@ -2432,7 +2428,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
 
-        let stored = cache.get_diagnostics(uri.as_ref());
+        let stored = cache.diagnostics(uri.as_ref());
         assert!(
             stored.is_some(),
             "an empty-diagnostics entry must still be tracked"
@@ -2487,17 +2483,17 @@ mod tests {
         for i in 0..500 {
             let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
             assert!(
-                cache.get_diagnostics(uri.as_ref()).is_some(),
+                cache.diagnostics(uri.as_ref()).is_some(),
                 "server a's real diagnostics must all survive; b has an empty entry to lose \
                  instead"
             );
         }
         let b_oldest: Uri = Uri::from("file:///b/file0.rs");
         assert!(
-            cache.get_diagnostics(b_oldest.as_ref()).is_none(),
+            cache.diagnostics(b_oldest.as_ref()).is_none(),
             "b's oldest empty entry must be evicted instead of a's real diagnostics"
         );
-        assert!(cache.get_diagnostics(overflow.as_ref()).is_some());
+        assert!(cache.diagnostics(overflow.as_ref()).is_some());
     }
 
     /// #284: a URI that transitions non-empty -> empty -> non-empty must not
@@ -2536,7 +2532,7 @@ mod tests {
         let overflow: Uri = Uri::from("file:///overflow.rs");
         cache.store_diagnostics(&server, &overflow, Some(1), vec![]);
 
-        let stored = cache.get_diagnostics(uri.as_ref());
+        let stored = cache.diagnostics(uri.as_ref());
         assert!(
             stored.is_some_and(|info| info.diagnostics.len() == 1),
             "the re-dirtied entry must survive and keep its real diagnostic, not be mistaken \

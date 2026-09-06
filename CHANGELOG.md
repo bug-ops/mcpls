@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `workspace/symbol` `kind_filter` validation now derives its accepted names from `SUPPORTED_SYMBOL_KINDS`, the same single source of truth used by the `initialize` handshake, instead of a separately hand-maintained string list. (#383)
 - Replaced the hand-rolled `DiagnosticRequestParams` workaround with upstream `lsp_types::DocumentDiagnosticParams` directly; wire format is unchanged. (#383)
 - Consolidated the duplicated `handle_definition`/`handle_implementation`/`handle_type_definition` go-to-X handlers and their response-flattening helpers in `bridge::translator::navigation` behind a shared generic path; behavior is unchanged. (#386)
+- **`NotificationCache::get_diagnostics`/`Translator::get_client_for_file` renamed to `diagnostics`/`client_for_file`** — Breaking change: drops the redundant `get_` prefix per Rust API guidelines C-GETTER, revisiting a previous entry in this changelog (#293) that had left `get_diagnostics` unchanged as a keyed lookup rather than a plain accessor. (#384)
 
 ### Removed
 

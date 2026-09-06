@@ -64,7 +64,7 @@ impl Translator {
     /// resolved server a chance to be respawned first if its process has
     /// died.
     ///
-    /// Thin async wrapper around [`Self::get_client_for_file`] (kept
+    /// Thin async wrapper around [`Self::client_for_file`] (kept
     /// synchronous so its existing unit tests don't need a runtime): this is
     /// the entry point async handlers call instead, so a dead server is
     /// transparently replaced before its stale client is handed back.
@@ -73,7 +73,7 @@ impl Translator {
         path: &Path,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient)> {
-        let (id, client) = self.get_client_for_file(path, tool)?;
+        let (id, client) = self.client_for_file(path, tool)?;
         self.respawn_if_dead(&id).await?;
         let client = lock_std(&self.lsp_clients)
             .get(&id)
@@ -94,7 +94,7 @@ impl Translator {
     /// Locks `router`, `lsp_clients`, and (on the not-yet-registered path)
     /// `expected_servers` only for their respective lookups — every guard is
     /// dropped before this method returns.
-    pub(super) fn get_client_for_file(
+    pub(super) fn client_for_file(
         &self,
         path: &Path,
         tool: ToolKind,
@@ -153,7 +153,7 @@ impl Translator {
     /// `path`'s detected language, without requiring that server to be
     /// currently registered.
     ///
-    /// Mirrors [`Self::get_client_for_file`]'s language-candidate order (the
+    /// Mirrors [`Self::client_for_file`]'s language-candidate order (the
     /// detected language, then its React base language) but only queries the
     /// router: a cache-only caller (`get_cached_diagnostics`) has no LSP
     /// round trip to gate a resolved server's registration on, and only
@@ -365,7 +365,7 @@ mod tests {
     type JsonValue = serde_json::Value;
 
     #[test]
-    fn test_get_client_for_file_server_initializing_when_expected() {
+    fn test_client_for_file_server_initializing_when_expected() {
         // A configured/applicable language whose LSP client has not registered
         // yet (large solution still loading via OmniSharp) must surface
         // ServerInitializing — "wait and retry" — not NoServerForLanguage.
@@ -379,13 +379,13 @@ mod tests {
         translator.set_expected_servers(expected);
 
         let err = translator
-            .get_client_for_file(&path, ToolKind::Hover)
+            .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
         assert!(matches!(err, Error::ServerInitializing { server_id } if server_id == id));
     }
 
     #[test]
-    fn test_get_client_for_file_no_server_when_not_expected() {
+    fn test_client_for_file_no_server_when_not_expected() {
         // When no route is configured for the language at all, the error
         // stays NoServerForLanguage.
         let translator = Translator::new();
@@ -393,7 +393,7 @@ mod tests {
         let lang = detect_language(&path, &translator.extension_map);
 
         let err = translator
-            .get_client_for_file(&path, ToolKind::Hover)
+            .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
         assert!(matches!(err, Error::NoServerForLanguage(ref l) if *l == lang));
     }
@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_client_for_file_uses_custom_extension() {
+    fn test_client_for_file_uses_custom_extension() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("script.nu");
         fs::write(&test_file, "echo hello").unwrap();
@@ -474,7 +474,7 @@ mod tests {
 
         let translator = Translator::new().with_extensions(extension_map);
 
-        let result = translator.get_client_for_file(&test_file, ToolKind::Hover);
+        let result = translator.client_for_file(&test_file, ToolKind::Hover);
 
         assert!(result.is_err());
         if let Err(Error::NoServerForLanguage(lang)) = result {
@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_client_for_file_falls_back_to_default() {
+    fn test_client_for_file_falls_back_to_default() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("unknown.xyz");
         fs::write(&test_file, "content").unwrap();
@@ -495,7 +495,7 @@ mod tests {
 
         let translator = Translator::new().with_extensions(extension_map);
 
-        let result = translator.get_client_for_file(&test_file, ToolKind::Hover);
+        let result = translator.client_for_file(&test_file, ToolKind::Hover);
 
         assert!(result.is_err());
         if let Err(Error::NoServerForLanguage(lang)) = result {
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_client_for_file_routes_tsx_to_typescript_server() {
+    fn test_client_for_file_routes_tsx_to_typescript_server() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("component.tsx");
         fs::write(&test_file, "export const Component = () => <div />").unwrap();
@@ -526,13 +526,13 @@ mod tests {
         );
 
         let (_id, client) = translator
-            .get_client_for_file(&test_file, ToolKind::Hover)
+            .client_for_file(&test_file, ToolKind::Hover)
             .unwrap();
         assert_eq!(client.language_id(), "typescript");
     }
 
     #[test]
-    fn test_get_client_for_file_prefers_exact_react_server() {
+    fn test_client_for_file_prefers_exact_react_server() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("component.tsx");
         fs::write(&test_file, "export const Component = () => <div />").unwrap();
@@ -573,7 +573,7 @@ mod tests {
         );
 
         let (_id, client) = translator
-            .get_client_for_file(&test_file, ToolKind::Hover)
+            .client_for_file(&test_file, ToolKind::Hover)
             .unwrap();
         assert_eq!(client.language_id(), "typescriptreact");
     }
@@ -597,7 +597,7 @@ mod tests {
             .with_extensions(extension_map)
             .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
         // Deliberately no `register_client`/`register_server`: this must not
-        // require a live registration, unlike `get_client_for_file`.
+        // require a live registration, unlike `client_for_file`.
 
         assert_eq!(
             translator.diagnostics_route_id_for_path(&test_file),
@@ -619,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_client_for_file_routes_jsx_to_javascript_server() {
+    fn test_client_for_file_routes_jsx_to_javascript_server() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("component.jsx");
         fs::write(&test_file, "export const Component = () => <div />").unwrap();
@@ -649,7 +649,7 @@ mod tests {
         translator.register_client("javascript".to_string(), LspClient::new(javascript_config));
 
         let (_id, client) = translator
-            .get_client_for_file(&test_file, ToolKind::Hover)
+            .client_for_file(&test_file, ToolKind::Hover)
             .unwrap();
         assert_eq!(client.language_id(), "javascript");
     }
@@ -1172,7 +1172,7 @@ mod tests {
         ));
     }
 
-    /// `handle_incoming_calls` resolves its server via `get_client_for_file`
+    /// `handle_incoming_calls` resolves its server via `client_for_file`
     /// directly (not `prepare_document`), a separate code path from the other
     /// gated handlers -- exercise it explicitly.
     #[tokio::test]
