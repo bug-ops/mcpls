@@ -7,6 +7,36 @@ use std::path::PathBuf;
 
 use crate::config::{ServerId, ToolKind};
 
+/// Rewrites an LSP server's raw error message for display to the MCP caller,
+/// replacing rust-analyzer's "Invalid offset" internal error with a clean,
+/// client-appropriate message.
+///
+/// rust-analyzer returns this `Debug`-formatted internal error (embedding its
+/// `LineCol` struct and the line index's byte length, e.g. `"Invalid offset
+/// LineCol { line: 2291, col: 0 } (line index length: 100417)"`) when a
+/// position-based request's `line` or `character` falls outside the target
+/// document. Every other [`Error`] variant produces a clean message; this
+/// function keeps [`Error::LspServerError`]'s `Display` impl consistent with
+/// that convention instead of forwarding the upstream server's internals
+/// verbatim.
+///
+/// Matches via `contains` rather than `starts_with`: rust-analyzer's error
+/// travels through `anyhow`/`lsp_server` before reaching mcpls, so a future
+/// upstream `.context(...)` wrapper (or a truncation prefix added on the
+/// mcpls side) could prepend text ahead of `"Invalid offset LineCol"` without
+/// mcpls's control -- `contains` keeps the guard robust to that at no extra
+/// cost. Deliberately not also gated on the JSON-RPC error `code`: this error
+/// class has been observed under both `-32603` (internal error) and `-32803`
+/// (`RequestFailed`) across rust-analyzer versions, so a code condition would
+/// make the guard more fragile, not less.
+fn sanitize_lsp_server_message(message: &str) -> String {
+    if message.contains("Invalid offset LineCol") {
+        "position out of range for this document".to_string()
+    } else {
+        message.to_string()
+    }
+}
+
 /// Details of a single server spawn failure.
 #[derive(Debug, Clone)]
 pub struct ServerSpawnFailure {
@@ -46,11 +76,14 @@ pub enum Error {
     },
 
     /// LSP server returned an error response.
-    #[error("LSP server error: {code} - {message}")]
+    #[error("LSP server error: {code} - {}", sanitize_lsp_server_message(message))]
     LspServerError {
         /// JSON-RPC error code.
         code: i32,
-        /// Error message from the server.
+        /// Raw error message from the server, kept verbatim for diagnostics
+        /// (logging, `Debug`, pattern matching). The `Display` impl for this
+        /// variant rewrites known-internal upstream text before it reaches
+        /// an MCP caller, so this field is not always what the caller sees.
         message: String,
         /// Optional additional data from the JSON-RPC error object.
         data: Option<serde_json::Value>,
@@ -274,6 +307,51 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "LSP server error: -32600 - Invalid request"
+        );
+    }
+
+    #[test]
+    fn test_error_display_lsp_server_error_sanitizes_invalid_offset() {
+        let err = Error::LspServerError {
+            code: -32603,
+            message: "Invalid offset LineCol { line: 2291, col: 0 } (line index length: 100417)"
+                .to_string(),
+            data: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "LSP server error: -32603 - position out of range for this document"
+        );
+    }
+
+    #[test]
+    fn test_error_display_lsp_server_error_sanitizes_wrapped_invalid_offset() {
+        // Guards the `contains` (not `starts_with`) match: an upstream
+        // wrapper (e.g. an `anyhow::Context`) or a future mcpls-side prefix
+        // could prepend text ahead of rust-analyzer's raw message.
+        let err = Error::LspServerError {
+            code: -32803,
+            message: "request handler panicked: Invalid offset LineCol { line: 5, col: 0 } \
+                      (line index length: 3)"
+                .to_string(),
+            data: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "LSP server error: -32803 - position out of range for this document"
+        );
+    }
+
+    #[test]
+    fn test_error_display_lsp_server_error_passes_through_unrelated_message() {
+        let err = Error::LspServerError {
+            code: -32602,
+            message: "Invalid params: expected object".to_string(),
+            data: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "LSP server error: -32602 - Invalid params: expected object"
         );
     }
 
