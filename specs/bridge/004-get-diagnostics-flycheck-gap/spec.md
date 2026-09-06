@@ -10,6 +10,7 @@ tags:
 created: 2026-07-25
 status: draft
 related:
+  - "[[constitution]]"
   - "[[MOC-specs]]"
   - "[[mcp/002-mcp-resources-diagnostics/spec]]"
 ---
@@ -191,6 +192,7 @@ No new entities. The fix operates on two existing shapes:
 
 ## 10. See Also
 
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [[bridge/003-rwlock-translator/spec|Spec bridge/003]] — `NotificationCache` / `Translator` lock-ordering discipline this fix must respect
 - [[mcp/002-mcp-resources-diagnostics/spec|Spec mcp/002]] — the `NotificationCache` / `get_cached_diagnostics` / resources design this fix reuses

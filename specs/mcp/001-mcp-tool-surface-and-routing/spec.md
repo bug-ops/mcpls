@@ -38,7 +38,7 @@ related:
 > This is a retroactive spec: `crates/mcpls-core/src/mcp/server.rs` (20 `#[tool]` handlers plus
 > the `resources/*` handlers), `crates/mcpls-core/src/mcp/tools.rs` (parameter schemas),
 > `crates/mcpls-core/src/config/routing.rs` (`ToolRouter`, `ServerId`, `ToolKind`), and
-> `crates/mcpls-core/src/bridge/translator/routing.rs` (`get_client_for_file`,
+> `crates/mcpls-core/src/bridge/translator/routing.rs` (`client_for_file`,
 > `resolve_client_for_file`, path validation) already implement everything described below.
 > [[mcp/002-mcp-resources-diagnostics/spec|spec mcp/002]] already covers the `resources/*` MCP surface in
 > detail; this spec covers the *tool* surface (the 20 `#[tool]` handlers) and the request-routing
@@ -152,6 +152,8 @@ THEN the request is rejected with the same PathOutsideWorkspace error regardless
 | FR-008 | THE SYSTEM SHALL map every bridge-layer `Result<T, Error>` to the MCP tool response shape via one shared function, so error formatting stays consistent across all 20 tool handlers | must |
 | FR-009 | THE SYSTEM SHALL classify all 20 tools as read-only (`ToolAnnotations`) at the router level, once, rather than repeating an identical annotation block on every `#[tool]` attribute, since every mcpls tool is a query or a proposed-edit generator that never itself writes to disk | must |
 | FR-010 | WHEN a tool call resolves to a server whose process has died THE SYSTEM SHALL attempt to respawn it (per [[lsp/001-lsp-server-lifecycle-and-respawn/spec|spec lsp/001]]) before the request is treated as failed | must |
+| FR-011 | THE SYSTEM SHALL advertise `outputSchema` and return `structuredContent` (via `to_structured_tool_result`/`Json<T>` handler signatures) for `get_diagnostics`, `get_definition`, `get_references`, and `get_document_symbols`, while every other tool continues to return a plain serialized-string response via `to_tool_result` | must |
+| FR-012 | WHEN the optional `[mcp].tool_prefix` config value is set THE SYSTEM SHALL prefix every tool's registered name with `{tool_prefix}_` at `build_tool_router` time, so a client can tell apart tools exposed by multiple concurrently running mcpls bridges; omitting it SHALL leave tool names unprefixed | must |
 
 ## 4. Non-Functional Requirements
 
@@ -166,11 +168,12 @@ THEN the request is rejected with the same PathOutsideWorkspace error regardless
 
 | Entity | Description | Key Attributes |
 |--------|-------------|-----------------|
-| `ToolKind` | Every routable MCP tool (excludes cache-only tools that never reach a specific server: `get_cached_diagnostics`, `get_server_logs`, `get_server_messages`) | 15 variants, `ALL: [Self; 15]`, `as_str()` snake_case name |
+| `ToolKind` | Every routable MCP tool (excludes cache-only tools that never reach a specific server: `get_cached_diagnostics`, `get_server_logs`, `get_server_messages`) | 15 variants, `#[non_exhaustive]`, `ALL: &[Self]` (slice, not a fixed-size array — #366), `as_str()` snake_case name |
 | `ServerId` | Unique routing identity of a configured server within a workspace | Wraps `String`; a server's explicit `name` if set, else its `language_id` |
 | `ToolRouter` | Resolves `(language, tool)` → `ServerId` | Built via `from_configs` (post-heuristics applicable configs), rebound via `rebind_to_registered` (post-spawn registered set) |
-| `NoServerReason` | Why `resolve_any` found no server for a workspace-wide tool | `NothingRegistered`, `NoClaimant` |
+| `NoServerReason` | Why `resolve_any` found no server for a workspace-wide tool | `NothingRegistered`, `NoClaimant`, `#[non_exhaustive]` (#366) |
 | `BridgeContext` (`mcp/handlers.rs`) | Shared state every `#[tool]` handler dispatches through | `translator`, `notification_cache`, `workspace_roots`, `subscriptions`, `project_config_ignored`, `mcp` (presentation overrides) |
+| `McpConfig` (`config/mod.rs`) | `[mcp]` TOML section carrying MCP-surface presentation/naming overrides | `title`, `description`, `instructions`, `tool_prefix: Option<ToolPrefix>` — `#[serde(deny_unknown_fields)]`, not `#[non_exhaustive]` (exhaustive struct-literal construction breaks whenever a field is added, e.g. `tool_prefix` in #377) |
 
 ## 6. Edge Cases and Error Handling
 
@@ -237,7 +240,10 @@ None — this is a retroactive spec documenting stable, already-shipped, well-te
   `declared_tool_router`
 - `crates/mcpls-core/src/mcp/tools.rs` — MCP tool parameter schemas
 - `crates/mcpls-core/src/mcp/handlers.rs` — `BridgeContext`
-- `crates/mcpls-core/src/config/routing.rs` — `ToolRouter`, `ServerId`, `ToolKind`,
-  `NoServerReason`
-- `crates/mcpls-core/src/bridge/translator/routing.rs` — `get_client_for_file`,
+- `crates/mcpls-core/src/config/routing.rs` — `ToolRouter`, `ServerId`, `ToolKind`
+  (`#[non_exhaustive]`), `NoServerReason` (`#[non_exhaustive]`)
+- `crates/mcpls-core/src/bridge/translator/routing.rs` — `client_for_file`,
   `resolve_client_for_file`, `validate_path_against_roots`
+- `crates/mcpls-core/src/config/mod.rs` — `McpConfig`, `ToolPrefix` (FR-012)
+- `to_tool_result`/`to_structured_tool_result` in `mcp/server.rs` — the plain-string vs.
+  structured (`outputSchema`/`structuredContent`) response-mapping split (FR-011)

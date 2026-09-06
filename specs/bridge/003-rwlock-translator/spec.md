@@ -9,7 +9,7 @@ tags:
   - bridge
   - concurrency
 created: 2026-08-01
-status: draft
+status: superseded
 related:
   - "[[constitution]]"
   - "[[bridge/001-position-encoding-layer/spec]]"
@@ -21,6 +21,22 @@ related:
 > [!info] Metadata
 > **Type**: enhancement
 > **Priority**: P2
+
+> [!warning] Superseded
+> The shipped design (since PR #326, `refactor(bridge): split translator.rs into submodules,
+> inject Clock seam`, well before v0.4.0) did not adopt either alternative proposed below. Instead,
+> `Translator` is now shared as a plain `Arc<Translator>` with no outer `Mutex`/`RwLock` at all —
+> every field that needs synchronization (`lsp_clients`, `lsp_servers`, `document_tracker`,
+> `router`, `respawn_locks`, etc.) carries its own independent lock, scoped to the narrowest
+> critical section that field actually needs (see the field-level doc comments in
+> `crates/mcpls-core/src/bridge/translator/mod.rs`). This achieves the same goal as FR-001/FR-002
+> (concurrent reads not serialized behind one global lock) more granularly than a single
+> `RwLock<Translator>` would, and sidesteps FR-005's deadlock concern entirely for most fields since
+> there is no single lock two call paths could acquire in conflicting order. `NotificationCache`
+> (FR-004) is likewise its own independently-locked structure, not nested inside `Translator`. The
+> `mcp/server.rs` tool count referenced in the Problem Statement below is also stale — the surface
+> is now 20 tools (see `specs/constitution.md`), not 16. Kept for historical context; do not use
+> this spec's FR/NFR table as a description of the current locking architecture.
 
 ## 1. Overview
 

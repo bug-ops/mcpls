@@ -10,6 +10,7 @@ tags:
 created: 2026-08-05
 status: implemented
 related:
+  - "[[constitution]]"
   - "[[testing/001-e2e-rust-analyzer-testing/spec]]"
   - "[[lsp/004-lsp-318-draft-gaps/spec]]"
 ---
@@ -85,6 +86,7 @@ requested by users of similar tools (see isaacphi/mcp-language-server issues).
 
 ## See Also
 
+- [[constitution]] — project principles
 - LSP 3.17 spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/
 - lsp-types 0.97: https://docs.rs/lsp-types/0.97.0/lsp_types/
 - Existing tool pattern: `crates/mcpls-core/src/mcp/server.rs`, `crates/mcpls-core/src/bridge/translator.rs`

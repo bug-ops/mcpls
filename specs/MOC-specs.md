@@ -37,7 +37,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 |---|------|------|----------|--------|-------|
 | 001 | [[bridge/001-position-encoding-layer/spec\|position-encoding-layer]] | enhancement | P1 | implemented (retroactive) | — |
 | 002 | [[bridge/002-document-tracker-synchronization/spec\|document-tracker-synchronization]] | enhancement | P1 | implemented (retroactive) | — |
-| 003 | [[bridge/003-rwlock-translator/spec\|rwlock-translator]] | enhancement | P2 | draft | #114 |
+| 003 | [[bridge/003-rwlock-translator/spec\|rwlock-translator]] | enhancement | P2 | superseded | #114 |
 | 004 | [[bridge/004-get-diagnostics-flycheck-gap/spec\|get-diagnostics-flycheck-gap]] | bug | P1 | draft | — |
 | 005 | [[bridge/005-expose-document-tracker-limits/spec\|expose-document-tracker-limits]] | enhancement | P2 | implemented (#324) | — |
 
