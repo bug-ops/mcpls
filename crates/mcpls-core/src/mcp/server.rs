@@ -665,7 +665,7 @@ impl McplsServer {
                         let push_degraded = route_id
                             .as_ref()
                             .is_some_and(|id| cache.is_push_degraded(id));
-                        (cache.get_diagnostics(&uri).cloned(), owner, push_degraded)
+                        (cache.diagnostics(&uri).cloned(), owner, push_degraded)
                     };
                     let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
                         self.context.translator.position_encoding_for(&server_id)
@@ -907,7 +907,7 @@ impl ServerHandler for McplsServer {
                 .is_some_and(|id| cache.is_push_degraded(id));
             build_resource_diagnostics_response(
                 self.context.translator.is_document_open(&validated_path),
-                cache.get_diagnostics(lsp_uri.as_ref()),
+                cache.diagnostics(lsp_uri.as_ref()),
                 push_degraded,
             )
         };
@@ -962,7 +962,7 @@ impl ServerHandler for McplsServer {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let has_cached_diagnostics = {
             let cache = self.context.notification_cache.lock().await;
-            cache.get_diagnostics(lsp_uri.as_ref()).is_some()
+            cache.diagnostics(lsp_uri.as_ref()).is_some()
         };
 
         if has_cached_diagnostics

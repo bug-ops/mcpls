@@ -524,7 +524,7 @@ mod tests {
         translator.clear_expected_servers();
 
         let err = translator
-            .get_client_for_file(&path, ToolKind::Hover)
+            .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
         assert!(matches!(err, Error::NoServerForLanguage(_)));
     }
