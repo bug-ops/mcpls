@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- README now documents that the HTTP transport (`--listen`) has no built-in authentication and requires a reverse proxy for non-loopback binding. (#391)
+- README now documents that the HTTP transport (`--listen`) has no built-in authentication and requires a reverse proxy for non-loopback binding. (#400)
 - Modernized `specs/bridge/003-rwlock-translator` and `specs/mcp/002-mcp-resources-diagnostics` to the current spec template (YAML frontmatter, numbered sections, FR/NFR tables). (#394)
 - **`McpConfig`** — Breaking change: gained a `tool_prefix` field; exhaustive struct-literal construction of `McpConfig` no longer compiles. (#377)
 - Relocated the SDD spec package from `.local/specs/` to repo-root `specs/`, reorganized into functional blocks (config/lsp/mcp/bridge/runtime/testing) with block-scoped numbering, and added retroactive specs for previously undocumented core subsystems (position encoding, config discovery, LSP lifecycle, document tracker sync, MCP tool routing). (#368)
@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- E2E test harness (`McpClient::spawn_with_args`) now honors `CARGO_TARGET_DIR`/`CARGO_BUILD_TARGET_DIR` when locating the built `mcpls` binary, instead of hardcoding `target/debug/mcpls`; spawn failures now report the resolved path. (#393)
+- E2E test harness (`McpClient::spawn_with_args`) now honors `CARGO_TARGET_DIR`/`CARGO_BUILD_TARGET_DIR` when locating the built `mcpls` binary, instead of hardcoding `target/debug/mcpls`; spawn failures now report the resolved path. (#400)
 - LSP `-32801` (`ContentModified`) error responses are now retried automatically for read-only/idempotent tool calls (hover, references, diagnostics, etc.), using the same attempt budget and backoff already applied to `-32802` (`ServerCancelled`); mutating requests (rename, formatting, code actions) are excluded. Also corrected a doc comment that mislabeled `-32802` as "content modified". (#390)
 - `NotificationCache` now derives the diagnostics cache fair-share budget automatically from the number of publishing servers when `set_diagnostics_route_count` is never called, instead of silently defaulting to an unpartitioned budget. (#379)
 - Cache eviction now prefers evicting empty ("file is clean") diagnostics entries over real ones, including across servers sharing the same eviction victim, so a stream of clean-file notifications can no longer displace actual diagnostics from the cache. (#379)
