@@ -182,10 +182,11 @@ pub struct LspServerConfig {
     /// while translating an MCP tool call (hover, definition, references, etc.).
     ///
     /// This bounds a single request attempt, not a whole tool call: on a
-    /// `-32802` (content modified) response, [`crate::lsp::LspClient::request`]
-    /// retries up to 4 attempts with backoff, so the worst-case latency for one
-    /// tool call is `4 * request_timeout_seconds + 3.5` seconds. Completion
-    /// requests are further capped at 10 seconds regardless of this value; see
+    /// `-32801` (`ContentModified`) or `-32802` (`ServerCancelled`) response,
+    /// [`crate::lsp::LspClient::request`] retries up to 4 attempts with
+    /// backoff, so the worst-case latency for one tool call is
+    /// `4 * request_timeout_seconds + 3.5` seconds. Completion requests are
+    /// further capped at 10 seconds regardless of this value; see
     /// [`crate::lsp::LspClient::completion_timeout`].
     #[serde(default = "default_request_timeout")]
     pub request_timeout_seconds: u64,
@@ -235,8 +236,9 @@ const fn default_request_timeout() -> u64 {
 /// bounds both, since the underlying defect and fix are identical for each.
 ///
 /// Set to 900 (15 minutes), not a rounder 3600 (1 hour): [`LspClient::request`]
-/// retries a request up to 4 times total on a `-32802` (`ServerCancelled`)
-/// response, so the worst-case latency for a single call bounded by this
+/// retries a request up to 4 times total on a `-32801` (`ContentModified`) or
+/// `-32802` (`ServerCancelled`) response, so the worst-case latency for a
+/// single call bounded by this
 /// value is `4 * 900 + 3.5s` ≈ 1 hour, not 4 hours — this constant bounds one
 /// attempt, so it is chosen such that the actually-experienced worst case
 /// (the retried total) stays within about an hour.

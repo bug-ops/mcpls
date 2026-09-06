@@ -25,11 +25,14 @@ const JSONRPC_VERSION: &str = "2.0";
 /// LSP error code returned when the server cancels a request and wants the client to retry.
 const SERVER_CANCELLED_CODE: i32 = -32802;
 
-/// Maximum number of retry attempts for server-cancelled requests.
-const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
+/// LSP error code returned when a request raced with a document update.
+const CONTENT_MODIFIED_CODE: i32 = -32801;
 
-/// Initial backoff delay for server-cancelled retries (milliseconds).
-const SERVER_CANCELLED_INITIAL_DELAY_MS: u64 = 500;
+/// Maximum number of retry attempts for transient LSP request failures.
+const RETRY_MAX_RETRIES: u32 = 3;
+
+/// Initial backoff delay for transient LSP request failures (milliseconds).
+const RETRY_INITIAL_DELAY_MS: u64 = 500;
 
 /// Byte-length threshold for truncating an LSP error message before logging it.
 ///
@@ -304,9 +307,10 @@ impl LspClient {
 
     /// Send request and wait for response with timeout.
     ///
-    /// Automatically retries up to 3 times when the server returns error code
-    /// -32802 (`ServerCancelled`) with `data.retriggerRequest == true`, using
-    /// exponential backoff starting at 500 ms.
+    /// Automatically retries up to 3 times when the server returns a transient
+    /// LSP error: -32801 (`ContentModified`) or -32802 (`ServerCancelled`).
+    /// `ServerCancelled` must also have `data.retriggerRequest == true`.
+    /// Retries use exponential backoff starting at 500 ms.
     ///
     /// # Type Parameters
     ///
@@ -331,13 +335,13 @@ impl LspClient {
         R: DeserializeOwned,
     {
         let params_value = serde_json::to_value(params)?;
-        let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
+        let mut delay_ms = RETRY_INITIAL_DELAY_MS;
 
-        for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
+        for attempt in 0..=RETRY_MAX_RETRIES {
             if attempt > 0 {
                 debug!(
-                    "Retrying {} after ServerCancelled (attempt {}/{}), backoff={}ms",
-                    method, attempt, SERVER_CANCELLED_MAX_RETRIES, delay_ms
+                    "Retrying {} after transient LSP error (attempt {}/{}), backoff={}ms",
+                    method, attempt, RETRY_MAX_RETRIES, delay_ms
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms *= 2;
@@ -384,12 +388,12 @@ impl LspClient {
                     code,
                     ref message,
                     ref data,
-                }) if code == SERVER_CANCELLED_CODE && Self::should_retrigger(data.as_ref()) => {
+                }) if Self::should_retry(code, data.as_ref()) => {
                     warn!(
-                        "ServerCancelled (-32802) on '{}', will retry: {}",
+                        "Transient LSP error ({code}) on '{}', will retry: {}",
                         method, message
                     );
-                    if attempt == SERVER_CANCELLED_MAX_RETRIES {
+                    if attempt == RETRY_MAX_RETRIES {
                         return Err(Error::LspServerError {
                             code,
                             message: message.clone(),
@@ -438,6 +442,20 @@ impl LspClient {
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
         })
+    }
+
+    /// Returns true when an LSP error represents a transient request failure.
+    ///
+    /// `ContentModified` is inherently retryable: the request raced with a
+    /// document update and the next attempt observes the newer document.
+    /// `ServerCancelled` remains gated by its protocol-defined
+    /// `retriggerRequest` flag.
+    fn should_retry(code: i32, data: Option<&Value>) -> bool {
+        match code {
+            CONTENT_MODIFIED_CODE => true,
+            SERVER_CANCELLED_CODE => Self::should_retrigger(data),
+            _ => false,
+        }
     }
 
     /// Fail every request still parked in `pending_requests` with
@@ -1269,10 +1287,10 @@ mod tests {
             });
 
             let mut reader = BufReader::new(&mut server.write_stdout);
-            // Initial attempt plus SERVER_CANCELLED_MAX_RETRIES retries: every
+            // Initial attempt plus RETRY_MAX_RETRIES retries: every
             // attempt gets ServerCancelled, so retries must exhaust rather
             // than loop forever or swallow the error.
-            for _ in 0..=SERVER_CANCELLED_MAX_RETRIES {
+            for _ in 0..=RETRY_MAX_RETRIES {
                 let request = read_framed_message(&mut reader).await;
                 let id = request["id"].clone();
                 write_server_cancelled_response(&mut server.read_half_stdin, &id, true).await;
@@ -1385,6 +1403,88 @@ mod tests {
 
             let result = request_task.await.unwrap();
             assert_eq!(result.unwrap(), expected_result);
+        }
+
+        #[tokio::test]
+        async fn test_retry_succeeds_after_one_content_modified_response() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/references",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            // ContentModified has no retriggerRequest flag, but is still
+            // transient by definition and must use the same retry policy.
+            let first = read_framed_message(&mut reader).await;
+            write_error_response(
+                &mut server.read_half_stdin,
+                &first["id"].clone(),
+                CONTENT_MODIFIED_CODE,
+                "content modified",
+            )
+            .await;
+
+            let second = read_framed_message(&mut reader).await;
+            assert_ne!(
+                first["id"], second["id"],
+                "retry must use a fresh request id"
+            );
+            let expected_result = serde_json::json!({ "locations": [] });
+            write_success_response(
+                &mut server.read_half_stdin,
+                &second["id"].clone(),
+                expected_result.clone(),
+            )
+            .await;
+
+            let result = request_task.await.unwrap();
+            assert_eq!(result.unwrap(), expected_result);
+        }
+
+        #[tokio::test]
+        async fn test_non_transient_error_returns_without_retry() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/references",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            write_error_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                -32603,
+                "internal error",
+            )
+            .await;
+
+            match request_task.await.unwrap() {
+                Err(Error::LspServerError { code, .. }) => assert_eq!(code, -32603),
+                other => panic!("expected non-transient LspServerError, got {other:?}"),
+            }
+
+            let second_request =
+                tokio::time::timeout(Duration::from_millis(200), read_framed_message(&mut reader))
+                    .await;
+            assert!(
+                second_request.is_err(),
+                "non-transient errors must not trigger a retry"
+            );
         }
 
         /// #313: an oversized, server-controlled error message must be
