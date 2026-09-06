@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `document_symbols` no longer redundantly recomputes the same range twice for flat (`SymbolInformation`) responses. (#365)
 - HTTP transport now catches a repeat shutdown signal received during the connection-drain window and cuts the drain short instead of waiting out the full timeout. (#365)
 - Corrected a broken assertion in the ignored `test_diagnostics_with_error` integration test (test-only; no production behavior change). (#365)
+- Capped nextest concurrency for `fake_lsp_client()` subprocess-mock tests (`bridge::translator`, `bridge::state`, `lsp::client`, `lsp::lifecycle`) to reduce, though not eliminate, a rare 120s hard timeout / spurious test failure caused by OS process contention under full parallel load (test-only; no production behavior change). (#380)
 
 ## [0.4.0] - 2026-09-05
 
