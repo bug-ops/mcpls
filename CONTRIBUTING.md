@@ -39,6 +39,16 @@ This project follows the [Rust Code of Conduct](https://www.rust-lang.org/polici
 
 ## Development Workflow
 
+### Claiming an Issue
+
+Before starting work on an issue:
+
+1. Check the issue's `assignee` field — if already assigned to someone else, please ask in a comment before opening a competing pull request.
+2. For non-trivial issues, leave a comment stating your intent to work on it. This allows maintainers to coordinate effort and catch duplicate work early.
+3. If a maintainer-authored fix is already in progress on the issue, their work takes precedence — coordinate with the maintainer before submitting an alternative solution.
+
+This helps prevent duplicate effort and keeps the project organized as it grows.
+
 ### Branch Naming
 
 - `feature/description` - New features
