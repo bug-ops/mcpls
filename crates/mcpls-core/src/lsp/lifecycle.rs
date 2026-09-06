@@ -277,7 +277,11 @@ pub struct LspServer {
     /// waits for it to exit after sending `exit`; otherwise, or if that wait
     /// times out, dropping it terminates the process via SIGKILL
     /// (`kill_on_drop`).
-    child: tokio::process::Child,
+    ///
+    /// `None` only for test fixtures that never spawn a real server process
+    /// (see `crate::test_lsp`, `Self::new_for_test_with_encoding`) --
+    /// [`Self::spawn`] always populates this with `Some`.
+    child: Option<tokio::process::Child>,
 }
 
 impl std::fmt::Debug for LspServer {
@@ -380,7 +384,7 @@ impl LspServer {
             capabilities,
             position_encoding,
             notification_rx,
-            child,
+            child: Some(child),
         })
     }
 
@@ -604,11 +608,19 @@ impl LspServer {
     /// [`crate::error::Error::ServerTerminated`]. Callers that want to
     /// recover substitute a freshly [`Self::spawn`]ed replacement.
     ///
+    /// Always returns `Ok(false)` for a test fixture with no real backing
+    /// process (`self.child` is `None`) -- there is nothing to have exited.
+    /// [`Self::spawn`] always populates `child`, so production code never
+    /// observes this case.
+    ///
     /// # Errors
     ///
     /// Returns an error if the OS fails to report the process's status.
     pub fn has_exited(&mut self) -> Result<bool> {
-        Ok(self.child.try_wait()?.is_some())
+        match &mut self.child {
+            Some(child) => Ok(child.try_wait()?.is_some()),
+            None => Ok(false),
+        }
     }
 
     /// Shutdown server gracefully.
@@ -618,7 +630,9 @@ impl LspServer {
     /// child process to exit on its own. If it hasn't by then, or if the
     /// `shutdown`/`exit` handshake itself fails, the child is simply dropped
     /// here — `kill_on_drop` terminates it via SIGKILL (a no-op if it has
-    /// already exited).
+    /// already exited). A test fixture with no real backing process (`child`
+    /// is `None`) skips this step entirely -- there is nothing to wait for or
+    /// kill.
     ///
     /// # Errors
     ///
@@ -638,23 +652,24 @@ impl LspServer {
         }
         .await;
 
-        let mut child = self.child;
-        match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
-            Ok(Ok(status)) => {
-                debug!(
-                    ?status,
-                    "LSP server process exited after `exit` notification"
-                );
+        if let Some(mut child) = self.child {
+            match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
+                Ok(Ok(status)) => {
+                    debug!(
+                        ?status,
+                        "LSP server process exited after `exit` notification"
+                    );
+                }
+                Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
+                Err(_) => warn!(
+                    timeout = ?CHILD_EXIT_GRACE,
+                    "LSP server process did not exit within grace period after `exit` \
+                     notification, killing it"
+                ),
             }
-            Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
-            Err(_) => warn!(
-                timeout = ?CHILD_EXIT_GRACE,
-                "LSP server process did not exit within grace period after `exit` \
-                 notification, killing it"
-            ),
+            // `child` drops here: `kill_on_drop` kills it if still running, and is a
+            // no-op if `wait()` above already reaped it.
         }
-        // `child` drops here: `kill_on_drop` kills it if still running, and is a
-        // no-op if `wait()` above already reaped it.
 
         handshake?;
         info!("LSP server shut down successfully");
@@ -798,8 +813,10 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
     })
 }
 
-/// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so it
-/// can be registered without a real language server.
+/// Builds an `LspServer` that can be registered without a real language
+/// server: an inert, in-memory transport (see `crate::test_lsp`) and no
+/// backing child process (`child: None`) -- neither is ever read from or
+/// written to.
 ///
 /// `pub` rather than private to this module's own `tests` (`lifecycle` is a
 /// private module, so this stays crate-scoped in practice, per the
@@ -809,29 +826,8 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 /// shutdown-path tests (`bridge::translator`, `lib.rs`) can get a real,
 /// registerable `LspServer` from.
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 pub fn fake_lsp_server() -> LspServer {
-    let mock_child = tokio::process::Command::new("echo")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mock_stdin = tokio::process::Command::new("cat")
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap()
-        .stdin
-        .take()
-        .unwrap();
-    let mock_stdout = tokio::process::Command::new("echo")
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap()
-        .stdout
-        .take()
-        .unwrap();
-    let transport = LspTransport::new(mock_stdin, mock_stdout);
+    let transport = crate::test_lsp::inert_transport();
     let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
     let (_, mock_notification_rx) = mpsc::channel(1);
     LspServer {
@@ -839,7 +835,7 @@ pub fn fake_lsp_server() -> LspServer {
         capabilities: lsp_types::ServerCapabilities::default(),
         position_encoding: PositionEncodingKind::UTF8,
         notification_rx: mock_notification_rx,
-        child: mock_child,
+        child: None,
     }
 }
 
@@ -849,14 +845,13 @@ impl LspServer {
     /// tests elsewhere in the crate that need to drive capability-gated
     /// dispatch paths in `Translator` without spawning a real language server.
     ///
-    /// The underlying client and child process are inert placeholders — only
-    /// `capabilities()` is meaningful on the returned value.
+    /// The underlying client and child process (`child: None`) are inert
+    /// placeholders — only `capabilities()` is meaningful on the returned
+    /// value.
     ///
     /// Uses `LspClient::new` (uninitialized, no background task) rather than
     /// `LspClient::from_transport`, so this does not depend on the Tokio
-    /// message loop — only `child`'s spawn needs a Tokio runtime, i.e. an
-    /// async test context (`#[tokio::test]`).
-    #[allow(clippy::unwrap_used)]
+    /// message loop or a real process at all.
     pub(crate) fn new_for_test(capabilities: ServerCapabilities) -> Self {
         Self::new_for_test_with_encoding(capabilities, PositionEncodingKind::UTF16)
     }
@@ -865,18 +860,10 @@ impl LspServer {
     /// encoding -- for tests exercising a non-UTF-16 conversion path (e.g.
     /// `EncodingCtx`-driven range conversion) without spawning a real
     /// process.
-    #[allow(clippy::unwrap_used)]
     pub(crate) fn new_for_test_with_encoding(
         capabilities: ServerCapabilities,
         position_encoding: PositionEncodingKind,
     ) -> Self {
-        let child = Command::new("echo")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
         let client = LspClient::new(LspServerConfig::rust_analyzer());
         let (_, notification_rx) = mpsc::channel(1);
 
@@ -885,7 +872,7 @@ impl LspServer {
             capabilities,
             position_encoding,
             notification_rx,
-            child,
+            child: None,
         }
     }
 }
@@ -1158,7 +1145,7 @@ mod tests {
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
-            child: mock_child,
+            child: Some(mock_child),
         };
 
         assert!(
@@ -1166,7 +1153,7 @@ mod tests {
             "freshly spawned `sleep 2` should still be running"
         );
 
-        server.child.kill().await.unwrap();
+        server.child.as_mut().unwrap().kill().await.unwrap();
         // `kill().await` waits for the process to actually exit, so the
         // very next `try_wait` reliably observes it as gone.
         assert!(
@@ -1179,30 +1166,7 @@ mod tests {
     async fn test_lsp_server_getters() {
         use lsp_types::ServerCapabilities;
 
-        let mock_child = tokio::process::Command::new("echo")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let mock_stdin = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let transport = crate::test_lsp::inert_transport();
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
         let (_, mock_notification_rx) = mpsc::channel(1);
 
@@ -1211,7 +1175,7 @@ mod tests {
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
-            child: mock_child,
+            child: None,
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -1269,30 +1233,7 @@ mod tests {
     async fn test_server_init_result_all_success() {
         let mut result = ServerInitResult::new();
 
-        let mock_child1 = tokio::process::Command::new("echo")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let mock_stdin1 = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout1 = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
+        let transport1 = crate::test_lsp::inert_transport();
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
         let (_, mock_notification_rx1) = mpsc::channel(1);
 
@@ -1301,7 +1242,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx1,
-            child: mock_child1,
+            child: None,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1317,30 +1258,7 @@ mod tests {
     async fn test_server_init_result_partial_success() {
         let mut result = ServerInitResult::new();
 
-        let mock_child = tokio::process::Command::new("echo")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let mock_stdin = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let transport = crate::test_lsp::inert_transport();
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
         let (_, mock_notification_rx) = mpsc::channel(1);
 
@@ -1349,7 +1267,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
-            child: mock_child,
+            child: None,
         };
 
         result.add_server("rust".to_string(), server);
@@ -1373,30 +1291,7 @@ mod tests {
         let mut result = ServerInitResult::new();
 
         for i in 0..3 {
-            let mock_child = tokio::process::Command::new("echo")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-
-            let mock_stdin = tokio::process::Command::new("cat")
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap()
-                .stdin
-                .take()
-                .unwrap();
-
-            let mock_stdout = tokio::process::Command::new("echo")
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap()
-                .stdout
-                .take()
-                .unwrap();
-
-            let transport = LspTransport::new(mock_stdin, mock_stdout);
+            let transport = crate::test_lsp::inert_transport();
             let config = if i == 0 {
                 LspServerConfig::rust_analyzer()
             } else if i == 1 {
@@ -1412,7 +1307,7 @@ mod tests {
                 capabilities: lsp_types::ServerCapabilities::default(),
                 position_encoding: PositionEncodingKind::UTF8,
                 notification_rx: mock_notification_rx,
-                child: mock_child,
+                child: None,
             };
 
             result.add_server(config.language_id, server);
@@ -1429,30 +1324,7 @@ mod tests {
     async fn test_server_init_result_replace_server() {
         let mut result = ServerInitResult::new();
 
-        let mock_child1 = tokio::process::Command::new("echo")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let mock_stdin1 = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout1 = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport1 = LspTransport::new(mock_stdin1, mock_stdout1);
+        let transport1 = crate::test_lsp::inert_transport();
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
         let (_, mock_notification_rx1) = mpsc::channel(1);
 
@@ -1461,36 +1333,13 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx1,
-            child: mock_child1,
+            child: None,
         };
 
         result.add_server("rust".to_string(), server1);
         assert_eq!(result.server_count(), 1);
 
-        let mock_child2 = tokio::process::Command::new("echo")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let mock_stdin2 = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdin
-            .take()
-            .unwrap();
-
-        let mock_stdout2 = tokio::process::Command::new("echo")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .stdout
-            .take()
-            .unwrap();
-
-        let transport2 = LspTransport::new(mock_stdin2, mock_stdout2);
+        let transport2 = crate::test_lsp::inert_transport();
         let client2 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport2);
         let (_, mock_notification_rx2) = mpsc::channel(1);
 
@@ -1499,7 +1348,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF16,
             notification_rx: mock_notification_rx2,
-            child: mock_child2,
+            child: None,
         };
 
         result.add_server("rust".to_string(), server2);
@@ -1727,96 +1576,19 @@ mod tests {
         assert_eq!(result.failures[1].command, "cmd2-nonexistent");
     }
 
-    /// Wire-level regressions for the `initialize` request. The tests capture
-    /// the real bytes `LspServer::initialize` writes over a piped `cat`
-    /// subprocess standing in for the LSP server. Mirrors the
+    /// Wire-level regressions for the `initialize` request. The tests
+    /// capture the real bytes `LspServer::initialize` writes over an
+    /// in-memory duplex pipe standing in for the LSP server. Mirrors the
     /// `fake_lsp_client`/`FakeServer` pattern in
     /// `client.rs::tests::retry_behavior`.
     mod initialize_wire {
-        use std::process::Stdio;
-
-        use serde_json::Value;
         use tempfile::TempDir;
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-        use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+        use tokio::io::BufReader;
 
         use super::*;
-        use crate::lsp::client::LspClient;
-
-        struct FakeServer {
-            _write_half: Child,
-            _read_half: Child,
-            read_half_stdin: ChildStdin,
-            write_stdout: ChildStdout,
-        }
-
-        fn fake_lsp_client() -> (LspClient, FakeServer) {
-            let mut write_half = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let write_stdin = write_half.stdin.take().unwrap();
-            let write_stdout = write_half.stdout.take().unwrap();
-
-            let mut read_half = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let read_stdout = read_half.stdout.take().unwrap();
-            let read_stdin = read_half.stdin.take().unwrap();
-
-            let transport = LspTransport::new(write_stdin, read_stdout);
-            let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-
-            (
-                client,
-                FakeServer {
-                    _write_half: write_half,
-                    _read_half: read_half,
-                    read_half_stdin: read_stdin,
-                    write_stdout,
-                },
-            )
-        }
-
-        /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
-        async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> Value {
-            let mut content_length = None;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).await.unwrap();
-                if line == "\r\n" || line == "\n" {
-                    break;
-                }
-                if let Some((key, value)) = line.trim_end().split_once(':')
-                    && key.trim().eq_ignore_ascii_case("content-length")
-                {
-                    content_length = Some(value.trim().parse::<usize>().unwrap());
-                }
-            }
-            let mut buf = vec![0u8; content_length.unwrap()];
-            reader.read_exact(&mut buf).await.unwrap();
-            serde_json::from_slice(&buf).unwrap()
-        }
-
-        /// Writes a framed JSON-RPC success response.
-        async fn write_success_response(stdin: &mut ChildStdin, id: &Value, result: Value) {
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": result,
-            });
-            let content = serde_json::to_string(&response).unwrap();
-            let header = format!("Content-Length: {}\r\n\r\n", content.len());
-            stdin.write_all(header.as_bytes()).await.unwrap();
-            stdin.write_all(content.as_bytes()).await.unwrap();
-            stdin.flush().await.unwrap();
-        }
+        use crate::test_lsp::{
+            fake_lsp_client, read_framed_message, write_response as write_success_response,
+        };
 
         #[tokio::test]
         async fn test_initialize_sends_configured_position_encodings() {

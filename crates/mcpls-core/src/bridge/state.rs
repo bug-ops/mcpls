@@ -1106,12 +1106,13 @@ mod tests {
     /// #249 S1 regression: a `sync_phase` call that captured `server`'s
     /// generation *before* a concurrent `forget_server` bumped it must not
     /// commit its `synced` write, even though its notification against the
-    /// now-superseded connection reports success (`fake_lsp_client`'s `cat`
-    /// backend always accepts writes, standing in for the window where a
-    /// server's process has already died but its message loop has not yet
-    /// observed that). Without this, a document synced against the old
-    /// (crashed) process would be wrongly marked as already open on the
-    /// respawned one, permanently desyncing it.
+    /// now-superseded connection reports success (`fake_lsp_client`'s
+    /// `DuplexStream` peer, held alive by the test's `FakeServer`, always
+    /// accepts writes, standing in for the window where a server's process
+    /// has already died but its message loop has not yet observed that).
+    /// Without this, a document synced against the old (crashed) process
+    /// would be wrongly marked as already open on the respawned one,
+    /// permanently desyncing it.
     #[tokio::test]
     async fn test_sync_phase_skips_commit_when_generation_is_stale() {
         let dir = TempDir::new().unwrap();
@@ -1884,68 +1885,10 @@ mod tests {
     // ensure_open resync (issue #102)
     // ------------------------------------------------------------------
 
-    use std::process::Stdio;
-
     use tempfile::TempDir;
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-    use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+    use tokio::io::BufReader;
 
-    use crate::config::LspServerConfig;
-    use crate::lsp::LspTransport;
-
-    /// Holds both fake-transport child processes alive for a test.
-    ///
-    /// The read-half's stdin is deliberately never written to, so its `cat`
-    /// process never sees EOF on input, never exits, and its stdout (which
-    /// backs the transport's `receive()`) never closes -- `receive()` pends
-    /// forever instead of observing EOF and tearing down the client's
-    /// message loop. Using `echo` here instead would exit immediately and
-    /// break every subsequent `notify()` call.
-    ///
-    /// `write_stdout` is the write-half's own stdout: since `cat` echoes
-    /// whatever mcpls writes to its stdin, reading this back is how a test
-    /// observes the actual framed JSON-RPC bytes sent to the "server".
-    struct FakeServer {
-        _write_half: Child,
-        _read_half: Child,
-        _read_half_stdin: ChildStdin,
-        write_stdout: ChildStdout,
-    }
-
-    /// Builds an `LspClient` backed by two `cat` child processes so
-    /// `notify()` succeeds without a real language server.
-    fn fake_lsp_client() -> (LspClient, FakeServer) {
-        let mut write_half = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let write_stdin = write_half.stdin.take().unwrap();
-        let write_stdout = write_half.stdout.take().unwrap();
-
-        let mut read_half = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let read_stdout = read_half.stdout.take().unwrap();
-        let read_stdin = read_half.stdin.take().unwrap();
-
-        let transport = LspTransport::new(write_stdin, read_stdout);
-        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-
-        (
-            client,
-            FakeServer {
-                _write_half: write_half,
-                _read_half: read_half,
-                _read_half_stdin: read_stdin,
-                write_stdout,
-            },
-        )
-    }
+    use crate::test_lsp::{fake_lsp_client, read_framed_message};
 
     /// Backdates or forwards a file's mtime for deterministic disk-sync tests.
     ///
@@ -1961,31 +1904,6 @@ mod tests {
 
     fn settled_past() -> SystemTime {
         SystemTime::now() - Duration::from_secs(10)
-    }
-
-    /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
-    ///
-    /// `reader` must be reused across calls (not recreated per message):
-    /// a fresh `BufReader` would silently drop any bytes of a later message
-    /// it over-read into its internal buffer while parsing an earlier one.
-    async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> serde_json::Value {
-        let mut content_length = None;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            reader.read_line(&mut line).await.unwrap();
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-            if let Some((key, value)) = line.trim_end().split_once(':')
-                && key.trim().eq_ignore_ascii_case("content-length")
-            {
-                content_length = Some(value.trim().parse::<usize>().unwrap());
-            }
-        }
-        let mut buf = vec![0u8; content_length.unwrap()];
-        reader.read_exact(&mut buf).await.unwrap();
-        serde_json::from_slice(&buf).unwrap()
     }
 
     #[test]

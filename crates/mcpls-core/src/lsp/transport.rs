@@ -9,10 +9,10 @@
 //! ```
 
 use std::collections::HashMap;
+use std::fmt;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, trace, warn};
 
 use crate::error::{Error, Result};
@@ -25,24 +25,41 @@ const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
 ///
 /// This transport handles the LSP protocol's header-content message format,
 /// parsing Content-Length headers and reading exact message content.
-#[derive(Debug)]
+///
+/// Boxes its reader/writer as trait objects rather than carrying them as
+/// type parameters: [`Self::new`] accepts any `AsyncWrite`/`AsyncRead` pair
+/// (a spawned LSP server's `ChildStdin`/`ChildStdout` in production, an
+/// in-memory `tokio::io::duplex` pipe in tests -- see `crate::test_lsp`),
+/// so `LspClient` and `LspServer` don't need to become generic over the
+/// underlying transport just to support both.
 pub struct LspTransport {
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdin: Box<dyn AsyncWrite + Unpin + Send>,
+    stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+}
+
+impl fmt::Debug for LspTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LspTransport").finish_non_exhaustive()
+    }
 }
 
 impl LspTransport {
-    /// Create transport from child process stdio.
+    /// Create a transport from a reader/writer pair.
     ///
     /// # Arguments
     ///
-    /// * `stdin` - The child process's stdin handle for sending messages
-    /// * `stdout` - The child process's stdout handle for receiving messages
+    /// * `stdin` - Where to write outbound messages (a spawned server's
+    ///   stdin in production)
+    /// * `stdout` - Where to read inbound messages from (a spawned server's
+    ///   stdout in production)
     #[must_use]
-    pub fn new(stdin: ChildStdin, stdout: ChildStdout) -> Self {
+    pub fn new(
+        stdin: impl AsyncWrite + Unpin + Send + 'static,
+        stdout: impl AsyncRead + Unpin + Send + 'static,
+    ) -> Self {
         Self {
-            stdin,
-            stdout: BufReader::new(stdout),
+            stdin: Box::new(stdin),
+            stdout: BufReader::new(Box::new(stdout)),
         }
     }
 
