@@ -194,6 +194,82 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "Location": {
+          "description": "Location in a document.",
+          "properties": {
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range within the document."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "locations": {
+          "description": "Locations of the definition.",
+          "items": {
+            "$ref": "#/$defs/Location"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "locations"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Go to Definition",
       "readOnlyHint": true,
@@ -218,6 +294,119 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "Diagnostic": {
+          "description": "A single diagnostic.",
+          "properties": {
+            "code": {
+              "description": "Optional diagnostic code.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Diagnostic message.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range where the diagnostic applies."
+            },
+            "severity": {
+              "$ref": "#/$defs/DiagnosticSeverity",
+              "description": "Severity of the diagnostic."
+            }
+          },
+          "required": [
+            "range",
+            "severity",
+            "message"
+          ],
+          "type": "object"
+        },
+        "DiagnosticSeverity": {
+          "description": "Diagnostic severity.",
+          "oneOf": [
+            {
+              "const": "error",
+              "description": "Error diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "warning",
+              "description": "Warning diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "information",
+              "description": "Informational diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "hint",
+              "description": "Hint diagnostic.",
+              "type": "string"
+            }
+          ]
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "diagnostics": {
+          "description": "List of diagnostics for the document.",
+          "items": {
+            "$ref": "#/$defs/Diagnostic"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "diagnostics"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Diagnostics",
       "readOnlyHint": true,
@@ -239,6 +428,102 @@
       },
       "required": [
         "file_path"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "Symbol": {
+          "description": "A document symbol.",
+          "properties": {
+            "children": {
+              "description": "Child symbols.",
+              "items": {
+                "$ref": "#/$defs/Symbol"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Kind of symbol.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selection_range": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location)."
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "range",
+            "selection_range"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "symbols": {
+          "description": "List of symbols in the document.",
+          "items": {
+            "$ref": "#/$defs/Symbol"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "symbols"
       ],
       "type": "object"
     },
@@ -418,6 +703,82 @@
         "file_path",
         "line",
         "character"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Location": {
+          "description": "Location in a document.",
+          "properties": {
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range within the document."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "locations": {
+          "description": "Locations of all references.",
+          "items": {
+            "$ref": "#/$defs/Location"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "locations"
       ],
       "type": "object"
     },

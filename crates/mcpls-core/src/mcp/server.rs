@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
+use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
     ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
@@ -16,6 +16,8 @@ use rmcp::model::{
     UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
@@ -27,8 +29,9 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
-    DiagnosticInfo, DiagnosticsResult, NotificationCache, Position, PositionEncoding,
-    ResourceSubscriptions, Translator, validate_path_against_roots,
+    DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, NotificationCache,
+    Position, PositionEncoding, ReferencesResult, ResourceSubscriptions, Translator,
+    validate_path_against_roots,
 };
 use crate::config::{McpConfig, ToolPrefix};
 
@@ -140,6 +143,21 @@ fn to_tool_result<T: serde::Serialize>(
     match result {
         Ok(value) => serde_json::to_string(&value)
             .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
+        Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+    }
+}
+
+/// Map a bridge-layer result to a structured MCP tool response (`structuredContent` plus the
+/// legacy `content` text block, per the MCP spec's backwards-compat shape).
+///
+/// The handler's own return type -- not this helper's -- is what the `#[tool]` macro reads to
+/// derive `outputSchema`; it must spell `Result<Json<T>, McpError>` literally (no alias) for the
+/// macro to detect it. See `Json<T>`'s `IntoCallToolResult` impl, which this helper relies on.
+fn to_structured_tool_result<T: Serialize + JsonSchema>(
+    result: crate::error::Result<T>,
+) -> Result<Json<T>, McpError> {
+    match result {
+        Ok(value) => Ok(Json(value)),
         Err(e) => Err(McpError::internal_error(e.to_string(), None)),
     }
 }
@@ -381,8 +399,8 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<DefinitionResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_definition(file_path, Position { line, character })
@@ -406,8 +424,8 @@ impl McplsServer {
                 },
             include_declaration,
         }): Parameters<ReferencesParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<ReferencesResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_references(file_path, Position { line, character }, include_declaration)
@@ -423,11 +441,11 @@ impl McplsServer {
     async fn get_diagnostics(
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
-    ) -> Result<String, McpError> {
+    ) -> Result<Json<DiagnosticsResult>, McpError> {
         // Merging push-model (flycheck/clippy) diagnostics into the pull
         // result, including the pull-error-but-cache-has-data fallback, is
         // handled inside handle_diagnostics itself -- see its doc comment.
-        to_tool_result(
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_diagnostics(file_path, &self.context.notification_cache)
@@ -495,8 +513,8 @@ impl McplsServer {
     async fn get_document_symbols(
         &self,
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<DocumentSymbolsResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_document_symbols(file_path)
@@ -2510,6 +2528,34 @@ sleep 0.3
         );
     }
 
+    /// Structured output (`outputSchema`) is advertised for exactly the tools migrated to
+    /// `Result<Json<T>, McpError>` handler signatures, and only those. Driven off a literal
+    /// expected-name set (not derived from the router) so both a future migration and an
+    /// accidental scope change fail loudly here instead of only showing up as an opaque diff in
+    /// `test_tool_surface_matches_golden_snapshot`.
+    #[test]
+    fn test_output_schema_present_only_for_structured_tools() {
+        const STRUCTURED_TOOLS: &[&str] = &[
+            "get_diagnostics",
+            "get_definition",
+            "get_references",
+            "get_document_symbols",
+        ];
+
+        let tools = McplsServer::build_tool_router(None).list_all();
+        assert!(!tools.is_empty(), "no tools registered");
+
+        for tool in &tools {
+            let expects_schema = STRUCTURED_TOOLS.contains(&tool.name.as_ref());
+            assert_eq!(
+                tool.output_schema.is_some(),
+                expects_schema,
+                "tool `{}`: expected output_schema.is_some() == {expects_schema}",
+                tool.name
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // tool_prefix tests
     // ------------------------------------------------------------------
@@ -2553,8 +2599,9 @@ sleep 0.3
     }
 
     /// A configured prefix rewrites only `name` -- every other field
-    /// (description, title, annotations, input schema) stays identical to
-    /// the unprefixed golden snapshot, and no route is gained or lost.
+    /// (description, title, annotations, input schema, output schema) stays
+    /// identical to the unprefixed golden snapshot, and no route is gained
+    /// or lost.
     #[test]
     fn test_build_tool_router_with_prefix_renames_only_name() {
         let prefix: ToolPrefix = "optics".parse().unwrap();
@@ -2568,6 +2615,7 @@ sleep 0.3
             assert_eq!(after.title, before.title);
             assert_eq!(after.annotations, before.annotations);
             assert_eq!(after.input_schema, before.input_schema);
+            assert_eq!(after.output_schema, before.output_schema);
         }
     }
 
