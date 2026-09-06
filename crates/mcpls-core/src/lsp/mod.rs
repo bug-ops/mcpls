@@ -8,6 +8,7 @@ mod lifecycle;
 mod transport;
 pub(crate) mod types;
 
+pub(crate) use client::CONTENT_MODIFIED_RETRY_METHODS;
 pub use client::LspClient;
 pub(crate) use lifecycle::SUPPORTED_SYMBOL_KINDS;
 #[cfg(test)]

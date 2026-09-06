@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use lsp_types::LspErrorCodes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -30,6 +31,45 @@ const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
 
 /// Initial backoff delay for server-cancelled retries (milliseconds).
 const SERVER_CANCELLED_INITIAL_DELAY_MS: u64 = 500;
+
+/// LSP request methods for which a `-32801` (`ContentModified`) error
+/// response is safe to retry automatically -- also declared to servers via
+/// `general.staleRequestSupport.retryOnContentModified` during initialize
+/// (see [`crate::lsp::LspServer`]'s handshake).
+///
+/// Per the LSP spec, `ContentModified` means the server noticed the document
+/// changed while it was computing a response; the (possibly stale) result may
+/// still be useful, or the client may choose to cancel the request instead.
+/// mcpls chooses to retry, which is safe for a read-only/idempotent request
+/// (hover, references, diagnostics, ...): a stale response is simply
+/// discarded and superseded by a fresh one.
+///
+/// Deliberately excludes every method in
+/// `crate::bridge::translator::edits` (`textDocument/rename`,
+/// `textDocument/formatting`, `textDocument/codeAction`): their result is an
+/// edit the MCP caller applies, and `-32801` means the document changed since
+/// the request was issued, so a retry at the original position could return
+/// an edit for content the caller no longer expects (e.g. renaming a
+/// different symbol than the one originally at that position).
+///
+/// This list only gates `-32801`. `-32802` (`ServerCancelled`) retry is
+/// unaffected and keeps retrying unconditionally for every method, as before.
+pub const CONTENT_MODIFIED_RETRY_METHODS: &[&str] = &[
+    "textDocument/signatureHelp",
+    "textDocument/inlayHint",
+    "textDocument/completion",
+    "textDocument/prepareCallHierarchy",
+    "callHierarchy/incomingCalls",
+    "callHierarchy/outgoingCalls",
+    "textDocument/diagnostic",
+    "textDocument/hover",
+    "textDocument/definition",
+    "textDocument/references",
+    "textDocument/implementation",
+    "textDocument/typeDefinition",
+    "textDocument/documentSymbol",
+    "workspace/symbol",
+];
 
 /// Byte-length threshold for truncating an LSP error message before logging it.
 ///
@@ -227,9 +267,10 @@ impl LspClient {
     ///
     /// This bounds one attempt, not a whole tool call: [`Self::request`]
     /// retries up to `SERVER_CANCELLED_MAX_RETRIES` (3) additional times on a
-    /// `-32802` (`ServerCancelled`) response, so the worst-case latency for a
-    /// single tool call is `4 * request_timeout() + 3.5s` (the sum of the
-    /// retry backoff delays).
+    /// `-32802` (`ServerCancelled`) or `-32801` (`ContentModified`) response,
+    /// sharing one attempt budget between the two codes, so the worst-case
+    /// latency for a single tool call is `4 * request_timeout() + 3.5s` (the
+    /// sum of the retry backoff delays).
     ///
     /// The configured value is clamped to the range from 1 second to
     /// [`MAX_TIMEOUT_SECONDS`]. [`crate::serve`]/[`crate::serve_with`] now
@@ -305,8 +346,11 @@ impl LspClient {
     /// Send request and wait for response with timeout.
     ///
     /// Automatically retries up to 3 times when the server returns error code
-    /// -32802 (`ServerCancelled`) with `data.retriggerRequest == true`, using
-    /// exponential backoff starting at 500 ms.
+    /// -32802 (`ServerCancelled`, any method) or -32801 (`ContentModified`,
+    /// only for methods in `CONTENT_MODIFIED_RETRY_METHODS`) -- gated by
+    /// `data.retriggerRequest` when present -- using exponential backoff
+    /// starting at 500 ms. Both codes share the same attempt budget: a
+    /// request that hits -32801 then -32802 does not get 8 attempts, only 4.
     ///
     /// # Type Parameters
     ///
@@ -336,7 +380,7 @@ impl LspClient {
         for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
             if attempt > 0 {
                 debug!(
-                    "Retrying {} after ServerCancelled (attempt {}/{}), backoff={}ms",
+                    "Retrying {} (attempt {}/{}), backoff={}ms",
                     method, attempt, SERVER_CANCELLED_MAX_RETRIES, delay_ms
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -384,11 +428,11 @@ impl LspClient {
                     code,
                     ref message,
                     ref data,
-                }) if code == SERVER_CANCELLED_CODE && Self::should_retrigger(data.as_ref()) => {
-                    warn!(
-                        "ServerCancelled (-32802) on '{}', will retry: {}",
-                        method, message
-                    );
+                }) if (code == SERVER_CANCELLED_CODE
+                    || (LspErrorCodes::from(code) == LspErrorCodes::ContentModified
+                        && CONTENT_MODIFIED_RETRY_METHODS.contains(&method)))
+                    && Self::should_retrigger(data.as_ref()) =>
+                {
                     if attempt == SERVER_CANCELLED_MAX_RETRIES {
                         return Err(Error::LspServerError {
                             code,
@@ -396,6 +440,13 @@ impl LspClient {
                             data: data.clone(),
                         });
                     }
+                    warn!(
+                        "{:?} ({}) on '{}', will retry: {}",
+                        LspErrorCodes::from(code),
+                        code,
+                        method,
+                        message
+                    );
                     // continue loop for next attempt
                 }
                 Err(e) => return Err(e),
@@ -426,12 +477,19 @@ impl LspClient {
             .await
     }
 
-    /// Returns true when the error data from a `ServerCancelled` (-32802) response
-    /// indicates the server wants the client to retrigger the request.
+    /// Returns true when the error data from a retryable "please retry" LSP
+    /// response (`ServerCancelled` -32802 or `ContentModified` -32801)
+    /// indicates a retry should happen.
     ///
-    /// Per the LSP specification, `data.retriggerRequest == true` is the signal.
-    /// When `data` is absent (older servers), we default to retrying anyway because
-    /// code -32802 is exclusively used for this purpose.
+    /// The LSP spec defines `data.retriggerRequest` only for diagnostic
+    /// requests' `ServerCancelled` responses (`DiagnosticServerCancellationData`)
+    /// -- it is not part of the general `ServerCancelled` or `ContentModified`
+    /// contract for other methods. mcpls checks this field whenever it is
+    /// present regardless of method (harmless for non-diagnostic methods,
+    /// since a compliant server won't send it there) and defaults to
+    /// retrying when the field is absent, since retrying is the more useful
+    /// default for a request that would otherwise surface as a hard error to
+    /// the MCP caller.
     fn should_retrigger(data: Option<&Value>) -> bool {
         data.is_none_or(|v| {
             v.get("retriggerRequest")
@@ -1196,18 +1254,22 @@ mod tests {
             serde_json::from_slice(&buf).unwrap()
         }
 
-        /// Writes a framed JSON-RPC `ServerCancelled` (-32802) error response.
-        async fn write_server_cancelled_response(
+        /// Writes a framed JSON-RPC retryable error response — either
+        /// `ServerCancelled` (-32802) or `ContentModified` (-32801) — with a
+        /// `data.retriggerRequest` flag.
+        async fn write_retryable_error_response(
             stdin: &mut ChildStdin,
             id: &Value,
+            code: i32,
+            message: &str,
             retrigger: bool,
         ) {
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "error": {
-                    "code": SERVER_CANCELLED_CODE,
-                    "message": "server cancelled the request",
+                    "code": code,
+                    "message": message,
                     "data": { "retriggerRequest": retrigger },
                 },
             });
@@ -1275,7 +1337,14 @@ mod tests {
             for _ in 0..=SERVER_CANCELLED_MAX_RETRIES {
                 let request = read_framed_message(&mut reader).await;
                 let id = request["id"].clone();
-                write_server_cancelled_response(&mut server.read_half_stdin, &id, true).await;
+                write_retryable_error_response(
+                    &mut server.read_half_stdin,
+                    &id,
+                    SERVER_CANCELLED_CODE,
+                    "server cancelled the request",
+                    true,
+                )
+                .await;
             }
 
             let result = request_task.await.unwrap();
@@ -1314,7 +1383,14 @@ mod tests {
             let mut reader = BufReader::new(&mut server.write_stdout);
             let request = read_framed_message(&mut reader).await;
             let id = request["id"].clone();
-            write_server_cancelled_response(&mut server.read_half_stdin, &id, false).await;
+            write_retryable_error_response(
+                &mut server.read_half_stdin,
+                &id,
+                SERVER_CANCELLED_CODE,
+                "server cancelled the request",
+                false,
+            )
+            .await;
 
             // With `retriggerRequest: false`, `should_retrigger`'s gate on
             // the retry branch must short-circuit the loop: the error
@@ -1361,9 +1437,11 @@ mod tests {
 
             // First attempt is cancelled and must retrigger.
             let first = read_framed_message(&mut reader).await;
-            write_server_cancelled_response(
+            write_retryable_error_response(
                 &mut server.read_half_stdin,
                 &first["id"].clone(),
+                SERVER_CANCELLED_CODE,
+                "server cancelled the request",
                 true,
             )
             .await;
@@ -1385,6 +1463,207 @@ mod tests {
 
             let result = request_task.await.unwrap();
             assert_eq!(result.unwrap(), expected_result);
+        }
+
+        #[tokio::test]
+        async fn test_retry_exhaustion_returns_original_content_modified_error() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            // Initial attempt plus SERVER_CANCELLED_MAX_RETRIES retries: every
+            // attempt gets ContentModified, so retries must exhaust rather
+            // than loop forever or swallow the error. -32801 shares the same
+            // attempt budget as -32802 (FR-002), not an independent one.
+            for _ in 0..=SERVER_CANCELLED_MAX_RETRIES {
+                let request = read_framed_message(&mut reader).await;
+                let id = request["id"].clone();
+                write_retryable_error_response(
+                    &mut server.read_half_stdin,
+                    &id,
+                    i32::from(LspErrorCodes::ContentModified),
+                    "content modified",
+                    true,
+                )
+                .await;
+            }
+
+            let result = request_task.await.unwrap();
+
+            match result {
+                Err(Error::LspServerError {
+                    code,
+                    message,
+                    data,
+                }) => {
+                    // Assert the exact original error surfaces, not merely
+                    // "some error with this code" -- a freshly constructed
+                    // placeholder error would satisfy a code-only check.
+                    assert_eq!(code, i32::from(LspErrorCodes::ContentModified));
+                    assert_eq!(message, "content modified");
+                    assert_eq!(data, Some(serde_json::json!({ "retriggerRequest": true })));
+                }
+                other => panic!("expected exhausted ContentModified error, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_retrigger_false_returns_immediately_without_retry_for_content_modified() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let id = request["id"].clone();
+            write_retryable_error_response(
+                &mut server.read_half_stdin,
+                &id,
+                i32::from(LspErrorCodes::ContentModified),
+                "content modified",
+                false,
+            )
+            .await;
+
+            // Same `should_retrigger` gate as -32802: a non-spec-compliant
+            // server sending `retriggerRequest: false` on -32801 must still
+            // be honored (FR-006 resolution), short-circuiting the loop well
+            // under the first 500ms backoff.
+            let result = tokio::time::timeout(Duration::from_millis(200), request_task)
+                .await
+                .unwrap()
+                .unwrap();
+
+            match result {
+                Err(Error::LspServerError { code, .. }) => {
+                    assert_eq!(code, i32::from(LspErrorCodes::ContentModified));
+                }
+                other => panic!("expected immediate ContentModified error, got {other:?}"),
+            }
+
+            let second_request =
+                tokio::time::timeout(Duration::from_millis(200), read_framed_message(&mut reader))
+                    .await;
+            assert!(
+                second_request.is_err(),
+                "no retry should have been sent after retriggerRequest: false"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_retry_succeeds_after_one_content_modified_response() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            // First attempt gets ContentModified and must retrigger.
+            let first = read_framed_message(&mut reader).await;
+            write_retryable_error_response(
+                &mut server.read_half_stdin,
+                &first["id"].clone(),
+                i32::from(LspErrorCodes::ContentModified),
+                "content modified",
+                true,
+            )
+            .await;
+
+            // Second attempt (after backoff) succeeds -- proves the loop
+            // genuinely re-sends the request rather than just counting down.
+            let second = read_framed_message(&mut reader).await;
+            assert_ne!(
+                first["id"], second["id"],
+                "retry must use a fresh request id"
+            );
+            let expected_result = serde_json::json!({ "contents": "resolved on retry" });
+            write_success_response(
+                &mut server.read_half_stdin,
+                &second["id"].clone(),
+                expected_result.clone(),
+            )
+            .await;
+
+            let result = request_task.await.unwrap();
+            assert_eq!(result.unwrap(), expected_result);
+        }
+
+        #[tokio::test]
+        async fn test_content_modified_on_non_allowlisted_method_does_not_retry() {
+            let (client, mut server) = fake_lsp_client();
+
+            // `textDocument/rename` is deliberately excluded from
+            // `CONTENT_MODIFIED_RETRY_METHODS` (its result is an edit the
+            // caller applies at a position that may no longer be valid once
+            // the document changed) -- a -32801 response for it must return
+            // immediately even though `retriggerRequest: true` would pass
+            // `should_retrigger`'s gate on its own.
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/rename",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let id = request["id"].clone();
+            write_retryable_error_response(
+                &mut server.read_half_stdin,
+                &id,
+                i32::from(LspErrorCodes::ContentModified),
+                "content modified",
+                true,
+            )
+            .await;
+
+            let result = tokio::time::timeout(Duration::from_millis(200), request_task)
+                .await
+                .unwrap()
+                .unwrap();
+
+            match result {
+                Err(Error::LspServerError { code, .. }) => {
+                    assert_eq!(code, i32::from(LspErrorCodes::ContentModified));
+                }
+                other => panic!("expected immediate ContentModified error, got {other:?}"),
+            }
+
+            let second_request =
+                tokio::time::timeout(Duration::from_millis(200), read_framed_message(&mut reader))
+                    .await;
+            assert!(
+                second_request.is_err(),
+                "no retry should have been sent for a non-allowlisted method"
+            );
         }
 
         /// #313: an oversized, server-controlled error message must be
