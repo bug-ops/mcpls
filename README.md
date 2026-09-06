@@ -308,6 +308,31 @@ See [Configuration Reference](docs/user-guide/configuration.md) for all options.
 
 </details>
 
+<details>
+<summary><strong>HTTP Transport</strong></summary>
+
+By default, mcpls communicates over stdin/stdout. You can expose it as an HTTP server using the `--listen` flag:
+
+```bash
+mcpls --listen 127.0.0.1:8080
+```
+
+> [!WARNING]
+> mcpls performs **no authentication** on any transport, including HTTP. When binding to a non-loopback address (e.g., `0.0.0.0:8080`), you **must** place mcpls behind a reverse proxy that:
+> - Enforces authentication before forwarding requests
+> - Rewrites the `Host` header (rmcp's host validation only allows `localhost`, `127.0.0.1`, or `::1` by default)
+
+**Example (nginx):**
+```nginx
+location / {
+    auth_request /auth;
+    proxy_pass http://localhost:8080;
+    proxy_set_header Host localhost;
+}
+```
+
+</details>
+
 ## Supported Language Servers
 
 mcpls works with any LSP 3.17 compliant server. Battle-tested with:
