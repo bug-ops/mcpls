@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - E2E test harness (`McpClient::spawn_with_args`) now honors `CARGO_TARGET_DIR`/`CARGO_BUILD_TARGET_DIR` when locating the built `mcpls` binary, instead of hardcoding `target/debug/mcpls`; spawn failures now report the resolved path. (#400)
+- Retried transient LSP errors (`-32802` `ServerCancelled`, allowlisted `-32801` `ContentModified`) no longer log at `error!` before the retry succeeds, avoiding false-positive alerts in log-based monitoring; `error!` is now reserved for errors actually surfaced to the caller. (#392)
 - LSP `-32801` (`ContentModified`) error responses are now retried automatically for read-only/idempotent tool calls (hover, references, diagnostics, etc.), using the same attempt budget and backoff already applied to `-32802` (`ServerCancelled`); mutating requests (rename, formatting, code actions) are excluded. Also corrected a doc comment that mislabeled `-32802` as "content modified". (#390)
 - `NotificationCache` now derives the diagnostics cache fair-share budget automatically from the number of publishing servers when `set_diagnostics_route_count` is never called, instead of silently defaulting to an unpartitioned budget. (#379)
 - Cache eviction now prefers evicting empty ("file is clean") diagnostics entries over real ones, including across servers sharing the same eviction victim, so a stream of clean-file notifications can no longer displace actual diagnostics from the cache. (#379)
