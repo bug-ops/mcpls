@@ -65,31 +65,45 @@ impl McpClient {
     /// - The mcpls binary cannot be found or spawned
     /// - stdin or stdout cannot be captured
     pub fn spawn_with_args(args: &[&str]) -> Result<Self> {
-        // Get binary path from cargo test environment
+        // Get binary path from cargo test environment.
         // CARGO_BIN_EXE_mcpls is only set for tests in the mcpls-cli crate.
         // For tests in mcpls-core, compute workspace root from CARGO_MANIFEST_DIR.
-        let binary_path = std::env::var("CARGO_BIN_EXE_mcpls")
-            .ok()
-            .or_else(|| {
+        // Path::join discards the base when the joined component is absolute, so
+        // an absolute CARGO_TARGET_DIR/CARGO_BUILD_TARGET_DIR is honored automatically.
+        // A *relative* value is resolved here against the workspace root rather than
+        // the original `cargo` invocation's working directory (unlike real cargo) —
+        // the invocation directory isn't recoverable at test runtime, so this is a
+        // best-effort approximation.
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"))
+            .unwrap_or_else(|| "target".into());
+
+        let binary_path: std::path::PathBuf = std::env::var_os("CARGO_BIN_EXE_mcpls").map_or_else(
+            || {
                 let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
                 manifest_dir
                     .ancestors()
                     .nth(2) // mcpls-core -> crates -> workspace
-                    .map(|root| {
-                        root.join("target/debug/mcpls")
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-            })
-            .unwrap_or_else(|| "target/debug/mcpls".to_string());
+                    .unwrap_or(manifest_dir)
+                    .join(&target_dir)
+                    .join("debug/mcpls")
+            },
+            std::path::PathBuf::from,
+        );
 
-        let mut process = Command::new(binary_path)
+        let mut process = Command::new(&binary_path)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .context("failed to spawn mcpls binary")?;
+            .with_context(|| {
+                format!(
+                    "failed to spawn mcpls binary at {} \
+                     (set CARGO_TARGET_DIR or CARGO_BUILD_TARGET_DIR if the build used a non-default target dir)",
+                    binary_path.display()
+                )
+            })?;
 
         let stdin = process
             .stdin
