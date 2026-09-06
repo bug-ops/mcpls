@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`search_workspace_symbols`**/**`rename_symbol`** — Breaking change: symbols without a location range are now dropped instead of given a fabricated placeholder range, and LSP-3.18 snippet-shaped rename edits are now dropped instead of their literal placeholder syntax (e.g. `${1:name}`) being written into the file. (#375)
 - `workspace/symbol` `kind_filter` validation now derives its accepted names from `SUPPORTED_SYMBOL_KINDS`, the same single source of truth used by the `initialize` handshake, instead of a separately hand-maintained string list. (#383)
 - Replaced the hand-rolled `DiagnosticRequestParams` workaround with upstream `lsp_types::DocumentDiagnosticParams` directly; wire format is unchanged. (#383)
+- Consolidated the duplicated `handle_definition`/`handle_implementation`/`handle_type_definition` go-to-X handlers and their response-flattening helpers in `bridge::translator::navigation` behind a shared generic path; behavior is unchanged. (#386)
 
 ### Removed
 
