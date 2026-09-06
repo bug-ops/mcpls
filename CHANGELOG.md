@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- LSP `-32801` (`ContentModified`) error responses are now retried automatically for read-only/idempotent tool calls (hover, references, diagnostics, etc.), using the same attempt budget and backoff already applied to `-32802` (`ServerCancelled`); mutating requests (rename, formatting, code actions) are excluded. Also corrected a doc comment that mislabeled `-32802` as "content modified". (#382)
+- LSP `-32801` (`ContentModified`) error responses are now retried automatically for read-only/idempotent tool calls (hover, references, diagnostics, etc.), using the same attempt budget and backoff already applied to `-32802` (`ServerCancelled`); mutating requests (rename, formatting, code actions) are excluded. Also corrected a doc comment that mislabeled `-32802` as "content modified". (#390)
 - `NotificationCache` now derives the diagnostics cache fair-share budget automatically from the number of publishing servers when `set_diagnostics_route_count` is never called, instead of silently defaulting to an unpartitioned budget. (#379)
 - Cache eviction now prefers evicting empty ("file is clean") diagnostics entries over real ones, including across servers sharing the same eviction victim, so a stream of clean-file notifications can no longer displace actual diagnostics from the cache. (#379)
 - Diagnostics push notifications no longer silently vanish after an LSP server respawn; `get_cached_diagnostics`/resource reads now flag when they're degraded. (#363)
