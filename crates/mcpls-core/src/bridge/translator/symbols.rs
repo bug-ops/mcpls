@@ -11,38 +11,11 @@ use super::encoding_ctx::EncodingCtx;
 use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ToolKind};
 use crate::error::{Error, Result};
+use crate::lsp::SUPPORTED_SYMBOL_KINDS;
 
 /// Validate parameters for `handle_workspace_symbol`.
 fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
     const MAX_QUERY_LENGTH: usize = 1000;
-    const VALID_SYMBOL_KINDS: &[&str] = &[
-        "File",
-        "Module",
-        "Namespace",
-        "Package",
-        "Class",
-        "Method",
-        "Property",
-        "Field",
-        "Constructor",
-        "Enum",
-        "Interface",
-        "Function",
-        "Variable",
-        "Constant",
-        "String",
-        "Number",
-        "Boolean",
-        "Array",
-        "Object",
-        "Key",
-        "Null",
-        "EnumMember",
-        "Struct",
-        "Event",
-        "Operator",
-        "TypeParameter",
-    ];
 
     if query.len() > MAX_QUERY_LENGTH {
         return Err(Error::InvalidToolParams(format!(
@@ -52,12 +25,16 @@ fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> R
     }
 
     if let Some(kind) = kind_filter
-        && !VALID_SYMBOL_KINDS
+        && !SUPPORTED_SYMBOL_KINDS
             .iter()
-            .any(|k| k.eq_ignore_ascii_case(kind))
+            .any(|k| format!("{k:?}").eq_ignore_ascii_case(kind))
     {
+        let valid: Vec<String> = SUPPORTED_SYMBOL_KINDS
+            .iter()
+            .map(|k| format!("{k:?}"))
+            .collect();
         return Err(Error::InvalidToolParams(format!(
-            "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
+            "Invalid kind_filter: '{kind}'. Valid values: {valid:?}"
         )));
     }
 
@@ -313,6 +290,31 @@ mod tests {
     use super::*;
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
+
+    /// #355 regression: `validate_workspace_symbol_params` accepts/rejects
+    /// `kind_filter` values based on `SymbolKind`'s derived `Debug` output,
+    /// since `gen-lsp-types` provides no `as_str()`/`Display`. This pins that
+    /// assumption directly so a future `gen-lsp-types` bump that changes the
+    /// `Debug` rendering (e.g. back to a newtype) fails loudly here instead
+    /// of silently diverging from the DTO `kind` strings the responses emit.
+    #[test]
+    fn test_symbol_kind_debug_rendering_is_pinned() {
+        assert_eq!(
+            format!("{:?}", lsp_types::SymbolKind::EnumMember),
+            "EnumMember"
+        );
+    }
+
+    #[test]
+    fn test_validate_workspace_symbol_params_accepts_known_kind() {
+        assert!(validate_workspace_symbol_params("q", Some("EnumMember")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_workspace_symbol_params_rejects_unknown_kind() {
+        let result = validate_workspace_symbol_params("q", Some("NotAKind"));
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
 
     #[tokio::test]
     async fn test_handle_workspace_symbol_no_server() {

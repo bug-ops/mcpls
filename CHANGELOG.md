@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace unmaintained `lsp-types` (gluon-lang) dependency with `gen-lsp-types` 0.11.0 (pinned); `lsp_types::` import paths are unchanged. (#375)
 - **`Uri` parsing** — Breaking change: `Uri` no longer validates its input, so a malformed MCP-supplied URI in `get_incoming_calls`/`get_outgoing_calls` now surfaces as a file-not-found error instead of an invalid-parameter error. (#375)
 - **`search_workspace_symbols`**/**`rename_symbol`** — Breaking change: symbols without a location range are now dropped instead of given a fabricated placeholder range, and LSP-3.18 snippet-shaped rename edits are now dropped instead of their literal placeholder syntax (e.g. `${1:name}`) being written into the file. (#375)
+- `workspace/symbol` `kind_filter` validation now derives its accepted names from `SUPPORTED_SYMBOL_KINDS`, the same single source of truth used by the `initialize` handshake, instead of a separately hand-maintained string list. (#355)
+- Replaced the hand-rolled `DiagnosticRequestParams` workaround with upstream `lsp_types::DocumentDiagnosticParams` directly; wire format is unchanged. (#166)
 
 ### Removed
 

@@ -47,7 +47,12 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Every symbol kind defined by LSP 3.17 and understood by mcpls.
-const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
+///
+/// Single source of truth for both the `initialize` request's
+/// `value_set` and the `workspace/symbol` `kind_filter` validation in
+/// [`crate::bridge::translator::symbols`] — the latter derives its accepted
+/// string names from this array via `format!("{:?}", kind)`.
+pub const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
     SymbolKind::File,
     SymbolKind::Module,
     SymbolKind::Namespace,

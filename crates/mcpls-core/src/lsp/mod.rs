@@ -9,6 +9,7 @@ mod transport;
 pub(crate) mod types;
 
 pub use client::LspClient;
+pub(crate) use lifecycle::SUPPORTED_SYMBOL_KINDS;
 #[cfg(test)]
 pub(crate) use lifecycle::fake_lsp_server;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
