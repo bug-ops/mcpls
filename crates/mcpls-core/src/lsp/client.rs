@@ -1185,80 +1185,23 @@ mod tests {
     }
 
     mod retry_behavior {
-        use std::process::Stdio;
-
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-        use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+        use tokio::io::{AsyncWriteExt, BufReader, DuplexStream};
 
         use super::*;
-        use crate::config::LspServerConfig;
-
-        struct FakeServer {
-            _write_half: Child,
-            _read_half: Child,
-            read_half_stdin: ChildStdin,
-            write_stdout: ChildStdout,
-        }
-
-        fn fake_lsp_client() -> (LspClient, FakeServer) {
-            let mut write_half = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let write_stdin = write_half.stdin.take().unwrap();
-            let write_stdout = write_half.stdout.take().unwrap();
-
-            let mut read_half = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let read_stdout = read_half.stdout.take().unwrap();
-            let read_stdin = read_half.stdin.take().unwrap();
-
-            let transport = LspTransport::new(write_stdin, read_stdout);
-            let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-
-            (
-                client,
-                FakeServer {
-                    _write_half: write_half,
-                    _read_half: read_half,
-                    read_half_stdin: read_stdin,
-                    write_stdout,
-                },
-            )
-        }
-
-        /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
-        async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> Value {
-            let mut content_length = None;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).await.unwrap();
-                if line == "\r\n" || line == "\n" {
-                    break;
-                }
-                if let Some((key, value)) = line.trim_end().split_once(':')
-                    && key.trim().eq_ignore_ascii_case("content-length")
-                {
-                    content_length = Some(value.trim().parse::<usize>().unwrap());
-                }
-            }
-            let mut buf = vec![0u8; content_length.unwrap()];
-            reader.read_exact(&mut buf).await.unwrap();
-            serde_json::from_slice(&buf).unwrap()
-        }
+        use crate::test_lsp::{
+            fake_lsp_client, read_framed_message, write_error_response,
+            write_response as write_success_response,
+        };
 
         /// Writes a framed JSON-RPC retryable error response — either
         /// `ServerCancelled` (-32802) or `ContentModified` (-32801) — with a
         /// `data.retriggerRequest` flag.
+        ///
+        /// Kept local rather than promoted to the shared `test_lsp` harness:
+        /// the `data.retriggerRequest` field is specific to this retry-logic
+        /// test suite, unlike the generic success/error responses above.
         async fn write_retryable_error_response(
-            stdin: &mut ChildStdin,
+            stdin: &mut DuplexStream,
             id: &Value,
             code: i32,
             message: &str,
@@ -1280,42 +1223,9 @@ mod tests {
             stdin.flush().await.unwrap();
         }
 
-        /// Writes a framed JSON-RPC error response with an arbitrary code/message.
-        async fn write_error_response(
-            stdin: &mut ChildStdin,
-            id: &Value,
-            code: i32,
-            message: &str,
-        ) {
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": code, "message": message },
-            });
-            let content = serde_json::to_string(&response).unwrap();
-            let header = format!("Content-Length: {}\r\n\r\n", content.len());
-            stdin.write_all(header.as_bytes()).await.unwrap();
-            stdin.write_all(content.as_bytes()).await.unwrap();
-            stdin.flush().await.unwrap();
-        }
-
-        /// Writes a framed JSON-RPC success response.
-        async fn write_success_response(stdin: &mut ChildStdin, id: &Value, result: Value) {
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": result,
-            });
-            let content = serde_json::to_string(&response).unwrap();
-            let header = format!("Content-Length: {}\r\n\r\n", content.len());
-            stdin.write_all(header.as_bytes()).await.unwrap();
-            stdin.write_all(content.as_bytes()).await.unwrap();
-            stdin.flush().await.unwrap();
-        }
-
         // Not `start_paused`: the retry loop's real backoff sleeps
-        // interleave with real subprocess pipe I/O below, and paused
-        // virtual time does not reliably auto-advance across both.
+        // interleave with real async I/O on the duplex pipes below, and
+        // paused virtual time does not reliably auto-advance across both.
         #[tokio::test]
         async fn test_retry_exhaustion_returns_original_server_cancelled_error() {
             let (client, mut server) = fake_lsp_client();

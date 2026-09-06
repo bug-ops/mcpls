@@ -13,28 +13,22 @@ fail-fast = false
 # Test threads configuration
 test-threads = "num-cpus"
 
-# `fake_lsp_client()`-style tests spawn real `cat`/`echo` child processes as
-# a loopback mock LSP server (bridge/translator/testing.rs, bridge/state.rs,
-# lsp/client.rs, lsp/lifecycle.rs); OS process contention from the
-# subprocess fan-out can either starve a test past nextest's 120s hard
-# timeout, or produce a spurious assertion failure that does not reproduce
-# on an isolated rerun (see #374). This mitigates by lowering collision
-# probability; it does not eliminate the underlying race (tracked as a
-# follow-up: replace the subprocess loopback with an in-memory
-# `tokio::io::duplex`, see #378). `max-threads` is set below the CI
-# matrix's smallest runner core count (3, macos-latest) — a cap at or
-# above the `test-threads` pool size never binds, since a test-group only
-# limits concurrency *within* the existing thread pool.
-[test-groups]
-subprocess-mock-pipe = { max-threads = 2 }
-
-[[profile.default.overrides]]
-filter = 'test(bridge::translator::) + test(bridge::state::) + test(lsp::client::) + test(lsp::lifecycle::)'
-test-group = 'subprocess-mock-pipe'
-
-[[profile.ci.overrides]]
-filter = 'test(bridge::translator::) + test(bridge::state::) + test(lsp::client::) + test(lsp::lifecycle::)'
-test-group = 'subprocess-mock-pipe'
+# #374 added a `subprocess-mock-pipe` test-group here, capping
+# `bridge::translator::`/`bridge::state::`/`lsp::client::`/`lsp::lifecycle::`
+# to 2 concurrent threads, on the hypothesis that a `cat`/`echo`-subprocess
+# loopback mock LSP transport in those modules' tests was causing OS
+# process-spawn contention severe enough to produce a 120s hard timeout or
+# a spurious assertion failure. A live-hang sample taken while investigating
+# #378 showed the actual cause was a lost-wakeup/deadlock in the runtime
+# (parked in mio with zero runnable tasks), not subprocess-spawn contention,
+# so this cap was never actually addressing it. #378 fixed the real issue:
+# replacing the `cat`/`echo` loopback (and every placeholder child spawn
+# these four modules' tests used to need) with an in-memory
+# `tokio::io::duplex` pipe pair (`crate::test_lsp`), plus an EOF guard and a
+# bounded read timeout on the shared harness's `read_framed_message`.
+# Stress runs after that fix (hundreds of full-suite and targeted-concurrent
+# repetitions) reproduced zero hangs/failures, so this cap is removed rather
+# than narrowed or kept.
 
 # Timeout settings
 [profile.default.junit]

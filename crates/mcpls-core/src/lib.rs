@@ -43,6 +43,10 @@ pub mod mcp;
 pub mod transport;
 mod util;
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod test_lsp;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
