@@ -42,6 +42,11 @@ related:
 > first time. Neither change was anticipated in Section 1 (Overview) or Section 8 (Agent
 > Boundaries, "Never: ... without explicit instruction") of this spec; they were bundled into the
 > same PR rather than filed separately.
+>
+> **Follow-up (#376)**: end-to-end and TOML parse-error test coverage for
+> `workspace.max_documents`/`max_file_size` was added, closing the remaining gap in SC-003; the
+> dead `mock_lsp` test module was also removed as part of the same PR (unrelated to this spec's
+> functional requirements).
 
 ## 1. Overview
 

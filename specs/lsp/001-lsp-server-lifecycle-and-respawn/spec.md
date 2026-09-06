@@ -33,6 +33,14 @@ related:
 > request/response with retry), `crates/mcpls-core/src/lsp/transport.rs` (stdio framing), and
 > `crates/mcpls-core/src/bridge/translator/respawn.rs` (dead-server detection and
 > backoff-bounded respawn) already implement everything described below.
+>
+> **Post-v0.4.0 additions**: `-32801` (`ContentModified`) retry (FR-013) was extended to read-only/
+> idempotent tool calls under the same attempt budget as `-32802` (`ServerCancelled`) (#390); the
+> `warn!`/`error!` log-level split for retried-vs-surfaced errors (FR-014) was corrected so a
+> successful retry no longer logs a false-positive `error!` (#401). `LspTransport::new` also now
+> accepts any `AsyncWrite`/`AsyncRead` pair rather than only `ChildStdin`/`ChildStdout` (#396,
+> already reflected in `transport.rs`'s own doc comment cited above) — source-compatible for every
+> production caller, so no FR change was needed for it here.
 
 ## 1. Overview
 
@@ -168,6 +176,8 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | FR-010 | WHEN the diagnostics-route server for a language is respawned THE SYSTEM SHALL mark that language's cached diagnostics as push-degraded (`NotificationCache::mark_push_degraded`) rather than silently continuing to serve stale cached diagnostics as current | must |
 | FR-011 | WHEN shutting down a server THE SYSTEM SHALL send the LSP `shutdown` request, then the `exit` notification, then wait up to a fixed grace period (3s) for the child process to exit on its own, falling back to `kill_on_drop` (SIGKILL on drop) if it does not | must |
 | FR-012 | THE SYSTEM SHALL perform the graceful-shutdown sequence (FR-011) even if the `shutdown`/`exit` handshake itself fails or times out — the child process must still be torn down (killed if necessary) regardless of handshake outcome | must |
+| FR-013 | WHEN an in-flight LSP request receives a `-32802` (`ServerCancelled`) response, or a `-32801` (`ContentModified`) response for a read-only/idempotent method THE SYSTEM SHALL retry it, sharing one combined attempt budget across both error codes (e.g. a request that hits `-32801` then `-32802` does not get separate budgets, only one shared one); mutating requests (rename, formatting, code actions) are excluded from the `-32801` retry allowlist | must |
+| FR-014 | WHEN a transient error (`-32802`/allowlisted `-32801`) is about to be retried THE SYSTEM SHALL log it at `warn!`, and reserve `error!` for the case where retries are exhausted and the error actually surfaces to the caller — a request that is retried and then succeeds must never log at `error!` | must |
 
 ## 4. Non-Functional Requirements
 
@@ -177,7 +187,7 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | NFR-002 | Performance | A crash-looping server must not cost more than the bounded backoff window per tool call once backed off — never a repeated full `timeout_seconds` wait per call (FR-007) |
 | NFR-003 | Security | A spawned LSP server must not inherit mcpls's full process environment by default — only the explicit allowlist plus configured overrides (FR-001); configured `env` keys/values are never logged, only an allowlist-presence count and an override count (secret-bearing env var names like `AWS_SECRET_ACCESS_KEY` must not leak via debug logs) |
 | NFR-004 | Correctness | A respawned server must never be treated as having synced state (open documents) it never actually saw (FR-009) |
-| NFR-005 | Observability | A respawn (successful or failed), a crash-loop backoff, and a diagnostics-degradation event must each be logged (`tracing::warn!`) with enough context (server id, language, backoff duration) to diagnose from logs alone |
+| NFR-005 | Observability | A respawn (successful or failed), a crash-loop backoff, and a diagnostics-degradation event must each be logged (`tracing::warn!`) with enough context (server id, language, backoff duration) to diagnose from logs alone. `error!` is reserved for errors actually surfaced to the caller, never for a transient error that a retry (FR-013/FR-014) still has attempts left to recover from — a monitoring setup alerting on `error!` logs must not false-positive on a successful retry |
 
 ## 5. Data Model
 
@@ -203,6 +213,10 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | Child does not exit within the grace period after `exit` | `kill_on_drop` (SIGKILL) fires when the `Child` handle drops |
 | A respawned server is the diagnostics-route server for its language | That language's cached diagnostics are marked push-degraded; a healthy sibling server's own language's diagnostics are unaffected (scoped by per-server ownership, not a blanket cache clear) |
 | A respawned server is *not* the diagnostics-route server | No diagnostics-cache side effect — only document-sync history (FR-009) is cleared |
+| A read-only request (hover, references, diagnostics, etc.) receives `-32801` (`ContentModified`) | Retried under the same attempt budget/backoff as `-32802`, per FR-013 |
+| A mutating request (rename, formatting, code actions) receives `-32801` (`ContentModified`) | Not retried — `-32801` retry is allowlisted to read-only/idempotent methods only |
+| A retried request eventually succeeds | Only `warn!` is logged for the retried attempt(s); no `error!` is logged (FR-014) |
+| A retried request exhausts its attempt budget | The final failure is logged at `error!`, since it is now surfaced to the caller (FR-014) |
 
 ## 7. Success Criteria
 

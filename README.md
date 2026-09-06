@@ -148,6 +148,10 @@ Claude: [get_references] Found 4 matches:
 Names below are the defaults; if the bridge is configured with `mcp.tool_prefix`, every tool
 name gains that prefix (`{tool_prefix}_{tool}`).
 
+`get_diagnostics`, `get_definition`, `get_references`, and `get_document_symbols` also publish a
+structured `outputSchema`, so MCP clients that support structured tool output get typed
+`structuredContent` alongside the text response.
+
 <details>
 <summary><strong>Code Intelligence</strong></summary>
 

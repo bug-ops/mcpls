@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-06
+
 ### Added
 
 - `specs/constitution.md` documenting project-wide principles for the SDD spec package; resolves the `[[constitution]]` wikilink dangling across all specs. (#394)
@@ -21,16 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`McpConfig`** — Breaking change: gained a `tool_prefix` field; exhaustive struct-literal construction of `McpConfig` no longer compiles. (#377)
 - Relocated the SDD spec package from `.local/specs/` to repo-root `specs/`, reorganized into functional blocks (config/lsp/mcp/bridge/runtime/testing) with block-scoped numbering, and added retroactive specs for previously undocumented core subsystems (position encoding, config discovery, LSP lifecycle, document tracker sync, MCP tool routing). (#368)
 - **`DocumentTracker::update`** — Breaking change: now `async`, serializing against `ensure_open` for the same path. (#363)
-- Bump rmcp from 3.1.4 to 3.2.0; an `initialize` request naming `protocolVersion: 2026-07-28` now receives the server's negotiated legacy version in response instead of an echo of the requested version (rmcp behavior change) (#364)
-- Reorder `mcpls-core` `Cargo.toml` dependencies into alphabetical order (#364)
-- **`ToolKind`/`NoServerReason`** — Breaking change: both marked `#[non_exhaustive]`; `ToolKind::ALL` is now `&[ToolKind]` instead of a fixed-size array. (#366)
-- **`WorkspaceConfig::get_language_for_extension`** — Breaking change: renamed to `language_for_extension`. (#366)
+- Bump rmcp from 3.1.4 to 3.2.0 (an `initialize` request naming `protocolVersion: 2026-07-28` now receives the server's negotiated legacy version in response instead of an echo of the requested version — rmcp behavior change) and reorder `mcpls-core` `Cargo.toml` dependencies into alphabetical order. (#364)
+- **`ToolKind`/`NoServerReason`** — Breaking change: both marked `#[non_exhaustive]`; `ToolKind::ALL` is now `&[ToolKind]` instead of a fixed-size array. **`WorkspaceConfig::get_language_for_extension`** — Breaking change: renamed to `language_for_extension`. (#366)
 - **`Translator::handle_*` position-based methods** — Breaking change: now take a `Position { line, character }` struct instead of two adjacent bare `u32` arguments, so a call site can no longer swap `line`/`character` without a compile error. (#367)
-- Replace unmaintained `lsp-types` (gluon-lang) dependency with `gen-lsp-types` 0.11.0 (pinned); `lsp_types::` import paths are unchanged. (#375)
-- **`Uri` parsing** — Breaking change: `Uri` no longer validates its input, so a malformed MCP-supplied URI in `get_incoming_calls`/`get_outgoing_calls` now surfaces as a file-not-found error instead of an invalid-parameter error. (#375)
-- **`search_workspace_symbols`**/**`rename_symbol`** — Breaking change: symbols without a location range are now dropped instead of given a fabricated placeholder range, and LSP-3.18 snippet-shaped rename edits are now dropped instead of their literal placeholder syntax (e.g. `${1:name}`) being written into the file. (#375)
-- `workspace/symbol` `kind_filter` validation now derives its accepted names from `SUPPORTED_SYMBOL_KINDS`, the same single source of truth used by the `initialize` handshake, instead of a separately hand-maintained string list. (#383)
-- Replaced the hand-rolled `DiagnosticRequestParams` workaround with upstream `lsp_types::DocumentDiagnosticParams` directly; wire format is unchanged. (#383)
+- Replace unmaintained `lsp-types` (gluon-lang) dependency with `gen-lsp-types` 0.11.0 (pinned); `lsp_types::` import paths are unchanged. **`Uri` parsing** — Breaking change: `Uri` no longer validates its input, so a malformed MCP-supplied URI in `get_incoming_calls`/`get_outgoing_calls` now surfaces as a file-not-found error instead of an invalid-parameter error. **`search_workspace_symbols`**/**`rename_symbol`** — Breaking change: symbols without a location range are now dropped instead of given a fabricated placeholder range, and LSP-3.18 snippet-shaped rename edits are now dropped instead of their literal placeholder syntax (e.g. `${1:name}`) being written into the file. (#375)
+- `workspace/symbol` `kind_filter` validation now derives its accepted names from `SUPPORTED_SYMBOL_KINDS`, the same single source of truth used by the `initialize` handshake, instead of a separately hand-maintained string list. Replaced the hand-rolled `DiagnosticRequestParams` workaround with upstream `lsp_types::DocumentDiagnosticParams` directly; wire format is unchanged. (#383)
 - Consolidated the duplicated `handle_definition`/`handle_implementation`/`handle_type_definition` go-to-X handlers and their response-flattening helpers in `bridge::translator::navigation` behind a shared generic path; behavior is unchanged. (#386)
 - **`NotificationCache::get_diagnostics`/`Translator::get_client_for_file` renamed to `diagnostics`/`client_for_file`** — Breaking change: drops the redundant `get_` prefix per Rust API guidelines C-GETTER, revisiting a previous entry in this changelog (#293) that had left `get_diagnostics` unchanged as a keyed lookup rather than a plain accessor. (#387)
 - **`LspTransport::new`** — now accepts any `AsyncWrite`/`AsyncRead` pair instead of only `ChildStdin`/`ChildStdout` (source-compatible for every existing caller), so tests can wire it to an in-memory `tokio::io::duplex` pipe instead of a real subprocess; `LspTransport`'s `Debug` output changed from a derived field dump to a fixed `LspTransport { .. }`. (#396)
@@ -45,14 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - E2E test harness (`McpClient::spawn_with_args`) now honors `CARGO_TARGET_DIR`/`CARGO_BUILD_TARGET_DIR` when locating the built `mcpls` binary, instead of hardcoding `target/debug/mcpls`; spawn failures now report the resolved path. (#400)
-- Retried transient LSP errors (`-32802` `ServerCancelled`, allowlisted `-32801` `ContentModified`) no longer log at `error!` before the retry succeeds, avoiding false-positive alerts in log-based monitoring; `error!` is now reserved for errors actually surfaced to the caller. (#392)
+- Retried transient LSP errors (`-32802` `ServerCancelled`, allowlisted `-32801` `ContentModified`) no longer log at `error!` before the retry succeeds, avoiding false-positive alerts in log-based monitoring; `error!` is now reserved for errors actually surfaced to the caller. (#401)
 - LSP `-32801` (`ContentModified`) error responses are now retried automatically for read-only/idempotent tool calls (hover, references, diagnostics, etc.), using the same attempt budget and backoff already applied to `-32802` (`ServerCancelled`); mutating requests (rename, formatting, code actions) are excluded. Also corrected a doc comment that mislabeled `-32802` as "content modified". (#390)
-- `NotificationCache` now derives the diagnostics cache fair-share budget automatically from the number of publishing servers when `set_diagnostics_route_count` is never called, instead of silently defaulting to an unpartitioned budget. (#379)
-- Cache eviction now prefers evicting empty ("file is clean") diagnostics entries over real ones, including across servers sharing the same eviction victim, so a stream of clean-file notifications can no longer displace actual diagnostics from the cache. (#379)
+- `NotificationCache` now derives the diagnostics cache fair-share budget automatically from the number of publishing servers when `set_diagnostics_route_count` is never called, instead of silently defaulting to an unpartitioned budget. Cache eviction now prefers evicting empty ("file is clean") diagnostics entries over real ones, including across servers sharing the same eviction victim, so a stream of clean-file notifications can no longer displace actual diagnostics from the cache. (#379)
 - Diagnostics push notifications no longer silently vanish after an LSP server respawn; `get_cached_diagnostics`/resource reads now flag when they're degraded. (#363)
-- `document_symbols` no longer redundantly recomputes the same range twice for flat (`SymbolInformation`) responses. (#365)
-- HTTP transport now catches a repeat shutdown signal received during the connection-drain window and cuts the drain short instead of waiting out the full timeout. (#365)
-- Corrected a broken assertion in the ignored `test_diagnostics_with_error` integration test (test-only; no production behavior change). (#365)
+- `document_symbols` no longer redundantly recomputes the same range twice for flat (`SymbolInformation`) responses. HTTP transport now catches a repeat shutdown signal received during the connection-drain window and cuts the drain short instead of waiting out the full timeout. Corrected a broken assertion in the ignored `test_diagnostics_with_error` integration test (test-only; no production behavior change). (#365)
 - Capped nextest concurrency for `fake_lsp_client()` subprocess-mock tests (`bridge::translator`, `bridge::state`, `lsp::client`, `lsp::lifecycle`) to reduce, though not eliminate, a rare 120s hard timeout / spurious test failure caused by OS process contention under full parallel load (test-only; no production behavior change). (#380)
 - Replaced the `cat`/`echo` subprocess loopback mock LSP transport, duplicated near-verbatim across `bridge::translator`, `bridge::state`, `lsp::client`, and `lsp::lifecycle`, with a single shared `tokio::io::duplex`-based harness (`crate::test_lsp`); `LspServer`'s test-only fixtures (`new_for_test`, `new_for_test_with_encoding`, `fake_lsp_server`) no longer spawn a placeholder child process either (`LspServer`'s internal `child` field is now `Option<tokio::process::Child>`), so no subprocess spawn remains anywhere in this mock path. The shared harness's `read_framed_message` also gained an EOF guard and a 30s read timeout, so a stuck or mismatched test fails fast with a clear panic instead of spinning until an external 120s test-runner kill. An initial version of this change (subprocess loopback removed, but the placeholder child spawn and the EOF/timeout guard still missing) reproduced the same 120s hang / spurious-assertion family the nextest cap was mitigating (3/25 uncapped, 1/25 capped full-suite stress runs) with a live-hang sample showing a lost wakeup/deadlock rather than spawn contention; after the placeholder-spawn removal and the read guard above, stress testing at up to 4x that sample size reproduced zero failures across 630 runs. Removed the `subprocess-mock-pipe` nextest test-group added in #380 accordingly — it was never addressing this flake's actual cause. (test-only; no production behavior change) (#396)
 
@@ -738,7 +732,8 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bug-ops/mcpls/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bug-ops/mcpls/compare/v0.3.9...v0.4.0
 [0.3.9]: https://github.com/bug-ops/mcpls/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/bug-ops/mcpls/compare/v0.3.7...v0.3.8

@@ -160,6 +160,7 @@ THEN the raw (unconverted) value is used as a fallback rather than erroring the 
 | `line_text` is `None` (file unreadable) | Falls back to the raw value (`test_mcp_to_lsp_position_missing_line_text_falls_back`) |
 | MCP position `(0, 0)` | Clamped to `(0, 0)` via `saturating_sub`, no underflow (`test_saturating_sub_zero`) |
 | CRLF-terminated source line | No column shift — `line_text` never includes the terminator (`test_mcp_to_lsp_position_utf8_negotiated_crlf_line_text`) |
+| rust-analyzer itself rejects a position as out-of-range (its own internal `"Invalid offset LineCol { .. }"` error, distinct from this module's own conversion fallbacks) | Sanitized to a clean `"position out of range for this document"` message by `Error::LspServerError`'s `Display` impl (`crates/mcpls-core/src/error.rs`, #399) before reaching the MCP caller — out of this module's scope (it never sees LSP server-reported errors), but worth cross-referencing since both concern "position out of range" |
 
 ## 7. Success Criteria
 

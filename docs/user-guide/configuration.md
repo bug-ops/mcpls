@@ -629,6 +629,20 @@ export MCPLS_LISTEN=127.0.0.1:3000
 mcpls
 ```
 
+> [!WARNING]
+> **Authentication requirement**: mcpls performs **no authentication** on any transport, including HTTP. When binding to a non-loopback address (e.g., `0.0.0.0:3000`), you **must** place mcpls behind a reverse proxy that enforces authentication before forwarding requests.
+>
+> The reverse proxy should also rewrite the `Host` header, as rmcp's host validation only allows `localhost`, `127.0.0.1`, or `::1` by default.
+>
+> **Example (nginx):**
+> ```nginx
+> location /mcp/ {
+>     auth_request /auth;
+>     proxy_pass http://localhost:3000;
+>     proxy_set_header Host localhost;
+> }
+> ```
+
 ### `MCPLS_HTTP_PATH` (transport-http feature)
 
 URL prefix the MCP service is mounted at.

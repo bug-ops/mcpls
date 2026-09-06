@@ -9,6 +9,7 @@ tags:
 created: 2026-08-05
 status: draft
 related:
+  - "[[constitution]]"
   - "[[MOC-specs]]"
 ---
 
@@ -34,7 +35,7 @@ every request must instead carry protocol version and client capabilities via
 `_meta` fields.
 
 mcpls's MCP server surface (`crates/mcpls-core/src/mcp/`, built on the `rmcp`
-crate, currently pinned to `rmcp = "3.0.0"` in the workspace
+crate, currently pinned to `rmcp = "3.2.0"` in the workspace
 `Cargo.toml`) implements `get_info()` / `ServerCapabilities` on top of rmcp's
 current stateful `initialize` model. If the removal of `initialize` becomes a
 hard protocol requirement, mcpls's MCP-facing capability negotiation surface
@@ -60,6 +61,17 @@ phased, Tier-based rollout, not a finished implementation. mcpls therefore
 cannot adopt the new model yet; this spec exists to **track** the change and
 define what mcpls will need to do once `rmcp` reaches conformance, not to
 implement it now.
+
+mcpls bumped `rmcp` again, to 3.2.0 (PR #364; see
+[[mcp/004-mcp-tasks-sep2663-adoption/spec|spec mcp/004]] for a separate Tasks-primitive
+audit against this same version). That bump surfaced one more observable data point for
+FR-001: an `initialize` request naming
+`protocolVersion: 2026-07-28` now receives rmcp's negotiated *legacy* version in the
+response instead of an echo of the requested version, whereas 3.1.4 echoed it back
+unchanged. This is still `initialize`-based negotiation, not the stateless per-request
+`_meta` model this spec tracks — it does not change this spec's "not yet safe to adopt"
+conclusion, but it is worth noting as incremental upstream movement the next FR-001
+re-review should account for.
 
 ### Goal
 
@@ -166,7 +178,7 @@ that mcpls's MCP layer will eventually need to represent:
 |----------|-------------------|
 | `rmcp` ships a version that supports 2026-07-28 as opt-in alongside legacy `initialize` | mcpls should stay on the legacy path until this spec is revisited and superseded by an implementation spec |
 | `rmcp` ships a version that drops legacy `initialize` support entirely (breaking) | mcpls's `Cargo.toml` `rmcp` version pin acts as the safety net — do not bump past that version until the migration described here is actually implemented |
-| A future MCP client sends 2026-07-28-style per-request `_meta` fields to a pre-migration mcpls server | Current `rmcp = "3.0.0"`-based server does not understand these fields; behavior depends on `rmcp`'s own backward-compatibility handling, not mcpls code — `[NEEDS CLARIFICATION: does rmcp 3.0.0 reject or silently ignore unrecognized _meta fields from newer clients?]` |
+| A future MCP client sends 2026-07-28-style per-request `_meta` fields to a pre-migration mcpls server | Current `rmcp = "3.2.0"`-based server does not understand these fields; behavior depends on `rmcp`'s own backward-compatibility handling, not mcpls code — `[NEEDS CLARIFICATION: does rmcp 3.2.0 reject or silently ignore unrecognized _meta fields from newer clients?]` |
 | Position-encoding negotiation (`bc95b89`, LSP-side) is mistaken for MCP-side handshake work in a future PR | Reviewers should point to this spec's Overview callout distinguishing the two handshakes |
 
 ## 7. Success Criteria
@@ -199,15 +211,17 @@ that mcpls's MCP layer will eventually need to represent:
 
 - [NEEDS CLARIFICATION: What is mcpls's actual timeline trigger for revisiting this — a specific `rmcp` version, a calendar date, or "when issue #119/#122 work resumes"?]
 - [NEEDS CLARIFICATION: Does mcpls currently use MCP Roots or Logging features (`crates/mcpls-core/src/mcp/`), which are formally deprecated in 2026-07-28 with a 12-month window?]
-- [NEEDS CLARIFICATION: Does `rmcp` 3.0.0 (mcpls's current pin) reject or silently ignore unrecognized 2026-07-28-style `_meta` fields sent by a forward-compatible client?]
+- [NEEDS CLARIFICATION: Does `rmcp` 3.2.0 (mcpls's current pin) reject or silently ignore unrecognized 2026-07-28-style `_meta` fields sent by a forward-compatible client?]
 - [NEEDS CLARIFICATION: Should this spec be re-filed as a GitHub issue (P3, `research` label) per the project's issue-filing protocol, or does the spec artifact alone satisfy tracking for now?]
 
 ## 10. See Also
 
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [MCP Specification 2026-07-28 changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog)
 - [MCP 2026-07-28 release candidate announcement](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/)
 - [rmcp v3.1.0 release notes](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.1.0)
+- [rmcp v3.2.0 release notes](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.2.0) — mcpls's current pin (PR #364); see the `initialize` `protocolVersion` negotiation-echo change noted above
 - [MCP Specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/) — mcpls's current cited reference in `.claude/rules/continuous-improvement.md`, superseded by 2026-07-28 above
 - [GitHub issue bug-ops/mcpls#119](https://github.com/bug-ops/mcpls/issues/119) — "support MCP 2025-11-25 tasks/call" (P4), directly affected by the Tasks extension redesign in 2026-07-28
 - [GitHub issue bug-ops/mcpls#122](https://github.com/bug-ops/mcpls/issues/122) — competitive-parity playbook / Streamable HTTP transport, affected by session-header removal in 2026-07-28
