@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `specs/constitution.md` documenting project-wide principles for the SDD spec package; resolves the `[[constitution]]` wikilink dangling across all specs. (#394)
 - Added end-to-end and TOML parse-error test coverage for `workspace.max_documents`/`max_file_size` resource-limit config. (#376)
 - `[mcp].tool_prefix` config option: prefixes every MCP tool name with `{tool_prefix}_`, letting a client tell apart tools from multiple concurrently running mcpls bridges. (#377)
+- Structured tool output (`outputSchema` + `structuredContent`) for `get_diagnostics`, `get_definition`, `get_references`, and `get_document_symbols`. (#397)
 
 ### Changed
 
