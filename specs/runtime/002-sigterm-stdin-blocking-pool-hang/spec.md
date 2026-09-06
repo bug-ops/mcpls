@@ -159,7 +159,7 @@ No new domain entities — this is a process-lifecycle/shutdown-sequencing fix.
 
 ## 10. See Also
 
-- [[constitution]] — project principles (not yet created for this project)
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - PR #270 (commit ec67fa4) — added the signal handling this bug affects, closed #241
 - Issue #241 — original "no SIGINT/SIGTERM handling" issue

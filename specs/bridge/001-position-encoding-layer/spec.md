@@ -193,7 +193,7 @@ None — this is a retroactive spec documenting stable, already-shipped, well-te
 
 ## 10. See Also
 
-- [[constitution]] — project principles (not yet created for this project)
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [[lsp/003-lsp-types-unmaintained-migration/spec|spec lsp/003]] — names `bridge/encoding.rs` as the
   critical-path code most sensitive to any `lsp-types`/`ls-types` type-level divergence

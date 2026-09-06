@@ -214,5 +214,5 @@ Not applicable — no code changes result from this spec.
 - [[lsp/002-lsp317-missing-tools/spec|spec lsp/002]] / issue #116 — existing tracked gap of unimplemented LSP 3.17-era tools (`get_signature_help`, `go_to_implementation`, `go_to_type_definition`, `get_inlay_hints`, `prepare_type_hierarchy`)
 - issue #290 — negotiated LSP position encoding not consumed by position conversion (P2, open)
 - [[lsp/003-lsp-types-unmaintained-migration/spec|spec lsp/003]] — companion finding on the unmaintained `lsp-types` dependency; prerequisite for adopting any 3.18 draft type
-- [[constitution]] — project principles (not yet created for this project)
+- [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
