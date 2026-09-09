@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `shutdown` and `exit` are now sent without a `params` key instead of `"params": null`. tsgo rejects the null form with `-32602 expected empty, got: null` and never exits, so every mcpls shutdown against tsgo fell through to the 3s kill-on-timeout path. (#404)
+
 ## [0.5.0] - 2026-09-06
 
 ### Added
