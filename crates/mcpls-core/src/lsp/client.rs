@@ -17,7 +17,8 @@ use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::{
-    InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
+    InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    LspNotification, RequestId,
 };
 
 /// JSON-RPC protocol version.
@@ -383,7 +384,7 @@ impl LspClient {
         P: Serialize,
         R: DeserializeOwned,
     {
-        let params_value = serde_json::to_value(params)?;
+        let params_value = Self::omit_null_params(serde_json::to_value(params)?);
         let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
 
         for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
@@ -402,7 +403,7 @@ impl LspClient {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: id.clone(),
                 method: method.to_string(),
-                params: Some(params_value.clone()),
+                params: params_value.clone(),
             };
 
             debug!("Sending request: {} (id={:?})", method, id);
@@ -559,14 +560,14 @@ impl LspClient {
     where
         P: Serialize,
     {
-        let params_value = serde_json::to_value(params)?;
+        let params_value = Self::omit_null_params(serde_json::to_value(params)?);
 
         debug!("Sending notification: {}", method);
 
         self.command_tx
             .send(ClientCommand::SendNotification {
                 method: method.to_string(),
-                params: Some(params_value),
+                params: params_value,
             })
             .await
             .map_err(|_| Error::ServerTerminated)?;
@@ -624,6 +625,13 @@ impl LspClient {
         result
     }
 
+    /// Maps a `null` params value to an omitted `params` field. LSP methods
+    /// with `params: void` (`shutdown`, `exit`) must go out without the key:
+    /// tsgo rejects `"params": null` with `-32602 expected empty, got: null`.
+    fn omit_null_params(params: Value) -> Option<Value> {
+        if params.is_null() { None } else { Some(params) }
+    }
+
     /// Truncate an LSP server's error message for the `tracing::error!` log
     /// line, bounding it to at most [`MAX_ERROR_MESSAGE_LOG_BYTES`] bytes
     /// (the full formatted string is slightly longer).
@@ -655,11 +663,11 @@ impl LspClient {
                             transport.send(&value).await?;
                         }
                         ClientCommand::SendNotification { method, params } => {
-                            let notification = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "method": method,
-                                "params": params,
-                            });
+                            let notification = serde_json::to_value(JsonRpcNotification {
+                                jsonrpc: JSONRPC_VERSION.to_string(),
+                                method,
+                                params,
+                            })?;
                             transport.send(&notification).await?;
                         }
                         ClientCommand::Shutdown => {
@@ -1233,6 +1241,76 @@ mod tests {
         assert!(LspClient::should_retrigger(Some(&serde_json::json!({
             "retriggerRequest": true
         }))));
+    }
+
+    /// Wire-level checks that `params: void` LSP methods go out without a
+    /// `params` key. tsgo rejects `"params": null` on `shutdown` with
+    /// `-32602 expected empty, got: null` and then ignores the `exit` that
+    /// follows, so mcpls fell through to the kill-on-timeout path.
+    mod void_params_wire {
+        use tokio::io::BufReader;
+
+        use super::*;
+        use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
+
+        #[tokio::test]
+        async fn test_request_with_null_params_omits_params_key() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>("shutdown", Value::Null, Duration::from_secs(5))
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+
+            assert_eq!(request["method"], "shutdown");
+            assert!(
+                request.get("params").is_none(),
+                "null params must be omitted, got: {request}"
+            );
+
+            write_response(&mut server.read_half_stdin, &request["id"], Value::Null).await;
+            request_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_notify_with_null_params_omits_params_key() {
+            let (client, mut server) = fake_lsp_client();
+
+            client.notify("exit", Value::Null).await.unwrap();
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let notification = read_framed_message(&mut reader).await;
+
+            assert_eq!(notification["method"], "exit");
+            assert!(
+                notification.get("params").is_none(),
+                "null params must be omitted, got: {notification}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_notify_with_empty_object_params_keeps_params_key() {
+            let (client, mut server) = fake_lsp_client();
+
+            client
+                .notify("initialized", lsp_types::InitializedParams {})
+                .await
+                .unwrap();
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let notification = read_framed_message(&mut reader).await;
+
+            assert_eq!(notification["method"], "initialized");
+            assert_eq!(
+                notification["params"],
+                serde_json::json!({}),
+                "non-null params must still be sent"
+            );
+        }
     }
 
     mod retry_behavior {
