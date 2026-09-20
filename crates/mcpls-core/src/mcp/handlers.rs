@@ -43,7 +43,7 @@ pub struct BridgeContext {
     /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted when
     /// the active [`ServerConfig`](crate::config::ServerConfig) was loaded.
     ///
-    /// Surfaced in-band via `McplsServer::get_info`'s `ServerInfo.instructions`
+    /// Surfaced in-band via `McplsServer::get_info`'s `RmcpServerConfig.instructions`
     /// (stderr's `tracing::warn!` at load time is typically invisible to an
     /// MCP client).
     pub project_config_ignored: bool,

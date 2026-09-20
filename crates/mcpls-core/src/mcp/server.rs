@@ -12,7 +12,7 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
     ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
-    ServerCapabilities, ServerInfo, SubscribeRequestParams, ToolAnnotations,
+    ServerCapabilities, ServerConfig as RmcpServerConfig, SubscribeRequestParams, ToolAnnotations,
     UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -42,7 +42,7 @@ const DEFAULT_SERVER_TITLE: &str = "MCPLS - MCP to LSP Bridge";
 /// configured. Sourced from the crate's own `Cargo.toml` `description` field.
 const DEFAULT_SERVER_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 
-/// Built-in `ServerInfo.instructions` capability blurb, used when
+/// Built-in `RmcpServerConfig.instructions` capability blurb, used when
 /// `[mcp].instructions` is not configured. A configured value replaces this
 /// text entirely rather than appending to it -- see [`McpConfig::instructions`].
 const DEFAULT_INSTRUCTIONS: &str = concat!(
@@ -293,7 +293,7 @@ impl McplsServer {
     /// `project_config_ignored` reports whether a CWD-discovered
     /// `./mcpls.toml` was skipped as untrusted when the active config was
     /// loaded (see [`ServerConfig::project_config_ignored`](crate::config::ServerConfig::project_config_ignored));
-    /// `get_info` surfaces it in [`ServerInfo::instructions`]. `mcp` carries
+    /// `get_info` surfaces it in [`RmcpServerConfig::instructions`]. `mcp` carries
     /// the configured `[mcp]` presentation overrides (see
     /// [`crate::config::McpConfig`]), also read by `get_info`.
     #[must_use]
@@ -1018,7 +1018,7 @@ impl ServerHandler for McplsServer {
         Ok(())
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> RmcpServerConfig {
         let mut implementation = Implementation::new("mcpls", env!("CARGO_PKG_VERSION"));
         implementation.title = Some(
             self.context
@@ -1041,7 +1041,7 @@ impl ServerHandler for McplsServer {
             .enable_resources()
             .enable_resources_subscribe()
             .build();
-        let mut server_info = ServerInfo::new(capabilities);
+        let mut server_info = RmcpServerConfig::new(capabilities);
         server_info.server_info = implementation;
         let mut instructions = self
             .context
