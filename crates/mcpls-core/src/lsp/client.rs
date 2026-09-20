@@ -171,10 +171,7 @@ impl Clone for LspClient {
 /// Commands for client control.
 enum ClientCommand {
     /// Send a request and wait for response.
-    SendRequest {
-        request: JsonRpcRequest,
-        response_tx: oneshot::Sender<Result<Value>>,
-    },
+    SendRequest { request: JsonRpcRequest },
     /// Send a notification (no response expected).
     SendNotification {
         method: String,
@@ -399,6 +396,33 @@ impl LspClient {
         self.request_timeout().min(CODE_ACTION_RESOLVE_TIMEOUT_CAP)
     }
 
+    /// Registers before enqueuing the send command (not before the message
+    /// loop's own transport read), cleaning up the entry if the send fails.
+    async fn register_and_send_request(
+        &self,
+        request: JsonRpcRequest,
+        response_tx: oneshot::Sender<Result<Value>>,
+    ) -> Result<()> {
+        let id = request.id.clone();
+
+        self.pending_requests
+            .lock()
+            .await
+            .insert(id.clone(), response_tx);
+
+        if self
+            .command_tx
+            .send(ClientCommand::SendRequest { request })
+            .await
+            .is_err()
+        {
+            self.pending_requests.lock().await.remove(&id);
+            return Err(Error::ServerTerminated);
+        }
+
+        Ok(())
+    }
+
     /// Send request and wait for response with timeout.
     ///
     /// Automatically retries up to 3 times when the server returns error code
@@ -461,13 +485,7 @@ impl LspClient {
 
             debug!("Sending request: {} (id={:?})", method, id);
 
-            self.command_tx
-                .send(ClientCommand::SendRequest {
-                    request,
-                    response_tx,
-                })
-                .await
-                .map_err(|_| Error::ServerTerminated)?;
+            self.register_and_send_request(request, response_tx).await?;
 
             let outcome = match timeout(timeout_duration, response_rx).await {
                 Ok(received) => received.map_err(|_| Error::ServerTerminated)?,
@@ -769,12 +787,7 @@ impl LspClient {
             tokio::select! {
                 Some(command) = command_rx.recv() => {
                     match command {
-                        ClientCommand::SendRequest { request, response_tx } => {
-                            pending_requests.lock().await.insert(
-                                request.id.clone(),
-                                response_tx,
-                            );
-
+                        ClientCommand::SendRequest { request } => {
                             let value = serde_json::to_value(&request)?;
                             transport.send(&value).await?;
                         }
