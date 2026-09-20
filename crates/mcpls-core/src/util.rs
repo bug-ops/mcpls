@@ -1,5 +1,54 @@
 //! Small helpers shared across `mcpls-core` modules.
 
+use std::string::FromUtf8Error;
+
+/// Byte cap for a bounded read against a `max`-byte size limit: `max + 1`
+/// when `max` is a real limit, so a read that reaches the cap is known to
+/// have exceeded it, or unbounded (`u64::MAX`) when `max == 0`, the
+/// documented "unlimited" sentinel used by
+/// [`crate::bridge::state::ResourceLimits::max_file_size`].
+pub const fn bounded_read_cap(max: u64) -> u64 {
+    if max == 0 {
+        u64::MAX
+    } else {
+        max.saturating_add(1)
+    }
+}
+
+/// Outcome of checking a bounded read's raw bytes against `max` and decoding
+/// them as UTF-8.
+pub enum BoundedReadOutcome {
+    /// `buf` was within `max` bytes and valid UTF-8.
+    Ok(String),
+    /// `buf` was longer than `max` bytes; carries the actual byte count.
+    TooLarge {
+        /// Number of bytes actually read.
+        size: u64,
+    },
+    /// `buf` was within `max` bytes but not valid UTF-8.
+    InvalidUtf8(FromUtf8Error),
+}
+
+/// Checks `buf`'s length against `max` *before* UTF-8-validating it, so that
+/// a multibyte character split by a bounded read's cap (see
+/// [`bounded_read_cap`]) is reported as oversized rather than as invalid
+/// UTF-8. `max == 0` means unlimited -- the size check is skipped in that
+/// case, matching [`bounded_read_cap`]'s sentinel.
+///
+/// Callers own the bounded read itself (sync or async filesystem I/O
+/// differs by caller) and map the outcome onto their own error type.
+pub fn check_bounded_utf8(buf: Vec<u8>, max: u64) -> BoundedReadOutcome {
+    if max != 0 && buf.len() as u64 > max {
+        return BoundedReadOutcome::TooLarge {
+            size: buf.len() as u64,
+        };
+    }
+    match String::from_utf8(buf) {
+        Ok(s) => BoundedReadOutcome::Ok(s),
+        Err(e) => BoundedReadOutcome::InvalidUtf8(e),
+    }
+}
+
 /// Marker appended to a truncated string; the returned string can be up to
 /// `max_bytes + TRUNCATION_MARKER.len()` bytes, not exactly `max_bytes`.
 const TRUNCATION_MARKER: &str = "... (truncated)";
@@ -59,6 +108,52 @@ pub fn truncate_string(mut s: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_read_cap_is_max_plus_one() {
+        assert_eq!(bounded_read_cap(100), 101);
+        assert_eq!(bounded_read_cap(u64::MAX - 1), u64::MAX);
+    }
+
+    #[test]
+    fn bounded_read_cap_zero_means_unlimited() {
+        assert_eq!(bounded_read_cap(0), u64::MAX);
+    }
+
+    #[test]
+    fn check_bounded_utf8_within_limit() {
+        let outcome = check_bounded_utf8(b"hello".to_vec(), 10);
+        assert!(matches!(outcome, BoundedReadOutcome::Ok(s) if s == "hello"));
+    }
+
+    #[test]
+    fn check_bounded_utf8_too_large() {
+        let outcome = check_bounded_utf8(b"hello".to_vec(), 4);
+        assert!(matches!(outcome, BoundedReadOutcome::TooLarge { size: 5 }));
+    }
+
+    #[test]
+    fn check_bounded_utf8_unlimited_when_max_zero() {
+        let outcome = check_bounded_utf8(b"a".repeat(1000), 0);
+        assert!(matches!(outcome, BoundedReadOutcome::Ok(s) if s.len() == 1000));
+    }
+
+    #[test]
+    fn check_bounded_utf8_invalid_utf8_within_limit() {
+        let outcome = check_bounded_utf8(vec![0xFF, 0xFE], 10);
+        assert!(matches!(outcome, BoundedReadOutcome::InvalidUtf8(_)));
+    }
+
+    /// A multibyte character split by the bound must be reported as
+    /// oversized, not as invalid UTF-8 -- the ordering this helper exists to
+    /// preserve across both call sites.
+    #[test]
+    fn check_bounded_utf8_reports_oversized_before_invalid_utf8() {
+        let mut buf = "é".repeat(3).into_bytes();
+        buf.truncate(5);
+        let outcome = check_bounded_utf8(buf, 4);
+        assert!(matches!(outcome, BoundedReadOutcome::TooLarge { size: 5 }));
+    }
 
     #[test]
     fn no_truncation_at_or_below_limit() {

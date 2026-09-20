@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced the `&'static str` + closure pair used to gate MCP tool calls on LSP server capabilities with a single `Capability` enum, so the reported capability name and the check that verifies it can no longer drift apart. (#436)
 - Deduplicated `LspNotification::parse`'s four deserialize-or-fallback match arms into a shared helper, sourcing method-name constants from `lsp_types` instead of string literals (no behavior change). (#449)
 - `Error::WorkspaceIndexing` now maps to a distinct JSON-RPC server-error code instead of the generic internal-error code. (#450)
+- Extracted a shared bounded-read helper used by both config loading and document disk reads, keeping their size-check/UTF-8-validation ordering from drifting apart. (#443, #446)
 
 ### Fixed
 

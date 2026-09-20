@@ -23,6 +23,7 @@ use crate::bridge::{
     INDEXING_STALENESS_BOUND, PROGRESS_SETTLE, ResourceLimits,
 };
 use crate::error::{Error, Result};
+use crate::util::{BoundedReadOutcome, bounded_read_cap, check_bounded_utf8};
 
 /// Maps file extensions to LSP language identifiers.
 ///
@@ -878,17 +879,23 @@ impl ServerConfig {
         // `MAX_CONFIG_FILE_BYTES`'s doc for why the pre-check alone is
         // bypassable.
         let mut buf = Vec::new();
-        file.take(MAX_CONFIG_FILE_BYTES + 1)
+        file.take(bounded_read_cap(MAX_CONFIG_FILE_BYTES))
             .read_to_end(&mut buf)
             .map_err(Error::Io)?;
-        if buf.len() as u64 > MAX_CONFIG_FILE_BYTES {
-            return Err(Error::FileSizeLimitExceeded {
-                size: buf.len() as u64,
-                max: MAX_CONFIG_FILE_BYTES,
-            });
-        }
-        let content = String::from_utf8(buf)
-            .map_err(|e| Error::InvalidConfig(format!("config file is not valid UTF-8: {e}")))?;
+        let content = match check_bounded_utf8(buf, MAX_CONFIG_FILE_BYTES) {
+            BoundedReadOutcome::Ok(s) => s,
+            BoundedReadOutcome::TooLarge { size } => {
+                return Err(Error::FileSizeLimitExceeded {
+                    size,
+                    max: MAX_CONFIG_FILE_BYTES,
+                });
+            }
+            BoundedReadOutcome::InvalidUtf8(e) => {
+                return Err(Error::InvalidConfig(format!(
+                    "config file is not valid UTF-8: {e}"
+                )));
+            }
+        };
 
         let mut config: Self = toml::from_str(&content)?;
         config.validate()?;

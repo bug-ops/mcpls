@@ -22,6 +22,7 @@ use super::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
+use crate::util::{BoundedReadOutcome, bounded_read_cap, check_bounded_utf8};
 
 /// Debounce window for re-reading a file's content when its mtime is not yet
 /// [`mtime_settled`]. The stat itself is never debounced -- only this
@@ -781,11 +782,7 @@ impl DocumentTracker {
         size_hint: u64,
     ) -> Result<String> {
         let max = self.limits.max_file_size;
-        let cap = if max == 0 {
-            u64::MAX
-        } else {
-            max.saturating_add(1)
-        };
+        let cap = bounded_read_cap(max);
         let mut buf = Vec::with_capacity(usize::try_from(size_hint.min(cap)).unwrap_or(0));
         let io_err = |e: std::io::Error| Error::FileIo {
             path: path.to_path_buf(),
@@ -797,19 +794,16 @@ impl DocumentTracker {
             .read_to_end(&mut buf)
             .await
             .map_err(io_err)?;
-        // Checked against the byte count before UTF-8 validation below, so a
-        // multibyte character split by the size bound is reported as
-        // oversized rather than as invalid UTF-8. Skipped when `max == 0`
-        // (unlimited): `cap` is `u64::MAX` in that case, so this could only
-        // ever fire on a practically unreachable file size.
-        if max != 0 && buf.len() as u64 > max {
-            return Err(Error::FileSizeLimitExceeded {
-                size: buf.len() as u64,
-                max,
-            });
+        match check_bounded_utf8(buf, max) {
+            BoundedReadOutcome::Ok(s) => Ok(s),
+            BoundedReadOutcome::TooLarge { size } => {
+                Err(Error::FileSizeLimitExceeded { size, max })
+            }
+            BoundedReadOutcome::InvalidUtf8(e) => Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e,
+            ))),
         }
-        String::from_utf8(buf)
-            .map_err(|e| io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
     }
 
     /// Reads `path` through a single open file handle, checking its size and
