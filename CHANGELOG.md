@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed a broken rustdoc intra-doc link to the feature-gated `Transport::Http` that broke `cargo doc` on a default-feature build. (#437)
 - CI's `docs` job now also builds rustdoc with default features, catching feature-gated doc-link breakage like the one fixed in #437 that `--all-features`-only builds masked. (#438, #440)
 - CI's `test-e2e` job filter now runs every `#[ignore]`d integration test instead of only those with "e2e" in their name, closing a gap where 22 ignored tests silently never ran in CI. (#430, #440)
-- Position-encoding conversion now enforces `workspace.max_file_size` on documents it reads from disk rather than reading them unbounded. (#427)
-- Disk reads now reject non-regular files (e.g. FIFOs, character/block devices) instead of trusting their reported size, closing a hang and size-limit bypass. (#418)
+- Position-encoding conversion now enforces `workspace.max_file_size` on documents it reads from disk rather than reading them unbounded. (#427, #441)
+- Disk reads now reject non-regular files (e.g. FIFOs, character/block devices) instead of trusting their reported size, closing a hang and size-limit bypass. (#418, #441)
 
 ## [0.5.0] - 2026-09-06
 
