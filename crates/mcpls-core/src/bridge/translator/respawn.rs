@@ -205,34 +205,54 @@ impl Translator {
     /// [`Self::with_notification_cache`]) rather than left to be merged into
     /// fresh pulls as if still current.
     ///
-    /// Diagnostics and other push notifications from the new process itself
-    /// are drained and discarded rather than wired into the existing pump
-    /// task: the pump's remaining dependencies (resource subscriptions, peer
-    /// handle) live in `serve_with`'s scope, not the translator's, so
-    /// reconnecting live push for a respawned server is out of scope for
-    /// this fix -- it does not resume until the whole mcpls process
-    /// restarts, but stale data is no longer served as current. For the
-    /// diagnostics-route server specifically (the only one whose push
-    /// notifications were ever cached to begin with -- see
+    /// Diagnostics and other notification-lane push notifications from the
+    /// new process itself are drained and discarded rather than wired into
+    /// the existing pump task: the pump's remaining dependencies (resource
+    /// subscriptions, peer handle) live in `serve_with`'s scope, not the
+    /// translator's, so reconnecting live diagnostics push for a respawned
+    /// server is out of scope for this fix -- it does not resume until the
+    /// whole mcpls process restarts, but stale data is no longer served as
+    /// current. For the diagnostics-route server specifically (the only one
+    /// whose push notifications were ever cached to begin with -- see
     /// `diagnostics_pump`'s `caches_diagnostics` gate), this is logged
     /// (`tracing::warn!`) and recorded via
     /// [`crate::bridge::NotificationCache::mark_push_degraded`] so
     /// `get_cached_diagnostics`/`read_resource` can flag their result as
-    /// potentially stale rather than only being visible in logs (#359); a
-    /// respawned non-route server gets neither, since its notifications
-    /// were already discarded before this fix.
+    /// potentially stale rather than only being visible in logs (#359).
     ///
-    /// `id`'s tracked [`crate::bridge::IndexingState`] is also reset to
-    /// `Unknown` (see
-    /// [`crate::bridge::NotificationCache::reset_indexing_state`]),
+    /// `id`'s tracked [`crate::bridge::IndexingState`] is reset to `Unknown`
+    /// (see [`crate::bridge::NotificationCache::reset_indexing_state`]),
     /// regardless of diagnostics-route status: the replacement process has
     /// indexed nothing yet, so a stale `Ready`/`Loading` carried over from
     /// the crashed connection must not leak into
-    /// `Translator::wait_for_indexing_ready` for the new one. Both of the
-    /// replacement's notification lanes are drained and discarded rather
-    /// than wired into a running pump, so it never re-acquires readiness
-    /// state on its own either -- pre-existing, tracked as a follow-up
-    /// (`bug-ops/mcpls#425`).
+    /// `Translator::wait_for_indexing_ready` for the new one. This reset
+    /// happens *before* the lifecycle lane below is wired up, not after:
+    /// `LspServer::spawn` starts the new client's message loop before
+    /// `initialize` is even awaited, so a readiness signal the replacement
+    /// emits during its own handshake can already be sitting in the
+    /// lifecycle channel by the time this method resumes. Resetting first
+    /// means that signal, once forwarded, is the last write and wins; the
+    /// reverse order would race the forwarding task on the production
+    /// multi-thread runtime and could silently erase the replacement's own
+    /// first readiness signal, right back to the #425 symptom this fix
+    /// removes.
+    ///
+    /// The lifecycle lane (`$/progress` and rust-analyzer's
+    /// `experimental/serverStatus`, both of which only ever feed
+    /// [`crate::bridge::IndexingState`], never the diagnostics cache) is the
+    /// exception to the notification-lane discard above: it *is* wired into
+    /// the shared [`crate::bridge::NotificationCache`], via the same
+    /// [`crate::bridge::apply_lifecycle_notification`] helper
+    /// [`crate::diagnostics_pump`] uses for a freshly spawned server, so
+    /// the replacement gets a chance to report its own readiness signal
+    /// instead of staying `Unknown`/fail-open forever (#425). Unlike that
+    /// pump, though, this forwarding task has no cancellation hook (the
+    /// shutdown watch lives in `serve_with`'s scope, not the translator's),
+    /// so it keeps writing to the cache until its channel closes even
+    /// during a graceful shutdown. Under a fast crash loop this method also
+    /// aborts the *previous* respawn generation's forwarder for `id` (see
+    /// [`Self::lifecycle_forwarders`]) before resetting, so a stale one can't
+    /// outlive its generation and write a backlogged notification after.
     ///
     /// A crash-looping server (repeated respawn failures) backs off
     /// exponentially (`RESPAWN_BACKOFF_BASE` up to `RESPAWN_BACKOFF_MAX`)
@@ -294,9 +314,33 @@ impl Translator {
         let new_client = new_server.client().clone();
         let mut notification_rx = new_server.take_notification_rx();
         tokio::spawn(async move { while notification_rx.recv().await.is_some() {} });
-        // Mirrors the notification-lane drain above -- see this fn's doc for why.
+
+        // Ordering (see this fn's doc): abort any stale forwarder, then reset, then spawn anew.
+        let stale_forwarder = lock_std(&self.lifecycle_forwarders).remove(id);
+        if let Some(handle) = stale_forwarder {
+            handle.abort();
+        }
+        if let Some(cache) = &self.notification_cache {
+            cache.lock().await.reset_indexing_state(id);
+        }
+
         let mut lifecycle_rx = new_server.take_lifecycle_rx();
-        tokio::spawn(async move { while lifecycle_rx.recv().await.is_some() {} });
+        let forwarder = match self.notification_cache.clone() {
+            Some(cache) => {
+                let lifecycle_id = id.clone();
+                tokio::spawn(async move {
+                    while let Some(notif) = lifecycle_rx.recv().await {
+                        crate::bridge::apply_lifecycle_notification(
+                            &mut *cache.lock().await,
+                            &lifecycle_id,
+                            notif,
+                        );
+                    }
+                })
+            }
+            None => tokio::spawn(async move { while lifecycle_rx.recv().await.is_some() {} }),
+        };
+        lock_std(&self.lifecycle_forwarders).insert(id.clone(), forwarder.abort_handle());
 
         let old_client = lock_std(&self.lsp_clients).insert(id.clone(), new_client);
         let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
@@ -342,11 +386,6 @@ impl Translator {
             // a cache-only result as potentially stale instead of presenting
             // it as current.
             cache.mark_push_degraded(id);
-        }
-
-        // The replacement process has indexed nothing yet; don't let a stale Ready/Loading from the crashed connection carry over.
-        if let Some(cache) = &self.notification_cache {
-            cache.lock().await.reset_indexing_state(id);
         }
 
         if let Some(old_client) = old_client {
@@ -510,8 +549,12 @@ sleep __SLEEP__
                     env: HashMap::new(),
                     file_patterns: vec![],
                     initialization_options: None,
-                    timeout_seconds: 5,
-                    request_timeout_seconds: 5,
+                    // Generous relative to the sub-second fake scripts these
+                    // tests spawn, to absorb CI scheduling jitter under
+                    // concurrent nextest load (a bare `sh` invocation has no
+                    // real work to do, so this never lengthens the happy path).
+                    timeout_seconds: 20,
+                    request_timeout_seconds: 20,
                     heuristics: None,
                     name: Some(id.to_string()),
                     handles: None,
@@ -937,6 +980,122 @@ fi
                 crate::bridge::IndexingState::Unknown,
                 "a respawned server must not carry over a stale Ready/Loading state \
                  from the crashed connection"
+            );
+        }
+
+        /// #425 regression: the *replacement* process's own lifecycle-lane
+        /// notifications (`$/progress` and `experimental/serverStatus`) must
+        /// be wired into the shared `NotificationCache`, not drained and
+        /// discarded like before -- otherwise a respawned server can never
+        /// re-acquire indexing readiness and stays `Unknown`/fail-open for
+        /// the rest of the process's life. The respawn script answers
+        /// `initialize` and *immediately* (no delay) emits its own
+        /// `experimental/serverStatus` notification, so it is already
+        /// buffered in the lifecycle channel by the time `respawn_if_dead`
+        /// gets to wiring it up -- exactly like a real rust-analyzer
+        /// replacement reporting readiness during its own handshake. Runs on
+        /// a multi-thread runtime (matching `crates/mcpls-cli/src/main.rs`'s
+        /// production `#[tokio::main]`) so the forwarding task can race
+        /// `respawn_if_dead`'s own continuation for real, which is what
+        /// exposed the S1 ordering bug this test is meant to catch: with
+        /// `reset_indexing_state` (wrongly) called *after* the forwarder was
+        /// spawned, the buffered signal could be drained and immediately
+        /// erased before this test ever observes it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_respawn_if_dead_reacquires_indexing_state_from_replacement() {
+            let dir = TempDir::new().unwrap();
+            let seed_script = write_crash_after_init_script(dir.path());
+            let id = ServerId::from("rust");
+            let seed_config = stub_server_config("rust", &seed_script);
+
+            let seed = LspServer::spawn(seed_config).await.unwrap();
+
+            let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
+            let translator = Translator::new()
+                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_notification_cache(Arc::clone(&cache));
+            translator.register_client(id.clone(), seed.client().clone());
+            translator.register_server(id.clone(), seed);
+            wait_until_dead(&translator, &id).await;
+
+            let respawn_script_path = dir.path().join("respawn_with_status.sh");
+            let respawn_script_body = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+notif='{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"quiescent":true}}'
+printf 'Content-Length: %d\r\n\r\n%sContent-Length: %d\r\n\r\n%s' ${#body} "$body" ${#notif} "$notif"
+sleep 1
+"#;
+            fs::write(&respawn_script_path, respawn_script_body).unwrap();
+            translator.register_server_config(
+                id.clone(),
+                stub_server_config("rust", &respawn_script_path),
+            );
+
+            translator.respawn_if_dead(&id).await.unwrap();
+
+            let observed_ready = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if cache.lock().await.indexing_state(&id) == crate::bridge::IndexingState::Ready
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+
+            assert!(
+                observed_ready.is_ok(),
+                "the replacement's own experimental/serverStatus notification must reach \
+                 the NotificationCache, not be discarded"
+            );
+        }
+
+        /// Code-review regression: `respawn_if_dead` must actually *abort*
+        /// any previously-registered lifecycle-forwarder handle for `id`,
+        /// not merely replace the map entry (which an earlier version of
+        /// this test could not tell apart from a forwarder that happened to
+        /// finish on its own -- e.g. because its channel closed naturally).
+        /// Pre-registers a handle to a task built from [`std::future::pending`],
+        /// which by construction can *never* complete except via
+        /// cancellation, so observing it end after a respawn is unambiguous
+        /// proof that `respawn_if_dead` called `.abort()` on it.
+        #[tokio::test]
+        async fn test_respawn_if_dead_aborts_previous_forwarder_handle() {
+            let dir = TempDir::new().unwrap();
+            let seed_script = write_crash_after_init_script(dir.path());
+            let id = ServerId::from("rust");
+            let seed_config = stub_server_config("rust", &seed_script);
+
+            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let translator = Translator::new()
+                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            translator.register_client(id.clone(), seed.client().clone());
+            translator.register_server(id.clone(), seed);
+            wait_until_dead(&translator, &id).await;
+
+            let never_completes = tokio::spawn(std::future::pending::<()>());
+            lock_std(&translator.lifecycle_forwarders)
+                .insert(id.clone(), never_completes.abort_handle());
+
+            let respawn_script = write_responder_script(dir.path(), 1);
+            translator
+                .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
+            translator.respawn_if_dead(&id).await.unwrap();
+
+            let outcome = tokio::time::timeout(Duration::from_secs(2), never_completes)
+                .await
+                .expect("respawn_if_dead must abort the stale handle promptly, not hang it");
+            assert!(
+                outcome.is_err_and(|join_err| join_err.is_cancelled()),
+                "a task that can never complete on its own must have been aborted \
+                 by the later respawn, not merely replaced in the map"
+            );
+
+            assert!(
+                lock_std(&translator.lifecycle_forwarders)
+                    .get(&id)
+                    .is_some_and(|current| !current.is_finished()),
+                "the new respawn's own forwarder must be registered and still running"
             );
         }
 

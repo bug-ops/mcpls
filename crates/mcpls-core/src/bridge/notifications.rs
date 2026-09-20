@@ -1185,6 +1185,36 @@ impl NotificationCache {
     }
 }
 
+/// Applies one lifecycle-lane notification (`$/progress` or the generic
+/// `Other` variant, which carries e.g. rust-analyzer's
+/// `experimental/serverStatus`) to `cache` -- the only two variants that
+/// lane ever carries, since the notification lane handles
+/// diagnostics/log/showMessage instead (see
+/// `LspClient::message_loop_inner`'s routing).
+///
+/// Shared by `diagnostics_pump`'s lifecycle-lane arm (wiring a freshly
+/// spawned server's own pump) and `Translator::respawn_if_dead`'s
+/// lifecycle-lane forwarding task (wiring a respawned server's replacement
+/// process), so the two can't silently drift apart on which notification
+/// variants feed which `NotificationCache` method.
+pub fn apply_lifecycle_notification(
+    cache: &mut NotificationCache,
+    server_id: &ServerId,
+    notif: crate::lsp::LspNotification,
+) {
+    match notif {
+        crate::lsp::LspNotification::Progress(params) => {
+            cache.observe_progress(server_id, &params);
+        }
+        crate::lsp::LspNotification::Other { method, params } => {
+            cache.observe_indexing_signal(server_id, &method, params.as_ref());
+        }
+        crate::lsp::LspNotification::PublishDiagnostics(_)
+        | crate::lsp::LspNotification::LogMessage(_)
+        | crate::lsp::LspNotification::ShowMessage(_) => {}
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

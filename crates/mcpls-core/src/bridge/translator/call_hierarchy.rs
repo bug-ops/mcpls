@@ -162,10 +162,20 @@ impl Translator {
 
     /// Handle incoming calls request.
     ///
+    /// Routing through `prepare_gated_document_for_path` means this now
+    /// stats, reads, and `didOpen`s the item's own file as a side effect,
+    /// even though a call-hierarchy item is opaque per the LSP spec and
+    /// needs no open document -- accepted for chokepoint/gating
+    /// consistency with `handle_references` and the other whole-workspace
+    /// tools; it does mean a replayed item whose file has since been
+    /// deleted now fails on that stat instead of just proceeding.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails, the item is invalid, or the
-    /// routed server does not advertise `callHierarchyProvider` support.
+    /// Returns an error if the LSP request fails, the item is invalid, the
+    /// routed server does not advertise `callHierarchyProvider` support, or
+    /// the server is still indexing the workspace after
+    /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_incoming_calls(
         &self,
         item: serde_json::Value,
@@ -173,16 +183,16 @@ impl Translator {
         // Deserialize as our own type (1-based coords).
         let parsed = parse_mcp_call_hierarchy_item(item)?;
 
-        // Parse and validate the URI. Resolved with the same ToolKind as
-        // `handle_call_hierarchy_prepare` -- the opaque item this call
-        // receives is only meaningful to the server that produced it, and
-        // that server is guaranteed to be the same one `prepare` synced the
-        // document to since both resolve via the same (language, tool) route.
+        // Same ToolKind/route as `handle_call_hierarchy_prepare`.
         let path = self.parse_file_uri(&parsed.uri)?;
-        let (server_id, client) = self
-            .resolve_client_for_file(&path, ToolKind::CallHierarchy)
+        let (server_id, client, _uri) = self
+            .prepare_gated_document_for_path(
+                &path,
+                ToolKind::CallHierarchy,
+                Capability::CallHierarchy,
+                IndexingGate::Required,
+            )
             .await?;
-        self.require_capability(&server_id, Capability::CallHierarchy)?;
         let ctx = self.encoding_ctx(&server_id);
         let lsp_item = call_hierarchy_item_to_lsp(parsed, &ctx).await;
 
@@ -227,10 +237,15 @@ impl Translator {
 
     /// Handle outgoing calls request.
     ///
+    /// Same `didOpen`-as-side-effect trade-off as `handle_incoming_calls` --
+    /// see that method's doc.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails, the item is invalid, or the
-    /// routed server does not advertise `callHierarchyProvider` support.
+    /// Returns an error if the LSP request fails, the item is invalid, the
+    /// routed server does not advertise `callHierarchyProvider` support, or
+    /// the server is still indexing the workspace after
+    /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_outgoing_calls(
         &self,
         item: serde_json::Value,
@@ -238,13 +253,18 @@ impl Translator {
         // Deserialize as our own type (1-based coords).
         let parsed = parse_mcp_call_hierarchy_item(item)?;
 
-        // Parse and validate the URI. Same ToolKind/route as `prepare` and
-        // `handle_incoming_calls` -- see that function's comment.
+        // Parse the URI and gate through the same chokepoint as
+        // `handle_incoming_calls` -- see that function's comment (#423).
+        // Same ToolKind/route as `prepare`.
         let path = self.parse_file_uri(&parsed.uri)?;
-        let (server_id, client) = self
-            .resolve_client_for_file(&path, ToolKind::CallHierarchy)
+        let (server_id, client, _uri) = self
+            .prepare_gated_document_for_path(
+                &path,
+                ToolKind::CallHierarchy,
+                Capability::CallHierarchy,
+                IndexingGate::Required,
+            )
             .await?;
-        self.require_capability(&server_id, Capability::CallHierarchy)?;
         let ctx = self.encoding_ctx(&server_id);
         // Per the LSP spec, an outgoing call's `fromRanges` are ranges within
         // the *queried* item's own document, not the callee's (`call.to.uri`).
@@ -297,10 +317,12 @@ mod tests {
 
     use tempfile::TempDir;
     use tokio::io::BufReader;
+    use tokio::sync::Mutex;
     use tokio::time::timeout;
     use url::Url;
 
     use super::*;
+    use crate::bridge::NotificationCache;
     use crate::bridge::translator::dto::{Position, Position2D, Range};
     use crate::bridge::translator::testing::*;
     use crate::config::ServerId;
@@ -371,6 +393,112 @@ mod tests {
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator.handle_outgoing_calls(invalid_item).await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+    }
+
+    /// Builds a `CallHierarchyItemResult` JSON value pointing at `path`, for
+    /// driving `handle_incoming_calls`/`handle_outgoing_calls` directly
+    /// without a preceding `prepare_call_hierarchy` round trip.
+    fn call_hierarchy_item_json(uri: &str) -> serde_json::Value {
+        serde_json::to_value(CallHierarchyItemResult {
+            name: "queried_fn".to_string(),
+            kind: 12,
+            detail: None,
+            uri: uri.to_string(),
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            selection_range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            data: None,
+        })
+        .unwrap()
+    }
+
+    /// #423 regression: `handle_incoming_calls` is a whole-workspace query of
+    /// the same class as `references` and must be gated on indexing
+    /// readiness the same way, instead of bypassing `prepare_gated_document`
+    /// entirely.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_incoming_calls_returns_workspace_indexing_error_when_loading() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("queried.rs");
+        fs::write(&path, "fn queried() {}").unwrap();
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+
+        let err = translator
+            .handle_incoming_calls(call_hierarchy_item_json(&uri))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
+    }
+
+    /// #423 regression: companion for `handle_outgoing_calls` -- see
+    /// `test_handle_incoming_calls_returns_workspace_indexing_error_when_loading`.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_outgoing_calls_returns_workspace_indexing_error_when_loading() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("queried.rs");
+        fs::write(&path, "fn queried() {}").unwrap();
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+
+        let err = translator
+            .handle_outgoing_calls(call_hierarchy_item_json(&uri))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
     }
 
     /// S4 lock-in for the documented `Uri`-validation-loss behavior change
@@ -558,6 +686,9 @@ mod tests {
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
         let request = read_framed_message(&mut wire).await;
         assert_eq!(request["method"], "callHierarchy/incomingCalls");
 
@@ -664,6 +795,9 @@ mod tests {
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
         let request = read_framed_message(&mut wire).await;
         assert_eq!(request["method"], "callHierarchy/outgoingCalls");
 
@@ -766,6 +900,9 @@ mod tests {
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
         let request = read_framed_message(&mut wire).await;
         assert_eq!(request["method"], "callHierarchy/incomingCalls");
 
@@ -862,6 +999,9 @@ mod tests {
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
         let request = read_framed_message(&mut wire).await;
         assert_eq!(request["method"], "callHierarchy/outgoingCalls");
 
