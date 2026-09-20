@@ -8,6 +8,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
 use super::encoding_ctx::EncodingCtx;
+use super::routing::IndexingGate;
 use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ToolKind};
 use crate::error::{Error, Result};
@@ -101,6 +102,7 @@ impl Translator {
                         )
                     )
                 },
+                IndexingGate::NotRequired,
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
@@ -507,5 +509,60 @@ mod tests {
             "the range-less LocationUriOnly symbol must be dropped, not fabricated"
         );
         assert_eq!(result.symbols[0].name, "with_range");
+    }
+
+    /// `document_symbols` is single-file analysis, valid even mid-index
+    /// (spec FR-008), so `IndexingGate::NotRequired` at its
+    /// `prepare_gated_document` call site must mean it dispatches even
+    /// while the routed server reports `IndexingState::Loading` -- unlike
+    /// the whole-workspace tools, which would error in this state.
+    #[tokio::test]
+    async fn test_handle_document_symbols_dispatches_while_indexing_loading() {
+        use crate::bridge::NotificationCache;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            document_symbol_provider: Some(lsp_types::DocumentSymbolProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(tokio::sync::Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_document_symbols(path).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/documentSymbol");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang -- document_symbols must not be gated")
+            .unwrap()
+            .unwrap();
+        assert!(result.symbols.is_empty());
     }
 }

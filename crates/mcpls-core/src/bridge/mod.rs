@@ -13,7 +13,8 @@ mod translator;
 
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 pub use notifications::{
-    DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
+    DiagnosticInfo, IndexingState, LogEntry, LogLevel, MessageType, NotificationCache,
+    ServerMessage,
 };
 pub use resources::ResourceSubscriptions;
 pub(crate) use state::try_path_to_uri;

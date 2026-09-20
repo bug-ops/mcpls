@@ -222,6 +222,14 @@ impl Translator {
     /// respawned non-route server gets neither, since its notifications
     /// were already discarded before this fix.
     ///
+    /// `id`'s tracked [`crate::bridge::IndexingState`] is also reset to
+    /// `Unknown` (see
+    /// [`crate::bridge::NotificationCache::reset_indexing_state`]),
+    /// regardless of diagnostics-route status: the replacement process has
+    /// indexed nothing yet, so a stale `Ready`/`Loading` carried over from
+    /// the crashed connection must not leak into
+    /// `Translator::wait_for_indexing_ready` for the new one.
+    ///
     /// A crash-looping server (repeated respawn failures) backs off
     /// exponentially (`RESPAWN_BACKOFF_BASE` up to `RESPAWN_BACKOFF_MAX`)
     /// instead of retrying on every single tool call, each of which would
@@ -327,6 +335,11 @@ impl Translator {
             // a cache-only result as potentially stale instead of presenting
             // it as current.
             cache.mark_push_degraded(id);
+        }
+
+        // The replacement process has indexed nothing yet; don't let a stale Ready/Loading from the crashed connection carry over.
+        if let Some(cache) = &self.notification_cache {
+            cache.lock().await.reset_indexing_state(id);
         }
 
         if let Some(old_client) = old_client {
@@ -865,6 +878,58 @@ fi
                 "an unrelated, never-respawned server must not be marked degraded"
             );
             drop(guard);
+        }
+
+        /// A respawned server's tracked `IndexingState` must reset
+        /// to `Unknown`, not carry over stale state from the crashed
+        /// connection -- the replacement process has indexed nothing yet,
+        /// and its own `experimental/serverStatus` notifications are
+        /// discarded (see this method's doc), so a stale `Ready` would let
+        /// whole-workspace queries through against an empty index. Unlike
+        /// diagnostics-cache clearing, this must happen regardless of
+        /// diagnostics-route status -- indexing readiness gates every
+        /// routed server's whole-workspace tools, not just the one that
+        /// owns diagnostics.
+        #[tokio::test]
+        async fn test_respawn_if_dead_resets_indexing_state() {
+            let dir = TempDir::new().unwrap();
+            let seed_script = write_crash_after_init_script(dir.path());
+            let id = ServerId::from("rust");
+            let seed_config = stub_server_config("rust", &seed_script);
+
+            let seed = LspServer::spawn(seed_config).await.unwrap();
+
+            let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
+            let translator = Translator::new()
+                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_notification_cache(Arc::clone(&cache));
+            translator.register_client(id.clone(), seed.client().clone());
+            translator.register_server(id.clone(), seed);
+
+            cache.lock().await.observe_indexing_signal(
+                &id,
+                "experimental/serverStatus",
+                Some(&serde_json::json!({"quiescent": true})),
+            );
+            assert_eq!(
+                cache.lock().await.indexing_state(&id),
+                crate::bridge::IndexingState::Ready
+            );
+
+            wait_until_dead(&translator, &id).await;
+
+            let respawn_script = write_responder_script(dir.path(), 1);
+            translator
+                .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
+
+            translator.respawn_if_dead(&id).await.unwrap();
+
+            assert_eq!(
+                cache.lock().await.indexing_state(&id),
+                crate::bridge::IndexingState::Unknown,
+                "a respawned server must not carry over a stale Ready/Loading state \
+                 from the crashed connection"
+            );
         }
 
         /// #249 C1 regression (over-clear direction): respawning a server

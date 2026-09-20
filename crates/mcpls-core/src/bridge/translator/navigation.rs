@@ -1,18 +1,46 @@
 //! Hover, go-to-definition/implementation/type-definition, and references
 //! handlers.
 
+use std::time::Duration;
+
 use lsp_types::{
     HoverParams as LspHoverParams, PartialResultParams, ReferenceContext, ReferenceParams,
     TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
 };
+use tokio::time::Instant;
 
 use super::Translator;
 use super::dto::{
     DefinitionResult, HoverResult, Location, LocationsResult, Position, ReferencesResult,
 };
 use super::encoding_ctx::EncodingCtx;
-use crate::config::ToolKind;
-use crate::error::Result;
+use super::routing::IndexingGate;
+use crate::bridge::IndexingState;
+use crate::bridge::notifications::INDEXING_STALENESS_BOUND;
+use crate::config::{ServerId, ToolKind};
+use crate::error::{Error, Result};
+
+/// Maximum time [`Translator::wait_for_indexing_ready`] waits for a routed
+/// LSP server to report it has finished its initial workspace load, once a
+/// readiness signal has shown indexing is actually in progress. Matches the
+/// timeout already used throughout the rust-analyzer integration test
+/// suite's own (test-only) indexing-readiness helper.
+const INDEXING_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval used while waiting out [`INDEXING_READY_TIMEOUT`]. A single
+/// mutex lock plus map lookup, not a network round trip, so a short
+/// interval adds no meaningful overhead relative to the LSP request that
+/// follows once the wait resolves.
+const INDEXING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// `INDEXING_STALENESS_BOUND` must stay larger than `INDEXING_READY_TIMEOUT`,
+/// or the read-time staleness self-heal could fire within a single caller's
+/// own wait -- reintroducing the cross-caller self-heal race this bound
+/// exists to prevent.
+const _: () = assert!(
+    INDEXING_STALENESS_BOUND.as_nanos() > INDEXING_READY_TIMEOUT.as_nanos(),
+    "INDEXING_STALENESS_BOUND must be greater than INDEXING_READY_TIMEOUT"
+);
 
 /// Flattens a `Definition` (`Location` or `Location[]`) into an owned `Vec`.
 fn definition_to_locations(definition: lsp_types::Definition) -> Vec<lsp_types::Location> {
@@ -178,24 +206,100 @@ fn marked_string_to_string(marked: lsp_types::MarkedString) -> String {
 }
 
 impl Translator {
+    /// Wait for the routed server `server_id` to finish its initial
+    /// workspace-load/indexing phase before a whole-workspace query (hover,
+    /// definition, implementation, type definition, references, rename,
+    /// completions, code actions) reaches it. Called from
+    /// [`Translator::prepare_gated_document`] for every call site declared
+    /// [`IndexingGate::Required`].
+    ///
+    /// Returns immediately, without waiting, unless
+    /// [`crate::bridge::NotificationCache::indexing_state`] currently
+    /// reports [`IndexingState::Loading`] for `server_id` -- i.e. a
+    /// recognized signal has positively indicated indexing is in progress.
+    /// A server that has never reported any readiness signal
+    /// ([`IndexingState::Unknown`]) is treated the same as
+    /// [`IndexingState::Ready`]: without evidence indexing is happening,
+    /// waiting would only add latency for servers and workspaces that have
+    /// no indexing phase at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WorkspaceIndexing`] if the server is still
+    /// [`IndexingState::Loading`] after [`INDEXING_READY_TIMEOUT`] elapses.
+    pub(super) async fn wait_for_indexing_ready(&self, server_id: &ServerId) -> Result<()> {
+        self.wait_for_indexing_ready_with(server_id, INDEXING_READY_TIMEOUT, INDEXING_POLL_INTERVAL)
+            .await
+    }
+
+    /// [`Self::wait_for_indexing_ready`] with an injectable timeout and poll
+    /// interval, so tests can exercise the timeout path without waiting out
+    /// the real default.
+    ///
+    /// On timeout this returns [`Error::WorkspaceIndexing`] to the caller
+    /// *without* mutating any shared state -- self-healing for a stuck
+    /// `Loading` signal (a dropped `quiescent: true` notification, or a
+    /// server that stalls mid-index) is handled entirely by
+    /// [`crate::bridge::NotificationCache::indexing_state`]'s own
+    /// read-time staleness check, keyed to the signal's age rather than
+    /// this call's. Earlier revisions reset the shared entry here on
+    /// timeout, which let one caller's short timeout silently un-gate
+    /// every other concurrent or later caller before its own deadline;
+    /// never reintroduce a write here.
+    async fn wait_for_indexing_ready_with(
+        &self,
+        server_id: &ServerId,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        let Some(cache) = self.notification_cache.as_ref() else {
+            return Ok(());
+        };
+
+        let start = Instant::now();
+        let deadline = start + timeout;
+        loop {
+            let state = cache.lock().await.indexing_state(server_id);
+            if state != IndexingState::Loading {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::WorkspaceIndexing {
+                    server_id: server_id.clone(),
+                    elapsed_secs: start.elapsed().as_secs(),
+                });
+            }
+            tokio::time::sleep(poll_interval.min(remaining)).await;
+        }
+    }
+
     /// Handle hover request.
     ///
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `hoverProvider` support.
+    /// the routed server does not advertise `hoverProvider` support, or the
+    /// server is still indexing the workspace after
+    /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_hover(&self, file_path: String, position: Position) -> Result<HoverResult> {
         let Position { line, character } = position;
         let (server_id, client, uri) = self
-            .prepare_gated_document(&file_path, ToolKind::Hover, "hoverProvider", |caps| {
-                matches!(
-                    caps.hover_provider,
-                    Some(
-                        lsp_types::HoverProvider::Bool(true)
-                            | lsp_types::HoverProvider::HoverOptions(_)
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::Hover,
+                "hoverProvider",
+                |caps| {
+                    matches!(
+                        caps.hover_provider,
+                        Some(
+                            lsp_types::HoverProvider::Bool(true)
+                                | lsp_types::HoverProvider::HoverOptions(_)
+                        )
                     )
-                )
-            })
+                },
+                IndexingGate::Required,
+            )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
@@ -233,15 +337,17 @@ impl Translator {
 
     /// Shared implementation of the go-to-X handlers (`textDocument/definition`,
     /// `textDocument/implementation`, `textDocument/typeDefinition`): gate on
-    /// the request's capability, translate the MCP position into LSP
-    /// coordinates, dispatch the LSP request, and flatten the response into
-    /// MCP locations. Each public handler supplies its request type via `R`
-    /// plus the capability key/predicate specific to it.
+    /// the request's capability and on indexing readiness, translate the MCP
+    /// position into LSP coordinates, dispatch the LSP request, and flatten
+    /// the response into MCP locations. Each public handler supplies its
+    /// request type via `R` plus the capability key/predicate specific to
+    /// it.
     ///
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `capability` support.
+    /// the routed server does not advertise `capability` support, or the
+    /// server is still indexing the workspace after `INDEXING_READY_TIMEOUT`.
     async fn handle_goto<R, T>(
         &self,
         file_path: &str,
@@ -257,7 +363,13 @@ impl Translator {
     {
         let Position { line, character } = position;
         let (server_id, client, uri) = self
-            .prepare_gated_document(file_path, tool, capability, supported)
+            .prepare_gated_document(
+                file_path,
+                tool,
+                capability,
+                supported,
+                IndexingGate::Required,
+            )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
@@ -279,7 +391,9 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `definitionProvider` support.
+    /// the routed server does not advertise `definitionProvider` support, or
+    /// the server is still indexing the workspace after
+    /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_definition(
         &self,
         file_path: String,
@@ -311,7 +425,9 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `referencesProvider` support.
+    /// the routed server does not advertise `referencesProvider` support, or
+    /// the server is still indexing the workspace after
+    /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_references(
         &self,
         file_path: String,
@@ -333,6 +449,7 @@ impl Translator {
                         )
                     )
                 },
+                IndexingGate::Required,
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
@@ -377,7 +494,9 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `implementationProvider` support.
+    /// the routed server does not advertise `implementationProvider`
+    /// support, or the server is still indexing the workspace after
+    /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_implementation(
         &self,
         file_path: String,
@@ -413,7 +532,9 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `typeDefinitionProvider` support.
+    /// the routed server does not advertise `typeDefinitionProvider`
+    /// support, or the server is still indexing the workspace after
+    /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_type_definition(
         &self,
         file_path: String,
@@ -451,12 +572,536 @@ mod tests {
 
     use tempfile::TempDir;
     use tokio::io::BufReader;
+    use tokio::sync::Mutex;
     use tokio::time::timeout;
     use url::Url;
 
     use super::*;
+    use crate::bridge::NotificationCache;
     use crate::bridge::translator::testing::*;
     use crate::config::ServerId;
+
+    // -----------------------------------------------------------------
+    // Indexing readiness gate (`Translator::wait_for_indexing_ready`)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_wait_for_indexing_ready_without_cache_is_noop() {
+        // No wired cache (most fixtures) must never block -- see `Translator::notification_cache`'s field doc.
+        let translator = Translator::new();
+        let server_id = ServerId::from("rust");
+
+        translator
+            .wait_for_indexing_ready(&server_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_indexing_ready_unknown_state_is_noop() {
+        let translator = Translator::new()
+            .with_notification_cache(Arc::new(Mutex::new(NotificationCache::new())));
+        let server_id = ServerId::from("rust");
+
+        translator
+            .wait_for_indexing_ready(&server_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_indexing_ready_ready_state_is_noop() {
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let server_id = ServerId::from("rust");
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Translator::new().with_notification_cache(cache);
+
+        translator
+            .wait_for_indexing_ready(&server_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_indexing_ready_loading_times_out() {
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let server_id = ServerId::from("rust");
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = Translator::new().with_notification_cache(cache);
+
+        let err = translator
+            .wait_for_indexing_ready_with(
+                &server_id,
+                Duration::from_millis(50),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == ServerId::from("rust")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_indexing_ready_returns_ok_once_signaled_ready() {
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let server_id = ServerId::from("rust");
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = Translator::new().with_notification_cache(Arc::clone(&cache));
+
+        let waiter = {
+            let server_id = server_id.clone();
+            tokio::spawn(async move {
+                translator
+                    .wait_for_indexing_ready_with(
+                        &server_id,
+                        Duration::from_secs(5),
+                        Duration::from_millis(10),
+                    )
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter task timed out")
+            .expect("waiter task panicked")
+            .expect("expected Ok once quiescent");
+    }
+
+    /// End-to-end: a real handler (`handle_hover`) must surface
+    /// `Error::WorkspaceIndexing` -- not an empty/`null` result -- when the
+    /// routed server is still `Loading`, without ever reaching the fake LSP
+    /// server. Runs under paused virtual time so it does not actually wait
+    /// out the real `INDEXING_READY_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_hover_returns_workspace_indexing_error_when_loading() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let err = translator
+            .handle_hover(path.to_string_lossy().to_string(), pos(1, 1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, elapsed_secs: 30 } if id == server_id
+        ));
+    }
+
+    /// Companion to the timeout test above: when the cache reports `Ready`,
+    /// `handle_hover` must dispatch normally with no added delay.
+    #[tokio::test]
+    async fn test_handle_hover_dispatches_when_indexing_ready() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_hover(path, pos(1, 1)).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/hover");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!({
+                "contents": {"kind": "markdown", "value": "hover text"}
+            }),
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.contents, "hover text");
+    }
+
+    /// End-to-end: `handle_definition` must surface `Error::WorkspaceIndexing`
+    /// while the routed server is still `Loading`, without reaching the fake
+    /// LSP server.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_definition_returns_workspace_indexing_error_when_loading() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let err = translator
+            .handle_definition(path.to_string_lossy().to_string(), pos(1, 1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
+    }
+
+    /// Companion: when the cache reports `Ready`, `handle_definition` must
+    /// dispatch normally.
+    #[tokio::test]
+    async fn test_handle_definition_dispatches_when_indexing_ready() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_definition(path, pos(1, 1)).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/definition");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.locations.is_empty());
+    }
+
+    /// End-to-end: `handle_references` must surface `Error::WorkspaceIndexing`
+    /// while the routed server is still `Loading`, without reaching the fake
+    /// LSP server.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_references_returns_workspace_indexing_error_when_loading() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let err = translator
+            .handle_references(path.to_string_lossy().to_string(), pos(1, 1), true)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
+    }
+
+    /// Companion: when the cache reports `Ready`, `handle_references` must
+    /// dispatch normally.
+    #[tokio::test]
+    async fn test_handle_references_dispatches_when_indexing_ready() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_references(path, pos(1, 1), true).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/references");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.locations.is_empty());
+    }
+
+    /// S3 fix: `handle_implementation` shares `handle_goto` with
+    /// `handle_definition` and must now be gated the same way --
+    /// `textDocument/implementation` needs the whole-crate trait-impl index,
+    /// which is at least as index-dependent as `definition`.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_implementation_returns_workspace_indexing_error_when_loading() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            implementation_provider: Some(lsp_types::ImplementationProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let err = translator
+            .handle_implementation(path.to_string_lossy().to_string(), pos(1, 1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
+    }
+
+    /// S3 fix, companion for `handle_type_definition`.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_type_definition_returns_workspace_indexing_error_when_loading() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            type_definition_provider: Some(lsp_types::TypeDefinitionProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let err = translator
+            .handle_type_definition(path.to_string_lossy().to_string(), pos(1, 1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
+    }
+
+    /// A timed-out wait must return `Error::WorkspaceIndexing` to its own
+    /// caller without mutating the shared cache entry -- a fixed-in-review
+    /// regression had the timeout handler reset the entry to `Unknown`,
+    /// which released every other concurrent/later caller early (see
+    /// `test_wait_for_indexing_ready_one_callers_timeout_does_not_release_another`
+    /// for the direct reproduction). Self-healing for a genuinely stuck
+    /// signal now lives entirely in
+    /// `NotificationCache::indexing_state`'s own staleness check.
+    #[tokio::test]
+    async fn test_wait_for_indexing_ready_timeout_does_not_mutate_shared_state() {
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let server_id = ServerId::from("rust");
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = Translator::new().with_notification_cache(Arc::clone(&cache));
+
+        translator
+            .wait_for_indexing_ready_with(
+                &server_id,
+                Duration::from_millis(30),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            cache.lock().await.indexing_state(&server_id),
+            IndexingState::Loading,
+            "a timed-out wait must not touch the shared entry -- it is still fresh, so it must \
+             still read as Loading for any other caller"
+        );
+    }
+
+    /// Direct reproduction of the self-heal race: a short-timeout waiter's
+    /// own timeout must never resolve a concurrent long-timeout waiter's
+    /// independent wait early. Before the fix, both waiters observed the
+    /// same shared `IndexingState`, and the short waiter's timeout handler
+    /// reset it to `Unknown` as a side effect -- silently un-gating the
+    /// long waiter tens of seconds before its own deadline.
+    #[tokio::test]
+    async fn test_wait_for_indexing_ready_one_callers_timeout_does_not_release_another() {
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let server_id = ServerId::from("rust");
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = Arc::new(Translator::new().with_notification_cache(Arc::clone(&cache)));
+
+        let short = {
+            let translator = Arc::clone(&translator);
+            let server_id = server_id.clone();
+            tokio::spawn(async move {
+                translator
+                    .wait_for_indexing_ready_with(
+                        &server_id,
+                        Duration::from_millis(80),
+                        Duration::from_millis(10),
+                    )
+                    .await
+            })
+        };
+        let long = {
+            let translator = Arc::clone(&translator);
+            let server_id = server_id.clone();
+            tokio::spawn(async move {
+                translator
+                    .wait_for_indexing_ready_with(
+                        &server_id,
+                        Duration::from_secs(30),
+                        Duration::from_millis(10),
+                    )
+                    .await
+            })
+        };
+
+        let short_result = short.await.unwrap();
+        assert!(
+            matches!(short_result, Err(Error::WorkspaceIndexing { .. })),
+            "the short-timeout waiter must time out on its own schedule, got {short_result:?}"
+        );
+
+        // Well past the short waiter's 80ms deadline, nowhere near the long
+        // waiter's 30s one.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !long.is_finished(),
+            "a concurrent caller's short timeout must never resolve another caller's \
+             independent wait early"
+        );
+        long.abort();
+    }
 
     #[test]
     fn test_extract_hover_contents_string() {

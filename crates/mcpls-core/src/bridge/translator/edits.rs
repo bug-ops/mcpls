@@ -13,7 +13,7 @@ use super::dto::{
     Position, RenameResult, TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
-use super::routing::{MAX_POSITION_VALUE, MAX_RANGE_LINES};
+use super::routing::{IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
@@ -175,8 +175,11 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if `new_name` exceeds the maximum allowed length,
-    /// the LSP request fails, the file cannot be opened, or the routed
-    /// server does not advertise `renameProvider` support.
+    /// the LSP request fails, the file cannot be opened, the routed server
+    /// does not advertise `renameProvider` support, or the server is still
+    /// indexing the workspace (see `Translator::wait_for_indexing_ready`) --
+    /// a rename needs the same whole-workspace reference index as
+    /// `get_references`.
     pub async fn handle_rename(
         &self,
         file_path: String,
@@ -187,15 +190,21 @@ impl Translator {
         validate_rename_params(&new_name)?;
 
         let (server_id, client, uri) = self
-            .prepare_gated_document(&file_path, ToolKind::Rename, "renameProvider", |caps| {
-                matches!(
-                    caps.rename_provider,
-                    Some(
-                        lsp_types::RenameProvider::Bool(true)
-                            | lsp_types::RenameProvider::RenameOptions(_)
+            .prepare_gated_document(
+                &file_path,
+                ToolKind::Rename,
+                "renameProvider",
+                |caps| {
+                    matches!(
+                        caps.rename_provider,
+                        Some(
+                            lsp_types::RenameProvider::Bool(true)
+                                | lsp_types::RenameProvider::RenameOptions(_)
+                        )
                     )
-                )
-            })
+                },
+                IndexingGate::Required,
+            )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
@@ -316,6 +325,7 @@ impl Translator {
                         )
                     )
                 },
+                IndexingGate::NotRequired,
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
@@ -356,7 +366,9 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
-    /// or the routed server does not advertise `codeActionProvider` support.
+    /// the routed server does not advertise `codeActionProvider` support, or
+    /// the server is still indexing the workspace (see
+    /// `wait_for_indexing_ready`).
     pub async fn handle_code_actions(
         &self,
         file_path: String,
@@ -380,6 +392,7 @@ impl Translator {
                         )
                     )
                 },
+                IndexingGate::Required,
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
@@ -1004,5 +1017,246 @@ mod tests {
         assert_eq!(cmd.title, "Execute refactor");
         assert_eq!(cmd.command, "refactor.extract");
         assert_eq!(cmd.arguments.len(), 2);
+    }
+
+    /// End-to-end: `handle_code_actions` must surface
+    /// `Error::WorkspaceIndexing` -- not an empty result -- while the routed
+    /// server is still `Loading`, without reaching the fake LSP server.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_code_actions_returns_workspace_indexing_error_when_loading() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            code_action_provider: Some(lsp_types::CodeActionProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let err = translator
+            .handle_code_actions(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                Position {
+                    line: 1,
+                    character: 10,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
+    }
+
+    /// Companion: when the cache reports `Ready`, `handle_code_actions` must
+    /// dispatch normally.
+    #[tokio::test]
+    async fn test_handle_code_actions_dispatches_when_indexing_ready() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            code_action_provider: Some(lsp_types::CodeActionProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_code_actions(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                        Position {
+                            line: 1,
+                            character: 10,
+                        },
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/codeAction");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([]),
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.actions.is_empty());
+    }
+
+    /// `handle_rename` needs the same whole-workspace reference index as
+    /// `get_references`; it must surface `Error::WorkspaceIndexing` -- not
+    /// attempt a rename against a partial index -- while the routed server
+    /// is still `Loading`, without reaching the fake LSP server.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_rename_returns_workspace_indexing_error_when_loading() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn old_name() {}").unwrap();
+
+        let err = translator
+            .handle_rename(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 4,
+                },
+                "new_name".to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
+    }
+
+    /// Companion: when the cache reports `Ready`, `handle_rename` must
+    /// dispatch normally.
+    #[tokio::test]
+    async fn test_handle_rename_dispatches_when_indexing_ready() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn old_name() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 4,
+                        },
+                        "new_name".to_string(),
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/rename");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.changes.is_empty());
     }
 }

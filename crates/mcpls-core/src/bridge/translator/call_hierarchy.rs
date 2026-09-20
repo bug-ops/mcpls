@@ -12,7 +12,7 @@ use super::dto::{
     OutgoingCall, OutgoingCallsResult, Position,
 };
 use super::encoding_ctx::EncodingCtx;
-use super::routing::MAX_POSITION_VALUE;
+use super::routing::{IndexingGate, MAX_POSITION_VALUE};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
@@ -142,6 +142,7 @@ impl Translator {
                 ToolKind::CallHierarchy,
                 "callHierarchyProvider",
                 call_hierarchy_provider_supported,
+                IndexingGate::NotRequired,
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);

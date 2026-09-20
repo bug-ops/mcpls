@@ -277,6 +277,22 @@ pub enum Error {
         /// Name of the missing LSP capability field (e.g. `"renameProvider"`).
         capability: &'static str,
     },
+
+    /// The routed server has an active signal indicating its initial
+    /// workspace-load/indexing phase is still in progress, and the bounded
+    /// wait for it to finish elapsed before it completed. Returned instead
+    /// of an unqualified empty/`null` result so a caller cannot mistake
+    /// "index not ready yet" for "this position/symbol genuinely has
+    /// nothing here".
+    #[error(
+        "LSP server '{server_id}' is still indexing the workspace after {elapsed_secs}s; wait and retry the request"
+    )]
+    WorkspaceIndexing {
+        /// Routing identity of the server still indexing.
+        server_id: ServerId,
+        /// How long mcpls waited for readiness before giving up.
+        elapsed_secs: u64,
+    },
 }
 
 /// A specialized Result type for mcpls-core operations.
@@ -569,6 +585,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "server 'rust' does not support capability 'renameProvider'"
+        );
+    }
+
+    #[test]
+    fn test_error_display_workspace_indexing() {
+        let err = Error::WorkspaceIndexing {
+            server_id: ServerId::from("rust"),
+            elapsed_secs: 30,
+        };
+        assert_eq!(
+            err.to_string(),
+            "LSP server 'rust' is still indexing the workspace after 30s; wait and retry the request"
         );
     }
 }

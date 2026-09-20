@@ -11,6 +11,7 @@ use super::dto::{
     Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, SignatureHelpResult,
     SignatureInfo, SignatureParameter,
 };
+use super::routing::IndexingGate;
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
@@ -53,8 +54,9 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if `trigger` exceeds the maximum allowed length,
-    /// the LSP request fails, the file cannot be opened, or the routed
-    /// server does not advertise `completionProvider` support.
+    /// the LSP request fails, the file cannot be opened, the routed server
+    /// does not advertise `completionProvider` support, or the server is
+    /// still indexing the workspace (see `wait_for_indexing_ready`).
     pub async fn handle_completions(
         &self,
         file_path: String,
@@ -70,6 +72,7 @@ impl Translator {
                 ToolKind::Completions,
                 "completionProvider",
                 |caps| caps.completion_provider.is_some(),
+                IndexingGate::Required,
             )
             .await?;
         let lsp_position = self
@@ -141,6 +144,7 @@ impl Translator {
                 ToolKind::SignatureHelp,
                 "signatureHelpProvider",
                 |caps| caps.signature_help_provider.is_some(),
+                IndexingGate::NotRequired,
             )
             .await?;
         let lsp_position = self
@@ -231,6 +235,7 @@ impl Translator {
                         )
                     )
                 },
+                IndexingGate::NotRequired,
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
@@ -289,7 +294,10 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::fs;
+
     use super::*;
+    use crate::bridge::translator::testing::*;
 
     /// #309 M3: `trigger` has no cap of its own even though the LSP spec
     /// defines it as a single character.
@@ -308,5 +316,121 @@ mod tests {
     #[test]
     fn test_validate_completions_params_accepts_none() {
         assert!(validate_completions_params(None).is_ok());
+    }
+
+    /// End-to-end: `handle_completions` must surface
+    /// `Error::WorkspaceIndexing` -- not an empty result -- while the routed
+    /// server is still `Loading`, without reaching the fake LSP server.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_completions_returns_workspace_indexing_error_when_loading() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            completion_provider: Some(lsp_types::CompletionOptions::default()),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let err = translator
+            .handle_completions(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
+    }
+
+    /// Companion: when the cache reports `Ready`, `handle_completions` must
+    /// dispatch normally.
+    #[tokio::test]
+    async fn test_handle_completions_dispatches_when_indexing_ready() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            completion_provider: Some(lsp_types::CompletionOptions::default()),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_completions(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/completion");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([]),
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.items.is_empty());
     }
 }

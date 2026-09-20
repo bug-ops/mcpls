@@ -50,6 +50,22 @@ pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> 
     Err(Error::PathOutsideWorkspace(path.to_path_buf()))
 }
 
+/// Whether a [`Translator::prepare_gated_document`] call site also needs
+/// [`Translator::wait_for_indexing_ready`] applied, declared explicitly at
+/// the same place capability-gating is declared so a newly added (or newly
+/// gated) tool can't silently ship without an indexing-readiness decision
+/// either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexingGate {
+    /// This tool's answer depends on whole-workspace analysis (e.g. hover,
+    /// definition, references, rename, completions, code actions).
+    Required,
+    /// This tool's answer is valid even mid-index (single-file analysis),
+    /// or gating it is a deliberately separate open question (spec FR-008,
+    /// for `document_symbols`/`workspace_symbol_search`).
+    NotRequired,
+}
+
 impl Translator {
     /// Validate that a path is within allowed workspace boundaries.
     ///
@@ -234,23 +250,33 @@ impl Translator {
     /// Like [`Self::prepare_document`], but checks `capability` against the
     /// routed server's `ServerCapabilities` *before* opening the document --
     /// see [`Self::resolve_client_for_file`]'s doc comment for why the
-    /// ordering matters.
+    /// ordering matters. When `indexing_gate` is
+    /// [`IndexingGate::Required`], also waits for
+    /// [`Self::wait_for_indexing_ready`] before opening the document, so a
+    /// server still indexing never receives (or answers from) an opened
+    /// document it would otherwise be asked about.
     ///
     /// # Errors
     ///
     /// Returns [`Error::CapabilityNotSupported`] if the routed server's
-    /// `ServerCapabilities` explicitly does not advertise `capability`.
+    /// `ServerCapabilities` explicitly does not advertise `capability`, or
+    /// [`Error::WorkspaceIndexing`] if `indexing_gate` is
+    /// [`IndexingGate::Required`] and the server is still indexing.
     pub(super) async fn prepare_gated_document(
         &self,
         file_path: &str,
         tool: ToolKind,
         capability: &'static str,
         supported: impl FnOnce(&lsp_types::ServerCapabilities) -> bool,
+        indexing_gate: IndexingGate,
     ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
         self.require_capability(&server_id, capability, supported)?;
+        if indexing_gate == IndexingGate::Required {
+            self.wait_for_indexing_ready(&server_id).await?;
+        }
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &server_id, &client)
