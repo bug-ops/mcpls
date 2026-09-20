@@ -37,9 +37,10 @@ pub(super) struct EncodingCtx {
 /// correct than disk for any document mcpls has opened, since it is exactly
 /// the text the server was told about, so it can't diverge from the
 /// server's own view even if the file has since been edited on disk (see
-/// #290 S1). Only a document `tracker` has never seen falls through to an
-/// async disk read, matching `state.rs`'s `tokio::fs` convention so this
-/// never blocks the executor thread.
+/// #290 S1). Only a document `tracker` has never seen falls through to
+/// [`DocumentTracker::read_checked`], which applies the same
+/// `ResourceLimits::max_file_size` and regular-file gate as any tracked
+/// document's disk read (see #427) rather than an unbounded read.
 async fn read_line_text(
     uri: &lsp_types::Uri,
     line: u32,
@@ -49,7 +50,7 @@ async fn read_line_text(
     if let Some(text) = tracker.line_text(&path, line) {
         return Some(text);
     }
-    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    let content = tracker.read_checked(&path).await.ok()?;
     content.lines().nth(line as usize).map(str::to_string)
 }
 
@@ -187,6 +188,32 @@ mod tests {
         // "hé") must re-derive to that byte offset via the disk-read line
         // text, matching the `encoding.rs`-level math for the same input.
         assert_eq!(lsp_pos.character, 3);
+    }
+
+    /// Regression for #427: `read_line_text`'s disk-read fallback for a
+    /// document `tracker` has never seen must respect
+    /// `ResourceLimits::max_file_size`, not read the file unbounded. Without
+    /// the fix, a server-supplied path outside any tracked document (e.g. one
+    /// reached only through position-encoding conversion) could be read in
+    /// full regardless of size.
+    #[tokio::test]
+    async fn test_read_line_text_enforces_max_file_size_for_untracked_document() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.rs");
+        fs::write(&path, "a".repeat(200)).unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let tracker = DocumentTracker::new(
+            ResourceLimits {
+                max_documents: 100,
+                max_file_size: 50,
+            },
+            HashMap::new(),
+        );
+        assert!(
+            read_line_text(&uri, 0, &tracker).await.is_none(),
+            "must refuse to return content from a file over max_file_size"
+        );
     }
 
     /// C3/S1: when a document is tracked, `EncodingCtx` must prefer its

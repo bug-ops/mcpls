@@ -685,13 +685,104 @@ impl DocumentTracker {
         Ok(Decision::unchanged(uri, 1))
     }
 
-    /// Reads `path` through a single open file handle, checking its size
-    /// against [`Self::check_file_size`] using that same handle's metadata
-    /// rather than a separately-stat'd size. Reading and size-checking
-    /// through one handle closes the TOCTOU window where an atomic replace
-    /// (e.g. a concurrent `rename`) between an earlier `metadata()` call and
-    /// a path-based read could let an oversized file bypass the pre-read
-    /// size gate.
+    /// Opens `path` for reading and verifies, via that same open handle's
+    /// metadata, that it is a regular file within [`Self::check_file_size`]'s
+    /// limit -- never a separately-stat'd path, which would let an atomic
+    /// replace (e.g. a concurrent `rename`) between the check and the open
+    /// swap in something else entirely.
+    ///
+    /// On Unix the open itself uses `O_NONBLOCK`, which has no effect on
+    /// regular files but makes opening a FIFO (or other peer-waiting special
+    /// file) return immediately instead of blocking indefinitely for a
+    /// writer -- the file-type check below then rejects it. Without this,
+    /// a FIFO substituted for an expected regular file could hang the
+    /// calling task (and pin a blocking-pool thread) forever (see #418).
+    ///
+    /// **Known gap on non-Unix (e.g. Windows)**: there is no equivalent
+    /// non-blocking open used here, so a peer-waiting special file can still
+    /// hang this open indefinitely on those platforms; Windows' own
+    /// `FileType::is_file()` is also not a reliable rejection for every
+    /// special path (e.g. `CON`, `COM1`, `NUL`). The size bound in
+    /// [`Self::read_string_bounded`] still holds regardless, so the residual
+    /// risk there is a blocking hang, not unbounded memory use.
+    async fn open_checked(&self, path: &Path) -> Result<(fs::File, std::fs::Metadata)> {
+        #[cfg(unix)]
+        let opened = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .await;
+        #[cfg(not(unix))]
+        let opened = fs::File::open(path).await;
+
+        let file = opened.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let meta = file.metadata().await.map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        if !meta.is_file() {
+            return Err(Error::NotARegularFile(path.to_path_buf()));
+        }
+        self.check_file_size(meta.len())?;
+        Ok((file, meta))
+    }
+
+    /// Reads `file`'s content as UTF-8, bounded to one byte past
+    /// [`Self::check_file_size`]'s limit regardless of the already-checked
+    /// stat result -- defense in depth against the file growing between the
+    /// stat (in [`Self::open_checked`]) and this read completing (see #418).
+    /// A read that reaches the bound is reported as oversized even though
+    /// the earlier stat passed, since the file grew past what was verified.
+    ///
+    /// `size_hint` is the size [`Self::open_checked`] already observed via
+    /// `stat`, used only to preallocate the read buffer and avoid
+    /// reallocation growth on the common (non-racing) path -- it is never
+    /// trusted for the size check itself, which is always re-derived from
+    /// the bytes actually read.
+    async fn read_string_bounded(
+        &self,
+        path: &Path,
+        mut file: fs::File,
+        size_hint: u64,
+    ) -> Result<String> {
+        let max = self.limits.max_file_size;
+        let cap = if max == 0 {
+            u64::MAX
+        } else {
+            max.saturating_add(1)
+        };
+        let mut buf = Vec::with_capacity(usize::try_from(size_hint.min(cap)).unwrap_or(0));
+        let io_err = |e: std::io::Error| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        };
+
+        (&mut file)
+            .take(cap)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(io_err)?;
+        // Checked against the byte count before UTF-8 validation below, so a
+        // multibyte character split by the size bound is reported as
+        // oversized rather than as invalid UTF-8. Skipped when `max == 0`
+        // (unlimited): `cap` is `u64::MAX` in that case, so this could only
+        // ever fire on a practically unreachable file size.
+        if max != 0 && buf.len() as u64 > max {
+            return Err(Error::FileSizeLimitExceeded {
+                size: buf.len() as u64,
+                max,
+            });
+        }
+        String::from_utf8(buf)
+            .map_err(|e| io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+    }
+
+    /// Reads `path` through a single open file handle, checking its size and
+    /// type via [`Self::open_checked`] and bounding the read via
+    /// [`Self::read_string_bounded`].
     ///
     /// Returns the content along with the handle's own mtime and size, so
     /// callers can build a [`DiskSync`] snapshot consistent with what was
@@ -700,23 +791,26 @@ impl DocumentTracker {
         &self,
         path: &Path,
     ) -> Result<(String, Option<SystemTime>, u64)> {
-        let mut file = fs::File::open(path).await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        let meta = file.metadata().await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        self.check_file_size(meta.len())?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)
-            .await
-            .map_err(|e| Error::FileIo {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-        Ok((content, meta.modified().ok(), meta.len()))
+        let (file, meta) = self.open_checked(path).await?;
+        let mtime = meta.modified().ok();
+        let size = meta.len();
+        let content = self.read_string_bounded(path, file, size).await?;
+        Ok((content, mtime, size))
+    }
+
+    /// Reads `path`'s full content directly from disk, applying the same
+    /// regular-file and [`Self::check_file_size`] checks as a tracked
+    /// document's disk read (see [`Self::read_to_string_checked`]).
+    ///
+    /// For a document not tracked by this tracker at all -- e.g. one
+    /// resolved only for encoding-conversion purposes, never opened for LSP
+    /// sync -- there is otherwise no size or file-type gate on the path at
+    /// all (see #427). Callers that only need best-effort text (falling back
+    /// to `None` on any error) should treat every error here that way rather
+    /// than surfacing it.
+    pub(crate) async fn read_checked(&self, path: &Path) -> Result<String> {
+        let (file, meta) = self.open_checked(path).await?;
+        self.read_string_bounded(path, file, meta.len()).await
     }
 
     /// Per-server sync phase of `ensure_open`: sends `didOpen`, `didChange`,
@@ -2433,28 +2527,30 @@ mod tests {
     /// `ensure_open` for an unrelated path, even while the first call is
     /// stuck inside its own disk I/O.
     ///
-    /// Simulated with a FIFO rather than a timing assumption: opening it for
-    /// read blocks deterministically until a writer connects, so path A's
-    /// `ensure_open` is guaranteed to still be in progress when path B's
-    /// runs. Under the old design (a single lock spanning all of
-    /// `ensure_open`, including disk I/O), path B would hang until path A's
-    /// FIFO is unblocked below; the per-path lock added here must let it
-    /// through immediately instead.
-    #[cfg(unix)]
+    /// Path A's own `ensure_open` call is genuinely parked on path A's
+    /// per-path lock: `path_a_guard` (held via `lock_path`, the exact
+    /// primitive `ensure_open` acquires before its disk I/O) is taken first,
+    /// then a *real*, spawned `ensure_open(path_a)` call is raced against
+    /// it, so the serialization point under test is inside `ensure_open`
+    /// itself, not merely the standalone `lock_path` guard. Previously this
+    /// used a FIFO, whose `open()` for read blocked deterministically until
+    /// a writer connected; that is no longer usable for this purpose now
+    /// that `open_checked` opens with `O_NONBLOCK` and rejects non-regular
+    /// files immediately (see #418) -- a FIFO can no longer be coaxed into
+    /// blocking `ensure_open`'s `open()` call at all. Under the old design
+    /// (a single lock spanning all of `ensure_open`, including disk I/O),
+    /// path B would hang until path A's lock is released below; the
+    /// per-path lock added here must let it through immediately instead.
     #[tokio::test]
     async fn test_ensure_open_different_paths_do_not_serialize() {
         let dir = TempDir::new().unwrap();
         let path_a = dir.path().join("a.rs");
         let path_b = dir.path().join("b.rs");
 
+        std::fs::write(&path_a, "fn a() {}").unwrap();
         std::fs::write(&path_b, "fn b() {}").unwrap();
+        set_mtime(&path_a, settled_past());
         set_mtime(&path_b, settled_past());
-
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path_a)
-            .status()
-            .unwrap();
-        assert!(status.success(), "mkfifo must succeed to set up this test");
 
         let (client_a, _server_a) = fake_lsp_client();
         let (client_b, _server_b) = fake_lsp_client();
@@ -2463,8 +2559,11 @@ mod tests {
             HashMap::new(),
         ));
 
-        // Spawned so it can genuinely block on the FIFO's open() while the
-        // rest of this test proceeds concurrently on the same runtime.
+        let path_a_guard = tracker.lock_path(&path_a).await;
+
+        // Spawned so a real `ensure_open(path_a)` call is genuinely parked
+        // on path A's lock (held by `path_a_guard` above) while path B's
+        // call below runs.
         let tracker_for_a = Arc::clone(&tracker);
         let path_a_for_task = path_a.clone();
         let handle_a = tokio::spawn(async move {
@@ -2473,8 +2572,8 @@ mod tests {
                 .await
         });
 
-        // Give the spawned task a chance to actually reach the FIFO's
-        // blocking open() before racing it against path B below.
+        // Give the spawned task a chance to actually reach and block on
+        // path A's lock before racing path B's call against it below.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // A `timeout` error here means path B is blocked by path A's stuck
@@ -2487,15 +2586,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // Unblock A: opening the FIFO for writing lets its open() proceed,
-        // and closing the write end (at the end of this call) delivers EOF
-        // to the read it's waiting to finish.
-        let path_a_writer = path_a.clone();
-        tokio::task::spawn_blocking(move || {
-            std::fs::write(path_a_writer, "fn a() {}").unwrap();
-        })
-        .await
-        .unwrap();
+        drop(path_a_guard);
 
         handle_a.await.unwrap().unwrap();
         assert_eq!(tracker.get(&path_a).unwrap().content(), "fn a() {}");
@@ -2505,25 +2596,20 @@ mod tests {
     /// `ensure_open` for the *same* path via the shared per-path lock, not
     /// just against other `ensure_open` calls.
     ///
-    /// Uses the same FIFO-blocking idiom as
-    /// `test_ensure_open_different_paths_do_not_serialize`: opening a FIFO
-    /// for read blocks deterministically until a writer connects, so
-    /// `ensure_open`'s `disk_phase_new` (and, with it, the per-path lock
-    /// acquired by `ensure_open` before any disk I/O) is guaranteed to still
-    /// be held when `update` is attempted below. Before the #358 fix,
+    /// A real, spawned `ensure_open(path)` call is genuinely parked on the
+    /// path's lock (held via `lock_path`, the exact primitive `ensure_open`
+    /// acquires before its disk I/O) while `update` is raced against it --
+    /// see `test_ensure_open_different_paths_do_not_serialize` for why a
+    /// standalone `lock_path` guard alone is not enough, and for why this
+    /// replaced the previous FIFO-blocking idiom. Before the #358 fix,
     /// `update` took no per-path lock at all and would have raced straight
     /// through instead of blocking.
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_update_serializes_with_concurrent_ensure_open_same_path() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.rs");
-
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(status.success(), "mkfifo must succeed to set up this test");
+        std::fs::write(&path, "fn a() {}").unwrap();
+        set_mtime(&path, settled_past());
 
         let (client, _server) = fake_lsp_client();
         let tracker = Arc::new(DocumentTracker::new(
@@ -2531,8 +2617,11 @@ mod tests {
             HashMap::new(),
         ));
 
-        // Spawned so it can genuinely block on the FIFO's open() while the
-        // rest of this test proceeds concurrently on the same runtime.
+        let path_guard = tracker.lock_path(&path).await;
+
+        // Spawned so a real `ensure_open(path)` call is genuinely parked on
+        // the path's lock (held by `path_guard` above) while `update` is
+        // raced against it below.
         let tracker_for_open = Arc::clone(&tracker);
         let path_for_task = path.clone();
         let handle_open = tokio::spawn(async move {
@@ -2541,9 +2630,8 @@ mod tests {
                 .await
         });
 
-        // Give the spawned task a chance to actually reach the FIFO's
-        // blocking open() -- and, with it, acquire the per-path lock --
-        // before racing `update` against it below.
+        // Give the spawned task a chance to actually reach and block on the
+        // path's lock before racing `update` against it below.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // A successful (non-timeout) result here would mean `update` raced
@@ -2559,15 +2647,7 @@ mod tests {
             "update() must block while ensure_open holds the per-path lock for the same path"
         );
 
-        // Unblock `ensure_open`: opening the FIFO for writing lets its
-        // open() proceed, and closing the write end (at the end of this
-        // call) delivers EOF to the read it's waiting to finish.
-        let path_writer = path.clone();
-        tokio::task::spawn_blocking(move || {
-            std::fs::write(path_writer, "fn a() {}").unwrap();
-        })
-        .await
-        .unwrap();
+        drop(path_guard);
 
         handle_open.await.unwrap().unwrap();
         assert_eq!(tracker.get(&path).unwrap().content(), "fn a() {}");
@@ -2681,5 +2761,69 @@ mod tests {
              for every path has completed, otherwise the map grows \
              unbounded for the lifetime of the process"
         );
+    }
+
+    /// Regression for #418: `read_to_string_checked` must reject a FIFO
+    /// rather than trust its (always-zero) reported size and either hang
+    /// reading it or return an unbounded stream of bytes.
+    ///
+    /// Unlike `test_ensure_open_different_paths_do_not_serialize`'s use of
+    /// the same `mkfifo` idiom, this test needs no background writer and no
+    /// timeout race to prove non-blocking behavior: `open_checked`'s
+    /// `O_NONBLOCK` open is the fix under test, so a correct implementation
+    /// returns an error immediately, with no peer ever connecting. The
+    /// outer `timeout` is only a safety net so a regression here fails fast
+    /// instead of hanging the test suite.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_to_string_checked_rejects_fifo() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        // A timeout here means the fix failed and open() is still blocking
+        // indefinitely on the FIFO -- the exact regression #418 fixes.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tracker.read_to_string_checked(&path),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, Err(Error::NotARegularFile(_))));
+    }
+
+    /// Boundary regression for #427/#418's shared size gate: a file of
+    /// exactly `max_file_size` bytes must succeed through
+    /// `read_to_string_checked` (the disk-read path `ensure_open` uses),
+    /// and one byte more must fail as `FileSizeLimitExceeded` -- not just
+    /// "some file well over the limit is rejected".
+    #[tokio::test]
+    async fn test_read_to_string_checked_size_boundary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("boundary.rs");
+        let tracker = DocumentTracker::new(
+            ResourceLimits {
+                max_documents: 100,
+                max_file_size: 10,
+            },
+            HashMap::new(),
+        );
+
+        std::fs::write(&path, "a".repeat(10)).unwrap();
+        let (content, ..) = tracker.read_to_string_checked(&path).await.unwrap();
+        assert_eq!(content.len(), 10);
+
+        std::fs::write(&path, "a".repeat(11)).unwrap();
+        let result = tracker.read_to_string_checked(&path).await;
+        assert!(matches!(
+            result,
+            Err(Error::FileSizeLimitExceeded { size: 11, max: 10 })
+        ));
     }
 }
