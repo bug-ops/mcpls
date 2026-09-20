@@ -534,7 +534,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 /// Call `std::process::exit` right after this function resolves instead of
 /// returning normally from `main`, as in the example below (see mcpls's own
 /// `mcpls-cli` binary; tracked as #308). This does not apply to
-/// [`Transport::Http`], which never touches `tokio::io::stdin()`.
+/// `Transport::Http`, which never touches `tokio::io::stdin()`.
 ///
 /// # Examples
 ///
