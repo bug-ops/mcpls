@@ -26,17 +26,21 @@ pub(super) const MAX_RANGE_LINES: u32 = 10_000;
 ///
 /// # Errors
 ///
-/// Returns `Error::PathOutsideWorkspace` if the path is outside all workspace roots.
+/// Returns `Error::NoWorkspaceRoots` if `workspace_roots` is empty -- fails
+/// closed rather than allowing unrestricted access -- and
+/// `Error::PathOutsideWorkspace` if the path is outside all configured
+/// workspace roots.
 pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> Result<PathBuf> {
+    // Checked before canonicalizing so a rootless embedder can't use the
+    // canonicalize/FileIo error split to probe file existence.
+    if workspace_roots.is_empty() {
+        return Err(Error::NoWorkspaceRoots(path.to_path_buf()));
+    }
+
     let canonical = path.canonicalize().map_err(|e| Error::FileIo {
         path: path.to_path_buf(),
         source: e,
     })?;
-
-    // If no workspace roots configured, allow any path (backward compatibility)
-    if workspace_roots.is_empty() {
-        return Ok(canonical);
-    }
 
     // Check if path is within any workspace root
     for root in workspace_roots {
@@ -257,7 +261,9 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns `Error::PathOutsideWorkspace` if the path is outside all workspace roots.
+    /// Returns `Error::NoWorkspaceRoots` if no workspace roots are
+    /// configured (fails closed), or `Error::PathOutsideWorkspace` if the
+    /// path is outside all configured workspace roots.
     pub(crate) fn validate_path(&self, path: &Path) -> Result<PathBuf> {
         validate_path_against_roots(path, &self.workspace_roots)
     }
@@ -676,15 +682,15 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_path_no_workspace_roots() {
+    fn test_validate_path_no_workspace_roots_rejects_any_path() {
         let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        // With no workspace roots, any valid path should be accepted
+        // With no workspace roots configured, access is rejected (fail closed)
         let result = translator.validate_path(&test_file);
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(Error::NoWorkspaceRoots(_))));
     }
 
     #[test]
@@ -763,8 +769,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_file_uri_valid_scheme() {
-        let translator = Translator::new();
+        let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
+        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -781,8 +788,9 @@ mod tests {
     /// though the file exists. `parse_file_uri` must percent-decode first.
     #[tokio::test]
     async fn test_parse_file_uri_percent_decodes_space_and_non_ascii() {
-        let translator = Translator::new();
+        let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
+        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
         let test_file = temp_dir.path().join("my file café.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 

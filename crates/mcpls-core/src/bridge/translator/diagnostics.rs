@@ -414,8 +414,11 @@ mod tests {
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let cache_key =
-            Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
+        let cache_key = Translator::cached_diagnostics_uri(
+            &[temp_dir.path().to_path_buf()],
+            test_file.to_str().unwrap(),
+        )
+        .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
@@ -527,8 +530,11 @@ mod tests {
 
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
-        let cache_key =
-            Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
+        let cache_key = Translator::cached_diagnostics_uri(
+            &[temp_dir.path().to_path_buf()],
+            test_file.to_str().unwrap(),
+        )
+        .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
@@ -643,8 +649,11 @@ mod tests {
 
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), diagnostics);
 
-        let cache_key =
-            Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
+        let cache_key = Translator::cached_diagnostics_uri(
+            &[temp_dir.path().to_path_buf()],
+            test_file.to_str().unwrap(),
+        )
+        .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
@@ -704,8 +713,11 @@ mod tests {
 
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
-        let cache_key =
-            Translator::cached_diagnostics_uri(&[], test_file.to_str().unwrap()).unwrap();
+        let cache_key = Translator::cached_diagnostics_uri(
+            &[temp_dir.path().to_path_buf()],
+            test_file.to_str().unwrap(),
+        )
+        .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
@@ -719,7 +731,11 @@ mod tests {
 
     #[test]
     fn test_handle_cached_diagnostics_invalid_path() {
-        let result = Translator::cached_diagnostics_uri(&[], "/nonexistent/path/file.rs");
+        #[cfg(windows)]
+        let root = PathBuf::from(r"C:\");
+        #[cfg(not(windows))]
+        let root = PathBuf::from("/");
+        let result = Translator::cached_diagnostics_uri(&[root], "/nonexistent/path/file.rs");
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }
 

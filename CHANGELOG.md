@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accepted cost: for a server that emits per-request `$/progress` (e.g. gopls, pyright), every whole-workspace query landing within 3s after any of that server's `$/progress` `end` frames now waits out that settle window, not just queries during the initial workspace load — a deliberate trade-off to keep the multi-phase-load re-gating correct; bounded, and avoidable per server via `indexing = "disabled"`. (#433)
 - `LspClient` gained `notify_typed`, deriving the LSP method string from the notification's `lsp_types::Notification` type instead of a hand-picked string; the initialize/initialized/shutdown/exit handshake and document open/change notifications now go through the typed request/notification API. (#436)
 - Replaced the `&'static str` + closure pair used to gate MCP tool calls on LSP server capabilities with a single `Capability` enum, so the reported capability name and the check that verifies it can no longer drift apart. (#436)
+- Deduplicated `LspNotification::parse`'s four deserialize-or-fallback match arms into a shared helper, sourcing method-name constants from `lsp_types` instead of string literals (no behavior change). (#449)
 
 ### Fixed
 
@@ -37,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Disk reads now reject non-regular files (e.g. FIFOs, character/block devices) instead of trusting their reported size, closing a hang and size-limit bypass. (#418, #441)
 - A respawned LSP server now re-acquires workspace-indexing readiness on its own: the replacement process's lifecycle-lane notifications (`$/progress`, `experimental/serverStatus`) are wired into the shared notification cache instead of being drained and discarded, so it no longer stays stuck `Unknown`/fail-open until the whole mcpls process restarts. (#425)
 - `get_incoming_calls`/`get_outgoing_calls` now wait for the routed LSP server to finish its initial workspace indexing, closing a gap where these whole-workspace queries bypassed the indexing-readiness gate applied to `get_references` and the other whole-workspace tools. (#423)
+
+### Security
+
+- **Workspace-roots validation now fails closed** — Breaking change: the diagnostics pump and rename/code-action edit filtering previously allowed unrestricted access when no workspace roots were configured; both now reject with no unrestricted opt-in, so embedders must call `Translator::set_workspace_roots` with real roots before serving any path-taking request. (#449)
 
 ## [0.5.0] - 2026-09-06
 

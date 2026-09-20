@@ -74,12 +74,13 @@ pub use translator::{
 /// `serve_with`'s `workspace_roots_snapshot` both satisfy this via
 /// `resolve_workspace_roots`.
 ///
-/// An empty `workspace_roots` (no workspace configured) allows any URI,
-/// matching [`validate_path_against_roots`]'s "no roots = no restriction"
-/// behavior.
+/// An empty `workspace_roots` (no workspace configured) rejects every URI,
+/// matching [`validate_path_against_roots`]'s fail-closed
+/// `Error::NoWorkspaceRoots` behavior: without a configured root there is
+/// nothing to treat as authoritative, so no server-supplied URI is trusted.
 pub(crate) fn uri_in_workspace_roots(uri: &Uri, workspace_roots: &[PathBuf]) -> bool {
     if workspace_roots.is_empty() {
-        return true;
+        return false;
     }
     let Some(path) = uri_to_path(uri) else {
         return false;

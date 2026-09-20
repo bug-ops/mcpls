@@ -1081,9 +1081,21 @@ mod tests {
         project_config_ignored: bool,
         mcp: McpConfig,
     ) -> McplsServer {
+        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        create_test_server_with_workspace_roots(project_config_ignored, mcp, workspace_roots)
+    }
+
+    /// Like [`create_test_server_with_mcp_config`], for tests that exercise a
+    /// path-taking tool (e.g. `get_cached_diagnostics`) and so need a real
+    /// workspace root -- an empty one now makes `validate_path_against_roots`
+    /// fail closed with `Error::NoWorkspaceRoots`.
+    fn create_test_server_with_workspace_roots(
+        project_config_ignored: bool,
+        mcp: McpConfig,
+        workspace_roots: Arc<[PathBuf]>,
+    ) -> McplsServer {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         McplsServer::new(
             translator,
@@ -1093,6 +1105,23 @@ mod tests {
             project_config_ignored,
             mcp,
         )
+    }
+
+    /// A server with no LSP servers configured, backed by a real file under
+    /// a real workspace root -- so a path-taking tool call clears the
+    /// workspace-roots gate and exercises the "no server configured for this
+    /// language" handler error downstream of it, rather than stopping at the
+    /// gate itself with an unrelated `NoWorkspaceRoots`/`FileIo` error.
+    fn create_test_server_with_real_file() -> (McplsServer, tempfile::TempDir, PathBuf) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("file.rs");
+        std::fs::write(&test_file, "fn main() {}").unwrap();
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            Arc::from([temp_dir.path().to_path_buf()]),
+        );
+        (server, temp_dir, test_file)
     }
 
     #[tokio::test]
@@ -1182,23 +1211,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_hover_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: "/nonexistent/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
             line: 1,
             character: 1,
         });
 
-        // This should return an error (no LSP server configured)
+        // No LSP server is registered for any language on this test server,
+        // so this fails downstream of the workspace-roots gate with
+        // `Error::NoServerForLanguage`/`NoServerConfigured`.
         let result = server.get_hover(params).await;
         assert!(result.is_err());
     }
 
+    /// #417: the fail-closed `Error::NoWorkspaceRoots` path must propagate
+    /// correctly through a `#[tool]` handler's full error-mapping chain
+    /// (`to_tool_result`/`McpError::internal_error`), not just through the
+    /// lower-level `Translator::validate_path`/`validate_path_against_roots`
+    /// unit tests -- `create_test_server()` here deliberately keeps the
+    /// empty roots that `create_test_server_with_real_file()` (used by the
+    /// rest of this test group) sets up a real root to avoid.
     #[tokio::test]
-    async fn test_definition_tool_with_params() {
+    async fn test_hover_tool_with_params_no_workspace_roots() {
         let server = create_test_server();
         let params = Parameters(PositionParams {
             file_path: "/test/file.rs".to_string(),
+            line: 1,
+            character: 1,
+        });
+
+        let result = server.get_hover(params).await;
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("no workspace roots configured"),
+            "expected the NoWorkspaceRoots error to propagate through the tool handler, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_definition_tool_with_params() {
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
+        let params = Parameters(PositionParams {
+            file_path: test_file.to_str().unwrap().to_string(),
             line: 10,
             character: 5,
         });
@@ -1209,10 +1265,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_references_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(ReferencesParams {
             position: PositionParams {
-                file_path: "/test/file.rs".to_string(),
+                file_path: test_file.to_str().unwrap().to_string(),
                 line: 10,
                 character: 5,
             },
@@ -1225,9 +1281,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_diagnostics_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(DiagnosticsParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
         });
 
         let result = server.get_diagnostics(params).await;
@@ -1236,10 +1292,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_rename_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(RenameParams {
             position: PositionParams {
-                file_path: "/test/file.rs".to_string(),
+                file_path: test_file.to_str().unwrap().to_string(),
                 line: 10,
                 character: 5,
             },
@@ -1252,10 +1308,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_completions_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(CompletionsParams {
             position: PositionParams {
-                file_path: "/test/file.rs".to_string(),
+                file_path: test_file.to_str().unwrap().to_string(),
                 line: 10,
                 character: 5,
             },
@@ -1268,9 +1324,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_document_symbols_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(DocumentSymbolsParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
         });
 
         let result = server.get_document_symbols(params).await;
@@ -1279,9 +1335,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_format_document_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(FormatDocumentParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
             tab_size: 4,
             insert_spaces: true,
         });
@@ -1304,9 +1360,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_code_actions_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(CodeActionsParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
             range: RangeParams {
                 start_line: 10,
                 start_character: 5,
@@ -1321,9 +1377,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_call_hierarchy_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
             line: 10,
             character: 5,
         });
@@ -1333,11 +1389,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_incoming_calls_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
+        let uri = url::Url::from_file_path(&test_file).unwrap().to_string();
         let item = serde_json::json!({
             "name": "test_function",
             "kind": 12,
-            "uri": "file:///test/file.rs",
+            "uri": uri,
             "range": {
                 "start": {"line": 0, "character": 0},
                 "end": {"line": 0, "character": 10}
@@ -1354,11 +1411,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_outgoing_calls_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
+        let uri = url::Url::from_file_path(&test_file).unwrap().to_string();
         let item = serde_json::json!({
             "name": "test_function",
             "kind": 12,
-            "uri": "file:///test/file.rs",
+            "uri": uri,
             "range": {
                 "start": {"line": 0, "character": 0},
                 "end": {"line": 0, "character": 10}
@@ -1379,11 +1437,15 @@ mod tests {
 
         use tempfile::TempDir;
 
-        let server = create_test_server();
-
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
+
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            Arc::from([temp_dir.path().to_path_buf()]),
+        );
 
         let params = Parameters(CachedDiagnosticsParams {
             file_path: test_file.to_str().unwrap().to_string(),
@@ -1410,13 +1472,17 @@ mod tests {
         use tempfile::TempDir;
         use url::Url;
 
-        let server = create_test_server();
-
         let temp_dir = TempDir::new().unwrap();
         let subdir = temp_dir.path().join("sub");
         fs::create_dir(&subdir).unwrap();
         let test_file = subdir.join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
+
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            Arc::from([temp_dir.path().to_path_buf()]),
+        );
 
         let canonical_path = test_file.canonicalize().unwrap();
         let uri: lsp_types::Uri =
@@ -1482,7 +1548,15 @@ mod tests {
         use tempfile::TempDir;
         use url::Url;
 
-        let server = create_test_server();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "héllo").unwrap();
+
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            Arc::from([temp_dir.path().to_path_buf()]),
+        );
         let owner = crate::config::ServerId::from("rust");
         server.context.translator.register_server(
             owner.clone(),
@@ -1491,10 +1565,6 @@ mod tests {
                 lsp_types::PositionEncodingKind::UTF8,
             ),
         );
-
-        let temp_dir = TempDir::new().unwrap();
-        let test_file = temp_dir.path().join("test.rs");
-        fs::write(&test_file, "héllo").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
         let uri: lsp_types::Uri =
@@ -1551,13 +1621,17 @@ mod tests {
         use tempfile::TempDir;
         use url::Url;
 
-        let server = create_test_server();
-        // Deliberately not registered with `translator.register_server`.
-        let owner = crate::config::ServerId::from("rust");
-
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "héllo").unwrap();
+
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            Arc::from([temp_dir.path().to_path_buf()]),
+        );
+        // Deliberately not registered with `translator.register_server`.
+        let owner = crate::config::ServerId::from("rust");
 
         let canonical_path = test_file.canonicalize().unwrap();
         let uri: lsp_types::Uri =
@@ -1631,18 +1705,18 @@ mod tests {
                 .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from(Vec::new()),
+            Arc::from([temp_dir.path().to_path_buf()]),
             Arc::new(ResourceSubscriptions::new()),
             false,
             McpConfig::default(),
         );
-
-        let temp_dir = TempDir::new().unwrap();
-        let test_file = temp_dir.path().join("test.rs");
-        fs::write(&test_file, "fn main() {}").unwrap();
 
         let canonical_path = test_file.canonicalize().unwrap();
         let uri: lsp_types::Uri =
@@ -1742,7 +1816,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(Vec::new()),
+            Arc::from([dir.path().to_path_buf()]),
             Arc::new(ResourceSubscriptions::new()),
             false,
             McpConfig::default(),
@@ -1788,11 +1862,15 @@ sleep 0.3
     async fn test_cached_diagnostics_tool_reports_not_degraded_by_default() {
         use tempfile::TempDir;
 
-        let server = create_test_server();
-
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         std::fs::write(&test_file, "fn main() {}").unwrap();
+
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            Arc::from([temp_dir.path().to_path_buf()]),
+        );
 
         let params = Parameters(CachedDiagnosticsParams {
             file_path: test_file.to_str().unwrap().to_string(),
@@ -1807,13 +1885,23 @@ sleep 0.3
 
     #[tokio::test]
     async fn test_cached_diagnostics_tool_nonexistent_file() {
-        let server = create_test_server();
+        #[cfg(windows)]
+        let root = PathBuf::from(r"C:\");
+        #[cfg(not(windows))]
+        let root = PathBuf::from("/");
+        let server =
+            create_test_server_with_workspace_roots(false, McpConfig::default(), Arc::from([root]));
         let params = Parameters(CachedDiagnosticsParams {
             file_path: "/nonexistent/file.rs".to_string(),
         });
 
         let result = server.get_cached_diagnostics(params).await;
-        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("file I/O error"),
+            "expected a file I/O error for a nonexistent path, got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -1966,9 +2054,9 @@ sleep 0.3
 
     #[tokio::test]
     async fn test_get_signature_help_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
             line: 10,
             character: 5,
         });
@@ -1979,9 +2067,9 @@ sleep 0.3
 
     #[tokio::test]
     async fn test_go_to_implementation_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
             line: 10,
             character: 5,
         });
@@ -1992,9 +2080,9 @@ sleep 0.3
 
     #[tokio::test]
     async fn test_go_to_type_definition_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
             line: 10,
             character: 5,
         });
@@ -2005,9 +2093,9 @@ sleep 0.3
 
     #[tokio::test]
     async fn test_get_inlay_hints_tool_with_params() {
-        let server = create_test_server();
+        let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(InlayHintsParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: test_file.to_str().unwrap().to_string(),
             range: RangeParams {
                 start_line: 1,
                 start_character: 1,
@@ -2444,7 +2532,7 @@ sleep 0.3
         let noncanonical = link_dir.join("test.rs");
         assert_ne!(noncanonical, test_file);
 
-        let validated = validate_path_against_roots(&noncanonical, &[]).unwrap();
+        let validated = validate_path_against_roots(&noncanonical, &[base]).unwrap();
         assert_eq!(validated, test_file.canonicalize().unwrap());
 
         let uri_from_raw_path = crate::bridge::path_to_uri(&noncanonical).unwrap();
@@ -2461,9 +2549,15 @@ sleep 0.3
     async fn test_validate_path_rejects_nonexistent_path() {
         use std::path::Path;
 
-        let translator = Translator::new();
+        use crate::error::Error;
+
+        let mut translator = Translator::new();
+        #[cfg(windows)]
+        translator.set_workspace_roots(vec![PathBuf::from(r"C:\")]);
+        #[cfg(not(windows))]
+        translator.set_workspace_roots(vec![PathBuf::from("/")]);
         let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::FileIo { .. })));
     }
 
     /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
