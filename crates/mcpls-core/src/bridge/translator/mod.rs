@@ -130,6 +130,11 @@ pub struct Translator {
     /// [`Self::with_clock`] in tests so backoff-window tests can advance
     /// time deterministically instead of sleeping in real time.
     clock: Arc<dyn Clock>,
+    /// Bound `Self::wait_for_indexing_ready` waits for a routed server to
+    /// report indexing readiness. Defaults to `navigation::INDEXING_READY_TIMEOUT`;
+    /// overridable via [`Self::with_indexing_ready_timeout`], wired from
+    /// `workspace.indexing_ready_timeout_seconds` in `mcpls.toml` (#424).
+    indexing_ready_timeout: std::time::Duration,
 }
 
 /// Upper bound on how long [`Translator::shutdown_servers`] waits for a
@@ -167,6 +172,7 @@ impl Translator {
             notification_cache: None,
             lifecycle_forwarders: Arc::new(StdMutex::new(HashMap::new())),
             clock: Arc::new(SystemClock),
+            indexing_ready_timeout: navigation::INDEXING_READY_TIMEOUT,
         }
     }
 
@@ -204,6 +210,20 @@ impl Translator {
     #[must_use]
     pub fn with_notification_cache(mut self, cache: Arc<Mutex<NotificationCache>>) -> Self {
         self.notification_cache = Some(cache);
+        self
+    }
+
+    /// Override the bound `Self::wait_for_indexing_ready` waits for a routed
+    /// server to report indexing readiness, in place of the built-in
+    /// `navigation::INDEXING_READY_TIMEOUT` default.
+    ///
+    /// Only called during single-owner setup (mirrors [`Self::with_notification_cache`]),
+    /// before the translator is shared. `serve()` wires this from
+    /// `workspace.indexing_ready_timeout_seconds`, already range-checked by
+    /// [`crate::config::ServerConfig::validate`].
+    #[must_use]
+    pub const fn with_indexing_ready_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.indexing_ready_timeout = timeout;
         self
     }
 

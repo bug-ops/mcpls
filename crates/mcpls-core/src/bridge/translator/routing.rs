@@ -70,9 +70,20 @@ pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> 
 ///   FR-008) and remains a known, deliberate limitation -- see #423.
 /// - `handle_diagnostics` calls the ungated `Translator::prepare_document`
 ///   sibling directly, so it gets neither an indexing-readiness decision nor
-///   a capability check. Whether a mid-index diagnostics pull (which can
-///   read as "no errors" while rust-analyzer is still loading) should be
-///   gated is an open question, not yet tracked as its own issue.
+///   a capability check. The indexing-readiness half of that is deliberate,
+///   not an oversight (#445): unlike `handle_incoming_calls`/`handle_outgoing_calls`
+///   (#423), it reads from the notification-cache poll path rather than
+///   issuing a live whole-workspace LSP request, so blocking it on
+///   `wait_for_indexing_ready` the way `Required` does for the other
+///   handlers would be the wrong fix shape (it would stall a cache read on a
+///   signal the cache itself doesn't need). Instead, the `get_diagnostics`
+///   MCP tool (`mcp::server::get_diagnostics`) independently resolves the
+///   file's diagnostics-route server and reports its indexing state as an
+///   explicit `indexingInProgress` flag on the response
+///   (`mcp::server::DiagnosticsResponse`), so a mid-index pull (which can
+///   read as "no errors" while rust-analyzer is still loading) is flagged
+///   rather than silently trusted. The missing capability check was not
+///   analyzed as part of #445 and remains an open question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IndexingGate {
     /// This tool's answer depends on whole-workspace analysis (e.g. hover,
@@ -1010,6 +1021,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_serve_initializes_translator_with_extensions() {
+        use crate::bridge::indexing::DEFAULT_INDEXING_READY_TIMEOUT_SECS;
         use crate::bridge::state::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
         use crate::config::{LanguageExtensionMapping, WorkspaceConfig};
 
@@ -1033,6 +1045,7 @@ mod tests {
                 heuristics_max_depth: 10,
                 max_documents: DEFAULT_MAX_DOCUMENTS,
                 max_file_size: DEFAULT_MAX_FILE_SIZE,
+                indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
             },
             lsp_servers: vec![],
             project_config_ignored: false,

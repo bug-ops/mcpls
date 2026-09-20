@@ -280,7 +280,7 @@
   {
     "name": "get_diagnostics",
     "title": "Diagnostics",
-    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location.",
+    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexingInProgress: true` means the routed server was indexing at some point during this read, so results may be incomplete.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -400,10 +400,15 @@
             "$ref": "#/$defs/Diagnostic"
           },
           "type": "array"
+        },
+        "indexingInProgress": {
+          "description": "`true` if the file's diagnostics-route server (resolved via\n[`Translator::diagnostics_route_id_for_path`]) had an active signal\nindicating its initial workspace-load/indexing phase was still in\nprogress at any point during this read -- the returned diagnostics\nmay reflect a partial index. Sampled both before and after the pull\nrequest (see `McplsServer::get_diagnostics`), not just at one point\nin time, so a server that was `Loading` mid-pull but finished by the\ntime the pull settled still reads `true` here. `false` both when the\nserver was done indexing for the whole read (or never reported a\nreadiness signal) and when no route is configured for the file's\nlanguage at all.",
+          "type": "boolean"
         }
       },
       "required": [
-        "diagnostics"
+        "diagnostics",
+        "indexingInProgress"
       ],
       "type": "object"
     },
