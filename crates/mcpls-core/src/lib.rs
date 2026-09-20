@@ -785,7 +785,11 @@ async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
 /// of the enclosing scope — unlike a bare `.abort()` call placed at the end
 /// of a function body, which is skipped if that scope is left early (a
 /// panic, or a future `?` added above it).
-struct AbortOnDrop<'a, T>(&'a JoinHandle<T>);
+///
+/// `pub(crate)` (and its field along with it): also used by
+/// [`crate::lsp::client`]'s message loop to abort its background reader task
+/// (#451) -- see that module for the other caller.
+pub(crate) struct AbortOnDrop<'a, T>(pub(crate) &'a JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<'_, T> {
     fn drop(&mut self) {

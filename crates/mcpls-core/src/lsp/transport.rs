@@ -21,20 +21,24 @@ use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, Jso
 /// Maximum allowed Content-Length (10 MB)
 const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
 
-/// LSP transport layer handling header-content format.
+/// Write half of the LSP transport, handling the header-content format for
+/// outbound messages.
 ///
-/// This transport handles the LSP protocol's header-content message format,
-/// parsing Content-Length headers and reading exact message content.
-///
-/// Boxes its reader/writer as trait objects rather than carrying them as
-/// type parameters: [`Self::new`] accepts any `AsyncWrite`/`AsyncRead` pair
-/// (a spawned LSP server's `ChildStdin`/`ChildStdout` in production, an
+/// Boxes its writer as a trait object rather than carrying it as a type
+/// parameter: [`Self::new`] accepts any `AsyncWrite`/`AsyncRead` pair (a
+/// spawned LSP server's `ChildStdin`/`ChildStdout` in production, an
 /// in-memory `tokio::io::duplex` pipe in tests -- see `crate::test_lsp`),
 /// so `LspClient` and `LspServer` don't need to become generic over the
 /// underlying transport just to support both.
+///
+/// Split from the read half ([`LspTransportReader`]) by [`Self::new`]: the
+/// read side must be driven exclusively by a dedicated background task
+/// (see `lsp::client::spawn_reader_task` -- a private free function, not an
+/// intra-doc link here since it isn't part of the public API), never raced
+/// inside a `tokio::select!` alongside outbound sends -- see
+/// [`LspTransportReader`] for why.
 pub struct LspTransport {
     stdin: Box<dyn AsyncWrite + Unpin + Send>,
-    stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
 }
 
 impl fmt::Debug for LspTransport {
@@ -43,8 +47,48 @@ impl fmt::Debug for LspTransport {
     }
 }
 
+/// Read half of the LSP transport, handling the header-content format for
+/// inbound messages.
+///
+/// Not cancel-safe: [`Self::receive`] reads headers and content into local
+/// buffers across multiple `.await` points, and dropping it mid-read
+/// discards those buffers while the underlying `BufReader` has already
+/// consumed the corresponding bytes from the pipe -- permanently
+/// desynchronizing the Content-Length-framed stream (#451). Callers must
+/// drive it from a task of its own that owns it exclusively and is never
+/// raced in a `tokio::select!` against another branch; see
+/// `lsp::client::spawn_reader_task`, the only production caller.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::lsp::LspTransport;
+///
+/// tokio::runtime::Runtime::new().unwrap().block_on(async {
+///     let (mut writer, mut reader) = LspTransport::new(tokio::io::sink(), tokio::io::empty());
+///     writer
+///         .send(&serde_json::json!({"jsonrpc": "2.0", "method": "exit"}))
+///         .await
+///         .unwrap();
+///
+///     // An empty `stdout` yields EOF immediately, which `receive` reports
+///     // as `Error::ServerTerminated` rather than hanging.
+///     assert!(reader.receive().await.is_err());
+/// });
+/// ```
+pub struct LspTransportReader {
+    stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+}
+
+impl fmt::Debug for LspTransportReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LspTransportReader").finish_non_exhaustive()
+    }
+}
+
 impl LspTransport {
-    /// Create a transport from a reader/writer pair.
+    /// Create a transport from a reader/writer pair, split into its write
+    /// half (this type) and its read half ([`LspTransportReader`]).
     ///
     /// # Arguments
     ///
@@ -56,11 +100,15 @@ impl LspTransport {
     pub fn new(
         stdin: impl AsyncWrite + Unpin + Send + 'static,
         stdout: impl AsyncRead + Unpin + Send + 'static,
-    ) -> Self {
-        Self {
-            stdin: Box::new(stdin),
-            stdout: BufReader::new(Box::new(stdout)),
-        }
+    ) -> (Self, LspTransportReader) {
+        (
+            Self {
+                stdin: Box::new(stdin),
+            },
+            LspTransportReader {
+                stdout: BufReader::new(Box::new(stdout)),
+            },
+        )
     }
 
     /// Send message to LSP server.
@@ -86,7 +134,9 @@ impl LspTransport {
 
         Ok(())
     }
+}
 
+impl LspTransportReader {
     /// Receive next message from LSP server.
     ///
     /// Reads headers, extracts Content-Length, reads exact message content,

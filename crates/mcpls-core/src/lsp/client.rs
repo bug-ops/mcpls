@@ -15,7 +15,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
-use crate::lsp::transport::LspTransport;
+use crate::lsp::transport::{LspTransport, LspTransportReader};
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     LspNotification, RequestId,
@@ -32,6 +32,28 @@ const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
 
 /// Initial backoff delay for server-cancelled retries (milliseconds).
 const SERVER_CANCELLED_INITIAL_DELAY_MS: u64 = 500;
+
+/// Bounded capacity for the channel carrying fully-decoded inbound LSP
+/// messages from [`spawn_reader_task`]'s background task to
+/// [`LspClient::message_loop_inner`].
+///
+/// Backpressured (`send().await`, not `try_send`) unlike the best-effort
+/// notification/lifecycle lanes: dropping a frame here would desync
+/// request/response correlation or silently swallow a server-initiated
+/// request. Matches the command channel's capacity -- both lanes carry
+/// protocol-critical traffic at a similar cadence.
+const READER_CHANNEL_CAPACITY: usize = 100;
+
+/// How long [`LspClient::message_loop`] waits, after aborting the reader
+/// task it no longer drains, for that task to actually finish dropping its
+/// [`LspTransportReader`] (and the `ChildStdout` it owns).
+///
+/// `abort()` only requests cancellation -- the task's locals are dropped
+/// once the runtime next polls it, not synchronously at the call site.
+/// Mirrors `await_lsp_init_handle`'s reasoning in `crate::lib` for the same
+/// pattern. Short: the task is either already parked in a cancel-safe
+/// `.await` (aborts promptly) or has nothing left to do.
+const READER_TASK_ABORT_GRACE: Duration = Duration::from_secs(1);
 
 /// LSP request methods for which a `-32801` (`ContentModified`) error
 /// response is safe to retry automatically -- also declared to servers via
@@ -116,6 +138,41 @@ const CODE_ACTION_RESOLVE_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
+
+/// Spawns the dedicated background task that owns `reader` exclusively and
+/// decodes inbound LSP frames in a loop, handing each one to
+/// [`LspClient::message_loop_inner`] over the returned channel.
+///
+/// This is the fix for #451: [`LspTransportReader::receive`] is not
+/// cancel-safe, so it must never run as a branch of the `select!` in
+/// `message_loop_inner`, which also waits on `command_rx`. Running it here
+/// instead, on a task driven only by its own `.await`s, means it can never
+/// be cancelled mid-frame.
+///
+/// The task exits after sending one `Err` (I/O failure or EOF), once
+/// `message_loop_inner` drops its end of the channel (e.g. on shutdown), or
+/// when the returned [`JoinHandle`] is aborted. Callers must abort it once
+/// they stop draining the channel -- see [`LspClient::message_loop`], the
+/// only caller -- otherwise it stays parked in a blocking read holding the
+/// underlying `ChildStdout` open indefinitely: not itself a correctness bug
+/// (`has_exited()`, lifecycle.rs, checks the child process directly via
+/// `try_wait()` and doesn't care whether we still hold its stdout open), but
+/// a leaked task and file descriptor for the lifetime of that connection.
+fn spawn_reader_task(
+    mut reader: LspTransportReader,
+) -> (JoinHandle<()>, mpsc::Receiver<Result<InboundMessage>>) {
+    let (tx, rx) = mpsc::channel(READER_CHANNEL_CAPACITY);
+    let handle = tokio::spawn(async move {
+        loop {
+            let message = reader.receive().await;
+            let is_err = message.is_err();
+            if tx.send(message).await.is_err() || is_err {
+                break;
+            }
+        }
+    });
+    (handle, rx)
+}
 
 /// LSP client with async request/response handling.
 ///
@@ -207,7 +264,10 @@ impl LspClient {
     ///
     /// This method initializes the background message loop with the provided transport.
     #[cfg(test)]
-    pub(crate) fn from_transport(config: LspServerConfig, transport: LspTransport) -> Self {
+    pub(crate) fn from_transport(
+        config: LspServerConfig,
+        transport: (LspTransport, LspTransportReader),
+    ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
@@ -242,7 +302,7 @@ impl LspClient {
     /// enqueued on either lane -- see [`Self::message_loop_inner`].
     pub(crate) fn from_transport_with_notifications(
         config: LspServerConfig,
-        transport: LspTransport,
+        transport: (LspTransport, LspTransportReader),
         notification_tx: mpsc::Sender<LspNotification>,
         lifecycle_tx: mpsc::Sender<LspNotification>,
     ) -> Self {
@@ -689,21 +749,29 @@ impl LspClient {
     /// - Inbound responses and server notifications
     /// - Matching responses to pending requests
     async fn message_loop(
-        mut transport: LspTransport,
+        transport: (LspTransport, LspTransportReader),
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<mpsc::Sender<LspNotification>>,
     ) -> Result<()> {
         debug!("Message loop started");
-        let result = Self::message_loop_inner(
-            &mut transport,
-            &mut command_rx,
-            &pending_requests,
-            notification_tx.as_ref(),
-            lifecycle_tx.as_ref(),
-        )
-        .await;
+        let (mut transport, reader) = transport;
+        let (reader_handle, mut msg_rx) = spawn_reader_task(reader);
+        let result = {
+            // Aborts the reader task the instant `message_loop_inner` returns, even via `?` (#451).
+            let _abort_reader_on_drop = crate::AbortOnDrop(&reader_handle);
+            Self::message_loop_inner(
+                &mut transport,
+                &mut msg_rx,
+                &mut command_rx,
+                &pending_requests,
+                notification_tx.as_ref(),
+                lifecycle_tx.as_ref(),
+            )
+            .await
+        };
+        let _ = timeout(READER_TASK_ABORT_GRACE, reader_handle).await;
         if let Err(ref e) = result {
             error!("Message loop exiting with error: {}", e);
         } else {
@@ -778,6 +846,7 @@ impl LspClient {
     #[allow(clippy::too_many_lines)]
     async fn message_loop_inner(
         transport: &mut LspTransport,
+        msg_rx: &mut mpsc::Receiver<Result<InboundMessage>>,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
@@ -801,107 +870,161 @@ impl LspClient {
                         }
                         ClientCommand::Shutdown => {
                             debug!("Client shutdown requested");
+                            // The reader task can run ahead of us (#451): drain whatever it
+                            // already queued instead of dropping it, or a response to a
+                            // concurrent caller's in-flight request would be silently lost.
+                            while let Ok(message) = msg_rx.try_recv() {
+                                match message {
+                                    Ok(m) => {
+                                        Self::handle_inbound_message(
+                                            transport,
+                                            m,
+                                            pending_requests,
+                                            notification_tx,
+                                            lifecycle_tx,
+                                        )
+                                        .await?;
+                                    }
+                                    Err(e) => {
+                                        error!("Transport receive error while draining on shutdown: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
                             break;
                         }
                     }
                 }
 
-                message = transport.receive() => {
+                // Cancel-safe, unlike the `transport.receive()` this replaces (#451): reading itself happens off this `select!`.
+                message = msg_rx.recv() => {
                     let message = match message {
-                        Ok(m) => m,
-                        Err(e) => {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => {
                             error!("Transport receive error: {}", e);
                             return Err(e);
                         }
+                        None => {
+                            // Reader task only exits after sending an `Err`, so this means it panicked.
+                            error!("Transport receive error: reader task ended unexpectedly");
+                            return Err(Error::ServerTerminated);
+                        }
                     };
-                    match message {
-                        InboundMessage::Response(response) => {
-                            trace!("Received response: id={:?}", response.id);
+                    Self::handle_inbound_message(
+                        transport,
+                        message,
+                        pending_requests,
+                        notification_tx,
+                        lifecycle_tx,
+                    )
+                    .await?;
+                }
+            }
+        }
 
-                            let sender = pending_requests.lock().await.remove(&response.id);
+        Ok(())
+    }
 
-                            if let Some(sender) = sender {
-                                if let Some(error) = response.error {
-                                    // Deliberately not logged at `error!` here: this fires
-                                    // for every attempt, before `LspClient::request`'s retry
-                                    // loop knows whether the error is transient and about to
-                                    // be retried (-32802, or -32801 for an allowlisted
-                                    // method). Logging unconditionally at this point would
-                                    // emit a spurious ERROR line for errors that are retried
-                                    // and succeed. `request` logs at `warn!` on retry and
-                                    // `error!` once the error is actually surfaced to the
-                                    // caller (retry exhaustion or a non-retryable error);
-                                    // the response id is already traced above.
-                                    trace!(
-                                        "LSP error response: {} (code {})",
-                                        Self::truncate_error_message_for_log(&error.message),
-                                        error.code
-                                    );
-                                    // Truncated separately from the log line, to the larger
-                                    // MAX_ERROR_MESSAGE_CALLER_BYTES -- the raw message is
-                                    // unbounded and attacker-influenceable (#313), but a
-                                    // log-line-sized cut would also clip legitimate long
-                                    // errors before the model ever sees them (S2).
-                                    let caller_message = crate::util::truncate_str(
-                                        &error.message,
-                                        MAX_ERROR_MESSAGE_CALLER_BYTES,
-                                    );
-                                    let _ = sender.send(Err(Error::LspServerError {
-                                        code: error.code,
-                                        message: caller_message,
-                                        data: error.data,
-                                    }));
-                                } else if let Some(result) = response.result {
-                                    let _ = sender.send(Ok(result));
-                                } else {
-                                    // LSP spec allows null result for some requests (e.g., hover with no info).
-                                    // Treat as successful response with null value.
-                                    trace!("Response with null result: {:?}", response.id);
-                                    let _ = sender.send(Ok(Value::Null));
-                                }
-                            } else {
-                                warn!("Received response for unknown request ID: {:?}", response.id);
-                            }
-                        }
-                        InboundMessage::Request(request) => {
-                            debug!(
-                                "Received server request: {} (id={:?})",
-                                request.method, request.id
-                            );
-                            let response = Self::server_request_response(request);
-                            let value = serde_json::to_value(&response)?;
-                            transport.send(&value).await?;
-                        }
-                        InboundMessage::Notification(notification) => {
-                            debug!("Received notification: {}", notification.method);
+    /// Processes one fully-decoded inbound LSP message: resolves a matching
+    /// pending request, answers a server-initiated request, or forwards a
+    /// notification to its lane. Shared by `message_loop_inner`'s normal
+    /// `msg_rx.recv()` branch and its `Shutdown` drain, so a message handled
+    /// during either path behaves identically.
+    async fn handle_inbound_message(
+        transport: &mut LspTransport,
+        message: InboundMessage,
+        pending_requests: &Arc<Mutex<PendingRequests>>,
+        notification_tx: Option<&mpsc::Sender<LspNotification>>,
+        lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
+    ) -> Result<()> {
+        match message {
+            InboundMessage::Response(response) => {
+                trace!("Received response: id={:?}", response.id);
 
-                            // Parse notification into typed variant
-                            let typed = LspNotification::parse(&notification.method, notification.params);
+                let sender = pending_requests.lock().await.remove(&response.id);
 
-                            let destination = Self::notification_lane(&typed, notification_tx, lifecycle_tx);
+                if let Some(sender) = sender {
+                    if let Some(error) = response.error {
+                        // Deliberately not logged at `error!` here: this fires
+                        // for every attempt, before `LspClient::request`'s retry
+                        // loop knows whether the error is transient and about to
+                        // be retried (-32802, or -32801 for an allowlisted
+                        // method). Logging unconditionally at this point would
+                        // emit a spurious ERROR line for errors that are retried
+                        // and succeed. `request` logs at `warn!` on retry and
+                        // `error!` once the error is actually surfaced to the
+                        // caller (retry exhaustion or a non-retryable error);
+                        // the response id is already traced above.
+                        trace!(
+                            "LSP error response: {} (code {})",
+                            Self::truncate_error_message_for_log(&error.message),
+                            error.code
+                        );
+                        // Truncated separately from the log line, to the larger
+                        // MAX_ERROR_MESSAGE_CALLER_BYTES -- the raw message is
+                        // unbounded and attacker-influenceable (#313), but a
+                        // log-line-sized cut would also clip legitimate long
+                        // errors before the model ever sees them (S2).
+                        let caller_message = crate::util::truncate_str(
+                            &error.message,
+                            MAX_ERROR_MESSAGE_CALLER_BYTES,
+                        );
+                        let _ = sender.send(Err(Error::LspServerError {
+                            code: error.code,
+                            message: caller_message,
+                            data: error.data,
+                        }));
+                    } else if let Some(result) = response.result {
+                        let _ = sender.send(Ok(result));
+                    } else {
+                        // LSP spec allows null result for some requests (e.g., hover with no info).
+                        // Treat as successful response with null value.
+                        trace!("Response with null result: {:?}", response.id);
+                        let _ = sender.send(Ok(Value::Null));
+                    }
+                } else {
+                    warn!(
+                        "Received response for unknown request ID: {:?}",
+                        response.id
+                    );
+                }
+            }
+            InboundMessage::Request(request) => {
+                debug!(
+                    "Received server request: {} (id={:?})",
+                    request.method, request.id
+                );
+                let response = Self::server_request_response(request);
+                let value = serde_json::to_value(&response)?;
+                transport.send(&value).await?;
+            }
+            InboundMessage::Notification(notification) => {
+                debug!("Received notification: {}", notification.method);
 
-                            if let Some((lane, tx)) = destination {
-                                // Log diagnostics count since it's useful for debugging
-                                if let LspNotification::PublishDiagnostics(ref params) = typed {
-                                    debug!(
-                                        "Forwarding diagnostics for {}: {} items",
-                                        params.uri.as_ref(),
-                                        params.diagnostics.len()
-                                    );
-                                } else {
-                                    trace!("Forwarding notification: {:?}", typed);
-                                }
+                // Parse notification into typed variant
+                let typed = LspNotification::parse(&notification.method, notification.params);
 
-                                // Names lane and method -- the only diagnostic for a dropped frame.
-                                if tx.try_send(typed).is_err() {
-                                    warn!(
-                                        "Dropping notification: lane={lane}, method={} \
-                                         (channel full or closed)",
-                                        notification.method
-                                    );
-                                }
-                            }
-                        }
+                let destination = Self::notification_lane(&typed, notification_tx, lifecycle_tx);
+
+                if let Some((lane, tx)) = destination {
+                    // Log diagnostics count since it's useful for debugging
+                    if let LspNotification::PublishDiagnostics(ref params) = typed {
+                        debug!(
+                            "Forwarding diagnostics for {}: {} items",
+                            params.uri.as_ref(),
+                            params.diagnostics.len()
+                        );
+                    } else {
+                        trace!("Forwarding notification: {:?}", typed);
+                    }
+
+                    // Names lane and method -- the only diagnostic for a dropped frame.
+                    if tx.try_send(typed).is_err() {
+                        warn!(
+                            "Dropping notification: lane={lane}, method={} \
+                             (channel full or closed)",
+                            notification.method
+                        );
                     }
                 }
             }
@@ -2187,6 +2310,169 @@ mod tests {
                 "a non-retryable error must still surface an ERROR log sharing the \
                  'LSP error response' prefix, got: {logs:?}"
             );
+        }
+    }
+
+    /// Regression coverage for #451 (`LspTransportReader::receive` moved off
+    /// the `select!` and onto a dedicated reader task, see
+    /// [`super::spawn_reader_task`]).
+    mod reader_task_regression {
+        use tokio::io::BufReader;
+
+        use super::*;
+        use crate::test_lsp::{
+            fake_lsp_client, inert_transport, read_framed_message, write_response,
+        };
+
+        /// The reader task only ever sends `Err` through the channel before
+        /// exiting (see `spawn_reader_task`) -- a `None` from `msg_rx.recv()`
+        /// means the task disappeared some other way (e.g. panicked). This is
+        /// the one branch in `message_loop_inner` that has no equivalent in
+        /// the pre-#451 code, so it needs its own direct test rather than
+        /// relying on the full `fake_lsp_client` harness to provoke it.
+        #[tokio::test]
+        async fn test_message_loop_inner_treats_reader_channel_close_as_server_terminated() {
+            let (mut transport, _reader) = inert_transport();
+            let (_command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(1);
+            let (msg_tx, mut msg_rx) = mpsc::channel::<Result<InboundMessage>>(1);
+            let pending_requests: Arc<Mutex<PendingRequests>> =
+                Arc::new(Mutex::new(HashMap::new()));
+
+            drop(msg_tx);
+
+            let result = LspClient::message_loop_inner(
+                &mut transport,
+                &mut msg_rx,
+                &mut command_rx,
+                &pending_requests,
+                None,
+                None,
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(Error::ServerTerminated)),
+                "got {result:?}"
+            );
+        }
+
+        /// The reader task can run ahead of `select!` and have already queued
+        /// a fully-decoded response in `msg_rx` by the time a concurrent
+        /// `Shutdown` command is what `select!` happens to pick. Before the
+        /// drain fix, that queued response was silently dropped instead of
+        /// resolving its caller's pending request -- the caller would then
+        /// block until its own `request_timeout_seconds` elapsed instead of
+        /// failing fast or succeeding.
+        #[tokio::test]
+        async fn test_shutdown_drains_buffered_responses_instead_of_dropping_them() {
+            let (mut transport, _reader) = inert_transport();
+            let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(1);
+            let (msg_tx, mut msg_rx) = mpsc::channel::<Result<InboundMessage>>(1);
+            let pending_requests: Arc<Mutex<PendingRequests>> =
+                Arc::new(Mutex::new(HashMap::new()));
+
+            let id = RequestId::Number(1);
+            let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
+            pending_requests
+                .lock()
+                .await
+                .insert(id.clone(), response_tx);
+
+            msg_tx
+                .send(Ok(InboundMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: id.clone(),
+                    result: Some(serde_json::json!({ "ok": true })),
+                    error: None,
+                })))
+                .await
+                .unwrap();
+            command_tx.send(ClientCommand::Shutdown).await.unwrap();
+            drop(command_tx);
+
+            let result = LspClient::message_loop_inner(
+                &mut transport,
+                &mut msg_rx,
+                &mut command_rx,
+                &pending_requests,
+                None,
+                None,
+            )
+            .await;
+
+            assert!(result.is_ok(), "got {result:?}");
+            // `Err` here means the sender was dropped without a reply -- i.e. the
+            // buffered response was lost instead of resolving this request.
+            let received = response_rx.await.unwrap();
+            assert_eq!(received.unwrap(), serde_json::json!({ "ok": true }));
+            assert!(
+                pending_requests.lock().await.is_empty(),
+                "the drained response must resolve its pending request entry"
+            );
+        }
+
+        /// Drives dense, concurrent request/response traffic through the real
+        /// `message_loop`/`spawn_reader_task` pair (via `fake_lsp_client`) and
+        /// answers deliberately out of arrival order, so a bug that matched
+        /// responses positionally instead of by id -- the failure mode a
+        /// mid-frame desync would eventually cause -- would surface as a
+        /// mismatched payload rather than a hang.
+        #[tokio::test]
+        async fn test_dense_concurrent_requests_all_resolve_to_matching_responses() {
+            const REQUEST_COUNT: usize = 20;
+            let (client, mut server) = fake_lsp_client();
+
+            // A manual push loop, not `.map(..).collect()`: `tokio::spawn`
+            // must run eagerly for every `i` right here, before
+            // `server_task` starts answering below -- a lazily-iterated
+            // combinator would spawn (and thus send) each request only as
+            // its `JoinHandle` is later awaited, one at a time, defeating
+            // the "dense concurrent" setup this test needs.
+            let mut request_tasks = Vec::with_capacity(REQUEST_COUNT);
+            for i in 0..REQUEST_COUNT {
+                let client = client.clone();
+                request_tasks.push(tokio::spawn(async move {
+                    client
+                        .request::<_, Value>(
+                            "textDocument/hover",
+                            serde_json::json!({ "n": i }),
+                            Duration::from_secs(30),
+                        )
+                        .await
+                }));
+            }
+
+            let server_task = tokio::spawn(async move {
+                let mut reader = BufReader::new(&mut server.write_stdout);
+                let mut requests = Vec::with_capacity(REQUEST_COUNT);
+                for _ in 0..REQUEST_COUNT {
+                    requests.push(read_framed_message(&mut reader).await);
+                }
+                for request in requests.into_iter().rev() {
+                    let id = request["id"].clone();
+                    let n = request["params"]["n"].clone();
+                    write_response(
+                        &mut server.read_half_stdin,
+                        &id,
+                        serde_json::json!({ "echo": n }),
+                    )
+                    .await;
+                }
+            });
+
+            server_task.await.unwrap();
+
+            for (i, task) in request_tasks.into_iter().enumerate() {
+                let value = task
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("request {i} failed: {e:?}"));
+                assert_eq!(
+                    value["echo"],
+                    serde_json::json!(i),
+                    "response for request {i} carried the wrong payload -- id/response mismatch"
+                );
+            }
         }
     }
 }
