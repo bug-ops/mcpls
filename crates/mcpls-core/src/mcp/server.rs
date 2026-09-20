@@ -2334,6 +2334,7 @@ mod tests {
 
         use crate::config::{LspServerConfig, ServerId, ToolRouter};
         use crate::lsp::{LspServer, ServerInitConfig};
+        use crate::test_lsp::with_read_preamble;
 
         let dir = TempDir::new().unwrap();
         let script_path = dir.path().join("crash_after_init.sh");
@@ -2344,10 +2345,12 @@ mod tests {
         // module's test helpers are private to it).
         fs::write(
             &script_path,
-            r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+            with_read_preamble(
+                r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
 printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 sleep 0.3
 "#,
+            ),
         )
         .unwrap();
 

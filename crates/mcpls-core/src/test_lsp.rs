@@ -228,3 +228,23 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
             .push((*event.metadata().level(), visitor.0));
     }
 }
+
+/// Reads and discards a full LSP-framed request from stdin, so a fixture
+/// replying after it can't answer before the request is even sent (#447).
+#[cfg(unix)]
+pub const READ_REQUEST_SH: &str = r#"content_length=0
+while IFS= read -r header; do
+  header=$(printf '%s' "$header" | tr -d '\r')
+  [ -z "$header" ] && break
+  case "$header" in
+    Content-Length:*) content_length=$(printf '%s' "$header" | sed 's/^Content-Length: *//') ;;
+  esac
+done
+[ "$content_length" -gt 0 ] 2>/dev/null && dd bs=1 count="$content_length" 2>/dev/null >/dev/null
+"#;
+
+/// Prepends [`READ_REQUEST_SH`] to a fake `sh`-server fixture body.
+#[cfg(unix)]
+pub fn with_read_preamble(body: &str) -> String {
+    format!("{READ_REQUEST_SH}{body}")
+}

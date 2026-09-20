@@ -499,6 +499,7 @@ mod tests {
         use super::*;
         use crate::config::{LspServerConfig, ToolKind, ToolRouter};
         use crate::lsp::ServerInitConfig;
+        use crate::test_lsp::with_read_preamble;
 
         /// Writes a `sh` script that answers the LSP `initialize` handshake
         /// with a canned response -- request id `1`, since a freshly spawned
@@ -516,10 +517,12 @@ mod tests {
         /// meant to seed.
         fn write_crash_after_init_script(dir: &Path) -> PathBuf {
             let script_path = dir.join("crash_after_init.sh");
-            let body = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+            let body = with_read_preamble(
+                r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
 printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 sleep 0.3
-"#;
+"#,
+            );
             fs::write(&script_path, body).unwrap();
             script_path
         }
@@ -528,10 +531,12 @@ sleep 0.3
         /// `sleep_secs` after responding instead of exiting immediately.
         fn write_responder_script(dir: &Path, sleep_secs: u64) -> PathBuf {
             let script_path = dir.join("responder.sh");
-            let template = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+            let template = with_read_preamble(
+                r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
 printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 sleep __SLEEP__
-"#;
+"#,
+            );
             fs::write(
                 &script_path,
                 template.replace("__SLEEP__", &sleep_secs.to_string()),
@@ -665,7 +670,8 @@ sleep __SLEEP__
             let marker = dir.path().join("marker");
             let counter = dir.path().join("invocations");
             let script_path = dir.path().join("flaky.sh");
-            let template = r#"echo x >> "__COUNTER__"
+            let template = with_read_preamble(
+                r#"echo x >> "__COUNTER__"
 if [ -f "__MARKER__" ]; then
   body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
   printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
@@ -676,7 +682,8 @@ else
   printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
   sleep 0.3
 fi
-"#;
+"#,
+            );
             let script_body = template
                 .replace("__COUNTER__", &counter.display().to_string())
                 .replace("__MARKER__", &marker.display().to_string());
@@ -1019,11 +1026,13 @@ fi
             wait_until_dead(&translator, &id).await;
 
             let respawn_script_path = dir.path().join("respawn_with_status.sh");
-            let respawn_script_body = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+            let respawn_script_body = with_read_preamble(
+                r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
 notif='{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"quiescent":true}}'
 printf 'Content-Length: %d\r\n\r\n%sContent-Length: %d\r\n\r\n%s' ${#body} "$body" ${#notif} "$notif"
 sleep 1
-"#;
+"#,
+            );
             fs::write(&respawn_script_path, respawn_script_body).unwrap();
             translator.register_server_config(
                 id.clone(),
