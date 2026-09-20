@@ -76,43 +76,15 @@ use transport::{ShutdownSignal, run_stdio};
 /// a misbehaving or compromised LSP server could otherwise publish
 /// diagnostics for an unbounded number of fabricated (often non-existent)
 /// URIs, defeating `MAX_DIAGNOSTIC_ENTRIES`'s FIFO cap by flushing every
-/// legitimate entry out of the cache before it (see #234). Deliberately does
-/// not canonicalize -- this runs per incoming notification, and LSP servers
-/// report already-resolved canonical paths, so a prefix check is enough to
-/// reject URIs a legitimate server would never publish for, without a
-/// filesystem syscall on every diagnostic.
-///
-/// # Preconditions
-///
-/// `workspace_roots` must itself already be canonical, or every diagnostic
-/// silently fails to match and gets dropped (a raw `[[lsp_servers]]`-derived
-/// or relative root will never `starts_with`-match a canonical LSP path).
-/// `serve_with` guarantees this by passing `workspace_roots_snapshot`, which
-/// clones the roots already normalized by [`resolve_workspace_roots`].
-///
-/// An empty `workspace_roots` (no workspace configured) allows any URI,
-/// matching `validate_path_against_roots`'s "no roots = no restriction"
-/// behavior.
+/// legitimate entry out of the cache before it (see #234). Thin wrapper
+/// around [`bridge::uri_in_workspace_roots`], the same containment check
+/// rename/code-action `WorkspaceEdit` results use for the identical
+/// untrusted-URI problem -- see that function's docs for why read-only
+/// navigation results are deliberately exempt (and how `document_symbols`'
+/// flat response shape takes a different, non-filtering approach), plus the
+/// canonicalization and preconditions this inherits.
 fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &[PathBuf]) -> bool {
-    if workspace_roots.is_empty() {
-        return true;
-    }
-    let Some(path) = bridge::uri_to_path(uri) else {
-        return false;
-    };
-    // `Path::starts_with` compares components lexically and does not resolve
-    // `.`/`..`, so `/workspace/../etc/passwd` would otherwise pass the
-    // `/workspace` prefix check despite pointing outside it. A legitimate LSP
-    // server never publishes such a path (canonical paths never contain
-    // `.`/`..` components), so rejecting them outright costs nothing and
-    // closes the bypass for a server that deliberately crafts one.
-    if path
-        .components()
-        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-    {
-        return false;
-    }
-    workspace_roots.iter().any(|root| path.starts_with(root))
+    bridge::uri_in_workspace_roots(uri, workspace_roots)
 }
 
 /// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one

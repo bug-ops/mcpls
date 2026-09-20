@@ -99,7 +99,7 @@ pub fn lsp_to_mcp_position(
         }
     };
 
-    (pos.line + 1, mcp_character + 1)
+    (pos.line.saturating_add(1), mcp_character.saturating_add(1))
 }
 
 /// Resolve `character_offset` (in `encoding`'s units) to a byte offset in
@@ -569,5 +569,51 @@ mod tests {
         let line_text = "héllo"; // as it would be yielded by "héllo\r\n".lines()
         let lsp_pos = mcp_to_lsp_position(1, 3, Some(line_text), PositionEncoding::Utf8);
         assert_eq!(lsp_pos.character, 3);
+    }
+
+    /// Issue #413: LSP 3.17 permits `character: u32::MAX` as an idiom for
+    /// "end of line". A plain `+ 1` on that value overflows; `saturating_add`
+    /// must clamp to `u32::MAX` instead of panicking or wrapping to 0.
+    #[test]
+    fn test_lsp_to_mcp_position_character_max_does_not_overflow() {
+        let (_, mcp_char) = lsp_to_mcp_position(
+            Position {
+                line: 0,
+                character: u32::MAX,
+            },
+            None,
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(mcp_char, u32::MAX);
+    }
+
+    /// Issue #413: same overflow hazard on `pos.line`, since it also comes
+    /// directly from the untrusted LSP server.
+    #[test]
+    fn test_lsp_to_mcp_position_line_max_does_not_overflow() {
+        let (mcp_line, _) = lsp_to_mcp_position(
+            Position {
+                line: u32::MAX,
+                character: 0,
+            },
+            None,
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(mcp_line, u32::MAX);
+    }
+
+    /// Issue #413: both components at `u32::MAX` simultaneously.
+    #[test]
+    fn test_lsp_to_mcp_position_both_max_does_not_overflow() {
+        let (mcp_line, mcp_char) = lsp_to_mcp_position(
+            Position {
+                line: u32::MAX,
+                character: u32::MAX,
+            },
+            None,
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(mcp_line, u32::MAX);
+        assert_eq!(mcp_char, u32::MAX);
     }
 }

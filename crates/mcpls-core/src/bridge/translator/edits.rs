@@ -1,5 +1,7 @@
 //! Rename, format-document, and code-actions handlers.
 
+use std::path::PathBuf;
+
 use lsp_types::{
     DocumentFormattingParams, FormattingOptions, PartialResultParams,
     RenameParams as LspRenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
@@ -14,6 +16,7 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
+use crate::bridge::uri_in_workspace_roots;
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
@@ -106,11 +109,14 @@ fn validate_rename_params(new_name: &str) -> Result<()> {
 
 /// Convert LSP code action to MCP code action. `uri` is the queried
 /// document's own URI, used for the action's `diagnostics` (always scoped to
-/// the requested document); `edit.changes` carries its own per-file URIs.
+/// the requested document); `edit.changes` carries its own per-file URIs,
+/// each checked against `workspace_roots` before being trusted -- see
+/// [`crate::bridge::uri_in_workspace_roots`].
 async fn convert_code_action(
     action: lsp_types::CodeAction,
     ctx: &EncodingCtx,
     uri: &lsp_types::Uri,
+    workspace_roots: &[PathBuf],
 ) -> CodeAction {
     let diagnostics = match action.diagnostics {
         Some(diags) => {
@@ -129,6 +135,13 @@ async fn convert_code_action(
                 Some(changes_map) => {
                     let mut result = Vec::with_capacity(changes_map.len());
                     for (uri, edits) in changes_map {
+                        if !uri_in_workspace_roots(&uri, workspace_roots) {
+                            tracing::warn!(
+                                uri = uri.as_ref(),
+                                "dropping out-of-workspace code-action edit"
+                            );
+                            continue;
+                        }
                         let mut text_edits = Vec::with_capacity(edits.len());
                         for e in edits {
                             text_edits.push(TextEdit {
@@ -180,6 +193,7 @@ impl Translator {
     /// indexing the workspace (see `Translator::wait_for_indexing_ready`) --
     /// a rename needs the same whole-workspace reference index as
     /// `get_references`.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_rename(
         &self,
         file_path: String,
@@ -226,8 +240,14 @@ impl Translator {
             let mut result_changes = Vec::new();
 
             // Prefer the legacy `changes` map (HashMap<Uri, Vec<TextEdit>>).
+            // An entry outside the workspace is dropped rather than rewritten
+            // into the client's response -- see `uri_in_workspace_roots`.
             if let Some(changes_map) = edit.changes {
                 for (uri, edits) in changes_map {
+                    if !uri_in_workspace_roots(&uri, &self.workspace_roots) {
+                        tracing::warn!(uri = uri.as_ref(), "dropping out-of-workspace rename edit");
+                        continue;
+                    }
                     let mut text_edits = Vec::with_capacity(edits.len());
                     for e in edits {
                         text_edits.push(TextEdit {
@@ -257,6 +277,13 @@ impl Translator {
                     .collect();
                 for tde in text_doc_edits {
                     let edit_uri = &tde.text_document.text_document_identifier.uri;
+                    if !uri_in_workspace_roots(edit_uri, &self.workspace_roots) {
+                        tracing::warn!(
+                            uri = edit_uri.as_ref(),
+                            "dropping out-of-workspace rename edit"
+                        );
+                        continue;
+                    }
                     let mut text_edits = Vec::with_capacity(tde.edits.len());
                     for one_of in tde.edits {
                         let text_edit = match one_of {
@@ -433,7 +460,7 @@ impl Translator {
         for action_or_command in response_vec {
             let action = match action_or_command {
                 lsp_types::CodeActionResponse::CodeAction(action) => {
-                    convert_code_action(action, &ctx, &response_uri).await
+                    convert_code_action(action, &ctx, &response_uri, &self.workspace_roots).await
                 }
                 lsp_types::CodeActionResponse::Command(cmd) => {
                     let arguments = cmd.arguments.unwrap_or_else(Vec::new);
@@ -571,6 +598,107 @@ mod tests {
                 .any(|e| e.new_text.contains("${1:comment}")),
             "snippet placeholder syntax must never appear as literal replacement text"
         );
+    }
+
+    /// #415: a `documentChanges` entry whose URI falls outside every
+    /// configured workspace root must be dropped -- the routed LSP server is
+    /// a trust boundary, and a compromised/misbehaving server could
+    /// otherwise smuggle an out-of-workspace path into a `WorkspaceEdit`
+    /// alongside legitimate in-workspace entries.
+    #[tokio::test]
+    async fn test_handle_rename_drops_out_of_workspace_workspace_edit_entries() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::time::timeout;
+        use url::Url;
+
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let file_path = dir.path().join("main.rs");
+        fs::write(&file_path, "fn old_name() {}").unwrap();
+        let inside_uri = Url::from_file_path(&file_path).unwrap().to_string();
+        let outside_uri = "file:///outside/workspace/evil.rs";
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = file_path.to_str().unwrap().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_rename(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 4,
+                        },
+                        "new_name".to_string(),
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/rename");
+
+        let mut changes_map = serde_json::Map::new();
+        changes_map.insert(
+            inside_uri.clone(),
+            serde_json::json!([
+                {
+                    "range": {
+                        "start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 11}
+                    },
+                    "newText": "new_name"
+                }
+            ]),
+        );
+        changes_map.insert(
+            outside_uri.to_string(),
+            serde_json::json!([
+                {
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3}
+                    },
+                    "newText": "evil"
+                }
+            ]),
+        );
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!({ "changes": changes_map }),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.changes.len(),
+            1,
+            "the out-of-workspace entry must be dropped, not forwarded"
+        );
+        assert_eq!(result.changes[0].uri, inside_uri);
     }
 
     /// #309: `new_name` has no inherent bound of its own and is forwarded to
@@ -813,7 +941,7 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
         assert_eq!(result.title, "Fix issue");
         assert!(result.kind.is_none());
         assert!(result.diagnostics.is_empty());
@@ -920,7 +1048,7 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
         assert_eq!(result.diagnostics.len(), 4);
         assert!(matches!(
             result.diagnostics[0].severity,
@@ -982,7 +1110,7 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
@@ -1011,7 +1139,7 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri()).await;
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
         assert!(result.command.is_some());
         let cmd = result.command.unwrap();
         assert_eq!(cmd.title, "Execute refactor");

@@ -163,7 +163,10 @@ impl Translator {
             )
             .await?;
 
-        // Pre-allocate and build result
+        // Pre-allocate and build result. Not filtered to workspace roots --
+        // see `lsp_locations_to_mcp`'s doc comment in `navigation.rs` for why
+        // a read-only location outside the workspace (stdlib, a dependency)
+        // is normal, expected navigation rather than something to drop.
         let lsp_items = response.unwrap_or_default();
         let mut items = Vec::with_capacity(lsp_items.len());
         for item in lsp_items {
@@ -216,7 +219,8 @@ impl Translator {
             )
             .await?;
 
-        // Pre-allocate and build result
+        // Pre-allocate and build result. Not filtered to workspace roots --
+        // see `handle_call_hierarchy_prepare`'s comment above.
         let lsp_calls = response.unwrap_or_default();
         let mut calls = Vec::with_capacity(lsp_calls.len());
 
@@ -284,7 +288,8 @@ impl Translator {
             )
             .await?;
 
-        // Pre-allocate and build result
+        // Pre-allocate and build result. Not filtered to workspace roots --
+        // see `handle_call_hierarchy_prepare`'s comment above.
         let lsp_calls = response.unwrap_or_default();
         let mut calls = Vec::with_capacity(lsp_calls.len());
 
@@ -725,6 +730,202 @@ mod tests {
              callee's (\"abc\") -- a byte offset of 3 is UTF-16 column 3 in the former, 4 in \
              the latter"
         );
+    }
+
+    /// #415 (revised per critic C1): an incoming call whose caller
+    /// (`call.from.uri`) lies outside every configured workspace root must
+    /// still be returned -- a caller in the standard library or a
+    /// crates.io dependency is normal, expected call-hierarchy navigation,
+    /// not an attack. See `navigation.rs`'s
+    /// `test_handle_definition_does_not_filter_out_of_workspace_location`
+    /// for the same policy on goto-X locations.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_does_not_filter_out_of_workspace_caller() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let queried_path = dir.path().join("queried.rs");
+        fs::write(&queried_path, "fn queried() {}").unwrap();
+        let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
+        let outside_uri = "file:///outside/workspace/stdlib.rs";
+
+        let item = CallHierarchyItemResult {
+            name: "queried_fn".to_string(),
+            kind: 12,
+            detail: None,
+            uri: queried_uri,
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            selection_range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            data: None,
+        };
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let item = serde_json::to_value(item).unwrap();
+            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "callHierarchy/incomingCalls");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "from": {
+                    "name": "caller_fn",
+                    "kind": 12,
+                    "uri": outside_uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    },
+                    "selectionRange": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    }
+                },
+                "fromRanges": [{
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1}
+                }]
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.calls.len(),
+            1,
+            "an out-of-workspace caller must be returned, not dropped"
+        );
+        assert_eq!(result.calls[0].from.uri, outside_uri);
+    }
+
+    /// #415 (revised per critic C1) companion for outgoing calls: a callee
+    /// (`call.to.uri`) outside every configured workspace root must still be
+    /// returned -- see the incoming-calls test above for the rationale.
+    #[tokio::test]
+    async fn test_handle_outgoing_calls_does_not_filter_out_of_workspace_callee() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let queried_path = dir.path().join("queried.rs");
+        fs::write(&queried_path, "fn queried() {}").unwrap();
+        let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
+        let outside_uri = "file:///outside/workspace/stdlib.rs";
+
+        let item = CallHierarchyItemResult {
+            name: "queried_fn".to_string(),
+            kind: 12,
+            detail: None,
+            uri: queried_uri,
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            selection_range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            data: None,
+        };
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let item = serde_json::to_value(item).unwrap();
+            tokio::spawn(async move { translator.handle_outgoing_calls(item).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "callHierarchy/outgoingCalls");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "to": {
+                    "name": "callee_fn",
+                    "kind": 12,
+                    "uri": outside_uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    },
+                    "selectionRange": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    }
+                },
+                "fromRanges": [{
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1}
+                }]
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.calls.len(),
+            1,
+            "an out-of-workspace callee must be returned, not dropped"
+        );
+        assert_eq!(result.calls[0].to.uri, outside_uri);
     }
 
     /// #411 regression: `prepare_call_hierarchy` -> `get_incoming_calls`
