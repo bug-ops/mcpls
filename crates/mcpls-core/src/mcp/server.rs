@@ -1466,14 +1466,15 @@ mod tests {
         use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
 
         let server_id = ServerId::from("rust");
-        let translator = Arc::new(
-            Translator::new()
-                .with_router(ToolRouter::catch_all([(
-                    server_id.clone(),
-                    "rust".to_string(),
-                )]))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
-        );
+        let dir = TempDir::new().unwrap();
+        let mut translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(
+                server_id.clone(),
+                "rust".to_string(),
+            )]))
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
 
@@ -1484,7 +1485,6 @@ mod tests {
             Some(&serde_json::json!({"quiescent": false})),
         );
 
-        let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
         let path_str = path.to_string_lossy().to_string();
@@ -1536,20 +1536,20 @@ mod tests {
         use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
 
         let server_id = ServerId::from("rust");
-        let translator = Arc::new(
-            Translator::new()
-                .with_router(ToolRouter::catch_all([(
-                    server_id.clone(),
-                    "rust".to_string(),
-                )]))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
-        );
+        let dir = TempDir::new().unwrap();
+        let mut translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(
+                server_id.clone(),
+                "rust".to_string(),
+            )]))
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
 
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
 
-        let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
         let path_str = path.to_string_lossy().to_string();
@@ -1604,14 +1604,15 @@ mod tests {
         use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
 
         let server_id = ServerId::from("rust");
-        let translator = Arc::new(
-            Translator::new()
-                .with_router(ToolRouter::catch_all([(
-                    server_id.clone(),
-                    "rust".to_string(),
-                )]))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
-        );
+        let dir = TempDir::new().unwrap();
+        let mut translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(
+                server_id.clone(),
+                "rust".to_string(),
+            )]))
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
 
@@ -1622,7 +1623,6 @@ mod tests {
             Some(&serde_json::json!({"quiescent": false})),
         );
 
-        let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
         let path_str = path.to_string_lossy().to_string();
@@ -1694,14 +1694,15 @@ mod tests {
         use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
 
         let server_id = ServerId::from("rust");
-        let translator = Arc::new(
-            Translator::new()
-                .with_router(ToolRouter::catch_all([(
-                    server_id.clone(),
-                    "rust".to_string(),
-                )]))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
-        );
+        let dir = TempDir::new().unwrap();
+        let mut translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(
+                server_id.clone(),
+                "rust".to_string(),
+            )]))
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
 
@@ -1712,7 +1713,6 @@ mod tests {
             Some(&serde_json::json!({"quiescent": false})),
         );
 
-        let dir = TempDir::new().unwrap();
         let target = dir.path().join("target.rs");
         fs::write(&target, "fn main() {}").unwrap();
         let link = dir.path().join("link.txt");
@@ -2228,16 +2228,16 @@ mod tests {
                 .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
+        let temp_dir = TempDir::new().unwrap();
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from(Vec::new()),
+            Arc::from(vec![temp_dir.path().to_path_buf()]),
             Arc::new(ResourceSubscriptions::new()),
             false,
             McpConfig::default(),
         );
 
-        let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -2280,16 +2280,16 @@ mod tests {
                 .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
+        let temp_dir = TempDir::new().unwrap();
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from(Vec::new()),
+            Arc::from(vec![temp_dir.path().to_path_buf()]),
             Arc::new(ResourceSubscriptions::new()),
             false,
             McpConfig::default(),
         );
 
-        let temp_dir = TempDir::new().unwrap();
         let target = temp_dir.path().join("target.rs");
         fs::write(&target, "fn main() {}").unwrap();
         let link = temp_dir.path().join("link.txt");
