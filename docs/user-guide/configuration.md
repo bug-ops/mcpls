@@ -324,6 +324,20 @@ max_file_size = 0  # unlimited
 
 Useful when a project contains files larger than 10MB (e.g. generated code, data fixtures) that still need LSP-backed tools to work against them.
 
+### `workspace.indexing_ready_timeout_seconds`
+
+**Type**: Integer (seconds)
+**Default**: `30`
+
+Maximum time a whole-workspace query (hover, definition, references, rename, completions, code actions, call hierarchy incoming/outgoing calls) waits for its routed LSP server to report it has finished its initial workspace indexing, once a readiness signal has actually shown indexing is in progress. If the server is still indexing when this elapses, the tool call fails with a "still indexing" error instead of silently answering from a partial index. A server that never reports a readiness signal is never delayed.
+
+```toml
+[workspace]
+indexing_ready_timeout_seconds = 45
+```
+
+Must be greater than 3 and less than 60 seconds; mcpls rejects the config otherwise. Raise it for large monorepos where the initial workspace load routinely takes longer than the default.
+
 ## LSP Server Configuration
 
 Each `[[lsp_servers]]` section defines a language server.

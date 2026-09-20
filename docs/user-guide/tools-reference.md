@@ -271,36 +271,37 @@ Get compiler errors, warnings, and hints for a file, including diagnostics from 
 
 ### Returns
 
-Array of diagnostic messages:
+An object with a `diagnostics` array plus an `indexingInProgress` flag:
 
 ```json
-[
-  {
-    "range": {
-      "start": { "line": 10, "character": 8 },
-      "end": { "line": 10, "character": 24 }
+{
+  "diagnostics": [
+    {
+      "range": {
+        "start": { "line": 10, "character": 8 },
+        "end": { "line": 10, "character": 24 }
+      },
+      "severity": "error",
+      "message": "cannot find value `undefined_variable` in this scope",
+      "code": "E0425"
     },
-    "severity": 1,
-    "message": "cannot find value `undefined_variable` in this scope",
-    "source": "rustc"
-  },
-  {
-    "range": {
-      "start": { "line": 15, "character": 0 },
-      "end": { "line": 15, "character": 40 }
-    },
-    "severity": 2,
-    "message": "unused variable: `x`",
-    "source": "clippy"
-  }
-]
+    {
+      "range": {
+        "start": { "line": 15, "character": 0 },
+        "end": { "line": 15, "character": 40 }
+      },
+      "severity": "warning",
+      "message": "unused variable: `x`",
+      "code": "unused_variables"
+    }
+  ],
+  "indexingInProgress": false
+}
 ```
 
-Severity levels:
-- `1` - Error
-- `2` - Warning
-- `3` - Information
-- `4` - Hint
+Severity levels: `error`, `warning`, `information`, `hint`.
+
+`indexingInProgress` is `true` when the routed language server had an active signal showing its initial workspace indexing was still in progress at any point during this read (checked both before and after the underlying request, so a server that finishes mid-read is still caught) — the diagnostics above may reflect a partial index (still-loading references/types can surface as false errors, or a genuine error can be silently missing). `get_cached_diagnostics` and the `mcpls-diagnostics://` resource carry the same flag. This is independent of the whole-workspace-query readiness gate other tools (`get_hover`, `get_definition`, etc.) block on, configured via `workspace.indexing_ready_timeout_seconds` (see [Configuration Reference](configuration.md)) — `get_diagnostics` never blocks on it, it only flags the result.
 
 ### Example Use Cases
 
@@ -809,16 +810,19 @@ Get diagnostics from LSP server push notifications (cached), without making a ne
 
 ```json
 {
-  "file_path": "/path/to/file.rs",
   "diagnostics": [
     {
       "message": "unused variable",
       "severity": "warning",
       "range": { "start": { "line": 10, "character": 5 }, "end": { "line": 10, "character": 10 } }
     }
-  ]
+  ],
+  "pushNotificationsDegraded": false,
+  "indexingInProgress": false
 }
 ```
+
+`pushNotificationsDegraded` is `true` if the file's routed server crashed and was respawned since it last published, so this cache entry can no longer be refreshed by a later push until mcpls restarts. `indexingInProgress` is the same signal `get_diagnostics` returns (see that tool's `Returns` section) -- `true` means the routed server was still indexing as of this read, so the cached diagnostics above may reflect a partial index.
 
 ### Notes
 
