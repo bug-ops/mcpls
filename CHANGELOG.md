@@ -9,15 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Workspace-indexing readiness is now also tracked from a generic LSP `$/progress` `begin`/`end` sequence, not just rust-analyzer's `experimental/serverStatus` — mcpls now advertises `window.workDoneProgress` at `initialize` and answers `window/workDoneProgress/create`, so any spec-compliant server (gopls, pyright, tsserver) can report indexing progress and be gated on. (#422)
-- New `[[lsp_servers]] indexing = "disabled"` config option to opt a server out of workspace-indexing readiness gating entirely. (#422)
+- Workspace-indexing readiness is now also tracked from a generic LSP `$/progress` `begin`/`end` sequence, not just rust-analyzer's `experimental/serverStatus` — mcpls now advertises `window.workDoneProgress` at `initialize` and answers `window/workDoneProgress/create`, so any spec-compliant server (gopls, pyright, tsserver) can report indexing progress and be gated on. (#433)
+- New `[[lsp_servers]] indexing = "disabled"` config option to opt a server out of workspace-indexing readiness gating entirely. (#433)
 
 ### Changed
 
 - Bump rmcp from 3.2.0 to 3.4.0; switch from the now-deprecated `rmcp::model::ServerInfo` alias to `ServerConfig` (imported as `RmcpServerConfig` to avoid clashing with `mcpls_core::config::ServerConfig`). (#407)
-- **`LspNotification::Progress`** — Breaking change: now wraps `lsp_types::ProgressParams` instead of a bare `{ token, value }` pair. (#422)
-- rust-analyzer's pre-`experimental/serverStatus` startup now also gates whole-workspace queries, since it emits `$/progress` during that window too; previously that window was ungated. (#422)
-- Accepted cost: for a server that emits per-request `$/progress` (e.g. gopls, pyright), every whole-workspace query landing within 3s after any of that server's `$/progress` `end` frames now waits out that settle window, not just queries during the initial workspace load — a deliberate trade-off to keep the multi-phase-load re-gating (#422) correct; bounded, and avoidable per server via `indexing = "disabled"`. (#422)
+- **`LspNotification::Progress`** — Breaking change: now wraps `lsp_types::ProgressParams` instead of a bare `{ token, value }` pair. (#433)
+- rust-analyzer's pre-`experimental/serverStatus` startup now also gates whole-workspace queries, since it emits `$/progress` during that window too; previously that window was ungated. (#433)
+- Accepted cost: for a server that emits per-request `$/progress` (e.g. gopls, pyright), every whole-workspace query landing within 3s after any of that server's `$/progress` `end` frames now waits out that settle window, not just queries during the initial workspace load — a deliberate trade-off to keep the multi-phase-load re-gating correct; bounded, and avoidable per server via `indexing = "disabled"`. (#433)
 
 ### Fixed
 
