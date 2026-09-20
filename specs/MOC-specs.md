@@ -21,6 +21,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 002 | [[lsp/002-lsp317-missing-tools/spec\|lsp317-missing-tools]] | enhancement | P3 | implemented (#124) | #116 |
 | 003 | [[lsp/003-lsp-types-unmaintained-migration/spec\|lsp-types-unmaintained-migration]] | research | P2 | implemented (#375) | #297 |
 | 004 | [[lsp/004-lsp-318-draft-gaps/spec\|lsp-318-draft-gaps]] | research | P4 | draft | #299 (also #116; #290 resolved by #289/#291) |
+| 005 | [[lsp/005-lsp-content-modified-retry/spec\|lsp-content-modified-retry]] | bug | P2 | implemented (#390) | #382 |
 
 ## mcp
 
@@ -40,6 +41,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 003 | [[bridge/003-rwlock-translator/spec\|rwlock-translator]] | enhancement | P2 | superseded | #114 |
 | 004 | [[bridge/004-get-diagnostics-flycheck-gap/spec\|get-diagnostics-flycheck-gap]] | bug | P1 | draft | — |
 | 005 | [[bridge/005-expose-document-tracker-limits/spec\|expose-document-tracker-limits]] | enhancement | P2 | implemented (#324) | — |
+| 006 | [[bridge/006-lsp-indexing-readiness-gate/spec\|lsp-indexing-readiness-gate]] | bug | P1 | implemented (#421) | #420 |
 
 ## runtime
 
