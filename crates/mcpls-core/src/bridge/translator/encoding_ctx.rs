@@ -186,14 +186,28 @@ mod tests {
 
     #[test]
     fn test_is_out_of_workspace_false_when_uri_inside_configured_root() {
-        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, vec![PathBuf::from("/")]);
-        assert!(!ctx.is_out_of_workspace(&test_uri()));
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, vec![dir.path().to_path_buf()]);
+        assert!(!ctx.is_out_of_workspace(&uri));
     }
 
     #[test]
     fn test_is_out_of_workspace_true_when_uri_outside_configured_roots() {
-        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, vec![PathBuf::from("/other")]);
-        assert!(ctx.is_out_of_workspace(&test_uri()));
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let other_dir = TempDir::new().unwrap();
+        let ctx = test_ctx_with_roots(
+            PositionEncoding::Utf16,
+            vec![other_dir.path().to_path_buf()],
+        );
+        assert!(ctx.is_out_of_workspace(&uri));
     }
 
     /// Matches [`crate::bridge::uri_in_workspace_roots`]'s fail-closed
@@ -201,8 +215,13 @@ mod tests {
     /// workspace makes every location report as not provably contained.
     #[test]
     fn test_is_out_of_workspace_true_when_no_roots_configured() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
         let ctx = test_ctx_with_roots(PositionEncoding::Utf16, Vec::new());
-        assert!(ctx.is_out_of_workspace(&test_uri()));
+        assert!(ctx.is_out_of_workspace(&uri));
     }
 
     #[tokio::test]
