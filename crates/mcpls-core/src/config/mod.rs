@@ -72,7 +72,7 @@ pub struct ServerConfig {
 /// presentation text.
 ///
 /// A configured [`instructions`](Self::instructions) **replaces** the
-/// built-in capability blurb in `ServerInfo.instructions` rather than
+/// built-in capability blurb in `RmcpServerConfig.instructions` rather than
 /// appending to it -- an agent that reads `instructions` at connection time
 /// (see `skills/mcpls/SKILL.md`) sees only the configured text, plus the
 /// unrelated untrusted-project-config NOTE (see
@@ -110,7 +110,7 @@ pub struct McpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// Replaces the built-in `ServerInfo.instructions` capability blurb.
+    /// Replaces the built-in `RmcpServerConfig.instructions` capability blurb.
     /// Omit to keep the built-in text. The untrusted-project-config NOTE
     /// (see [`ServerConfig::project_config_ignored`]) is still appended
     /// after this value when set.
