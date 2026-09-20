@@ -971,6 +971,7 @@ dependencies = [
  "futures",
  "gen-lsp-types",
  "ignore",
+ "libc",
  "rmcp",
  "rstest",
  "schemars",

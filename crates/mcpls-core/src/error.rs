@@ -254,6 +254,18 @@ pub enum Error {
         max: u64,
     },
 
+    /// Path exists but does not refer to a regular file (e.g. a FIFO or a
+    /// character/block device).
+    ///
+    /// mcpls refuses to read such paths: their reported size does not bound
+    /// how much data reading them could produce, and opening some of them
+    /// for reading can block indefinitely waiting for a peer. A Unix domain
+    /// socket special file is not covered by this variant -- `open(2)` on
+    /// one fails outright (`ENXIO`) before the file-type check that produces
+    /// this error ever runs, so it surfaces as [`Self::FileIo`] instead.
+    #[error("not a regular file: {0}")]
+    NotARegularFile(PathBuf),
+
     /// All configured LSP servers failed to initialize.
     #[error("all LSP servers failed to initialize ({count} configured)")]
     AllServersFailedToInit {
@@ -431,6 +443,12 @@ mod tests {
             err.to_string(),
             "file size limit exceeded: 20000000 bytes, max 10000000 bytes (raise workspace.max_file_size in config to increase this)"
         );
+    }
+
+    #[test]
+    fn test_error_display_not_a_regular_file() {
+        let err = Error::NotARegularFile(PathBuf::from("/tmp/some.fifo"));
+        assert_eq!(err.to_string(), "not a regular file: /tmp/some.fifo");
     }
 
     #[test]
