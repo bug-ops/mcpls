@@ -48,6 +48,26 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 /// `kill_on_drop`.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
+/// Capacity of the diagnostics/log/showMessage notification channel (P3).
+///
+/// Raised from the pre-#422 value of 64: P1 makes mcpls advertise
+/// `window.workDoneProgress`, so a server may now attach progress reporting
+/// to ordinary request capabilities too, raising overall notification
+/// volume generally even though progress itself moved to its own
+/// [`LIFECYCLE_CHANNEL_CAPACITY`] lane.
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
+
+/// Capacity of the lifecycle channel (P3): `$/progress` `begin`/`end`
+/// frames plus `Other` (rust-analyzer's `experimental/serverStatus`).
+///
+/// O(phases), not O(reports): a `$/progress` `report` frame is filtered out
+/// before it ever reaches this channel (see
+/// `lsp::client::LspClient::message_loop_inner`), so this only needs to hold
+/// a handful of `begin`/`end` transitions even for a server with several
+/// concurrent operations, not a `report`-per-package stream like gopls can
+/// produce.
+const LIFECYCLE_CHANNEL_CAPACITY: usize = 128;
+
 /// Every symbol kind defined by LSP 3.17 and understood by mcpls.
 ///
 /// Single source of truth for both the `initialize` request's
@@ -267,11 +287,21 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
-    /// Receiver for push notifications from the LSP server.
+    /// Receiver for push notifications from the LSP server: diagnostics,
+    /// log messages, and show-message requests.
     ///
     /// Extract this before registering the server to receive real-time
-    /// notifications (e.g., `textDocument/publishDiagnostics`, `$/progress`).
+    /// notifications (e.g., `textDocument/publishDiagnostics`).
     pub notification_rx: mpsc::Receiver<LspNotification>,
+    /// Receiver for the lifecycle lane (P3): `$/progress` `begin`/`end`
+    /// frames and unrecognized notifications (which carry e.g.
+    /// rust-analyzer's `experimental/serverStatus`), kept separate from
+    /// [`Self::notification_rx`] so a high-volume diagnostics publisher can
+    /// never starve out a workspace-readiness signal, or vice versa.
+    ///
+    /// Extract this before registering the server, the same way as
+    /// [`Self::notification_rx`] -- see [`Self::take_lifecycle_rx`].
+    pub lifecycle_rx: mpsc::Receiver<LspNotification>,
     /// Child process handle. Kept alive for process lifetime management and
     /// queried by [`Self::has_exited`] to detect a crash. [`LspServer::shutdown`]
     /// waits for it to exit after sending `exit`; otherwise, or if that wait
@@ -291,6 +321,7 @@ impl std::fmt::Debug for LspServer {
             .field("capabilities", &self.capabilities)
             .field("position_encoding", &self.position_encoding)
             .field("notification_rx", &"<channel>")
+            .field("lifecycle_rx", &"<channel>")
             .field("child", &"<process>")
             .finish()
     }
@@ -305,6 +336,16 @@ impl LspServer {
     pub fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
         let (_, dummy) = tokio::sync::mpsc::channel(1);
         std::mem::replace(&mut self.notification_rx, dummy)
+    }
+
+    /// Take the lifecycle receiver out of this server, replacing it with a
+    /// dummy channel -- the lifecycle-lane counterpart to
+    /// [`Self::take_notification_rx`]. Extract this before registering the
+    /// server for a background pump task to drain, the same way as
+    /// [`Self::notification_rx`].
+    pub fn take_lifecycle_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
+        let (_, dummy) = tokio::sync::mpsc::channel(1);
+        std::mem::replace(&mut self.lifecycle_rx, dummy)
     }
 
     /// Spawn and initialize LSP server.
@@ -368,11 +409,13 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
-        let (notification_tx, notification_rx) = mpsc::channel(64);
+        let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
         let client = LspClient::from_transport_with_notifications(
             config.server_config.clone(),
             transport,
             notification_tx,
+            lifecycle_tx,
         );
 
         let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
@@ -384,6 +427,7 @@ impl LspServer {
             capabilities,
             position_encoding,
             notification_rx,
+            lifecycle_rx,
             child: Some(child),
         })
     }
@@ -426,10 +470,100 @@ impl LspServer {
         command
     }
 
+    /// Build the `capabilities` mcpls advertises in the `initialize`
+    /// request, given the configured position-encoding preference order.
+    ///
+    /// Extracted from [`Self::initialize`] (S2) so a unit test can assert
+    /// directly on the returned value -- in particular that
+    /// `window.work_done_progress == Some(true)` (P1), without which no
+    /// spec-compliant LSP server may ever initiate `$/progress` at all (see
+    /// the matching `window/workDoneProgress/create` allowlist entry in
+    /// [`crate::lsp::client::LspClient::server_request_result`]). Before
+    /// this existed, deleting those capability lines would silently no-op
+    /// the whole feature with an otherwise-green test suite.
+    #[allow(clippy::too_many_lines)]
+    fn client_capabilities(position_encodings: &[String]) -> ClientCapabilities {
+        ClientCapabilities {
+            general: Some(GeneralClientCapabilities {
+                position_encodings: Some(resolve_position_encodings(position_encodings)),
+                stale_request_support: Some(StaleRequestSupportOptions {
+                    // mcpls does not implement active in-flight request
+                    // cancellation.
+                    cancel: false,
+                    retry_on_content_modified: CONTENT_MODIFIED_RETRY_METHODS
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                }),
+                ..Default::default()
+            }),
+            text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
+                    dynamic_registration: Some(false),
+                    symbol_kind: Some(lsp_types::ClientSymbolKindOptions {
+                        value_set: Some(SUPPORTED_SYMBOL_KINDS.to_vec()),
+                    }),
+                    hierarchical_document_symbol_support: Some(true),
+                    ..Default::default()
+                }),
+                hover: Some(lsp_types::HoverClientCapabilities {
+                    dynamic_registration: Some(false),
+                    content_format: Some(vec![
+                        lsp_types::MarkupKind::Markdown,
+                        lsp_types::MarkupKind::PlainText,
+                    ]),
+                }),
+                definition: Some(lsp_types::DefinitionClientCapabilities {
+                    dynamic_registration: Some(false),
+                    link_support: Some(true),
+                }),
+                references: Some(lsp_types::ReferenceClientCapabilities {
+                    dynamic_registration: Some(false),
+                }),
+                code_action: Some(lsp_types::CodeActionClientCapabilities {
+                    dynamic_registration: Some(false),
+                    data_support: Some(true),
+                    resolve_support: Some(lsp_types::ClientCodeActionResolveOptions {
+                        properties: vec!["edit".to_string()],
+                    }),
+                    // Declare supported action kinds so the server returns
+                    // CodeAction objects (not just legacy Command objects).
+                    code_action_literal_support: Some(lsp_types::ClientCodeActionLiteralOptions {
+                        code_action_kind: lsp_types::ClientCodeActionKindOptions {
+                            value_set: vec![
+                                lsp_types::CodeActionKind::Empty,
+                                lsp_types::CodeActionKind::QuickFix,
+                                lsp_types::CodeActionKind::Refactor,
+                                lsp_types::CodeActionKind::RefactorExtract,
+                                lsp_types::CodeActionKind::RefactorInline,
+                                lsp_types::CodeActionKind::RefactorRewrite,
+                                lsp_types::CodeActionKind::Source,
+                                lsp_types::CodeActionKind::SourceOrganizeImports,
+                            ],
+                        },
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            workspace: Some(lsp_types::WorkspaceClientCapabilities {
+                workspace_folders: Some(true),
+                ..Default::default()
+            }),
+            // Required per LSP 3.17 before a server may send $/progress at all -- see this fn's doc.
+            window: Some(lsp_types::WindowClientCapabilities {
+                work_done_progress: Some(true),
+                ..Default::default()
+            }),
+            // Required for rust-analyzer to ever emit experimental/serverStatus; other servers ignore this unrecognized key.
+            experimental: Some(serde_json::json!({ "serverStatusNotification": true })),
+            ..Default::default()
+        }
+    }
+
     /// Perform LSP initialization handshake.
     ///
     /// Sends initialize request and waits for response, then sends initialized notification.
-    #[allow(clippy::too_many_lines)]
     async fn initialize(
         client: &LspClient,
         config: &ServerInitConfig,
@@ -447,81 +581,7 @@ impl LspServer {
             #[allow(deprecated)]
             root_uri: None,
             initialization_options: config.initialization_options.clone(),
-            capabilities: ClientCapabilities {
-                general: Some(GeneralClientCapabilities {
-                    position_encodings: Some(resolve_position_encodings(
-                        &config.position_encodings,
-                    )),
-                    stale_request_support: Some(StaleRequestSupportOptions {
-                        // mcpls does not implement active in-flight request
-                        // cancellation.
-                        cancel: false,
-                        retry_on_content_modified: CONTENT_MODIFIED_RETRY_METHODS
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect(),
-                    }),
-                    ..Default::default()
-                }),
-                text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                    document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
-                        dynamic_registration: Some(false),
-                        symbol_kind: Some(lsp_types::ClientSymbolKindOptions {
-                            value_set: Some(SUPPORTED_SYMBOL_KINDS.to_vec()),
-                        }),
-                        hierarchical_document_symbol_support: Some(true),
-                        ..Default::default()
-                    }),
-                    hover: Some(lsp_types::HoverClientCapabilities {
-                        dynamic_registration: Some(false),
-                        content_format: Some(vec![
-                            lsp_types::MarkupKind::Markdown,
-                            lsp_types::MarkupKind::PlainText,
-                        ]),
-                    }),
-                    definition: Some(lsp_types::DefinitionClientCapabilities {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    references: Some(lsp_types::ReferenceClientCapabilities {
-                        dynamic_registration: Some(false),
-                    }),
-                    code_action: Some(lsp_types::CodeActionClientCapabilities {
-                        dynamic_registration: Some(false),
-                        data_support: Some(true),
-                        resolve_support: Some(lsp_types::ClientCodeActionResolveOptions {
-                            properties: vec!["edit".to_string()],
-                        }),
-                        // Declare supported action kinds so the server returns
-                        // CodeAction objects (not just legacy Command objects).
-                        code_action_literal_support: Some(
-                            lsp_types::ClientCodeActionLiteralOptions {
-                                code_action_kind: lsp_types::ClientCodeActionKindOptions {
-                                    value_set: vec![
-                                        lsp_types::CodeActionKind::Empty,
-                                        lsp_types::CodeActionKind::QuickFix,
-                                        lsp_types::CodeActionKind::Refactor,
-                                        lsp_types::CodeActionKind::RefactorExtract,
-                                        lsp_types::CodeActionKind::RefactorInline,
-                                        lsp_types::CodeActionKind::RefactorRewrite,
-                                        lsp_types::CodeActionKind::Source,
-                                        lsp_types::CodeActionKind::SourceOrganizeImports,
-                                    ],
-                                },
-                            },
-                        ),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                workspace: Some(lsp_types::WorkspaceClientCapabilities {
-                    workspace_folders: Some(true),
-                    ..Default::default()
-                }),
-                // Required for rust-analyzer to ever emit experimental/serverStatus; other servers ignore this unrecognized key.
-                experimental: Some(serde_json::json!({ "serverStatusNotification": true })),
-                ..Default::default()
-            },
+            capabilities: Self::client_capabilities(&config.position_encodings),
             client_info: Some(ClientInfo {
                 name: "mcpls".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -832,11 +892,13 @@ pub fn fake_lsp_server() -> LspServer {
     let transport = crate::test_lsp::inert_transport();
     let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
     let (_, mock_notification_rx) = mpsc::channel(1);
+    let (_, mock_lifecycle_rx) = mpsc::channel(1);
     LspServer {
         client,
         capabilities: lsp_types::ServerCapabilities::default(),
         position_encoding: PositionEncodingKind::UTF8,
         notification_rx: mock_notification_rx,
+        lifecycle_rx: mock_lifecycle_rx,
         child: None,
     }
 }
@@ -868,12 +930,14 @@ impl LspServer {
     ) -> Self {
         let client = LspClient::new(LspServerConfig::rust_analyzer());
         let (_, notification_rx) = mpsc::channel(1);
+        let (_, lifecycle_rx) = mpsc::channel(1);
 
         Self {
             client,
             capabilities,
             position_encoding,
             notification_rx,
+            lifecycle_rx,
             child: None,
         }
     }
@@ -914,6 +978,22 @@ mod tests {
         assert_eq!(
             result,
             vec![PositionEncodingKind::UTF8, PositionEncodingKind::UTF16]
+        );
+    }
+
+    /// P1/S2: without `window.work_done_progress == Some(true)`, no
+    /// spec-compliant LSP server may ever initiate `$/progress` at all.
+    /// Regression guard: deleting the capability lines in
+    /// `client_capabilities` must fail this test, not silently no-op the
+    /// whole feature with an otherwise-green suite.
+    #[test]
+    fn test_client_capabilities_advertises_work_done_progress() {
+        let capabilities =
+            LspServer::client_capabilities(&["utf-8".to_string(), "utf-16".to_string()]);
+
+        assert_eq!(
+            capabilities.window.and_then(|w| w.work_done_progress),
+            Some(true)
         );
     }
 
@@ -1075,6 +1155,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
@@ -1141,12 +1222,14 @@ mod tests {
         let transport = LspTransport::new(mock_stdin, mock_stdout);
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
         let (_, mock_notification_rx) = mpsc::channel(1);
+        let (_, mock_lifecycle_rx) = mpsc::channel(1);
 
         let mut server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
+            lifecycle_rx: mock_lifecycle_rx,
             child: Some(mock_child),
         };
 
@@ -1171,12 +1254,14 @@ mod tests {
         let transport = crate::test_lsp::inert_transport();
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
         let (_, mock_notification_rx) = mpsc::channel(1);
+        let (_, mock_lifecycle_rx) = mpsc::channel(1);
 
         let server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
+            lifecycle_rx: mock_lifecycle_rx,
             child: None,
         };
 
@@ -1238,12 +1323,14 @@ mod tests {
         let transport1 = crate::test_lsp::inert_transport();
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
         let (_, mock_notification_rx1) = mpsc::channel(1);
+        let (_, mock_lifecycle_rx1) = mpsc::channel(1);
 
         let server1 = LspServer {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx1,
+            lifecycle_rx: mock_lifecycle_rx1,
             child: None,
         };
 
@@ -1263,12 +1350,14 @@ mod tests {
         let transport = crate::test_lsp::inert_transport();
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
         let (_, mock_notification_rx) = mpsc::channel(1);
+        let (_, mock_lifecycle_rx) = mpsc::channel(1);
 
         let server = LspServer {
             client,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
+            lifecycle_rx: mock_lifecycle_rx,
             child: None,
         };
 
@@ -1303,12 +1392,14 @@ mod tests {
             };
             let client = LspClient::from_transport(config.clone(), transport);
             let (_, mock_notification_rx) = mpsc::channel(1);
+            let (_, mock_lifecycle_rx) = mpsc::channel(1);
 
             let server = LspServer {
                 client,
                 capabilities: lsp_types::ServerCapabilities::default(),
                 position_encoding: PositionEncodingKind::UTF8,
                 notification_rx: mock_notification_rx,
+                lifecycle_rx: mock_lifecycle_rx,
                 child: None,
             };
 
@@ -1329,12 +1420,14 @@ mod tests {
         let transport1 = crate::test_lsp::inert_transport();
         let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
         let (_, mock_notification_rx1) = mpsc::channel(1);
+        let (_, mock_lifecycle_rx1) = mpsc::channel(1);
 
         let server1 = LspServer {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx1,
+            lifecycle_rx: mock_lifecycle_rx1,
             child: None,
         };
 
@@ -1344,12 +1437,14 @@ mod tests {
         let transport2 = crate::test_lsp::inert_transport();
         let client2 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport2);
         let (_, mock_notification_rx2) = mpsc::channel(1);
+        let (_, mock_lifecycle_rx2) = mpsc::channel(1);
 
         let server2 = LspServer {
             client: client2,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF16,
             notification_rx: mock_notification_rx2,
+            lifecycle_rx: mock_lifecycle_rx2,
             child: None,
         };
 
@@ -1423,6 +1518,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
             workspace_roots: vec![],
             initialization_options: None,
@@ -1460,6 +1556,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1479,6 +1576,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1498,6 +1596,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1540,6 +1639,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1559,6 +1659,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1819,6 +1920,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1838,6 +1940,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -1868,6 +1971,7 @@ mod tests {
             heuristics: None,
             name: None,
             handles: None,
+            indexing: crate::bridge::IndexingPolicy::Auto,
         }
     }
 
@@ -2005,6 +2109,7 @@ mod tests {
                 heuristics: None,
                 name: Some("pyright-diag".to_string()),
                 handles: Some(vec![ToolKind::Diagnostics]),
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
             LspServerConfig {
                 language_id: "python".to_string(),
@@ -2018,6 +2123,7 @@ mod tests {
                 heuristics: None,
                 name: Some("pylsp".to_string()),
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();

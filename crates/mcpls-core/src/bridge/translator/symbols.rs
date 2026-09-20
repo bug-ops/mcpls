@@ -377,6 +377,7 @@ mod tests {
             heuristics: None,
             name: Some("pyright".to_string()),
             handles: Some(vec![ToolKind::Hover]),
+            indexing: crate::bridge::IndexingPolicy::Auto,
         }];
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);

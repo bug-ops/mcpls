@@ -228,7 +228,11 @@ impl Translator {
     /// regardless of diagnostics-route status: the replacement process has
     /// indexed nothing yet, so a stale `Ready`/`Loading` carried over from
     /// the crashed connection must not leak into
-    /// `Translator::wait_for_indexing_ready` for the new one.
+    /// `Translator::wait_for_indexing_ready` for the new one. Both of the
+    /// replacement's notification lanes are drained and discarded rather
+    /// than wired into a running pump, so it never re-acquires readiness
+    /// state on its own either -- pre-existing, tracked as a follow-up
+    /// (`bug-ops/mcpls#425`).
     ///
     /// A crash-looping server (repeated respawn failures) backs off
     /// exponentially (`RESPAWN_BACKOFF_BASE` up to `RESPAWN_BACKOFF_MAX`)
@@ -290,6 +294,9 @@ impl Translator {
         let new_client = new_server.client().clone();
         let mut notification_rx = new_server.take_notification_rx();
         tokio::spawn(async move { while notification_rx.recv().await.is_some() {} });
+        // Mirrors the notification-lane drain above -- see this fn's doc for why.
+        let mut lifecycle_rx = new_server.take_lifecycle_rx();
+        tokio::spawn(async move { while lifecycle_rx.recv().await.is_some() {} });
 
         let old_client = lock_std(&self.lsp_clients).insert(id.clone(), new_client);
         let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
@@ -508,6 +515,7 @@ sleep __SLEEP__
                     heuristics: None,
                     name: Some(id.to_string()),
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 workspace_roots: vec![],
                 initialization_options: None,
@@ -964,6 +972,7 @@ fi
                     heuristics: None,
                     name: Some("hover-only".to_string()),
                     handles: Some(vec![ToolKind::Hover]),
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 LspServerConfig {
                     language_id: "rust".to_string(),
@@ -977,6 +986,7 @@ fi
                     heuristics: None,
                     name: Some("diag-catchall".to_string()),
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 },
             ];
             let router = ToolRouter::from_configs(configs.iter()).unwrap();

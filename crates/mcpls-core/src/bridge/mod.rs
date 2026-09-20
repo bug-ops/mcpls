@@ -9,15 +9,16 @@ use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 use lsp_types::Uri;
 
 mod encoding;
+mod indexing;
 mod notifications;
 pub mod resources;
 mod state;
 mod translator;
 
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
+pub use indexing::{IndexingPolicy, IndexingState};
 pub use notifications::{
-    DiagnosticInfo, IndexingState, LogEntry, LogLevel, MessageType, NotificationCache,
-    ServerMessage,
+    DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
 pub use resources::ResourceSubscriptions;
 pub(crate) use state::try_path_to_uri;

@@ -210,6 +210,7 @@ impl LspClient {
             command_rx,
             Arc::clone(&pending_requests),
             None,
+            None,
         ));
 
         Self {
@@ -224,12 +225,17 @@ impl LspClient {
 
     /// Create client from transport with notification forwarding.
     ///
-    /// Notifications received from the LSP server will be parsed and sent
-    /// through the provided channel.
+    /// Notifications are parsed and split across two lanes (P3): diagnostics/
+    /// log/showMessage go through `notification_tx`; `$/progress` `begin`/
+    /// `end` frames and unrecognized notifications (`LspNotification::Other`,
+    /// which carries rust-analyzer's `experimental/serverStatus`) go through
+    /// `lifecycle_tx` instead. A `$/progress` `report` frame is never
+    /// enqueued on either lane -- see [`Self::message_loop_inner`].
     pub(crate) fn from_transport_with_notifications(
         config: LspServerConfig,
         transport: LspTransport,
         notification_tx: mpsc::Sender<LspNotification>,
+        lifecycle_tx: mpsc::Sender<LspNotification>,
     ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
@@ -242,6 +248,7 @@ impl LspClient {
             command_rx,
             Arc::clone(&pending_requests),
             Some(notification_tx),
+            Some(lifecycle_tx),
         ));
 
         Self {
@@ -608,6 +615,7 @@ impl LspClient {
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
+        lifecycle_tx: Option<mpsc::Sender<LspNotification>>,
     ) -> Result<()> {
         debug!("Message loop started");
         let result = Self::message_loop_inner(
@@ -615,6 +623,7 @@ impl LspClient {
             &mut command_rx,
             &pending_requests,
             notification_tx.as_ref(),
+            lifecycle_tx.as_ref(),
         )
         .await;
         if let Err(ref e) = result {
@@ -643,11 +652,58 @@ impl LspClient {
         crate::util::truncate_str(message, MAX_ERROR_MESSAGE_LOG_BYTES)
     }
 
+    /// Which of the two notification lanes (P3) `notification` belongs on,
+    /// or `None` if it must be dropped before reaching either.
+    ///
+    /// `notification_tx` (returned as `"notification"`) carries diagnostics/
+    /// log/showMessage; `lifecycle_tx` (returned as `"lifecycle"`) carries
+    /// `$/progress` `begin`/`end` frames and `Other` (which carries e.g.
+    /// rust-analyzer's `experimental/serverStatus`) -- splitting them means
+    /// a high-volume diagnostics publisher can never starve out a
+    /// low-volume readiness signal, or vice versa. The lane name is
+    /// returned alongside the sender purely for the drop-warning log at the
+    /// call site (Fix 6) -- it plays no role in routing.
+    ///
+    /// A `$/progress` `report` frame -- the high-volume case a
+    /// `report`-per-package emitter like gopls can produce -- is classified
+    /// via [`crate::lsp::types::ProgressKind::from_value`] (shared with
+    /// `bridge::indexing::IndexingTracker::observe_progress` so the two
+    /// can't drift out of sync on which `kind`s are recognized -- Fix 9)
+    /// and dropped before it ever reaches either channel (S3). An
+    /// *unparseable* `$/progress` notification
+    /// (e.g. missing the mandatory `token` field) falls back to
+    /// `LspNotification::Other { method: "$/progress", .. }` at parse time
+    /// (`LspNotification::parse`) rather than `Progress`, so it must be
+    /// dropped here too by matching on `method` -- otherwise a server whose
+    /// `report` payloads fail to deserialize could bypass the `kind`-based
+    /// filter above entirely by sending malformed frames (security LOW /
+    /// M1).
+    fn notification_lane<'a>(
+        notification: &LspNotification,
+        notification_tx: Option<&'a mpsc::Sender<LspNotification>>,
+        lifecycle_tx: Option<&'a mpsc::Sender<LspNotification>>,
+    ) -> Option<(&'static str, &'a mpsc::Sender<LspNotification>)> {
+        match notification {
+            LspNotification::PublishDiagnostics(_)
+            | LspNotification::LogMessage(_)
+            | LspNotification::ShowMessage(_) => notification_tx.map(|tx| ("notification", tx)),
+            LspNotification::Progress(params) => {
+                crate::lsp::types::ProgressKind::from_value(&params.value)
+                    .and(lifecycle_tx)
+                    .map(|tx| ("lifecycle", tx))
+            }
+            LspNotification::Other { method, .. } if method.as_ref() == "$/progress" => None,
+            LspNotification::Other { .. } => lifecycle_tx.map(|tx| ("lifecycle", tx)),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn message_loop_inner(
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
+        lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -749,8 +805,9 @@ impl LspClient {
                             // Parse notification into typed variant
                             let typed = LspNotification::parse(&notification.method, notification.params);
 
-                            // Forward to notification handler if sender is available
-                            if let Some(tx) = notification_tx {
+                            let destination = Self::notification_lane(&typed, notification_tx, lifecycle_tx);
+
+                            if let Some((lane, tx)) = destination {
                                 // Log diagnostics count since it's useful for debugging
                                 if let LspNotification::PublishDiagnostics(ref params) = typed {
                                     debug!(
@@ -762,9 +819,13 @@ impl LspClient {
                                     trace!("Forwarding notification: {:?}", typed);
                                 }
 
-                                // Send the notification with backpressure handling
+                                // Names lane and method -- the only diagnostic for a dropped frame.
                                 if tx.try_send(typed).is_err() {
-                                    warn!("Notification channel full or closed, dropping notification");
+                                    warn!(
+                                        "Dropping notification: lane={lane}, method={} \
+                                         (channel full or closed)",
+                                        notification.method
+                                    );
                                 }
                             }
                         }
@@ -805,7 +866,8 @@ impl LspClient {
             | "workspace/semanticTokens/refresh"
             | "workspace/inlayHint/refresh"
             | "workspace/codeLens/refresh"
-            | "window/showMessageRequest" => Ok(Value::Null),
+            | "window/showMessageRequest"
+            | "window/workDoneProgress/create" => Ok(Value::Null),
             "workspace/configuration" => Ok(Self::workspace_configuration_result(params)),
             "workspace/applyEdit" => Ok(serde_json::json!({ "applied": false })),
             _ => Err(JsonRpcError {
@@ -951,6 +1013,107 @@ mod tests {
         })));
 
         assert_eq!(result, serde_json::json!([null, null]));
+    }
+
+    /// P1: without this, no spec-compliant LSP server may ever initiate
+    /// `$/progress` at all (per LSP 3.17, a server needs a successful
+    /// `window/workDoneProgress/create` response before it may report
+    /// server-initiated progress for a token).
+    #[test]
+    fn test_work_done_progress_create_request_is_acknowledged() {
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: RequestId::String("wdp1".to_string()),
+            method: "window/workDoneProgress/create".to_string(),
+            params: Some(serde_json::json!({ "token": "indexing" })),
+        };
+
+        let response = LspClient::server_request_response(request);
+
+        assert_eq!(response.result, Some(Value::Null));
+        assert!(response.error.is_none());
+    }
+
+    /// S3 (Fix 7): a `report`-kind `$/progress` frame must never be
+    /// enqueued on either notification lane -- the actual mechanism
+    /// protecting against a `report`-per-package emitter like gopls
+    /// overrunning the bounded lifecycle channel.
+    #[test]
+    fn test_report_progress_frame_reaches_neither_lane() {
+        let (notification_tx, _notification_rx) = mpsc::channel(8);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
+
+        let report = LspNotification::Progress(lsp_types::ProgressParams {
+            token: lsp_types::ProgressToken::Int(1),
+            value: serde_json::json!({ "kind": "report", "percentage": 50 }),
+        });
+
+        let destination =
+            LspClient::notification_lane(&report, Some(&notification_tx), Some(&lifecycle_tx));
+
+        assert!(
+            destination.is_none(),
+            "a report-kind frame must be dropped before reaching either lane"
+        );
+    }
+
+    /// Fix 3 / M1: an unparseable `$/progress` notification (e.g. missing
+    /// the mandatory `token` field) falls back to `LspNotification::Other {
+    /// method: "$/progress", .. }` at parse time -- this must be dropped
+    /// the same as a well-formed `report` frame, not routed to the
+    /// lifecycle lane, or a server whose payloads fail to deserialize could
+    /// bypass the kind-based filter entirely.
+    #[test]
+    fn test_malformed_progress_other_reaches_neither_lane() {
+        let (notification_tx, _notification_rx) = mpsc::channel(8);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
+
+        let malformed = LspNotification::Other {
+            method: std::borrow::Cow::Borrowed("$/progress"),
+            params: None,
+        };
+
+        let destination =
+            LspClient::notification_lane(&malformed, Some(&notification_tx), Some(&lifecycle_tx));
+
+        assert!(
+            destination.is_none(),
+            "a malformed $/progress frame must be dropped, not routed to the lifecycle lane"
+        );
+    }
+
+    /// P3 sanity check alongside the two tests above: a `begin` frame and a
+    /// genuine `Other` notification (e.g. rust-analyzer's
+    /// `experimental/serverStatus`) must still reach the lifecycle lane --
+    /// the report/malformed filters must not have overcorrected.
+    #[test]
+    fn test_begin_and_other_notifications_reach_lifecycle_lane() {
+        let (notification_tx, _notification_rx) = mpsc::channel(8);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
+
+        let begin = LspNotification::Progress(lsp_types::ProgressParams {
+            token: lsp_types::ProgressToken::Int(1),
+            value: serde_json::json!({ "kind": "begin", "title": "Indexing" }),
+        });
+        assert_eq!(
+            LspClient::notification_lane(&begin, Some(&notification_tx), Some(&lifecycle_tx))
+                .map(|(lane, _)| lane),
+            Some("lifecycle")
+        );
+
+        let server_status = LspNotification::Other {
+            method: std::borrow::Cow::Borrowed("experimental/serverStatus"),
+            params: Some(serde_json::json!({ "quiescent": false })),
+        };
+        assert_eq!(
+            LspClient::notification_lane(
+                &server_status,
+                Some(&notification_tx),
+                Some(&lifecycle_tx)
+            )
+            .map(|(lane, _)| lane),
+            Some("lifecycle")
+        );
     }
 
     #[test]

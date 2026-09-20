@@ -510,6 +510,7 @@ mod tests {
             heuristics: None,
             name: name.map(str::to_string),
             handles,
+            indexing: crate::bridge::IndexingPolicy::Auto,
         }
     }
 
@@ -600,6 +601,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
             LspServerConfig {
                 language_id: "rust".to_string(),
@@ -613,6 +615,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();

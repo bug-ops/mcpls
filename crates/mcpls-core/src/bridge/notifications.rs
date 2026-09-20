@@ -9,6 +9,7 @@ use lsp_types::{Diagnostic as LspDiagnostic, Uri};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::bridge::indexing::{IndexingPolicy, IndexingState, IndexingTracker};
 use crate::config::ServerId;
 use crate::util::{truncate_str, truncate_string};
 
@@ -522,10 +523,11 @@ pub struct NotificationCache {
     /// misreport the cache as fresh again.
     push_degraded: HashSet<ServerId>,
     /// Workspace-indexing readiness per server, driven by recognized
-    /// out-of-band signals (currently rust-analyzer's
-    /// `experimental/serverStatus`) rather than the `initialize`/
-    /// `initialized` handshake. See [`Self::observe_indexing_signal`].
-    indexing: HashMap<ServerId, IndexingEntry>,
+    /// out-of-band signals (rust-analyzer's `experimental/serverStatus`, and
+    /// a generic `$/progress` `begin`/`end` sequence) rather than the
+    /// `initialize`/`initialized` handshake. See
+    /// [`Self::observe_indexing_signal`] and [`Self::observe_progress`].
+    indexing: IndexingTracker,
 }
 
 impl Default for NotificationCache {
@@ -533,62 +535,6 @@ impl Default for NotificationCache {
         Self::new()
     }
 }
-
-/// Workspace-indexing readiness of a routed LSP server.
-///
-/// Tracked separately from the `initialize`/`initialized` handshake
-/// completion (`ServerState::is_ready`). A server can finish the handshake
-/// and still be mid-index for tens of seconds afterward, during which
-/// whole-workspace queries (hover, definition, references, completions,
-/// code actions) can silently return an empty/`null` result
-/// indistinguishable from a genuine "nothing found".
-///
-/// `Unknown` and `Ready` are treated identically by
-/// `Translator::wait_for_indexing_ready` (proceed without waiting): a server
-/// that never emits a recognized readiness signal must never be penalized
-/// with an artificial delay, and the only way to tell "no signal ever comes"
-/// apart from "just hasn't reported yet" would require guessing at a
-/// server's protocol support, so both stay unblocked. Only `Loading` -- a
-/// positive signal that indexing is actively in progress -- triggers a
-/// bounded wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IndexingState {
-    /// No recognized workspace-readiness signal has been observed for this
-    /// server yet.
-    #[default]
-    Unknown,
-    /// A recognized signal reported that indexing is still in progress.
-    Loading,
-    /// A recognized signal reported that the initial workspace load is
-    /// complete.
-    Ready,
-}
-
-/// Custom notification method rust-analyzer uses to report workspace-load
-/// progress; requires opting in at `initialize` (see `LspServer::initialize`).
-const SERVER_STATUS_METHOD: &str = "experimental/serverStatus";
-
-/// Boolean field on a [`SERVER_STATUS_METHOD`] payload: `true` once
-/// rust-analyzer's initial workspace load is complete, `false` while it is
-/// still in progress.
-const QUIESCENT_FIELD: &str = "quiescent";
-
-/// A tracked [`IndexingState`] paired with when it was last confirmed by a
-/// recognized readiness signal.
-#[derive(Debug, Clone, Copy)]
-struct IndexingEntry {
-    state: IndexingState,
-    last_updated: tokio::time::Instant,
-}
-
-/// Once a `Loading` entry has gone this long without a fresh signal, reads
-/// stop trusting it -- see [`NotificationCache::indexing_state`].
-///
-/// Deliberately larger than `navigation::INDEXING_READY_TIMEOUT` (30s) and
-/// anchored to the signal's own age, not to any individual caller's wait:
-/// a caller that times out must never affect another concurrent or later
-/// caller's deadline, only the age of the last real signal does.
-pub(super) const INDEXING_STALENESS_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl NotificationCache {
     /// Create a new notification cache.
@@ -605,7 +551,7 @@ impl NotificationCache {
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
             push_degraded: HashSet::new(),
-            indexing: HashMap::new(),
+            indexing: IndexingTracker::new(),
         }
     }
 
@@ -995,34 +941,28 @@ impl NotificationCache {
         method: &str,
         params: Option<&serde_json::Value>,
     ) {
-        let sticky_ready = self
-            .indexing
-            .get(server_id)
-            .is_some_and(|entry| entry.state == IndexingState::Ready);
-        if sticky_ready {
-            return;
-        }
-        if method != SERVER_STATUS_METHOD {
-            return;
-        }
-        let Some(quiescent) = params
-            .and_then(|p| p.get(QUIESCENT_FIELD))
-            .and_then(serde_json::Value::as_bool)
-        else {
-            return;
-        };
-        let state = if quiescent {
-            IndexingState::Ready
-        } else {
-            IndexingState::Loading
-        };
-        self.indexing.insert(
-            server_id.clone(),
-            IndexingEntry {
-                state,
-                last_updated: tokio::time::Instant::now(),
-            },
-        );
+        self.indexing
+            .observe_server_status(server_id, method, params);
+    }
+
+    /// Record a `$/progress` notification toward `server_id`'s tracked
+    /// [`IndexingState`] -- the generic LSP counterpart to
+    /// [`Self::observe_indexing_signal`]'s rust-analyzer-specific
+    /// `experimental/serverStatus`. See
+    /// [`crate::bridge::indexing::IndexingTracker::observe_progress`] for
+    /// the full begin/end/settle/latch transition rules.
+    pub(crate) fn observe_progress(
+        &mut self,
+        server_id: &ServerId,
+        params: &lsp_types::ProgressParams,
+    ) {
+        self.indexing.observe_progress(server_id, params);
+    }
+
+    /// Configure `server_id`'s [`IndexingPolicy`] -- see
+    /// [`crate::bridge::indexing::IndexingTracker::set_policy`].
+    pub(crate) fn set_indexing_policy(&mut self, server_id: ServerId, policy: IndexingPolicy) {
+        self.indexing.set_policy(server_id, policy);
     }
 
     /// Current tracked workspace-indexing readiness for `server_id`.
@@ -1039,16 +979,7 @@ impl NotificationCache {
     /// `Translator::wait_for_indexing_ready`.
     #[must_use]
     pub fn indexing_state(&self, server_id: &ServerId) -> IndexingState {
-        match self.indexing.get(server_id) {
-            Some(entry)
-                if entry.state == IndexingState::Loading
-                    && entry.last_updated.elapsed() >= INDEXING_STALENESS_BOUND =>
-            {
-                IndexingState::Unknown
-            }
-            Some(entry) => entry.state,
-            None => IndexingState::Unknown,
-        }
+        self.indexing.state(server_id)
     }
 
     /// Forget `server_id`'s tracked [`IndexingState`], reverting it to
@@ -1078,7 +1009,7 @@ impl NotificationCache {
     /// assert_eq!(cache.indexing_state(&id), IndexingState::Unknown);
     /// ```
     pub fn reset_indexing_state(&mut self, server_id: &ServerId) {
-        self.indexing.remove(server_id);
+        self.indexing.reset(server_id);
     }
 
     /// Get diagnostics for a document URI.
@@ -2718,6 +2649,8 @@ mod tests {
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
     }
 
+    // Transition logic is unit-tested in `bridge::indexing`; these tests only cover delegation wiring.
+
     #[test]
     fn test_indexing_state_defaults_unknown() {
         let cache = NotificationCache::new();
@@ -2725,7 +2658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_observe_indexing_signal_quiescent_false_marks_loading() {
+    fn test_observe_indexing_signal_delegates_to_tracker() {
         let mut cache = NotificationCache::new();
         let server = test_server();
         cache.observe_indexing_signal(
@@ -2737,145 +2670,15 @@ mod tests {
     }
 
     #[test]
-    fn test_observe_indexing_signal_quiescent_true_marks_ready() {
+    fn test_reset_indexing_state_delegates_to_tracker() {
         let mut cache = NotificationCache::new();
         let server = test_server();
         cache.observe_indexing_signal(
             &server,
             "experimental/serverStatus",
-            Some(&serde_json::json!({"quiescent": true})),
+            Some(&serde_json::json!({"quiescent": false})),
         );
-        assert_eq!(cache.indexing_state(&server), IndexingState::Ready);
-    }
-
-    #[test]
-    fn test_observe_indexing_signal_ignores_unrecognized_method() {
-        let mut cache = NotificationCache::new();
-        let server = test_server();
-        cache.observe_indexing_signal(
-            &server,
-            "$/some/other/notification",
-            Some(&serde_json::json!({"quiescent": true})),
-        );
+        cache.reset_indexing_state(&server);
         assert_eq!(cache.indexing_state(&server), IndexingState::Unknown);
-    }
-
-    #[test]
-    fn test_observe_indexing_signal_ignores_malformed_payload() {
-        let mut cache = NotificationCache::new();
-        let server = test_server();
-        cache.observe_indexing_signal(
-            &server,
-            "experimental/serverStatus",
-            Some(&serde_json::json!({"health": "ok"})),
-        );
-        assert_eq!(cache.indexing_state(&server), IndexingState::Unknown);
-
-        cache.observe_indexing_signal(&server, "experimental/serverStatus", None);
-        assert_eq!(cache.indexing_state(&server), IndexingState::Unknown);
-    }
-
-    /// Once a server reaches `Ready`, a later `quiescent: false` (e.g. from
-    /// a stray/duplicate notification) must not regress it back to
-    /// `Loading` -- this feature only tracks the *initial* workspace load.
-    #[test]
-    fn test_observe_indexing_signal_ready_is_sticky() {
-        let mut cache = NotificationCache::new();
-        let server = test_server();
-        cache.observe_indexing_signal(
-            &server,
-            "experimental/serverStatus",
-            Some(&serde_json::json!({"quiescent": true})),
-        );
-        cache.observe_indexing_signal(
-            &server,
-            "experimental/serverStatus",
-            Some(&serde_json::json!({"quiescent": false})),
-        );
-        assert_eq!(cache.indexing_state(&server), IndexingState::Ready);
-    }
-
-    #[test]
-    fn test_observe_indexing_signal_tracks_servers_independently() {
-        let mut cache = NotificationCache::new();
-        let rust: ServerId = "rust-analyzer".into();
-        let python: ServerId = "pyright".into();
-        cache.observe_indexing_signal(
-            &rust,
-            "experimental/serverStatus",
-            Some(&serde_json::json!({"quiescent": false})),
-        );
-        assert_eq!(cache.indexing_state(&rust), IndexingState::Loading);
-        assert_eq!(cache.indexing_state(&python), IndexingState::Unknown);
-    }
-
-    /// The read-time self-heal for a stuck `Loading` signal: once an entry
-    /// has gone `INDEXING_STALENESS_BOUND` without a fresh update, it must
-    /// read back as `Unknown`, not `Loading` -- see `Translator::wait_for_indexing_ready`'s
-    /// doc for why this must live here (keyed to the signal's own age) and
-    /// not in any individual caller's timeout handler.
-    #[tokio::test(start_paused = true)]
-    async fn test_indexing_state_treats_stale_loading_as_unknown() {
-        let mut cache = NotificationCache::new();
-        let server = test_server();
-        cache.observe_indexing_signal(
-            &server,
-            "experimental/serverStatus",
-            Some(&serde_json::json!({"quiescent": false})),
-        );
-        assert_eq!(cache.indexing_state(&server), IndexingState::Loading);
-
-        tokio::time::advance(
-            INDEXING_STALENESS_BOUND.saturating_sub(std::time::Duration::from_secs(1)),
-        )
-        .await;
-        assert_eq!(
-            cache.indexing_state(&server),
-            IndexingState::Loading,
-            "must still read as Loading just under the staleness bound"
-        );
-
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
-        assert_eq!(
-            cache.indexing_state(&server),
-            IndexingState::Unknown,
-            "a Loading entry older than INDEXING_STALENESS_BOUND must read back as Unknown"
-        );
-    }
-
-    /// A fresh `observe_indexing_signal` call resets the staleness clock,
-    /// not just the state -- a server that keeps reporting `Loading` every
-    /// few seconds (still legitimately indexing) must not be treated as
-    /// stale just because its *first* signal is old.
-    #[tokio::test(start_paused = true)]
-    async fn test_observe_indexing_signal_refreshes_staleness_clock() {
-        let mut cache = NotificationCache::new();
-        let server = test_server();
-        cache.observe_indexing_signal(
-            &server,
-            "experimental/serverStatus",
-            Some(&serde_json::json!({"quiescent": false})),
-        );
-
-        tokio::time::advance(
-            INDEXING_STALENESS_BOUND.saturating_sub(std::time::Duration::from_secs(1)),
-        )
-        .await;
-        // A fresh signal just before staleness would kick in.
-        cache.observe_indexing_signal(
-            &server,
-            "experimental/serverStatus",
-            Some(&serde_json::json!({"quiescent": false})),
-        );
-
-        tokio::time::advance(
-            INDEXING_STALENESS_BOUND.saturating_sub(std::time::Duration::from_secs(1)),
-        )
-        .await;
-        assert_eq!(
-            cache.indexing_state(&server),
-            IndexingState::Loading,
-            "a refreshed signal must reset the staleness clock, not just the state"
-        );
     }
 }

@@ -593,6 +593,7 @@ mod tests {
             heuristics: None,
             name: None,
             handles: None,
+            indexing: crate::bridge::IndexingPolicy::Auto,
         };
 
         let translator = Translator::new()
@@ -680,6 +681,7 @@ mod tests {
             heuristics: None,
             name: None,
             handles: None,
+            indexing: crate::bridge::IndexingPolicy::Auto,
         };
         let translator = Translator::new()
             .with_extensions(extension_map)
@@ -939,6 +941,7 @@ mod tests {
                 heuristics: None,
                 name: Some("pyright".to_string()),
                 handles: Some(vec![ToolKind::Hover]),
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
             LspServerConfig {
                 language_id: "python".to_string(),
@@ -952,6 +955,7 @@ mod tests {
                 heuristics: None,
                 name: Some("pylsp".to_string()),
                 handles: Some(vec![ToolKind::Diagnostics]),
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();
