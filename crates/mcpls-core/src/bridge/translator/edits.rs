@@ -107,11 +107,116 @@ fn validate_rename_params(new_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Convert a raw LSP `WorkspaceEdit` into MCP `DocumentChanges`.
+///
+/// Prefers the legacy `changes` map (`HashMap<Uri, Vec<TextEdit>>`) and falls
+/// back to `documentChanges` (the array form some servers, e.g.
+/// rust-analyzer, use instead) only when `changes` is absent or empty. This
+/// order is safe because mcpls's advertised client capabilities
+/// (`lsp/lifecycle.rs`) do not set `workspace.workspaceEdit.documentChanges`,
+/// so per LSP 3.17 a spec-compliant server must always populate `changes`;
+/// the `documentChanges`-only fallback exists solely for common
+/// non-compliant servers (e.g. rust-analyzer), and the branch where both are
+/// present and non-empty is effectively dead in practice -- do not "fix"
+/// this to prefer `documentChanges` first without first advertising that
+/// capability. An entry outside `workspace_roots` is dropped rather than
+/// rewritten into the response -- see [`crate::bridge::uri_in_workspace_roots`].
+/// `edit_kind` names the caller for the dropped-entry log line (e.g.
+/// `"rename edit"`, `"code-action edit"`).
+async fn convert_workspace_edit(
+    edit: lsp_types::WorkspaceEdit,
+    ctx: &EncodingCtx,
+    workspace_roots: &[PathBuf],
+    edit_kind: &str,
+) -> Vec<DocumentChanges> {
+    let mut result_changes = Vec::new();
+
+    if let Some(changes_map) = edit.changes {
+        for (uri, edits) in changes_map {
+            if !uri_in_workspace_roots(&uri, workspace_roots) {
+                tracing::warn!(uri = uri.as_ref(), "dropping out-of-workspace {edit_kind}");
+                continue;
+            }
+            let mut text_edits = Vec::with_capacity(edits.len());
+            for e in edits {
+                text_edits.push(TextEdit {
+                    range: ctx.normalize_range(&uri, e.range).await,
+                    new_text: e.new_text,
+                });
+            }
+            result_changes.push(DocumentChanges {
+                uri: uri.to_string(),
+                edits: text_edits,
+            });
+        }
+    }
+
+    if result_changes.is_empty() {
+        let text_doc_edits: Vec<lsp_types::TextDocumentEdit> = edit
+            .document_changes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|change| match change {
+                lsp_types::DocumentChange::TextDocumentEdit(e) => Some(e),
+                lsp_types::DocumentChange::CreateFile(_)
+                | lsp_types::DocumentChange::RenameFile(_)
+                | lsp_types::DocumentChange::DeleteFile(_) => {
+                    tracing::debug!("dropping unsupported file-operation document change");
+                    None
+                }
+            })
+            .collect();
+        for tde in text_doc_edits {
+            let edit_uri = &tde.text_document.text_document_identifier.uri;
+            if !uri_in_workspace_roots(edit_uri, workspace_roots) {
+                tracing::warn!(
+                    uri = edit_uri.as_ref(),
+                    "dropping out-of-workspace {edit_kind}"
+                );
+                continue;
+            }
+            let mut text_edits = Vec::with_capacity(tde.edits.len());
+            for one_of in tde.edits {
+                let text_edit = match one_of {
+                    lsp_types::Edit::TextEdit(te) => TextEdit {
+                        range: ctx.normalize_range(edit_uri, te.range).await,
+                        new_text: te.new_text,
+                    },
+                    lsp_types::Edit::AnnotatedTextEdit(ate) => TextEdit {
+                        range: ctx.normalize_range(edit_uri, ate.text_edit.range).await,
+                        new_text: ate.text_edit.new_text,
+                    },
+                    // Snippet edits are an LSP 3.18 addition mcpls does not
+                    // advertise support for (`WorkspaceEditClientCapabilities`
+                    // carries no `snippetEditSupport`). A server can still send
+                    // one; its `new_text` would carry literal snippet
+                    // placeholder syntax (e.g. `${1:name}`), which would be
+                    // written into the user's file as-is if treated as plain
+                    // text -- this is dropped instead, consistent with how
+                    // `CreateFile`/`RenameFile`/`DeleteFile` are already
+                    // dropped above rather than mistranslated.
+                    lsp_types::Edit::SnippetTextEdit(_) => {
+                        tracing::debug!("dropping unsupported snippet text edit");
+                        continue;
+                    }
+                };
+                text_edits.push(text_edit);
+            }
+            result_changes.push(DocumentChanges {
+                uri: edit_uri.to_string(),
+                edits: text_edits,
+            });
+        }
+    }
+
+    result_changes
+}
+
 /// Convert LSP code action to MCP code action. `uri` is the queried
 /// document's own URI, used for the action's `diagnostics` (always scoped to
-/// the requested document); `edit.changes` carries its own per-file URIs,
-/// each checked against `workspace_roots` before being trusted -- see
-/// [`crate::bridge::uri_in_workspace_roots`].
+/// the requested document); `edit`'s per-file URIs (from either `changes` or
+/// `documentChanges`) are each checked against `workspace_roots` before being
+/// trusted -- see [`crate::bridge::uri_in_workspace_roots`].
 async fn convert_code_action(
     action: lsp_types::CodeAction,
     ctx: &EncodingCtx,
@@ -131,33 +236,8 @@ async fn convert_code_action(
 
     let edit = match action.edit {
         Some(edit) => {
-            let changes = match edit.changes {
-                Some(changes_map) => {
-                    let mut result = Vec::with_capacity(changes_map.len());
-                    for (uri, edits) in changes_map {
-                        if !uri_in_workspace_roots(&uri, workspace_roots) {
-                            tracing::warn!(
-                                uri = uri.as_ref(),
-                                "dropping out-of-workspace code-action edit"
-                            );
-                            continue;
-                        }
-                        let mut text_edits = Vec::with_capacity(edits.len());
-                        for e in edits {
-                            text_edits.push(TextEdit {
-                                range: ctx.normalize_range(&uri, e.range).await,
-                                new_text: e.new_text,
-                            });
-                        }
-                        result.push(DocumentChanges {
-                            uri: uri.to_string(),
-                            edits: text_edits,
-                        });
-                    }
-                    result
-                }
-                None => Vec::new(),
-            };
+            let changes =
+                convert_workspace_edit(edit, ctx, workspace_roots, "code-action edit").await;
             Some(WorkspaceEditDescription { changes })
         }
         None => None,
@@ -237,86 +317,7 @@ impl Translator {
             .await?;
 
         let changes = if let Some(edit) = response {
-            let mut result_changes = Vec::new();
-
-            // Prefer the legacy `changes` map (HashMap<Uri, Vec<TextEdit>>).
-            // An entry outside the workspace is dropped rather than rewritten
-            // into the client's response -- see `uri_in_workspace_roots`.
-            if let Some(changes_map) = edit.changes {
-                for (uri, edits) in changes_map {
-                    if !uri_in_workspace_roots(&uri, &self.workspace_roots) {
-                        tracing::warn!(uri = uri.as_ref(), "dropping out-of-workspace rename edit");
-                        continue;
-                    }
-                    let mut text_edits = Vec::with_capacity(edits.len());
-                    for e in edits {
-                        text_edits.push(TextEdit {
-                            range: ctx.normalize_range(&uri, e.range).await,
-                            new_text: e.new_text,
-                        });
-                    }
-                    result_changes.push(DocumentChanges {
-                        uri: uri.to_string(),
-                        edits: text_edits,
-                    });
-                }
-            }
-
-            // Also handle `documentChanges` (array format returned by rust-analyzer).
-            if result_changes.is_empty() {
-                let text_doc_edits: Vec<lsp_types::TextDocumentEdit> = edit
-                    .document_changes
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|change| match change {
-                        lsp_types::DocumentChange::TextDocumentEdit(e) => Some(e),
-                        lsp_types::DocumentChange::CreateFile(_)
-                        | lsp_types::DocumentChange::RenameFile(_)
-                        | lsp_types::DocumentChange::DeleteFile(_) => None,
-                    })
-                    .collect();
-                for tde in text_doc_edits {
-                    let edit_uri = &tde.text_document.text_document_identifier.uri;
-                    if !uri_in_workspace_roots(edit_uri, &self.workspace_roots) {
-                        tracing::warn!(
-                            uri = edit_uri.as_ref(),
-                            "dropping out-of-workspace rename edit"
-                        );
-                        continue;
-                    }
-                    let mut text_edits = Vec::with_capacity(tde.edits.len());
-                    for one_of in tde.edits {
-                        let text_edit = match one_of {
-                            lsp_types::Edit::TextEdit(te) => TextEdit {
-                                range: ctx.normalize_range(edit_uri, te.range).await,
-                                new_text: te.new_text,
-                            },
-                            lsp_types::Edit::AnnotatedTextEdit(ate) => TextEdit {
-                                range: ctx.normalize_range(edit_uri, ate.text_edit.range).await,
-                                new_text: ate.text_edit.new_text,
-                            },
-                            // Snippet edits are an LSP 3.18 addition mcpls does not
-                            // advertise support for (`WorkspaceEditClientCapabilities`
-                            // carries no `snippetEditSupport`). A server can still send
-                            // one; its `new_text` would carry literal snippet
-                            // placeholder syntax (e.g. `${1:name}`), which would be
-                            // written into the user's file as-is if treated as plain
-                            // text -- this is the one tool that rewrites files, so the
-                            // edit is dropped instead, consistent with how
-                            // `CreateFile`/`RenameFile`/`DeleteFile` are already
-                            // dropped above rather than mistranslated.
-                            lsp_types::Edit::SnippetTextEdit(_) => continue,
-                        };
-                        text_edits.push(text_edit);
-                    }
-                    result_changes.push(DocumentChanges {
-                        uri: edit_uri.to_string(),
-                        edits: text_edits,
-                    });
-                }
-            }
-
-            result_changes
+            convert_workspace_edit(edit, &ctx, &self.workspace_roots, "rename edit").await
         } else {
             vec![]
         };
@@ -1118,6 +1119,209 @@ mod tests {
         assert_eq!(edit.changes[0].edits.len(), 1);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
         assert!(result.is_preferred);
+    }
+
+    /// #429: a `codeAction` response carrying only `documentChanges` (the
+    /// array form some servers, e.g. rust-analyzer, use instead of the
+    /// legacy `changes` map) must still populate the action's edit list
+    /// rather than silently dropping it.
+    #[tokio::test]
+    async fn test_convert_code_action_with_document_changes_only() {
+        let uri = lsp_types::Uri::from("file:///test.rs");
+        let text_document_edit = lsp_types::TextDocumentEdit {
+            text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                version: Some(1),
+                text_document_identifier: TextDocumentIdentifier { uri },
+            },
+            edits: vec![lsp_types::Edit::TextEdit(lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                new_text: "fixed".to_string(),
+            })],
+        };
+
+        let lsp_action = lsp_types::CodeAction {
+            title: "Apply fix via documentChanges".to_string(),
+            kind: Some(lsp_types::CodeActionKind::QuickFix),
+            diagnostics: None,
+            edit: Some(lsp_types::WorkspaceEdit {
+                changes: None,
+                document_changes: Some(vec![lsp_types::DocumentChange::TextDocumentEdit(
+                    text_document_edit,
+                )]),
+                change_annotations: None,
+            }),
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            tags: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
+        assert!(result.edit.is_some());
+        let edit = result.edit.unwrap();
+        assert_eq!(edit.changes.len(), 1);
+        assert_eq!(edit.changes[0].uri, "file:///test.rs");
+        assert_eq!(edit.changes[0].edits.len(), 1);
+        assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
+        assert!(result.is_preferred);
+    }
+
+    /// #429 companion: when a `WorkspaceEdit` carries both `changes` and
+    /// `documentChanges`, `changes` must win and `documentChanges` must be
+    /// ignored -- matching the precedence `convert_workspace_edit` already
+    /// applies for `handle_rename`.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn test_convert_code_action_changes_takes_precedence_over_document_changes() {
+        use std::collections::HashMap;
+
+        let changes_uri = lsp_types::Uri::from("file:///changes.rs");
+        let mut changes_map = HashMap::new();
+        changes_map.insert(
+            changes_uri,
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                new_text: "from_changes".to_string(),
+            }],
+        );
+
+        let document_changes_uri = lsp_types::Uri::from("file:///document_changes.rs");
+        let text_document_edit = lsp_types::TextDocumentEdit {
+            text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                version: Some(1),
+                text_document_identifier: TextDocumentIdentifier {
+                    uri: document_changes_uri,
+                },
+            },
+            edits: vec![lsp_types::Edit::TextEdit(lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                new_text: "from_document_changes".to_string(),
+            })],
+        };
+
+        let lsp_action = lsp_types::CodeAction {
+            title: "Apply fix".to_string(),
+            kind: Some(lsp_types::CodeActionKind::QuickFix),
+            diagnostics: None,
+            edit: Some(lsp_types::WorkspaceEdit {
+                changes: Some(changes_map),
+                document_changes: Some(vec![lsp_types::DocumentChange::TextDocumentEdit(
+                    text_document_edit,
+                )]),
+                change_annotations: None,
+            }),
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            tags: None,
+            data: None,
+        };
+
+        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
+        let edit = result.edit.unwrap();
+        assert_eq!(
+            edit.changes.len(),
+            1,
+            "only the `changes` entry should be present"
+        );
+        assert_eq!(edit.changes[0].uri, "file:///changes.rs");
+        assert_eq!(edit.changes[0].edits[0].new_text, "from_changes");
+    }
+
+    /// #429 companion / #415 parity: a `documentChanges` entry whose URI
+    /// falls outside every configured workspace root must be dropped, the
+    /// same trust-boundary check `changes` entries already get.
+    #[tokio::test]
+    async fn test_convert_code_action_document_changes_drops_out_of_workspace_entry() {
+        use url::Url;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let inside_path = dir.path().join("inside.rs");
+        fs::write(&inside_path, "fn inside() {}").unwrap();
+        let inside_uri_string = Url::from_file_path(&inside_path).unwrap().to_string();
+        let inside_uri = lsp_types::Uri::from(inside_uri_string.as_str());
+        let outside_uri = lsp_types::Uri::from("file:///outside/workspace/evil.rs");
+
+        let make_edit = |uri: lsp_types::Uri, new_text: &str| {
+            lsp_types::DocumentChange::TextDocumentEdit(lsp_types::TextDocumentEdit {
+                text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                    version: Some(1),
+                    text_document_identifier: TextDocumentIdentifier { uri },
+                },
+                edits: vec![lsp_types::Edit::TextEdit(lsp_types::TextEdit {
+                    range: lsp_types::Range {
+                        start: lsp_types::Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: lsp_types::Position {
+                            line: 0,
+                            character: 3,
+                        },
+                    },
+                    new_text: new_text.to_string(),
+                })],
+            })
+        };
+
+        let lsp_action = lsp_types::CodeAction {
+            title: "Apply fix".to_string(),
+            kind: Some(lsp_types::CodeActionKind::QuickFix),
+            diagnostics: None,
+            edit: Some(lsp_types::WorkspaceEdit {
+                changes: None,
+                document_changes: Some(vec![
+                    make_edit(inside_uri, "fixed"),
+                    make_edit(outside_uri, "evil"),
+                ]),
+                change_annotations: None,
+            }),
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            tags: None,
+            data: None,
+        };
+
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let result =
+            convert_code_action(lsp_action, &test_ctx(), &test_uri(), &workspace_roots).await;
+        let edit = result.edit.unwrap();
+        assert_eq!(
+            edit.changes.len(),
+            1,
+            "the out-of-workspace entry must be dropped, not forwarded"
+        );
+        assert_eq!(edit.changes[0].uri, inside_uri_string);
+        assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
     }
 
     #[tokio::test]
