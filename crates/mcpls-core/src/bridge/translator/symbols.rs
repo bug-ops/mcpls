@@ -8,7 +8,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
 use super::encoding_ctx::EncodingCtx;
-use super::routing::IndexingGate;
+use super::routing::{Capability, IndexingGate};
 use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ToolKind};
 use crate::error::{Error, Result};
@@ -92,16 +92,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::DocumentSymbols,
-                "documentSymbolProvider",
-                |caps| {
-                    matches!(
-                        caps.document_symbol_provider,
-                        Some(
-                            lsp_types::DocumentSymbolProvider::Bool(true)
-                                | lsp_types::DocumentSymbolProvider::DocumentSymbolOptions(_)
-                        )
-                    )
-                },
+                Capability::DocumentSymbols,
                 IndexingGate::NotRequired,
             )
             .await?;
@@ -207,15 +198,7 @@ impl Translator {
                 Error::NoServerConfigured
             }
         })?;
-        self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
-            matches!(
-                caps.workspace_symbol_provider,
-                Some(
-                    lsp_types::WorkspaceSymbolProvider::Bool(true)
-                        | lsp_types::WorkspaceSymbolProvider::WorkspaceSymbolOptions(_)
-                )
-            )
-        })?;
+        self.require_capability(&server_id, Capability::WorkspaceSymbols)?;
 
         let params = LspWorkspaceSymbolParams {
             query,

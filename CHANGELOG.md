@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`LspNotification::Progress`** — Breaking change: now wraps `lsp_types::ProgressParams` instead of a bare `{ token, value }` pair. (#433)
 - rust-analyzer's pre-`experimental/serverStatus` startup now also gates whole-workspace queries, since it emits `$/progress` during that window too; previously that window was ungated. (#433)
 - Accepted cost: for a server that emits per-request `$/progress` (e.g. gopls, pyright), every whole-workspace query landing within 3s after any of that server's `$/progress` `end` frames now waits out that settle window, not just queries during the initial workspace load — a deliberate trade-off to keep the multi-phase-load re-gating correct; bounded, and avoidable per server via `indexing = "disabled"`. (#433)
+- `LspClient` gained `notify_typed`, deriving the LSP method string from the notification's `lsp_types::Notification` type instead of a hand-picked string; the initialize/initialized/shutdown/exit handshake and document open/change notifications now go through the typed request/notification API. (#436)
+- Replaced the `&'static str` + closure pair used to gate MCP tool calls on LSP server capabilities with a single `Capability` enum, so the reported capability name and the check that verifies it can no longer drift apart. (#436)
 
 ### Fixed
 

@@ -12,24 +12,9 @@ use super::dto::{
     OutgoingCall, OutgoingCallsResult, Position,
 };
 use super::encoding_ctx::EncodingCtx;
-use super::routing::{IndexingGate, MAX_POSITION_VALUE};
+use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
-
-/// Whether a server's capabilities advertise `callHierarchyProvider` support.
-///
-/// Shared by `handle_call_hierarchy_prepare`, `handle_incoming_calls`, and
-/// `handle_outgoing_calls`, which all gate on the same capability field.
-const fn call_hierarchy_provider_supported(caps: &lsp_types::ServerCapabilities) -> bool {
-    matches!(
-        caps.call_hierarchy_provider,
-        Some(
-            lsp_types::CallHierarchyProvider::Bool(true)
-                | lsp_types::CallHierarchyProvider::CallHierarchyOptions(_)
-                | lsp_types::CallHierarchyProvider::CallHierarchyRegistrationOptions(_)
-        )
-    )
-}
 
 /// Parsed form of an MCP-facing `CallHierarchyItemResult` JSON value (1-based
 /// coordinates), before its ranges are converted back to the routed server's
@@ -140,8 +125,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::CallHierarchy,
-                "callHierarchyProvider",
-                call_hierarchy_provider_supported,
+                Capability::CallHierarchy,
                 IndexingGate::NotRequired,
             )
             .await?;
@@ -198,11 +182,7 @@ impl Translator {
         let (server_id, client) = self
             .resolve_client_for_file(&path, ToolKind::CallHierarchy)
             .await?;
-        self.require_capability(
-            &server_id,
-            "callHierarchyProvider",
-            call_hierarchy_provider_supported,
-        )?;
+        self.require_capability(&server_id, Capability::CallHierarchy)?;
         let ctx = self.encoding_ctx(&server_id);
         let lsp_item = call_hierarchy_item_to_lsp(parsed, &ctx).await;
 
@@ -264,11 +244,7 @@ impl Translator {
         let (server_id, client) = self
             .resolve_client_for_file(&path, ToolKind::CallHierarchy)
             .await?;
-        self.require_capability(
-            &server_id,
-            "callHierarchyProvider",
-            call_hierarchy_provider_supported,
-        )?;
+        self.require_capability(&server_id, Capability::CallHierarchy)?;
         let ctx = self.encoding_ctx(&server_id);
         // Per the LSP spec, an outgoing call's `fromRanges` are ranges within
         // the *queried* item's own document, not the callee's (`call.to.uri`).

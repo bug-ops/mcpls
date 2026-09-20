@@ -16,7 +16,7 @@ use super::dto::{
     Position, RenameResult, TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
-use super::routing::{IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
+use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
 use crate::bridge::uri_in_workspace_roots;
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
@@ -427,16 +427,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Rename,
-                "renameProvider",
-                |caps| {
-                    matches!(
-                        caps.rename_provider,
-                        Some(
-                            lsp_types::RenameProvider::Bool(true)
-                                | lsp_types::RenameProvider::RenameOptions(_)
-                        )
-                    )
-                },
+                Capability::Rename,
                 IndexingGate::Required,
             )
             .await?;
@@ -481,18 +472,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::FormatDocument,
-                "documentFormattingProvider",
-                |caps| {
-                    matches!(
-                        caps.document_formatting_provider,
-                        Some(
-                            lsp_types::DocumentFormattingProvider::Bool(true)
-                                | lsp_types::DocumentFormattingProvider::DocumentFormattingOptions(
-                                    _
-                                )
-                        )
-                    )
-                },
+                Capability::FormatDocument,
                 IndexingGate::NotRequired,
             )
             .await?;
@@ -555,16 +535,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::CodeActions,
-                "codeActionProvider",
-                |caps| {
-                    matches!(
-                        caps.code_action_provider,
-                        Some(
-                            lsp_types::CodeActionProvider::Bool(true)
-                                | lsp_types::CodeActionProvider::CodeActionOptions(_)
-                        )
-                    )
-                },
+                Capability::CodeActions,
                 IndexingGate::Required,
             )
             .await?;

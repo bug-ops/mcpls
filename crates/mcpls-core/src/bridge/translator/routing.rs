@@ -66,6 +66,170 @@ pub(super) enum IndexingGate {
     NotRequired,
 }
 
+/// An LSP server capability mcpls gates a tool on before dispatching its
+/// request, tying the [`ServerCapabilities`](lsp_types::ServerCapabilities)
+/// field name (used only for the error message, via [`Self::name`]) to the
+/// predicate that actually checks it (via [`Self::is_supported`]) so the two
+/// cannot drift apart the way two independent, hand-picked call-site values
+/// could.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// `completionProvider` (`textDocument/completion`).
+    Completions,
+    /// `signatureHelpProvider` (`textDocument/signatureHelp`).
+    SignatureHelp,
+    /// `inlayHintProvider` (`textDocument/inlayHint`).
+    InlayHints,
+    /// `hoverProvider` (`textDocument/hover`).
+    Hover,
+    /// `definitionProvider` (`textDocument/definition`).
+    Definition,
+    /// `referencesProvider` (`textDocument/references`).
+    References,
+    /// `implementationProvider` (`textDocument/implementation`).
+    Implementation,
+    /// `typeDefinitionProvider` (`textDocument/typeDefinition`).
+    TypeDefinition,
+    /// `callHierarchyProvider` (`textDocument/prepareCallHierarchy`,
+    /// `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`).
+    CallHierarchy,
+    /// `renameProvider` (`textDocument/rename`).
+    Rename,
+    /// `documentFormattingProvider` (`textDocument/formatting`).
+    FormatDocument,
+    /// `codeActionProvider` (`textDocument/codeAction`).
+    CodeActions,
+    /// `documentSymbolProvider` (`textDocument/documentSymbol`).
+    DocumentSymbols,
+    /// `workspaceSymbolProvider` (`workspace/symbol`).
+    WorkspaceSymbols,
+}
+
+impl Capability {
+    /// The `ServerCapabilities` field name, as reported to the MCP caller in
+    /// [`Error::CapabilityNotSupported`].
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Completions => "completionProvider",
+            Self::SignatureHelp => "signatureHelpProvider",
+            Self::InlayHints => "inlayHintProvider",
+            Self::Hover => "hoverProvider",
+            Self::Definition => "definitionProvider",
+            Self::References => "referencesProvider",
+            Self::Implementation => "implementationProvider",
+            Self::TypeDefinition => "typeDefinitionProvider",
+            Self::CallHierarchy => "callHierarchyProvider",
+            Self::Rename => "renameProvider",
+            Self::FormatDocument => "documentFormattingProvider",
+            Self::CodeActions => "codeActionProvider",
+            Self::DocumentSymbols => "documentSymbolProvider",
+            Self::WorkspaceSymbols => "workspaceSymbolProvider",
+        }
+    }
+
+    /// Whether `caps` advertises support for this capability.
+    pub(crate) const fn is_supported(self, caps: &lsp_types::ServerCapabilities) -> bool {
+        match self {
+            Self::Completions => caps.completion_provider.is_some(),
+            Self::SignatureHelp => caps.signature_help_provider.is_some(),
+            Self::InlayHints => matches!(
+                caps.inlay_hint_provider,
+                Some(
+                    lsp_types::InlayHintProvider::Bool(true)
+                        | lsp_types::InlayHintProvider::InlayHintOptions(_)
+                        | lsp_types::InlayHintProvider::InlayHintRegistrationOptions(_)
+                )
+            ),
+            Self::Hover => matches!(
+                caps.hover_provider,
+                Some(
+                    lsp_types::HoverProvider::Bool(true)
+                        | lsp_types::HoverProvider::HoverOptions(_)
+                )
+            ),
+            Self::Definition => matches!(
+                caps.definition_provider,
+                Some(
+                    lsp_types::DefinitionProvider::Bool(true)
+                        | lsp_types::DefinitionProvider::DefinitionOptions(_)
+                )
+            ),
+            Self::References => matches!(
+                caps.references_provider,
+                Some(
+                    lsp_types::ReferencesProvider::Bool(true)
+                        | lsp_types::ReferencesProvider::ReferenceOptions(_)
+                )
+            ),
+            Self::Implementation => matches!(
+                caps.implementation_provider,
+                Some(
+                    lsp_types::ImplementationProvider::Bool(true)
+                        | lsp_types::ImplementationProvider::ImplementationOptions(_)
+                        | lsp_types::ImplementationProvider::ImplementationRegistrationOptions(_)
+                )
+            ),
+            Self::TypeDefinition => matches!(
+                caps.type_definition_provider,
+                Some(
+                    lsp_types::TypeDefinitionProvider::Bool(true)
+                        | lsp_types::TypeDefinitionProvider::TypeDefinitionOptions(_)
+                        | lsp_types::TypeDefinitionProvider::TypeDefinitionRegistrationOptions(_)
+                )
+            ),
+            Self::CallHierarchy => matches!(
+                caps.call_hierarchy_provider,
+                Some(
+                    lsp_types::CallHierarchyProvider::Bool(true)
+                        | lsp_types::CallHierarchyProvider::CallHierarchyOptions(_)
+                        | lsp_types::CallHierarchyProvider::CallHierarchyRegistrationOptions(_)
+                )
+            ),
+            Self::Rename => matches!(
+                caps.rename_provider,
+                Some(
+                    lsp_types::RenameProvider::Bool(true)
+                        | lsp_types::RenameProvider::RenameOptions(_)
+                )
+            ),
+            Self::FormatDocument => matches!(
+                caps.document_formatting_provider,
+                Some(
+                    lsp_types::DocumentFormattingProvider::Bool(true)
+                        | lsp_types::DocumentFormattingProvider::DocumentFormattingOptions(_)
+                )
+            ),
+            Self::CodeActions => matches!(
+                caps.code_action_provider,
+                Some(
+                    lsp_types::CodeActionProvider::Bool(true)
+                        | lsp_types::CodeActionProvider::CodeActionOptions(_)
+                )
+            ),
+            Self::DocumentSymbols => matches!(
+                caps.document_symbol_provider,
+                Some(
+                    lsp_types::DocumentSymbolProvider::Bool(true)
+                        | lsp_types::DocumentSymbolProvider::DocumentSymbolOptions(_)
+                )
+            ),
+            Self::WorkspaceSymbols => matches!(
+                caps.workspace_symbol_provider,
+                Some(
+                    lsp_types::WorkspaceSymbolProvider::Bool(true)
+                        | lsp_types::WorkspaceSymbolProvider::WorkspaceSymbolOptions(_)
+                )
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 impl Translator {
     /// Validate that a path is within allowed workspace boundaries.
     ///
@@ -266,14 +430,13 @@ impl Translator {
         &self,
         file_path: &str,
         tool: ToolKind,
-        capability: &'static str,
-        supported: impl FnOnce(&lsp_types::ServerCapabilities) -> bool,
+        capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
-        self.require_capability(&server_id, capability, supported)?;
+        self.require_capability(&server_id, capability)?;
         if indexing_gate == IndexingGate::Required {
             self.wait_for_indexing_ready(&server_id).await?;
         }
@@ -311,15 +474,14 @@ impl Translator {
     pub(super) fn require_capability(
         &self,
         server_id: &ServerId,
-        capability: &'static str,
-        supported: impl FnOnce(&lsp_types::ServerCapabilities) -> bool,
+        capability: Capability,
     ) -> Result<()> {
         let servers = lock_std(&self.lsp_servers);
         match servers.get(server_id) {
-            Some(server) if !supported(server.capabilities()) => {
+            Some(server) if !capability.is_supported(server.capabilities()) => {
                 Err(Error::CapabilityNotSupported {
                     server_id: server_id.clone(),
-                    capability,
+                    capability: capability.name(),
                 })
             }
             _ => Ok(()),
@@ -1071,8 +1233,7 @@ mod tests {
     #[test]
     fn test_require_capability_ok_when_server_not_registered() {
         let translator = Translator::new();
-        let result =
-            translator.require_capability(&ServerId::from("rust"), "renameProvider", |_| false);
+        let result = translator.require_capability(&ServerId::from("rust"), Capability::Rename);
         assert!(result.is_ok());
     }
 
@@ -1086,15 +1247,7 @@ mod tests {
         };
         translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
 
-        let result = translator.require_capability(&server_id, "renameProvider", |c| {
-            matches!(
-                c.rename_provider,
-                Some(
-                    lsp_types::RenameProvider::Bool(true)
-                        | lsp_types::RenameProvider::RenameOptions(_)
-                )
-            )
-        });
+        let result = translator.require_capability(&server_id, Capability::Rename);
         assert!(result.is_ok());
     }
 
@@ -1105,15 +1258,7 @@ mod tests {
         let caps = lsp_types::ServerCapabilities::default();
         translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
 
-        let result = translator.require_capability(&server_id, "renameProvider", |c| {
-            matches!(
-                c.rename_provider,
-                Some(
-                    lsp_types::RenameProvider::Bool(true)
-                        | lsp_types::RenameProvider::RenameOptions(_)
-                )
-            )
-        });
+        let result = translator.require_capability(&server_id, Capability::Rename);
         assert!(matches!(
             result,
             Err(Error::CapabilityNotSupported {
@@ -1698,15 +1843,7 @@ mod tests {
         };
         translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
 
-        let result = translator.require_capability(&server_id, "renameProvider", |c| {
-            matches!(
-                c.rename_provider,
-                Some(
-                    lsp_types::RenameProvider::Bool(true)
-                        | lsp_types::RenameProvider::RenameOptions(_)
-                )
-            )
-        });
+        let result = translator.require_capability(&server_id, Capability::Rename);
         assert!(matches!(
             result,
             Err(Error::CapabilityNotSupported {
