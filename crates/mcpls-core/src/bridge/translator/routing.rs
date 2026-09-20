@@ -305,34 +305,17 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The URI doesn't have a file:// scheme
+    /// - The URI doesn't have a file:// scheme, carries an authority, or
+    ///   otherwise cannot be converted to a path (see
+    ///   [`crate::bridge::state::uri_to_path`])
     /// - The path is outside workspace boundaries
     pub(super) fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
-        let uri_str = uri.as_ref();
-
-        // Validate file:// scheme
-        if !uri_str.starts_with("file://") {
-            return Err(Error::InvalidToolParams(format!(
-                "Invalid URI scheme, expected file:// but got: {uri_str}"
-            )));
-        }
-
-        // Extract path after file://
-        let path_str = &uri_str["file://".len()..];
-
-        // Handle Windows paths: file:///C:/path -> /C:/path -> C:/path
-        // On Windows, URIs have format file:///C:/path, so we need to strip the leading /
-        #[cfg(windows)]
-        let path_str = if path_str.len() >= 3
-            && path_str.starts_with('/')
-            && path_str.chars().nth(2) == Some(':')
-        {
-            &path_str[1..]
-        } else {
-            path_str
-        };
-
-        let path = PathBuf::from(path_str);
+        let path = crate::bridge::state::uri_to_path(uri).ok_or_else(|| {
+            Error::InvalidToolParams(format!(
+                "Invalid URI, expected an absolute file:// URI but got: {}",
+                uri.as_ref()
+            ))
+        })?;
 
         // Validate path is within workspace
         self.validate_path(&path)
@@ -461,6 +444,38 @@ mod tests {
         let uri: lsp_types::Uri = lsp_types::Uri::from(file_url.as_str());
         let result = translator.parse_file_uri(&uri);
         assert!(result.is_ok());
+    }
+
+    /// #411 regression: a raw-sliced (non-decoded) URI keeps `%20`/`%C3%A9`
+    /// literally in the path, so `canonicalize()` fails with `ENOENT` for
+    /// any file whose path contains a space or a non-ASCII character, even
+    /// though the file exists. `parse_file_uri` must percent-decode first.
+    #[tokio::test]
+    async fn test_parse_file_uri_percent_decodes_space_and_non_ascii() {
+        let translator = Translator::new();
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("my file café.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let file_url = Url::from_file_path(&test_file).unwrap();
+        assert!(
+            file_url.as_str().contains("%20"),
+            "test fixture must exercise percent-encoding"
+        );
+        let uri: lsp_types::Uri = lsp_types::Uri::from(file_url.as_str());
+        let result = translator.parse_file_uri(&uri).unwrap();
+        assert_eq!(result, test_file.canonicalize().unwrap());
+    }
+
+    /// #411: an authority-bearing `file://` URI (e.g. `file://host/path`)
+    /// must be rejected, not silently resolved to a path relative to the
+    /// process's cwd -- see `uri_to_path`'s authority check.
+    #[tokio::test]
+    async fn test_parse_file_uri_rejects_authority() {
+        let translator = Translator::new();
+        let uri: lsp_types::Uri = lsp_types::Uri::from("file://host/some/path.rs");
+        let result = translator.parse_file_uri(&uri);
+        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
 
     #[test]
