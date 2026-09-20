@@ -326,6 +326,35 @@ impl Translator {
         }
     }
 
+    /// Returns true when the routed server's `codeActionProvider` capability
+    /// advertises `resolveProvider: true` (per LSP 3.16, `CodeActionOptions`),
+    /// meaning it will actually answer a `codeAction/resolve` follow-up
+    /// request rather than merely receiving mcpls's client-side
+    /// `resolve_support` advertisement (`lsp/lifecycle.rs`) with no server
+    /// implementation behind it (#432).
+    ///
+    /// Unlike [`Self::require_capability`], an unregistered server (only
+    /// possible in tests, see that method's doc comment) is treated as
+    /// *not* supporting resolve rather than assumed-supported: resolve is a
+    /// best-effort enhancement, so the safe default when capability
+    /// information is unavailable is to skip the extra round-trip, not to
+    /// risk it against a server that may not implement it.
+    pub(super) fn code_action_resolve_supported(&self, server_id: &ServerId) -> bool {
+        let servers = lock_std(&self.lsp_servers);
+        matches!(
+            servers
+                .get(server_id)
+                .map(crate::lsp::LspServer::capabilities)
+                .and_then(|caps| caps.code_action_provider.as_ref()),
+            Some(lsp_types::CodeActionProvider::CodeActionOptions(
+                lsp_types::CodeActionOptions {
+                    resolve_provider: Some(true),
+                    ..
+                }
+            ))
+        )
+    }
+
     /// Parse and validate a file URI, returning the validated path.
     ///
     /// # Errors

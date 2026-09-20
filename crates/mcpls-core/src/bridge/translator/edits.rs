@@ -7,6 +7,7 @@ use lsp_types::{
     RenameParams as LspRenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
     WorkDoneProgressParams,
 };
+use tokio::task::JoinSet;
 
 use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
@@ -17,8 +18,9 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
 use crate::bridge::uri_in_workspace_roots;
-use crate::config::ToolKind;
+use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
+use crate::lsp::LspClient;
 
 /// Convert LSP range to MCP range (0-based to 1-based).
 /// Validate parameters for `handle_code_actions`.
@@ -212,6 +214,144 @@ async fn convert_workspace_edit(
     result_changes
 }
 
+/// Upper bound on the number of `codeAction/resolve` round-trips attempted
+/// for a single `handle_code_actions` call.
+///
+/// mcpls advertises both `data_support` and `resolve_support: ["edit"]`
+/// (`lsp/lifecycle.rs`), so a server such as rust-analyzer may defer the
+/// edit on every returned action -- realistically 5-20 for a single cursor
+/// position. Resolves run concurrently (see `handle_code_actions`) and each
+/// is capped by `LspClient::code_action_resolve_timeout`, but an unbounded
+/// count would still let one tool call fan out an unbounded number of LSP
+/// requests. Actions beyond this limit are returned without an edit, exactly
+/// as they were before this round-trip existed (#432).
+const MAX_CODE_ACTION_RESOLVES: usize = 20;
+
+/// Resolve a code action's deferred `edit` via `codeAction/resolve`.
+///
+/// Per LSP 3.16, a server may return a `CodeAction` with `data: Some(_)` and
+/// `edit: None` from `textDocument/codeAction`, expecting the client to
+/// follow up with `codeAction/resolve` to obtain the actual edit (#432) --
+/// mcpls advertises `resolve_support` for `edit` (`lsp/lifecycle.rs`) but
+/// previously never issued that follow-up request, so such an action was
+/// always reported to the MCP caller with no edit at all.
+///
+/// Returns the *original* `action` with only its `edit` field replaced by
+/// the resolve response's `edit`, rather than the resolve response
+/// wholesale: mcpls's `resolve_support` advertises exactly one resolvable
+/// property (`edit`), so a server that builds a fresh `CodeAction` in its
+/// resolve handler instead of mutating the one it was handed could otherwise
+/// silently drop `kind`, `command`, `diagnostics`, `is_preferred`, or
+/// `disabled`.
+///
+/// Falls back to the original, edit-less `action` on any resolve failure
+/// (timeout, server error, or a server that does not actually implement
+/// resolve despite advertising it) -- a missing edit is strictly better than
+/// failing the whole `code_actions` call over one unresolvable action.
+async fn resolve_code_action(
+    client: &LspClient,
+    server_id: &ServerId,
+    mut action: lsp_types::CodeAction,
+) -> lsp_types::CodeAction {
+    match client
+        .request_typed::<lsp_types::CodeActionResolveRequest>(
+            action.clone(),
+            client.code_action_resolve_timeout(),
+        )
+        .await
+    {
+        Ok(resolved) => {
+            if resolved.edit.is_some() {
+                action.edit = resolved.edit;
+            } else {
+                tracing::debug!(
+                    %server_id,
+                    title = %action.title,
+                    "codeAction/resolve succeeded but returned no edit"
+                );
+            }
+            action
+        }
+        Err(err) => {
+            tracing::warn!(
+                %server_id,
+                title = %action.title,
+                error = %err,
+                "codeAction/resolve failed, returning action without edit"
+            );
+            action
+        }
+    }
+}
+
+/// Resolves up to [`MAX_CODE_ACTION_RESOLVES`] deferred actions in `entries`
+/// concurrently -- via [`resolve_code_action`] -- replacing each resolved
+/// entry in place. No-op when `resolve_supported` is `false`.
+///
+/// Runs the round-trips through a [`JoinSet`] rather than sequentially so
+/// this call's added latency stays close to one resolve's, not proportional
+/// to how many deferred actions the response contains (#432).
+async fn resolve_deferred_code_actions(
+    entries: &mut [lsp_types::CodeActionResponse],
+    client: &LspClient,
+    server_id: &ServerId,
+    resolve_supported: bool,
+) {
+    if !resolve_supported {
+        return;
+    }
+
+    let mut resolve_tasks = JoinSet::new();
+    let mut skipped_due_to_cap = 0usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let lsp_types::CodeActionResponse::CodeAction(action) = entry else {
+            continue;
+        };
+        if action.edit.is_some() || action.data.is_none() {
+            continue;
+        }
+        if resolve_tasks.len() >= MAX_CODE_ACTION_RESOLVES {
+            skipped_due_to_cap += 1;
+            continue;
+        }
+        let client = client.clone();
+        let server_id = server_id.clone();
+        let action = action.clone();
+        resolve_tasks.spawn(async move {
+            (
+                index,
+                resolve_code_action(&client, &server_id, action).await,
+            )
+        });
+    }
+    if skipped_due_to_cap > 0 {
+        tracing::warn!(
+            %server_id,
+            skipped = skipped_due_to_cap,
+            cap = MAX_CODE_ACTION_RESOLVES,
+            "codeAction/resolve cap reached, returning some actions without edit"
+        );
+    }
+
+    while let Some(result) = resolve_tasks.join_next().await {
+        match result {
+            Ok((index, resolved_action)) => {
+                entries[index] = lsp_types::CodeActionResponse::CodeAction(resolved_action);
+            }
+            Err(join_err) => {
+                // The original, edit-less action already in `entries` is
+                // kept as-is -- same graceful-degradation outcome as a
+                // resolve request that returns an LSP error.
+                tracing::warn!(
+                    %server_id,
+                    error = %join_err,
+                    "codeAction/resolve task panicked, returning action without edit"
+                );
+            }
+        }
+    }
+}
+
 /// Convert LSP code action to MCP code action. `uri` is the queried
 /// document's own URI, used for the action's `diagnostics` (always scoped to
 /// the requested document); `edit`'s per-file URIs (from either `changes` or
@@ -391,6 +531,11 @@ impl Translator {
 
     /// Handle code actions request.
     ///
+    /// For an action returned with `data` present but `edit` absent, and
+    /// only when the routed server's `codeActionProvider` advertises
+    /// `resolveProvider: true`, follows up with a `codeAction/resolve`
+    /// request to populate the edit before returning the action (#432).
+    ///
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, the file cannot be opened,
@@ -455,10 +600,12 @@ impl Translator {
         let response = client
             .request_typed::<lsp_types::CodeActionRequest>(params, client.request_timeout())
             .await?;
-        let response_vec = response.unwrap_or_default();
-        let mut actions = Vec::with_capacity(response_vec.len());
+        let mut entries = response.unwrap_or_default();
+        let resolve_supported = self.code_action_resolve_supported(&server_id);
+        resolve_deferred_code_actions(&mut entries, &client, &server_id, resolve_supported).await;
 
-        for action_or_command in response_vec {
+        let mut actions = Vec::with_capacity(entries.len());
+        for action_or_command in entries {
             let action = match action_or_command {
                 lsp_types::CodeActionResponse::CodeAction(action) => {
                     convert_code_action(action, &ctx, &response_uri, &self.workspace_roots).await
@@ -1473,6 +1620,506 @@ mod tests {
 
         let result = handle.await.unwrap().unwrap();
         assert!(result.actions.is_empty());
+    }
+
+    /// #432: an action returned with `data` but no `edit`, from a server
+    /// advertising `codeActionProvider.resolveProvider: true`, must trigger
+    /// a `codeAction/resolve` follow-up whose edit ends up in the result.
+    #[tokio::test]
+    async fn test_handle_code_actions_resolves_deferred_edit_when_supported() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+        use url::Url;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            code_action_provider: Some(lsp_types::CodeActionProvider::CodeActionOptions(
+                lsp_types::CodeActionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let file_path = dir.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let file_uri = Url::from_file_path(&file_path).unwrap().to_string();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = file_path.to_str().unwrap().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_code_actions(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                        Position {
+                            line: 1,
+                            character: 10,
+                        },
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/codeAction");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "title": "Add missing import",
+                "kind": "quickfix",
+                "data": {"id": 42},
+            }]),
+        )
+        .await;
+
+        let resolve_request = read_framed_message(&mut wire).await;
+        assert_eq!(resolve_request["method"], "codeAction/resolve");
+        assert_eq!(resolve_request["params"]["title"], "Add missing import");
+
+        let mut changes_map = serde_json::Map::new();
+        changes_map.insert(
+            file_uri,
+            serde_json::json!([{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0}
+                },
+                "newText": "use std::fmt;\n",
+            }]),
+        );
+
+        write_response(
+            &mut server.read_half_stdin,
+            &resolve_request["id"],
+            serde_json::json!({
+                "title": "Add missing import",
+                "kind": "quickfix",
+                "data": {"id": 42},
+                "edit": { "changes": changes_map }
+            }),
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.actions.len(), 1);
+        let edit = result.actions[0]
+            .edit
+            .as_ref()
+            .expect("edit must be populated by codeAction/resolve");
+        assert_eq!(edit.changes.len(), 1);
+        assert_eq!(edit.changes[0].edits[0].new_text, "use std::fmt;\n");
+    }
+
+    /// #432 companion: a server that does not advertise
+    /// `codeActionProvider.resolveProvider: true` must never receive a
+    /// `codeAction/resolve` follow-up, even for an action with `data` but no
+    /// `edit` -- the action is returned as-is, without an edit.
+    #[tokio::test]
+    async fn test_handle_code_actions_skips_resolve_when_not_supported() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+        use tokio::time::timeout;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            code_action_provider: Some(lsp_types::CodeActionProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let file_path = dir.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = file_path.to_str().unwrap().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_code_actions(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                        Position {
+                            line: 1,
+                            character: 10,
+                        },
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/codeAction");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "title": "Add missing import",
+                "kind": "quickfix",
+                "data": {"id": 42},
+            }]),
+        )
+        .await;
+
+        // No resolve request must ever arrive.
+        let no_more_requests =
+            timeout(Duration::from_millis(200), read_framed_message(&mut wire)).await;
+        assert!(
+            no_more_requests.is_err(),
+            "codeAction/resolve must not be sent when resolveProvider is unset"
+        );
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.actions.len(), 1);
+        assert!(result.actions[0].edit.is_none());
+    }
+
+    /// #432: a `codeAction/resolve` request that comes back as a JSON-RPC
+    /// error must not fail the whole `code_actions` call -- the action is
+    /// still returned, just without an edit (`resolve_code_action`'s `Err`
+    /// fallback).
+    #[tokio::test]
+    async fn test_handle_code_actions_falls_back_when_resolve_errors() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            code_action_provider: Some(lsp_types::CodeActionProvider::CodeActionOptions(
+                lsp_types::CodeActionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let file_path = dir.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = file_path.to_str().unwrap().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_code_actions(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                        Position {
+                            line: 1,
+                            character: 10,
+                        },
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/codeAction");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "title": "Add missing import",
+                "kind": "quickfix",
+                "data": {"id": 42},
+            }]),
+        )
+        .await;
+
+        let resolve_request = read_framed_message(&mut wire).await;
+        assert_eq!(resolve_request["method"], "codeAction/resolve");
+
+        write_error_response(
+            &mut server.read_half_stdin,
+            &resolve_request["id"],
+            -32603,
+            "internal error",
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.actions.len(), 1);
+        assert_eq!(result.actions[0].title, "Add missing import");
+        assert!(
+            result.actions[0].edit.is_none(),
+            "a resolve error must not propagate, only leave the edit unset"
+        );
+    }
+
+    /// #432 companion: an action already carrying `edit: Some(_)` must never
+    /// be re-resolved, even when it also carries `data: Some(_)` against a
+    /// `resolveProvider: true` server.
+    #[tokio::test]
+    async fn test_handle_code_actions_skips_resolve_when_edit_already_present() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+        use tokio::time::timeout;
+        use url::Url;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            code_action_provider: Some(lsp_types::CodeActionProvider::CodeActionOptions(
+                lsp_types::CodeActionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let file_path = dir.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let file_uri = Url::from_file_path(&file_path).unwrap().to_string();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = file_path.to_str().unwrap().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_code_actions(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                        Position {
+                            line: 1,
+                            character: 10,
+                        },
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/codeAction");
+
+        let mut changes_map = serde_json::Map::new();
+        changes_map.insert(
+            file_uri,
+            serde_json::json!([{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0}
+                },
+                "newText": "use std::fmt;\n",
+            }]),
+        );
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "title": "Add missing import",
+                "kind": "quickfix",
+                "data": {"id": 42},
+                "edit": { "changes": changes_map },
+            }]),
+        )
+        .await;
+
+        // No resolve request must ever arrive: the action already has an edit.
+        let no_more_requests =
+            timeout(Duration::from_millis(200), read_framed_message(&mut wire)).await;
+        assert!(
+            no_more_requests.is_err(),
+            "codeAction/resolve must not be sent when edit is already present"
+        );
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.actions.len(), 1);
+        let edit = result.actions[0]
+            .edit
+            .as_ref()
+            .expect("original edit must be preserved");
+        assert_eq!(edit.changes[0].edits[0].new_text, "use std::fmt;\n");
+    }
+
+    /// #432 companion: an action with `data: None` must never be resolved,
+    /// even against a `resolveProvider: true` server -- per LSP 3.16, `data`
+    /// presence is what signals an action is resolvable.
+    #[tokio::test]
+    async fn test_handle_code_actions_skips_resolve_when_data_absent() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+        use tokio::time::timeout;
+
+        use crate::bridge::NotificationCache;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            code_action_provider: Some(lsp_types::CodeActionProvider::CodeActionOptions(
+                lsp_types::CodeActionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let file_path = dir.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = file_path.to_str().unwrap().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_code_actions(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                        Position {
+                            line: 1,
+                            character: 10,
+                        },
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/codeAction");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "title": "Organize imports",
+                "kind": "source.organizeImports",
+            }]),
+        )
+        .await;
+
+        // No resolve request must ever arrive: the action has no `data`.
+        let no_more_requests =
+            timeout(Duration::from_millis(200), read_framed_message(&mut wire)).await;
+        assert!(
+            no_more_requests.is_err(),
+            "codeAction/resolve must not be sent when data is absent"
+        );
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.actions.len(), 1);
+        assert!(result.actions[0].edit.is_none());
     }
 
     /// `handle_rename` needs the same whole-workspace reference index as
