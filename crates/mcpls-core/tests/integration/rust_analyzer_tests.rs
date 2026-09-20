@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{NotificationCache, Position, Translator};
 use mcpls_core::config::{LspServerConfig, ServerId, ToolRouter};
-use mcpls_core::lsp::{LspServer, ServerInitConfig};
+use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
@@ -60,6 +60,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         heuristics: None,
         name: None,
         handles: None,
+        indexing: mcpls_core::bridge::IndexingPolicy::Auto,
     };
 
     let server_init_config = ServerInitConfig {
@@ -912,4 +913,66 @@ async fn test_workspace_symbol_search_function() {
             println!("Has 'create' in name: {}", has_create);
         }
     }
+}
+
+/// P1/D1: once mcpls advertises `window.workDoneProgress` at `initialize`, a
+/// spec-compliant server (rust-analyzer) may actually send `$/progress` --
+/// before this issue, nothing evidenced any server sending mcpls one at all.
+///
+/// Asserts at the notification/lane level, not on `IndexingState`: P2b
+/// deliberately ignores rust-analyzer's `$/progress` for readiness once its
+/// own `experimental/serverStatus` has been seen, so an `IndexingState`
+/// assertion would pass for the wrong reason even if this capability were
+/// never advertised at all.
+#[tokio::test]
+#[ignore = "Requires rust-analyzer installed"]
+async fn test_progress_notifications_arrive_on_lifecycle_lane() {
+    skip_if_no_rust_analyzer!();
+    init_tracing();
+
+    let workspace_path = rust_workspace_path();
+    let lsp_config = LspServerConfig {
+        language_id: "rust".to_string(),
+        command: "rust-analyzer".to_string(),
+        args: vec![],
+        env: std::collections::HashMap::new(),
+        file_patterns: vec!["**/*.rs".to_string()],
+        initialization_options: None,
+        timeout_seconds: 30,
+        request_timeout_seconds: 30,
+        heuristics: None,
+        name: None,
+        handles: None,
+        indexing: mcpls_core::bridge::IndexingPolicy::Auto,
+    };
+
+    let server_init_config = ServerInitConfig {
+        server_config: lsp_config,
+        workspace_roots: vec![workspace_path],
+        initialization_options: None,
+        position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+        notification_tx: None,
+    };
+
+    let mut server = LspServer::spawn(server_init_config)
+        .await
+        .expect("Failed to spawn rust-analyzer");
+    let mut lifecycle_rx = server.take_lifecycle_rx();
+
+    let saw_progress = timeout(Duration::from_secs(30), async {
+        while let Some(notif) = lifecycle_rx.recv().await {
+            if matches!(notif, LspNotification::Progress(_)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(
+        saw_progress,
+        "expected at least one $/progress notification on the lifecycle lane \
+         after window.workDoneProgress was advertised at initialize"
+    );
 }

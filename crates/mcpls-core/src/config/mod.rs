@@ -1949,6 +1949,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             }],
             project_config_ignored: false,
         };
@@ -1975,6 +1976,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             }],
             project_config_ignored: false,
         };
@@ -2001,6 +2003,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             }],
             project_config_ignored: false,
         };
@@ -2027,6 +2030,7 @@ mod tests {
                 heuristics: None,
                 name: None,
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             }],
             project_config_ignored: false,
         };

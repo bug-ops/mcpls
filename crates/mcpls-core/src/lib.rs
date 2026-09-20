@@ -104,13 +104,25 @@ pub(crate) struct PumpShared {
 /// Background task that drains LSP notifications, writes them to the cache,
 /// and forwards `resources/updated` to the MCP peer when subscribed.
 ///
+/// Selects over two independent lanes (P3) rather than one: `rx` carries
+/// diagnostics/log/showMessage, `lifecycle_rx` carries `$/progress`
+/// `begin`/`end` frames and `Other` (which carries e.g. rust-analyzer's
+/// `experimental/serverStatus`). Splitting them means a high-volume
+/// diagnostics publisher (rust-analyzer republishing whole-workspace
+/// diagnostics on every save) can never starve out a low-volume readiness
+/// signal, or vice versa -- see `lsp::client::LspClient::message_loop_inner`
+/// for where each notification is classified onto its lane.
+///
 /// The task operates in two phases without explicit state:
 /// - **Phase A** (before peer is set): caches every notification, skips peer notify.
 /// - **Phase B** (after peer is set): additionally fires `notify_resource_updated`
 ///   for subscribed `PublishDiagnostics` URIs.
 ///
 /// The task exits when:
-/// - The LSP notification channel closes (`rx.recv()` returns `None`).
+/// - **Both** lanes have closed (`rx.recv()` and `lifecycle_rx.recv()` both
+///   returned `None`) -- in practice both senders live inside the same
+///   `LspClient` and close together, but each lane is tracked independently
+///   so one closing early can never stop the other from still being drained.
 /// - The cancellation watch fires (or the sender is dropped).
 /// - `notify_resource_updated` returns an error (peer disconnect / transport closed).
 ///
@@ -129,6 +141,7 @@ pub(crate) struct PumpShared {
 pub(crate) async fn diagnostics_pump(
     server_id: ServerId,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
+    mut lifecycle_rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     caches_diagnostics: bool,
     shared: PumpShared,
@@ -139,7 +152,12 @@ pub(crate) async fn diagnostics_pump(
         peer_cell,
         workspace_roots,
     } = shared;
+    let mut notification_closed = false;
+    let mut lifecycle_closed = false;
     loop {
+        if notification_closed && lifecycle_closed {
+            break;
+        }
         tokio::select! {
             // Exit when cancellation is requested or the sender is dropped.
             result = cancel_rx.changed() => {
@@ -148,8 +166,11 @@ pub(crate) async fn diagnostics_pump(
                     break;
                 }
             }
-            msg = rx.recv() => {
-                let Some(notif) = msg else { break };
+            msg = rx.recv(), if !notification_closed => {
+                let Some(notif) = msg else {
+                    notification_closed = true;
+                    continue;
+                };
                 match notif {
                     LspNotification::PublishDiagnostics(p) => {
                         // Only the server the router resolves `Diagnostics` to for
@@ -208,12 +229,28 @@ pub(crate) async fn diagnostics_pump(
                         let mut cache = notification_cache.lock().await;
                         cache.store_message(m.kind.into(), m.message);
                     }
-                    // Deliberate descope: no standardized way to identify a workspace-load `$/progress` sequence across servers.
-                    LspNotification::Progress { .. } => {}
+                    // Never classified onto this lane -- see `LspClient::message_loop_inner`'s routing.
+                    LspNotification::Progress(_) | LspNotification::Other { .. } => {}
+                }
+            }
+            msg = lifecycle_rx.recv(), if !lifecycle_closed => {
+                let Some(notif) = msg else {
+                    lifecycle_closed = true;
+                    continue;
+                };
+                match notif {
+                    LspNotification::Progress(params) => {
+                        let mut cache = notification_cache.lock().await;
+                        cache.observe_progress(&server_id, &params);
+                    }
                     LspNotification::Other { method, params } => {
                         let mut cache = notification_cache.lock().await;
                         cache.observe_indexing_signal(&server_id, &method, params.as_ref());
                     }
+                    // Never classified onto this lane -- see `LspClient::message_loop_inner`'s routing.
+                    LspNotification::PublishDiagnostics(_)
+                    | LspNotification::LogMessage(_)
+                    | LspNotification::ShowMessage(_) => {}
                 }
             }
         }
@@ -223,8 +260,21 @@ pub(crate) async fn diagnostics_pump(
 /// Result of [`register_servers`]: everything the caller needs to start the
 /// per-server diagnostics pump tasks.
 pub(crate) struct RegisteredServers {
-    /// Notification receivers extracted from each server before registration.
-    pub(crate) receivers: HashMap<ServerId, tokio::sync::mpsc::Receiver<lsp::LspNotification>>,
+    /// Notification and lifecycle-lane (P3) receivers extracted from each
+    /// server before registration, paired per server rather than kept in
+    /// two separate maps: both are always extracted together in
+    /// [`register_servers`]'s single population loop, so there is no
+    /// "notification receiver without a matching lifecycle receiver" state
+    /// to represent or handle at the call site (Fix 4 -- a `HashMap<_,
+    /// (Receiver, Receiver)>` makes that case unrepresentable instead of
+    /// needing an `unwrap`/`expect` to rule it out).
+    pub(crate) receivers: HashMap<
+        ServerId,
+        (
+            tokio::sync::mpsc::Receiver<lsp::LspNotification>,
+            tokio::sync::mpsc::Receiver<lsp::LspNotification>,
+        ),
+    >,
     /// Whether each server is the one the (rebound) router resolves
     /// `ToolKind::Diagnostics` to for its language -- see #174 §8. Computed
     /// here, right after the rebind, so it always reflects the post-rebind
@@ -252,7 +302,10 @@ pub(crate) fn register_servers(
 ) -> RegisteredServers {
     let mut receivers = HashMap::new();
     for (id, server) in &mut result.servers {
-        receivers.insert(id.clone(), server.take_notification_rx());
+        receivers.insert(
+            id.clone(),
+            (server.take_notification_rx(), server.take_lifecycle_rx()),
+        );
     }
 
     let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
@@ -918,10 +971,16 @@ fn spawn_lsp_servers_background(
             .values()
             .filter(|&&is_route| is_route)
             .count();
-        notification_cache
-            .lock()
-            .await
-            .set_diagnostics_route_count(diagnostics_route_count);
+        {
+            let mut cache = notification_cache.lock().await;
+            cache.set_diagnostics_route_count(diagnostics_route_count);
+            // Apply each server's IndexingPolicy (P4) before any pump starts, pinning Disabled to Unknown.
+            for id in registered.receivers.keys() {
+                if let Some(config) = configs_by_id.get(id) {
+                    cache.set_indexing_policy(id.clone(), config.server_config.indexing);
+                }
+            }
+        }
 
         // Start diagnostics pump tasks now that servers are registered.
         let pump_shared = PumpShared {
@@ -931,7 +990,7 @@ fn spawn_lsp_servers_background(
             workspace_roots,
         };
         let mut pumps: JoinSet<()> = JoinSet::new();
-        for (id, rx) in registered.receivers {
+        for (id, (rx, lifecycle_rx)) in registered.receivers {
             let caches_diagnostics = registered
                 .diagnostics_flags
                 .get(&id)
@@ -940,6 +999,7 @@ fn spawn_lsp_servers_background(
             pumps.spawn(diagnostics_pump(
                 id,
                 rx,
+                lifecycle_rx,
                 cancel_rx.clone(),
                 caches_diagnostics,
                 pump_shared.clone(),
@@ -1595,6 +1655,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 }],
                 project_config_ignored: false,
             };
@@ -1757,6 +1818,7 @@ mod tests {
                     heuristics: None,
                     name: None,
                     handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
                 }],
                 project_config_ignored: false,
             };
@@ -1970,6 +2032,7 @@ mod tests {
             let subs = make_subs();
             let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
+            let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             // Keep _cancel_tx alive: dropping it causes cancel_rx.changed() to return Err,
             // which makes the pump exit before processing any messages.
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -1978,6 +2041,7 @@ mod tests {
             tokio::spawn(diagnostics_pump(
                 ServerId::from("rust"),
                 rx,
+                lifecycle_rx,
                 cancel_rx,
                 true,
                 PumpShared {
@@ -2029,6 +2093,7 @@ mod tests {
             let subs = make_subs();
             let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
+            let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
 
             // See `test_diagnostic_path_in_workspace_accepts_uri_under_root`
@@ -2050,6 +2115,7 @@ mod tests {
             tokio::spawn(diagnostics_pump(
                 ServerId::from("rust"),
                 rx,
+                lifecycle_rx,
                 cancel_rx,
                 true,
                 PumpShared {
@@ -2118,11 +2184,13 @@ mod tests {
             let subs = make_subs();
             let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
             let (cancel_tx, cancel_rx) = watch::channel(false);
 
             let handle = tokio::spawn(diagnostics_pump(
                 ServerId::from("rust"),
                 rx,
+                lifecycle_rx,
                 cancel_rx,
                 true,
                 PumpShared {
@@ -2148,11 +2216,13 @@ mod tests {
             let subs = make_subs();
             let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
             let (cancel_tx, cancel_rx) = watch::channel(false);
 
             let handle = tokio::spawn(diagnostics_pump(
                 ServerId::from("rust"),
                 rx,
+                lifecycle_rx,
                 cancel_rx,
                 true,
                 PumpShared {
@@ -2182,6 +2252,7 @@ mod tests {
             let subs = make_subs();
             let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
+            let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
 
             // Simulate a slow in-flight MCP request (e.g. `pull_diagnostics`)
@@ -2198,6 +2269,7 @@ mod tests {
             tokio::spawn(diagnostics_pump(
                 ServerId::from("rust"),
                 rx,
+                lifecycle_rx,
                 cancel_rx,
                 true,
                 PumpShared {
@@ -2241,23 +2313,25 @@ mod tests {
 
         /// The `Other` arm (custom/unrecognized notifications, e.g.
         /// rust-analyzer's `experimental/serverStatus`) must reach
-        /// `NotificationCache::observe_indexing_signal` -- this is the one
-        /// place in production that notification actually gets from the LSP
-        /// transport into the indexing-readiness gate; every other test for
-        /// the gate pre-seeds the cache by hand and would not have caught a
-        /// pump wiring regression.
+        /// `NotificationCache::observe_indexing_signal` via the lifecycle
+        /// lane -- this is the one place in production that notification
+        /// actually gets from the LSP transport into the indexing-readiness
+        /// gate; every other test for the gate pre-seeds the cache by hand
+        /// and would not have caught a pump wiring regression.
         #[tokio::test]
         async fn test_pump_routes_other_notifications_to_indexing_signal() {
             let cache = make_cache();
             let subs = make_subs();
             let peer_cell = make_peer_cell();
-            let (tx, rx) = mpsc::channel(8);
+            let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
             let server_id = ServerId::from("rust");
 
             tokio::spawn(diagnostics_pump(
                 server_id.clone(),
                 rx,
+                lifecycle_rx,
                 cancel_rx,
                 true,
                 PumpShared {
@@ -2268,13 +2342,14 @@ mod tests {
                 },
             ));
 
-            tx.send(LspNotification::Other {
-                method: std::borrow::Cow::Borrowed("experimental/serverStatus"),
-                params: Some(serde_json::json!({"quiescent": false})),
-            })
-            .await
-            .unwrap();
-            drop(tx);
+            lifecycle_tx
+                .send(LspNotification::Other {
+                    method: std::borrow::Cow::Borrowed("experimental/serverStatus"),
+                    params: Some(serde_json::json!({"quiescent": false})),
+                })
+                .await
+                .unwrap();
+            drop(lifecycle_tx);
 
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
@@ -2292,6 +2367,131 @@ mod tests {
                 "pump did not route the Other{experimental/serverStatus} notification into \
                  NotificationCache::observe_indexing_signal within 5s",
             );
+        }
+
+        /// P3: a `$/progress` `report` frame must never reach the lifecycle
+        /// lane at all (S3) -- classified and dropped by
+        /// `LspClient::message_loop_inner` before enqueueing, not merely
+        /// ignored once received. This test exercises the pump side: even
+        /// if a `report` somehow arrived on the lifecycle lane, the pump
+        /// itself only recognizes `begin`/`end` shapes via
+        /// `NotificationCache::observe_progress`, so a `begin` sent
+        /// afterward must still be the one that flips the state.
+        #[tokio::test]
+        async fn test_pump_routes_progress_begin_to_indexing_signal() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+            let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let server_id = ServerId::from("gopls");
+
+            tokio::spawn(diagnostics_pump(
+                server_id.clone(),
+                rx,
+                lifecycle_rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
+            ));
+
+            lifecycle_tx
+                .send(LspNotification::Progress(lsp_types::ProgressParams {
+                    token: lsp_types::ProgressToken::String("indexing".to_string()),
+                    value: serde_json::json!({"kind": "begin", "title": "Loading"}),
+                }))
+                .await
+                .unwrap();
+            drop(lifecycle_tx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    {
+                        let guard = cache.lock().await;
+                        if guard.indexing_state(&server_id) == IndexingState::Loading {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect(
+                "pump did not route the Progress(begin) notification into \
+                 NotificationCache::observe_progress within 5s",
+            );
+        }
+
+        /// P3: saturating the diagnostics lane to capacity must not stall the
+        /// lifecycle lane -- a `begin`/`end` frame arriving while the
+        /// notification lane is backed up must still reach the readiness
+        /// gate promptly.
+        #[tokio::test]
+        async fn test_lifecycle_lane_unaffected_by_saturated_notification_lane() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (tx, rx) = mpsc::channel(2);
+            let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let server_id = ServerId::from("gopls");
+
+            // Fill the notification lane to capacity before the pump drains it, forcing a backlog.
+            for _ in 0..2 {
+                tx.send(LspNotification::PublishDiagnostics(
+                    PublishDiagnosticsParams {
+                        uri: Uri::from("file:///test/saturate.rs"),
+                        diagnostics: vec![],
+                        version: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            }
+
+            tokio::spawn(diagnostics_pump(
+                server_id.clone(),
+                rx,
+                lifecycle_rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
+            ));
+
+            lifecycle_tx
+                .send(LspNotification::Other {
+                    method: std::borrow::Cow::Borrowed("experimental/serverStatus"),
+                    params: Some(serde_json::json!({"quiescent": false})),
+                })
+                .await
+                .unwrap();
+            drop(tx);
+            drop(lifecycle_tx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    {
+                        let guard = cache.lock().await;
+                        if guard.indexing_state(&server_id) == IndexingState::Loading {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("lifecycle lane must still be served while the notification lane is backed up");
         }
     }
 }

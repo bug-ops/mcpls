@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 
 // Re-export LSP notification types from lsp_types to avoid duplication.
-pub use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParams};
+pub use lsp_types::{
+    LogMessageParams, ProgressParams, PublishDiagnosticsParams, ShowMessageParams,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
@@ -95,12 +97,7 @@ pub enum LspNotification {
     /// window/showMessage
     ShowMessage(ShowMessageParams),
     /// $/progress
-    Progress {
-        /// Progress token (string or number).
-        token: serde_json::Value,
-        /// Progress value.
-        value: serde_json::Value,
-    },
+    Progress(ProgressParams),
     /// Unknown or unhandled notification
     Other {
         /// Method name.
@@ -108,6 +105,38 @@ pub enum LspNotification {
         /// Optional parameters.
         params: Option<serde_json::Value>,
     },
+}
+
+/// A `$/progress` notification's `value.kind`, decoded from the raw JSON
+/// payload (`ProgressParams::value` is `serde_json::Value`; `gen-lsp-types`
+/// 0.11.0 has no union type for it).
+///
+/// Single source of truth for both `LspClient::notification_lane` (routes
+/// `begin`/`end` to the lifecycle lane, drops everything else) and
+/// `bridge::indexing::IndexingTracker::observe_progress` (the settle/latch
+/// transition) -- previously each read `value["kind"]` independently, so
+/// the two could silently drift out of sync (Fix 9). No `Report` variant:
+/// a `report` frame is dropped at the transport boundary rather than
+/// classified into a variant here. A frame whose `kind` is missing,
+/// `"report"`, or anything else unrecognized parses to `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressKind {
+    /// A `$/progress` frame with `kind: "begin"`.
+    Begin,
+    /// A `$/progress` frame with `kind: "end"`.
+    End,
+}
+
+impl ProgressKind {
+    /// Classify a `$/progress` notification's raw `value` payload.
+    #[must_use]
+    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
+        match value.get("kind").and_then(Value::as_str) {
+            Some("begin") => Some(Self::Begin),
+            Some("end") => Some(Self::End),
+            _ => None,
+        }
+    }
 }
 
 impl LspNotification {
@@ -176,14 +205,15 @@ impl LspNotification {
                 }
             }
             "$/progress" => {
-                if let Some(ref p) = params {
-                    let token = p.get("token").cloned().unwrap_or(Value::Null);
-                    let value = p.get("value").cloned().unwrap_or(Value::Null);
-                    return Self::Progress { token, value };
+                if let Some(p) = params {
+                    match serde_json::from_value(p) {
+                        Ok(parsed) => return Self::Progress(parsed),
+                        Err(e) => debug!(method, error = %e, "failed to parse notification params"),
+                    }
                 }
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
-                    params,
+                    params: None,
                 }
             }
             _ => Self::Other {
@@ -368,6 +398,52 @@ mod tests {
                 );
             }
             _ => panic!("Expected PublishDiagnostics variant"),
+        }
+    }
+
+    #[test]
+    fn test_progress_notification_parsing() {
+        let params = json!({
+            "token": "indexing",
+            "value": {"kind": "begin", "title": "Indexing"}
+        });
+
+        let notification = super::LspNotification::parse("$/progress", Some(params));
+
+        match notification {
+            super::LspNotification::Progress(p) => {
+                assert_eq!(p.value.get("kind").and_then(|v| v.as_str()), Some("begin"));
+            }
+            _ => panic!("Expected Progress variant"),
+        }
+    }
+
+    #[test]
+    fn test_malformed_progress_params() {
+        // Missing the mandatory `token` field.
+        let malformed_params = json!({"value": {"kind": "begin"}});
+
+        let notification = super::LspNotification::parse("$/progress", Some(malformed_params));
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "$/progress");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant for malformed params"),
+        }
+    }
+
+    #[test]
+    fn test_progress_with_none_params() {
+        let notification = super::LspNotification::parse("$/progress", None);
+
+        match notification {
+            super::LspNotification::Other { method, params } => {
+                assert_eq!(method, "$/progress");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected Other variant when params is None"),
         }
     }
 

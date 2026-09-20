@@ -16,7 +16,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::routing::IndexingGate;
 use crate::bridge::IndexingState;
-use crate::bridge::notifications::INDEXING_STALENESS_BOUND;
+use crate::bridge::indexing::{INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE, PROGRESS_SETTLE};
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 
@@ -40,6 +40,23 @@ const INDEXING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const _: () = assert!(
     INDEXING_STALENESS_BOUND.as_nanos() > INDEXING_READY_TIMEOUT.as_nanos(),
     "INDEXING_STALENESS_BOUND must be greater than INDEXING_READY_TIMEOUT"
+);
+
+/// `PROGRESS_SETTLE` (the read-path settle window) must stay shorter than
+/// `PROGRESS_LATCH_IDLE` (the write-path latch threshold) -- see
+/// `bridge::indexing::PROGRESS_LATCH_IDLE`'s doc for why collapsing the two
+/// into a single threshold reintroduces a real regression (N1).
+const _: () = assert!(
+    PROGRESS_SETTLE.as_nanos() < PROGRESS_LATCH_IDLE.as_nanos(),
+    "PROGRESS_SETTLE must be less than PROGRESS_LATCH_IDLE"
+);
+
+/// A settle window longer than the gate's own wait timeout would let
+/// `wait_for_indexing_ready` time out while the entry is merely mid-settle,
+/// not actually still loading.
+const _: () = assert!(
+    PROGRESS_SETTLE.as_nanos() < INDEXING_READY_TIMEOUT.as_nanos(),
+    "PROGRESS_SETTLE must be less than INDEXING_READY_TIMEOUT"
 );
 
 /// Flattens a `Definition` (`Location` or `Location[]`) into an owned `Vec`.

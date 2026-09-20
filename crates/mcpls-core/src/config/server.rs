@@ -7,6 +7,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
 use super::routing::{ServerId, ToolKind};
+use crate::bridge::IndexingPolicy;
 
 /// Default max depth for recursive marker search.
 pub const DEFAULT_HEURISTICS_MAX_DEPTH: usize = 10;
@@ -214,6 +215,15 @@ pub struct LspServerConfig {
     /// `Some(list)` restricts the server to exactly those tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handles: Option<Vec<ToolKind>>,
+
+    /// Workspace-indexing readiness policy for this server (P4 escape
+    /// hatch). Defaults to [`IndexingPolicy::Auto`]: readiness is tracked
+    /// normally from whatever signals the server sends (rust-analyzer's
+    /// `experimental/serverStatus`, or a generic `$/progress` sequence).
+    /// Set to `"disabled"` for a server whose signal shape doesn't fit this
+    /// tracker's assumptions -- see [`IndexingPolicy::Disabled`].
+    #[serde(default, skip_serializing_if = "IndexingPolicy::is_auto")]
+    pub indexing: IndexingPolicy,
 }
 
 const fn default_timeout() -> u64 {
@@ -296,6 +306,7 @@ impl LspServerConfig {
             heuristics: Some(ServerHeuristics::with_markers(markers)),
             name: None,
             handles: None,
+            indexing: IndexingPolicy::Auto,
         }
     }
 
@@ -450,6 +461,7 @@ mod tests {
             heuristics: None,
             name: None,
             handles: None,
+            indexing: crate::bridge::IndexingPolicy::Auto,
         };
 
         assert_eq!(config.language_id, "custom");
@@ -481,6 +493,66 @@ mod tests {
     #[test]
     fn test_default_request_timeout() {
         assert_eq!(default_request_timeout(), 30);
+    }
+
+    #[test]
+    fn test_indexing_defaults_to_auto_when_omitted() {
+        assert_eq!(
+            LspServerConfig::rust_analyzer().indexing,
+            crate::bridge::IndexingPolicy::Auto
+        );
+    }
+
+    /// P4: `[[lsp_servers]] indexing = "disabled"` must round-trip through
+    /// TOML, the format `[[lsp_servers]]` entries are actually configured in.
+    #[test]
+    fn test_indexing_disabled_round_trips_through_toml() {
+        let toml_str = r#"
+            language_id = "rust"
+            command = "rust-analyzer"
+            indexing = "disabled"
+        "#;
+        let config: LspServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.indexing, crate::bridge::IndexingPolicy::Disabled);
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains(r#"indexing = "disabled""#));
+        let round_tripped: LspServerConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            round_tripped.indexing,
+            crate::bridge::IndexingPolicy::Disabled
+        );
+    }
+
+    /// A `[[lsp_servers]]` entry that omits `indexing` entirely must default
+    /// to `Auto`, not fail `deny_unknown_fields`/require the field.
+    #[test]
+    fn test_indexing_omitted_from_toml_defaults_to_auto() {
+        let toml_str = r#"
+            language_id = "rust"
+            command = "rust-analyzer"
+        "#;
+        let config: LspServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.indexing, crate::bridge::IndexingPolicy::Auto);
+    }
+
+    /// M4: a config at the default `IndexingPolicy::Auto` must not write
+    /// `indexing = "auto"` into the serialized TOML -- every other optional
+    /// field on this struct is skipped at its default, and generating
+    /// ~30 builtin server entries each carrying a redundant `indexing =
+    /// "auto"` line would be a visible regression to `mcpls.toml`'s
+    /// generated default.
+    #[test]
+    fn test_indexing_auto_is_omitted_from_serialized_toml() {
+        let config = LspServerConfig::rust_analyzer();
+        assert_eq!(config.indexing, crate::bridge::IndexingPolicy::Auto);
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("indexing"),
+            "the default IndexingPolicy::Auto must be omitted, not serialized as \
+             indexing = \"auto\""
+        );
     }
 
     #[test]
@@ -568,6 +640,7 @@ mod tests {
             heuristics: None,
             name: None,
             handles: None,
+            indexing: crate::bridge::IndexingPolicy::Auto,
         };
 
         let tmp = TempDir::new().unwrap();

@@ -1718,6 +1718,7 @@ sleep 0.3
                 heuristics: None,
                 name: Some("rust".to_string()),
                 handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
             },
             workspace_roots: vec![],
             initialization_options: None,
