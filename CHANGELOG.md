@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced the `&'static str` + closure pair used to gate MCP tool calls on LSP server capabilities with a single `Capability` enum, so the reported capability name and the check that verifies it can no longer drift apart. (#436)
 - Deduplicated `LspNotification::parse`'s four deserialize-or-fallback match arms into a shared helper, sourcing method-name constants from `lsp_types` instead of string literals (no behavior change). (#449)
 - `Error::WorkspaceIndexing` now maps to a distinct JSON-RPC server-error code instead of the generic internal-error code. (#450)
+- Extracted a shared bounded-read helper used by both config loading and document disk reads, keeping their size-check/UTF-8-validation ordering from drifting apart. (#443, #446)
 
 ### Fixed
 
@@ -42,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A respawned LSP server now re-acquires workspace-indexing readiness on its own: the replacement process's lifecycle-lane notifications (`$/progress`, `experimental/serverStatus`) are wired into the shared notification cache instead of being drained and discarded, so it no longer stays stuck `Unknown`/fail-open until the whole mcpls process restarts. (#425)
 - `get_incoming_calls`/`get_outgoing_calls` now wait for the routed LSP server to finish its initial workspace indexing, closing a gap where these whole-workspace queries bypassed the indexing-readiness gate applied to `get_references` and the other whole-workspace tools. (#423)
 - Fixed a response-registration race in `LspClient` where a reply arriving before the caller finished enqueuing its request could be silently dropped, causing the caller to wait out the full request timeout instead of receiving it; also closed the same window in respawn test fixtures, which previously replied to LSP requests without reading them first. (#447, #452)
+- Disk reads on Windows now reject non-disk file types (e.g. reserved device names like `CON`, `COM1`, `NUL`) via `GetFileType`, bounding the content read; the open itself can still block on Windows, which has no `O_NONBLOCK` equivalent. (#442, #446)
 
 ### Security
 

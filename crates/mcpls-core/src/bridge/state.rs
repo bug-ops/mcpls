@@ -22,6 +22,7 @@ use super::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
+use crate::util::{BoundedReadOutcome, bounded_read_cap, check_bounded_utf8};
 
 /// Debounce window for re-reading a file's content when its mtime is not yet
 /// [`mtime_settled`]. The stat itself is never debounced -- only this
@@ -55,6 +56,29 @@ fn mtime_settled(mtime: Option<SystemTime>, read_at: SystemTime) -> bool {
         m.checked_add(MTIME_GRANULARITY)
             .is_some_and(|t| t <= read_at)
     })
+}
+
+/// Rejects `file` unless its Win32 file type is `FILE_TYPE_DISK`, the
+/// Windows equivalent of the Unix `fstat`-based regular-file check in
+/// [`DocumentTracker::open_checked`]. `std::fs::Metadata::is_file()` alone
+/// is not a reliable rejection for every special path on Windows (e.g.
+/// reserved device names like `CON`, `COM1`, `NUL`); those can still block
+/// indefinitely on read, so this bounds the read -- not the open itself,
+/// which Win32 has no non-blocking equivalent for (see #442).
+#[cfg(windows)]
+fn check_disk_file_type(file: &fs::File, path: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+
+    #[allow(unsafe_code)]
+    // SAFETY: `file` is a valid, still-open handle just obtained from open(); GetFileType's only precondition.
+    let file_type = unsafe { GetFileType(file.as_raw_handle().cast()) };
+
+    if file_type != FILE_TYPE_DISK {
+        return Err(Error::NotARegularFile(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 /// A snapshot of a document's on-disk filesystem state, captured the last
@@ -698,13 +722,19 @@ impl DocumentTracker {
     /// a FIFO substituted for an expected regular file could hang the
     /// calling task (and pin a blocking-pool thread) forever (see #418).
     ///
-    /// **Known gap on non-Unix (e.g. Windows)**: there is no equivalent
-    /// non-blocking open used here, so a peer-waiting special file can still
-    /// hang this open indefinitely on those platforms; Windows' own
-    /// `FileType::is_file()` is also not a reliable rejection for every
-    /// special path (e.g. `CON`, `COM1`, `NUL`). The size bound in
-    /// [`Self::read_string_bounded`] still holds regardless, so the residual
-    /// risk there is a blocking hang, not unbounded memory use.
+    /// **Known gap on Windows**: `CreateFileW` (what `fs::File::open` and
+    /// `OpenOptions::open` call into) has no `O_NONBLOCK` equivalent, so the
+    /// open itself can still block indefinitely on a hostile path (e.g. an
+    /// oplock held by another process, or a dead network redirector) --
+    /// Win32 offers nothing to bound that. What Windows does get is a
+    /// content-read guarantee: the open handle is checked via `GetFileType`
+    /// (see [`check_disk_file_type`]) immediately after open and before
+    /// `metadata()` or any content read, rejecting anything that is not
+    /// `FILE_TYPE_DISK` (e.g. reserved device names like `CON`, `COM1`,
+    /// `NUL`, which `FileType::is_file()` alone does not reliably reject) --
+    /// see #442. Platforms that are neither Unix nor Windows get neither
+    /// protection: a plain blocking open with no file-type check beyond
+    /// `is_file()`.
     async fn open_checked(&self, path: &Path) -> Result<(fs::File, std::fs::Metadata)> {
         #[cfg(unix)]
         let opened = fs::OpenOptions::new()
@@ -719,6 +749,9 @@ impl DocumentTracker {
             path: path.to_path_buf(),
             source: e,
         })?;
+        // Must precede metadata() below: GetFileInformationByHandle may fail for non-disk handles.
+        #[cfg(windows)]
+        check_disk_file_type(&file, path)?;
         let meta = file.metadata().await.map_err(|e| Error::FileIo {
             path: path.to_path_buf(),
             source: e,
@@ -749,11 +782,7 @@ impl DocumentTracker {
         size_hint: u64,
     ) -> Result<String> {
         let max = self.limits.max_file_size;
-        let cap = if max == 0 {
-            u64::MAX
-        } else {
-            max.saturating_add(1)
-        };
+        let cap = bounded_read_cap(max);
         let mut buf = Vec::with_capacity(usize::try_from(size_hint.min(cap)).unwrap_or(0));
         let io_err = |e: std::io::Error| Error::FileIo {
             path: path.to_path_buf(),
@@ -765,19 +794,16 @@ impl DocumentTracker {
             .read_to_end(&mut buf)
             .await
             .map_err(io_err)?;
-        // Checked against the byte count before UTF-8 validation below, so a
-        // multibyte character split by the size bound is reported as
-        // oversized rather than as invalid UTF-8. Skipped when `max == 0`
-        // (unlimited): `cap` is `u64::MAX` in that case, so this could only
-        // ever fire on a practically unreachable file size.
-        if max != 0 && buf.len() as u64 > max {
-            return Err(Error::FileSizeLimitExceeded {
-                size: buf.len() as u64,
-                max,
-            });
+        match check_bounded_utf8(buf, max) {
+            BoundedReadOutcome::Ok(s) => Ok(s),
+            BoundedReadOutcome::TooLarge { size } => {
+                Err(Error::FileSizeLimitExceeded { size, max })
+            }
+            BoundedReadOutcome::InvalidUtf8(e) => Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e,
+            ))),
         }
-        String::from_utf8(buf)
-            .map_err(|e| io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
     }
 
     /// Reads `path` through a single open file handle, checking its size and
@@ -2788,6 +2814,53 @@ mod tests {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         // A timeout here means the fix failed and open() is still blocking
         // indefinitely on the FIFO -- the exact regression #418 fixes.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tracker.read_to_string_checked(&path),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, Err(Error::NotARegularFile(_))));
+    }
+
+    /// Direct regression for #442: `check_disk_file_type` itself, isolated
+    /// from `open_checked`'s surrounding `is_file()` check. Unlike
+    /// `test_read_to_string_checked_rejects_nul_device` below, this fails if
+    /// `check_disk_file_type` were ever bypassed or deleted -- both checks
+    /// currently produce the identical `Error::NotARegularFile` variant, so
+    /// an end-to-end test alone can't tell them apart.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_check_disk_file_type_accepts_regular_rejects_nul() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("regular.txt");
+        std::fs::write(&path, "hello").unwrap();
+
+        let regular = fs::File::open(&path).await.unwrap();
+        assert!(check_disk_file_type(&regular, &path).is_ok());
+
+        let nul_path = PathBuf::from("NUL");
+        let nul = fs::File::open(&nul_path).await.unwrap();
+        assert!(matches!(
+            check_disk_file_type(&nul, &nul_path),
+            Err(Error::NotARegularFile(_))
+        ));
+    }
+
+    /// Regression for #442: `read_to_string_checked` must reject the `NUL`
+    /// device on Windows via `GetFileType`, not `FileType::is_file()` --
+    /// which does not reliably classify reserved device names as
+    /// non-regular. This is the Windows counterpart of
+    /// `test_read_to_string_checked_rejects_fifo`; `NUL` opens immediately
+    /// (unlike a FIFO with no writer), so the outer `timeout` here is only a
+    /// safety net, not proof of non-blocking behavior on its own -- the
+    /// `GetFileType` check itself is what's under test.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_read_to_string_checked_rejects_nul_device() {
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("NUL");
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             tracker.read_to_string_checked(&path),
