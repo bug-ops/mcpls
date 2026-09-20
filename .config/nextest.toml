@@ -36,3 +36,20 @@ path = "target/nextest/default/junit.xml"
 
 [profile.ci.junit]
 path = "target/nextest/ci/junit.xml"
+
+# `test_hover_on_std_vec` (#453) is the only test using `wait_for_std_lib_ready`'s
+# Windows-aware timeout, so its worst case (INDEXING_READY_TIMEOUT +
+# request_timeout_seconds overrun on top of both readiness waits, see
+# `std_lib_readiness_timeout` in rust_analyzer_tests.rs) can exceed the default/ci
+# slow-timeout kill windows above; terminate-after=8 gives it a wider budget.
+# retries=0: the test's own internal polling already retries, so an outer nextest
+# retry would multiply this budget by up to 3x.
+[[profile.default.overrides]]
+filter = 'test(test_hover_on_std_vec)'
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 8 }
+
+[[profile.ci.overrides]]
+filter = 'test(test_hover_on_std_vec)'
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 8 }
