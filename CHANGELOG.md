@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_incoming_calls`/`get_outgoing_calls` now wait for the routed LSP server to finish its initial workspace indexing, closing a gap where these whole-workspace queries bypassed the indexing-readiness gate applied to `get_references` and the other whole-workspace tools. (#423)
 - Fixed a response-registration race in `LspClient` where a reply arriving before the caller finished enqueuing its request could be silently dropped, causing the caller to wait out the full request timeout instead of receiving it; also closed the same window in respawn test fixtures, which previously replied to LSP requests without reading them first. (#447, #452)
 - Disk reads on Windows now reject non-disk file types (e.g. reserved device names like `CON`, `COM1`, `NUL`) via `GetFileType`, bounding the content read; the open itself can still block on Windows, which has no `O_NONBLOCK` equivalent. (#442, #446)
-- The e2e job now installs the `rust-src` component and `test_hover_on_std_vec` waits for std-lib indexing readiness, fixing a hover flake on a std-lib symbol. (#453)
+- The e2e job now installs the `rust-src` component and `test_hover_on_std_vec` waits for std-lib indexing readiness, fixing a hover flake on a std-lib symbol. (#453, #455)
 
 ### Security
 
