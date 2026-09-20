@@ -102,6 +102,18 @@ const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
 /// value today. See [`LspClient::completion_timeout`].
 const COMPLETION_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 
+/// Upper bound on the effective timeout for a single `codeAction/resolve`
+/// request, regardless of `request_timeout_seconds`.
+///
+/// `handle_code_actions` (`bridge::translator::edits`) resolves up to
+/// `MAX_CODE_ACTION_RESOLVES` deferred actions concurrently after the
+/// initial `textDocument/codeAction` response; an uncapped per-resolve
+/// timeout would let a large `request_timeout_seconds` configuration make
+/// one tool call wait far longer than a caller expects for what is meant to
+/// be a best-effort follow-up. Mirrors [`COMPLETION_TIMEOUT_CAP`]'s
+/// reasoning. See [`LspClient::code_action_resolve_timeout`].
+const CODE_ACTION_RESOLVE_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
 
@@ -282,6 +294,16 @@ impl LspClient {
     /// latency for a single tool call is `4 * request_timeout() + 3.5s` (the
     /// sum of the retry backoff delays).
     ///
+    /// Exception: `get_code_actions` (`bridge::translator::edits`) can add a
+    /// second, concurrent round of requests on top of this bound -- up to
+    /// `MAX_CODE_ACTION_RESOLVES` `codeAction/resolve` calls, each retried
+    /// under the same rules but bounded by [`Self::code_action_resolve_timeout`]
+    /// rather than this timeout. Since those run concurrently with each
+    /// other (not with the initial `textDocument/codeAction` request), the
+    /// worst case for that one tool call is
+    /// `(4 * request_timeout() + 3.5s) + (4 * code_action_resolve_timeout() + 3.5s)`,
+    /// not a multiple scaling with the number of resolved actions.
+    ///
     /// The configured value is clamped to the range from 1 second to
     /// [`MAX_TIMEOUT_SECONDS`]. [`crate::serve`]/[`crate::serve_with`] now
     /// validate the top-level `ServerConfig` (via [`ServerConfig::validate`],
@@ -351,6 +373,30 @@ impl LspClient {
     #[must_use]
     pub fn completion_timeout(&self) -> Duration {
         self.request_timeout().min(COMPLETION_TIMEOUT_CAP)
+    }
+
+    /// The timeout applied to a single `codeAction/resolve` request.
+    ///
+    /// Equal to [`Self::request_timeout`], capped at 10 seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::config::LspServerConfig;
+    /// use mcpls_core::lsp::LspClient;
+    ///
+    /// let mut config = LspServerConfig::rust_analyzer();
+    /// config.request_timeout_seconds = 300;
+    /// let client = LspClient::new(config);
+    ///
+    /// // Capped at 10s even though request_timeout_seconds is 300.
+    /// assert_eq!(client.code_action_resolve_timeout(), Duration::from_secs(10));
+    /// assert!(client.code_action_resolve_timeout() <= client.request_timeout());
+    /// ```
+    #[must_use]
+    pub fn code_action_resolve_timeout(&self) -> Duration {
+        self.request_timeout().min(CODE_ACTION_RESOLVE_TIMEOUT_CAP)
     }
 
     /// Send request and wait for response with timeout.
@@ -951,6 +997,22 @@ mod tests {
                 "request_timeout_seconds={secs}"
             );
             assert!(client.completion_timeout() <= client.request_timeout());
+        }
+    }
+
+    #[test]
+    fn test_code_action_resolve_timeout_clamps_to_ten_seconds() {
+        for secs in [1, 2, 3, 30, 300] {
+            let mut config = LspServerConfig::rust_analyzer();
+            config.request_timeout_seconds = secs;
+            let client = LspClient::new(config);
+
+            assert_eq!(
+                client.code_action_resolve_timeout(),
+                Duration::from_secs(secs.min(10)),
+                "request_timeout_seconds={secs}"
+            );
+            assert!(client.code_action_resolve_timeout() <= client.request_timeout());
         }
     }
 
