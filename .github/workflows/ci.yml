@@ -233,7 +233,7 @@ jobs:
       - name: Install rust-analyzer
         run: rustup component add rust-analyzer
       - name: Run e2e tests
-        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test) and test(e2e)'
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test)'
 
   msrv:
     name: MSRV check (1.88)
@@ -272,8 +272,10 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           shared-key: "ci"
-      - name: Build docs
+      - name: Build docs (all features)
         run: cargo doc --no-deps --all-features
+      - name: Build docs (default features)
+        run: cargo doc --no-deps --workspace
       - name: Doc-tests
         run: cargo test --doc --workspace --all-features
 
