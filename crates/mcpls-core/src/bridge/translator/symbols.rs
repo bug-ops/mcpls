@@ -150,6 +150,14 @@ impl Translator {
 
     /// Handle workspace symbol search.
     ///
+    /// Deliberately not gated on indexing readiness, unlike other
+    /// whole-workspace queries (e.g. `references`, call hierarchy
+    /// incoming/outgoing calls): it resolves via `resolve_any` rather than a
+    /// per-file route, so it never goes through `prepare_gated_document`
+    /// (the only chokepoint `IndexingGate` applies to) at all. Whether/how to
+    /// gate it was deferred as a separate open question (spec FR-008) and
+    /// remains a known limitation (#423).
+    ///
     /// # Errors
     ///
     /// Returns an error if the LSP request fails, no server is configured, or

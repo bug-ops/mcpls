@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI's `test-e2e` job filter now runs every `#[ignore]`d integration test instead of only those with "e2e" in their name, closing a gap where 22 ignored tests silently never ran in CI. (#430, #440)
 - Position-encoding conversion now enforces `workspace.max_file_size` on documents it reads from disk rather than reading them unbounded. (#427, #441)
 - Disk reads now reject non-regular files (e.g. FIFOs, character/block devices) instead of trusting their reported size, closing a hang and size-limit bypass. (#418, #441)
+- A respawned LSP server now re-acquires workspace-indexing readiness on its own: the replacement process's lifecycle-lane notifications (`$/progress`, `experimental/serverStatus`) are wired into the shared notification cache instead of being drained and discarded, so it no longer stays stuck `Unknown`/fail-open until the whole mcpls process restarts. (#425)
+- `get_incoming_calls`/`get_outgoing_calls` now wait for the routed LSP server to finish its initial workspace indexing, closing a gap where these whole-workspace queries bypassed the indexing-readiness gate applied to `get_references` and the other whole-workspace tools. (#423)
 
 ## [0.5.0] - 2026-09-06
 

@@ -238,20 +238,11 @@ pub(crate) async fn diagnostics_pump(
                     lifecycle_closed = true;
                     continue;
                 };
-                match notif {
-                    LspNotification::Progress(params) => {
-                        let mut cache = notification_cache.lock().await;
-                        cache.observe_progress(&server_id, &params);
-                    }
-                    LspNotification::Other { method, params } => {
-                        let mut cache = notification_cache.lock().await;
-                        cache.observe_indexing_signal(&server_id, &method, params.as_ref());
-                    }
-                    // Never classified onto this lane -- see `LspClient::message_loop_inner`'s routing.
-                    LspNotification::PublishDiagnostics(_)
-                    | LspNotification::LogMessage(_)
-                    | LspNotification::ShowMessage(_) => {}
-                }
+                bridge::apply_lifecycle_notification(
+                    &mut *notification_cache.lock().await,
+                    &server_id,
+                    notif,
+                );
             }
         }
     }

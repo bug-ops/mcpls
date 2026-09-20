@@ -55,14 +55,36 @@ pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> 
 /// the same place capability-gating is declared so a newly added (or newly
 /// gated) tool can't silently ship without an indexing-readiness decision
 /// either way.
+///
+/// This only covers call sites that actually go through
+/// `prepare_gated_document` -- two production handlers bypass that
+/// chokepoint entirely and so make no `IndexingGate` decision at all:
+/// - `handle_workspace_symbol` (`workspace_symbol_search`) has no per-file
+///   document to resolve or open (it resolves via `resolve_any` instead), so
+///   it cannot be routed through this chokepoint as-is. Whether/how to gate
+///   it on indexing readiness was deferred as a separate open question (spec
+///   FR-008) and remains a known, deliberate limitation -- see #423.
+/// - `handle_diagnostics` calls the ungated `Translator::prepare_document`
+///   sibling directly, so it gets neither an indexing-readiness decision nor
+///   a capability check. Whether a mid-index diagnostics pull (which can
+///   read as "no errors" while rust-analyzer is still loading) should be
+///   gated is an open question, not yet tracked as its own issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IndexingGate {
     /// This tool's answer depends on whole-workspace analysis (e.g. hover,
-    /// definition, references, rename, completions, code actions).
+    /// definition, references, rename, completions, code actions, call
+    /// hierarchy incoming/outgoing calls).
     Required,
     /// This tool's answer is valid even mid-index (single-file analysis),
-    /// or gating it is a deliberately separate open question (spec FR-008,
-    /// for `document_symbols`/`workspace_symbol_search`).
+    /// e.g. `document_symbols`. `handle_call_hierarchy_prepare` also uses
+    /// this variant, but not for the same reason: unlike `document_symbols`,
+    /// `prepareCallHierarchy` does perform position-based name resolution
+    /// (the same class of query as `textDocument/definition`, which *is*
+    /// [`Self::Required`]) -- leaving it ungated is a deliberate scope
+    /// decision for #423 (mid-index it degrades to an empty `prepare`
+    /// result rather than an explicit error), not a claim that it is
+    /// single-file analysis like `document_symbols`. The incoming/outgoing
+    /// calls that follow `prepare` use [`Self::Required`].
     NotRequired,
 }
 
@@ -363,19 +385,30 @@ impl Translator {
     /// Split out from [`Self::prepare_document`] so [`Self::prepare_gated_document`]
     /// can check the routed server's capabilities *before* `ensure_open` sends
     /// `textDocument/didOpen` -- a server rejected by the gate should never
-    /// observe an open notification for a request it can't service. Also
-    /// used directly by handlers that already have a resolved `PathBuf`
-    /// (from `parse_file_uri`) but still need capability gating, e.g.
-    /// `handle_incoming_calls`/`handle_outgoing_calls`.
+    /// observe an open notification for a request it can't service.
     async fn resolve_validated_client_for_file(
         &self,
         file_path: &str,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient, PathBuf)> {
-        let path = PathBuf::from(file_path);
-        let validated_path = self.validate_path(&path)?;
+        let validated_path = self.validate_path(Path::new(file_path))?;
         let (server_id, client) = self.resolve_client_for_file(&validated_path, tool).await?;
         Ok((server_id, client, validated_path))
+    }
+
+    /// As [`Self::resolve_validated_client_for_file`], but for a caller that
+    /// already has a `&Path` it validated itself (e.g. `parse_file_uri`'s
+    /// return value). `path` is trusted to already be validated -- this does
+    /// *not* re-`canonicalize`/re-check it against workspace roots, unlike
+    /// the `&str` overload above, which always validates an untrusted MCP
+    /// input from scratch.
+    async fn resolve_validated_client_for_path(
+        &self,
+        path: &Path,
+        tool: ToolKind,
+    ) -> Result<(ServerId, LspClient, PathBuf)> {
+        let (server_id, client) = self.resolve_client_for_file(path, tool).await?;
+        Ok((server_id, client, path.to_path_buf()))
     }
 
     /// Resolve the LSP client and ensure the document is open.
@@ -436,6 +469,50 @@ impl Translator {
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
+        self.finish_prepare_gated_document(
+            server_id,
+            client,
+            validated_path,
+            capability,
+            indexing_gate,
+        )
+        .await
+    }
+
+    /// As [`Self::prepare_gated_document`], but for a caller that already
+    /// has a `&Path` it validated itself (e.g. `handle_incoming_calls`/`handle_outgoing_calls`,
+    /// via `parse_file_uri`) -- see [`Self::resolve_validated_client_for_path`]'s
+    /// doc for why this skips re-validation.
+    pub(super) async fn prepare_gated_document_for_path(
+        &self,
+        path: &Path,
+        tool: ToolKind,
+        capability: Capability,
+        indexing_gate: IndexingGate,
+    ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
+        let (server_id, client, validated_path) =
+            self.resolve_validated_client_for_path(path, tool).await?;
+        self.finish_prepare_gated_document(
+            server_id,
+            client,
+            validated_path,
+            capability,
+            indexing_gate,
+        )
+        .await
+    }
+
+    /// Shared tail of [`Self::prepare_gated_document`] and
+    /// [`Self::prepare_gated_document_for_path`], once each has resolved and
+    /// validated its own path: capability-gate, indexing-gate, then open.
+    async fn finish_prepare_gated_document(
+        &self,
+        server_id: ServerId,
+        client: LspClient,
+        validated_path: PathBuf,
+        capability: Capability,
+        indexing_gate: IndexingGate,
+    ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
         self.require_capability(&server_id, capability)?;
         if indexing_gate == IndexingGate::Required {
             self.wait_for_indexing_ready(&server_id).await?;
@@ -638,6 +715,41 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = translator.validate_path(&test_file);
+        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+    }
+
+    /// Regression guard: `prepare_gated_document`'s `&str` overload (used by
+    /// `handle_hover` and nearly every other gated handler) must still
+    /// reject an out-of-workspace path end-to-end, i.e.
+    /// `resolve_validated_client_for_file` must validate independently
+    /// rather than ever delegating to the `&Path` overload (whose
+    /// `resolve_validated_client_for_path` sibling trusts its caller to have
+    /// already validated and does not check workspace roots itself). Pins
+    /// down a near-miss caught during the #423/#425 refactor, where
+    /// `prepare_gated_document` briefly delegated through the `&Path`
+    /// overload and would have silently skipped this check for every
+    /// `&str`-based handler.
+    #[tokio::test]
+    async fn test_handle_hover_blocked_when_path_outside_workspace() {
+        let workspace_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &workspace_dir,
+            &server_id,
+            lsp_types::ServerCapabilities {
+                hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
+                ..Default::default()
+            },
+        );
+
+        let outside_path = outside_dir.path().join("outside.rs");
+        fs::write(&outside_path, "fn outside() {}").unwrap();
+
+        let result = translator
+            .handle_hover(outside_path.to_string_lossy().to_string(), pos(1, 1))
+            .await;
+
         assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
     }
 

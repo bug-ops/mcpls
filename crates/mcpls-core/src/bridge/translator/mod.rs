@@ -109,6 +109,22 @@ pub struct Translator {
     /// it to invalidate a respawned server's stale cached diagnostics --
     /// see that method's docs for why that matters.
     notification_cache: Option<Arc<Mutex<NotificationCache>>>,
+    /// `AbortHandle` for the currently-running lifecycle-lane forwarding
+    /// task spawned by the most recent [`Self::respawn_if_dead`] call for
+    /// each server, keyed by routing identity. Under a fast crash loop, an
+    /// earlier respawn's forwarder can still be alive (or have a buffered
+    /// notification in flight) when a later respawn for the same `id`
+    /// resets the cache -- aborting the previous handle before installing a
+    /// new one bounds that stale write instead of letting it run
+    /// indefinitely. See [`Self::respawn_if_dead`].
+    ///
+    /// Scope: this only covers forwarder-vs-forwarder races across
+    /// consecutive respawns. The *original* `diagnostics_pump` task from a
+    /// server's initial spawn (`serve_with`'s scope, not `Translator`'s) has
+    /// the same theoretical backlog risk on the *first* respawn, but fixing
+    /// that is out of scope here -- same accepted trade-off already
+    /// documented at `NotificationCache::push_degraded`'s `#249` reference.
+    lifecycle_forwarders: Arc<StdMutex<HashMap<ServerId, tokio::task::AbortHandle>>>,
     /// Time source for respawn-backoff bookkeeping ([`respawn`](self::respawn)).
     /// Always [`SystemClock`] in production; overridden via
     /// [`Self::with_clock`] in tests so backoff-window tests can advance
@@ -144,6 +160,7 @@ impl Translator {
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
+            lifecycle_forwarders: Arc::new(StdMutex::new(HashMap::new())),
             clock: Arc::new(SystemClock),
         }
     }
