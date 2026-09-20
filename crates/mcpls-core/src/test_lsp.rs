@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexS
 use tokio::time::Duration;
 
 use crate::config::LspServerConfig;
-use crate::lsp::{LspClient, LspTransport};
+use crate::lsp::{LspClient, LspTransport, LspTransportReader};
 
 /// Duplex buffer capacity for the mock pipes below. Framed JSON-RPC
 /// messages exchanged in these tests run from a few dozen bytes to a
@@ -88,7 +88,7 @@ pub fn fake_lsp_client_with_config(config: LspServerConfig) -> (LspClient, FakeS
 /// an `LspServer`/`LspClient` around this and never send real traffic
 /// through it are unaffected.
 #[must_use]
-pub fn inert_transport() -> LspTransport {
+pub fn inert_transport() -> (LspTransport, LspTransportReader) {
     let (stdin, _unused_read) = tokio::io::duplex(1);
     let (_unused_write, stdout) = tokio::io::duplex(1);
     LspTransport::new(stdin, stdout)
