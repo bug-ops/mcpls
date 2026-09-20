@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `get_code_actions` silently dropping edits from language servers that respond with `WorkspaceEdit.documentChanges` instead of the legacy `changes` map. (#429, #431)
 - `get_code_actions` now resolves code actions a language server deferred (`edit: None`, `data: Some(...)`) via `codeAction/resolve` instead of returning them with no edit. (#432, #435)
 - Fixed a broken rustdoc intra-doc link to the feature-gated `Transport::Http` that broke `cargo doc` on a default-feature build. (#437)
+- CI's `docs` job now also builds rustdoc with default features, catching feature-gated doc-link breakage like the one fixed in #437 that `--all-features`-only builds masked. (#438, #440)
+- CI's `test-e2e` job filter now runs every `#[ignore]`d integration test instead of only those with "e2e" in their name, closing a gap where 22 ignored tests silently never ran in CI. (#430, #440)
 
 ## [0.5.0] - 2026-09-06
 
