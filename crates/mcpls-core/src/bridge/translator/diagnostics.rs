@@ -2,7 +2,7 @@
 //! log/message retrieval.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use lsp_types::{
     DocumentDiagnosticParams, PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
@@ -43,6 +43,10 @@ enum DocumentDiagnosticReportResult {
     // is preserved.
     Partial(#[allow(dead_code)] lsp_types::DocumentDiagnosticReportPartialResult),
 }
+
+/// Shared, never-mutated empty `workspace_roots` for an `EncodingCtx` built
+/// where it's documented as never read -- avoids a per-poll `Arc` allocation.
+static EMPTY_WORKSPACE_ROOTS: LazyLock<Arc<Vec<PathBuf>>> = LazyLock::new(|| Arc::new(Vec::new()));
 
 /// Convert an LSP diagnostic into the MCP-facing `Diagnostic` shape.
 ///
@@ -237,6 +241,8 @@ impl Translator {
                 let ctx = EncodingCtx {
                     encoding,
                     tracker: tracker.clone(),
+                    // Never read here -- see `EMPTY_WORKSPACE_ROOTS`'s doc.
+                    workspace_roots: EMPTY_WORKSPACE_ROOTS.clone(),
                 };
                 let mut result = Vec::with_capacity(diag_info.diagnostics.len());
                 for d in &diag_info.diagnostics {

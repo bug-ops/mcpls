@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace-indexing readiness is now also tracked from a generic LSP `$/progress` `begin`/`end` sequence, not just rust-analyzer's `experimental/serverStatus` — mcpls now advertises `window.workDoneProgress` at `initialize` and answers `window/workDoneProgress/create`, so any spec-compliant server (gopls, pyright, tsserver) can report indexing progress and be gated on. (#433)
 - New `[[lsp_servers]] indexing = "disabled"` config option to opt a server out of workspace-indexing readiness gating entirely. (#433)
 - New `workspace.indexing_ready_timeout_seconds` config option (default 30) to make the workspace-indexing readiness wait bound configurable. (#450)
+- `mcpls-core` now publishes `[package.metadata.docs.rs]` metadata so docs.rs builds with every feature enabled, including the `transport-http` feature; `Transport::Http`, `HttpConfig`, and other `transport-http`-gated items are now annotated and visible on the published docs. (#439, #448)
+- Read-only navigation results (`get_definition`, `get_references`, `get_implementation`, `get_type_definition`, call hierarchy, `search_workspace_symbols`) now carry an advisory `out_of_workspace` flag on each returned location, set when it falls outside every configured workspace root, so an MCP client can apply its own policy without mcpls filtering the result. (#428, #448)
 
 ### Changed
 

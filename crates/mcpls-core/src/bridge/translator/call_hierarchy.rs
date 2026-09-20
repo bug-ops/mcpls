@@ -77,6 +77,7 @@ async fn convert_call_hierarchy_item(
     item: CallHierarchyItem,
     ctx: &EncodingCtx,
 ) -> CallHierarchyItemResult {
+    let out_of_workspace = ctx.is_out_of_workspace(&item.uri);
     let range = ctx.normalize_range(&item.uri, item.range).await;
     let selection_range = ctx.normalize_range(&item.uri, item.selection_range).await;
 
@@ -92,6 +93,7 @@ async fn convert_call_hierarchy_item(
         range,
         selection_range,
         data: item.data,
+        out_of_workspace,
     }
 }
 
@@ -425,6 +427,7 @@ mod tests {
                 },
             },
             data: None,
+            out_of_workspace: false,
         })
         .unwrap()
     }
@@ -688,6 +691,7 @@ mod tests {
                 },
             },
             data: None,
+            out_of_workspace: false,
         };
 
         let translator = Arc::new(translator);
@@ -743,6 +747,10 @@ mod tests {
              item's (\"abc\") -- a byte offset of 3 is UTF-16 column 3 in the former, 4 in the \
              latter"
         );
+        assert!(
+            !result.calls[0].from.out_of_workspace,
+            "an in-workspace caller must not be marked out_of_workspace"
+        );
     }
 
     /// Per the LSP spec, an outgoing call's `fromRanges` are ranges within
@@ -797,6 +805,7 @@ mod tests {
                 },
             },
             data: None,
+            out_of_workspace: false,
         };
 
         let translator = Arc::new(translator);
@@ -902,6 +911,7 @@ mod tests {
                 },
             },
             data: None,
+            out_of_workspace: false,
         };
 
         let translator = Arc::new(translator);
@@ -955,6 +965,10 @@ mod tests {
             "an out-of-workspace caller must be returned, not dropped"
         );
         assert_eq!(result.calls[0].from.uri, outside_uri);
+        assert!(
+            result.calls[0].from.out_of_workspace,
+            "an out-of-workspace caller must be marked out_of_workspace"
+        );
     }
 
     /// #415 (revised per critic C1) companion for outgoing calls: a callee
@@ -1001,6 +1015,7 @@ mod tests {
                 },
             },
             data: None,
+            out_of_workspace: false,
         };
 
         let translator = Arc::new(translator);
@@ -1054,6 +1069,10 @@ mod tests {
             "an out-of-workspace callee must be returned, not dropped"
         );
         assert_eq!(result.calls[0].to.uri, outside_uri);
+        assert!(
+            result.calls[0].to.out_of_workspace,
+            "an out-of-workspace callee must be marked out_of_workspace"
+        );
     }
 
     /// #411 regression: `prepare_call_hierarchy` -> `get_incoming_calls`

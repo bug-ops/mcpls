@@ -3,6 +3,7 @@
 //! `crate::test_lsp`), and JSON-RPC framing helpers.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tempfile::TempDir;
@@ -34,12 +35,22 @@ pub(super) fn test_ctx() -> EncodingCtx {
 /// tests that need a non-UTF-16 encoding and don't care about the
 /// tracker fast path (e.g. exercising the disk-read fallback directly).
 pub(super) fn test_ctx_with(encoding: PositionEncoding) -> EncodingCtx {
+    test_ctx_with_roots(encoding, Vec::new())
+}
+
+/// [`test_ctx_with`] with explicit workspace roots, for tests exercising
+/// [`EncodingCtx::is_out_of_workspace`](super::encoding_ctx::EncodingCtx::is_out_of_workspace).
+pub(super) fn test_ctx_with_roots(
+    encoding: PositionEncoding,
+    workspace_roots: Vec<PathBuf>,
+) -> EncodingCtx {
     EncodingCtx {
         encoding,
         tracker: Arc::new(DocumentTracker::new(
             ResourceLimits::default(),
             HashMap::new(),
         )),
+        workspace_roots: Arc::new(workspace_roots),
     }
 }
 
