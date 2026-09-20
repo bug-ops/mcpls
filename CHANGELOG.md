@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Workspace-indexing readiness is now also tracked from a generic LSP `$/progress` `begin`/`end` sequence, not just rust-analyzer's `experimental/serverStatus` — mcpls now advertises `window.workDoneProgress` at `initialize` and answers `window/workDoneProgress/create`, so any spec-compliant server (gopls, pyright, tsserver) can report indexing progress and be gated on. (#433)
 - New `[[lsp_servers]] indexing = "disabled"` config option to opt a server out of workspace-indexing readiness gating entirely. (#433)
-- New `workspace.indexing_ready_timeout_seconds` config option (default 30) to make the workspace-indexing readiness wait bound configurable. (#424)
+- New `workspace.indexing_ready_timeout_seconds` config option (default 30) to make the workspace-indexing readiness wait bound configurable. (#450)
 
 ### Changed
 
@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LspClient` gained `notify_typed`, deriving the LSP method string from the notification's `lsp_types::Notification` type instead of a hand-picked string; the initialize/initialized/shutdown/exit handshake and document open/change notifications now go through the typed request/notification API. (#436)
 - Replaced the `&'static str` + closure pair used to gate MCP tool calls on LSP server capabilities with a single `Capability` enum, so the reported capability name and the check that verifies it can no longer drift apart. (#436)
 - Deduplicated `LspNotification::parse`'s four deserialize-or-fallback match arms into a shared helper, sourcing method-name constants from `lsp_types` instead of string literals (no behavior change). (#449)
-- `Error::WorkspaceIndexing` now maps to a distinct JSON-RPC server-error code instead of the generic internal-error code. (#424)
+- `Error::WorkspaceIndexing` now maps to a distinct JSON-RPC server-error code instead of the generic internal-error code. (#450)
 
 ### Fixed
 
@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed a broken rustdoc intra-doc link to the feature-gated `Transport::Http` that broke `cargo doc` on a default-feature build. (#437)
 - CI's `docs` job now also builds rustdoc with default features, catching feature-gated doc-link breakage like the one fixed in #437 that `--all-features`-only builds masked. (#438, #440)
 - CI's `test-e2e` job filter now runs every `#[ignore]`d integration test instead of only those with "e2e" in their name, closing a gap where 22 ignored tests silently never ran in CI. (#430, #440)
-- `get_diagnostics`, `get_cached_diagnostics`, and the `mcpls-diagnostics://` resource now flag `indexingInProgress: true` when the routed server is still indexing. (#445)
+- `get_diagnostics`, `get_cached_diagnostics`, and the `mcpls-diagnostics://` resource now flag `indexingInProgress: true` when the routed server is still indexing. (#450)
 - Position-encoding conversion now enforces `workspace.max_file_size` on documents it reads from disk rather than reading them unbounded. (#427, #441)
 - Disk reads now reject non-regular files (e.g. FIFOs, character/block devices) instead of trusting their reported size, closing a hang and size-limit bypass. (#418, #441)
 - A respawned LSP server now re-acquires workspace-indexing readiness on its own: the replacement process's lifecycle-lane notifications (`$/progress`, `experimental/serverStatus`) are wired into the shared notification cache instead of being drained and discarded, so it no longer stays stuck `Unknown`/fail-open until the whole mcpls process restarts. (#425)
