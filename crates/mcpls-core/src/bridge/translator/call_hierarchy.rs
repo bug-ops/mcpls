@@ -407,10 +407,20 @@ mod tests {
     async fn test_handle_incoming_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
     {
         let translator = Translator::new();
+        // `Url::to_file_path` on Windows requires a drive-letter first path
+        // segment; a Unix-style path with none fails to convert at all
+        // (`uri_to_path` returns `None`, i.e. `Error::InvalidToolParams`)
+        // before ever reaching `canonicalize()`, trivially failing this
+        // assertion for the wrong reason. Use a drive-letter path so the
+        // test exercises the intended `FileIo` path on every platform.
+        #[cfg(windows)]
+        let uri = "file:///C:/this/path/does/not/exist/anywhere.rs";
+        #[cfg(not(windows))]
+        let uri = "file:///this/path/does/not/exist/anywhere.rs";
         let item = serde_json::json!({
             "name": "foo",
             "kind": 12,
-            "uri": "file:///this/path/does/not/exist/anywhere.rs",
+            "uri": uri,
             "range": {
                 "start": {"line": 1, "character": 1},
                 "end": {"line": 1, "character": 1}
@@ -436,10 +446,14 @@ mod tests {
     async fn test_handle_outgoing_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
     {
         let translator = Translator::new();
+        #[cfg(windows)]
+        let uri = "file:///C:/this/path/does/not/exist/anywhere.rs";
+        #[cfg(not(windows))]
+        let uri = "file:///this/path/does/not/exist/anywhere.rs";
         let item = serde_json::json!({
             "name": "foo",
             "kind": 12,
-            "uri": "file:///this/path/does/not/exist/anywhere.rs",
+            "uri": uri,
             "range": {
                 "start": {"line": 1, "character": 1},
                 "end": {"line": 1, "character": 1}
