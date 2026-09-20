@@ -120,11 +120,19 @@ impl Translator {
 
         let symbols = match response {
             Some(lsp_types::DocumentSymbolResponse::SymbolInformationList(symbols)) => {
+                // Unlike `DocumentSymbol` (below), the legacy flat
+                // `SymbolInformation` shape carries its own per-entry
+                // `location.uri`. `document_symbols` is a single-document
+                // request by construction (unlike `workspace/symbol`), so
+                // rather than trust a server-supplied URI here -- which
+                // feeds `normalize_range` into a file read -- every entry is
+                // normalized against `response_uri`, the already-resolved,
+                // trusted document this request was made for. A
+                // conformant server always reports the queried document's
+                // own URI here anyway, so this is a no-op in practice.
                 let mut result = Vec::with_capacity(symbols.len());
                 for sym in symbols {
-                    let range = ctx
-                        .normalize_range(&sym.location.uri, sym.location.range)
-                        .await;
+                    let range = ctx.normalize_range(&response_uri, sym.location.range).await;
                     let selection_range = range.clone();
                     result.push(Symbol {
                         name: sym.base_symbol_information.name,
@@ -222,6 +230,12 @@ impl Translator {
         let ctx = self.encoding_ctx(&server_id);
         let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
         match response {
+            // Not filtered to workspace roots -- like other read-only
+            // navigation results (see `uri_in_workspace_roots`'s doc
+            // comment), a legitimate workspace-symbol result routinely
+            // points outside the workspace (stdlib, a dependency), and any
+            // subsequent open/read of it still hits the inbound
+            // `validate_path_against_roots` gate.
             Some(lsp_types::WorkspaceSymbolResponse::SymbolInformationList(list)) => {
                 for sym in list {
                     let range = ctx
@@ -288,6 +302,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::BufReader;
     use tokio::time::timeout;
+    use url::Url;
 
     use super::*;
     use crate::bridge::translator::testing::*;
@@ -398,6 +413,7 @@ mod tests {
         let path = dir.path().join("main.rs");
         fs::write(&path, "fn main() {}\n").unwrap();
         let path_str = path.to_string_lossy().to_string();
+        let uri = Url::from_file_path(&path).unwrap().to_string();
 
         let translator = Arc::new(translator);
         let handle = {
@@ -418,7 +434,7 @@ mod tests {
                 "name": "main",
                 "kind": 12,
                 "location": {
-                    "uri": "file:///main.rs",
+                    "uri": uri,
                     "range": {
                         "start": {"line": 0, "character": 0},
                         "end": {"line": 0, "character": 12},
@@ -438,6 +454,79 @@ mod tests {
         assert_eq!(result.symbols[0].range, result.symbols[0].selection_range);
     }
 
+    /// M2: a flat `SymbolInformation` document-symbol entry's `location.uri`
+    /// is never trusted for encoding conversion -- `document_symbols` is a
+    /// single-document request by construction, so every entry is
+    /// normalized against `response_uri` (the already-resolved, trusted
+    /// queried document), regardless of what the entry's own `location.uri`
+    /// says. Uses a UTF-8-negotiated server and multibyte content to prove
+    /// this: the entry names a nonexistent out-of-workspace URI, so if that
+    /// URI were used instead, the disk read would fail and the position
+    /// would fall back to the raw, unconverted byte offset (4) rather than
+    /// the correctly re-derived UTF-16 column (3).
+    #[tokio::test]
+    async fn test_handle_document_symbols_flat_response_normalizes_against_response_uri() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, mut server) = translator_with_capabilities_and_encoding(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities {
+                document_symbol_provider: Some(lsp_types::DocumentSymbolProvider::Bool(true)),
+                ..Default::default()
+            },
+            lsp_types::PositionEncodingKind::UTF8,
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "aöb").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let outside_uri = "file:///outside/workspace/does-not-exist.rs";
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move { translator.handle_document_symbols(path_str).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let symbol_request = read_framed_message(&mut wire).await;
+        assert_eq!(symbol_request["method"], "textDocument/documentSymbol");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &symbol_request["id"],
+            serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                "location": {
+                    "uri": outside_uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3},
+                    },
+                },
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .expect("flat document symbol response should succeed");
+
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(
+            result.symbols[0].range.end.character, 3,
+            "must convert against the queried document's own content (\"aöb\"), not fail to \
+             read the entry's own (nonexistent, out-of-workspace) location.uri and fall back to \
+             the raw byte offset"
+        );
+    }
+
     /// S1/S4 regression: a `workspace/symbol` response in the newer
     /// `WorkspaceSymbol[]` shape can mix `Location` (has a range) and
     /// `LocationUriOnly` (no range) entries in the same response. The
@@ -452,6 +541,12 @@ mod tests {
             ..Default::default()
         };
         let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let a_uri = Url::from_file_path(dir.path().join("a.rs"))
+            .unwrap()
+            .to_string();
+        let b_uri = Url::from_file_path(dir.path().join("b.rs"))
+            .unwrap()
+            .to_string();
 
         let translator = Arc::new(translator);
         let handle = {
@@ -481,7 +576,7 @@ mod tests {
                     "name": "with_range",
                     "kind": 12,
                     "location": {
-                        "uri": "file:///a.rs",
+                        "uri": a_uri,
                         "range": {
                             "start": {"line": 0, "character": 0},
                             "end": {"line": 0, "character": 5}
@@ -491,7 +586,7 @@ mod tests {
                 {
                     "name": "without_range",
                     "kind": 12,
-                    "location": { "uri": "file:///b.rs" }
+                    "location": { "uri": b_uri }
                 }
             ]),
         )
@@ -509,6 +604,84 @@ mod tests {
             "the range-less LocationUriOnly symbol must be dropped, not fabricated"
         );
         assert_eq!(result.symbols[0].name, "with_range");
+    }
+
+    /// #415 (revised: `search_workspace_symbols` is read-only navigation,
+    /// same policy as `get_definition`/`get_references`/call hierarchy --
+    /// see `uri_in_workspace_roots`'s doc comment): a result whose URI falls
+    /// outside every configured workspace root must still be returned, e.g.
+    /// a symbol defined in the standard library or a crates.io dependency.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_does_not_filter_out_of_workspace_location() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let inside_uri = Url::from_file_path(dir.path().join("inside.rs"))
+            .unwrap()
+            .to_string();
+        let outside_uri = "file:///outside/workspace/evil.rs";
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_workspace_symbol("foo".to_string(), None, 100)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "workspace/symbol");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([
+                {
+                    "name": "inside",
+                    "kind": 12,
+                    "location": {
+                        "uri": inside_uri,
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 5}
+                        }
+                    }
+                },
+                {
+                    "name": "outside",
+                    "kind": 12,
+                    "location": {
+                        "uri": outside_uri,
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 4}
+                        }
+                    }
+                }
+            ]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.symbols.len(),
+            2,
+            "both the in-workspace and out-of-workspace symbols must be returned"
+        );
+        assert!(result.symbols.iter().any(|s| s.name == "inside"));
+        assert!(result.symbols.iter().any(|s| s.name == "outside"));
     }
 
     /// `document_symbols` is single-file analysis, valid even mid-index

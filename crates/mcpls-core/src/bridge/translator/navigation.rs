@@ -60,6 +60,15 @@ fn definition_link_to_location(link: lsp_types::DefinitionLink) -> lsp_types::Lo
 
 /// Converts raw LSP locations into MCP-facing `Location` values, normalizing
 /// each range into the caller's 1-based coordinate space.
+///
+/// Deliberately not filtered to workspace roots: unlike a write-bearing
+/// `WorkspaceEdit` (see `edits.rs`), a goto-X/references location is
+/// read-only, and legitimate results routinely point outside the workspace
+/// (e.g. the standard library or a crates.io dependency) -- dropping those
+/// would break ordinary navigation. Any subsequent attempt to open or read
+/// the path this location names still goes through the inbound
+/// `validate_path_against_roots` gate (`mcp/server.rs`), which fails closed,
+/// so the untrusted-URI concern is already covered downstream.
 async fn lsp_locations_to_mcp(locs: Vec<lsp_types::Location>, ctx: &EncodingCtx) -> Vec<Location> {
     let mut locations = Vec::with_capacity(locs.len());
     for loc in locs {
@@ -1198,6 +1207,148 @@ mod tests {
 
         assert_eq!(result.locations.len(), 1);
         assert_eq!(result.locations[0].uri, target_uri);
+    }
+
+    /// #415 (revised per critic C1): a definition location whose URI falls
+    /// outside every configured workspace root must still be returned --
+    /// goto-definition into the standard library or a crates.io dependency
+    /// is normal, expected navigation, not an attack. The untrusted-URI
+    /// concern is instead covered downstream, by the inbound
+    /// `validate_path_against_roots` gate any subsequent open/read of the
+    /// path would hit.
+    #[tokio::test]
+    async fn test_handle_definition_does_not_filter_out_of_workspace_location() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let outside_uri = "file:///outside/workspace/stdlib.rs";
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_definition(
+                        path,
+                        Position {
+                            line: 1,
+                            character: 1,
+                        },
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/definition");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!({
+                "uri": outside_uri,
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 6}
+                }
+            }),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_definition should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.locations.len(),
+            1,
+            "an out-of-workspace definition location (e.g. stdlib/a dependency) must be \
+             returned, not dropped"
+        );
+        assert_eq!(result.locations[0].uri, outside_uri);
+    }
+
+    /// #415 (revised per critic C1) companion for `handle_references`: an
+    /// out-of-workspace location must pass through unfiltered, same as an
+    /// in-workspace one -- see `test_handle_definition_does_not_filter_out_of_workspace_location`.
+    #[tokio::test]
+    async fn test_handle_references_does_not_filter_out_of_workspace_location() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let inside_path = dir.path().join("inside.rs");
+        fs::write(&inside_path, "fn used() {}").unwrap();
+        let inside_uri = Url::from_file_path(&inside_path).unwrap().to_string();
+        let outside_uri = "file:///outside/workspace/stdlib.rs";
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_references(path, pos(1, 1), true).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/references");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([
+                {
+                    "uri": inside_uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 4}
+                    }
+                },
+                {
+                    "uri": outside_uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 4}
+                    }
+                }
+            ]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_references should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.locations.len(),
+            2,
+            "both the in-workspace and out-of-workspace locations must survive"
+        );
+        assert!(result.locations.iter().any(|l| l.uri == inside_uri));
+        assert!(result.locations.iter().any(|l| l.uri == outside_uri));
     }
 
     /// Success-path coverage for `handle_implementation` through the
