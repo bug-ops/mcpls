@@ -45,6 +45,34 @@ pub struct Location {
     pub uri: String,
     /// Range within the document.
     pub range: Range,
+    /// Whether this location is not provably inside any configured
+    /// workspace root (e.g. the standard library or a crates.io dependency).
+    ///
+    /// Advisory only, not a security/safety guarantee: read-only navigation
+    /// results are never filtered by workspace containment (see
+    /// `bridge::uri_in_workspace_roots`'s docs for why), so callers that
+    /// want to apply their own policy toward out-of-workspace locations can
+    /// check this flag. The underlying check is purely lexical -- it does
+    /// not resolve symlinks -- so a location reached through a symlinked
+    /// workspace root (e.g. macOS's `/var` -> `/private/var`, or a package
+    /// manager's symlinked dependency store) can read `true` even though it
+    /// is genuinely inside the workspace. Also always `true` when no
+    /// workspace roots are configured, consistent with
+    /// `bridge::uri_in_workspace_roots`'s fail-closed convention: without a
+    /// configured root, nothing can be vouched for as inside the workspace.
+    /// Omitted (defaults to `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub out_of_workspace: bool,
+}
+
+/// `skip_serializing_if` predicate for a `bool` field that should be omitted
+/// from the serialized output when `false`.
+///
+/// Takes `&bool` rather than `bool` because serde's `skip_serializing_if`
+/// always calls the predicate with a field reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Result of a hover request.
@@ -273,6 +301,11 @@ pub struct CallHierarchyItemResult {
     /// Opaque data to pass to incoming/outgoing calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// Whether this item is not provably inside any configured workspace
+    /// root -- see [`Location::out_of_workspace`] for the exact semantics
+    /// and caveats (advisory only, lexical, symlink-unaware).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub out_of_workspace: bool,
 }
 
 /// Result of call hierarchy prepare request.

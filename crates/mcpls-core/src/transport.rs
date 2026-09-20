@@ -44,6 +44,7 @@ pub enum Transport {
     /// network-accessible deployments and clients that speak HTTP rather than
     /// stdio. Only available when the `transport-http` feature is enabled.
     #[cfg(feature = "transport-http")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
     Http(HttpConfig),
 }
 
@@ -70,6 +71,7 @@ pub enum Transport {
 /// let transport = Transport::Http(cfg);
 /// ```
 #[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct HttpConfig {
@@ -101,6 +103,7 @@ pub struct HttpConfig {
 }
 
 #[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 impl HttpConfig {
     /// Default request body size cap (4 MiB), matching `rmcp`'s own default.
     pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;

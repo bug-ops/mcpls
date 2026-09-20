@@ -238,6 +238,7 @@ impl Translator {
                         location: Location {
                             uri: sym.location.uri.to_string(),
                             range,
+                            out_of_workspace: ctx.is_out_of_workspace(&sym.location.uri),
                         },
                         container_name: sym.base_symbol_information.container_name,
                     });
@@ -245,10 +246,11 @@ impl Translator {
             }
             Some(lsp_types::WorkspaceSymbolResponse::WorkspaceSymbolList(list)) => {
                 for sym in list {
-                    let (uri, range) = match sym.location {
+                    let (uri, out_of_workspace, range) = match sym.location {
                         lsp_types::WorkspaceSymbolLocation::Location(loc) => {
+                            let out_of_workspace = ctx.is_out_of_workspace(&loc.uri);
                             let range = ctx.normalize_range(&loc.uri, loc.range).await;
-                            (loc.uri.to_string(), range)
+                            (loc.uri.to_string(), out_of_workspace, range)
                         }
                         // `LocationUriOnly` carries no range -- the server
                         // deliberately withheld it (e.g. to avoid computing it
@@ -262,7 +264,11 @@ impl Translator {
                     symbols.push(WorkspaceSymbol {
                         name: sym.base_symbol_information.name,
                         kind: format!("{:?}", sym.base_symbol_information.kind),
-                        location: Location { uri, range },
+                        location: Location {
+                            uri,
+                            range,
+                            out_of_workspace,
+                        },
                         container_name: sym.base_symbol_information.container_name,
                     });
                 }
@@ -674,6 +680,26 @@ mod tests {
         );
         assert!(result.symbols.iter().any(|s| s.name == "inside"));
         assert!(result.symbols.iter().any(|s| s.name == "outside"));
+        assert!(
+            !result
+                .symbols
+                .iter()
+                .find(|s| s.name == "inside")
+                .unwrap()
+                .location
+                .out_of_workspace,
+            "an in-workspace symbol location must not be marked out_of_workspace"
+        );
+        assert!(
+            result
+                .symbols
+                .iter()
+                .find(|s| s.name == "outside")
+                .unwrap()
+                .location
+                .out_of_workspace,
+            "an out-of-workspace symbol location must be marked out_of_workspace"
+        );
     }
 
     /// `document_symbols` is single-file analysis, valid even mid-index

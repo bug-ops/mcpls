@@ -35,6 +35,8 @@
 //! }
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 pub mod bridge;
 pub mod config;
 pub mod error;
@@ -64,6 +66,7 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 #[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 pub use transport::HttpConfig;
 pub use transport::Transport;
 #[cfg(feature = "transport-http")]

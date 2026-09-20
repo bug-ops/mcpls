@@ -288,6 +288,7 @@ impl Translator {
         EncodingCtx {
             encoding: self.position_encoding_for(server_id),
             tracker: self.document_tracker.clone(),
+            workspace_roots: self.workspace_roots.clone(),
         }
     }
 

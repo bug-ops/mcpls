@@ -1,6 +1,7 @@
 //! Per-response position/range encoding conversion between MCP's 1-based
 //! UTF-16 columns and an LSP server's negotiated encoding.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::dto::{Position2D, Range};
@@ -26,6 +27,11 @@ pub(super) struct EncodingCtx {
     /// actually sent the server via `didOpen`/`didChange` -- consulted
     /// before falling back to disk. See [`read_line_text`].
     pub(super) tracker: Arc<DocumentTracker>,
+    /// Snapshot of the configured workspace roots, used only by
+    /// [`Self::is_out_of_workspace`] to annotate (never filter) a read-only
+    /// navigation result -- see `crate::bridge::uri_in_workspace_roots`'s
+    /// docs for why filtering is deliberately not done here.
+    pub(super) workspace_roots: Arc<Vec<PathBuf>>,
 }
 
 /// Text of the 0-based `line`'th line of the file at `uri`, or `None` if it
@@ -55,6 +61,34 @@ async fn read_line_text(
 }
 
 impl EncodingCtx {
+    /// Whether `uri` is *not provably* inside any configured workspace root.
+    ///
+    /// Advisory only, for a read-only navigation handler to annotate a
+    /// result location (`Location::out_of_workspace`,
+    /// `CallHierarchyItemResult::out_of_workspace`) instead of rejecting it
+    /// -- never a safety/security gate. Delegates to
+    /// [`crate::bridge::uri_in_workspace_roots`], which is a purely lexical
+    /// `starts_with` check: unlike
+    /// [`Translator::validate_path`](super::Translator::validate_path) (via
+    /// `validate_path_against_roots`), it does **not** canonicalize `uri` or
+    /// the configured roots first. A location that resolves to a workspace
+    /// root through a symlink (e.g. macOS's `/var` -> `/private/var`, or a
+    /// package manager's symlinked dependency store) can therefore come back
+    /// `true` even though `validate_path` would accept the same path -- the
+    /// two checks are not equivalent, and this one is never used to decide
+    /// what mcpls will open or read.
+    ///
+    /// Also always `true` when no workspace roots are configured at all
+    /// (empty `workspace_roots`, e.g. a library embedder that never called
+    /// `Translator::set_workspace_roots`), consistent with
+    /// `uri_in_workspace_roots`'s fail-closed convention (see its doc
+    /// comment): without a configured root, nothing can be vouched for as
+    /// inside the workspace, so every location is honestly reported as not
+    /// provably contained.
+    pub(super) fn is_out_of_workspace(&self, uri: &lsp_types::Uri) -> bool {
+        !crate::bridge::uri_in_workspace_roots(uri, &self.workspace_roots)
+    }
+
     /// Convert an MCP position for the document at `uri` into an LSP
     /// position in this context's negotiated encoding.
     pub(super) async fn to_lsp(
@@ -150,6 +184,46 @@ mod tests {
     use crate::bridge::state::ResourceLimits;
     use crate::bridge::translator::testing::*;
 
+    #[test]
+    fn test_is_out_of_workspace_false_when_uri_inside_configured_root() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, vec![dir.path().to_path_buf()]);
+        assert!(!ctx.is_out_of_workspace(&uri));
+    }
+
+    #[test]
+    fn test_is_out_of_workspace_true_when_uri_outside_configured_roots() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let other_dir = TempDir::new().unwrap();
+        let ctx = test_ctx_with_roots(
+            PositionEncoding::Utf16,
+            vec![other_dir.path().to_path_buf()],
+        );
+        assert!(ctx.is_out_of_workspace(&uri));
+    }
+
+    /// Matches [`crate::bridge::uri_in_workspace_roots`]'s fail-closed
+    /// convention -- see `is_out_of_workspace`'s doc for why an unconfigured
+    /// workspace makes every location report as not provably contained.
+    #[test]
+    fn test_is_out_of_workspace_true_when_no_roots_configured() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, Vec::new());
+        assert!(ctx.is_out_of_workspace(&uri));
+    }
+
     #[tokio::test]
     async fn test_normalize_range() {
         let lsp_range = lsp_types::Range {
@@ -239,6 +313,7 @@ mod tests {
         let ctx = EncodingCtx {
             encoding: PositionEncoding::Utf8,
             tracker,
+            workspace_roots: Arc::new(Vec::new()),
         };
         let lsp_pos = ctx.to_lsp(&uri, 1, 3).await;
         assert_eq!(

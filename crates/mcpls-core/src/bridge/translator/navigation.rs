@@ -104,6 +104,7 @@ async fn lsp_locations_to_mcp(locs: Vec<lsp_types::Location>, ctx: &EncodingCtx)
         locations.push(Location {
             uri: loc.uri.to_string(),
             range: ctx.normalize_range(&loc.uri, loc.range).await,
+            out_of_workspace: ctx.is_out_of_workspace(&loc.uri),
         });
     }
     locations
@@ -482,14 +483,7 @@ impl Translator {
             .await?;
 
         let locations = response.unwrap_or_default();
-
-        let mut result_locations = Vec::with_capacity(locations.len());
-        for loc in locations {
-            result_locations.push(Location {
-                uri: loc.uri.to_string(),
-                range: ctx.normalize_range(&loc.uri, loc.range).await,
-            });
-        }
+        let result_locations = lsp_locations_to_mcp(locations, &ctx).await;
         let result = ReferencesResult {
             locations: result_locations,
         };
@@ -1216,6 +1210,10 @@ mod tests {
 
         assert_eq!(result.locations.len(), 1);
         assert_eq!(result.locations[0].uri, target_uri);
+        assert!(
+            !result.locations[0].out_of_workspace,
+            "a definition location inside the workspace root must not be marked out_of_workspace"
+        );
     }
 
     /// #415 (revised per critic C1): a definition location whose URI falls
@@ -1288,6 +1286,10 @@ mod tests {
              returned, not dropped"
         );
         assert_eq!(result.locations[0].uri, outside_uri);
+        assert!(
+            result.locations[0].out_of_workspace,
+            "a definition location outside every workspace root must be marked out_of_workspace"
+        );
     }
 
     /// #415 (revised per critic C1) companion for `handle_references`: an
@@ -1358,6 +1360,24 @@ mod tests {
         );
         assert!(result.locations.iter().any(|l| l.uri == inside_uri));
         assert!(result.locations.iter().any(|l| l.uri == outside_uri));
+        assert!(
+            !result
+                .locations
+                .iter()
+                .find(|l| l.uri == inside_uri)
+                .unwrap()
+                .out_of_workspace,
+            "an in-workspace reference location must not be marked out_of_workspace"
+        );
+        assert!(
+            result
+                .locations
+                .iter()
+                .find(|l| l.uri == outside_uri)
+                .unwrap()
+                .out_of_workspace,
+            "an out-of-workspace reference location must be marked out_of_workspace"
+        );
     }
 
     /// Success-path coverage for `handle_implementation` through the
