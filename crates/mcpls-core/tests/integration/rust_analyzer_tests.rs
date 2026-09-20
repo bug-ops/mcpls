@@ -270,13 +270,19 @@ async fn test_definition_user_struct() {
     );
 
     let def_json = def_result.unwrap();
-    let def_str = serde_json::to_string(&def_json).unwrap();
 
-    // Verify definition points to lib.rs where User is defined
+    // Verify definition points to the `User` struct declaration in lib.rs
+    // (line 18, chars 12-16 cover the `User` token in `pub struct User {`).
     assert!(
-        def_str.contains("lib.rs") && def_str.contains("User"),
-        "Definition should reference User struct in lib.rs, got: {}",
-        def_str
+        def_json
+            .locations
+            .iter()
+            .any(|loc| loc.uri.ends_with("lib.rs")
+                && loc.range.start.line == 18
+                && loc.range.start.character == 12
+                && loc.range.end.character == 16),
+        "Definition should reference User struct in lib.rs, got: {:?}",
+        def_json.locations
     );
 }
 
