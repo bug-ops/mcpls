@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rename_symbol` and `get_code_actions` now drop `WorkspaceEdit` entries whose URI falls outside the configured workspace roots, matching the containment check diagnostics already applied — a compromised or misbehaving LSP server can no longer smuggle an out-of-workspace file write into an edit the MCP client would apply as authoritative. `get_document_symbols`' legacy flat (`SymbolInformation`) response shape no longer trusts the server-reported per-entry URI for position-encoding conversion either, always normalizing against the queried document itself. Read-only navigation results (`get_definition`, `get_references`, `get_implementation`, `get_type_definition`, call hierarchy, `search_workspace_symbols`) are deliberately left unfiltered, since a legitimate result routinely points outside the workspace (e.g. the standard library or a dependency). (#426)
 - Fixed `get_code_actions` silently dropping edits from language servers that respond with `WorkspaceEdit.documentChanges` instead of the legacy `changes` map. (#429, #431)
 - `get_code_actions` now resolves code actions a language server deferred (`edit: None`, `data: Some(...)`) via `codeAction/resolve` instead of returning them with no edit. (#432, #435)
-- Fixed a broken rustdoc intra-doc link to the feature-gated `Transport::Http` that broke `cargo doc` on a default-feature build. (#434)
+- Fixed a broken rustdoc intra-doc link to the feature-gated `Transport::Http` that broke `cargo doc` on a default-feature build. (#437)
 
 ## [0.5.0] - 2026-09-06
 
