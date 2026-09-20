@@ -14,7 +14,7 @@ use super::dto::{
     DefinitionResult, HoverResult, Location, LocationsResult, Position, ReferencesResult,
 };
 use super::encoding_ctx::EncodingCtx;
-use super::routing::IndexingGate;
+use super::routing::{Capability, IndexingGate};
 use crate::bridge::IndexingState;
 use crate::bridge::indexing::{INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE, PROGRESS_SETTLE};
 use crate::config::{ServerId, ToolKind};
@@ -314,16 +314,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Hover,
-                "hoverProvider",
-                |caps| {
-                    matches!(
-                        caps.hover_provider,
-                        Some(
-                            lsp_types::HoverProvider::Bool(true)
-                                | lsp_types::HoverProvider::HoverOptions(_)
-                        )
-                    )
-                },
+                Capability::Hover,
                 IndexingGate::Required,
             )
             .await?;
@@ -379,8 +370,7 @@ impl Translator {
         file_path: &str,
         position: Position,
         tool: ToolKind,
-        capability: &'static str,
-        supported: impl FnOnce(&lsp_types::ServerCapabilities) -> bool,
+        capability: Capability,
     ) -> Result<Vec<Location>>
     where
         R: lsp_types::Request<Result = Option<T>>,
@@ -389,13 +379,7 @@ impl Translator {
     {
         let Position { line, character } = position;
         let (server_id, client, uri) = self
-            .prepare_gated_document(
-                file_path,
-                tool,
-                capability,
-                supported,
-                IndexingGate::Required,
-            )
+            .prepare_gated_document(file_path, tool, capability, IndexingGate::Required)
             .await?;
         let ctx = self.encoding_ctx(&server_id);
         let lsp_position = ctx.to_lsp(&uri, line, character).await;
@@ -430,16 +414,7 @@ impl Translator {
                 &file_path,
                 position,
                 ToolKind::Definition,
-                "definitionProvider",
-                |caps| {
-                    matches!(
-                        caps.definition_provider,
-                        Some(
-                            lsp_types::DefinitionProvider::Bool(true)
-                                | lsp_types::DefinitionProvider::DefinitionOptions(_)
-                        )
-                    )
-                },
+                Capability::Definition,
             )
             .await?;
 
@@ -465,16 +440,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::References,
-                "referencesProvider",
-                |caps| {
-                    matches!(
-                        caps.references_provider,
-                        Some(
-                            lsp_types::ReferencesProvider::Bool(true)
-                                | lsp_types::ReferencesProvider::ReferenceOptions(_)
-                        )
-                    )
-                },
+                Capability::References,
                 IndexingGate::Required,
             )
             .await?;
@@ -533,17 +499,7 @@ impl Translator {
                 &file_path,
                 position,
                 ToolKind::Implementation,
-                "implementationProvider",
-                |caps| {
-                    matches!(
-                        caps.implementation_provider,
-                        Some(
-                            lsp_types::ImplementationProvider::Bool(true)
-                                | lsp_types::ImplementationProvider::ImplementationOptions(_)
-                                | lsp_types::ImplementationProvider::ImplementationRegistrationOptions(_)
-                        )
-                    )
-                },
+                Capability::Implementation,
             )
             .await?;
 
@@ -571,17 +527,7 @@ impl Translator {
                 &file_path,
                 position,
                 ToolKind::TypeDefinition,
-                "typeDefinitionProvider",
-                |caps| {
-                    matches!(
-                        caps.type_definition_provider,
-                        Some(
-                            lsp_types::TypeDefinitionProvider::Bool(true)
-                                | lsp_types::TypeDefinitionProvider::TypeDefinitionOptions(_)
-                                | lsp_types::TypeDefinitionProvider::TypeDefinitionRegistrationOptions(_)
-                        )
-                    )
-                },
+                Capability::TypeDefinition,
             )
             .await?;
 

@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 
 use lsp_types::{
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, TextDocumentContentChangeEvent,
+    DidChangeTextDocumentNotification, DidChangeTextDocumentParams,
+    DidOpenTextDocumentNotification, DidOpenTextDocumentParams, TextDocumentContentChangeEvent,
     TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
 };
 use tokio::fs;
@@ -771,36 +772,30 @@ impl DocumentTracker {
 
         let notify_result = if is_first_open {
             lsp_client
-                .notify(
-                    "textDocument/didOpen",
-                    DidOpenTextDocumentParams {
-                        text_document: TextDocumentItem {
-                            uri: uri.clone(),
-                            language_id: language_id.into(),
-                            version: target_version,
-                            text,
-                        },
+                .notify_typed::<DidOpenTextDocumentNotification>(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: language_id.into(),
+                        version: target_version,
+                        text,
                     },
-                )
+                })
                 .await
         } else {
             lsp_client
-                .notify(
-                    "textDocument/didChange",
-                    DidChangeTextDocumentParams {
-                        text_document: VersionedTextDocumentIdentifier {
-                            version: target_version,
-                            text_document_identifier: lsp_types::TextDocumentIdentifier {
-                                uri: uri.clone(),
-                            },
+                .notify_typed::<DidChangeTextDocumentNotification>(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        version: target_version,
+                        text_document_identifier: lsp_types::TextDocumentIdentifier {
+                            uri: uri.clone(),
                         },
-                        content_changes: vec![
-                            TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(
-                                lsp_types::TextDocumentContentChangeWholeDocument { text },
-                            ),
-                        ],
                     },
-                )
+                    content_changes: vec![
+                        TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(
+                            lsp_types::TextDocumentContentChangeWholeDocument { text },
+                        ),
+                    ],
+                })
                 .await
         };
 

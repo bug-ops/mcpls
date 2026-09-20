@@ -11,7 +11,7 @@ use super::dto::{
     Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, SignatureHelpResult,
     SignatureInfo, SignatureParameter,
 };
-use super::routing::IndexingGate;
+use super::routing::{Capability, IndexingGate};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
@@ -70,8 +70,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Completions,
-                "completionProvider",
-                |caps| caps.completion_provider.is_some(),
+                Capability::Completions,
                 IndexingGate::Required,
             )
             .await?;
@@ -142,8 +141,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::SignatureHelp,
-                "signatureHelpProvider",
-                |caps| caps.signature_help_provider.is_some(),
+                Capability::SignatureHelp,
                 IndexingGate::NotRequired,
             )
             .await?;
@@ -224,17 +222,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 ToolKind::InlayHints,
-                "inlayHintProvider",
-                |caps| {
-                    matches!(
-                        caps.inlay_hint_provider,
-                        Some(
-                            lsp_types::InlayHintProvider::Bool(true)
-                                | lsp_types::InlayHintProvider::InlayHintOptions(_)
-                                | lsp_types::InlayHintProvider::InlayHintRegistrationOptions(_)
-                        )
-                    )
-                },
+                Capability::InlayHints,
                 IndexingGate::NotRequired,
             )
             .await?;

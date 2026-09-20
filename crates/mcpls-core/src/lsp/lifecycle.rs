@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use lsp_types::{
-    ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
-    InitializedParams, PositionEncodingKind, ServerCapabilities, StaleRequestSupportOptions,
+    ClientCapabilities, ClientInfo, ExitNotification, GeneralClientCapabilities, InitializeParams,
+    InitializeRequest, InitializeResult, InitializedNotification, InitializedParams,
+    PositionEncodingKind, Request, ServerCapabilities, ShutdownRequest, StaleRequestSupportOptions,
     SymbolKind, WorkspaceFolder,
 };
 use tokio::process::Command;
@@ -598,8 +599,7 @@ impl LspServer {
         // not a hardcoded 30s: large solutions (e.g. a 130-project Unity .sln via
         // OmniSharp) take minutes to respond to `initialize`.
         let result: InitializeResult = client
-            .request(
-                "initialize",
+            .request_typed::<InitializeRequest>(
                 params,
                 // Clamped for the same reason as `LspClient::request_timeout`:
                 // `serve()`/`serve_with()` now validate the top-level
@@ -634,7 +634,7 @@ impl LspServer {
         );
 
         client
-            .notify("initialized", InitializedParams {})
+            .notify_typed::<InitializedNotification>(InitializedParams {})
             .await
             .map_err(|e| Error::LspInitFailed {
                 message: format!("Initialized notification failed: {e}"),
@@ -707,9 +707,9 @@ impl LspServer {
         let handshake: Result<()> = async move {
             let _: serde_json::Value = self
                 .client
-                .request("shutdown", serde_json::Value::Null, Duration::from_secs(5))
+                .request(ShutdownRequest::METHOD.as_str(), (), Duration::from_secs(5))
                 .await?;
-            self.client.notify("exit", serde_json::Value::Null).await?;
+            self.client.notify_typed::<ExitNotification>(()).await?;
             self.client.shutdown().await
         }
         .await;

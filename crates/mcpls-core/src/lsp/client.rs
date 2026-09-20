@@ -628,6 +628,20 @@ impl LspClient {
         Ok(())
     }
 
+    /// Send a typed LSP notification, deriving the method string from `N`'s
+    /// [`lsp_types::Notification`] implementation so it cannot drift from the
+    /// params type -- the notification counterpart to [`Self::request_typed`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::notify`].
+    pub async fn notify_typed<N>(&self, params: N::Params) -> Result<()>
+    where
+        N: lsp_types::Notification,
+    {
+        self.notify(N::METHOD.as_str(), params).await
+    }
+
     /// Shutdown client gracefully.
     ///
     /// This sends a shutdown command to the background task and waits for it to complete.

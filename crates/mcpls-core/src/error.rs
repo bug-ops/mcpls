@@ -274,7 +274,8 @@ pub enum Error {
     CapabilityNotSupported {
         /// Routing identity of the server that lacks the capability.
         server_id: ServerId,
-        /// Name of the missing LSP capability field (e.g. `"renameProvider"`).
+        /// The missing LSP capability's name (e.g. `"renameProvider"`), the
+        /// `ServerCapabilities` field mcpls checked.
         capability: &'static str,
     },
 
