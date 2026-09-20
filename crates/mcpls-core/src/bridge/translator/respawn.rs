@@ -549,8 +549,12 @@ sleep __SLEEP__
                     env: HashMap::new(),
                     file_patterns: vec![],
                     initialization_options: None,
-                    timeout_seconds: 5,
-                    request_timeout_seconds: 5,
+                    // Generous relative to the sub-second fake scripts these
+                    // tests spawn, to absorb CI scheduling jitter under
+                    // concurrent nextest load (a bare `sh` invocation has no
+                    // real work to do, so this never lengthens the happy path).
+                    timeout_seconds: 20,
+                    request_timeout_seconds: 20,
                     heuristics: None,
                     name: Some(id.to_string()),
                     handles: None,
