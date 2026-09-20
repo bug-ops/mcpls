@@ -78,12 +78,13 @@ impl EncodingCtx {
     /// two checks are not equivalent, and this one is never used to decide
     /// what mcpls will open or read.
     ///
-    /// Also always `false` when no workspace roots are configured at all
+    /// Also always `true` when no workspace roots are configured at all
     /// (empty `workspace_roots`, e.g. a library embedder that never called
-    /// `Translator::set_workspace_roots`), matching
-    /// `uri_in_workspace_roots`'s "no roots = no restriction" convention --
-    /// the marker is meaningless in that configuration, not a positive
-    /// containment signal (related, unfixed gap: #417).
+    /// `Translator::set_workspace_roots`), consistent with
+    /// `uri_in_workspace_roots`'s fail-closed convention (see its doc
+    /// comment): without a configured root, nothing can be vouched for as
+    /// inside the workspace, so every location is honestly reported as not
+    /// provably contained.
     pub(super) fn is_out_of_workspace(&self, uri: &lsp_types::Uri) -> bool {
         !crate::bridge::uri_in_workspace_roots(uri, &self.workspace_roots)
     }
@@ -195,14 +196,13 @@ mod tests {
         assert!(ctx.is_out_of_workspace(&test_uri()));
     }
 
-    /// Matches [`crate::bridge::uri_in_workspace_roots`]'s "no roots = no
-    /// restriction" convention -- see `is_out_of_workspace`'s doc for why
-    /// this makes the marker meaningless (not a positive signal) in this
-    /// configuration.
+    /// Matches [`crate::bridge::uri_in_workspace_roots`]'s fail-closed
+    /// convention -- see `is_out_of_workspace`'s doc for why an unconfigured
+    /// workspace makes every location report as not provably contained.
     #[test]
-    fn test_is_out_of_workspace_false_when_no_roots_configured() {
+    fn test_is_out_of_workspace_true_when_no_roots_configured() {
         let ctx = test_ctx_with_roots(PositionEncoding::Utf16, Vec::new());
-        assert!(!ctx.is_out_of_workspace(&test_uri()));
+        assert!(ctx.is_out_of_workspace(&test_uri()));
     }
 
     #[tokio::test]

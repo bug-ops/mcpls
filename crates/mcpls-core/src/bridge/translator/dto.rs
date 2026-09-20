@@ -56,10 +56,11 @@ pub struct Location {
     /// not resolve symlinks -- so a location reached through a symlinked
     /// workspace root (e.g. macOS's `/var` -> `/private/var`, or a package
     /// manager's symlinked dependency store) can read `true` even though it
-    /// is genuinely inside the workspace. Also always `false` when no
-    /// workspace roots are configured, which is a "no signal" state, not a
-    /// positive containment result (related, unfixed gap: #417). Omitted
-    /// (defaults to `false`) when serialized.
+    /// is genuinely inside the workspace. Also always `true` when no
+    /// workspace roots are configured, consistent with
+    /// `bridge::uri_in_workspace_roots`'s fail-closed convention: without a
+    /// configured root, nothing can be vouched for as inside the workspace.
+    /// Omitted (defaults to `false`) when serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_workspace: bool,
 }
