@@ -142,6 +142,11 @@ impl Translator {
     ///
     /// Starts with an empty router: nothing is routable until [`Self::with_router`]
     /// installs one, which matches having no servers registered.
+    ///
+    /// Also starts with no workspace roots, which makes every path-taking
+    /// operation fail closed with `Error::NoWorkspaceRoots` -- embedders
+    /// MUST call [`Self::set_workspace_roots`] before serving any
+    /// path-taking request.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -181,6 +186,11 @@ impl Translator {
     ///
     /// Only called during single-owner setup, before the translator is
     /// shared, so this replaces the `Arc` wholesale rather than locking.
+    ///
+    /// Mandatory for any embedder that will serve path-taking requests:
+    /// leaving `roots` empty (or never calling this) makes every such
+    /// operation reject with `Error::NoWorkspaceRoots` instead of allowing
+    /// unrestricted access.
     pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
         self.workspace_roots = Arc::new(roots);
     }
@@ -423,6 +433,9 @@ impl Translator {
 }
 
 impl Default for Translator {
+    /// Same as [`Translator::new`]: no workspace roots configured, so every
+    /// path-taking operation fails closed with `Error::NoWorkspaceRoots`
+    /// until [`Translator::set_workspace_roots`] is called.
     fn default() -> Self {
         Self::new()
     }

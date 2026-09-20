@@ -232,6 +232,11 @@ pub enum Error {
     #[error("path outside workspace: {0}")]
     PathOutsideWorkspace(PathBuf),
 
+    /// No workspace roots are configured, so path-taking operations are
+    /// rejected outright rather than allowed unrestricted (fail closed).
+    #[error("no workspace roots configured: refusing access to {0}")]
+    NoWorkspaceRoots(PathBuf),
+
     /// Document limit exceeded.
     #[error(
         "document limit exceeded: {current}/{max} (raise workspace.max_documents in config to increase this)"

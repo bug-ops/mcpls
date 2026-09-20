@@ -515,7 +515,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_incoming_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
     {
-        let translator = Translator::new();
+        let mut translator = Translator::new();
+        // A workspace root is required so `validate_path` reaches
+        // `canonicalize()` instead of failing closed on `NoWorkspaceRoots`.
+        #[cfg(windows)]
+        translator.set_workspace_roots(vec![std::path::PathBuf::from(r"C:\")]);
+        #[cfg(not(windows))]
+        translator.set_workspace_roots(vec![std::path::PathBuf::from("/")]);
         // `Url::to_file_path` on Windows requires a drive-letter first path
         // segment; a Unix-style path with none fails to convert at all
         // (`uri_to_path` returns `None`, i.e. `Error::InvalidToolParams`)
@@ -554,7 +560,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_outgoing_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
     {
-        let translator = Translator::new();
+        let mut translator = Translator::new();
+        // A workspace root is required so `validate_path` reaches
+        // `canonicalize()` instead of failing closed on `NoWorkspaceRoots`.
+        #[cfg(windows)]
+        translator.set_workspace_roots(vec![std::path::PathBuf::from(r"C:\")]);
+        #[cfg(not(windows))]
+        translator.set_workspace_roots(vec![std::path::PathBuf::from("/")]);
         #[cfg(windows)]
         let uri = "file:///C:/this/path/does/not/exist/anywhere.rs";
         #[cfg(not(windows))]

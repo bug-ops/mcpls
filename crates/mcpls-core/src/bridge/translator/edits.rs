@@ -872,8 +872,9 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_quickfix() {
         use tempfile::TempDir;
 
-        let translator = Translator::new();
+        let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
+        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -900,8 +901,9 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_refactor() {
         use tempfile::TempDir;
 
-        let translator = Translator::new();
+        let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
+        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -927,8 +929,9 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_refactor_extract() {
         use tempfile::TempDir;
 
-        let translator = Translator::new();
+        let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
+        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -954,8 +957,9 @@ mod tests {
     async fn test_handle_code_actions_valid_kind_source() {
         use tempfile::TempDir;
 
-        let translator = Translator::new();
+        let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
+        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1021,8 +1025,9 @@ mod tests {
     async fn test_handle_code_actions_empty_range() {
         use tempfile::TempDir;
 
-        let translator = Translator::new();
+        let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
+        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1194,7 +1199,13 @@ mod tests {
     async fn test_convert_code_action_with_workspace_edit() {
         use std::collections::HashMap;
 
-        let uri = lsp_types::Uri::from("file:///test.rs");
+        use url::Url;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let uri_string = Url::from_file_path(&file_path).unwrap().to_string();
+        let uri = lsp_types::Uri::from(uri_string.as_str());
         let mut changes_map = HashMap::new();
         changes_map.insert(
             uri,
@@ -1229,11 +1240,13 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let result =
+            convert_code_action(lsp_action, &test_ctx(), &test_uri(), &workspace_roots).await;
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
-        assert_eq!(edit.changes[0].uri, "file:///test.rs");
+        assert_eq!(edit.changes[0].uri, uri_string);
         assert_eq!(edit.changes[0].edits.len(), 1);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
         assert!(result.is_preferred);
@@ -1245,7 +1258,13 @@ mod tests {
     /// rather than silently dropping it.
     #[tokio::test]
     async fn test_convert_code_action_with_document_changes_only() {
-        let uri = lsp_types::Uri::from("file:///test.rs");
+        use url::Url;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let uri_string = Url::from_file_path(&file_path).unwrap().to_string();
+        let uri = lsp_types::Uri::from(uri_string.as_str());
         let text_document_edit = lsp_types::TextDocumentEdit {
             text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
                 version: Some(1),
@@ -1284,11 +1303,13 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let result =
+            convert_code_action(lsp_action, &test_ctx(), &test_uri(), &workspace_roots).await;
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
-        assert_eq!(edit.changes[0].uri, "file:///test.rs");
+        assert_eq!(edit.changes[0].uri, uri_string);
         assert_eq!(edit.changes[0].edits.len(), 1);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
         assert!(result.is_preferred);
@@ -1303,7 +1324,13 @@ mod tests {
     async fn test_convert_code_action_changes_takes_precedence_over_document_changes() {
         use std::collections::HashMap;
 
-        let changes_uri = lsp_types::Uri::from("file:///changes.rs");
+        use url::Url;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let changes_path = dir.path().join("changes.rs");
+        fs::write(&changes_path, "fn changes() {}").unwrap();
+        let changes_uri_string = Url::from_file_path(&changes_path).unwrap().to_string();
+        let changes_uri = lsp_types::Uri::from(changes_uri_string.as_str());
         let mut changes_map = HashMap::new();
         changes_map.insert(
             changes_uri,
@@ -1322,7 +1349,13 @@ mod tests {
             }],
         );
 
-        let document_changes_uri = lsp_types::Uri::from("file:///document_changes.rs");
+        let document_changes_path = dir.path().join("document_changes.rs");
+        fs::write(&document_changes_path, "fn document_changes() {}").unwrap();
+        let document_changes_uri = lsp_types::Uri::from(
+            Url::from_file_path(&document_changes_path)
+                .unwrap()
+                .as_str(),
+        );
         let text_document_edit = lsp_types::TextDocumentEdit {
             text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
                 version: Some(1),
@@ -1363,14 +1396,16 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let result =
+            convert_code_action(lsp_action, &test_ctx(), &test_uri(), &workspace_roots).await;
         let edit = result.edit.unwrap();
         assert_eq!(
             edit.changes.len(),
             1,
             "only the `changes` entry should be present"
         );
-        assert_eq!(edit.changes[0].uri, "file:///changes.rs");
+        assert_eq!(edit.changes[0].uri, changes_uri_string);
         assert_eq!(edit.changes[0].edits[0].new_text, "from_changes");
     }
 

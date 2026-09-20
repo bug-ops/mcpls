@@ -2,6 +2,8 @@
 
 use std::borrow::Cow;
 
+// Brings `Notification::METHOD` into scope for `<Type>::METHOD` below.
+use lsp_types::Notification as _;
 // Re-export LSP notification types from lsp_types to avoid duplication.
 pub use lsp_types::{
     LogMessageParams, ProgressParams, PublishDiagnosticsParams, ShowMessageParams,
@@ -168,58 +170,42 @@ impl LspNotification {
     #[must_use]
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
         match method {
-            "textDocument/publishDiagnostics" => {
-                if let Some(p) = params {
-                    match serde_json::from_value(p) {
-                        Ok(parsed) => return Self::PublishDiagnostics(parsed),
-                        Err(e) => debug!(method, error = %e, "failed to parse notification params"),
-                    }
-                }
-                Self::Other {
-                    method: Cow::Owned(method.to_string()),
-                    params: None,
-                }
+            m if m == lsp_types::PublishDiagnosticsNotification::METHOD.as_str() => {
+                Self::typed(m, params, Self::PublishDiagnostics)
             }
-            "window/logMessage" => {
-                if let Some(p) = params {
-                    match serde_json::from_value(p) {
-                        Ok(parsed) => return Self::LogMessage(parsed),
-                        Err(e) => debug!(method, error = %e, "failed to parse notification params"),
-                    }
-                }
-                Self::Other {
-                    method: Cow::Owned(method.to_string()),
-                    params: None,
-                }
+            m if m == lsp_types::LogMessageNotification::METHOD.as_str() => {
+                Self::typed(m, params, Self::LogMessage)
             }
-            "window/showMessage" => {
-                if let Some(p) = params {
-                    match serde_json::from_value(p) {
-                        Ok(parsed) => return Self::ShowMessage(parsed),
-                        Err(e) => debug!(method, error = %e, "failed to parse notification params"),
-                    }
-                }
-                Self::Other {
-                    method: Cow::Owned(method.to_string()),
-                    params: None,
-                }
+            m if m == lsp_types::ShowMessageNotification::METHOD.as_str() => {
+                Self::typed(m, params, Self::ShowMessage)
             }
-            "$/progress" => {
-                if let Some(p) = params {
-                    match serde_json::from_value(p) {
-                        Ok(parsed) => return Self::Progress(parsed),
-                        Err(e) => debug!(method, error = %e, "failed to parse notification params"),
-                    }
-                }
-                Self::Other {
-                    method: Cow::Owned(method.to_string()),
-                    params: None,
-                }
+            m if m == lsp_types::ProgressNotification::METHOD.as_str() => {
+                Self::typed(m, params, Self::Progress)
             }
             _ => Self::Other {
                 method: Cow::Owned(method.to_string()),
                 params,
             },
+        }
+    }
+
+    /// Shared body for the deserialize-or-fallback arms of [`Self::parse`]:
+    /// deserializes `params` as `T` and passes it to `wrap`, or falls back to
+    /// `Other` (logging why) when `params` is absent or fails to deserialize.
+    fn typed<T, F>(method: &str, params: Option<serde_json::Value>, wrap: F) -> Self
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(T) -> Self,
+    {
+        if let Some(p) = params {
+            match serde_json::from_value(p) {
+                Ok(parsed) => return wrap(parsed),
+                Err(e) => debug!(method, error = %e, "failed to parse notification params"),
+            }
+        }
+        Self::Other {
+            method: Cow::Owned(method.to_string()),
+            params: None,
         }
     }
 }

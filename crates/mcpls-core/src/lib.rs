@@ -1085,9 +1085,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_diagnostic_path_in_workspace_empty_roots_allows_any_uri() {
+    fn test_diagnostic_path_in_workspace_empty_roots_rejects_any_uri() {
         let uri: Uri = Uri::from("file:///anywhere/at/all.rs");
-        assert!(diagnostic_path_in_workspace(&uri, &[]));
+        assert!(!diagnostic_path_in_workspace(&uri, &[]));
     }
 
     #[test]
@@ -2009,11 +2009,27 @@ mod tests {
             Arc::new(OnceCell::new())
         }
 
-        /// Empty workspace roots: `diagnostic_path_in_workspace` allows any
-        /// URI in this mode, matching `validate_path_against_roots`, so these
-        /// pump-mechanics tests don't need to construct real workspace paths.
-        fn no_workspace_roots() -> Arc<[PathBuf]> {
-            Arc::from([])
+        /// A single real workspace root shared by the pump-mechanics tests
+        /// below, cfg-gated because `Url::to_file_path` requires a drive
+        /// letter on Windows -- mirrors
+        /// `test_pump_drops_diagnostics_outside_workspace_roots`.
+        #[cfg(windows)]
+        fn test_workspace_roots() -> Arc<[PathBuf]> {
+            Arc::from([PathBuf::from(r"C:\test")])
+        }
+        #[cfg(not(windows))]
+        fn test_workspace_roots() -> Arc<[PathBuf]> {
+            Arc::from([PathBuf::from("/test")])
+        }
+
+        /// A `file://` URI for `file` beneath [`test_workspace_roots`]'s root.
+        #[cfg(windows)]
+        fn test_uri(file: &str) -> Uri {
+            Uri::from(format!("file:///C:/test/{file}").as_str())
+        }
+        #[cfg(not(windows))]
+        fn test_uri(file: &str) -> Uri {
+            Uri::from(format!("file:///test/{file}").as_str())
         }
 
         /// `PublishDiagnostics` is cached even when the peer is not yet connected.
@@ -2039,11 +2055,11 @@ mod tests {
                     notification_cache: c,
                     subs: Arc::clone(&subs),
                     peer_cell: Arc::clone(&peer_cell),
-                    workspace_roots: no_workspace_roots(),
+                    workspace_roots: test_workspace_roots(),
                 },
             ));
 
-            let uri: Uri = Uri::from("file:///test/main.rs");
+            let uri: Uri = test_uri("main.rs");
             tx.send(LspNotification::PublishDiagnostics(
                 PublishDiagnosticsParams {
                     uri: uri.clone(),
@@ -2188,7 +2204,7 @@ mod tests {
                     notification_cache: cache,
                     subs,
                     peer_cell,
-                    workspace_roots: no_workspace_roots(),
+                    workspace_roots: test_workspace_roots(),
                 },
             ));
 
@@ -2220,7 +2236,7 @@ mod tests {
                     notification_cache: cache,
                     subs,
                     peer_cell,
-                    workspace_roots: no_workspace_roots(),
+                    workspace_roots: test_workspace_roots(),
                 },
             ));
 
@@ -2267,11 +2283,11 @@ mod tests {
                     notification_cache: Arc::clone(&cache),
                     subs,
                     peer_cell,
-                    workspace_roots: no_workspace_roots(),
+                    workspace_roots: test_workspace_roots(),
                 },
             ));
 
-            let uri: Uri = Uri::from("file:///test/locked.rs");
+            let uri: Uri = test_uri("locked.rs");
             tx.send(LspNotification::PublishDiagnostics(
                 PublishDiagnosticsParams {
                     uri: uri.clone(),
@@ -2329,7 +2345,7 @@ mod tests {
                     notification_cache: Arc::clone(&cache),
                     subs,
                     peer_cell,
-                    workspace_roots: no_workspace_roots(),
+                    workspace_roots: test_workspace_roots(),
                 },
             ));
 
@@ -2388,7 +2404,7 @@ mod tests {
                     notification_cache: Arc::clone(&cache),
                     subs,
                     peer_cell,
-                    workspace_roots: no_workspace_roots(),
+                    workspace_roots: test_workspace_roots(),
                 },
             ));
 
@@ -2437,7 +2453,7 @@ mod tests {
             for _ in 0..2 {
                 tx.send(LspNotification::PublishDiagnostics(
                     PublishDiagnosticsParams {
-                        uri: Uri::from("file:///test/saturate.rs"),
+                        uri: test_uri("saturate.rs"),
                         diagnostics: vec![],
                         version: None,
                     },
@@ -2456,7 +2472,7 @@ mod tests {
                     notification_cache: Arc::clone(&cache),
                     subs,
                     peer_cell,
-                    workspace_roots: no_workspace_roots(),
+                    workspace_roots: test_workspace_roots(),
                 },
             ));
 
