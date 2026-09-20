@@ -518,6 +518,8 @@ impl LspServer {
                     workspace_folders: Some(true),
                     ..Default::default()
                 }),
+                // Required for rust-analyzer to ever emit experimental/serverStatus; other servers ignore this unrecognized key.
+                experimental: Some(serde_json::json!({ "serverStatusNotification": true })),
                 ..Default::default()
             },
             client_info: Some(ClientInfo {
@@ -1666,6 +1668,43 @@ mod tests {
                     .collect::<Vec<_>>(),
                 "the wire-advertised capability must match the methods LspClient::request \
                  actually retries -32801 for, not drift from it"
+            );
+
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                serde_json::json!({ "capabilities": {} }),
+            )
+            .await;
+
+            init_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_initialize_advertises_server_status_notification_support() {
+            let (client, mut server) = fake_lsp_client();
+
+            let config = ServerInitConfig {
+                server_config: LspServerConfig::rust_analyzer(),
+                workspace_roots: vec![],
+                initialization_options: None,
+                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                notification_tx: None,
+            };
+
+            let init_task =
+                tokio::spawn(async move { LspServer::initialize(&client, &config).await });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+
+            assert_eq!(request["method"], "initialize");
+            assert_eq!(
+                request["params"]["capabilities"]["experimental"]["serverStatusNotification"],
+                serde_json::json!(true),
+                "without this, rust-analyzer never emits experimental/serverStatus and the \
+                 indexing-readiness gate in Translator::wait_for_indexing_ready is a \
+                 permanent no-op"
             );
 
             write_success_response(

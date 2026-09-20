@@ -236,7 +236,12 @@ pub(crate) async fn diagnostics_pump(
                         let mut cache = notification_cache.lock().await;
                         cache.store_message(m.kind.into(), m.message);
                     }
-                    LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
+                    // Deliberate descope: no standardized way to identify a workspace-load `$/progress` sequence across servers.
+                    LspNotification::Progress { .. } => {}
+                    LspNotification::Other { method, params } => {
+                        let mut cache = notification_cache.lock().await;
+                        cache.observe_indexing_signal(&server_id, &method, params.as_ref());
+                    }
                 }
             }
         }
@@ -1963,6 +1968,7 @@ mod tests {
         use tokio::sync::{mpsc, watch};
 
         use super::*;
+        use crate::bridge::IndexingState;
 
         fn make_cache() -> Arc<Mutex<NotificationCache>> {
             Arc::new(Mutex::new(NotificationCache::new()))
@@ -2259,6 +2265,61 @@ mod tests {
             .expect("pump stalled behind translator lock");
 
             holder.await.unwrap();
+        }
+
+        /// The `Other` arm (custom/unrecognized notifications, e.g.
+        /// rust-analyzer's `experimental/serverStatus`) must reach
+        /// `NotificationCache::observe_indexing_signal` -- this is the one
+        /// place in production that notification actually gets from the LSP
+        /// transport into the indexing-readiness gate; every other test for
+        /// the gate pre-seeds the cache by hand and would not have caught a
+        /// pump wiring regression.
+        #[tokio::test]
+        async fn test_pump_routes_other_notifications_to_indexing_signal() {
+            let cache = make_cache();
+            let subs = make_subs();
+            let peer_cell = make_peer_cell();
+            let (tx, rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let server_id = ServerId::from("rust");
+
+            tokio::spawn(diagnostics_pump(
+                server_id.clone(),
+                rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    peer_cell,
+                    workspace_roots: no_workspace_roots(),
+                },
+            ));
+
+            tx.send(LspNotification::Other {
+                method: std::borrow::Cow::Borrowed("experimental/serverStatus"),
+                params: Some(serde_json::json!({"quiescent": false})),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    {
+                        let guard = cache.lock().await;
+                        if guard.indexing_state(&server_id) == IndexingState::Loading {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect(
+                "pump did not route the Other{experimental/serverStatus} notification into \
+                 NotificationCache::observe_indexing_signal within 5s",
+            );
         }
     }
 }

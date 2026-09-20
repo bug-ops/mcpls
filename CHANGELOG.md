@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `shutdown` and `exit` are now sent without a `params` key instead of `"params": null`. tsgo rejects the null form with `-32602 expected empty, got: null` and never exits, so every mcpls shutdown against tsgo fell through to the 3s kill-on-timeout path. (#404)
+- Call hierarchy (`get_incoming_calls`/`get_outgoing_calls`) now percent-decodes `file://` URIs before resolving them on disk, fixing lookups for files whose path contains a space, non-ASCII character, or other reserved character. (#421)
+- `get_hover`, `get_definition`, `get_implementation`, `get_type_definition`, `get_references`, `rename_symbol`, `get_completions`, and `get_code_actions` now wait for the routed LSP server to finish its initial workspace indexing (when a readiness signal shows it is still in progress) instead of silently answering from a partial index; a bounded timeout surfaces an explicit "still indexing" error rather than an unqualified empty result. mcpls now also declares the `experimental.serverStatusNotification` client capability, which rust-analyzer requires before it will ever emit this readiness signal. (#421)
 
 ## [0.5.0] - 2026-09-06
 
