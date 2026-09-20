@@ -91,41 +91,95 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
     Arc::new(Mutex::new(translator))
 }
 
-/// Poll hover on the `add` function until rust-analyzer returns consistent results.
+/// Find the 1-based line number of the first line in `file` containing `needle`.
 ///
-/// Requires 3 consecutive successful hover responses that contain "fn add" and
-/// "i32" before declaring RA ready. This mirrors the approach in `ra_e2e.rs` and
-/// is more reliable than waiting for `publishDiagnostics`, which can arrive before
-/// type-checking is complete.
-async fn wait_for_indexing_ready(
+/// Mirrors `ra_e2e.rs`'s `find_line` helper, so an edit to the fixture can't
+/// silently desync a hardcoded line/column pair from the symbol it targets.
+fn find_line(file: &Path, needle: &str) -> u32 {
+    let content = std::fs::read_to_string(file).expect("failed to read file for anchor search");
+    content
+        .lines()
+        .enumerate()
+        .find_map(|(i, line)| {
+            line.contains(needle)
+                .then(|| u32::try_from(i + 1).expect("line number fits u32"))
+        })
+        .unwrap_or_else(|| panic!("anchor '{needle}' not found in {}", file.display()))
+}
+
+/// Find the 1-based line and column of `symbol`'s first occurrence on the line
+/// matched by `needle`. The column is a byte offset + 1, which is only correct
+/// for ASCII text; fine for this fixture's anchor lines, not general UTF-8 safe.
+fn find_anchor(file: &Path, needle: &str, symbol: &str) -> (u32, u32) {
+    let line = find_line(file, needle);
+    let content = std::fs::read_to_string(file).expect("failed to read file for anchor search");
+    let line_text = content
+        .lines()
+        .nth((line - 1) as usize)
+        .unwrap_or_else(|| panic!("line {line} out of range in {}", file.display()));
+    let col = line_text
+        .find(symbol)
+        .unwrap_or_else(|| panic!("symbol '{symbol}' not found on anchor line '{needle}'"));
+    (line, u32::try_from(col + 1).expect("column fits u32"))
+}
+
+/// Timeout for [`wait_for_std_lib_ready`]'s probe only, Windows-aware because Windows
+/// CI runners index noticeably slower, overridable via `MCPLS_RA_INDEX_TIMEOUT_SECS`.
+/// Mirrors `ra_e2e.rs`'s `wait_until_ready` timeout policy.
+///
+/// `wait_for_indexing_ready`'s pre-existing local-crate probe deliberately keeps its
+/// original flat 30s timeout instead of this one: it was already reliable at that
+/// budget, and 16 other tests call it whose nextest slow-timeout window was never
+/// widened for this fix, so raising their timeout without also raising their kill
+/// window would risk a new failure mode for tests this issue never touched.
+fn std_lib_readiness_timeout() -> Duration {
+    let default_timeout: u64 = if cfg!(windows) { 120 } else { 60 };
+    let timeout_secs: u64 = std::env::var("MCPLS_RA_INDEX_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(default_timeout, |t| t.max(5));
+    Duration::from_secs(timeout_secs)
+}
+
+/// Poll `handle_hover` at `position` (1-based `(line, col)`) in `file` until every
+/// substring in `required` is present in 3 consecutive responses, guarding against
+/// transient results during rust-analyzer's intermediate indexing phases (observed
+/// on Windows CI).
+///
+/// `handle_hover` itself gates on the translator's own indexing-readiness wait
+/// (`translator::navigation::INDEXING_READY_TIMEOUT`, up to 30s) before issuing the LSP
+/// request, so a single call here can absorb a large chunk of `timeout` -- callers with
+/// a short timeout budget should account for that overrun.
+async fn wait_for_hover_ready(
     translator: &Arc<Mutex<Translator>>,
-    workspace: &Path,
+    file: &Path,
+    label: &str,
+    position: (u32, u32),
+    required: &[&str],
     timeout: Duration,
 ) {
-    let lib_rs = workspace.join("src/lib.rs");
-    let file_path = lib_rs.to_string_lossy().to_string();
-    // `pub fn add(` is on line 51; 'a' of "add" is at column 8 (1-based).
-    let add_line: u32 = 51;
-    let add_col: u32 = 8;
+    let (line, col) = position;
+    let file_path = file.to_string_lossy().to_string();
 
     let deadline = Instant::now() + timeout;
     let required_consecutive: u32 = 3;
     let mut consecutive = 0u32;
+    let mut last_print = Instant::now();
+
+    println!(
+        "[rust_analyzer_tests] waiting for {label} readiness (timeout {}s)…",
+        timeout.as_secs()
+    );
 
     loop {
-        if Instant::now() >= deadline {
-            tracing::warn!("Timed out waiting for rust-analyzer readiness");
-            return;
-        }
-
         let hover_result = translator
             .lock()
             .await
             .handle_hover(
                 file_path.clone(),
                 Position {
-                    line: add_line,
-                    character: add_col,
+                    line,
+                    character: col,
                 },
             )
             .await;
@@ -133,9 +187,10 @@ async fn wait_for_indexing_ready(
         match hover_result {
             Ok(result) => {
                 let text = serde_json::to_string(&result).unwrap_or_default();
-                if text.contains("fn add") && text.contains("i32") {
+                if required.iter().all(|needle| text.contains(needle)) {
                     consecutive += 1;
                     if consecutive >= required_consecutive {
+                        println!("[rust_analyzer_tests] {label} is ready");
                         return;
                     }
                 } else {
@@ -147,8 +202,64 @@ async fn wait_for_indexing_ready(
             }
         }
 
+        if last_print.elapsed() >= Duration::from_secs(10) {
+            println!("[rust_analyzer_tests] still waiting on {label}: consecutive={consecutive}");
+            last_print = Instant::now();
+        }
+
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "Timed out waiting for {label} readiness after {}s",
+                timeout.as_secs()
+            );
+            return;
+        }
+
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Poll hover on the `add` function until rust-analyzer returns consistent results.
+///
+/// This mirrors the approach in `ra_e2e.rs` and is more reliable than waiting for
+/// `publishDiagnostics`, which can arrive before type-checking is complete.
+async fn wait_for_indexing_ready(translator: &Arc<Mutex<Translator>>, workspace: &Path) {
+    let lib_rs = workspace.join("src/lib.rs");
+    let anchor = find_anchor(&lib_rs, "pub fn add(", "add");
+    wait_for_hover_ready(
+        translator,
+        &lib_rs,
+        "local-crate (add fn)",
+        anchor,
+        &["fn add", "i32"],
+        Duration::from_secs(30),
+    )
+    .await;
+}
+
+/// Poll hover on the `String` field of `User` until rust-analyzer returns
+/// consistent std-lib results. `wait_for_indexing_ready` only confirms local-crate
+/// symbols are indexed, which does not guarantee sysroot/std-lib indexing has
+/// caught up — this closes that gap before a test hovers a std-lib symbol.
+///
+/// Returns the resolved `(line, col)` anchor so callers can reuse it for their own
+/// hover assertion instead of re-reading the fixture file to re-derive it.
+async fn wait_for_std_lib_ready(
+    translator: &Arc<Mutex<Translator>>,
+    workspace: &Path,
+) -> (u32, u32) {
+    let lib_rs = workspace.join("src/lib.rs");
+    let anchor = find_anchor(&lib_rs, "pub name: String,", "String");
+    wait_for_hover_ready(
+        translator,
+        &lib_rs,
+        "std-lib (String field)",
+        anchor,
+        &["String"],
+        std_lib_readiness_timeout(),
+    )
+    .await;
+    anchor
 }
 
 #[tokio::test]
@@ -161,17 +272,20 @@ async fn test_hover_on_std_vec() {
     let file_path = workspace_path.join("src/lib.rs");
 
     // Give rust-analyzer time to index the workspace
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
+    // Local-crate readiness doesn't guarantee std-lib/sysroot indexing is done.
+    // Reuse the anchor the readiness probe already resolved for the hover assertion below.
+    let (string_line, string_col) =
+        wait_for_std_lib_ready(&translator, &rust_workspace_path()).await;
 
-    // Hover over "String" in User struct (line 20)
-    // The line is: `pub name: String,`
+    // Hover over "String" in the `User` struct's `name` field.
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
             file_path.to_string_lossy().to_string(),
             Position {
-                line: 20,
-                character: 19, // Position on "String"
+                line: string_line,
+                character: string_col,
             },
         ),
     )
@@ -205,7 +319,7 @@ async fn test_hover_on_u64_type() {
     let workspace_path = rust_workspace_path();
     let file_path = workspace_path.join("src/lib.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Hover over "u64" in User struct (line 19)
     // The line is: `pub id: u64,`
@@ -245,7 +359,7 @@ async fn test_definition_user_struct() {
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Go to definition of User in types.rs (line 9, owner: User)
     // The line is: `pub owner: User,`
@@ -295,7 +409,7 @@ async fn test_definition_across_files() {
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Go to definition of Repository in functions.rs (line 3, use statement)
     // The line is: `use crate::types::Repository;`
@@ -335,7 +449,7 @@ async fn test_references_create_repo_function() {
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Find references to create_repo function (line 7, function name)
     // The line is: `pub fn create_repo(name: &str) -> Repository {`
@@ -378,7 +492,7 @@ async fn test_references_user_struct() {
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Find references to User struct (line 18, struct name)
     // The line is: `pub struct User {`
@@ -419,7 +533,7 @@ async fn test_diagnostics_with_error() {
     let lib_file = workspace_path.join("src/lib.rs");
 
     // Give rust-analyzer extra time to analyze and generate diagnostics
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // lib.rs has two intentional errors: an undefined variable in
     // has_error() (line 37) and an incomplete trait impl for
@@ -468,7 +582,7 @@ async fn test_diagnostics_no_errors() {
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Get diagnostics from types.rs (should have no errors)
     let notification_cache = Mutex::new(NotificationCache::new());
@@ -511,7 +625,7 @@ async fn test_document_symbols() {
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Get document symbols from lib.rs
     let result = timeout(
@@ -565,7 +679,7 @@ async fn test_document_symbols_types_file() {
     let workspace_path = rust_workspace_path();
     let types_file = workspace_path.join("src/types.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Get document symbols from types.rs
     let result = timeout(
@@ -608,7 +722,7 @@ async fn test_completions_basic() {
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Get completions in functions.rs
     // Position after "repo." on line 23 (repo.get_owner().name)
@@ -651,7 +765,7 @@ async fn test_format_document() {
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Request document formatting
     let result = timeout(
@@ -741,7 +855,7 @@ async fn test_out_of_bounds_position() {
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Try to get hover at an extremely large line number
     let result = timeout(
@@ -774,7 +888,7 @@ async fn test_workspace_symbol_search_basic() {
     let translator = setup_rust_analyzer().await;
 
     // Give rust-analyzer time to index the workspace
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Search for "User" struct
     let result = timeout(
@@ -816,7 +930,7 @@ async fn test_workspace_symbol_search_with_kind_filter() {
 
     let translator = setup_rust_analyzer().await;
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Search for symbols and filter by Struct kind
     let result = timeout(
@@ -852,7 +966,7 @@ async fn test_workspace_symbol_search_max_results() {
 
     let translator = setup_rust_analyzer().await;
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Search with very low limit
     let result = timeout(
@@ -883,7 +997,7 @@ async fn test_workspace_symbol_search_function() {
 
     let translator = setup_rust_analyzer().await;
 
-    wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
+    wait_for_indexing_ready(&translator, &rust_workspace_path()).await;
 
     // Search for function symbols
     let result = timeout(
