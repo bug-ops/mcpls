@@ -543,6 +543,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 ///     std::process::exit(exit_code);
 /// }
 /// ```
+#[allow(clippy::too_many_lines)]
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
@@ -645,7 +646,10 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         .with_resource_limits(config.workspace.resource_limits())
         .with_extensions(extension_map)
         .with_router(router)
-        .with_notification_cache(Arc::clone(&notification_cache));
+        .with_notification_cache(Arc::clone(&notification_cache))
+        .with_indexing_ready_timeout(Duration::from_secs(
+            config.workspace.indexing_ready_timeout_seconds,
+        ));
     // moved, not cloned -- `config`'s last use is above
     let (project_config_ignored, mcp) = (config.project_config_ignored, config.mcp);
     translator.set_workspace_roots(workspace_roots.clone());
@@ -1080,7 +1084,9 @@ mod test_support {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
+    use bridge::{
+        DEFAULT_INDEXING_READY_TIMEOUT_SECS, DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE,
+    };
 
     use super::*;
 
@@ -1633,6 +1639,7 @@ mod tests {
                     heuristics_max_depth: 10,
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -1688,6 +1695,7 @@ mod tests {
                     heuristics_max_depth: 10,
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
                 },
                 lsp_servers: vec![],
                 project_config_ignored: false,
@@ -1745,6 +1753,7 @@ mod tests {
                     heuristics_max_depth: 10,
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
                 },
                 lsp_servers: vec![],
                 project_config_ignored: false,
@@ -1796,6 +1805,7 @@ mod tests {
                     heuristics_max_depth: 10,
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),

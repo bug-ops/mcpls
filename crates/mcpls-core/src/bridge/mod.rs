@@ -16,6 +16,14 @@ mod state;
 mod translator;
 
 pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
+// Not part of the crate's public API surface (unlike `IndexingPolicy`/`IndexingState`
+// above, both referenced from public signatures) -- these three exist only
+// for `config`'s default-value/validation wiring, so `pub(crate)` avoids
+// widening the public surface and keeps `indexing.rs`'s own intra-doc links
+// to private items (`IndexingTracker::state`, `PROGRESS_LATCH_IDLE`) valid.
+pub(crate) use indexing::{
+    DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_SETTLE,
+};
 pub use indexing::{IndexingPolicy, IndexingState};
 pub(crate) use notifications::apply_lifecycle_notification;
 pub use notifications::{

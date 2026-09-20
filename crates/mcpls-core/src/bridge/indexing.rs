@@ -211,6 +211,18 @@ const QUIESCENT_FIELD: &str = "quiescent";
 /// this, `INDEXING_READY_TIMEOUT`, and the two constants below.
 pub const INDEXING_STALENESS_BOUND: Duration = Duration::from_secs(60);
 
+/// Default maximum time, in seconds, `Translator::wait_for_indexing_ready`
+/// waits for a routed LSP server to report indexing readiness.
+///
+/// Only takes effect once a readiness signal has shown indexing is actually
+/// in progress. A raw `u64` (not a `Duration`), so
+/// `config::default_indexing_ready_timeout_seconds` can share this single
+/// source of truth without a config -> translator module dependency;
+/// `navigation::INDEXING_READY_TIMEOUT` derives its `Duration` from this
+/// same value. Overridable via `workspace.indexing_ready_timeout_seconds` in
+/// `mcpls.toml` (#424).
+pub const DEFAULT_INDEXING_READY_TIMEOUT_SECS: u64 = 30;
+
 /// How long a `Progress`-sourced entry's `open` set must stay empty before a
 /// *read* trusts it as settled and reports `Ready` -- the read-path
 /// counterpart to [`PROGRESS_LATCH_IDLE`] below.

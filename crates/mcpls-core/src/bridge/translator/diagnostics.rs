@@ -86,12 +86,30 @@ impl Translator {
     ///
     /// Returns an error if the path is invalid or outside workspace boundaries.
     pub fn cached_diagnostics_uri(workspace_roots: &[PathBuf], file_path: &str) -> Result<String> {
+        Self::cached_diagnostics_path_and_uri(workspace_roots, file_path).map(|(_, uri)| uri)
+    }
+
+    /// As [`Self::cached_diagnostics_uri`], but also returns the validated,
+    /// canonicalized path -- for a caller (e.g. `get_cached_diagnostics`,
+    /// `read_resource`) that needs it too, such as to resolve a
+    /// diagnostics-route server via [`Self::diagnostics_route_id_for_path`]
+    /// from the same canonical path the URI itself is derived from, rather
+    /// than re-canonicalizing or (worse) using an unvalidated raw path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid or outside workspace boundaries.
+    pub(crate) fn cached_diagnostics_path_and_uri(
+        workspace_roots: &[PathBuf],
+        file_path: &str,
+    ) -> Result<(PathBuf, String)> {
         let path = PathBuf::from(file_path);
         let validated_path = validate_path_against_roots(&path, workspace_roots)?;
 
         // Use path_to_uri (strips \\?\ on Windows) so the key matches what
         // rust-analyzer stores in publishDiagnostics notifications.
-        Ok(path_to_uri(&validated_path)?.to_string())
+        let uri = path_to_uri(&validated_path)?.to_string();
+        Ok((validated_path, uri))
     }
 
     /// Handle diagnostics request.
@@ -115,6 +133,15 @@ impl Translator {
     /// treated as eventually consistent: a cached entry may reflect a
     /// slightly older document version than the fresh pull result if an edit
     /// landed inside the server's flycheck debounce window.
+    ///
+    /// Deliberately not gated on workspace-indexing readiness the way
+    /// `IndexingGate::Required` whole-workspace queries are (#445, see
+    /// `routing::IndexingGate`'s doc): this is a poll-based read, not a live
+    /// whole-workspace LSP request, so blocking it on
+    /// `Translator::wait_for_indexing_ready` would be the wrong fix shape.
+    /// The `get_diagnostics` MCP tool instead surfaces the routed server's
+    /// indexing state as an explicit `indexingInProgress` flag alongside this
+    /// method's result.
     ///
     /// # Errors
     ///

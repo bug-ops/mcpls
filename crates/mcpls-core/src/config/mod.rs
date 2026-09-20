@@ -18,7 +18,10 @@ pub use server::{
     DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, ServerHeuristics,
 };
 
-use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
+use crate::bridge::{
+    DEFAULT_INDEXING_READY_TIMEOUT_SECS, DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE,
+    INDEXING_STALENESS_BOUND, PROGRESS_SETTLE, ResourceLimits,
+};
 use crate::error::{Error, Result};
 
 /// Maps file extensions to LSP language identifiers.
@@ -325,6 +328,20 @@ pub struct WorkspaceConfig {
     /// Default: 10485760 (10MB)
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
+
+    /// Maximum time, in seconds, a whole-workspace query (hover, definition,
+    /// references, rename, completions, code actions, call hierarchy
+    /// incoming/outgoing calls) waits for its routed LSP server to report
+    /// workspace-indexing readiness before failing with
+    /// [`crate::error::Error::WorkspaceIndexing`] (see
+    /// [`crate::bridge::Translator::with_indexing_ready_timeout`]). Only
+    /// takes effect once a readiness signal has actually shown indexing is
+    /// in progress -- a server that never reports one is never delayed.
+    /// Must be strictly between `PROGRESS_SETTLE` (3s) and
+    /// `INDEXING_STALENESS_BOUND` (60s); see [`ServerConfig::validate`].
+    /// Default: 30
+    #[serde(default = "default_indexing_ready_timeout_seconds")]
+    pub indexing_ready_timeout_seconds: u64,
 }
 
 impl Default for WorkspaceConfig {
@@ -336,6 +353,7 @@ impl Default for WorkspaceConfig {
             heuristics_max_depth: default_heuristics_max_depth(),
             max_documents: default_max_documents(),
             max_file_size: default_max_file_size(),
+            indexing_ready_timeout_seconds: default_indexing_ready_timeout_seconds(),
         }
     }
 }
@@ -350,6 +368,10 @@ const fn default_max_documents() -> usize {
 
 const fn default_max_file_size() -> u64 {
     DEFAULT_MAX_FILE_SIZE
+}
+
+const fn default_indexing_ready_timeout_seconds() -> u64 {
+    DEFAULT_INDEXING_READY_TIMEOUT_SECS
 }
 
 impl WorkspaceConfig {
@@ -970,6 +992,7 @@ impl ServerConfig {
     /// ```
     pub fn validate(&self) -> Result<()> {
         self.validate_mcp()?;
+        self.validate_indexing_ready_timeout()?;
 
         if self.workspace.position_encodings.is_empty() {
             return Err(Error::InvalidConfig(
@@ -999,7 +1022,6 @@ impl ServerConfig {
                 "workspace.roots entries cannot be empty".to_string(),
             ));
         }
-
         let mut seen_names: HashMap<&str, &str> = HashMap::new();
         for server in &self.lsp_servers {
             if server.language_id.is_empty() {
@@ -1078,6 +1100,35 @@ impl ServerConfig {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validates `workspace.indexing_ready_timeout_seconds` against the same
+    /// bounds pinned at compile time in `bridge::translator::navigation` for
+    /// the *built-in default* (`INDEXING_STALENESS_BOUND` >
+    /// `INDEXING_READY_TIMEOUT` > `PROGRESS_SETTLE`) -- re-checked here since
+    /// a configured override is a runtime value and can't be asserted at
+    /// compile time. Violating either bound would either reopen the
+    /// cross-caller self-heal race `INDEXING_STALENESS_BOUND` exists to
+    /// prevent, or make `wait_for_indexing_ready` time out while the entry
+    /// is merely mid-settle, not actually still loading. Split out of
+    /// [`Self::validate`] to keep that function under clippy's line count
+    /// threshold.
+    fn validate_indexing_ready_timeout(&self) -> Result<()> {
+        if self.workspace.indexing_ready_timeout_seconds <= PROGRESS_SETTLE.as_secs() {
+            return Err(Error::InvalidConfig(format!(
+                "workspace.indexing_ready_timeout_seconds ({}) must be greater than {} seconds",
+                self.workspace.indexing_ready_timeout_seconds,
+                PROGRESS_SETTLE.as_secs()
+            )));
+        }
+        if self.workspace.indexing_ready_timeout_seconds >= INDEXING_STALENESS_BOUND.as_secs() {
+            return Err(Error::InvalidConfig(format!(
+                "workspace.indexing_ready_timeout_seconds ({}) must be less than {} seconds",
+                self.workspace.indexing_ready_timeout_seconds,
+                INDEXING_STALENESS_BOUND.as_secs()
+            )));
         }
         Ok(())
     }
@@ -1441,6 +1492,80 @@ mod tests {
 
         let result = ServerConfig::load_from(&config_path);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_validate_rejects_indexing_ready_timeout_seconds_at_or_below_progress_settle() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = format!(
+            r"
+            [workspace]
+            indexing_ready_timeout_seconds = {}
+        ",
+            PROGRESS_SETTLE.as_secs()
+        );
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("indexing_ready_timeout_seconds"));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_indexing_ready_timeout_seconds_at_or_above_staleness_bound() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = format!(
+            r"
+            [workspace]
+            indexing_ready_timeout_seconds = {}
+        ",
+            INDEXING_STALENESS_BOUND.as_secs()
+        );
+
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("indexing_ready_timeout_seconds"));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_indexing_ready_timeout_seconds_within_bounds() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        fs::write(
+            &config_path,
+            r"
+            [workspace]
+            indexing_ready_timeout_seconds = 45
+        ",
+        )
+        .unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(result.unwrap().workspace.indexing_ready_timeout_seconds, 45);
+    }
+
+    #[test]
+    fn test_indexing_ready_timeout_seconds_default() {
+        let config = ServerConfig::default();
+        assert_eq!(
+            config.workspace.indexing_ready_timeout_seconds,
+            DEFAULT_INDEXING_READY_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -1899,6 +2024,7 @@ mod tests {
             heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
             max_documents: DEFAULT_MAX_DOCUMENTS,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
         };
 
         let map = workspace.build_extension_map();
@@ -2058,6 +2184,7 @@ mod tests {
             heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
             max_documents: DEFAULT_MAX_DOCUMENTS,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
         };
 
         assert_eq!(
@@ -2522,6 +2649,7 @@ mod tests {
             heuristics_max_depth: 5,
             max_documents: 500,
             max_file_size: 0,
+            indexing_ready_timeout_seconds: 45,
         };
 
         let toml_content = toml::to_string_pretty(&original).unwrap();
@@ -2550,6 +2678,10 @@ mod tests {
         );
         assert_eq!(round_tripped.max_documents, original.max_documents);
         assert_eq!(round_tripped.max_file_size, original.max_file_size);
+        assert_eq!(
+            round_tripped.indexing_ready_timeout_seconds,
+            original.indexing_ready_timeout_seconds
+        );
     }
 
     #[test]

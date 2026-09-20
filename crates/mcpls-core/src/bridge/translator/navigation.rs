@@ -16,16 +16,28 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::IndexingState;
-use crate::bridge::indexing::{INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE, PROGRESS_SETTLE};
+use crate::bridge::indexing::{
+    DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE,
+    PROGRESS_SETTLE,
+};
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 
-/// Maximum time [`Translator::wait_for_indexing_ready`] waits for a routed
-/// LSP server to report it has finished its initial workspace load, once a
-/// readiness signal has shown indexing is actually in progress. Matches the
-/// timeout already used throughout the rust-analyzer integration test
-/// suite's own (test-only) indexing-readiness helper.
-const INDEXING_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default maximum time [`Translator::wait_for_indexing_ready`] waits for a
+/// routed LSP server to report it has finished its initial workspace load,
+/// once a readiness signal has shown indexing is actually in progress.
+/// Matches the timeout already used throughout the rust-analyzer integration
+/// test suite's own (test-only) indexing-readiness helper.
+///
+/// This is only the built-in default (used by [`Translator::new`]) --
+/// overridable per `Translator` via [`Translator::with_indexing_ready_timeout`],
+/// wired from `workspace.indexing_ready_timeout_seconds` in `mcpls.toml`
+/// (#424). The compile-time invariants below are checked against this
+/// default; the same invariants are re-checked against a configured override
+/// at `ServerConfig::validate` time, since a runtime value can't be asserted
+/// at compile time.
+pub(super) const INDEXING_READY_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_INDEXING_READY_TIMEOUT_SECS);
 
 /// Poll interval used while waiting out [`INDEXING_READY_TIMEOUT`]. A single
 /// mutex lock plus map lookup, not a network round trip, so a short
@@ -252,10 +264,16 @@ impl Translator {
     /// # Errors
     ///
     /// Returns [`Error::WorkspaceIndexing`] if the server is still
-    /// [`IndexingState::Loading`] after [`INDEXING_READY_TIMEOUT`] elapses.
+    /// [`IndexingState::Loading`] after the translator's configured
+    /// indexing-ready timeout (default [`INDEXING_READY_TIMEOUT`],
+    /// overridable via [`Self::with_indexing_ready_timeout`]) elapses.
     pub(super) async fn wait_for_indexing_ready(&self, server_id: &ServerId) -> Result<()> {
-        self.wait_for_indexing_ready_with(server_id, INDEXING_READY_TIMEOUT, INDEXING_POLL_INTERVAL)
-            .await
+        self.wait_for_indexing_ready_with(
+            server_id,
+            self.indexing_ready_timeout,
+            INDEXING_POLL_INTERVAL,
+        )
+        .await
     }
 
     /// [`Self::wait_for_indexing_ready`] with an injectable timeout and poll
@@ -596,6 +614,34 @@ mod tests {
             .wait_for_indexing_ready(&server_id)
             .await
             .unwrap();
+    }
+
+    /// #424: `with_indexing_ready_timeout` must actually change the bound
+    /// `wait_for_indexing_ready` (the public entry point, not the
+    /// timeout-injectable `_with` test helper) waits before giving up --
+    /// pins the config wiring end-to-end rather than only the constructor
+    /// storing the value.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_indexing_ready_uses_configured_timeout_override() {
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let server_id = ServerId::from("rust");
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = Translator::new()
+            .with_notification_cache(cache)
+            .with_indexing_ready_timeout(Duration::from_secs(5));
+
+        let start = Instant::now();
+        let err = translator
+            .wait_for_indexing_ready(&server_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::WorkspaceIndexing { elapsed_secs, .. } if elapsed_secs == 5));
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
     }
 
     #[tokio::test]
