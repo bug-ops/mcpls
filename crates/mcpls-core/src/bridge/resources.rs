@@ -216,22 +216,19 @@ impl ResourceSubscriptions {
 /// a deliberate GC-on-next-use design, not a leak: the cost is a few dead
 /// `Weak` slots, never unbounded growth or a wrong query answer.
 ///
-/// # Known limitation: rmcp's stateless HTTP path
+/// # Known limitation: rmcp's stateless HTTP path (#482)
 ///
 /// This is scoped per `McplsServer` *instance*, not per durable client
-/// identity. That coincides with "per session" only on rmcp's legacy
-/// (`initialize`-handshake) session path, where one instance lives for the
-/// session's whole lifetime. rmcp also has a stateless request path (a
-/// non-`initialize` request naming the `2026-07-28` protocol revision via
-/// `_meta`/`MCP-Protocol-Version`, which never calls `create_session`); on
-/// that path a fresh `McplsServer` -- and a fresh, empty registration here --
-/// is built per *request* and dropped once that single request completes. A
-/// `subscribe` sent over that path is therefore a no-op that no later request
-/// can observe, and [`MAX_SUBSCRIPTIONS`] caps per request rather than per
-/// client. Tracked in
-/// [issue #482](https://github.com/bug-ops/mcpls/issues/482); fixing it needs
-/// keying by a durable session identity that survives across stateless
-/// requests, which is a larger change than this type's per-instance scoping.
+/// identity, which only coincides with "per session" on rmcp's legacy
+/// (`initialize`-handshake) session path -- rmcp also serves some requests
+/// through a stateless, per-request path with a fresh, ephemeral instance.
+/// `mcp::server`'s `reject_if_stateless_http`/`is_stateless_http_request`
+/// detect that case on `subscribe`/`unsubscribe` and reject it explicitly
+/// instead of silently losing the subscription; see their docs for the exact
+/// mechanism. [`MAX_SUBSCRIPTIONS`] is unaffected by this gap: nothing is
+/// ever recorded into a set on the path those functions reject. See
+/// [issue #482](https://github.com/bug-ops/mcpls/issues/482); `crate::transport`'s
+/// test module has HTTP-level regression coverage.
 #[derive(Debug, Default, Clone)]
 pub struct SubscriptionRegistry(Arc<StdMutex<Vec<Weak<ResourceSubscriptions>>>>);
 
