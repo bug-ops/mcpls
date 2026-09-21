@@ -149,6 +149,69 @@ pub struct McplsServer {
     tool_router: Arc<ToolRouter<Self>>,
 }
 
+/// Same convention range as [`crate::error::WORKSPACE_INDEXING_ERROR_CODE`]/
+/// [`crate::error::SERVER_INITIALIZING_ERROR_CODE`], next unused slot.
+const STATELESS_SUBSCRIPTION_ERROR_CODE: ErrorCode = ErrorCode(-32052);
+
+/// Whether `meta` carries rmcp's discover-lifecycle keys -- the same test
+/// `tower.rs::is_legacy_request` uses to route a request through its
+/// stateless per-request HTTP path instead of a durable session (#482). An
+/// attached `Mcp-Session-Id` header proves nothing here: rmcp never reads it
+/// on that path, so it must not be trusted as a counter-signal.
+#[cfg(feature = "transport-http")]
+fn request_uses_discover_lifecycle_meta(meta: &rmcp::model::RequestMetaObject) -> bool {
+    meta.missing_required_keys(&rmcp::model::ProtocolVersion::V_2026_07_28)
+        .is_empty()
+}
+
+/// Whether this HTTP-served request must be rejected as effectively
+/// stateless (#482): its `_meta` matches [`request_uses_discover_lifecycle_meta`],
+/// or it never echoes an `Mcp-Session-Id` header. Gated on the `Parts`
+/// extension being present so a non-HTTP transport (stdio) is never affected.
+#[cfg(feature = "transport-http")]
+fn is_stateless_http_request(
+    extensions: &rmcp::model::Extensions,
+    meta: &rmcp::model::RequestMetaObject,
+) -> bool {
+    extensions
+        .get::<axum::http::request::Parts>()
+        .is_some_and(|parts| {
+            request_uses_discover_lifecycle_meta(meta)
+                || !parts
+                    .headers
+                    .contains_key(rmcp::transport::common::http_header::HEADER_SESSION_ID)
+        })
+}
+
+#[cfg(not(feature = "transport-http"))]
+const fn is_stateless_http_request(
+    _extensions: &rmcp::model::Extensions,
+    _meta: &rmcp::model::RequestMetaObject,
+) -> bool {
+    false
+}
+
+/// Reject a subscription request rmcp served over the stateless per-request
+/// HTTP path (#482): the state it would write is dropped the moment the
+/// request completes, so this surfaces an explicit error instead of a
+/// silent no-op.
+fn reject_if_stateless_http(
+    context: &rmcp::service::RequestContext<RoleServer>,
+) -> Result<(), McpError> {
+    if is_stateless_http_request(&context.extensions, &context.meta) {
+        return Err(McpError::new(
+            STATELESS_SUBSCRIPTION_ERROR_CODE,
+            "resource subscriptions require a stateful session; this request was served over \
+             the stateless per-request HTTP path, which never persists a subscription past the \
+             response that acknowledges it -- retry over a session established via the MCP \
+             `initialize` handshake, and without per-request `_meta` protocol negotiation"
+                .to_string(),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Maps an [`crate::error::Error`] onto the wire-level MCP error, via
 /// [`crate::error::Error::mcp_error_kind`]'s classification: caller-fault
 /// variants become `INVALID_PARAMS`, retryable variants (e.g.
@@ -1148,6 +1211,8 @@ impl ServerHandler for McplsServer {
         request: SubscribeRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
+        reject_if_stateless_http(&context)?;
+
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
@@ -1206,8 +1271,10 @@ impl ServerHandler for McplsServer {
     async fn unsubscribe(
         &self,
         request: UnsubscribeRequestParams,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
+        reject_if_stateless_http(&context)?;
+
         // Parse the URI for consistency with subscribe validation.
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
@@ -3222,6 +3289,129 @@ sleep 0.3
     fn test_subscribe_rejects_https_scheme() {
         let result = parse_uri("https://evil.com/file.rs");
         assert!(result.is_err());
+    }
+
+    /// A request with no `http::request::Parts` extension at all (e.g. served
+    /// over stdio) is never mistaken for a stateless HTTP request, even with
+    /// an empty `_meta`.
+    #[test]
+    fn test_is_stateless_http_request_false_without_http_extension() {
+        let extensions = rmcp::model::Extensions::new();
+        let meta = rmcp::model::RequestMetaObject::new();
+        assert!(!super::is_stateless_http_request(&extensions, &meta));
+    }
+
+    /// #482 regression: a stdio request (no `Parts` extension) whose `_meta`
+    /// carries discover-lifecycle keys must still be allowed through -- see
+    /// [`super::is_stateless_http_request`]'s docs for why.
+    #[test]
+    fn test_is_stateless_http_request_false_without_http_extension_even_with_discover_meta() {
+        let extensions = rmcp::model::Extensions::new();
+        let meta = rmcp::model::RequestMetaObject::with_client_context(
+            rmcp::model::ProtocolVersion::V_2025_03_26,
+            rmcp::model::Implementation::default(),
+            rmcp::model::ClientCapabilities::default(),
+        );
+        assert!(!super::is_stateless_http_request(&extensions, &meta));
+    }
+
+    /// #482: an HTTP-served request that never echoes `Mcp-Session-Id` is
+    /// detected as stateless -- the secondary, unioned signal (see
+    /// [`super::request_uses_discover_lifecycle_meta`] for the primary,
+    /// exhaustive one).
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_is_stateless_http_request_true_without_session_header() {
+        let (parts, ()) = axum::http::Request::builder()
+            .body(())
+            .unwrap()
+            .into_parts();
+        let mut extensions = rmcp::model::Extensions::new();
+        extensions.insert(parts);
+        let meta = rmcp::model::RequestMetaObject::new();
+        assert!(super::is_stateless_http_request(&extensions, &meta));
+    }
+
+    /// A request that echoes an `Mcp-Session-Id` header and carries no
+    /// discover-lifecycle `_meta` is not flagged -- the ordinary legacy
+    /// session case.
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_is_stateless_http_request_false_with_session_header_and_no_discover_meta() {
+        let (mut parts, ()) = axum::http::Request::builder()
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts.headers.insert(
+            rmcp::transport::common::http_header::HEADER_SESSION_ID,
+            axum::http::HeaderValue::from_static("test-session-id"),
+        );
+        let mut extensions = rmcp::model::Extensions::new();
+        extensions.insert(parts);
+        let meta = rmcp::model::RequestMetaObject::new();
+        assert!(!super::is_stateless_http_request(&extensions, &meta));
+    }
+
+    /// A request that echoes an `Mcp-Session-Id` header is still flagged if
+    /// its `_meta` carries discover-lifecycle keys -- proving the session
+    /// header alone is *not* a sufficient counter-signal: rmcp never
+    /// validates that header on the stateless branch #482 targets, so a
+    /// request can carry one (fabricated, stale, or even genuinely live)
+    /// while still being served statelessly.
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_is_stateless_http_request_true_with_session_header_and_discover_meta() {
+        let (mut parts, ()) = axum::http::Request::builder()
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts.headers.insert(
+            rmcp::transport::common::http_header::HEADER_SESSION_ID,
+            axum::http::HeaderValue::from_static("test-session-id"),
+        );
+        let mut extensions = rmcp::model::Extensions::new();
+        extensions.insert(parts);
+        let meta = rmcp::model::RequestMetaObject::with_client_context(
+            rmcp::model::ProtocolVersion::V_2025_03_26,
+            rmcp::model::Implementation::default(),
+            rmcp::model::ClientCapabilities::default(),
+        );
+        assert!(super::is_stateless_http_request(&extensions, &meta));
+    }
+
+    /// #482 primary signal: `_meta` carrying both discover-lifecycle keys
+    /// (`protocolVersion` + `clientCapabilities`) is detected regardless of
+    /// the declared protocol version's value -- mirroring rmcp's own
+    /// `missing_required_keys`, which only checks presence.
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_request_uses_discover_lifecycle_meta_true_with_both_keys_present() {
+        let meta = rmcp::model::RequestMetaObject::with_client_context(
+            rmcp::model::ProtocolVersion::V_2025_03_26,
+            rmcp::model::Implementation::default(),
+            rmcp::model::ClientCapabilities::default(),
+        );
+        assert!(super::request_uses_discover_lifecycle_meta(&meta));
+    }
+
+    /// Only one of the two required keys present is not enough -- matching
+    /// rmcp's own `missing_required_keys`, which requires both.
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_request_uses_discover_lifecycle_meta_false_with_only_one_key() {
+        let mut meta = rmcp::model::RequestMetaObject::new();
+        meta.set_protocol_version(rmcp::model::ProtocolVersion::V_2025_03_26);
+        assert!(!super::request_uses_discover_lifecycle_meta(&meta));
+    }
+
+    /// Empty `_meta` (typical for a legacy session's ordinary request, which
+    /// relies on the session's own handshake state instead of per-request
+    /// metadata) is not flagged.
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_request_uses_discover_lifecycle_meta_false_when_empty() {
+        let meta = rmcp::model::RequestMetaObject::new();
+        assert!(!super::request_uses_discover_lifecycle_meta(&meta));
     }
 
     /// Regression test for `read_resource`'s canonical-path fix: a path reached

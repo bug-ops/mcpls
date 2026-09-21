@@ -371,7 +371,9 @@ pub(crate) async fn run_stdio(
 /// MCP tools. A follow-up issue will add per-session broadcast.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
-/// "one instance per request" -- see
+/// "one instance per request"; `resources/subscribe`/`unsubscribe` detect
+/// that path and return an explicit error rather than silently accepting a
+/// subscription that would never be observed -- see
 /// [`SubscriptionRegistry`](crate::bridge::SubscriptionRegistry)'s "Known
 /// limitation" section.
 ///
@@ -1085,10 +1087,12 @@ mod tests {
             drop(occupied);
         }
 
-        /// Builds a `McplsServer` with empty/default collaborators, matching the
-        /// setup shared by every `run_http`-driving test in this module.
-        fn test_server() -> crate::mcp::McplsServer {
-            use std::path::PathBuf;
+        /// Builds a `McplsServer` with default collaborators and the given
+        /// workspace roots, matching the setup shared by every
+        /// `run_http`-driving test in this module.
+        fn test_server_with_roots(
+            workspace_roots: std::sync::Arc<[std::path::PathBuf]>,
+        ) -> crate::mcp::McplsServer {
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
@@ -1099,7 +1103,6 @@ mod tests {
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = SubscriptionRegistry::new();
             McplsServer::new(
                 translator,
@@ -1109,6 +1112,11 @@ mod tests {
                 false,
                 McpConfig::default(),
             )
+        }
+
+        /// [`test_server_with_roots`] with no workspace roots configured.
+        fn test_server() -> crate::mcp::McplsServer {
+            test_server_with_roots(std::sync::Arc::from(Vec::new()))
         }
 
         /// Sends a raw HTTP/1.1 POST request over TCP and returns the raw response
@@ -1512,6 +1520,184 @@ mod tests {
             );
 
             server_task.abort();
+        }
+
+        /// Shared setup for the `#482` regression tests below: a real
+        /// `run_http` server with one file inside its sole workspace root, so
+        /// `resources/subscribe` requests validate and reach the handler.
+        struct SubscribeTestServer {
+            addr: SocketAddr,
+            uri: String,
+            server_task: tokio::task::JoinHandle<Result<(), crate::Error>>,
+            // Held so the file `subscribe` canonicalizes stays on disk.
+            _workspace: tempfile::TempDir,
+        }
+
+        async fn spawn_subscribe_test_server() -> SubscribeTestServer {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let file_path = workspace.path().join("main.rs");
+            std::fs::write(&file_path, "fn main() {}").unwrap();
+            let uri = crate::bridge::resources::make_uri(&file_path).unwrap();
+
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+
+            let server =
+                test_server_with_roots(std::sync::Arc::from(vec![workspace.path().to_path_buf()]));
+
+            let cfg = HttpConfig::new(addr, "/mcp");
+            let server_task = tokio::spawn(super::super::run_http(
+                server,
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            SubscribeTestServer {
+                addr,
+                uri,
+                server_task,
+                _workspace: workspace,
+            }
+        }
+
+        /// #482: `_meta` negotiating `2026-07-28` per request is stateless by
+        /// both rmcp and mcpls' reckoning, so rmcp itself answers
+        /// `-32601 method not found` before dispatch.
+        #[tokio::test]
+        async fn test_stateless_subscribe_negotiated_per_request_is_rejected_by_rmcp() {
+            let srv = spawn_subscribe_test_server().await;
+            let uri = &srv.uri;
+
+            let headers = format!(
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: resources/subscribe\r\nMcp-Name: {uri}\r\n"
+            );
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{{"uri":"{uri}","_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+            );
+            let response = raw_http_post(srv.addr, "/mcp", &headers, body.as_bytes()).await;
+            assert!(
+                response.contains("-32601"),
+                "expected rmcp to refuse dispatching a 2026-07-28-negotiated resources/subscribe \
+                 (method not found), got: {response}"
+            );
+
+            srv.server_task.abort();
+        }
+
+        /// #482 regression matrix: `_meta` naming a pre-`2026-07-28` version
+        /// (see [`super::super::request_uses_discover_lifecycle_meta`]'s docs
+        /// for why rmcp still serves this statelessly) must be rejected by
+        /// mcpls' own guard for both `subscribe` and `unsubscribe`, and a
+        /// fabricated `Mcp-Session-Id` must not bypass it.
+        #[tokio::test]
+        async fn test_stateless_lifecycle_mismatch_is_rejected_by_mcpls() {
+            let srv = spawn_subscribe_test_server().await;
+            let uri = &srv.uri;
+
+            for (method, extra_header) in [
+                ("resources/subscribe", ""),
+                (
+                    "resources/subscribe",
+                    "Mcp-Session-Id: not-a-real-session\r\n",
+                ),
+                ("resources/unsubscribe", ""),
+            ] {
+                let headers = format!(
+                    "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-06-18\r\n{extra_header}"
+                );
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"uri":"{uri}","_meta":{{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+                );
+                let response = raw_http_post(srv.addr, "/mcp", &headers, body.as_bytes()).await;
+                assert!(
+                    response.contains("-32052") && !response.contains(r#""result":{}"#),
+                    "{method} (extra header: {extra_header:?}) must be rejected by mcpls' \
+                     stateless-subscription guard, not silently succeed, got: {response}"
+                );
+            }
+
+            srv.server_task.abort();
+        }
+
+        /// #482 non-regression: a legacy session's `resources/subscribe`,
+        /// sent with the session's assigned `Mcp-Session-Id` echoed back and
+        /// no per-request `_meta`, must not be rejected by either guard above.
+        #[tokio::test]
+        async fn test_legacy_session_subscribe_is_not_rejected_as_stateless() {
+            let srv = spawn_subscribe_test_server().await;
+            let uri = &srv.uri;
+            let session_id = initialize_legacy_session(srv.addr).await;
+
+            let session_headers = format!(
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMcp-Session-Id: {session_id}\r\n"
+            );
+            let subscribe_body = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{{"uri":"{uri}"}}}}"#
+            );
+            let session_response = raw_http_post(
+                srv.addr,
+                "/mcp",
+                &session_headers,
+                subscribe_body.as_bytes(),
+            )
+            .await;
+            assert!(
+                !session_response.contains("-32601") && !session_response.contains("-32052"),
+                "a legacy session's subscribe must not be rejected as stateless, got: \
+                 {session_response}"
+            );
+
+            srv.server_task.abort();
+        }
+
+        /// #482: a live session's `resources/subscribe` that also carries
+        /// per-request discover-lifecycle `_meta` is rejected too -- rmcp
+        /// serves it statelessly regardless of the session id, so this is
+        /// intentional, not a regression.
+        #[tokio::test]
+        async fn test_legacy_session_subscribe_with_discover_meta_is_rejected_as_stateless() {
+            let srv = spawn_subscribe_test_server().await;
+            let uri = &srv.uri;
+            let session_id = initialize_legacy_session(srv.addr).await;
+
+            let headers = format!(
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMcp-Session-Id: {session_id}\r\nMCP-Protocol-Version: 2025-06-18\r\n"
+            );
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{{"uri":"{uri}","_meta":{{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+            );
+            let response = raw_http_post(srv.addr, "/mcp", &headers, body.as_bytes()).await;
+            assert!(
+                response.contains("-32052"),
+                "a live session's subscribe with per-request discover _meta must still be \
+                 rejected -- rmcp serves it statelessly regardless of the session id, got: \
+                 {response}"
+            );
+
+            srv.server_task.abort();
+        }
+
+        /// Performs the `initialize` handshake for a legacy HTTP session and
+        /// returns its assigned `Mcp-Session-Id`.
+        async fn initialize_legacy_session(addr: SocketAddr) -> String {
+            let accept_headers =
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
+            let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+            let init_response = raw_http_post(addr, "/mcp", accept_headers, initialize_body).await;
+            assert!(
+                init_response.starts_with("HTTP/1.1 200"),
+                "legacy initialize should succeed, got: {init_response}"
+            );
+            init_response
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("mcp-session-id")
+                        .then(|| value.trim().to_string())
+                })
+                .unwrap()
         }
 
         /// #233: binding to a non-loopback address must log a warning that
