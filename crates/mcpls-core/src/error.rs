@@ -7,6 +7,13 @@ use std::path::PathBuf;
 
 use crate::config::{ServerId, ToolKind};
 
+/// Substring rust-analyzer's raw error text carries when a position-based
+/// request's `line`/`character` falls outside the target document. Shared
+/// between [`sanitize_lsp_server_message`] (rewrites the message shown to the
+/// caller) and [`Error::mcp_error_kind`] (classifies this shape of
+/// [`Error::LspServerError`] as caller-fault) so the two stay in sync.
+const INVALID_OFFSET_MARKER: &str = "Invalid offset LineCol";
+
 /// Rewrites an LSP server's raw error message for display to the MCP caller,
 /// replacing rust-analyzer's "Invalid offset" internal error with a clean,
 /// client-appropriate message.
@@ -30,7 +37,7 @@ use crate::config::{ServerId, ToolKind};
 /// (`RequestFailed`) across rust-analyzer versions, so a code condition would
 /// make the guard more fragile, not less.
 fn sanitize_lsp_server_message(message: &str) -> String {
-    if message.contains("Invalid offset LineCol") {
+    if message.contains(INVALID_OFFSET_MARKER) {
         "position out of range for this document".to_string()
     } else {
         message.to_string()
@@ -254,6 +261,18 @@ pub enum Error {
         max: usize,
     },
 
+    /// Resource-subscription limit exceeded for the session.
+    ///
+    /// See [`Error::mcp_error_kind`] for the JSON-RPC classification: same
+    /// shape as [`Self::DocumentLimitExceeded`] -- fires on aggregate
+    /// per-session tracker state, not this request's params -- so it is
+    /// classified the same way, not `InvalidParams`.
+    #[error("subscription limit of {max} reached")]
+    SubscriptionLimitReached {
+        /// Maximum number of subscriptions allowed per session.
+        max: usize,
+    },
+
     /// File size limit exceeded.
     #[error(
         "file size limit exceeded: {size} bytes, max {max} bytes (raise workspace.max_file_size in config to increase this)"
@@ -347,6 +366,26 @@ pub const WORKSPACE_INDEXING_ERROR_CODE: i32 = -32050;
 /// assert_ne!(SERVER_INITIALIZING_ERROR_CODE, WORKSPACE_INDEXING_ERROR_CODE);
 /// ```
 pub const SERVER_INITIALIZING_ERROR_CODE: i32 = -32051;
+
+/// Bespoke JSON-RPC code for a resource subscription request rejected
+/// because it was served over rmcp's stateless per-request HTTP path (#482).
+///
+/// Same convention range as [`WORKSPACE_INDEXING_ERROR_CODE`]/
+/// [`SERVER_INITIALIZING_ERROR_CODE`], next unused slot.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::{
+///     SERVER_INITIALIZING_ERROR_CODE, STATELESS_SUBSCRIPTION_ERROR_CODE,
+///     WORKSPACE_INDEXING_ERROR_CODE,
+/// };
+///
+/// assert_eq!(STATELESS_SUBSCRIPTION_ERROR_CODE, -32052);
+/// assert_ne!(STATELESS_SUBSCRIPTION_ERROR_CODE, WORKSPACE_INDEXING_ERROR_CODE);
+/// assert_ne!(STATELESS_SUBSCRIPTION_ERROR_CODE, SERVER_INITIALIZING_ERROR_CODE);
+/// ```
+pub const STATELESS_SUBSCRIPTION_ERROR_CODE: i32 = -32052;
 
 /// JSON-RPC error-code classification for an [`Error`], returned by
 /// [`Error::mcp_error_kind`].
@@ -457,6 +496,15 @@ impl Error {
                 data: serde_json::json!({}),
             },
 
+            // Same recognized shape `sanitize_lsp_server_message` rewrites
+            // for display: rust-analyzer reports this when a position-based
+            // request's line/character falls outside the target document --
+            // caller-fault. Every other `LspServerError` shape is a genuine
+            // server-side problem and stays `Internal`.
+            Self::LspServerError { message, .. } if message.contains(INVALID_OFFSET_MARKER) => {
+                McpErrorKind::InvalidParams
+            }
+
             Self::LspInitFailed { .. }
             | Self::LspServerError { .. }
             | Self::McpServer(_)
@@ -482,6 +530,9 @@ impl Error {
             // once other documents close, so `InvalidParams` is wrong; not
             // `Retryable` either, since nothing evicts documents on a timer.
             | Self::DocumentLimitExceeded { .. }
+            // Same shape as `DocumentLimitExceeded` above -- see this
+            // variant's doc comment.
+            | Self::SubscriptionLimitReached { .. }
             | Self::AllServersFailedToInit { .. }
             | Self::NoServersAvailable(_)
             | Self::CapabilityNotSupported { .. } => McpErrorKind::Internal,
@@ -883,6 +934,7 @@ mod tests {
                 current: 150,
                 max: 100,
             },
+            Error::SubscriptionLimitReached { max: 1000 },
         ];
 
         for err in internal_errors {
@@ -915,6 +967,42 @@ mod tests {
             path: PathBuf::from("/root/secret.rs"),
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
         };
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
+    }
+
+    /// #496: an `LspServerError` carrying the recognized "position out of
+    /// range" shape (same substring `sanitize_lsp_server_message` rewrites
+    /// for display) is caller-fault, not a generic internal failure.
+    #[test]
+    fn test_mcp_error_kind_lsp_server_error_invalid_offset_is_invalid_params() {
+        let err = Error::LspServerError {
+            code: -32603,
+            message: "Invalid offset LineCol { line: 2291, col: 0 } (line index length: 100417)"
+                .to_string(),
+            data: None,
+        };
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
+    }
+
+    /// Counterpart: an `LspServerError` whose message doesn't match the
+    /// recognized position-out-of-range shape is a genuine server-side
+    /// problem and must stay `Internal`.
+    #[test]
+    fn test_mcp_error_kind_lsp_server_error_other_message_stays_internal() {
+        let err = Error::LspServerError {
+            code: -32603,
+            message: "internal error".to_string(),
+            data: None,
+        };
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
+    }
+
+    /// #496: `SubscriptionLimitReached` fires on aggregate per-session
+    /// tracker state, not this request's params, so it must classify the
+    /// same way as `DocumentLimitExceeded` -- not `InvalidParams`.
+    #[test]
+    fn test_mcp_error_kind_subscription_limit_reached_stays_internal() {
+        let err = Error::SubscriptionLimitReached { max: 1000 };
         assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
     }
 }

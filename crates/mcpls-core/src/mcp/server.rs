@@ -149,10 +149,6 @@ pub struct McplsServer {
     tool_router: Arc<ToolRouter<Self>>,
 }
 
-/// Same convention range as [`crate::error::WORKSPACE_INDEXING_ERROR_CODE`]/
-/// [`crate::error::SERVER_INITIALIZING_ERROR_CODE`], next unused slot.
-const STATELESS_SUBSCRIPTION_ERROR_CODE: ErrorCode = ErrorCode(-32052);
-
 /// Whether `meta` carries rmcp's discover-lifecycle keys -- the same test
 /// `tower.rs::is_legacy_request` uses to route a request through its
 /// stateless per-request HTTP path instead of a durable session (#482). An
@@ -200,7 +196,7 @@ fn reject_if_stateless_http(
 ) -> Result<(), McpError> {
     if is_stateless_http_request(&context.extensions, &context.meta) {
         return Err(McpError::new(
-            STATELESS_SUBSCRIPTION_ERROR_CODE,
+            ErrorCode(crate::error::STATELESS_SUBSCRIPTION_ERROR_CODE),
             "resource subscriptions require a stateful session; this request was served over \
              the stateless per-request HTTP path, which never persists a subscription past the \
              response that acknowledges it -- retry over a session established via the MCP \
@@ -1241,10 +1237,19 @@ impl ServerHandler for McplsServer {
             .subscriptions
             .subscribe(canonical_uri.clone())
             .await
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(|e| map_bridge_error(e.into()))?;
         if !newly_subscribed {
             tracing::debug!("client re-subscribed to already-subscribed resource {canonical_uri}");
         }
+
+        // Record the raw request URI as an alias of the canonical one so a
+        // later `unsubscribe` for the same raw URI still resolves even if
+        // canonicalizing it then fails, e.g. because the file was deleted
+        // since subscribing (#499). No-op when the two already match.
+        self.context
+            .subscriptions
+            .record_alias(request.uri.clone(), canonical_uri.clone())
+            .await;
 
         // Build the URI from the canonicalized path, matching `read_resource` and
         // what `diagnostics_pump` stores from LSP notifications.
@@ -1281,13 +1286,19 @@ impl ServerHandler for McplsServer {
 
         // Remove under the same canonical URI `subscribe` recorded under. Best-effort
         // fall back to the raw URI if canonicalization fails (e.g. the file was
-        // deleted since subscribing) so unsubscribing a stale entry never errors.
+        // deleted since subscribing) so unsubscribing a stale entry never errors --
+        // `ResourceSubscriptions::unsubscribe` then resolves it via the alias
+        // `subscribe` recorded for this raw URI (#499).
         let key = validate_path_against_roots(&path, &self.context.workspace_roots)
             .ok()
             .and_then(|validated_path| make_uri(&validated_path).ok())
             .unwrap_or_else(|| request.uri.clone());
 
-        self.context.subscriptions.unsubscribe(&key).await;
+        if !self.context.subscriptions.unsubscribe(&key).await {
+            tracing::debug!(
+                "client unsubscribed from resource with no matching subscription: {key}"
+            );
+        }
         Ok(())
     }
 
@@ -3500,6 +3511,72 @@ sleep 0.3
 
         let mcp_err = map_bridge_error(result.unwrap_err());
         assert_eq!(mcp_err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    /// #496 site 2 regression: a `SubscriptionError::LimitReached`, routed
+    /// through `map_bridge_error` the same way `subscribe`'s handler now
+    /// does, must classify as `INTERNAL_ERROR` (like `DocumentLimitExceeded`),
+    /// not `INVALID_PARAMS` -- it fires on aggregate per-session tracker
+    /// state, not this request's params, so it can succeed unchanged once
+    /// other subscriptions are dropped.
+    #[test]
+    fn test_subscription_limit_reached_maps_to_internal_error() {
+        let err: crate::error::Error =
+            crate::bridge::resources::SubscriptionError::LimitReached.into();
+        let mcp_err = map_bridge_error(err);
+        assert_eq!(mcp_err.code, ErrorCode::INTERNAL_ERROR);
+    }
+
+    /// #499 regression: `unsubscribe`'s best-effort fallback to the raw
+    /// request URI must still resolve to the entry `subscribe` created, even
+    /// when canonicalizing the raw URI now fails because the file was
+    /// deleted since subscribing. Without the alias recorded by
+    /// `record_alias` at subscribe time, this fallback used to leak a capped
+    /// subscription slot forever.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_unsubscribe_resolves_stale_deleted_file_via_alias() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let real_dir = base.join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let test_file = real_dir.join("test.rs");
+        fs::write(&test_file, "fn main() {}").unwrap();
+
+        let link_dir = base.join("link");
+        symlink(&real_dir, &link_dir).unwrap();
+        let noncanonical = link_dir.join("test.rs");
+
+        let roots = std::slice::from_ref(&base);
+        let validated = validate_path_against_roots(&noncanonical, roots).unwrap();
+        let raw_uri = make_uri(&noncanonical).unwrap();
+        let canonical_uri = make_uri(&validated).unwrap();
+        assert_ne!(raw_uri, canonical_uri);
+
+        let subscriptions = ResourceSubscriptions::new();
+        subscriptions
+            .subscribe(canonical_uri.clone())
+            .await
+            .unwrap();
+        subscriptions
+            .record_alias(raw_uri.clone(), canonical_uri.clone())
+            .await;
+
+        // Delete the file (through the real path, not the symlink) so
+        // canonicalizing the symlinked path at unsubscribe time fails.
+        fs::remove_file(&test_file).unwrap();
+        assert!(validate_path_against_roots(&noncanonical, roots).is_err());
+
+        // Mirrors `unsubscribe`'s handler: falls back to the raw URI once
+        // canonicalization fails.
+        let key = raw_uri;
+        assert!(subscriptions.unsubscribe(&key).await);
+        assert!(!subscriptions.contains(&canonical_uri).await);
     }
 
     /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
