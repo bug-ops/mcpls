@@ -270,7 +270,10 @@ impl Translator {
             });
         }
 
-        Ok(InlayHintsResult { hints })
+        Ok(InlayHintsResult {
+            hints,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 }
 

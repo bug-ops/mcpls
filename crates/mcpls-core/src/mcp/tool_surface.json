@@ -2,7 +2,7 @@
   {
     "name": "format_document",
     "title": "Format Document",
-    "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style.",
+    "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style. `positions_degraded: true` on the result means some returned edit ranges' `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -38,7 +38,7 @@
   {
     "name": "get_cached_diagnostics",
     "title": "Cached Diagnostics",
-    "description": "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis.",
+    "description": "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -62,7 +62,7 @@
   {
     "name": "get_code_actions",
     "title": "Code Actions",
-    "description": "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files).",
+    "description": "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). `positions_degraded: true` on the result means some returned `character` offsets (diagnostic or edit ranges) may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -166,7 +166,7 @@
   {
     "name": "get_definition",
     "title": "Go to Definition",
-    "description": "Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned.",
+    "description": "Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -268,6 +268,10 @@
           },
           "type": "array"
         },
+        "positions_degraded": {
+          "description": "Whether a position in this response could not be resolved for\nencoding conversion -- disk-read budget exhaustion, an unresolvable\nserver-supplied path, a line past EOF, or invalid UTF-8 content can\neach cause this -- meaning some `locations` entries' `character` values may be\nwrong for a non-UTF-16 LSP server (#497). Omitted (defaults to\n`false`) when serialized.",
+          "type": "boolean"
+        },
         "truncated": {
           "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
           "type": "boolean"
@@ -288,7 +292,7 @@
   {
     "name": "get_diagnostics",
     "title": "Diagnostics",
-    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexingInProgress: true` means the routed server was indexing at some point during this read, so results may be incomplete.",
+    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexingInProgress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -412,6 +416,10 @@
         "indexingInProgress": {
           "description": "`true` if the file's diagnostics-route server (resolved via\n[`Translator::diagnostics_route_id_for_path`]) had an active signal\nindicating its initial workspace-load/indexing phase was still in\nprogress at any point during this read -- the returned diagnostics\nmay reflect a partial index. Sampled both before and after the pull\nrequest (see `McplsServer::get_diagnostics`), not just at one point\nin time, so a server that was `Loading` mid-pull but finished by the\ntime the pull settled still reads `true` here. `false` both when the\nserver was done indexing for the whole read (or never reported a\nreadiness signal) and when no route is configured for the file's\nlanguage at all.",
           "type": "boolean"
+        },
+        "positions_degraded": {
+          "description": "Whether a position in this response could not be resolved for\nencoding conversion -- disk-read budget exhaustion, an unresolvable\nserver-supplied path, a line past EOF, or invalid UTF-8 content can\neach cause this -- meaning some `diagnostics` ranges' `character` values may be\nwrong for a non-UTF-16 LSP server (#497). Omitted (defaults to\n`false`) when serialized.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -430,7 +438,7 @@
   {
     "name": "get_document_symbols",
     "title": "Document Symbols",
-    "description": "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations.",
+    "description": "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -529,6 +537,10 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "positions_degraded": {
+          "description": "Whether a position in this response could not be resolved for\nencoding conversion -- disk-read budget exhaustion, an unresolvable\nserver-supplied path, a line past EOF, or invalid UTF-8 content can\neach cause this -- meaning some `symbols` ranges' `character` values may be\nwrong for a non-UTF-16 LSP server (#497). Omitted (defaults to\n`false`) when serialized.",
+          "type": "boolean"
+        },
         "symbols": {
           "description": "List of symbols in the document.",
           "items": {
@@ -552,7 +564,7 @@
   {
     "name": "get_hover",
     "title": "Hover",
-    "description": "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols.",
+    "description": "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols. `positions_degraded: true` on the result means the returned range's `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -590,7 +602,7 @@
   {
     "name": "get_incoming_calls",
     "title": "Incoming Calls",
-    "description": "Functions calling the specified item. Takes call hierarchy item, returns all callers.",
+    "description": "Functions calling the specified item. Takes call hierarchy item, returns all callers. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -613,7 +625,7 @@
   {
     "name": "get_inlay_hints",
     "title": "Inlay Hints",
-    "description": "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline.",
+    "description": "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. `positions_degraded: true` on the result means some returned hint `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -665,7 +677,7 @@
   {
     "name": "get_outgoing_calls",
     "title": "Outgoing Calls",
-    "description": "Functions called by the specified item. Takes call hierarchy item, returns all callees.",
+    "description": "Functions called by the specified item. Takes call hierarchy item, returns all callees. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -688,7 +700,7 @@
   {
     "name": "get_references",
     "title": "Find References",
-    "description": "References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned.",
+    "description": "References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -794,6 +806,10 @@
             "$ref": "#/$defs/Location"
           },
           "type": "array"
+        },
+        "positions_degraded": {
+          "description": "Whether a position in this response could not be resolved for\nencoding conversion -- disk-read budget exhaustion, an unresolvable\nserver-supplied path, a line past EOF, or invalid UTF-8 content can\neach cause this -- meaning some `locations` entries' `character` values may be\nwrong for a non-UTF-16 LSP server (#497). Omitted (defaults to\n`false`) when serialized.",
+          "type": "boolean"
         },
         "truncated": {
           "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more references\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
@@ -908,7 +924,7 @@
   {
     "name": "go_to_implementation",
     "title": "Go to Implementation",
-    "description": "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned.",
+    "description": "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -946,7 +962,7 @@
   {
     "name": "go_to_type_definition",
     "title": "Go to Type Definition",
-    "description": "Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned.",
+    "description": "Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -984,7 +1000,7 @@
   {
     "name": "prepare_call_hierarchy",
     "title": "Prepare Call Hierarchy",
-    "description": "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis.",
+    "description": "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -1022,7 +1038,7 @@
   {
     "name": "rename_symbol",
     "title": "Rename Symbol",
-    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty.",
+    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty. `positions_degraded: true` means some returned edit ranges' `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -1065,7 +1081,7 @@
   {
     "name": "workspace_symbol_search",
     "title": "Workspace Symbol Search",
-    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned.",
+    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

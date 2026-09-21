@@ -469,12 +469,14 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
+    use tempfile::TempDir;
     use tokio::time::Duration;
 
     use super::*;
     use crate::bridge::state::detect_language;
     use crate::config::{ServerId, ToolKind, ToolRouter};
     use crate::error::Error;
+    use crate::test_lsp::fake_lsp_client;
 
     #[test]
     fn test_translator_new() {
@@ -601,9 +603,14 @@ mod tests {
     }
 
     /// `with_resource_limits` called before `with_extensions` (the order
-    /// `serve()` uses) must reach `document_tracker`.
-    #[test]
-    fn test_with_resource_limits_applies_before_with_extensions() {
+    /// `serve()` uses) must reach `document_tracker`. With `max_documents:
+    /// 1` and neither document locked, the second `ensure_open` evicts the
+    /// first (#495) rather than failing -- `document_tracker.len()` staying
+    /// at 1 is what proves the limit actually reached the tracker. Goes
+    /// through `ensure_open` (not the raw `open`) so the first document is
+    /// disk-verified and therefore actually evictable (#495 S4).
+    #[tokio::test]
+    async fn test_with_resource_limits_applies_before_with_extensions() {
         let limits = ResourceLimits {
             max_documents: 1,
             max_file_size: 0,
@@ -612,15 +619,28 @@ mod tests {
             .with_resource_limits(limits)
             .with_extensions(HashMap::new());
 
+        let dir = TempDir::new().unwrap();
+        let path_a = dir.path().join("a.rs");
+        std::fs::write(&path_a, "a").unwrap();
+        let path_b = dir.path().join("b.rs");
+        std::fs::write(&path_b, "b").unwrap();
+
+        let (client, _server) = fake_lsp_client();
+        let server_id = ServerId::from("rust");
+
         translator
             .document_tracker
-            .open(PathBuf::from("/tmp/a.rs"), "a".to_string())
+            .ensure_open(&path_a, &server_id, &client)
+            .await
             .unwrap();
-        let err = translator
+        translator
             .document_tracker
-            .open(PathBuf::from("/tmp/b.rs"), "b".to_string())
-            .unwrap_err();
-        assert!(matches!(err, Error::DocumentLimitExceeded { max: 1, .. }));
+            .ensure_open(&path_b, &server_id, &client)
+            .await
+            .unwrap();
+        assert_eq!(translator.document_tracker.len(), 1);
+        assert!(!translator.document_tracker.is_open(&path_a));
+        assert!(translator.document_tracker.is_open(&path_b));
     }
 
     /// `with_resource_limits` called *after* `with_extensions` (the reverse
@@ -635,8 +655,8 @@ mod tests {
     /// `self.extension_map`) would leave `max_documents` correct but the
     /// extension map silently empty, which the "before" test alone cannot
     /// detect.
-    #[test]
-    fn test_with_resource_limits_applies_after_with_extensions() {
+    #[tokio::test]
+    async fn test_with_resource_limits_applies_after_with_extensions() {
         let limits = ResourceLimits {
             max_documents: 1,
             max_file_size: 0,
@@ -645,18 +665,33 @@ mod tests {
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]))
             .with_resource_limits(limits);
 
-        let path = PathBuf::from("/tmp/a.rs");
+        let dir = TempDir::new().unwrap();
+        let path_a = dir.path().join("a.rs");
+        std::fs::write(&path_a, "a").unwrap();
+        let path_b = dir.path().join("b.rs");
+        std::fs::write(&path_b, "b").unwrap();
+
+        let (client, _server) = fake_lsp_client();
+        let server_id = ServerId::from("rust");
+
         translator
             .document_tracker
-            .open(path.clone(), "a".to_string())
+            .ensure_open(&path_a, &server_id, &client)
+            .await
             .unwrap();
-        let err = translator
+        translator
             .document_tracker
-            .open(PathBuf::from("/tmp/b.rs"), "b".to_string())
-            .unwrap_err();
-        assert!(matches!(err, Error::DocumentLimitExceeded { max: 1, .. }));
+            .ensure_open(&path_b, &server_id, &client)
+            .await
+            .unwrap();
+        assert_eq!(translator.document_tracker.len(), 1);
+        assert!(!translator.document_tracker.is_open(&path_a));
 
-        let state = translator.document_tracker.close(&path).unwrap();
-        assert_eq!(state.language_id(), "rust");
+        let state = translator.document_tracker.close(&path_b).unwrap();
+        assert_eq!(
+            state.language_id(),
+            "rust",
+            "extension map must have survived with_resource_limits's rebuild"
+        );
     }
 }

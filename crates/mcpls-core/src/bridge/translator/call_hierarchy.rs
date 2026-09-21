@@ -155,7 +155,10 @@ impl Translator {
             items.push(convert_call_hierarchy_item(item, &ctx).await);
         }
 
-        Ok(CallHierarchyPrepareResult { items })
+        Ok(CallHierarchyPrepareResult {
+            items,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 
     /// Handle incoming calls request.
@@ -230,7 +233,10 @@ impl Translator {
             });
         }
 
-        Ok(IncomingCallsResult { calls })
+        Ok(IncomingCallsResult {
+            calls,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 
     /// Handle outgoing calls request.
@@ -302,7 +308,10 @@ impl Translator {
             });
         }
 
-        Ok(OutgoingCallsResult { calls })
+        Ok(OutgoingCallsResult {
+            calls,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 }
 

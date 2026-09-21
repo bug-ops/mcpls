@@ -139,6 +139,7 @@ async fn lsp_locations_to_mcp(
     NormalizedLocations {
         locations,
         truncated,
+        positions_degraded: ctx.positions_degraded(),
     }
 }
 
@@ -146,10 +147,15 @@ async fn lsp_locations_to_mcp(
 /// [`MAX_NORMALIZED_LOCATIONS`] actually dropped any of the LSP server's
 /// reported locations -- surfaced to the MCP caller via each result DTO's
 /// `truncated` field, since `references`'/goto-X's tool descriptions
-/// otherwise imply a complete result (see #474).
+/// otherwise imply a complete result (see #474) -- and whether any position
+/// among them could not be resolved for encoding conversion while
+/// normalizing (disk-read budget exhaustion, an unresolvable path, a line
+/// past EOF, or invalid UTF-8 -- see `ctx.positions_degraded()`), surfaced
+/// via each result DTO's `positions_degraded` field (#497).
 struct NormalizedLocations {
     locations: Vec<Location>,
     truncated: bool,
+    positions_degraded: bool,
 }
 
 /// The two response shapes shared by `textDocument/definition`,
@@ -402,11 +408,16 @@ impl Translator {
                     Some(r) => Some(ctx.normalize_range(&response_uri, r).await),
                     None => None,
                 };
-                HoverResult { contents, range }
+                HoverResult {
+                    contents,
+                    range,
+                    positions_degraded: ctx.positions_degraded(),
+                }
             }
             None => HoverResult {
                 contents: "No hover information available".to_string(),
                 range: None,
+                positions_degraded: ctx.positions_degraded(),
             },
         };
 
@@ -473,6 +484,7 @@ impl Translator {
         let NormalizedLocations {
             locations,
             truncated,
+            positions_degraded,
         } = self
             .handle_goto::<lsp_types::DefinitionRequest, _>(
                 &file_path,
@@ -485,6 +497,7 @@ impl Translator {
         Ok(DefinitionResult {
             locations,
             truncated,
+            positions_degraded,
         })
     }
 
@@ -534,11 +547,13 @@ impl Translator {
         let NormalizedLocations {
             locations,
             truncated,
+            positions_degraded,
         } = lsp_locations_to_mcp(locations, &ctx).await;
 
         Ok(ReferencesResult {
             locations,
             truncated,
+            positions_degraded,
         })
     }
 
@@ -560,6 +575,7 @@ impl Translator {
         let NormalizedLocations {
             locations,
             truncated,
+            positions_degraded,
         } = self
             .handle_goto::<lsp_types::ImplementationRequest, _>(
                 &file_path,
@@ -572,6 +588,7 @@ impl Translator {
         Ok(LocationsResult {
             locations,
             truncated,
+            positions_degraded,
         })
     }
 
@@ -594,6 +611,7 @@ impl Translator {
         let NormalizedLocations {
             locations,
             truncated,
+            positions_degraded,
         } = self
             .handle_goto::<lsp_types::TypeDefinitionRequest, _>(
                 &file_path,
@@ -606,6 +624,7 @@ impl Translator {
         Ok(LocationsResult {
             locations,
             truncated,
+            positions_degraded,
         })
     }
 }

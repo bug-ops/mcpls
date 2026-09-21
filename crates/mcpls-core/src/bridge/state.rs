@@ -140,11 +140,12 @@ impl Eq for DiskSync {}
 /// compare rather than trusting a stat match. `DiskSync`'s hand-written
 /// `PartialEq` excludes `content_checked_at` (see that field's doc comment),
 /// and that exclusion propagates here: two `DocumentState`s can compare
-/// equal via this struct's derived `PartialEq`/`Eq` despite having been
-/// disk-verified at different instants. This is intentional --
+/// equal via this struct's own hand-written `PartialEq`/`Eq` (below) despite
+/// having been disk-verified at different instants. This is intentional --
 /// `content_checked_at` is a debounce timer, not part of a document's
-/// logical state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// logical state. `last_accessed` (also excluded, for the same reason) is
+/// likewise not logical state, just an LRU-eviction timestamp (#495).
+#[derive(Debug, Clone)]
 pub struct DocumentState {
     uri: Uri,
     language_id: String,
@@ -152,7 +153,38 @@ pub struct DocumentState {
     content: String,
     disk: Option<DiskSync>,
     synced: HashMap<ServerId, i32>,
+    /// When this document was last accessed via `ensure_open`/`update`
+    /// (`Self::touch`), used to pick the least-recently-used entry when
+    /// `DocumentTracker::open` must evict to stay under
+    /// `ResourceLimits::max_documents` (#495).
+    last_accessed: Instant,
 }
+
+impl PartialEq for DocumentState {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured (rather than plain field access) so a future new
+        // field fails to compile here until it's deliberately included or
+        // excluded -- unlike a derived impl, hand-written equality gets no
+        // such reminder for free.
+        let Self {
+            uri,
+            language_id,
+            version,
+            content,
+            disk,
+            synced,
+            last_accessed: _,
+        } = self;
+        *uri == other.uri
+            && *language_id == other.language_id
+            && *version == other.version
+            && *content == other.content
+            && *disk == other.disk
+            && *synced == other.synced
+    }
+}
+
+impl Eq for DocumentState {}
 
 impl DocumentState {
     /// Creates a new document state at version 1, with unknown disk
@@ -165,7 +197,14 @@ impl DocumentState {
             content,
             disk: None,
             synced: HashMap::new(),
+            last_accessed: Instant::now(),
         }
+    }
+
+    /// Marks this document as just accessed, for LRU eviction ordering under
+    /// `ResourceLimits::max_documents` (#495).
+    fn touch(&mut self) {
+        self.last_accessed = Instant::now();
     }
 
     /// Document URI.
@@ -318,6 +357,28 @@ pub struct LineRead {
     pub(crate) bytes_read: u64,
 }
 
+/// A document evicted by [`DocumentTracker::open`]'s LRU eviction (#495).
+///
+/// Carries the servers whose `textDocument/didOpen`/`didChange` it had
+/// received. `DocumentTracker` itself has no access to any server's
+/// [`LspClient`] --
+/// that registry lives one layer up, in `Translator` -- so it cannot send
+/// `textDocument/didClose` itself. Instead, [`DocumentTracker::take_evicted`]
+/// hands these back to a caller that does have that access, which must send
+/// each of `synced_servers` a `textDocument/didClose` for `uri`, or that
+/// server's own open-document set keeps growing even though mcpls's own
+/// tracking evicted the entry.
+#[derive(Debug, Clone)]
+pub struct EvictedDocument {
+    /// Filesystem path of the evicted document.
+    pub path: PathBuf,
+    /// URI of the evicted document, as sent to any server that had it open.
+    pub uri: Uri,
+    /// Servers that had this document open, each needing a
+    /// `textDocument/didClose` now that mcpls itself has evicted it.
+    pub synced_servers: Vec<ServerId>,
+}
+
 /// Tracks document state across the workspace.
 ///
 /// Every method takes `&self`: the document map and the per-path locks used
@@ -332,6 +393,13 @@ pub struct DocumentTracker {
     /// Per-path locks serializing [`Self::ensure_open`] calls for the same
     /// path, so calls for different paths never wait on each other. See
     /// `lock_path` for how entries are created and evicted.
+    ///
+    /// Also doubles as the "has an in-flight operation" signal
+    /// [`Self::open`]'s LRU eviction consults (#495): a path is present here
+    /// for the whole duration of any `ensure_open`/`update` call against it
+    /// (`lock_path`'s guard is held across both), so excluding every path
+    /// present in this map from eviction candidates is exactly "never evict
+    /// a document with an operation in flight".
     path_locks: StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
     /// Per-server sync generation, bumped by [`Self::forget_server`].
     ///
@@ -344,6 +412,10 @@ pub struct DocumentTracker {
     limits: ResourceLimits,
     /// Custom file extension to language ID mappings.
     extension_map: HashMap<String, String>,
+    /// Documents evicted by [`Self::open`]'s LRU eviction, queued for
+    /// [`Self::take_evicted`] to hand to a caller that can notify their
+    /// servers (#495). See [`EvictedDocument`].
+    evicted: StdMutex<Vec<EvictedDocument>>,
 }
 
 impl DocumentTracker {
@@ -356,7 +428,18 @@ impl DocumentTracker {
             generations: StdMutex::new(HashMap::new()),
             limits,
             extension_map,
+            evicted: StdMutex::new(Vec::new()),
         }
+    }
+
+    /// Drains and returns documents evicted by [`Self::open`]'s LRU eviction
+    /// since the last call (#495) -- see [`EvictedDocument`]. A caller with
+    /// access to each server's `LspClient` (i.e. `Translator`) should call
+    /// this after every `ensure_open` that could have triggered eviction and
+    /// send `textDocument/didClose` for each evicted document to each of its
+    /// `synced_servers`.
+    pub fn take_evicted(&self) -> Vec<EvictedDocument> {
+        std::mem::take(&mut lock_std(&self.evicted))
     }
 
     /// Check if a document is currently open.
@@ -404,10 +487,37 @@ impl DocumentTracker {
     ///
     /// Returns the document URI for use in LSP requests.
     ///
+    /// When `max_documents` would otherwise be exceeded, evicts the
+    /// least-recently-used tracked document that both has no
+    /// `ensure_open`/`update` call currently in flight against it and is
+    /// disk-verified (see `evict_lru`) to make room, rather than failing
+    /// outright (#495) -- the evicted document is queued for
+    /// [`Self::take_evicted`]. Only falls back to
+    /// [`Error::DocumentLimitExceeded`] when no tracked document meets both
+    /// conditions, so none is safe to evict.
+    ///
+    /// `take_evicted`'s queue is an unbounded `Vec` that only ever grows
+    /// until drained -- `Translator` drains it after every `ensure_open`
+    /// that could have triggered eviction, but a caller that invokes this
+    /// method directly (bypassing `ensure_open`, e.g. an embedder) is
+    /// responsible for draining it too, or the queue (and every
+    /// `EvictedDocument`'s content) accumulates for the tracker's lifetime.
+    ///
+    /// Note the narrower guarantee than "no operation in flight" might
+    /// suggest: the `ensure_open`/`update` lock this checks (`path_locks`)
+    /// is released once that call returns, *before* the caller's actual LSP
+    /// round-trip for the document runs (see `path_locks`'s doc) -- a
+    /// document already past its own `ensure_open` can still be evicted
+    /// while its handler's request is in flight. Harmless at the default
+    /// `max_documents` (100): the just-prepared document is always the most
+    /// recently used, so it's never the LRU candidate. At a very small
+    /// configured limit with enough concurrent calls, two in-flight
+    /// documents could in principle evict each other mid-request.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Document limit is exceeded
+    /// - Document limit is exceeded and no document is evictable
     /// - File size limit is exceeded
     pub fn open(&self, path: PathBuf, content: String) -> Result<Uri> {
         self.check_file_size(content.len() as u64)?;
@@ -421,16 +531,72 @@ impl DocumentTracker {
         // two concurrent `open` calls for different new paths can't both
         // pass the check and jointly exceed the limit by one. Dropped
         // explicitly right after the insert rather than at function return.
+        //
+        // Skipped entirely when `path` is already tracked: re-opening an
+        // existing path (`insert` below overwrites its entry in place, not
+        // growing the map) never needs room made for it -- checking the
+        // limit anyway would needlessly evict some unrelated victim (or, if
+        // `path` itself were picked as the LRU candidate, evict and then
+        // immediately re-insert it, queuing a spurious `didClose`).
         let mut documents = lock_std(&self.documents);
-        if self.limits.max_documents > 0 && documents.len() >= self.limits.max_documents {
-            return Err(Error::DocumentLimitExceeded {
-                current: documents.len(),
-                max: self.limits.max_documents,
+        if self.limits.max_documents > 0
+            && documents.len() >= self.limits.max_documents
+            && !documents.contains_key(&path)
+        {
+            let Some((evicted_path, evicted_state)) =
+                Self::evict_lru(&mut documents, &self.path_locks)
+            else {
+                return Err(Error::DocumentLimitExceeded {
+                    current: documents.len(),
+                    max: self.limits.max_documents,
+                });
+            };
+            lock_std(&self.evicted).push(EvictedDocument {
+                path: evicted_path,
+                uri: evicted_state.uri,
+                synced_servers: evicted_state.synced.into_keys().collect(),
             });
         }
         documents.insert(path, state);
         drop(documents);
         Ok(uri)
+    }
+
+    /// Removes and returns the least-recently-used entry in `documents` that
+    /// is both unlocked and disk-verified -- see `path_locks`'s doc for why
+    /// "present in `path_locks`" is exactly "has an `ensure_open`/`update`
+    /// operation in flight" (#495), and below for why "disk-verified" is
+    /// required too.
+    ///
+    /// A candidate whose `disk()` is `None` is skipped: that means its
+    /// in-memory `content` either has never been read-back-verified against
+    /// disk at all, or -- the concerning case -- has *diverged* from disk
+    /// via `Self::update`'s `apply_local_edit` (a local, not-yet-`didOpen`ed
+    /// edit already pushed to the server, per that method's own doc). In
+    /// either case, evicting it and later reopening the path from disk on a
+    /// future `ensure_open` would silently discard content mcpls has no
+    /// other record of -- unlike a disk-verified candidate, whose evicted
+    /// content is by definition reproducible by re-reading the file. No
+    /// in-tree caller invokes `update` today, so this is a structural guard
+    /// against a latent, not-yet-reachable data-loss shape rather than a
+    /// currently-observed bug.
+    ///
+    /// Returns `None` if every tracked document is currently locked or not
+    /// disk-verified, in which case the caller must not evict anything.
+    fn evict_lru(
+        documents: &mut HashMap<PathBuf, DocumentState>,
+        path_locks: &StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+    ) -> Option<(PathBuf, DocumentState)> {
+        let locked = lock_std(path_locks)
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let lru_path = documents
+            .iter()
+            .filter(|(path, state)| !locked.contains(path.as_path()) && state.disk().is_some())
+            .min_by_key(|(_, state)| state.last_accessed)
+            .map(|(path, _)| path.clone())?;
+        documents.remove(&lru_path).map(|state| (lru_path, state))
     }
 
     /// Update a document's content and increment its version.
@@ -455,9 +621,10 @@ impl DocumentTracker {
     /// permanently, with no panic and no timeout to signal it.
     pub async fn update(&self, path: &Path, content: String) -> Option<i32> {
         let _path_guard = self.lock_path(path).await;
-        lock_std(&self.documents)
-            .get_mut(path)
-            .map(|state| state.apply_local_edit(content))
+        lock_std(&self.documents).get_mut(path).map(|state| {
+            state.touch();
+            state.apply_local_edit(content)
+        })
     }
 
     /// Returns an error if `size` exceeds the configured file size limit.
@@ -669,9 +836,14 @@ impl DocumentTracker {
 
         // `.map(...)` extracts an owned tuple from the lookup in a single
         // statement, so the lock releases immediately rather than staying
-        // held while `fast_path` is computed.
+        // held while `fast_path` is computed. `get_mut` (rather than `get`)
+        // so this same lookup can also `touch` the entry for LRU eviction
+        // ordering (#495) -- every `ensure_open` call for an already-tracked
+        // document reaches here, whether or not it ends up taking the fast
+        // path below.
         let Some((uri, current_version, fast_path)) =
-            lock_std(&self.documents).get(path).map(|st| {
+            lock_std(&self.documents).get_mut(path).map(|st| {
+                st.touch();
                 let stat_matches = st
                     .disk()
                     .is_some_and(|d| d.mtime == mtime && d.size == size);
@@ -1429,8 +1601,29 @@ mod tests {
         assert_eq!(state.synced_version(&server), Some(1));
     }
 
+    /// Marks `path`'s tracked document as disk-verified, for a test that
+    /// opens a document directly via `open` (bypassing `ensure_open`'s
+    /// `disk_phase`, which is what normally sets this) but still needs it
+    /// eligible for `evict_lru`'s LRU eviction -- disk-verified is a
+    /// precondition for eviction, not just unlocked (#495 S4).
+    fn mark_disk_verified(tracker: &DocumentTracker, path: &Path) {
+        tracker.set_disk(
+            path,
+            DiskSync {
+                mtime: None,
+                size: 0,
+                mtime_settled: false,
+                content_checked_at: Instant::now(),
+            },
+        );
+    }
+
+    /// #495: at capacity with every existing document unlocked and
+    /// disk-verified, `open` must evict the least-recently-used one to make
+    /// room rather than fail -- the evicted document is queued for
+    /// `take_evicted`.
     #[test]
-    fn test_document_limit() {
+    fn test_document_limit_evicts_lru_instead_of_failing() {
         let limits = ResourceLimits {
             max_documents: 2,
             max_file_size: 100,
@@ -1440,17 +1633,165 @@ mod tests {
 
         let tracker = DocumentTracker::new(limits, map);
 
-        // First two documents should succeed
         tracker
             .open(PathBuf::from("/test/file1.rs"), "fn test1() {}".to_string())
             .unwrap();
+        mark_disk_verified(&tracker, Path::new("/test/file1.rs"));
         tracker
             .open(PathBuf::from("/test/file2.rs"), "fn test2() {}".to_string())
             .unwrap();
+        mark_disk_verified(&tracker, Path::new("/test/file2.rs"));
 
-        // Third should fail
-        let result = tracker.open(PathBuf::from("/test/file3.rs"), "fn test3() {}".to_string());
+        tracker
+            .open(PathBuf::from("/test/file3.rs"), "fn test3() {}".to_string())
+            .unwrap();
+
+        assert_eq!(tracker.len(), 2);
+        assert!(!tracker.is_open(Path::new("/test/file1.rs")));
+        assert!(tracker.is_open(Path::new("/test/file2.rs")));
+        assert!(tracker.is_open(Path::new("/test/file3.rs")));
+
+        let evicted = tracker.take_evicted();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].path, PathBuf::from("/test/file1.rs"));
+        assert!(
+            evicted[0].synced_servers.is_empty(),
+            "opened directly via `open`, never synced to any server"
+        );
+    }
+
+    /// #495: `open` must fall back to `DocumentLimitExceeded` when every
+    /// tracked document currently has an operation in flight against it
+    /// (simulated here by inserting its `path_locks` entry directly, which
+    /// is exactly what `evict_lru` checks for) -- evicting a locked document
+    /// would pull it out from under that in-flight operation.
+    #[test]
+    fn test_document_limit_falls_back_to_error_when_only_candidate_is_locked() {
+        let limits = ResourceLimits {
+            max_documents: 1,
+            max_file_size: 100,
+        };
+        let tracker = DocumentTracker::new(limits, HashMap::new());
+
+        let locked_path = PathBuf::from("/test/locked.rs");
+        tracker
+            .open(locked_path.clone(), "fn locked() {}".to_string())
+            .unwrap();
+        lock_std(&tracker.path_locks).insert(locked_path.clone(), Arc::new(AsyncMutex::new(())));
+
+        let result = tracker.open(PathBuf::from("/test/other.rs"), "fn other() {}".to_string());
         assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+        assert!(
+            tracker.is_open(&locked_path),
+            "the locked document must not be evicted"
+        );
+        assert!(tracker.take_evicted().is_empty());
+    }
+
+    /// #495 S4: a document whose content has diverged from disk (via
+    /// `update`, which clears `disk` -- see `DocumentState::apply_local_edit`)
+    /// must never be evicted even though it is unlocked -- evicting it would
+    /// silently discard in-memory content mcpls has no other record of. No
+    /// in-tree caller invokes `update` today; this guards a structural,
+    /// not-yet-reachable data-loss shape rather than a currently-observed bug.
+    #[tokio::test]
+    async fn test_evict_lru_skips_document_with_diverged_unsaved_content() {
+        let dir = TempDir::new().unwrap();
+        let path_a = dir.path().join("a.rs");
+        std::fs::write(&path_a, "AAAA").unwrap();
+        set_mtime(&path_a, settled_past());
+
+        let limits = ResourceLimits {
+            max_documents: 1,
+            max_file_size: 0,
+        };
+        let (client, _server) = fake_lsp_client();
+        let tracker = DocumentTracker::new(limits, HashMap::new());
+        let server_id = ServerId::from("rust");
+
+        tracker
+            .ensure_open(&path_a, &server_id, &client)
+            .await
+            .unwrap();
+        // Diverge from disk: an in-memory edit not yet reflected on disk.
+        tracker
+            .update(&path_a, "AAAA-edited".to_string())
+            .await
+            .unwrap();
+
+        let path_b = dir.path().join("b.rs");
+        std::fs::write(&path_b, "BBBB").unwrap();
+
+        let result = tracker.open(path_b, "BBBB".to_string());
+        assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+        assert!(
+            tracker.is_open(&path_a),
+            "the diverged, not-disk-verified document must not be evicted"
+        );
+        assert_eq!(tracker.get(&path_a).unwrap().content(), "AAAA-edited");
+        assert!(tracker.take_evicted().is_empty());
+    }
+
+    /// #495: `ensure_open` must bump a document's LRU recency (via
+    /// `disk_phase`'s `touch`), so a document that was merely opened first
+    /// but has since been re-accessed is not the one evicted -- eviction
+    /// order must reflect actual usage, not just insertion order.
+    #[tokio::test]
+    async fn test_ensure_open_touch_changes_lru_eviction_order() {
+        let dir = TempDir::new().unwrap();
+        let path_a = dir.path().join("a.rs");
+        let path_b = dir.path().join("b.rs");
+        std::fs::write(&path_a, "AAAA").unwrap();
+        std::fs::write(&path_b, "BBBB").unwrap();
+        set_mtime(&path_a, settled_past());
+        set_mtime(&path_b, settled_past());
+
+        let limits = ResourceLimits {
+            max_documents: 2,
+            max_file_size: 0,
+        };
+        let (client, _server) = fake_lsp_client();
+        let tracker = DocumentTracker::new(limits, HashMap::new());
+        let server_id = ServerId::from("rust");
+
+        tracker
+            .ensure_open(&path_a, &server_id, &client)
+            .await
+            .unwrap();
+        tracker
+            .ensure_open(&path_b, &server_id, &client)
+            .await
+            .unwrap();
+
+        // Re-access `a` so it becomes the more-recently-used of the two,
+        // leaving `b` as the LRU entry despite having been opened second.
+        tracker
+            .ensure_open(&path_a, &server_id, &client)
+            .await
+            .unwrap();
+
+        let path_c = dir.path().join("c.rs");
+        std::fs::write(&path_c, "CCCC").unwrap();
+        set_mtime(&path_c, settled_past());
+        tracker
+            .ensure_open(&path_c, &server_id, &client)
+            .await
+            .unwrap();
+
+        assert!(
+            tracker.is_open(&path_a),
+            "recently re-accessed, must survive"
+        );
+        assert!(
+            !tracker.is_open(&path_b),
+            "least-recently-used, must be evicted"
+        );
+        assert!(tracker.is_open(&path_c));
+
+        let evicted = tracker.take_evicted();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].path, path_b);
+        assert_eq!(evicted[0].synced_servers, vec![server_id]);
     }
 
     #[test]
@@ -1530,6 +1871,7 @@ mod tests {
             content: "fn main() {}".to_string(),
             disk: None,
             synced: HashMap::new(),
+            last_accessed: Instant::now(),
         };
 
         #[allow(clippy::redundant_clone)]
@@ -1930,6 +2272,9 @@ mod tests {
         assert_eq!(tracker.get(&path).unwrap().content(), content);
     }
 
+    /// #495: at exactly `max_documents`, `open` must evict the LRU entry
+    /// (here `file0`, the first opened) rather than fail, since none of the
+    /// existing documents are locked and all are disk-verified.
     #[test]
     fn test_document_limit_exact_boundary() {
         let limits = ResourceLimits {
@@ -1942,18 +2287,20 @@ mod tests {
         let tracker = DocumentTracker::new(limits, map);
 
         for i in 0..5 {
-            tracker
-                .open(
-                    PathBuf::from(format!("/test/file{i}.rs")),
-                    "content".to_string(),
-                )
-                .unwrap();
+            let path = PathBuf::from(format!("/test/file{i}.rs"));
+            tracker.open(path.clone(), "content".to_string()).unwrap();
+            mark_disk_verified(&tracker, &path);
         }
 
         assert_eq!(tracker.len(), 5);
 
-        let result = tracker.open(PathBuf::from("/test/file6.rs"), "content".to_string());
-        assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+        tracker
+            .open(PathBuf::from("/test/file6.rs"), "content".to_string())
+            .unwrap();
+
+        assert_eq!(tracker.len(), 5);
+        assert!(!tracker.is_open(Path::new("/test/file0.rs")));
+        assert!(tracker.is_open(Path::new("/test/file6.rs")));
     }
 
     #[test]

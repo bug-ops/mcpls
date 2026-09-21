@@ -313,12 +313,20 @@ pub struct WorkspaceConfig {
 
     /// Maximum number of documents `DocumentTracker` will keep open
     /// simultaneously. A `textDocument/didOpen`-triggering tool call (hover,
-    /// definition, diagnostics, etc.) for a document beyond this count fails
-    /// with `DocumentLimitExceeded`. Documents stay tracked for the whole
-    /// mcpls process lifetime (there is no eviction), so once the ceiling is
-    /// reached, opening any further new path fails until either the process
-    /// is restarted or this limit is raised; already-tracked paths are
-    /// unaffected. `0` disables the limit.
+    /// definition, diagnostics, etc.) for a new document once this count is
+    /// reached evicts the least-recently-used tracked document that is both
+    /// unlocked (no `ensure_open`/`update` call currently in flight against
+    /// it) and disk-verified (sending `textDocument/didClose` to every
+    /// server that had it open), making room rather than failing;
+    /// already-tracked paths are unaffected. Falls back to
+    /// `DocumentLimitExceeded` when no tracked document is both, which at
+    /// the default of 100 only happens under pathological concurrency, but
+    /// at a very small configured value (e.g. 1-2) is easy to hit under
+    /// ordinary concurrent use. A too-small limit does not just risk that
+    /// error, either: it can cause silent thrashing, evicting and
+    /// re-reading a document (a full disk read plus a fresh `didOpen`) on
+    /// every access as the same handful of files repeatedly fall out of and
+    /// back into the tracker. `0` disables the limit.
     /// Default: 100
     #[serde(default = "default_max_documents")]
     pub max_documents: usize,
