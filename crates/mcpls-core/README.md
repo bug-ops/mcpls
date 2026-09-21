@@ -27,7 +27,7 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 
 ```toml
 [dependencies]
-mcpls-core = "0.4"
+mcpls-core = "0.6"
 ```
 
 ## Architecture
