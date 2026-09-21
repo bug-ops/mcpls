@@ -149,24 +149,23 @@ pub struct McplsServer {
     tool_router: Arc<ToolRouter<Self>>,
 }
 
-/// Picked clear of rmcp's `-32002`/`-32020..-32022`; the range is convention, not a registry.
-const WORKSPACE_INDEXING_ERROR_CODE: ErrorCode = ErrorCode(-32050);
-
-/// `WorkspaceIndexing` gets its own code + `data`; everything else uses `INTERNAL_ERROR`.
+/// Maps an [`crate::error::Error`] onto the wire-level MCP error, via
+/// [`crate::error::Error::mcp_error_kind`]'s classification: caller-fault
+/// variants become `INVALID_PARAMS`, retryable variants (e.g.
+/// `WorkspaceIndexing`, `ServerInitializing`) get their own bespoke code plus
+/// a structured `data` payload, and everything else falls back to
+/// `INTERNAL_ERROR`.
+// By-value `e` matches `Result::map_err`'s `FnOnce(E) -> F`, letting this be
+// passed directly as `.map_err(map_bridge_error)` at every call site.
+#[allow(clippy::needless_pass_by_value)]
 fn map_bridge_error(e: crate::error::Error) -> McpError {
     let message = e.to_string();
-    match e {
-        crate::error::Error::WorkspaceIndexing {
-            server_id,
-            elapsed_secs,
-        } => {
-            let data = serde_json::json!({
-                "serverId": server_id.as_str(),
-                "elapsedSecs": elapsed_secs,
-            });
-            McpError::new(WORKSPACE_INDEXING_ERROR_CODE, message, Some(data))
+    match e.mcp_error_kind() {
+        crate::error::McpErrorKind::InvalidParams => McpError::invalid_params(message, None),
+        crate::error::McpErrorKind::Internal => McpError::internal_error(message, None),
+        crate::error::McpErrorKind::Retryable { code, data } => {
+            McpError::new(ErrorCode(code), message, Some(data))
         }
-        _ => McpError::internal_error(message, None),
     }
 }
 
@@ -1098,13 +1097,12 @@ impl ServerHandler for McplsServer {
         // Validated against a lock-free snapshot of workspace_roots (fixed at
         // startup) so this cache-only read never needs to touch `translator` at all.
         let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(map_bridge_error)?;
 
         // Build the URI from the canonicalized path (not the raw input path):
         // it must match what `diagnostics_pump` stores from LSP notifications,
         // which are always keyed by the canonical form.
-        let lsp_uri = crate::bridge::path_to_uri(&validated_path)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let lsp_uri = crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
 
         // Resolved independently of the cache lookup below -- see the same
         // reasoning on `get_cached_diagnostics` (#359): a respawn clears
@@ -1157,7 +1155,7 @@ impl ServerHandler for McplsServer {
         // Validated against a lock-free snapshot of workspace_roots so subscribing
         // never needs to touch `translator` at all (see `read_resource`).
         let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            .map_err(map_bridge_error)?;
 
         // Track and reply under the canonical resource URI, not the client's raw
         // `request.uri`: `diagnostics_pump` derives `mcp_uri` from the canonical LSP
@@ -1185,8 +1183,7 @@ impl ServerHandler for McplsServer {
 
         // Build the URI from the canonicalized path, matching `read_resource` and
         // what `diagnostics_pump` stores from LSP notifications.
-        let lsp_uri = crate::bridge::path_to_uri(&validated_path)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let lsp_uri = crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
         let has_cached_diagnostics = {
             let cache = self.context.notification_cache.lock().await;
             cache.diagnostics(lsp_uri.as_ref()).is_some()
@@ -1345,14 +1342,40 @@ mod tests {
         };
         let mcp_err = map_bridge_error(err);
 
-        assert_eq!(mcp_err.code, WORKSPACE_INDEXING_ERROR_CODE);
+        assert_eq!(
+            mcp_err.code,
+            ErrorCode(crate::error::WORKSPACE_INDEXING_ERROR_CODE)
+        );
         let data = mcp_err.data.unwrap();
         assert_eq!(data["serverId"], "rust");
         assert_eq!(data["elapsedSecs"], 30);
     }
 
-    /// Counterpart to the above: every other `Error` variant must still map
-    /// onto the generic `INTERNAL_ERROR` code, unchanged.
+    /// #479: `Error::ServerInitializing` must be distinguishable on the wire
+    /// from a crash (`INTERNAL_ERROR`) and from `WorkspaceIndexing`, since
+    /// both are retryable but for different reasons.
+    #[test]
+    fn test_map_bridge_error_server_initializing_uses_dedicated_error_code() {
+        let err = crate::error::Error::ServerInitializing {
+            server_id: crate::config::ServerId::from("python"),
+        };
+        let mcp_err = map_bridge_error(err);
+
+        assert_eq!(
+            mcp_err.code,
+            ErrorCode(crate::error::SERVER_INITIALIZING_ERROR_CODE)
+        );
+        assert_ne!(
+            mcp_err.code,
+            ErrorCode(crate::error::WORKSPACE_INDEXING_ERROR_CODE)
+        );
+        let data = mcp_err.data.unwrap();
+        assert_eq!(data["serverId"], "python");
+    }
+
+    /// Counterpart to the above: a variant with no explicit classification
+    /// (neither caller-fault nor retryable) must still map onto the generic
+    /// `INTERNAL_ERROR` code, unchanged.
     #[test]
     fn test_map_bridge_error_other_variant_uses_internal_error_code() {
         let err = crate::error::Error::NoServerForLanguage("python".to_string());
@@ -1360,6 +1383,47 @@ mod tests {
 
         assert_eq!(mcp_err.code, ErrorCode::INTERNAL_ERROR);
         assert!(mcp_err.data.is_none());
+    }
+
+    /// #479: caller-fault variants that used to fall through to
+    /// `INTERNAL_ERROR` (`-32603`) must now map onto `INVALID_PARAMS`
+    /// (`-32602`), matching how the resource handlers already classify a
+    /// `PathOutsideWorkspace` rejection.
+    #[test]
+    fn test_map_bridge_error_caller_fault_variants_use_invalid_params() {
+        let caller_fault_errors = vec![
+            crate::error::Error::InvalidToolParams("bad params".to_string()),
+            crate::error::Error::PathOutsideWorkspace(PathBuf::from("/etc/passwd")),
+            crate::error::Error::NotARegularFile(PathBuf::from("/dev/null")),
+            crate::error::Error::InvalidUri("not a uri".to_string()),
+            crate::error::Error::DocumentNotFound(PathBuf::from("/missing.rs")),
+            crate::error::Error::FileSizeLimitExceeded { size: 100, max: 10 },
+        ];
+
+        for err in caller_fault_errors {
+            let debug = format!("{err:?}");
+            let mcp_err = map_bridge_error(err);
+            assert_eq!(
+                mcp_err.code,
+                ErrorCode::INVALID_PARAMS,
+                "expected {debug} to map onto INVALID_PARAMS"
+            );
+        }
+    }
+
+    /// #479 follow-up: `WorkspaceServersInitializing` (the no-single-server
+    /// counterpart of `ServerInitializing`, see its doc comment) must be
+    /// retryable too, sharing `SERVER_INITIALIZING_ERROR_CODE` since it's the
+    /// same underlying condition.
+    #[test]
+    fn test_map_bridge_error_workspace_servers_initializing_is_retryable() {
+        let err = crate::error::Error::WorkspaceServersInitializing;
+        let mcp_err = map_bridge_error(err);
+
+        assert_eq!(
+            mcp_err.code,
+            ErrorCode(crate::error::SERVER_INITIALIZING_ERROR_CODE)
+        );
     }
 
     #[tokio::test]
@@ -3225,6 +3289,27 @@ sleep 0.3
         translator.set_workspace_roots(vec![PathBuf::from("/")]);
         let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
         assert!(matches!(result, Err(Error::FileIo { .. })));
+    }
+
+    /// #479 regression: `read_resource`/`subscribe` must still return
+    /// `INVALID_PARAMS` (`-32602`), not `INTERNAL_ERROR` (`-32603`), for a
+    /// client-supplied path that doesn't exist. Exercised at the same
+    /// logic level as the rest of this test group (constructing a live
+    /// `rmcp::service::RequestContext` isn't possible in a unit test, see
+    /// the note above "Resource handler tests"): `validate_path_against_roots`
+    /// is the exact call both handlers make, and `map_bridge_error` is the
+    /// exact function both now pipe its `Err` through.
+    #[test]
+    fn test_read_resource_nonexistent_path_maps_to_invalid_params() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let roots = [temp_dir.path().to_path_buf()];
+        let missing = temp_dir.path().join("does-not-exist.rs");
+
+        let result = validate_path_against_roots(&missing, &roots);
+        assert!(matches!(result, Err(crate::error::Error::FileIo { .. })));
+
+        let mcp_err = map_bridge_error(result.unwrap_err());
+        assert_eq!(mcp_err.code, ErrorCode::INVALID_PARAMS);
     }
 
     /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
