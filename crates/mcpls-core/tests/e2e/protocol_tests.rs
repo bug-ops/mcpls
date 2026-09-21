@@ -644,17 +644,19 @@ fn call_hover_past_server_init(
     }
 }
 
-/// #325: end-to-end proof that `workspace.max_documents`, set in a real
+/// #325/#495: end-to-end proof that `workspace.max_documents`, set in a real
 /// `mcpls.toml`, is enforced by `DocumentTracker` through the actual
 /// `serve()`/`serve_with()` startup path (`main` -> `serve` -> `serve_with`
 /// -> `Translator::with_resource_limits`), not an in-process reconstruction
 /// of that wiring.
 ///
-/// `DocumentTracker::open` rejects (returns `Err(DocumentLimitExceeded)`)
-/// rather than evicting the oldest document once the limit is reached (see
-/// `crates/mcpls-core/src/bridge/state.rs`), so this asserts rejection, not
-/// eviction: the in-limit calls must not fail with that specific error, and
-/// the over-limit call must.
+/// `DocumentTracker::open` evicts the least-recently-used unlocked document
+/// (sending `textDocument/didClose` to the LSP server) instead of rejecting
+/// once the limit is reached (see `crates/mcpls-core/src/bridge/state.rs`),
+/// so this asserts the cap is a real bound, not a ceiling: every open beyond
+/// the configured limit must still succeed, crossing the boundary more than
+/// once, and a document opened before the limit was first crossed (now
+/// long evicted) must remain re-openable afterward.
 #[test]
 #[ignore = "Requires mcpls binary built and rust-analyzer installed"]
 fn test_e2e_max_documents_config_enforced() -> Result<()> {
@@ -668,45 +670,48 @@ fn test_e2e_max_documents_config_enforced() -> Result<()> {
     let (_config_dir, mut client) =
         spawn_mcpls_with_workspace_config(&format!("max_documents = {max_documents}"))?;
 
-    // More real, distinct files than the configured limit, so opening them
-    // one by one crosses the boundary set in TOML.
+    // At least two more real, distinct files than the configured limit, so
+    // opening them one by one crosses the boundary set in TOML more than
+    // once, proving eviction repeats rather than firing only for the very
+    // first document past the limit.
     let files = [
         workspace_path.join("src/lib.rs"),
         workspace_path.join("src/types.rs"),
         workspace_path.join("src/functions.rs"),
         workspace_path.join("extras/untouched.rs"),
+        workspace_path.join("extras/bad_format.rs"),
     ];
     assert!(
-        files.len() > max_documents,
-        "fixture must provide more files than the configured limit to exercise the (N+1)th open"
+        files.len() > max_documents + 1,
+        "fixture must provide at least two more files than the configured limit to \
+         exercise eviction repeatedly, not just once"
     );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    for (i, path) in files[..max_documents].iter().enumerate() {
+    for (i, path) in files.iter().enumerate() {
         let result = call_hover_past_server_init(&mut client, path, deadline);
-        if let Err(e) = &result {
-            assert!(
-                !e.to_string().contains("document limit exceeded"),
-                "opening document {} of {max_documents} (within the configured limit) must \
-                 not hit the limit: {e}",
-                i + 1
-            );
-        }
+        assert!(
+            result.is_ok(),
+            "opening document {} of {} must succeed: the cap is a real bound that evicts \
+             the least-recently-used document, not a ceiling that wedges the session once \
+             reached; got: {:?}",
+            i + 1,
+            files.len(),
+            result.err()
+        );
     }
 
-    let over_limit_path = &files[max_documents];
-    let result = call_hover_past_server_init(&mut client, over_limit_path, deadline);
-    match result {
-        Err(e) => assert!(
-            e.to_string().contains("document limit exceeded"),
-            "expected a DocumentLimitExceeded error (per DocumentTracker::open's actual \
-             reject-not-evict behavior), got: {e}"
-        ),
-        Ok(_) => panic!(
-            "opening the (N+1)th distinct document must be rejected once \
-             workspace.max_documents is reached"
-        ),
-    }
+    // The first document opened is now the least recently used and has long
+    // since been evicted from the tracker. Re-opening it must still succeed,
+    // proving eviction actually released the tracker slot (and closed the
+    // document on the LSP server) instead of leaving it in a broken,
+    // half-tracked state.
+    let result = call_hover_past_server_init(&mut client, &files[0], deadline);
+    assert!(
+        result.is_ok(),
+        "re-opening the first (evicted) document must succeed: {:?}",
+        result.err()
+    );
 
     Ok(())
 }
