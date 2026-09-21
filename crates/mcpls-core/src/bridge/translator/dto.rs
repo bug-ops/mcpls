@@ -163,6 +163,48 @@ pub struct DocumentChanges {
 pub struct RenameResult {
     /// Changes to apply across documents.
     pub changes: Vec<DocumentChanges>,
+    /// Entries withheld from `changes` -- see [`DroppedEdits`]. A non-empty
+    /// value means the rename is incomplete even if `changes` is non-empty,
+    /// and callers must not treat this result as the full rename otherwise.
+    #[serde(default, skip_serializing_if = "DroppedEdits::is_empty")]
+    pub dropped: DroppedEdits,
+}
+
+/// Counts of `WorkspaceEdit` entries withheld during conversion to MCP DTOs,
+/// broken down by reason (#475).
+///
+/// `convert_workspace_edit` silently discarded such entries with only a
+/// `tracing` log line, so a client applying a [`RenameResult`] or
+/// `WorkspaceEditDescription` straight to disk could not tell "nothing to
+/// rename" apart from "some of the rename was withheld" -- this makes that
+/// distinction visible in the result itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedEdits {
+    /// Entries referencing a URI outside every configured workspace root.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub out_of_workspace: usize,
+    /// `CreateFile`/`RenameFile`/`DeleteFile` document changes, which mcpls
+    /// does not translate into MCP DTOs.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unsupported_file_operation: usize,
+    /// `SnippetTextEdit` entries, which mcpls does not translate since it
+    /// advertises no `snippetEditSupport`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unsupported_snippet_edit: usize,
+}
+
+impl DroppedEdits {
+    /// Whether no entries were withheld.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+// Signature required by `#[serde(skip_serializing_if = "is_zero")]` on a `usize` field.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// A completion item.
@@ -263,6 +305,9 @@ pub struct CodeAction {
 pub struct WorkspaceEditDescription {
     /// Changes to apply to documents.
     pub changes: Vec<DocumentChanges>,
+    /// Entries withheld from `changes` -- see [`DroppedEdits`].
+    #[serde(default, skip_serializing_if = "DroppedEdits::is_empty")]
+    pub dropped: DroppedEdits,
 }
 
 /// Description of a command.

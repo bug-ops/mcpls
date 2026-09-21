@@ -359,28 +359,58 @@ Workspace edit with all changes:
 
 ```json
 {
-  "changes": {
-    "file:///path/to/file1.rs": [
-      {
-        "range": {
-          "start": { "line": 10, "character": 4 },
-          "end": { "line": 10, "character": 16 }
-        },
-        "newText": "new_identifier_name"
-      }
-    ],
-    "file:///path/to/file2.rs": [
-      {
-        "range": {
-          "start": { "line": 5, "character": 8 },
-          "end": { "line": 5, "character": 20 }
-        },
-        "newText": "new_identifier_name"
-      }
-    ]
-  }
+  "changes": [
+    {
+      "uri": "file:///path/to/file1.rs",
+      "edits": [
+        {
+          "range": {
+            "start": { "line": 10, "character": 4 },
+            "end": { "line": 10, "character": 16 }
+          },
+          "new_text": "new_identifier_name"
+        }
+      ]
+    },
+    {
+      "uri": "file:///path/to/file2.rs",
+      "edits": [
+        {
+          "range": {
+            "start": { "line": 5, "character": 8 },
+            "end": { "line": 5, "character": 20 }
+          },
+          "new_text": "new_identifier_name"
+        }
+      ]
+    }
+  ]
 }
 ```
+
+If any edits from the language server had to be withheld (e.g. they referenced a file outside every configured workspace root, or used an edit shape mcpls does not translate), the result also carries a `dropped` field with a per-reason count:
+
+```json
+{
+  "changes": [
+    {
+      "uri": "file:///path/to/file1.rs",
+      "edits": [
+        {
+          "range": {
+            "start": { "line": 10, "character": 4 },
+            "end": { "line": 10, "character": 16 }
+          },
+          "new_text": "new_identifier_name"
+        }
+      ]
+    }
+  ],
+  "dropped": { "out_of_workspace": 1 }
+}
+```
+
+`dropped` is omitted entirely when nothing was withheld. A non-empty `dropped` means the rename is **incomplete** even when `changes` is non-empty -- do not apply `changes` as the full rename without checking for it first.
 
 ### Example Use Cases
 
@@ -707,7 +737,7 @@ Get available code actions (quick fixes, refactorings) for a range.
 
 ### Returns
 
-Array of available code actions with edits.
+Array of available code actions with edits. An action's `edit.dropped` field, when present and non-empty, means some of that action's changes were withheld (e.g. out-of-workspace files) -- see `rename_symbol`'s Returns section for the shape of `dropped`.
 
 ### Example Use Cases
 

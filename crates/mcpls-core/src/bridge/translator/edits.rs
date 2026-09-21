@@ -12,8 +12,8 @@ use tokio::task::JoinSet;
 use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
-    CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, FormatDocumentResult,
-    Position, RenameResult, TextEdit, WorkspaceEditDescription,
+    CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, DroppedEdits,
+    FormatDocumentResult, Position, RenameResult, TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
@@ -113,30 +113,40 @@ fn validate_rename_params(new_name: &str) -> Result<()> {
 ///
 /// Prefers the legacy `changes` map (`HashMap<Uri, Vec<TextEdit>>`) and falls
 /// back to `documentChanges` (the array form some servers, e.g.
-/// rust-analyzer, use instead) only when `changes` is absent or empty. This
-/// order is safe because mcpls's advertised client capabilities
-/// (`lsp/lifecycle.rs`) do not set `workspace.workspaceEdit.documentChanges`,
-/// so per LSP 3.17 a spec-compliant server must always populate `changes`;
-/// the `documentChanges`-only fallback exists solely for common
-/// non-compliant servers (e.g. rust-analyzer), and the branch where both are
-/// present and non-empty is effectively dead in practice -- do not "fix"
-/// this to prefer `documentChanges` first without first advertising that
-/// capability. An entry outside `workspace_roots` is dropped rather than
-/// rewritten into the response -- see [`crate::bridge::uri_in_workspace_roots`].
-/// `edit_kind` names the caller for the dropped-entry log line (e.g.
-/// `"rename edit"`, `"code-action edit"`).
+/// rust-analyzer, use instead) only when `changes` is `None` or an empty
+/// map. The choice of source is made once, up front, from the *raw* map's
+/// presence and emptiness -- decided before any per-entry filtering -- never
+/// from whether filtering happened to leave zero surviving entries. This
+/// matters because `changes` and `documentChanges` each get their own
+/// [`DroppedEdits`] tally: branching on the post-filter result instead would
+/// reintroduce #475 M1, where a `changes` map that exists but whose entries
+/// are all filtered out falls through to `documentChanges` and either
+/// double-counts or loses the `changes`-side drops. The fallback order is
+/// safe because mcpls's advertised client capabilities (`lsp/lifecycle.rs`)
+/// do not set `workspace.workspaceEdit.documentChanges`, so per LSP 3.17 a
+/// spec-compliant server must always populate `changes`; the
+/// `documentChanges`-only fallback exists solely for common non-compliant
+/// servers (e.g. rust-analyzer), and the branch where both are present is
+/// effectively dead in practice -- do not "fix" this to prefer
+/// `documentChanges` first without first advertising that capability. An
+/// entry outside `workspace_roots` is dropped rather than rewritten into the
+/// response -- see [`crate::bridge::uri_in_workspace_roots`]. `edit_kind`
+/// names the caller for the dropped-entry log line (e.g. `"rename edit"`,
+/// `"code-action edit"`).
 async fn convert_workspace_edit(
     edit: lsp_types::WorkspaceEdit,
     ctx: &EncodingCtx,
     workspace_roots: &[PathBuf],
     edit_kind: &str,
-) -> Vec<DocumentChanges> {
+) -> (Vec<DocumentChanges>, DroppedEdits) {
     let mut result_changes = Vec::new();
+    let mut dropped = DroppedEdits::default();
 
-    if let Some(changes_map) = edit.changes {
+    if let Some(changes_map) = edit.changes.filter(|m| !m.is_empty()) {
         for (uri, edits) in changes_map {
             if !uri_in_workspace_roots(&uri, workspace_roots) {
                 tracing::warn!(uri = uri.as_ref(), "dropping out-of-workspace {edit_kind}");
+                dropped.out_of_workspace += 1;
                 continue;
             }
             let mut text_edits = Vec::with_capacity(edits.len());
@@ -151,12 +161,8 @@ async fn convert_workspace_edit(
                 edits: text_edits,
             });
         }
-    }
-
-    if result_changes.is_empty() {
-        let text_doc_edits: Vec<lsp_types::TextDocumentEdit> = edit
-            .document_changes
-            .unwrap_or_default()
+    } else if let Some(document_changes) = edit.document_changes {
+        let text_doc_edits: Vec<lsp_types::TextDocumentEdit> = document_changes
             .into_iter()
             .filter_map(|change| match change {
                 lsp_types::DocumentChange::TextDocumentEdit(e) => Some(e),
@@ -164,6 +170,7 @@ async fn convert_workspace_edit(
                 | lsp_types::DocumentChange::RenameFile(_)
                 | lsp_types::DocumentChange::DeleteFile(_) => {
                     tracing::debug!("dropping unsupported file-operation document change");
+                    dropped.unsupported_file_operation += 1;
                     None
                 }
             })
@@ -175,6 +182,7 @@ async fn convert_workspace_edit(
                     uri = edit_uri.as_ref(),
                     "dropping out-of-workspace {edit_kind}"
                 );
+                dropped.out_of_workspace += 1;
                 continue;
             }
             let mut text_edits = Vec::with_capacity(tde.edits.len());
@@ -199,6 +207,7 @@ async fn convert_workspace_edit(
                     // dropped above rather than mistranslated.
                     lsp_types::Edit::SnippetTextEdit(_) => {
                         tracing::debug!("dropping unsupported snippet text edit");
+                        dropped.unsupported_snippet_edit += 1;
                         continue;
                     }
                 };
@@ -211,7 +220,7 @@ async fn convert_workspace_edit(
         }
     }
 
-    result_changes
+    (result_changes, dropped)
 }
 
 /// Upper bound on the number of `codeAction/resolve` round-trips attempted
@@ -376,9 +385,9 @@ async fn convert_code_action(
 
     let edit = match action.edit {
         Some(edit) => {
-            let changes =
+            let (changes, dropped) =
                 convert_workspace_edit(edit, ctx, workspace_roots, "code-action edit").await;
-            Some(WorkspaceEditDescription { changes })
+            Some(WorkspaceEditDescription { changes, dropped })
         }
         None => None,
     };
@@ -447,13 +456,13 @@ impl Translator {
             .request_typed::<lsp_types::RenameRequest>(params, client.request_timeout())
             .await?;
 
-        let changes = if let Some(edit) = response {
+        let (changes, dropped) = if let Some(edit) = response {
             convert_workspace_edit(edit, &ctx, &self.workspace_roots, "rename edit").await
         } else {
-            vec![]
+            (vec![], DroppedEdits::default())
         };
 
-        Ok(RenameResult { changes })
+        Ok(RenameResult { changes, dropped })
     }
 
     /// Handle format document request.
@@ -717,6 +726,12 @@ mod tests {
                 .any(|e| e.new_text.contains("${1:comment}")),
             "snippet placeholder syntax must never appear as literal replacement text"
         );
+        assert_eq!(
+            result.dropped.unsupported_snippet_edit, 1,
+            "the dropped snippet edit must be tallied so callers can tell the rename is incomplete"
+        );
+        assert_eq!(result.dropped.out_of_workspace, 0);
+        assert_eq!(result.dropped.unsupported_file_operation, 0);
     }
 
     /// #415: a `documentChanges` entry whose URI falls outside every
@@ -818,6 +833,12 @@ mod tests {
             "the out-of-workspace entry must be dropped, not forwarded"
         );
         assert_eq!(result.changes[0].uri, inside_uri);
+        assert_eq!(
+            result.dropped.out_of_workspace, 1,
+            "the dropped out-of-workspace entry must be tallied so callers can tell the rename is incomplete"
+        );
+        assert_eq!(result.dropped.unsupported_file_operation, 0);
+        assert_eq!(result.dropped.unsupported_snippet_edit, 0);
     }
 
     /// #309: `new_name` has no inherent bound of its own and is forwarded to
@@ -1407,6 +1428,10 @@ mod tests {
         );
         assert_eq!(edit.changes[0].uri, changes_uri_string);
         assert_eq!(edit.changes[0].edits[0].new_text, "from_changes");
+        assert!(
+            edit.dropped.is_empty(),
+            "documentChanges being ignored in favor of changes is not a drop"
+        );
     }
 
     /// #429 companion / #415 parity: a `documentChanges` entry whose URI
@@ -1475,6 +1500,416 @@ mod tests {
         );
         assert_eq!(edit.changes[0].uri, inside_uri_string);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
+        assert_eq!(
+            edit.dropped.out_of_workspace, 1,
+            "the dropped out-of-workspace entry must be tallied so callers can tell the code action is incomplete"
+        );
+    }
+
+    /// #475: `CreateFile`/`RenameFile`/`DeleteFile` document changes -- e.g.
+    /// rust-analyzer emitting `RenameFile` for a module rename -- must each be
+    /// tallied under `dropped.unsupported_file_operation`, distinct from the
+    /// other two drop reasons, while a plain `TextDocumentEdit` in the same
+    /// response still survives.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_tallies_dropped_file_operations() {
+        use url::Url;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("kept.rs");
+        fs::write(&file_path, "fn kept() {}").unwrap();
+        let uri_string = Url::from_file_path(&file_path).unwrap().to_string();
+        let uri = lsp_types::Uri::from(uri_string.as_str());
+
+        let text_document_edit = lsp_types::TextDocumentEdit {
+            text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                version: Some(1),
+                text_document_identifier: TextDocumentIdentifier { uri: uri.clone() },
+            },
+            edits: vec![lsp_types::Edit::TextEdit(lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 2,
+                    },
+                },
+                new_text: "kept".to_string(),
+            })],
+        };
+
+        let edit = lsp_types::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(vec![
+                lsp_types::DocumentChange::TextDocumentEdit(text_document_edit),
+                lsp_types::DocumentChange::CreateFile(lsp_types::CreateFile {
+                    uri: lsp_types::Uri::from("file:///workspace/new.rs"),
+                    options: None,
+                    annotation_id: None,
+                }),
+                lsp_types::DocumentChange::RenameFile(lsp_types::RenameFile {
+                    old_uri: lsp_types::Uri::from("file:///workspace/old_module.rs"),
+                    new_uri: lsp_types::Uri::from("file:///workspace/new_module.rs"),
+                    options: None,
+                    annotation_id: None,
+                }),
+                lsp_types::DocumentChange::DeleteFile(lsp_types::DeleteFile {
+                    uri: lsp_types::Uri::from("file:///workspace/gone.rs"),
+                    options: None,
+                    annotation_id: None,
+                }),
+            ]),
+            change_annotations: None,
+        };
+
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let (changes, dropped) =
+            convert_workspace_edit(edit, &test_ctx(), &workspace_roots, "rename edit").await;
+
+        assert_eq!(
+            changes.len(),
+            1,
+            "the plain TextDocumentEdit must survive alongside the dropped file operations"
+        );
+        assert_eq!(changes[0].uri, uri_string);
+        assert_eq!(
+            dropped.unsupported_file_operation, 3,
+            "CreateFile, RenameFile, and DeleteFile must each be tallied"
+        );
+        assert_eq!(dropped.out_of_workspace, 0);
+        assert_eq!(dropped.unsupported_snippet_edit, 0);
+    }
+
+    /// #475: when every entry in a `WorkspaceEdit` is filtered out, the
+    /// resulting `changes` list is empty just like "nothing to rename" would
+    /// be -- `dropped` is what makes the two cases distinguishable.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn test_convert_workspace_edit_everything_dropped_is_distinguishable_from_no_edits() {
+        use std::collections::HashMap;
+
+        let outside_uri = lsp_types::Uri::from("file:///outside/workspace/evil.rs");
+        let mut changes_map = HashMap::new();
+        changes_map.insert(
+            outside_uri,
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                new_text: "evil".to_string(),
+            }],
+        );
+        let all_dropped_edit = lsp_types::WorkspaceEdit {
+            changes: Some(changes_map),
+            document_changes: None,
+            change_annotations: None,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let (changes, dropped) = convert_workspace_edit(
+            all_dropped_edit,
+            &test_ctx(),
+            &workspace_roots,
+            "rename edit",
+        )
+        .await;
+        assert!(changes.is_empty());
+        assert!(
+            !dropped.is_empty(),
+            "an edit where everything was withheld must not look like an edit with nothing to do"
+        );
+        assert_eq!(dropped.out_of_workspace, 1);
+
+        let no_op_edit = lsp_types::WorkspaceEdit {
+            changes: None,
+            document_changes: None,
+            change_annotations: None,
+        };
+        let (changes, dropped) =
+            convert_workspace_edit(no_op_edit, &test_ctx(), &workspace_roots, "rename edit").await;
+        assert!(changes.is_empty());
+        assert!(
+            dropped.is_empty(),
+            "a genuinely empty edit must not be reported as having withheld anything"
+        );
+    }
+
+    /// #475 M1: a `WorkspaceEdit` populating both `changes` and
+    /// `documentChanges` with the same withheld entry must not tally it
+    /// twice -- `changes` takes exclusive precedence, so `documentChanges`
+    /// is never even inspected once `changes` is present.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn test_convert_workspace_edit_changes_precedence_avoids_double_counting_drops() {
+        use std::collections::HashMap;
+
+        let outside_uri = lsp_types::Uri::from("file:///outside/workspace/evil.rs");
+        let mut changes_map = HashMap::new();
+        changes_map.insert(
+            outside_uri.clone(),
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                new_text: "evil".to_string(),
+            }],
+        );
+
+        let text_document_edit = lsp_types::TextDocumentEdit {
+            text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                version: Some(1),
+                text_document_identifier: TextDocumentIdentifier { uri: outside_uri },
+            },
+            edits: vec![lsp_types::Edit::TextEdit(lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                new_text: "evil".to_string(),
+            })],
+        };
+
+        let edit = lsp_types::WorkspaceEdit {
+            changes: Some(changes_map),
+            document_changes: Some(vec![lsp_types::DocumentChange::TextDocumentEdit(
+                text_document_edit,
+            )]),
+            change_annotations: None,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let (changes, dropped) =
+            convert_workspace_edit(edit, &test_ctx(), &workspace_roots, "rename edit").await;
+
+        assert!(changes.is_empty());
+        assert_eq!(
+            dropped.out_of_workspace, 1,
+            "documentChanges must be ignored entirely once changes is present, not merged in \
+             and double-tallied"
+        );
+    }
+
+    /// #475 M1 asymmetric case: `changes` populates entries that are *all*
+    /// dropped while `documentChanges` separately carries a distinct,
+    /// in-workspace edit that would fully succeed. A design that falls back
+    /// to `documentChanges` whenever `changes` yields no *surviving* entries
+    /// (rather than deciding up front from field presence) would process
+    /// `documentChanges` here, discarding the real `changes` drops in the
+    /// process -- reporting `dropped.is_empty()` even though entries were
+    /// genuinely withheld. `changes` being present must keep its own drop
+    /// count intact regardless of what `documentChanges` separately contains.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn test_convert_workspace_edit_changes_precedence_keeps_drops_when_document_changes_would_succeed()
+     {
+        use std::collections::HashMap;
+
+        use url::Url;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut changes_map = HashMap::new();
+        changes_map.insert(
+            lsp_types::Uri::from("file:///outside/workspace/one.rs"),
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                new_text: "evil".to_string(),
+            }],
+        );
+        changes_map.insert(
+            lsp_types::Uri::from("file:///outside/workspace/two.rs"),
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                new_text: "evil".to_string(),
+            }],
+        );
+
+        let in_workspace_path = dir.path().join("kept.rs");
+        fs::write(&in_workspace_path, "fn kept() {}").unwrap();
+        let in_workspace_uri =
+            lsp_types::Uri::from(Url::from_file_path(&in_workspace_path).unwrap().as_str());
+        let text_document_edit = lsp_types::TextDocumentEdit {
+            text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                version: Some(1),
+                text_document_identifier: TextDocumentIdentifier {
+                    uri: in_workspace_uri,
+                },
+            },
+            edits: vec![lsp_types::Edit::TextEdit(lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 2,
+                    },
+                },
+                new_text: "kept".to_string(),
+            })],
+        };
+
+        let edit = lsp_types::WorkspaceEdit {
+            changes: Some(changes_map),
+            document_changes: Some(vec![lsp_types::DocumentChange::TextDocumentEdit(
+                text_document_edit,
+            )]),
+            change_annotations: None,
+        };
+
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let (changes, dropped) =
+            convert_workspace_edit(edit, &test_ctx(), &workspace_roots, "rename edit").await;
+
+        assert!(
+            changes.is_empty(),
+            "changes takes precedence even though every one of its entries was withheld"
+        );
+        assert_eq!(
+            dropped.out_of_workspace, 2,
+            "both changes-branch drops must be tallied, not lost by falling back to documentChanges"
+        );
+    }
+
+    /// #475 M1 (second bug): `changes` can be present as a literally empty
+    /// map (`"changes": {}`, legal per `lsp_types::WorkspaceEdit`) rather
+    /// than omitted -- branching on `Option::is_some()` alone would treat
+    /// that as "use `changes`", silently discarding a populated
+    /// `documentChanges` and returning a result indistinguishable from
+    /// "nothing to rename".
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn test_convert_workspace_edit_falls_back_to_document_changes_when_changes_map_is_present_but_empty()
+     {
+        use std::collections::HashMap;
+
+        use url::Url;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("kept.rs");
+        fs::write(&file_path, "fn kept() {}").unwrap();
+        let uri_string = Url::from_file_path(&file_path).unwrap().to_string();
+        let uri = lsp_types::Uri::from(uri_string.as_str());
+
+        let text_document_edit = lsp_types::TextDocumentEdit {
+            text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                version: Some(1),
+                text_document_identifier: TextDocumentIdentifier { uri },
+            },
+            edits: vec![lsp_types::Edit::TextEdit(lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 2,
+                    },
+                },
+                new_text: "kept".to_string(),
+            })],
+        };
+
+        let edit = lsp_types::WorkspaceEdit {
+            changes: Some(HashMap::new()),
+            document_changes: Some(vec![lsp_types::DocumentChange::TextDocumentEdit(
+                text_document_edit,
+            )]),
+            change_annotations: None,
+        };
+
+        let workspace_roots = vec![dir.path().to_path_buf()];
+        let (changes, dropped) =
+            convert_workspace_edit(edit, &test_ctx(), &workspace_roots, "rename edit").await;
+
+        assert_eq!(
+            changes.len(),
+            1,
+            "an empty-but-present `changes` map must not be treated as authoritative over a \
+             populated documentChanges"
+        );
+        assert_eq!(changes[0].uri, uri_string);
+        assert!(dropped.is_empty());
+    }
+
+    /// #475: `RenameResult::dropped` must round-trip through the wire format
+    /// used by MCP responses -- present with per-reason counts when something
+    /// was withheld, and omitted entirely (not `"dropped":{}`) when nothing
+    /// was, so existing clients that ignore unknown fields see no change.
+    #[test]
+    fn test_rename_result_dropped_field_serde_presence() {
+        let clean = RenameResult {
+            changes: vec![],
+            dropped: DroppedEdits::default(),
+        };
+        let clean_json = serde_json::to_value(&clean).unwrap();
+        assert!(
+            clean_json.get("dropped").is_none(),
+            "an empty DroppedEdits must be omitted from the serialized result, not `dropped: {{}}`"
+        );
+
+        let incomplete = RenameResult {
+            changes: vec![],
+            dropped: DroppedEdits {
+                out_of_workspace: 1,
+                unsupported_file_operation: 2,
+                unsupported_snippet_edit: 0,
+            },
+        };
+        let incomplete_json = serde_json::to_value(&incomplete).unwrap();
+        let dropped_json = incomplete_json
+            .get("dropped")
+            .expect("non-empty DroppedEdits must be serialized");
+        assert_eq!(dropped_json["out_of_workspace"], 1);
+        assert_eq!(dropped_json["unsupported_file_operation"], 2);
+        assert!(
+            dropped_json.get("unsupported_snippet_edit").is_none(),
+            "a zero-valued reason must itself be omitted per-field"
+        );
     }
 
     #[tokio::test]
