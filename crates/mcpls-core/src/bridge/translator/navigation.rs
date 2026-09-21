@@ -87,8 +87,25 @@ fn definition_link_to_location(link: lsp_types::DefinitionLink) -> lsp_types::Lo
     }
 }
 
+/// Hard cap on the number of `Location`s/symbols a single call normalizes
+/// (`goto`, `references`, `workspace_symbol_search`). Without a limit, a
+/// response naming an unbounded number of locations turns one MCP tool call
+/// into an unbounded number of range conversions -- each one a potential
+/// disk read on a cache miss -- letting a hostile or misbehaving LSP server
+/// amplify one request into massive I/O (see #474). Applied before
+/// normalization, not after, so it bounds the work actually done rather
+/// than just the size of the returned list. Also used by
+/// `Translator::handle_workspace_symbol` to clamp its caller-supplied
+/// `limit`, which otherwise has no upper bound of its own.
+pub(super) const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
+
 /// Converts raw LSP locations into MCP-facing `Location` values, normalizing
 /// each range into the caller's 1-based coordinate space.
+///
+/// Truncates to [`MAX_NORMALIZED_LOCATIONS`] first -- see its doc. Logs a
+/// single `warn!` when that truncation actually drops locations, so a
+/// response silently capped below what the LSP server reported is at least
+/// visible in logs (see #474).
 ///
 /// Deliberately not filtered to workspace roots: unlike a write-bearing
 /// `WorkspaceEdit` (see `edits.rs`), a goto-X/references location is
@@ -98,7 +115,19 @@ fn definition_link_to_location(link: lsp_types::DefinitionLink) -> lsp_types::Lo
 /// the path this location names still goes through the inbound
 /// `validate_path_against_roots` gate (`mcp/server.rs`), which fails closed,
 /// so the untrusted-URI concern is already covered downstream.
-async fn lsp_locations_to_mcp(locs: Vec<lsp_types::Location>, ctx: &EncodingCtx) -> Vec<Location> {
+async fn lsp_locations_to_mcp(
+    mut locs: Vec<lsp_types::Location>,
+    ctx: &EncodingCtx,
+) -> NormalizedLocations {
+    let truncated = locs.len() > MAX_NORMALIZED_LOCATIONS;
+    if truncated {
+        tracing::warn!(
+            reported = locs.len(),
+            cap = MAX_NORMALIZED_LOCATIONS,
+            "LSP response location count exceeds MAX_NORMALIZED_LOCATIONS; truncating"
+        );
+    }
+    locs.truncate(MAX_NORMALIZED_LOCATIONS);
     let mut locations = Vec::with_capacity(locs.len());
     for loc in locs {
         locations.push(Location {
@@ -107,7 +136,20 @@ async fn lsp_locations_to_mcp(locs: Vec<lsp_types::Location>, ctx: &EncodingCtx)
             out_of_workspace: ctx.is_out_of_workspace(&loc.uri),
         });
     }
-    locations
+    NormalizedLocations {
+        locations,
+        truncated,
+    }
+}
+
+/// [`lsp_locations_to_mcp`]'s result: the normalized locations plus whether
+/// [`MAX_NORMALIZED_LOCATIONS`] actually dropped any of the LSP server's
+/// reported locations -- surfaced to the MCP caller via each result DTO's
+/// `truncated` field, since `references`'/goto-X's tool descriptions
+/// otherwise imply a complete result (see #474).
+struct NormalizedLocations {
+    locations: Vec<Location>,
+    truncated: bool,
 }
 
 /// The two response shapes shared by `textDocument/definition`,
@@ -163,7 +205,7 @@ impl GotoResponse for lsp_types::TypeDefinitionResponse {
 async fn goto_response_to_locations<R: GotoResponse>(
     response: Option<R>,
     ctx: &EncodingCtx,
-) -> Vec<Location> {
+) -> NormalizedLocations {
     let lsp_locs = match response.map(GotoResponse::into_kind) {
         Some(GotoKind::Definition(def)) => definition_to_locations(def),
         Some(GotoKind::DefinitionLinkList(links)) => {
@@ -390,7 +432,7 @@ impl Translator {
         position: Position,
         tool: ToolKind,
         capability: Capability,
-    ) -> Result<Vec<Location>>
+    ) -> Result<NormalizedLocations>
     where
         R: lsp_types::Request<Result = Option<T>>,
         R::Params: GotoParams,
@@ -428,7 +470,10 @@ impl Translator {
         file_path: String,
         position: Position,
     ) -> Result<DefinitionResult> {
-        let locations = self
+        let NormalizedLocations {
+            locations,
+            truncated,
+        } = self
             .handle_goto::<lsp_types::DefinitionRequest, _>(
                 &file_path,
                 position,
@@ -437,7 +482,10 @@ impl Translator {
             )
             .await?;
 
-        Ok(DefinitionResult { locations })
+        Ok(DefinitionResult {
+            locations,
+            truncated,
+        })
     }
 
     /// Handle references request.
@@ -483,12 +531,15 @@ impl Translator {
             .await?;
 
         let locations = response.unwrap_or_default();
-        let result_locations = lsp_locations_to_mcp(locations, &ctx).await;
-        let result = ReferencesResult {
-            locations: result_locations,
-        };
+        let NormalizedLocations {
+            locations,
+            truncated,
+        } = lsp_locations_to_mcp(locations, &ctx).await;
 
-        Ok(result)
+        Ok(ReferencesResult {
+            locations,
+            truncated,
+        })
     }
 
     /// Handle go-to-implementation request (`textDocument/implementation`).
@@ -506,7 +557,10 @@ impl Translator {
         file_path: String,
         position: Position,
     ) -> Result<LocationsResult> {
-        let locations = self
+        let NormalizedLocations {
+            locations,
+            truncated,
+        } = self
             .handle_goto::<lsp_types::ImplementationRequest, _>(
                 &file_path,
                 position,
@@ -515,7 +569,10 @@ impl Translator {
             )
             .await?;
 
-        Ok(LocationsResult { locations })
+        Ok(LocationsResult {
+            locations,
+            truncated,
+        })
     }
 
     /// Handle go-to-type-definition request (`textDocument/typeDefinition`).
@@ -534,7 +591,10 @@ impl Translator {
         file_path: String,
         position: Position,
     ) -> Result<LocationsResult> {
-        let locations = self
+        let NormalizedLocations {
+            locations,
+            truncated,
+        } = self
             .handle_goto::<lsp_types::TypeDefinitionRequest, _>(
                 &file_path,
                 position,
@@ -543,7 +603,10 @@ impl Translator {
             )
             .await?;
 
-        Ok(LocationsResult { locations })
+        Ok(LocationsResult {
+            locations,
+            truncated,
+        })
     }
 }
 
@@ -561,8 +624,9 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::NotificationCache;
+    use crate::bridge::encoding::PositionEncoding;
     use crate::bridge::translator::testing::*;
+    use crate::bridge::{NotificationCache, lock_std, path_to_uri};
     use crate::config::ServerId;
 
     // -----------------------------------------------------------------
@@ -1380,6 +1444,69 @@ mod tests {
         );
     }
 
+    /// Regression for #474/M4: `get_references`' tool description no longer
+    /// promises "all" references, since a response past
+    /// `MAX_NORMALIZED_LOCATIONS` is capped -- the client must be able to
+    /// detect that via `ReferencesResult::truncated` rather than silently
+    /// receiving a partial result that looks complete.
+    #[tokio::test]
+    async fn test_handle_references_sets_truncated_flag_past_cap() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_references(path, pos(1, 1), true).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/references");
+
+        let locations: Vec<serde_json::Value> = (0..MAX_NORMALIZED_LOCATIONS + 500)
+            .map(|_| {
+                serde_json::json!({
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 4}
+                    }
+                })
+            })
+            .collect();
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!(locations),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("handle_references should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.locations.len(), MAX_NORMALIZED_LOCATIONS);
+        assert!(
+            result.truncated,
+            "a references response past MAX_NORMALIZED_LOCATIONS must set truncated: true"
+        );
+    }
+
     /// Success-path coverage for `handle_implementation` through the
     /// `Definition::LocationList` -> `GotoKind::Definition` arm, pinning the
     /// `GotoResponse` impl for `ImplementationResponse`.
@@ -1528,5 +1655,96 @@ mod tests {
         assert_eq!(result.locations.len(), 1);
         assert_eq!(result.locations[0].uri, target_uri);
         assert_eq!(result.locations[0].range.start.character, 8);
+    }
+
+    // -----------------------------------------------------------------
+    // Resource-amplification defenses (#474)
+    // -----------------------------------------------------------------
+
+    /// Regression for #474's exact attack scenario: many `Location`s
+    /// clustered onto a handful of distinct `(file, line)` pairs must cost
+    /// one disk read per distinct pair, not one per location. Proven through
+    /// the real `lsp_locations_to_mcp` entry point shared by `handle_goto`
+    /// and `handle_references` -- not by calling the cache-backed helper
+    /// directly -- and via the cache's own size, which is a direct count of
+    /// how many times the disk-read fallback actually ran.
+    #[tokio::test]
+    async fn test_lsp_locations_to_mcp_reads_disk_once_per_distinct_file_line() {
+        let dir = TempDir::new().unwrap();
+        let mut uris = Vec::new();
+        for i in 0..3 {
+            let path = dir.path().join(format!("file{i}.rs"));
+            fs::write(&path, "hello").unwrap();
+            uris.push(path_to_uri(&path).unwrap());
+        }
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        // 300 locations, but only 3 distinct (file, line) pairs.
+        let locs: Vec<lsp_types::Location> = (0..300)
+            .map(|i| lsp_types::Location {
+                uri: uris[i % 3].clone(),
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+            })
+            .collect();
+
+        let result = lsp_locations_to_mcp(locs, &ctx).await;
+
+        assert_eq!(result.locations.len(), 300);
+        assert!(!result.truncated);
+        assert!(
+            result.locations.iter().all(|l| l.range.end.character == 4),
+            "MCP columns are 1-based, so LSP byte offset 3 in all-ASCII \"hello\" must convert \
+             to 4"
+        );
+        assert_eq!(
+            lock_std(&ctx.line_cache).entries.len(),
+            3,
+            "300 locations across 3 distinct files must populate the cache with exactly 3 \
+             entries (one disk read per distinct file/line), not one per location"
+        );
+    }
+
+    /// Regression for #474: without a cap, a response naming an unbounded
+    /// number of locations would drive an unbounded number of range
+    /// conversions. `Utf16` needs no disk read at all (see `test_ctx`), so
+    /// this isolates the truncation itself from I/O cost -- a response well
+    /// past `MAX_NORMALIZED_LOCATIONS` must be truncated to it, not hang,
+    /// OOM, or panic.
+    #[tokio::test]
+    async fn test_lsp_locations_to_mcp_truncates_to_max_normalized_locations() {
+        let ctx = test_ctx();
+        let uri = test_uri();
+        let locs: Vec<lsp_types::Location> = (0..MAX_NORMALIZED_LOCATIONS + 500)
+            .map(|_| lsp_types::Location {
+                uri: uri.clone(),
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 1,
+                    },
+                },
+            })
+            .collect();
+
+        let result = lsp_locations_to_mcp(locs, &ctx).await;
+
+        assert_eq!(result.locations.len(), MAX_NORMALIZED_LOCATIONS);
+        assert!(
+            result.truncated,
+            "a response naming more than MAX_NORMALIZED_LOCATIONS must report truncated: true"
+        );
     }
 }

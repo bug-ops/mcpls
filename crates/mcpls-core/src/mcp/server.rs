@@ -538,7 +538,7 @@ impl McplsServer {
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = "Definition location of symbol at position. Returns file path, line, and character where declared.",
+        description = "Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned.",
         title = "Go to Definition"
     )]
     async fn get_definition(
@@ -559,7 +559,7 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = "All references to symbol at position. Returns locations across workspace where symbol is used.",
+        description = "References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned.",
         title = "Find References"
     )]
     async fn get_references(
@@ -737,7 +737,7 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = "Search workspace symbols by name. Supports partial matching and fuzzy search.",
+        description = "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned.",
         title = "Workspace Symbol Search"
     )]
     async fn workspace_symbol_search(
@@ -958,7 +958,7 @@ impl McplsServer {
 
     /// Go to implementation locations.
     #[tool(
-        description = "Implementation locations of trait method or interface member at position.",
+        description = "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned.",
         title = "Go to Implementation"
     )]
     async fn go_to_implementation(
@@ -979,7 +979,7 @@ impl McplsServer {
 
     /// Go to type definition location.
     #[tool(
-        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings.",
+        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned.",
         title = "Go to Type Definition"
     )]
     async fn go_to_type_definition(

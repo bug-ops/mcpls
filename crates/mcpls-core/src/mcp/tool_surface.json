@@ -166,7 +166,7 @@
   {
     "name": "get_definition",
     "title": "Go to Definition",
-    "description": "Definition location of symbol at position. Returns file path, line, and character where declared.",
+    "description": "Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -267,6 +267,10 @@
             "$ref": "#/$defs/Location"
           },
           "type": "array"
+        },
+        "truncated": {
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -684,7 +688,7 @@
   {
     "name": "get_references",
     "title": "Find References",
-    "description": "All references to symbol at position. Returns locations across workspace where symbol is used.",
+    "description": "References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -790,6 +794,10 @@
             "$ref": "#/$defs/Location"
           },
           "type": "array"
+        },
+        "truncated": {
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more references\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -900,7 +908,7 @@
   {
     "name": "go_to_implementation",
     "title": "Go to Implementation",
-    "description": "Implementation locations of trait method or interface member at position.",
+    "description": "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -938,7 +946,7 @@
   {
     "name": "go_to_type_definition",
     "title": "Go to Type Definition",
-    "description": "Type definition location of expression at position. Distinct from go-to-definition for variable bindings.",
+    "description": "Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -1057,7 +1065,7 @@
   {
     "name": "workspace_symbol_search",
     "title": "Workspace Symbol Search",
-    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search.",
+    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

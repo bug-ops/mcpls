@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 use super::Translator;
 use super::dto::Position;
-use super::encoding_ctx::EncodingCtx;
+use super::encoding_ctx::{EncodingCtx, new_line_cache};
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DiagnosticInfo, DocumentTracker};
@@ -51,6 +51,7 @@ pub(super) fn test_ctx_with_roots(
             HashMap::new(),
         )),
         workspace_roots: Arc::new(workspace_roots),
+        line_cache: new_line_cache(),
     }
 }
 

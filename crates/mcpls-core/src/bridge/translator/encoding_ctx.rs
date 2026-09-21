@@ -1,13 +1,82 @@
 //! Per-response position/range encoding conversion between MCP's 1-based
 //! UTF-16 columns and an LSP server's negotiated encoding.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use super::dto::{Position2D, Range};
-use crate::bridge::DocumentTracker;
 use crate::bridge::encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
-use crate::bridge::state::uri_to_path;
+use crate::bridge::state::{DEFAULT_MAX_FILE_SIZE, uri_to_path};
+use crate::bridge::{DocumentTracker, lock_std};
+
+/// Total bytes [`read_line_text`]'s disk-read fallback (via
+/// [`DocumentTracker::read_line_checked`]) may scan across one
+/// `EncodingCtx`'s whole lifetime (one MCP response), independent of how
+/// many distinct `(path, line)` lookups that spans.
+///
+/// [`LineCacheState::entries`] alone caps repeats of the *same* line, but a
+/// response naming enough distinct lines (e.g. `references` results spread
+/// across a large file, or several call-hierarchy/inlay-hint/workspace-edit
+/// locations) could still add up to an unbounded amount of scanning even
+/// with that cache and [`super::navigation::MAX_NORMALIZED_LOCATIONS`]'s
+/// count cap in place (see #474's follow-up). Every conversion that reaches
+/// disk goes through [`read_line_text`], so charging this single budget
+/// there caps every `EncodingCtx`-mediated handler uniformly -- `to_lsp`,
+/// `to_mcp`, `normalize_range`, `denormalize_range` -- with no per-handler
+/// cap needed.
+///
+/// Set to four times the default single-file read bound: enough slack for a
+/// legitimate response touching a handful of large files, while still
+/// bounding a hostile response to double-digit MiB of I/O rather than the
+/// unbounded (or count-cap x `max_file_size`) amount possible without it.
+/// This is a fixed constant, not derived from the tracker's *configured*
+/// `ResourceLimits::max_file_size` -- deliberately: `read_line_checked`'s
+/// `budget` parameter always caps an individual read to
+/// `min(bounded_read_cap(configured_max_file_size), remaining_budget)`, so a
+/// larger configured `max_file_size` (including `0`, meaning unlimited)
+/// only widens what *one* read is theoretically allowed to scan before
+/// finding its line, never what it can actually charge against this
+/// response-wide budget -- the physical cap always wins.
+const MAX_LINE_READ_BYTES_PER_RESPONSE: u64 = 4 * DEFAULT_MAX_FILE_SIZE;
+
+/// [`EncodingCtx::line_cache`]'s guarded state: the per-`(path, line)`
+/// memoization table plus the shared disk-read byte budget both are checked
+/// and charged against (see [`MAX_LINE_READ_BYTES_PER_RESPONSE`]).
+#[derive(Debug)]
+pub(super) struct LineCacheState {
+    /// Memoized line text keyed by `(path, 0-based line)`, `None` meaning
+    /// "resolved to no such line". Populated for both the tracker-hit and
+    /// disk-read paths (see [`read_line_text`]).
+    pub(super) entries: HashMap<(PathBuf, u32), Option<String>>,
+    /// Remaining disk-read byte allowance for this response; see
+    /// [`MAX_LINE_READ_BYTES_PER_RESPONSE`].
+    bytes_remaining: u64,
+    /// Whether the once-per-response budget-exhausted warning has already
+    /// been logged, so a response with many post-exhaustion lookups logs
+    /// once rather than once per lookup.
+    budget_exhausted_logged: bool,
+}
+
+impl LineCacheState {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes_remaining: MAX_LINE_READ_BYTES_PER_RESPONSE,
+            budget_exhausted_logged: false,
+        }
+    }
+}
+
+/// [`EncodingCtx::line_cache`]'s field type.
+type LineCache = Arc<StdMutex<LineCacheState>>;
+
+/// Builds a fresh, empty [`LineCache`] for a new [`EncodingCtx`] -- used by
+/// every construction site so the budget/cache initialization can't drift
+/// between them.
+pub(super) fn new_line_cache() -> LineCache {
+    Arc::new(StdMutex::new(LineCacheState::new()))
+}
 
 /// Per-response encoding context: the negotiated [`PositionEncoding`] of the
 /// LSP server that produced a response, used to convert every
@@ -32,32 +101,112 @@ pub(super) struct EncodingCtx {
     /// navigation result -- see `crate::bridge::uri_in_workspace_roots`'s
     /// docs for why filtering is deliberately not done here.
     pub(super) workspace_roots: Arc<Vec<PathBuf>>,
+    /// Memoizes [`read_line_text`]'s result (both the tracker hit and the
+    /// disk-read fallback) per `(path, line)` for the lifetime of this
+    /// context, and tracks the shared disk-read byte budget -- one
+    /// `EncodingCtx` is built per MCP response (see
+    /// [`Translator::encoding_ctx`](super::Translator::encoding_ctx)), so
+    /// this bounds a response that reconverts the same file/line many times
+    /// (e.g. `references` results clustered in one file) to a single lookup
+    /// per distinct line, and caps the response's total disk-read I/O
+    /// regardless of how many distinct lines it touches (see #474).
+    pub(super) line_cache: LineCache,
 }
 
 /// Text of the 0-based `line`'th line of the file at `uri`, or `None` if it
-/// cannot be resolved to a path, read, or has no such line.
+/// cannot be resolved to a path, read, has no such line, or the response's
+/// disk-read budget ([`MAX_LINE_READ_BYTES_PER_RESPONSE`]) is exhausted.
 ///
 /// Only ever consulted when the negotiated encoding is not UTF-16 (see
-/// [`EncodingCtx::to_lsp`]/[`EncodingCtx::to_mcp`]). Checks `tracker` first
-/// (in-memory, no I/O) -- this is by construction both cheaper and more
-/// correct than disk for any document mcpls has opened, since it is exactly
-/// the text the server was told about, so it can't diverge from the
-/// server's own view even if the file has since been edited on disk (see
-/// #290 S1). Only a document `tracker` has never seen falls through to
-/// [`DocumentTracker::read_checked`], which applies the same
-/// `ResourceLimits::max_file_size` and regular-file gate as any tracked
-/// document's disk read (see #427) rather than an unbounded read.
-async fn read_line_text(
-    uri: &lsp_types::Uri,
-    line: u32,
-    tracker: &DocumentTracker,
-) -> Option<String> {
+/// [`EncodingCtx::to_lsp`]/[`EncodingCtx::to_mcp`]). Every outcome --
+/// tracker hit, disk hit, or "no such line" -- is memoized in
+/// `ctx.line_cache` per `(path, line)`, so a response reconverting the same
+/// line more than once pays for `ctx.tracker.line_text`'s lock/scan or
+/// [`DocumentTracker::read_line_checked`]'s disk read only the first time.
+///
+/// On a cache miss, checks `ctx.tracker` first (in-memory) -- correct even
+/// when cached, since it is exactly the text the server was told about and
+/// can't diverge from the server's own view within one response's lifetime
+/// (see #290 S1: that concern is about disk-vs-tracker divergence across
+/// requests, not within one). Only a document the tracker has never seen
+/// falls through to [`DocumentTracker::read_line_checked`], which applies
+/// the same `ResourceLimits::max_file_size` and regular-file gate as any
+/// tracked document's disk read (see #427) while reading only up to the
+/// requested line rather than the whole file (see #474) -- gated by the
+/// per-response byte budget so that no single response can rack up
+/// unbounded disk I/O by naming enough distinct lines.
+async fn read_line_text(uri: &lsp_types::Uri, line: u32, ctx: &EncodingCtx) -> Option<String> {
     let path = uri_to_path(uri)?;
-    if let Some(text) = tracker.line_text(&path, line) {
-        return Some(text);
+    let key = (path.clone(), line);
+
+    if let Some(cached) = lock_std(&ctx.line_cache).entries.get(&key) {
+        return cached.clone();
     }
-    let content = tracker.read_checked(&path).await.ok()?;
-    content.lines().nth(line as usize).map(str::to_string)
+
+    let text = if let Some(text) = ctx.tracker.line_text(&path, line) {
+        Some(text)
+    } else {
+        disk_read_line_budgeted(&path, line, ctx).await
+    };
+
+    lock_std(&ctx.line_cache).entries.insert(key, text.clone());
+    text
+}
+
+/// [`read_line_text`]'s disk-read fallback, charging the bytes
+/// [`DocumentTracker::read_line_checked`] scans against `ctx.line_cache`'s
+/// shared [`MAX_LINE_READ_BYTES_PER_RESPONSE`] budget. Once exhausted, no
+/// further disk reads are attempted for the rest of this response -- every
+/// subsequent budget-gated lookup returns `None` immediately, logging a
+/// single `warn!` the first time that happens.
+///
+/// The remaining budget is passed *into* the read itself
+/// (`read_line_checked`'s `budget` parameter), which physically bounds how
+/// many bytes that call can scan -- so unlike charging only on success,
+/// this can't be bypassed by a read that ends in a content-shaped failure
+/// (invalid UTF-8 at the target line, a truncation-by-cap, or a path that
+/// doesn't resolve via `open_checked` at all -- e.g. an LSP server naming a
+/// stdlib path not present locally): `LineRead` reports `bytes_read` on
+/// every one of those outcomes too (a small nominal charge, not a literal
+/// `0`, for the `open_checked`-failure case -- see
+/// `state::OPEN_FAILURE_CHARGE_BYTES`), and this function always charges
+/// exactly that. Only a genuine mid-read I/O error (rare, not
+/// attacker-controlled by response content) has no byte count available;
+/// that one case fails safe by charging this call's whole budget slice
+/// rather than leaving it unaccounted (see #474's S1 budget-bypass fix).
+async fn disk_read_line_budgeted(path: &Path, line: u32, ctx: &EncodingCtx) -> Option<String> {
+    let budget = {
+        let mut state = lock_std(&ctx.line_cache);
+        if state.bytes_remaining != 0 {
+            state.bytes_remaining
+        } else {
+            let already_logged = state.budget_exhausted_logged;
+            state.budget_exhausted_logged = true;
+            drop(state);
+            if !already_logged {
+                tracing::warn!(
+                    path = %path.display(),
+                    budget_bytes = MAX_LINE_READ_BYTES_PER_RESPONSE,
+                    "per-response disk-read budget exhausted; further position conversions \
+                     requiring a disk read in this response will pass columns through \
+                     unconverted"
+                );
+            }
+            return None;
+        }
+    };
+
+    if let Ok(read) = ctx.tracker.read_line_checked(path, line, budget).await {
+        let mut state = lock_std(&ctx.line_cache);
+        state.bytes_remaining = state.bytes_remaining.saturating_sub(read.bytes_read);
+        drop(state);
+        read.text
+    } else {
+        let mut state = lock_std(&ctx.line_cache);
+        state.bytes_remaining = state.bytes_remaining.saturating_sub(budget);
+        drop(state);
+        None
+    }
 }
 
 impl EncodingCtx {
@@ -100,7 +249,7 @@ impl EncodingCtx {
         let line_text = if self.encoding == PositionEncoding::Utf16 {
             None
         } else {
-            let text = read_line_text(uri, line.saturating_sub(1), &self.tracker).await;
+            let text = read_line_text(uri, line.saturating_sub(1), self).await;
             if text.is_none() {
                 tracing::warn!(
                     uri = uri.as_ref(),
@@ -125,7 +274,7 @@ impl EncodingCtx {
         let line_text = if self.encoding == PositionEncoding::Utf16 {
             None
         } else {
-            let text = read_line_text(uri, pos.line, &self.tracker).await;
+            let text = read_line_text(uri, pos.line, self).await;
             if text.is_none() {
                 tracing::warn!(
                     uri = uri.as_ref(),
@@ -277,15 +426,20 @@ mod tests {
         fs::write(&path, "a".repeat(200)).unwrap();
         let uri = path_to_uri(&path).unwrap();
 
-        let tracker = DocumentTracker::new(
-            ResourceLimits {
-                max_documents: 100,
-                max_file_size: 50,
-            },
-            HashMap::new(),
-        );
+        let ctx = EncodingCtx {
+            encoding: PositionEncoding::Utf8,
+            tracker: Arc::new(DocumentTracker::new(
+                ResourceLimits {
+                    max_documents: 100,
+                    max_file_size: 50,
+                },
+                HashMap::new(),
+            )),
+            workspace_roots: Arc::new(Vec::new()),
+            line_cache: new_line_cache(),
+        };
         assert!(
-            read_line_text(&uri, 0, &tracker).await.is_none(),
+            read_line_text(&uri, 0, &ctx).await.is_none(),
             "must refuse to return content from a file over max_file_size"
         );
     }
@@ -314,6 +468,7 @@ mod tests {
             encoding: PositionEncoding::Utf8,
             tracker,
             workspace_roots: Arc::new(Vec::new()),
+            line_cache: new_line_cache(),
         };
         let lsp_pos = ctx.to_lsp(&uri, 1, 3).await;
         assert_eq!(
@@ -364,6 +519,142 @@ mod tests {
         assert_eq!(
             range_b.end.character, 4,
             "must convert against b.rs's own content"
+        );
+    }
+
+    /// Regression for #474: a single `EncodingCtx` must memoize
+    /// [`read_line_text`]'s disk-read fallback per `(path, line)`, so a
+    /// response that reconverts the same untracked file's line more than
+    /// once (e.g. several `references` locations on one line) reads disk
+    /// only the first time. Proven by mutating the file between two lookups
+    /// through the same `ctx`: if the second lookup re-read disk, it would
+    /// observe the new content instead of the cached one.
+    #[tokio::test]
+    async fn test_read_line_text_caches_disk_read_per_path_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cached.rs");
+        fs::write(&path, "hello").unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        assert_eq!(
+            read_line_text(&uri, 0, &ctx).await.as_deref(),
+            Some("hello")
+        );
+
+        fs::write(&path, "héllo").unwrap();
+        assert_eq!(
+            read_line_text(&uri, 0, &ctx).await.as_deref(),
+            Some("hello"),
+            "must reuse the first lookup's cached result instead of re-reading disk"
+        );
+    }
+
+    /// Regression for S1: the per-`(path, line)` cache alone doesn't bound a
+    /// response naming enough *distinct* lines/files -- `read_line_text`
+    /// must also stop performing disk reads once the shared per-response
+    /// byte budget is spent, refusing further lookups rather than letting
+    /// each new distinct key add unbounded I/O.
+    #[tokio::test]
+    async fn test_read_line_text_stops_disk_reads_once_budget_exhausted() {
+        let dir = TempDir::new().unwrap();
+        let path_a = dir.path().join("a.rs");
+        fs::write(&path_a, "hello\n").unwrap();
+        let uri_a = path_to_uri(&path_a).unwrap();
+
+        let path_b = dir.path().join("b.rs");
+        fs::write(&path_b, "world\n").unwrap();
+        let uri_b = path_to_uri(&path_b).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        // Exactly enough budget for the first read ("hello\n" is 6 bytes) to
+        // complete, but nothing left after.
+        lock_std(&ctx.line_cache).bytes_remaining = 6;
+
+        assert_eq!(
+            read_line_text(&uri_a, 0, &ctx).await.as_deref(),
+            Some("hello")
+        );
+        assert_eq!(lock_std(&ctx.line_cache).bytes_remaining, 0);
+
+        // A second, distinct (path, line) lookup must now be refused.
+        assert_eq!(read_line_text(&uri_b, 0, &ctx).await, None);
+    }
+
+    /// Regression for the S1 budget-bypass fix: a read whose remaining
+    /// budget is smaller than the line it's scanning for must stop at
+    /// exactly the budget (never returning the truncated text as if it
+    /// were complete), and must still charge exactly what it scanned --
+    /// proven by draining the budget to zero rather than leaving any
+    /// unaccounted.
+    #[tokio::test]
+    async fn test_read_line_text_bounds_read_by_remaining_budget() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("long_line.rs");
+        fs::write(&path, "a".repeat(1000)).unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        lock_std(&ctx.line_cache).bytes_remaining = 10;
+
+        assert_eq!(
+            read_line_text(&uri, 0, &ctx).await,
+            None,
+            "a line far longer than the remaining budget must not be returned"
+        );
+        assert_eq!(
+            lock_std(&ctx.line_cache).bytes_remaining,
+            0,
+            "the physically-capped read must charge (at most one byte over) the budget it was \
+             given, not overshoot to max_file_size"
+        );
+    }
+
+    /// Regression for the S1 budget-bypass fix (security re-audit): an
+    /// invalid-UTF-8 line -- the realistic attack shape (a `.rlib`, image,
+    /// or pack file under `max_file_size`) -- must still charge the shared
+    /// per-response budget for the bytes actually scanned, not leave it
+    /// unaccounted because the line failed to decode. Before this fix, this
+    /// exact case charged zero, letting a hostile response repeat it over
+    /// enough distinct `(path, line)` keys to restore unbounded scanning.
+    #[tokio::test]
+    async fn test_read_line_text_charges_budget_even_when_line_is_invalid_utf8() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("invalid_utf8.rs");
+        let mut content = vec![0xFFu8, 0xFE, 0xFD];
+        content.push(b'\n');
+        fs::write(&path, &content).unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        assert_eq!(read_line_text(&uri, 0, &ctx).await, None);
+        assert_eq!(
+            lock_std(&ctx.line_cache).bytes_remaining,
+            MAX_LINE_READ_BYTES_PER_RESPONSE - content.len() as u64,
+            "the budget must be charged for the bytes scanned even though the line was not \
+             valid UTF-8"
+        );
+    }
+
+    /// Regression for the open-failure-charge fix: an LSP server routinely
+    /// names a path that doesn't exist locally (e.g. rust-analyzer's
+    /// `file:///rustc/<hash>/library/...` stdlib locations without
+    /// `rust-src` installed) -- a completely normal, non-attacker scenario.
+    /// This must charge only the small nominal `OPEN_FAILURE_CHARGE_BYTES`
+    /// amount, not the previous round's regression of zeroing the *entire*
+    /// remaining per-response budget on the very first such location.
+    #[tokio::test]
+    async fn test_read_line_text_charges_nominal_amount_for_nonexistent_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rustc_stdlib_without_rust_src.rs");
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        assert_eq!(read_line_text(&uri, 0, &ctx).await, None);
+        assert_eq!(
+            lock_std(&ctx.line_cache).bytes_remaining,
+            MAX_LINE_READ_BYTES_PER_RESPONSE - crate::bridge::state::OPEN_FAILURE_CHARGE_BYTES,
+            "a nonexistent path must charge only the small nominal amount, not the whole budget"
         );
     }
 }

@@ -97,6 +97,12 @@ pub struct HoverResult {
 pub struct DefinitionResult {
     /// Locations of the definition.
     pub locations: Vec<Location>,
+    /// Whether `locations` was capped below the LSP server's full response
+    /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations
+    /// exist than are returned here. Omitted (defaults to `false`) when
+    /// serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 /// Result of a references request.
@@ -104,6 +110,12 @@ pub struct DefinitionResult {
 pub struct ReferencesResult {
     /// Locations of all references.
     pub locations: Vec<Location>,
+    /// Whether `locations` was capped below the LSP server's full response
+    /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more references
+    /// exist than are returned here. Omitted (defaults to `false`) when
+    /// serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 /// Diagnostic severity.
@@ -276,6 +288,13 @@ pub struct WorkspaceSymbol {
 pub struct WorkspaceSymbolResult {
     /// List of symbols found.
     pub symbols: Vec<WorkspaceSymbol>,
+    /// Whether more symbols matched than are returned in `symbols` -- set
+    /// whenever any are dropped, whether by the caller's own smaller
+    /// `limit` or by the server-side maximum it's clamped to (see
+    /// `MAX_NORMALIZED_LOCATIONS`, #474); this does not distinguish which of
+    /// the two caused it. Omitted (defaults to `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 /// A single code action.
@@ -454,6 +473,12 @@ pub struct SignatureHelpResult {
 pub struct LocationsResult {
     /// Locations found.
     pub locations: Vec<Location>,
+    /// Whether `locations` was capped below the LSP server's full response
+    /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations
+    /// exist than are returned here. Omitted (defaults to `false`) when
+    /// serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 /// A single inlay hint entry.
