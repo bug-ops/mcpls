@@ -573,7 +573,7 @@ impl McplsServer {
     // read-only: returns a proposed WorkspaceEdit, does not apply it -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used.",
+        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty.",
         title = "Rename Symbol"
     )]
     async fn rename_symbol(
@@ -686,7 +686,7 @@ impl McplsServer {
     // read-only: returns proposed CodeAction edits, does not apply them --
     // mcpls has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits.",
+        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files).",
         title = "Code Actions"
     )]
     async fn get_code_actions(

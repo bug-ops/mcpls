@@ -38,9 +38,9 @@ pub use state::{
 pub(crate) use translator::validate_path_against_roots;
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
-    DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    Location, Position, Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit,
-    Translator,
+    DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, DroppedEdits, FormatDocumentResult,
+    HoverResult, Location, Position, Position2D, Range, ReferencesResult, RenameResult, Symbol,
+    TextEdit, Translator,
 };
 
 /// Whether `uri` resolves to a path within one of `workspace_roots`.
