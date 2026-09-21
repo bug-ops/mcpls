@@ -301,7 +301,7 @@ This reduces memory usage compared to loading all 30 default mappings.
 **Type**: Integer
 **Default**: `100`
 
-Maximum number of documents mcpls will keep open simultaneously. A tool call (hover, definition, diagnostics, etc.) that would open a document beyond this count fails with a "document limit exceeded" error. Documents stay tracked for the whole mcpls process lifetime — there is no automatic eviction — so once the ceiling is reached, opening any further new file fails until you restart mcpls or raise this limit; already-open files are unaffected. Set to `0` to disable the limit.
+Maximum number of documents mcpls will keep open simultaneously. Once the ceiling is reached, opening a new document evicts the least-recently-used, unlocked document (sending `textDocument/didClose` to its LSP server) to make room; if every tracked document is locked (in active use), the tool call fails with a "document limit exceeded" error instead. Set to `0` to disable the limit.
 
 ```toml
 [workspace]
@@ -339,6 +339,25 @@ indexing_ready_timeout_seconds = 45
 Must be greater than 3 and less than 60 seconds; mcpls rejects the config otherwise. Raise it for large monorepos where the initial workspace load routinely takes longer than the default.
 
 ## LSP Server Configuration
+
+### `indexing`
+
+**Type**: String
+**Default**: unset (readiness gating enabled)
+
+Set to `"disabled"` to opt this server out of workspace-indexing readiness
+gating entirely — whole-workspace queries routed to it never wait for an
+indexing-readiness signal, even if the server emits one.
+
+```toml
+[[lsp_servers]]
+language_id = "go"
+command = "gopls"
+indexing = "disabled"
+```
+
+Use this for a server whose indexing-progress signal is unreliable or too
+slow to be useful as a gate; every other server config field still applies.
 
 Each `[[lsp_servers]]` section defines a language server.
 

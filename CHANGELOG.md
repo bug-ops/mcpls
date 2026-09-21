@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-21
+
 ### Added
 
 - Workspace-indexing readiness is now also tracked from a generic LSP `$/progress` `begin`/`end` sequence, not just rust-analyzer's `experimental/serverStatus` — mcpls now advertises `window.workDoneProgress` at `initialize` and answers `window/workDoneProgress/create`, so any spec-compliant server (gopls, pyright, tsserver) can report indexing progress and be gated on. (#433)
@@ -26,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deduplicated `LspNotification::parse`'s four deserialize-or-fallback match arms into a shared helper, sourcing method-name constants from `lsp_types` instead of string literals (no behavior change). (#449)
 - `Error::WorkspaceIndexing` now maps to a distinct JSON-RPC server-error code instead of the generic internal-error code. (#450)
 - Extracted a shared bounded-read helper used by both config loading and document disk reads, keeping their size-check/UTF-8-validation ordering from drifting apart. (#443, #446)
+- Bump dirs from 6.0.0 to 7.0.0 (#405)
+- Bump toml from 1.1.5+spec-1.1.0 to 1.1.6+spec-1.1.0 (#408)
+- Bump rstest from 0.26.1 to 0.27.0 (#409)
+- CI: bump cargo-bins/cargo-binstall from 1.22.0 to 1.23.0 (#406)
 
 ### Fixed
 
@@ -793,7 +799,8 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/bug-ops/mcpls/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/bug-ops/mcpls/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bug-ops/mcpls/compare/v0.3.9...v0.4.0
 [0.3.9]: https://github.com/bug-ops/mcpls/compare/v0.3.8...v0.3.9

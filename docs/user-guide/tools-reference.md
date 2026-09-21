@@ -10,6 +10,21 @@ Names below are the defaults; if the bridge is configured with `mcp.tool_prefix`
 [Configuration Reference](configuration.md#mcp-section)), every tool name gains that prefix
 (`{tool_prefix}_{tool}`).
 
+### Advisory Flags on Position-Bearing Results
+
+Two flags can appear on results that carry file positions or locations, both purely advisory —
+neither blocks or filters the result, they just tell the caller when to apply extra caution:
+
+- **`out_of_workspace`** — set per-location on `get_definition`, `get_references`,
+  `go_to_implementation`, `go_to_type_definition`, `get_incoming_calls`/`get_outgoing_calls`, and
+  `workspace_symbol_search` results, `true` when that location falls outside every configured
+  workspace root (e.g. it points into the standard library or a dependency). This is expected and
+  common — the location is still valid, just outside the roots you configured.
+- **`positions_degraded`** — set on any result whose position/range could not be reliably
+  converted between LSP's 0-based and MCP's 1-based encoding (disk-read budget exhausted, an
+  unresolvable server-reported path, an oversized file, invalid UTF-8, or a line past EOF), `true`
+  when at least one returned column may be inaccurate.
+
 ## Tool Index
 
 ### Code Intelligence Tools
@@ -153,10 +168,13 @@ Array of definition locations:
     "range": {
       "start": { "line": 5, "character": 0 },
       "end": { "line": 5, "character": 14 }
-    }
+    },
+    "out_of_workspace": false
   }
 ]
 ```
+
+See [Advisory Flags on Position-Bearing Results](#advisory-flags-on-position-bearing-results) for `out_of_workspace`.
 
 ### Example Use Cases
 
@@ -214,17 +232,21 @@ Array of reference locations:
     "range": {
       "start": { "line": 15, "character": 4 },
       "end": { "line": 15, "character": 8 }
-    }
+    },
+    "out_of_workspace": false
   },
   {
     "uri": "file:///path/to/file2.rs",
     "range": {
       "start": { "line": 42, "character": 10 },
       "end": { "line": 42, "character": 14 }
-    }
+    },
+    "out_of_workspace": false
   }
 ]
 ```
+
+See [Advisory Flags on Position-Bearing Results](#advisory-flags-on-position-bearing-results) for `out_of_workspace`.
 
 ### Example Use Cases
 
