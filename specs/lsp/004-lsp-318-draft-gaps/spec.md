@@ -20,7 +20,7 @@ related:
 > **Author**: rust-researcher (filed from competitive-parity research cycle)
 > **Type**: research / competitive-parity
 > **Priority**: P3 (bumped from P4 on 2026-09-21 per SC-003 — see Re-assessment callout and Success Criteria below)
-> **Related issues**: #116 (P3, LSP 3.17-era tools — resolved by #124, see note below), #290 (P2, negotiated position encoding not consumed — resolved, see Resolution below)
+> **Related issues**: #116 (P3, LSP 3.17-era tools — resolved by #124, see note below), #290 (P2, negotiated position encoding not consumed — resolved, see Resolution below), #477 (tracking issue for this spec's 2026-09-21 SC-003 re-assessment)
 
 > [!success] #290 resolved
 > Issue #290 (negotiated LSP position encoding not consumed) is now closed, in two parts:

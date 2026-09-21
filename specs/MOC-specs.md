@@ -20,7 +20,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 001 | [[lsp/001-lsp-server-lifecycle-and-respawn/spec\|lsp-server-lifecycle-and-respawn]] | enhancement | P1 | implemented (retroactive) | — |
 | 002 | [[lsp/002-lsp317-missing-tools/spec\|lsp317-missing-tools]] | enhancement | P3 | implemented (#124) | #116 |
 | 003 | [[lsp/003-lsp-types-unmaintained-migration/spec\|lsp-types-unmaintained-migration]] | research | P2 | implemented (#375) | #297 |
-| 004 | [[lsp/004-lsp-318-draft-gaps/spec\|lsp-318-draft-gaps]] | research | P3 (bumped from P4, 2026-09-21, SC-003: LSP 3.18 finalized) | draft | #299 (also #116, resolved by #124; #290 resolved by #289/#291) |
+| 004 | [[lsp/004-lsp-318-draft-gaps/spec\|lsp-318-draft-gaps]] | research | P3 (bumped from P4, 2026-09-21, SC-003: LSP 3.18 finalized) | draft | #299 (also #116, resolved by #124; #290 resolved by #289/#291); #477 (SC-003 re-assessment tracking) |
 | 005 | [[lsp/005-lsp-content-modified-retry/spec\|lsp-content-modified-retry]] | bug | P2 | implemented (#390) | #382 |
 
 ## mcp
