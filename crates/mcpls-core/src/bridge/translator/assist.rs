@@ -9,7 +9,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{
     Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, SignatureHelpResult,
-    SignatureInfo, SignatureParameter,
+    SignatureInfo, SignatureParameter, lsp_kind_to_u32,
 };
 use super::routing::{Capability, IndexingGate};
 use crate::config::ToolKind;
@@ -109,7 +109,7 @@ impl Translator {
                 .into_iter()
                 .map(|item| Completion {
                     label: item.label,
-                    kind: item.kind.map(|k| format!("{k:?}")),
+                    kind: item.kind.map(lsp_kind_to_u32),
                     detail: item.detail,
                     documentation: item.documentation.map(|doc| match doc {
                         lsp_types::Documentation::String(s) => s,
@@ -263,12 +263,7 @@ impl Translator {
             hints.push(InlayHintEntry {
                 position,
                 label,
-                kind: hint.kind.and_then(|k| {
-                    serde_json::to_value(k)
-                        .ok()
-                        .and_then(|v| v.as_i64())
-                        .and_then(|n| u8::try_from(n).ok())
-                }),
+                kind: hint.kind.map(lsp_kind_to_u32),
                 padding_left: hint.padding_left,
                 padding_right: hint.padding_right,
                 tooltip,
@@ -420,5 +415,67 @@ mod tests {
 
         let result = handle.await.unwrap().unwrap();
         assert!(result.items.is_empty());
+    }
+
+    /// #467 M2/tester gap 1: exercises the actual `handle_inlay_hints`
+    /// conversion site (`assist.rs:266`, not just the bare `lsp_kind_to_u32`
+    /// helper) with a `kind` value above `u8::MAX` -- the old `Option<u8>`
+    /// roundtrip silently dropped this to `None`.
+    #[tokio::test]
+    async fn test_handle_inlay_hints_preserves_custom_kind_above_u8_range() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+
+        use crate::bridge::translator::testing::pos;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            inlay_hint_provider: Some(lsp_types::InlayHintProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_inlay_hints(path, pos(1, 1), pos(1, 13))
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/inlayHint");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "position": {"line": 0, "character": 5},
+                "label": "custom",
+                "kind": 300,
+            }]),
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.hints.len(), 1);
+        assert_eq!(
+            result.hints[0].kind,
+            Some(300u32),
+            "a custom InlayHintKind above u8::MAX must not be truncated or dropped"
+        );
     }
 }

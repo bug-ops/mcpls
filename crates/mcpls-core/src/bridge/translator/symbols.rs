@@ -6,7 +6,10 @@ use lsp_types::{
 };
 
 use super::Translator;
-use super::dto::{DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
+use super::dto::{
+    DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult,
+    lsp_kind_to_u32,
+};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::lock_std;
@@ -14,8 +17,8 @@ use crate::config::{NoServerReason, ToolKind};
 use crate::error::{Error, Result};
 use crate::lsp::SUPPORTED_SYMBOL_KINDS;
 
-/// Validate parameters for `handle_workspace_symbol`.
-fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
+/// Validate `query`'s length for `handle_workspace_symbol`.
+fn validate_query_length(query: &str) -> Result<()> {
     const MAX_QUERY_LENGTH: usize = 1000;
 
     if query.len() > MAX_QUERY_LENGTH {
@@ -25,21 +28,37 @@ fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> R
         )));
     }
 
-    if let Some(kind) = kind_filter
-        && !SUPPORTED_SYMBOL_KINDS
-            .iter()
-            .any(|k| format!("{k:?}").eq_ignore_ascii_case(kind))
-    {
-        let valid: Vec<String> = SUPPORTED_SYMBOL_KINDS
-            .iter()
-            .map(|k| format!("{k:?}"))
-            .collect();
-        return Err(Error::InvalidToolParams(format!(
-            "Invalid kind_filter: '{kind}'. Valid values: {valid:?}"
-        )));
+    Ok(())
+}
+
+/// Resolve a `kind_filter` value to the numeric LSP `SymbolKind` it names.
+///
+/// Accepts either a `SymbolKind`'s `Debug`-derived name (case-insensitive,
+/// e.g. `"Function"`), validated against [`SUPPORTED_SYMBOL_KINDS`], or its
+/// numeric wire value directly (e.g. `"12"`) -- accepted as-is with no range
+/// check, since `SymbolKind::Custom(n)` is legitimately open-ended and has no
+/// fixed valid range to check against. A typo'd numeric filter therefore
+/// returns an empty result instead of `InvalidToolParams`, unlike a typo'd
+/// name.
+fn resolve_kind_filter(kind: &str) -> Result<u32> {
+    if let Ok(numeric) = kind.parse::<u32>() {
+        return Ok(numeric);
     }
 
-    Ok(())
+    SUPPORTED_SYMBOL_KINDS
+        .iter()
+        .find(|k| format!("{k:?}").eq_ignore_ascii_case(kind))
+        .map(|&k| u32::from(k))
+        .ok_or_else(|| {
+            let valid: Vec<String> = SUPPORTED_SYMBOL_KINDS
+                .iter()
+                .map(|k| format!("{k:?}"))
+                .collect();
+            Error::InvalidToolParams(format!(
+                "Invalid kind_filter: '{kind}'. Valid values: {valid:?}, or the numeric LSP \
+                 SymbolKind value"
+            ))
+        })
 }
 
 /// Convert LSP document symbol to MCP symbol. `uri` is the queried
@@ -69,7 +88,7 @@ fn convert_document_symbol<'a>(
 
         Symbol {
             name: symbol.name,
-            kind: format!("{:?}", symbol.kind),
+            kind: lsp_kind_to_u32(symbol.kind),
             range,
             selection_range,
             children,
@@ -127,7 +146,7 @@ impl Translator {
                     let selection_range = range.clone();
                     result.push(Symbol {
                         name: sym.base_symbol_information.name,
-                        kind: format!("{:?}", sym.base_symbol_information.kind),
+                        kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
                         range,
                         selection_range,
                         children: None,
@@ -169,7 +188,11 @@ impl Translator {
         kind_filter: Option<String>,
         limit: u32,
     ) -> Result<WorkspaceSymbolResult> {
-        validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
+        validate_query_length(&query)?;
+        let kind_filter = kind_filter
+            .as_deref()
+            .map(resolve_kind_filter)
+            .transpose()?;
 
         // Workspace search has no document, so it resolves via `resolve_any`
         // rather than a per-language route. If the resolved server is not
@@ -234,7 +257,7 @@ impl Translator {
                         .await;
                     symbols.push(WorkspaceSymbol {
                         name: sym.base_symbol_information.name,
-                        kind: format!("{:?}", sym.base_symbol_information.kind),
+                        kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
                         location: Location {
                             uri: sym.location.uri.to_string(),
                             range,
@@ -263,7 +286,7 @@ impl Translator {
                     };
                     symbols.push(WorkspaceSymbol {
                         name: sym.base_symbol_information.name,
-                        kind: format!("{:?}", sym.base_symbol_information.kind),
+                        kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
                         location: Location {
                             uri,
                             range,
@@ -276,9 +299,9 @@ impl Translator {
             None => {}
         }
 
-        // Apply kind filter if specified
-        if let Some(kind) = kind_filter {
-            symbols.retain(|s| s.kind.eq_ignore_ascii_case(&kind));
+        // Apply kind filter if specified.
+        if let Some(target) = kind_filter {
+            symbols.retain(|s| s.kind == target);
         }
 
         // Limit results
@@ -305,12 +328,13 @@ mod tests {
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
 
-    /// #355 regression: `validate_workspace_symbol_params` accepts/rejects
-    /// `kind_filter` values based on `SymbolKind`'s derived `Debug` output,
-    /// since `gen-lsp-types` provides no `as_str()`/`Display`. This pins that
-    /// assumption directly so a future `gen-lsp-types` bump that changes the
-    /// `Debug` rendering (e.g. back to a newtype) fails loudly here instead
-    /// of silently diverging from the DTO `kind` strings the responses emit.
+    /// #355/#467 regression: `resolve_kind_filter`'s name-matching branch
+    /// accepts/rejects `kind_filter` values based on `SymbolKind`'s derived
+    /// `Debug` output, since `gen-lsp-types` provides no `as_str()`/`Display`.
+    /// This pins that assumption directly so a future `gen-lsp-types` bump
+    /// that changes the `Debug` rendering (e.g. back to a newtype) fails
+    /// loudly here instead of silently diverging from the input-filter
+    /// matching logic.
     #[test]
     fn test_symbol_kind_debug_rendering_is_pinned() {
         assert_eq!(
@@ -319,14 +343,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_validate_workspace_symbol_params_accepts_known_kind() {
-        assert!(validate_workspace_symbol_params("q", Some("EnumMember")).is_ok());
+    /// #467 regression: the output `kind` field is the raw LSP wire-format
+    /// `u32`, not the `SymbolKind`'s `Debug` string -- pins the numeric
+    /// behavior that replaced the old, lossy `format!("{:?}", kind)`
+    /// rendering.
+    #[tokio::test]
+    async fn test_convert_document_symbol_kind_is_numeric() {
+        let symbol = DocumentSymbol {
+            name: "my_enum_member".to_string(),
+            detail: None,
+            kind: lsp_types::SymbolKind::EnumMember,
+            tags: None,
+            #[allow(deprecated)]
+            deprecated: None,
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            selection_range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            children: None,
+        };
+        let ctx = test_ctx();
+        let uri = lsp_types::Uri::from("file:///tmp/test.rs");
+        let result = convert_document_symbol(symbol, &ctx, &uri).await;
+        // SymbolKind::EnumMember is LSP integer 22.
+        assert_eq!(result.kind, 22u32);
     }
 
     #[test]
-    fn test_validate_workspace_symbol_params_rejects_unknown_kind() {
-        let result = validate_workspace_symbol_params("q", Some("NotAKind"));
+    fn test_resolve_kind_filter_accepts_known_name() {
+        assert_eq!(resolve_kind_filter("EnumMember").unwrap(), 22u32);
+    }
+
+    /// #467 S1: a client can feed back the numeric `kind` a result actually
+    /// carries, closing the round-trip the switch to a numeric output field
+    /// would otherwise have broken.
+    #[test]
+    fn test_resolve_kind_filter_accepts_numeric_value() {
+        assert_eq!(resolve_kind_filter("22").unwrap(), 22u32);
+    }
+
+    #[test]
+    fn test_resolve_kind_filter_rejects_unknown_name() {
+        let result = resolve_kind_filter("NotAKind");
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
 

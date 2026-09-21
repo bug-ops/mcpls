@@ -662,7 +662,7 @@ Search for symbols across the entire workspace by name or pattern.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `query` | string | Yes | Search query for symbol names |
-| `kind_filter` | string | No | Filter by kind (function, class, etc.) |
+| `kind_filter` | string | No | Filter by kind: a name (function, class, etc.) or the numeric `kind` value from a result |
 | `limit` | integer | No | Maximum results (default: 100) |
 
 ### Returns
@@ -1070,12 +1070,12 @@ Array of inlay hints with positions and labels:
   {
     "position": { "line": 5, "character": 12 },
     "label": ": Vec<String>",
-    "kind": "type"
+    "kind": 1
   },
   {
     "position": { "line": 8, "character": 24 },
     "label": "timeout:",
-    "kind": "parameter"
+    "kind": 2
   }
 ]
 ```

@@ -952,7 +952,8 @@ async fn test_workspace_symbol_search_with_kind_filter() {
         // All results should be structs
         for symbol in &symbols.symbols {
             assert_eq!(
-                symbol.kind, "Struct",
+                symbol.kind,
+                u32::from(lsp_types::SymbolKind::Struct),
                 "All filtered results should be Struct kind"
             );
         }
@@ -1019,7 +1020,8 @@ async fn test_workspace_symbol_search_function() {
         // All results should be functions
         for symbol in &symbols.symbols {
             assert_eq!(
-                symbol.kind, "Function",
+                symbol.kind,
+                u32::from(lsp_types::SymbolKind::Function),
                 "All filtered results should be Function kind"
             );
         }

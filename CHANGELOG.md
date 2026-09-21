@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The e2e job now installs the `rust-src` component and `test_hover_on_std_vec` waits for std-lib indexing readiness, fixing a hover flake on a std-lib symbol. (#453, #455)
 - **`LspTransport::new`** — Breaking change: now returns `(LspTransport, LspTransportReader)` instead of one value; `LspClient`'s inbound read is cancel-safe, fixing LSP stream desync. (#451, #456)
 - In-flight LSP requests now fail immediately with `Error::ServerTerminated` when the message loop exits (transport error, reader task gone, or shutdown), instead of each caller blocking for the full request timeout. (#458, #463)
+- **`kind` fields on `get_document_symbols`, `workspace_symbol_search`, `get_completions`, and `get_inlay_hints`** — Breaking change: now the raw LSP numeric kind (`u32`) instead of a lossy `Debug`-string rendering or a narrowing `Option<u8>`; `workspace_symbol_search`'s `kind_filter` now also accepts that numeric value. (#467, #472)
 
 ### Security
 

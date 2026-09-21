@@ -4,6 +4,14 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Convert an LSP integer-valued enum (`SymbolKind`, `CompletionItemKind`,
+/// `InlayHintKind`, ...) to its wire-format `u32`.
+///
+/// Infallible and needs no fallback value, unlike a `serde_json` roundtrip.
+pub(super) fn lsp_kind_to_u32<T: Into<u32>>(kind: T) -> u32 {
+    kind.into()
+}
+
 /// Position in a document (1-based for MCP).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Position2D {
@@ -162,8 +170,8 @@ pub struct RenameResult {
 pub struct Completion {
     /// Label of the completion.
     pub label: String,
-    /// Kind of completion.
-    pub kind: Option<String>,
+    /// LSP numeric completion-item kind (e.g. 3 for Function).
+    pub kind: Option<u32>,
     /// Detail information.
     pub detail: Option<String>,
     /// Documentation.
@@ -182,8 +190,8 @@ pub struct CompletionsResult {
 pub struct Symbol {
     /// Name of the symbol.
     pub name: String,
-    /// Kind of symbol.
-    pub kind: String,
+    /// LSP numeric symbol kind (e.g. 12 for Function).
+    pub kind: u32,
     /// Range of the symbol.
     pub range: Range,
     /// Selection range (identifier location).
@@ -212,8 +220,8 @@ pub struct FormatDocumentResult {
 pub struct WorkspaceSymbol {
     /// Name of the symbol.
     pub name: String,
-    /// Kind of symbol.
-    pub kind: String,
+    /// LSP numeric symbol kind (e.g. 12 for Function).
+    pub kind: u32,
     /// Location of the symbol.
     pub location: Location,
     /// Optional container name (parent scope).
@@ -410,9 +418,10 @@ pub struct InlayHintEntry {
     pub position: Position2D,
     /// Label text for the hint.
     pub label: String,
-    /// Hint kind (1 = Type, 2 = Parameter).
+    /// LSP numeric inlay-hint kind (1 = Type, 2 = Parameter, or a
+    /// server-defined custom value).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<u8>,
+    pub kind: Option<u32>,
     /// Whether to add a space before the hint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub padding_left: Option<bool>,
@@ -429,4 +438,20 @@ pub struct InlayHintEntry {
 pub struct InlayHintsResult {
     /// List of inlay hints.
     pub hints: Vec<InlayHintEntry>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::lsp_kind_to_u32;
+
+    /// #467 regression: the old `Option<u8>` narrowing silently dropped any
+    /// `InlayHintKind::Custom(n)` with `n > 255` to `None`, indistinguishable
+    /// from "server sent no kind". `lsp_kind_to_u32` must preserve the full
+    /// `u32` value losslessly.
+    #[test]
+    fn test_lsp_kind_to_u32_preserves_custom_values_above_u8_range() {
+        let kind = lsp_types::InlayHintKind::Custom(300);
+        assert_eq!(lsp_kind_to_u32(kind), 300u32);
+    }
 }

@@ -9,7 +9,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{
     CallHierarchyItemResult, CallHierarchyPrepareResult, IncomingCall, IncomingCallsResult,
-    OutgoingCall, OutgoingCallsResult, Position,
+    OutgoingCall, OutgoingCallsResult, Position, lsp_kind_to_u32,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE};
@@ -53,10 +53,10 @@ async fn call_hierarchy_item_to_lsp(
 ) -> CallHierarchyItem {
     let ParsedCallHierarchyItem { uri, mcp } = parsed;
 
-    // Round-trip via serde: `convert_call_hierarchy_item` stored the kind as a u32
-    // by serialising `SymbolKind`; we reverse this to reconstruct the same value.
-    let kind: lsp_types::SymbolKind = serde_json::from_value(serde_json::json!(mcp.kind))
-        .unwrap_or(lsp_types::SymbolKind::Function);
+    // `SymbolKind: From<u32>` is infallible (see `lsp_kind_to_u32`'s docs),
+    // so this exactly reverses the `lsp_kind_to_u32` call in
+    // `convert_call_hierarchy_item` with no fallback needed.
+    let kind = lsp_types::SymbolKind::from(mcp.kind);
     let range = ctx.denormalize_range(&uri, &mcp.range).await;
     let selection_range = ctx.denormalize_range(&uri, &mcp.selection_range).await;
 
@@ -83,11 +83,7 @@ async fn convert_call_hierarchy_item(
 
     CallHierarchyItemResult {
         name: item.name,
-        kind: serde_json::to_value(item.kind)
-            .ok()
-            .and_then(|v| v.as_u64())
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0),
+        kind: lsp_kind_to_u32(item.kind),
         detail: item.detail,
         uri: item.uri.to_string(),
         range,
@@ -631,6 +627,88 @@ mod tests {
         // SymbolKind::Function is LSP integer 12
         assert_eq!(result.kind, 12u32);
         assert_eq!(result.name, "my_fn");
+    }
+
+    /// #467 M2/tester gap 2: pins that `call_hierarchy_item_to_lsp`'s reverse
+    /// `u32 -> SymbolKind` conversion round-trips a non-`Function` kind
+    /// through to the outbound wire request unchanged -- not the
+    /// `unwrap_or(Function)` fallback it used to fabricate on a conversion
+    /// failure that could not actually occur.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_round_trips_non_function_kind() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let queried_path = dir.path().join("queried.rs");
+        fs::write(&queried_path, "fn queried() {}").unwrap();
+        let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
+
+        let item = CallHierarchyItemResult {
+            name: "queried_method".to_string(),
+            kind: 6, // SymbolKind::Method
+            detail: None,
+            uri: queried_uri,
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            selection_range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            data: None,
+            out_of_workspace: false,
+        };
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let item = serde_json::to_value(item).unwrap();
+            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "callHierarchy/incomingCalls");
+        assert_eq!(
+            request["params"]["item"]["kind"], 6,
+            "the reverse u32 -> SymbolKind conversion must round-trip a non-Function kind \
+             exactly, not fall back to Function (12)"
+        );
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+        assert!(result.calls.is_empty());
     }
 
     /// Per the LSP spec, an incoming call's `fromRanges` are ranges within
