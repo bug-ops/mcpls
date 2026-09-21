@@ -13,7 +13,7 @@ use lsp_types::{
     TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
 };
 use tokio::fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
@@ -283,6 +283,39 @@ impl Default for ResourceLimits {
             max_file_size: DEFAULT_MAX_FILE_SIZE,
         }
     }
+}
+
+/// Nominal charge for a [`DocumentTracker::read_line_checked`] call whose
+/// [`DocumentTracker::open_checked`] failed (path doesn't exist, isn't a
+/// regular file, or already exceeds `max_file_size`) -- zero bytes were
+/// actually scanned, but charging a literal `0` would let a response naming
+/// many nonexistent paths (a routine, non-attacker-controlled LSP server
+/// behavior -- e.g. rust-analyzer's stdlib locations without `rust-src`
+/// installed) repeat that cheap-but-nonzero syscall for free against a
+/// per-response I/O budget (see #474's budget-bypass follow-up). Small
+/// enough to have no material effect on a legitimate response's budget
+/// (~10,000 failed opens before exhausting [`DEFAULT_MAX_FILE_SIZE`]'s
+/// worth of budget on their own), while still bounding the failed-open
+/// amplification to the same order of magnitude as other count caps in this
+/// crate.
+pub const OPEN_FAILURE_CHARGE_BYTES: u64 = 4096;
+
+/// Outcome of [`DocumentTracker::read_line_checked`]: the requested line
+/// (`None` if the file has fewer lines, doesn't exist, or otherwise
+/// resolved to no usable text), plus the bytes to charge a caller
+/// tracking its own I/O budget across many calls (see `EncodingCtx`'s
+/// per-response disk-read budget, #474) -- not always a literal count of
+/// bytes scanned (see [`OPEN_FAILURE_CHARGE_BYTES`]), but always safe to
+/// charge as such. Charge this rather than assuming cost is proportional
+/// to `text`'s own length -- most of the cost is the lines skipped before
+/// it.
+#[derive(Debug, Clone)]
+pub struct LineRead {
+    /// The requested line's text, or `None` if the file has no such line.
+    pub(crate) text: Option<String>,
+    /// Bytes to charge against a caller's I/O budget for this call; see
+    /// this type's own doc for when this isn't a literal scanned-byte count.
+    pub(crate) bytes_read: u64,
 }
 
 /// Tracks document state across the workspace.
@@ -824,9 +857,11 @@ impl DocumentTracker {
         Ok((content, mtime, size))
     }
 
-    /// Reads `path`'s full content directly from disk, applying the same
-    /// regular-file and [`Self::check_file_size`] checks as a tracked
-    /// document's disk read (see [`Self::read_to_string_checked`]).
+    /// Reads only the 0-based `line`'th line of `path` from disk, applying
+    /// the same regular-file and [`Self::check_file_size`] checks as a
+    /// tracked document's disk read (see [`Self::read_to_string_checked`]),
+    /// but stopping as soon as `line` is found rather than buffering the
+    /// whole file just to discard everything past one line (see #474).
     ///
     /// For a document not tracked by this tracker at all -- e.g. one
     /// resolved only for encoding-conversion purposes, never opened for LSP
@@ -834,9 +869,118 @@ impl DocumentTracker {
     /// all (see #427). Callers that only need best-effort text (falling back
     /// to `None` on any error) should treat every error here that way rather
     /// than surfacing it.
-    pub(crate) async fn read_checked(&self, path: &Path) -> Result<String> {
-        let (file, meta) = self.open_checked(path).await?;
-        self.read_string_bounded(path, file, meta.len()).await
+    ///
+    /// [`LineRead::text`] is `None` if `path` doesn't resolve to an
+    /// existing, readable regular file at all (see [`Self::open_checked`]),
+    /// if `path` has fewer than `line + 1` lines, if the line's bytes are
+    /// not valid UTF-8, or if `budget` (or `max_file_size`) was exhausted
+    /// before a complete line could be read -- [`LineRead::bytes_read`] is
+    /// populated in every one of these cases (see below), never silently
+    /// dropped via an `Err` with no byte count. The line's trailing line
+    /// ending is stripped to match `str::lines`'s convention exactly: a
+    /// trailing `\n` is removed, and only then is one further trailing `\r`
+    /// also removed (a real `\r\n` terminator) -- a final line with no
+    /// trailing `\n` at all keeps any trailing `\r` verbatim, since it was
+    /// never followed by a real line terminator, same as `str::lines`.
+    ///
+    /// `budget` bounds this call's own read on top of
+    /// [`crate::util::bounded_read_cap`] of `max_file_size`: the actual cap
+    /// used is `min(bounded_read_cap(max_file_size), budget + 1)`, enforced
+    /// by wrapping the file handle itself in [`AsyncReadExt::take`] rather
+    /// than checked after the fact -- so this call physically cannot scan
+    /// more than one byte past `budget`, regardless of how large
+    /// `max_file_size` is configured (including `max_file_size = 0`,
+    /// meaning unlimited). The `+ 1` is the same disambiguation slack
+    /// `bounded_read_cap` already applies to `max_file_size`: without it, a
+    /// read whose remaining budget exactly equals its target line's byte
+    /// length (no trailing newline) is indistinguishable from one
+    /// genuinely truncated by the cap. A caller enforcing its own I/O
+    /// budget across many calls (see `EncodingCtx`'s per-response
+    /// disk-read budget, #474) passes its remaining allowance here and
+    /// charges exactly [`LineRead::bytes_read`] afterward -- always
+    /// available, on every outcome, so the budget can never be bypassed by
+    /// triggering a failure mid-scan, and never overshoots by more than
+    /// this one byte of slack.
+    ///
+    /// [`Self::open_checked`] failing (path doesn't exist, isn't a regular
+    /// file, or already exceeds `max_file_size` at stat time) is reported
+    /// the same way, charging [`OPEN_FAILURE_CHARGE_BYTES`] rather than a
+    /// literal `0` -- zero bytes were actually scanned, but an LSP server
+    /// routinely names paths that don't exist locally (e.g. rust-analyzer's
+    /// `file:///rustc/<hash>/library/...` without `rust-src` installed),
+    /// and a literal `0` would let a response naming many such paths repeat
+    /// this cheap-but-nonzero syscall for free against the per-response
+    /// budget (see #474's budget-bypass follow-up). A real mid-read I/O
+    /// error (rare, not attacker-controlled by response content) is the one
+    /// case that still returns a genuine `Err` with no byte count.
+    ///
+    /// Also closes #427/#418's TOCTOU margin without a dedicated error: if
+    /// `path` grows past `max_file_size` (or past `budget`) between
+    /// [`Self::open_checked`]'s stat and this read completing, the capped
+    /// take-adapter simply runs out mid-line, which this method detects
+    /// (`buf` doesn't end in the expected `\n`) and reports as `None` rather
+    /// than returning a truncated line as if it were complete.
+    pub(crate) async fn read_line_checked(
+        &self,
+        path: &Path,
+        line: u32,
+        budget: u64,
+    ) -> Result<LineRead> {
+        let Ok((file, _meta)) = self.open_checked(path).await else {
+            return Ok(LineRead {
+                text: None,
+                bytes_read: OPEN_FAILURE_CHARGE_BYTES,
+            });
+        };
+        let max = self.limits.max_file_size;
+        // `+1` slack on `budget`, same trick `bounded_read_cap` already
+        // applies to `max_file_size`: without it, a read whose remaining
+        // budget exactly equals its target line's byte length (no trailing
+        // newline) is indistinguishable from one truncated by the cap, and
+        // was misreported as truncated (see #474's correctness-gate fix).
+        let cap = bounded_read_cap(max).min(budget.saturating_add(1));
+        let mut reader = tokio::io::BufReader::new(file.take(cap));
+        let io_err = |e: std::io::Error| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        };
+
+        let mut buf = Vec::new();
+        let mut bytes_read: u64 = 0;
+        let mut current_line = 0u32;
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf).await.map_err(io_err)?;
+            bytes_read += n as u64;
+            if n == 0 {
+                // No complete line left to return either way; bytes scanned
+                // are still reported so the caller can charge them.
+                return Ok(LineRead {
+                    text: None,
+                    bytes_read,
+                });
+            }
+            if current_line == line {
+                let truncated_by_cap = bytes_read >= cap && buf.last() != Some(&b'\n');
+                if truncated_by_cap {
+                    return Ok(LineRead {
+                        text: None,
+                        bytes_read,
+                    });
+                }
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                return Ok(LineRead {
+                    text: String::from_utf8(buf).ok(),
+                    bytes_read,
+                });
+            }
+            current_line += 1;
+        }
     }
 
     /// Per-server sync phase of `ensure_open`: sends `didOpen`, `didChange`,
@@ -2898,5 +3042,313 @@ mod tests {
             result,
             Err(Error::FileSizeLimitExceeded { size: 11, max: 10 })
         ));
+    }
+
+    /// Regression for #474: `read_line_checked` must stop reading (and
+    /// UTF-8-decoding) once it has the requested line, not buffer/validate
+    /// the rest of the file. The file's second line is invalid UTF-8, which
+    /// would fail a whole-file read (as the pre-#474 `read_checked` +
+    /// `.lines().nth(...)` path did); reading line 0 must still succeed.
+    #[tokio::test]
+    async fn test_read_line_checked_does_not_read_past_target_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partial.rs");
+        let mut content = b"hello\n".to_vec();
+        content.extend_from_slice(&[0xFF, 0xFE]);
+        content.push(b'\n');
+        std::fs::write(&path, &content).unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let line = tracker.read_line_checked(&path, 0, u64::MAX).await.unwrap();
+        assert_eq!(line.text.as_deref(), Some("hello"));
+    }
+
+    /// Regression for M3: an off-by-one in `current_line` (e.g. returning
+    /// line `N + 1` for `N`) would ship green if every test used line 0.
+    /// Exercises a non-zero target line on a multi-line fixture.
+    #[tokio::test]
+    async fn test_read_line_checked_returns_requested_non_zero_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("multi.rs");
+        std::fs::write(&path, "first\nsecond\nthird\nfourth\n").unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 2, u64::MAX)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("third")
+        );
+    }
+
+    /// `read_line_checked` must report `Ok(None)`, not an error, when `line`
+    /// is past the file's last line -- distinguishing "file has fewer lines
+    /// than requested" from an actual read failure.
+    #[tokio::test]
+    async fn test_read_line_checked_returns_none_past_last_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("short.rs");
+        std::fs::write(&path, "only one line").unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 5, u64::MAX)
+                .await
+                .unwrap()
+                .text,
+            None
+        );
+    }
+
+    /// A requested line with no trailing `\n` at all (the file's only line,
+    /// never terminated) must still be returned -- distinct from
+    /// `test_read_line_checked_returns_none_past_last_line`, which requests a
+    /// line number past this same kind of file instead of the line itself.
+    #[tokio::test]
+    async fn test_read_line_checked_reads_last_line_without_trailing_newline() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("no_newline.rs");
+        std::fs::write(&path, "only one line").unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 0, u64::MAX)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("only one line")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_line_checked_empty_file_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.rs");
+        std::fs::write(&path, "").unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 0, u64::MAX)
+                .await
+                .unwrap()
+                .text,
+            None
+        );
+    }
+
+    /// `read_until(b'\n', ..)` splits lines on `\n` alone, so a `\r` ahead of
+    /// it is left in `buf` until the trailing-separator strip loop removes
+    /// it -- pins that CRLF-terminated lines come out identical to LF-only
+    /// ones.
+    #[tokio::test]
+    async fn test_read_line_checked_strips_crlf_line_ending() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("crlf.rs");
+        std::fs::write(&path, "first\r\nsecond\r\n").unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 0, u64::MAX)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 1, u64::MAX)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("second")
+        );
+    }
+
+    /// Regression for M2: `str::lines` strips at most one trailing `\r` per
+    /// line, not every trailing `\r`, and only when it precedes an actual
+    /// `\n` terminator -- a final, untermined line keeps a trailing `\r`
+    /// verbatim. Uses `str::lines` itself as the oracle on the exact inputs
+    /// that distinguish these from a naive "strip every trailing `\r`/`\n`"
+    /// implementation.
+    #[tokio::test]
+    async fn test_read_line_checked_matches_str_lines_crlf_semantics() {
+        let dir = TempDir::new().unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+
+        let double_cr = "abc\r\r\n";
+        let path_a = dir.path().join("double_cr.rs");
+        std::fs::write(&path_a, double_cr).unwrap();
+        assert_eq!(
+            tracker
+                .read_line_checked(&path_a, 0, u64::MAX)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            double_cr.lines().next()
+        );
+
+        let trailing_cr_no_newline = "abc\r";
+        let path_b = dir.path().join("trailing_cr_no_newline.rs");
+        std::fs::write(&path_b, trailing_cr_no_newline).unwrap();
+        assert_eq!(
+            tracker
+                .read_line_checked(&path_b, 0, u64::MAX)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            trailing_cr_no_newline.lines().next()
+        );
+    }
+
+    /// Regression for the `bounded_read_cap` off-by-one: a file whose size
+    /// is exactly `max_file_size` must not be misreported as oversized when
+    /// a request (for a line past the file's content) forces a full read to
+    /// EOF. The cap is `max_file_size + 1` precisely so this exact-boundary
+    /// case is distinguishable from a genuinely oversized file.
+    #[tokio::test]
+    async fn test_read_line_checked_exact_max_file_size_reads_to_eof_without_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("exact.rs");
+        let content = "a".repeat(20);
+        std::fs::write(&path, &content).unwrap();
+
+        let limits = ResourceLimits {
+            max_documents: 100,
+            max_file_size: 20,
+        };
+        let tracker = DocumentTracker::new(limits, HashMap::new());
+
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 0, u64::MAX)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            Some(content.as_str())
+        );
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 1, u64::MAX)
+                .await
+                .unwrap()
+                .text,
+            None,
+            "a line past an exact-max_file_size file's only line must read to EOF cleanly, not \
+             be misreported as truncated"
+        );
+    }
+
+    /// Regression for the S1 budget-bypass fix: `budget` must physically
+    /// bound the read (via the take-adapter), not just gate whether a read
+    /// is attempted -- a read that starts with budget left must still stop
+    /// at exactly that many bytes, never at the full `max_file_size`.
+    /// Distinguishes this from `bounded_read_cap(max_file_size)` alone by
+    /// using a `budget` far smaller than `max_file_size`.
+    #[tokio::test]
+    async fn test_read_line_checked_bounds_read_by_budget_not_just_max_file_size() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("budget.rs");
+        std::fs::write(&path, "a".repeat(1000)).unwrap();
+
+        let limits = ResourceLimits {
+            max_documents: 100,
+            max_file_size: 1000,
+        };
+        let tracker = DocumentTracker::new(limits, HashMap::new());
+
+        let read = tracker.read_line_checked(&path, 0, 10).await.unwrap();
+        assert_eq!(
+            read.text, None,
+            "a single line far longer than the budget must not be returned as if complete"
+        );
+        assert_eq!(
+            read.bytes_read, 11,
+            "the read must stop at exactly the budget's +1 slack (see the correctness-gate fix \
+             below), not at max_file_size"
+        );
+    }
+
+    /// Regression for a correctness-gate finding: `cap`'s `budget` component
+    /// needs the same `+1` disambiguation slack `bounded_read_cap` already
+    /// applies to `max_file_size` -- without it, a read whose remaining
+    /// budget exactly equals its target line's byte length (no trailing
+    /// newline) is indistinguishable from one genuinely truncated by the
+    /// cap, and was misreported as truncated (`text: None`) even though the
+    /// read fully succeeded.
+    #[tokio::test]
+    async fn test_read_line_checked_exact_budget_match_on_unterminated_line_not_truncated() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("exact_budget.rs");
+        let content = "twelve chars";
+        std::fs::write(&path, content).unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let read = tracker
+            .read_line_checked(&path, 0, content.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.text.as_deref(),
+            Some(content),
+            "budget exactly matching the line's byte length must not be misreported as truncated"
+        );
+        assert_eq!(read.bytes_read, content.len() as u64);
+    }
+
+    /// Regression for the S1 budget-bypass fix: an invalid-UTF-8 line (the
+    /// realistic attack shape -- a `.rlib`/image/pack file under
+    /// `max_file_size`) must still report an accurate `bytes_read` on
+    /// `LineRead::text == None`, not lose it down an `Err` path with no byte
+    /// count -- that loss is exactly what let a hostile response scan
+    /// unlimited bytes while charging the per-response budget zero.
+    #[tokio::test]
+    async fn test_read_line_checked_reports_bytes_read_for_invalid_utf8_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("invalid_utf8.rs");
+        let mut content = vec![0xFFu8, 0xFE, 0xFD];
+        content.push(b'\n');
+        std::fs::write(&path, &content).unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let read = tracker.read_line_checked(&path, 0, u64::MAX).await.unwrap();
+        assert_eq!(read.text, None);
+        assert_eq!(
+            read.bytes_read,
+            content.len() as u64,
+            "bytes scanned must be reported even though the line wasn't valid UTF-8"
+        );
+    }
+
+    /// Regression for the open-failure-charge fix: a path that doesn't
+    /// exist (the realistic, non-attacker case -- e.g. an LSP server naming
+    /// a stdlib location not present locally) must resolve to `Ok(None)`,
+    /// not `Err`, and must charge the small nominal
+    /// `OPEN_FAILURE_CHARGE_BYTES` amount rather than `0` (which would let
+    /// a response repeat this for free) or the full budget (the previous
+    /// round's regression, which zeroed the whole per-response budget on
+    /// the very first such location).
+    #[tokio::test]
+    async fn test_read_line_checked_charges_nominal_amount_for_nonexistent_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("does_not_exist.rs");
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        // A nonexistent path must resolve to Ok(None), not Err.
+        let read = tracker.read_line_checked(&path, 0, u64::MAX).await.unwrap();
+        assert_eq!(read.text, None);
+        assert_eq!(read.bytes_read, OPEN_FAILURE_CHARGE_BYTES);
     }
 }

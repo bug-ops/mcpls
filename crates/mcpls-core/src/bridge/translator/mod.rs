@@ -289,6 +289,7 @@ impl Translator {
             encoding: self.position_encoding_for(server_id),
             tracker: self.document_tracker.clone(),
             workspace_roots: self.workspace_roots.clone(),
+            line_cache: encoding_ctx::new_line_cache(),
         }
     }
 

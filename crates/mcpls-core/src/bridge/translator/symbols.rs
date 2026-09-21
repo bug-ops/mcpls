@@ -11,6 +11,7 @@ use super::dto::{
     lsp_kind_to_u32,
 };
 use super::encoding_ctx::EncodingCtx;
+use super::navigation::MAX_NORMALIZED_LOCATIONS;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::lock_std;
 use crate::config::{NoServerReason, ToolKind};
@@ -242,7 +243,13 @@ impl Translator {
             .await?;
 
         let ctx = self.encoding_ctx(&server_id);
-        let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
+
+        // Collected without normalizing each symbol's range yet, so
+        // `kind_filter`/`limit` below can drop entries before paying for
+        // `EncodingCtx::normalize_range` (a disk read on a cache miss) on
+        // each one -- bounds the *normalization* loop's cost to `limit`;
+        // this collection loop itself still scans the full response (#474).
+        let mut raw_symbols: Vec<RawWorkspaceSymbol> = Vec::new();
         match response {
             // Not filtered to workspace roots -- like other read-only
             // navigation results (see `uri_in_workspace_roots`'s doc
@@ -252,29 +259,20 @@ impl Translator {
             // `validate_path_against_roots` gate.
             Some(lsp_types::WorkspaceSymbolResponse::SymbolInformationList(list)) => {
                 for sym in list {
-                    let range = ctx
-                        .normalize_range(&sym.location.uri, sym.location.range)
-                        .await;
-                    symbols.push(WorkspaceSymbol {
+                    raw_symbols.push(RawWorkspaceSymbol {
                         name: sym.base_symbol_information.name,
                         kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
-                        location: Location {
-                            uri: sym.location.uri.to_string(),
-                            range,
-                            out_of_workspace: ctx.is_out_of_workspace(&sym.location.uri),
-                        },
                         container_name: sym.base_symbol_information.container_name,
+                        out_of_workspace: ctx.is_out_of_workspace(&sym.location.uri),
+                        uri: sym.location.uri,
+                        range: sym.location.range,
                     });
                 }
             }
             Some(lsp_types::WorkspaceSymbolResponse::WorkspaceSymbolList(list)) => {
                 for sym in list {
-                    let (uri, out_of_workspace, range) = match sym.location {
-                        lsp_types::WorkspaceSymbolLocation::Location(loc) => {
-                            let out_of_workspace = ctx.is_out_of_workspace(&loc.uri);
-                            let range = ctx.normalize_range(&loc.uri, loc.range).await;
-                            (loc.uri.to_string(), out_of_workspace, range)
-                        }
+                    let (uri, range) = match sym.location {
+                        lsp_types::WorkspaceSymbolLocation::Location(loc) => (loc.uri, loc.range),
                         // `LocationUriOnly` carries no range -- the server
                         // deliberately withheld it (e.g. to avoid computing it
                         // eagerly for every workspace-search result). The MCP
@@ -284,31 +282,58 @@ impl Translator {
                         // symbol is dropped rather than inventing coordinates.
                         lsp_types::WorkspaceSymbolLocation::LocationUriOnly(_) => continue,
                     };
-                    symbols.push(WorkspaceSymbol {
+                    raw_symbols.push(RawWorkspaceSymbol {
                         name: sym.base_symbol_information.name,
                         kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
-                        location: Location {
-                            uri,
-                            range,
-                            out_of_workspace,
-                        },
                         container_name: sym.base_symbol_information.container_name,
+                        out_of_workspace: ctx.is_out_of_workspace(&uri),
+                        uri,
+                        range,
                     });
                 }
             }
             None => {}
         }
 
-        // Apply kind filter if specified.
         if let Some(target) = kind_filter {
-            symbols.retain(|s| s.kind == target);
+            raw_symbols.retain(|s| s.kind == target);
+        }
+        // `limit` is clamped to MAX_NORMALIZED_LOCATIONS (else u32::MAX
+        // would reopen the unbounded normalization loop, see #474).
+        let effective_limit = (limit as usize).min(MAX_NORMALIZED_LOCATIONS);
+        let truncated = raw_symbols.len() > effective_limit;
+        raw_symbols.truncate(effective_limit);
+
+        let mut symbols = Vec::with_capacity(raw_symbols.len());
+        for raw in raw_symbols {
+            let range = ctx.normalize_range(&raw.uri, raw.range).await;
+            symbols.push(WorkspaceSymbol {
+                name: raw.name,
+                kind: raw.kind,
+                location: Location {
+                    uri: raw.uri.to_string(),
+                    range,
+                    out_of_workspace: raw.out_of_workspace,
+                },
+                container_name: raw.container_name,
+            });
         }
 
-        // Limit results
-        symbols.truncate(limit as usize);
-
-        Ok(WorkspaceSymbolResult { symbols })
+        Ok(WorkspaceSymbolResult { symbols, truncated })
     }
+}
+
+/// A workspace symbol not yet normalized into MCP coordinates -- lets
+/// [`Translator::handle_workspace_symbol`] apply `kind_filter`/`limit` before
+/// paying for [`EncodingCtx::normalize_range`] on each surviving entry (see
+/// #474).
+struct RawWorkspaceSymbol {
+    name: String,
+    kind: u32,
+    container_name: Option<String>,
+    out_of_workspace: bool,
+    uri: lsp_types::Uri,
+    range: lsp_types::Range,
 }
 
 #[cfg(test)]
@@ -773,6 +798,76 @@ mod tests {
                 .location
                 .out_of_workspace,
             "an out-of-workspace symbol location must be marked out_of_workspace"
+        );
+    }
+
+    /// Regression for #474: `limit` is a caller-supplied `u32` with no
+    /// upper bound of its own -- `limit: u32::MAX` must still be clamped to
+    /// `MAX_NORMALIZED_LOCATIONS`, not restore the unbounded normalization
+    /// loop the cap exists to prevent.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_clamps_limit_to_max_normalized_locations() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let uri = Url::from_file_path(dir.path().join("many.rs"))
+            .unwrap()
+            .to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_workspace_symbol("foo".to_string(), None, u32::MAX)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "workspace/symbol");
+
+        let symbols: Vec<serde_json::Value> = (0..MAX_NORMALIZED_LOCATIONS + 500)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("sym{i}"),
+                    "kind": 12,
+                    "location": {
+                        "uri": uri,
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 3}
+                        }
+                    }
+                })
+            })
+            .collect();
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!(symbols),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.symbols.len(),
+            MAX_NORMALIZED_LOCATIONS,
+            "limit: u32::MAX must be clamped to MAX_NORMALIZED_LOCATIONS, not left unbounded"
+        );
+        assert!(
+            result.truncated,
+            "a limit clamped below what the caller asked for must set truncated: true"
         );
     }
 

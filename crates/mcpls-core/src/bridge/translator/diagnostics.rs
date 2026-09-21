@@ -243,6 +243,7 @@ impl Translator {
                     tracker: tracker.clone(),
                     // Never read here -- see `EMPTY_WORKSPACE_ROOTS`'s doc.
                     workspace_roots: EMPTY_WORKSPACE_ROOTS.clone(),
+                    line_cache: super::encoding_ctx::new_line_cache(),
                 };
                 let mut result = Vec::with_capacity(diag_info.diagnostics.len());
                 for d in &diag_info.diagnostics {
