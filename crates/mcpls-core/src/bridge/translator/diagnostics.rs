@@ -195,7 +195,10 @@ impl Translator {
                 for d in &items {
                     diagnostics.push(diagnostic_to_mcp(d, &ctx, &uri).await);
                 }
-                let pull = DiagnosticsResult { diagnostics };
+                let pull = DiagnosticsResult {
+                    diagnostics,
+                    positions_degraded: ctx.positions_degraded(),
+                };
                 Ok(Self::merge_diagnostics(
                     pull,
                     diag_info.as_ref(),
@@ -236,7 +239,7 @@ impl Translator {
         encoding: PositionEncoding,
         tracker: &Arc<DocumentTracker>,
     ) -> DiagnosticsResult {
-        let diagnostics = match diag_info {
+        match diag_info {
             Some(diag_info) => {
                 let ctx = EncodingCtx {
                     encoding,
@@ -249,12 +252,16 @@ impl Translator {
                 for d in &diag_info.diagnostics {
                     result.push(diagnostic_to_mcp(d, &ctx, &diag_info.uri).await);
                 }
-                result
+                DiagnosticsResult {
+                    diagnostics: result,
+                    positions_degraded: ctx.positions_degraded(),
+                }
             }
-            None => Vec::new(),
-        };
-
-        DiagnosticsResult { diagnostics }
+            None => DiagnosticsResult {
+                diagnostics: Vec::new(),
+                positions_degraded: false,
+            },
+        }
     }
 
     /// Merge push-model diagnostics from the notification cache into a
@@ -326,10 +333,10 @@ impl Translator {
             })
         }
 
-        let cached = Self::diagnostics_from_cache_entry(diag_info, encoding, tracker)
-            .await
-            .diagnostics;
+        let cached = Self::diagnostics_from_cache_entry(diag_info, encoding, tracker).await;
+        pull.positions_degraded |= cached.positions_degraded;
         let new_diagnostics: Vec<_> = cached
+            .diagnostics
             .into_iter()
             .filter(|c| !is_duplicate(&pull.diagnostics, c))
             .collect();
@@ -777,6 +784,7 @@ mod tests {
     async fn test_merge_diagnostics_cache_only_appends_to_empty_pull() {
         let pull = DiagnosticsResult {
             diagnostics: vec![],
+            positions_degraded: false,
         };
         let cache = diag_info(vec![lsp_diag(
             0,
@@ -823,6 +831,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
+            positions_degraded: false,
         };
         let cache = diag_info(vec![lsp_diag(
             0,
@@ -844,6 +853,73 @@ mod tests {
         assert_eq!(merged.diagnostics[0], pull_diag);
     }
 
+    /// #497 test gap: `merge_diagnostics`'s `pull.positions_degraded |=
+    /// cached.positions_degraded` must actually OR the two sides, not just
+    /// pass one through -- exercised here with the pull side degraded and
+    /// the cache side (UTF-16, never degradable) not.
+    #[tokio::test]
+    async fn test_merge_diagnostics_positions_degraded_true_when_pull_side_is_degraded() {
+        let pull = DiagnosticsResult {
+            diagnostics: vec![],
+            positions_degraded: true,
+        };
+        let cache = diag_info(vec![lsp_diag(
+            0,
+            10,
+            lsp_types::DiagnosticSeverity::Warning,
+            "unused import: `std::fmt`",
+            None,
+        )]);
+
+        let merged = Translator::merge_diagnostics(
+            pull,
+            Some(&cache),
+            PositionEncoding::Utf16,
+            &test_tracker(),
+        )
+        .await;
+
+        assert!(
+            merged.positions_degraded,
+            "the pull side's degraded flag must survive the merge even when the cache side \
+             isn't degraded"
+        );
+    }
+
+    /// #497 test gap companion: the same OR-merge, but with the degradation
+    /// coming from the *cache* side instead -- `diagnostics_from_cache_entry`
+    /// under a non-UTF-16 encoding, resolving `diag_info`'s uri
+    /// (`file:///test.rs`, which does not exist on disk), degrades on its
+    /// own. Proves the merge isn't only ever driven by the pull side.
+    #[tokio::test]
+    async fn test_merge_diagnostics_positions_degraded_true_when_cache_side_is_degraded() {
+        let pull = DiagnosticsResult {
+            diagnostics: vec![],
+            positions_degraded: false,
+        };
+        let cache = diag_info(vec![lsp_diag(
+            0,
+            10,
+            lsp_types::DiagnosticSeverity::Warning,
+            "unused import: `std::fmt`",
+            None,
+        )]);
+
+        let merged = Translator::merge_diagnostics(
+            pull,
+            Some(&cache),
+            PositionEncoding::Utf8,
+            &test_tracker(),
+        )
+        .await;
+
+        assert!(
+            merged.positions_degraded,
+            "the cache side's degraded flag must be OR-ed into the merged result even when the \
+             pull side isn't degraded"
+        );
+    }
+
     #[tokio::test]
     async fn test_merge_diagnostics_no_cache_entry_returns_pull_unchanged() {
         let pull_diag = Diagnostic {
@@ -863,6 +939,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
+            positions_degraded: false,
         };
 
         let merged =
@@ -876,6 +953,7 @@ mod tests {
     async fn test_merge_diagnostics_multiple_distinct_cache_entries_all_appear() {
         let pull = DiagnosticsResult {
             diagnostics: vec![],
+            positions_degraded: false,
         };
         let cache = diag_info(vec![
             lsp_diag(
@@ -936,6 +1014,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag],
+            positions_degraded: false,
         };
         // Same range and severity as the pull diagnostic, but a different
         // message — must be treated as a distinct diagnostic, not a duplicate.
@@ -984,6 +1063,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
+            positions_degraded: false,
         };
         // Same code and severity, but a different range and a longer,
         // differently-worded message -- the rustc-rendered push side of the
@@ -1042,6 +1122,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
+            positions_degraded: false,
         };
         // A second, unrelated E0308 at a completely different location with
         // a completely different message -- a real, distinct diagnostic,

@@ -54,8 +54,26 @@ pub(super) struct LineCacheState {
     bytes_remaining: u64,
     /// Whether the once-per-response budget-exhausted warning has already
     /// been logged, so a response with many post-exhaustion lookups logs
-    /// once rather than once per lookup.
+    /// once rather than once per lookup. Purely a log-dedup flag -- do not
+    /// reuse this for [`Self::positions_degraded`] (#497 S1/S2): it is only
+    /// set in [`disk_read_line_budgeted`]'s already-exhausted branch, never
+    /// for a read that merely couldn't complete *within* the remaining
+    /// budget (which still returns `None` and drains the budget, but
+    /// through the other branch), and it says nothing about any of the
+    /// other ways a position conversion can fall back to an unconverted
+    /// column (an unresolvable/non-`file:` URI, a path over
+    /// `max_file_size`, invalid UTF-8, or a line past EOF).
     budget_exhausted_logged: bool,
+    /// Whether any position conversion in this response passed a column
+    /// through unconverted because its line text could not be resolved --
+    /// set directly at the point that decision is made
+    /// ([`EncodingCtx::to_lsp`]/[`EncodingCtx::to_mcp`]'s `text.is_none()`
+    /// branch), covering every cause uniformly (disk-read budget
+    /// exhaustion, an unresolvable/non-`file:` URI, a path over
+    /// `max_file_size`, invalid UTF-8, a line past EOF, or the tracked
+    /// document's own line not existing) rather than only the one
+    /// `budget_exhausted_logged` covers. See [`EncodingCtx::positions_degraded`].
+    positions_degraded: bool,
 }
 
 impl LineCacheState {
@@ -64,6 +82,7 @@ impl LineCacheState {
             entries: HashMap::new(),
             bytes_remaining: MAX_LINE_READ_BYTES_PER_RESPONSE,
             budget_exhausted_logged: false,
+            positions_degraded: false,
         }
     }
 }
@@ -238,6 +257,19 @@ impl EncodingCtx {
         !crate::bridge::uri_in_workspace_roots(uri, &self.workspace_roots)
     }
 
+    /// Whether any position conversion made through this context so far
+    /// passed a column through unconverted because its line text could not
+    /// be resolved, for any reason -- surfaced to the caller via a
+    /// `positions_degraded`-style field on the affected result DTOs (#497),
+    /// since that was previously visible only as a `tracing::warn!`.
+    ///
+    /// Sticky for the context's lifetime -- once `true`, stays `true` for
+    /// the rest of the response, even if a later lookup for a *different*
+    /// `(path, line)` succeeds.
+    pub(super) fn positions_degraded(&self) -> bool {
+        lock_std(&self.line_cache).positions_degraded
+    }
+
     /// Convert an MCP position for the document at `uri` into an LSP
     /// position in this context's negotiated encoding.
     pub(super) async fn to_lsp(
@@ -251,6 +283,7 @@ impl EncodingCtx {
         } else {
             let text = read_line_text(uri, line.saturating_sub(1), self).await;
             if text.is_none() {
+                lock_std(&self.line_cache).positions_degraded = true;
                 tracing::warn!(
                     uri = uri.as_ref(),
                     line,
@@ -276,6 +309,7 @@ impl EncodingCtx {
         } else {
             let text = read_line_text(uri, pos.line, self).await;
             if text.is_none() {
+                lock_std(&self.line_cache).positions_degraded = true;
                 tracing::warn!(
                     uri = uri.as_ref(),
                     line = pos.line,
@@ -608,6 +642,63 @@ mod tests {
             "the physically-capped read must charge (at most one byte over) the budget it was \
              given, not overshoot to max_file_size"
         );
+    }
+
+    /// Regression for #497 S1: `positions_degraded()` must become `true` on
+    /// the very first lookup that falls back to an unconverted column, even
+    /// when that lookup's *own* remaining budget was nonzero going in
+    /// (merely insufficient for the line it needed) -- not only once the
+    /// budget has already been fully drained to zero by some earlier
+    /// lookup. Before this fix, `positions_degraded()` read
+    /// `budget_exhausted_logged`, which `disk_read_line_budgeted` only sets
+    /// in its *already-exhausted* branch, so this exact case (a single
+    /// `to_lsp` call against a too-long line) silently reported
+    /// `positions_degraded: false`.
+    #[tokio::test]
+    async fn test_positions_degraded_true_on_first_lookup_with_insufficient_remaining_budget() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("long_line.rs");
+        fs::write(&path, "a".repeat(1000)).unwrap();
+        let uri = path_to_uri(&path).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        lock_std(&ctx.line_cache).bytes_remaining = 10;
+
+        assert!(!ctx.positions_degraded(), "no lookup has happened yet");
+
+        ctx.to_lsp(&uri, 1, 3).await;
+
+        assert!(
+            ctx.positions_degraded(),
+            "a line too long for the remaining budget must mark positions_degraded, even on \
+             the very first such lookup"
+        );
+    }
+
+    /// Regression for #497 S2: `positions_degraded()` must reflect every
+    /// cause of a `to_lsp`/`to_mcp` unconverted-column fallback, not only
+    /// disk-read budget exhaustion -- an unresolvable path (e.g.
+    /// rust-analyzer naming a stdlib location without `rust-src` installed)
+    /// is the more common real-world case, and shares none of
+    /// `disk_read_line_budgeted`'s budget bookkeeping.
+    #[tokio::test]
+    async fn test_positions_degraded_true_for_nonexistent_path() {
+        let dir = TempDir::new().unwrap();
+        let uri = path_to_uri(&dir.path().join("does_not_exist.rs")).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        assert!(!ctx.positions_degraded());
+
+        ctx.to_mcp(
+            &uri,
+            lsp_types::Position {
+                line: 0,
+                character: 0,
+            },
+        )
+        .await;
+
+        assert!(ctx.positions_degraded());
     }
 
     /// Regression for the S1 budget-bypass fix (security re-audit): an

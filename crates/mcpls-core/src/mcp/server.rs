@@ -576,7 +576,7 @@ impl McplsServer {
 
     /// Get hover information at a position in a file.
     #[tool(
-        description = "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols.",
+        description = "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols. `positions_degraded: true` on the result means the returned range's `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Hover"
     )]
     async fn get_hover(
@@ -597,7 +597,7 @@ impl McplsServer {
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = "Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned.",
+        description = "Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Go to Definition"
     )]
     async fn get_definition(
@@ -618,7 +618,7 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = "References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned.",
+        description = "References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Find References"
     )]
     async fn get_references(
@@ -643,7 +643,7 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexingInProgress: true` means the routed server was indexing at some point during this read, so results may be incomplete.",
+        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexingInProgress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Diagnostics"
     )]
     async fn get_diagnostics(
@@ -706,7 +706,7 @@ impl McplsServer {
     // read-only: returns a proposed WorkspaceEdit, does not apply it -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty.",
+        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty. `positions_degraded: true` means some returned edit ranges' `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Rename Symbol"
     )]
     async fn rename_symbol(
@@ -756,7 +756,7 @@ impl McplsServer {
 
     /// Get all symbols in a document.
     #[tool(
-        description = "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations.",
+        description = "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Document Symbols"
     )]
     async fn get_document_symbols(
@@ -775,7 +775,7 @@ impl McplsServer {
     // read-only: returns proposed text edits, does not apply them -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Format document with language-specific rules. Returns text edits for indentation, spacing, and style.",
+        description = "Format document with language-specific rules. Returns text edits for indentation, spacing, and style. `positions_degraded: true` on the result means some returned edit ranges' `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Format Document"
     )]
     async fn format_document(
@@ -796,7 +796,7 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned.",
+        description = "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Workspace Symbol Search"
     )]
     async fn workspace_symbol_search(
@@ -819,7 +819,7 @@ impl McplsServer {
     // read-only: returns proposed CodeAction edits, does not apply them --
     // mcpls has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files).",
+        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). `positions_degraded: true` on the result means some returned `character` offsets (diagnostic or edit ranges) may be inexact (only possible for a non-UTF-16 server).",
         title = "Code Actions"
     )]
     async fn get_code_actions(
@@ -857,7 +857,7 @@ impl McplsServer {
 
     /// Prepare call hierarchy at a position.
     #[tool(
-        description = "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis.",
+        description = "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Prepare Call Hierarchy"
     )]
     async fn prepare_call_hierarchy(
@@ -878,7 +878,7 @@ impl McplsServer {
 
     /// Get incoming calls (callers).
     #[tool(
-        description = "Functions calling the specified item. Takes call hierarchy item, returns all callers.",
+        description = "Functions calling the specified item. Takes call hierarchy item, returns all callers. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Incoming Calls"
     )]
     async fn get_incoming_calls(
@@ -890,7 +890,7 @@ impl McplsServer {
 
     /// Get outgoing calls (callees).
     #[tool(
-        description = "Functions called by the specified item. Takes call hierarchy item, returns all callees.",
+        description = "Functions called by the specified item. Takes call hierarchy item, returns all callees. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Outgoing Calls"
     )]
     async fn get_outgoing_calls(
@@ -902,7 +902,7 @@ impl McplsServer {
 
     /// Get cached diagnostics for a file.
     #[tool(
-        description = "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis.",
+        description = "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Cached Diagnostics"
     )]
     async fn get_cached_diagnostics(
@@ -1017,7 +1017,7 @@ impl McplsServer {
 
     /// Go to implementation locations.
     #[tool(
-        description = "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned.",
+        description = "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Go to Implementation"
     )]
     async fn go_to_implementation(
@@ -1038,7 +1038,7 @@ impl McplsServer {
 
     /// Go to type definition location.
     #[tool(
-        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned.",
+        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Go to Type Definition"
     )]
     async fn go_to_type_definition(
@@ -1059,7 +1059,7 @@ impl McplsServer {
 
     /// Get inlay hints for a range.
     #[tool(
-        description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline.",
+        description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. `positions_degraded: true` on the result means some returned hint `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Inlay Hints"
     )]
     async fn get_inlay_hints(

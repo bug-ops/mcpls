@@ -462,7 +462,11 @@ impl Translator {
             (vec![], DroppedEdits::default())
         };
 
-        Ok(RenameResult { changes, dropped })
+        Ok(RenameResult {
+            changes,
+            dropped,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 
     /// Handle format document request.
@@ -513,6 +517,7 @@ impl Translator {
         }
         let result = FormatDocumentResult {
             edits: result_edits,
+            positions_degraded: ctx.positions_degraded(),
         };
 
         Ok(result)
@@ -609,7 +614,10 @@ impl Translator {
             actions.push(action);
         }
 
-        Ok(CodeActionsResult { actions })
+        Ok(CodeActionsResult {
+            actions,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 }
 
@@ -1885,6 +1893,7 @@ mod tests {
         let clean = RenameResult {
             changes: vec![],
             dropped: DroppedEdits::default(),
+            positions_degraded: false,
         };
         let clean_json = serde_json::to_value(&clean).unwrap();
         assert!(
@@ -1899,6 +1908,7 @@ mod tests {
                 unsupported_file_operation: 2,
                 unsupported_snippet_edit: 0,
             },
+            positions_degraded: false,
         };
         let incomplete_json = serde_json::to_value(&incomplete).unwrap();
         let dropped_json = incomplete_json

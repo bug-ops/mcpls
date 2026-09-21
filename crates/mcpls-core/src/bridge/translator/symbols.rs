@@ -165,7 +165,10 @@ impl Translator {
             None => vec![],
         };
 
-        Ok(DocumentSymbolsResult { symbols })
+        Ok(DocumentSymbolsResult {
+            symbols,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 
     /// Handle workspace symbol search.
@@ -319,7 +322,11 @@ impl Translator {
             });
         }
 
-        Ok(WorkspaceSymbolResult { symbols, truncated })
+        Ok(WorkspaceSymbolResult {
+            symbols,
+            truncated,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 }
 
@@ -621,6 +628,75 @@ mod tests {
             "must convert against the queried document's own content (\"aöb\"), not fail to \
              read the entry's own (nonexistent, out-of-workspace) location.uri and fall back to \
              the raw byte offset"
+        );
+    }
+
+    /// #497 end-to-end: `DocumentSymbolsResult::positions_degraded` must
+    /// become `true` when a returned range's line can't be resolved for
+    /// conversion under a non-UTF-16 server (here: a line past the queried
+    /// document's own EOF) -- proving the flag actually reaches the
+    /// caller-facing DTO, not just `EncodingCtx::positions_degraded()`
+    /// itself.
+    #[tokio::test]
+    async fn test_handle_document_symbols_sets_positions_degraded_for_unresolvable_line() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, mut server) = translator_with_capabilities_and_encoding(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities {
+                document_symbol_provider: Some(lsp_types::DocumentSymbolProvider::Bool(true)),
+                ..Default::default()
+            },
+            lsp_types::PositionEncodingKind::UTF8,
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "aöb").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move { translator.handle_document_symbols(path_str).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let symbol_request = read_framed_message(&mut wire).await;
+        assert_eq!(symbol_request["method"], "textDocument/documentSymbol");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &symbol_request["id"],
+            serde_json::json!([{
+                "name": "sym",
+                "kind": 12,
+                // The file has one line -- line 5 doesn't exist, so its
+                // text can't be resolved for UTF-8 conversion.
+                "range": {
+                    "start": {"line": 5, "character": 0},
+                    "end": {"line": 5, "character": 1},
+                },
+                "selectionRange": {
+                    "start": {"line": 5, "character": 0},
+                    "end": {"line": 5, "character": 1},
+                },
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+            .expect("document symbol response should still succeed, just degraded");
+
+        assert_eq!(result.symbols.len(), 1);
+        assert!(
+            result.positions_degraded,
+            "a range whose line can't be resolved must mark the result degraded"
         );
     }
 

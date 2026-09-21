@@ -90,6 +90,14 @@ pub struct HoverResult {
     pub contents: String,
     /// Optional range the hover applies to.
     pub range: Option<Range>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning `range`'s `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// Result of a definition request.
@@ -103,6 +111,14 @@ pub struct DefinitionResult {
     /// serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `locations` entries' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// Result of a references request.
@@ -116,6 +132,14 @@ pub struct ReferencesResult {
     /// serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `locations` entries' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// Diagnostic severity.
@@ -150,6 +174,14 @@ pub struct Diagnostic {
 pub struct DiagnosticsResult {
     /// List of diagnostics for the document.
     pub diagnostics: Vec<Diagnostic>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `diagnostics` ranges' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// A text edit operation.
@@ -180,6 +212,14 @@ pub struct RenameResult {
     /// and callers must not treat this result as the full rename otherwise.
     #[serde(default, skip_serializing_if = "DroppedEdits::is_empty")]
     pub dropped: DroppedEdits,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `changes` edit ranges' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// Counts of `WorkspaceEdit` entries withheld during conversion to MCP DTOs,
@@ -260,6 +300,14 @@ pub struct Symbol {
 pub struct DocumentSymbolsResult {
     /// List of symbols in the document.
     pub symbols: Vec<Symbol>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `symbols` ranges' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// Result of a format document request.
@@ -267,6 +315,14 @@ pub struct DocumentSymbolsResult {
 pub struct FormatDocumentResult {
     /// List of edits to format the document.
     pub edits: Vec<TextEdit>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `edits` ranges' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// A workspace symbol.
@@ -295,6 +351,14 @@ pub struct WorkspaceSymbolResult {
     /// the two caused it. Omitted (defaults to `false`) when serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `symbols` locations' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// A single code action.
@@ -346,6 +410,14 @@ pub struct CommandDescription {
 pub struct CodeActionsResult {
     /// Available code actions.
     pub actions: Vec<CodeAction>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `actions` diagnostic/edit ranges'
+    /// `character` values may be wrong for a non-UTF-16 LSP server (#497).
+    /// Omitted (defaults to `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// A call hierarchy item.
@@ -385,6 +457,14 @@ pub struct CallHierarchyItemResult {
 pub struct CallHierarchyPrepareResult {
     /// List of callable items at the position.
     pub items: Vec<CallHierarchyItemResult>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `items` ranges' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// An incoming call (caller of the current item).
@@ -401,6 +481,14 @@ pub struct IncomingCall {
 pub struct IncomingCallsResult {
     /// List of incoming calls.
     pub calls: Vec<IncomingCall>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `calls` ranges' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// An outgoing call (callee from the current item).
@@ -417,6 +505,14 @@ pub struct OutgoingCall {
 pub struct OutgoingCallsResult {
     /// List of outgoing calls.
     pub calls: Vec<OutgoingCall>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `calls` ranges' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// Result of server logs request.
@@ -479,6 +575,14 @@ pub struct LocationsResult {
     /// serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `locations` entries' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 /// A single inlay hint entry.
@@ -508,6 +612,14 @@ pub struct InlayHintEntry {
 pub struct InlayHintsResult {
     /// List of inlay hints.
     pub hints: Vec<InlayHintEntry>,
+    /// Whether a position in this response could not be resolved for
+    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
+    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
+    /// each cause this -- meaning some `hints` positions' `character` values may be
+    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
+    /// `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positions_degraded: bool,
 }
 
 #[cfg(test)]

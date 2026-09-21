@@ -454,10 +454,18 @@ impl Translator {
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
-        let uri = self
+        // Drained unconditionally, before propagating `ensure_open`'s
+        // result: even on its error path (e.g. a `didOpen`/`didChange`
+        // notify failure), `DocumentTracker::open` may already have evicted
+        // a *different*, unrelated document and queued its `didClose` --
+        // returning early via `?` before this would lose that queued close,
+        // leaving the tracker desynced from that server (#495 S5).
+        let result = self
             .document_tracker
             .ensure_open(&validated_path, &server_id, &client)
-            .await?;
+            .await;
+        self.notify_evicted_documents().await;
+        let uri = result?;
         Ok((server_id, client, uri))
     }
 
@@ -534,11 +542,69 @@ impl Translator {
         if indexing_gate == IndexingGate::Required {
             self.wait_for_indexing_ready(&server_id).await?;
         }
-        let uri = self
+        // See `prepare_document`'s matching comment (#495 S5): drained
+        // unconditionally, before propagating the result, so a queued
+        // eviction from this call is never lost on `ensure_open`'s error path.
+        let result = self
             .document_tracker
             .ensure_open(&validated_path, &server_id, &client)
-            .await?;
+            .await;
+        self.notify_evicted_documents().await;
+        let uri = result?;
         Ok((server_id, client, uri))
+    }
+
+    /// Sends `textDocument/didClose` to every server that had a document
+    /// [`DocumentTracker::open`]'s LRU eviction just reclaimed (#495), so a
+    /// server's own open-document set does not keep growing even though
+    /// mcpls's own tracking has stopped counting it.
+    ///
+    /// `DocumentTracker` has no access to any server's [`LspClient`] --
+    /// `self.lsp_clients` is the registry for that, kept one layer up in
+    /// `Translator` -- so this is the chokepoint that reconciles
+    /// [`DocumentTracker::take_evicted`]'s queue against it. Called after
+    /// every `ensure_open` that could have triggered eviction (both
+    /// `prepare_document` and `finish_prepare_gated_document`) --
+    /// unconditionally, even when `ensure_open` itself returned an error, so
+    /// a different, already-evicted document's queued close is never lost
+    /// on that path (#495 S5).
+    ///
+    /// Best-effort: a failed notify is logged and otherwise ignored, exactly
+    /// like `sync_phase`'s own `didOpen`/`didChange` failures are handled
+    /// one layer down -- the request that triggered the eviction must not
+    /// fail just because a *different*, already-evicted document's close
+    /// notification could not be delivered. A failure here does leave a
+    /// residual desync, though: mcpls has already forgotten the document
+    /// (it's out of `document_tracker`), but the server never learned it
+    /// was closed, so a later `ensure_open` for the same path sends a fresh
+    /// `didOpen` for a document the server (as far as it knows) already has
+    /// open. In practice this self-heals whenever that server is later
+    /// respawned (`forget_server` clears its whole sync history).
+    async fn notify_evicted_documents(&self) {
+        for doc in self.document_tracker.take_evicted() {
+            for server_id in &doc.synced_servers {
+                let Some(client) = lock_std(&self.lsp_clients).get(server_id).cloned() else {
+                    continue;
+                };
+                if let Err(err) = client
+                    .notify_typed::<lsp_types::DidCloseTextDocumentNotification>(
+                        lsp_types::DidCloseTextDocumentParams {
+                            text_document: lsp_types::TextDocumentIdentifier {
+                                uri: doc.uri.clone(),
+                            },
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        %server_id,
+                        path = %doc.path.display(),
+                        error = %err,
+                        "failed to notify evicted document's server of textDocument/didClose"
+                    );
+                }
+            }
+        }
     }
 
     /// Verify the routed server advertises support for a capability before
@@ -1238,6 +1304,137 @@ mod tests {
                 .unwrap();
             assert!(result.is_ok());
         }
+    }
+
+    /// #495: once `DocumentTracker::open`'s LRU eviction reclaims a document
+    /// to make room under `max_documents`, `prepare_document` must notify
+    /// that document's server with `textDocument/didClose` -- `DocumentTracker`
+    /// itself has no `LspClient` access to do this, so it's `Translator`'s
+    /// job (`notify_evicted_documents`) once `ensure_open` returns.
+    #[tokio::test]
+    async fn test_prepare_document_sends_didclose_for_evicted_document() {
+        use crate::bridge::state::ResourceLimits;
+
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("aa".to_string(), "lang_a".to_string());
+
+        let mut translator = Translator::new()
+            .with_extensions(extensions)
+            .with_router(ToolRouter::catch_all([(
+                ServerId::from("lang_a"),
+                "lang_a".to_string(),
+            )]))
+            .with_resource_limits(ResourceLimits {
+                max_documents: 1,
+                max_file_size: 0,
+            });
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client, mut server) = fake_lsp_client();
+        translator.register_client("lang_a".to_string(), client);
+
+        let path_a = dir.path().join("a.aa");
+        fs::write(&path_a, "content a").unwrap();
+        let path_b = dir.path().join("b.aa");
+        fs::write(&path_b, "content b").unwrap();
+
+        translator
+            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap();
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened_a = read_framed_message(&mut wire).await;
+        assert_eq!(opened_a["method"], "textDocument/didOpen");
+
+        translator
+            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap();
+
+        let opened_b = read_framed_message(&mut wire).await;
+        assert_eq!(opened_b["method"], "textDocument/didOpen");
+        let closed_a = read_framed_message(&mut wire).await;
+        assert_eq!(
+            closed_a["method"], "textDocument/didClose",
+            "evicting `a` to make room for `b` under max_documents: 1 must notify its server"
+        );
+        assert_eq!(
+            closed_a["params"]["textDocument"]["uri"], opened_a["params"]["textDocument"]["uri"],
+            "the didClose must name the evicted document, not the newly opened one"
+        );
+    }
+
+    /// #495 S5: even when `ensure_open` itself fails for the document being
+    /// opened (here: its own `didOpen` notify fails), a `didClose` already
+    /// queued for a *different* document evicted earlier in that same call
+    /// must still be sent -- `prepare_document` must not lose it by
+    /// returning early via `?` before draining `take_evicted`. Uses two
+    /// separate servers (`lang_a` stays healthy, `lang_b`'s connection is
+    /// broken) so the evicted document's own `didClose` delivery can be
+    /// observed independently of the failure that aborts this call.
+    #[tokio::test]
+    async fn test_prepare_document_still_sends_didclose_when_ensure_open_itself_fails() {
+        use crate::bridge::state::ResourceLimits;
+
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("aa".to_string(), "lang_a".to_string());
+        extensions.insert("bb".to_string(), "lang_b".to_string());
+
+        let mut translator = Translator::new()
+            .with_extensions(extensions)
+            .with_router(ToolRouter::catch_all([
+                (ServerId::from("lang_a"), "lang_a".to_string()),
+                (ServerId::from("lang_b"), "lang_b".to_string()),
+            ]))
+            .with_resource_limits(ResourceLimits {
+                max_documents: 1,
+                max_file_size: 0,
+            });
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client_a, mut server_a) = fake_lsp_client();
+        translator.register_client("lang_a".to_string(), client_a);
+        let (client_b, _server_b) = fake_lsp_client();
+        translator.register_client("lang_b".to_string(), client_b.clone());
+
+        let path_a = dir.path().join("a.aa");
+        fs::write(&path_a, "content a").unwrap();
+        let path_b = dir.path().join("b.bb");
+        fs::write(&path_b, "content b").unwrap();
+
+        translator
+            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap();
+
+        let mut wire_a = BufReader::new(&mut server_a.write_stdout);
+        let opened_a = read_framed_message(&mut wire_a).await;
+        assert_eq!(opened_a["method"], "textDocument/didOpen");
+
+        // Break only `lang_b`'s connection -- see
+        // `test_first_open_self_heals_when_did_open_notify_fails` (state.rs)
+        // for why shutting down a clone deterministically fails the next
+        // `notify()` on any other clone of the same client.
+        client_b.shutdown().await.unwrap();
+
+        let err = translator
+            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ServerTerminated));
+
+        // `a` was evicted (LRU, to make room for `b`) before `b`'s own
+        // notify failed, and its didClose must still have gone out on
+        // `lang_a`'s still-healthy connection.
+        let closed_a = read_framed_message(&mut wire_a).await;
+        assert_eq!(closed_a["method"], "textDocument/didClose");
+        assert_eq!(
+            closed_a["params"]["textDocument"]["uri"],
+            opened_a["params"]["textDocument"]["uri"]
+        );
     }
 
     /// #174 §12's own headline dispatch scenario: "pyright/pylsp fixture --
