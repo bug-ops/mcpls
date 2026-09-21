@@ -21,6 +21,17 @@ use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, Jso
 /// Maximum allowed Content-Length (10 MB)
 const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
 
+/// Maximum length of a single header line, including its terminating `\n`
+/// (#457). Bounds `read_headers` against a spawned server that writes one
+/// endless line with no `\n` -- without this, `read_line` would grow its
+/// buffer without limit.
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+
+/// Maximum number of header lines read per frame before the terminating
+/// blank line (#457). Bounds `read_headers` against a spawned server that
+/// emits endlessly many distinct header lines.
+const MAX_HEADERS: usize = 100;
+
 /// Write half of the LSP transport, handling the header-content format for
 /// outbound messages.
 ///
@@ -196,10 +207,14 @@ impl LspTransportReader {
     async fn read_headers(&mut self) -> Result<HashMap<String, String>> {
         let mut headers = HashMap::new();
         let mut line = String::new();
+        let mut lines_read = 0usize;
 
         loop {
             line.clear();
-            let bytes_read = self.stdout.read_line(&mut line).await?;
+            let bytes_read = (&mut self.stdout)
+                .take(MAX_HEADER_LINE_BYTES as u64)
+                .read_line(&mut line)
+                .await?;
 
             // EOF - stream closed (read_line returns 0 bytes on EOF)
             if bytes_read == 0 || line.is_empty() {
@@ -211,14 +226,33 @@ impl LspTransportReader {
                 return Err(Error::ServerTerminated);
             }
 
+            // The `take` limit was hit with no line ending, as opposed to a
+            // short final line truncated by a genuine EOF (caught above on
+            // the next iteration) -- see `MAX_HEADER_LINE_BYTES`.
+            if bytes_read == MAX_HEADER_LINE_BYTES && !line.ends_with('\n') {
+                return Err(Error::LspProtocolError(format!(
+                    "LSP header line exceeded {MAX_HEADER_LINE_BYTES} bytes without a newline"
+                )));
+            }
+
             if line == "\r\n" || line == "\n" {
                 break;
+            }
+
+            lines_read += 1;
+            if lines_read > MAX_HEADERS {
+                return Err(Error::LspProtocolError(format!(
+                    "LSP frame exceeded {MAX_HEADERS} header lines"
+                )));
             }
 
             if let Some((key, value)) = line.trim_end().split_once(':') {
                 headers.insert(key.trim().to_lowercase(), value.trim().to_string());
             } else {
-                warn!("Malformed header: {}", line.trim());
+                warn!(
+                    "Malformed header: {}",
+                    crate::util::truncate_str(line.trim(), crate::util::MAX_LOG_STRING_BYTES)
+                );
             }
         }
 
@@ -268,6 +302,8 @@ fn parse_inbound_message(value: Value) -> Result<InboundMessage> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use crate::lsp::types::RequestId;
 
@@ -448,5 +484,85 @@ mod tests {
             assert_eq!(key_trimmed, "content-length");
             assert_eq!(value_trimmed, "456");
         }
+    }
+
+    /// #457: a spawned server writing one endless header line with no `\n`
+    /// must not grow `read_headers`' buffer without bound -- it must fail
+    /// fast instead.
+    #[tokio::test]
+    async fn test_read_headers_rejects_oversized_line() {
+        let (mut peer, stdout) = tokio::io::duplex(MAX_HEADER_LINE_BYTES + 4096);
+        let (_transport, mut reader) = LspTransport::new(tokio::io::sink(), stdout);
+
+        let oversized_line = vec![b'a'; MAX_HEADER_LINE_BYTES + 10];
+        peer.write_all(&oversized_line).await.unwrap();
+
+        let result = reader.receive().await;
+        assert!(
+            matches!(result, Err(Error::LspProtocolError(_))),
+            "got {result:?}"
+        );
+    }
+
+    /// #457: a spawned server writing endlessly many distinct header lines
+    /// before the blank-line terminator must not grow the header map without
+    /// bound -- it must fail fast instead.
+    #[tokio::test]
+    async fn test_read_headers_rejects_too_many_headers() {
+        let mut body = String::new();
+        for i in 0..=MAX_HEADERS {
+            let _ = write!(body, "X-Header-{i}: value\r\n");
+        }
+
+        let (mut peer, stdout) = tokio::io::duplex(body.len() + 4096);
+        let (_transport, mut reader) = LspTransport::new(tokio::io::sink(), stdout);
+
+        peer.write_all(body.as_bytes()).await.unwrap();
+
+        let result = reader.receive().await;
+        assert!(
+            matches!(result, Err(Error::LspProtocolError(_))),
+            "got {result:?}"
+        );
+    }
+
+    /// #457 boundary: a header line whose length lands exactly at
+    /// `MAX_HEADER_LINE_BYTES` (including its `\r\n`) must still parse --
+    /// the cap only rejects a line that *exceeds* it.
+    #[tokio::test]
+    async fn test_read_headers_accepts_line_at_exact_length_boundary() {
+        let key = "X-Pad: ";
+        let terminator = "\r\n";
+        let pad_len = MAX_HEADER_LINE_BYTES - key.len() - terminator.len();
+        let padded_value = "a".repeat(pad_len);
+        let mut body = format!("{key}{padded_value}{terminator}");
+        assert_eq!(body.len(), MAX_HEADER_LINE_BYTES);
+        body.push_str("\r\n");
+
+        let (mut peer, stdout) = tokio::io::duplex(body.len() + 64);
+        let (_transport, mut reader) = LspTransport::new(tokio::io::sink(), stdout);
+        peer.write_all(body.as_bytes()).await.unwrap();
+
+        let headers = reader.read_headers().await.unwrap();
+        assert_eq!(headers.get("x-pad"), Some(&padded_value));
+    }
+
+    /// #457 boundary: exactly `MAX_HEADERS` header lines, properly
+    /// terminated, must still parse -- the cap only rejects a frame that
+    /// *exceeds* it.
+    #[tokio::test]
+    async fn test_read_headers_accepts_exactly_max_headers() {
+        let mut body = String::new();
+        for i in 0..MAX_HEADERS {
+            let _ = write!(body, "X-Header-{i}: value\r\n");
+        }
+        body.push_str("\r\n");
+
+        let (mut peer, stdout) = tokio::io::duplex(body.len() + 4096);
+        let (_transport, mut reader) = LspTransport::new(tokio::io::sink(), stdout);
+        peer.write_all(body.as_bytes()).await.unwrap();
+
+        let headers = reader.read_headers().await.unwrap();
+        assert_eq!(headers.len(), MAX_HEADERS);
     }
 }

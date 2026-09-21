@@ -48,9 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Disk reads on Windows now reject non-disk file types (e.g. reserved device names like `CON`, `COM1`, `NUL`) via `GetFileType`, bounding the content read; the open itself can still block on Windows, which has no `O_NONBLOCK` equivalent. (#442, #446)
 - The e2e job now installs the `rust-src` component and `test_hover_on_std_vec` waits for std-lib indexing readiness, fixing a hover flake on a std-lib symbol. (#453, #455)
 - **`LspTransport::new`** — Breaking change: now returns `(LspTransport, LspTransportReader)` instead of one value; `LspClient`'s inbound read is cancel-safe, fixing LSP stream desync. (#451, #456)
+- In-flight LSP requests now fail immediately with `Error::ServerTerminated` when the message loop exits (transport error, reader task gone, or shutdown), instead of each caller blocking for the full request timeout. (#458, #463)
 
 ### Security
 
+- LSP frame header parsing is now bounded on both single-line length and header count per frame, closing an unbounded-memory-growth path from a malicious or malfunctioning spawned LSP server. (#457, #463)
 - **Workspace-roots validation now fails closed** — Breaking change: the diagnostics pump and rename/code-action edit filtering previously allowed unrestricted access when no workspace roots were configured; both now reject with no unrestricted opt-in, so embedders must call `Translator::set_workspace_roots` with real roots before serving any path-taking request. (#449)
 
 ## [0.5.0] - 2026-09-06

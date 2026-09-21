@@ -94,25 +94,19 @@ pub const CONTENT_MODIFIED_RETRY_METHODS: &[&str] = &[
     "workspace/symbol",
 ];
 
-/// Byte-length threshold for truncating an LSP error message before logging it.
-///
-/// Kept short since this feeds a single log line in [`LspClient::request`]
-/// -- `warn!` while a transient error is being retried, `error!` once it is
-/// actually surfaced to the caller -- not the MCP caller itself; see
-/// `MAX_ERROR_MESSAGE_CALLER_BYTES` for that budget.
-const MAX_ERROR_MESSAGE_LOG_BYTES: usize = 200;
-
 /// Byte-length threshold for the LSP error message forwarded to the MCP
 /// caller in [`Error::LspServerError`] (#313).
 ///
-/// Deliberately much larger than `MAX_ERROR_MESSAGE_LOG_BYTES`: a
-/// legitimate LSP error (e.g. a verbose rust-analyzer type-mismatch
-/// diagnostic reported through an error response) can run into the low
-/// kilobytes, and that detail is useful to the calling model -- a log line
-/// should stay terse, but a truncated-to-200-bytes error handed to the
-/// model would cut off real content on every longer-but-honest error. Still
-/// far below #311's 256 KiB cache-entry cap: this string is echoed directly
-/// into the MCP tool result / model context, not merely cached.
+/// Deliberately much larger than [`crate::util::MAX_LOG_STRING_BYTES`]
+/// (used for this same error message in [`LspClient::request`]'s own log
+/// line): a legitimate LSP error (e.g. a verbose rust-analyzer
+/// type-mismatch diagnostic reported through an error response) can run
+/// into the low kilobytes, and that detail is useful to the calling model --
+/// a log line should stay terse, but a truncated-to-200-bytes error handed
+/// to the model would cut off real content on every longer-but-honest
+/// error. Still far below #311's 256 KiB cache-entry cap: this string is
+/// echoed directly into the MCP tool result / model context, not merely
+/// cached.
 const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
 
 /// Upper bound on the effective timeout for completion requests, regardless
@@ -676,8 +670,14 @@ impl LspClient {
     /// superseded by a respawned replacement for the same server -- so
     /// callers still waiting on it unblock immediately.
     pub(crate) async fn fail_pending_requests(&self) {
-        let mut pending = self.pending_requests.lock().await;
-        for (_, sender) in pending.drain() {
+        Self::drain_and_fail_pending(&self.pending_requests).await;
+    }
+
+    /// Drains `pending`, resolving each remaining sender to
+    /// `Err(Error::ServerTerminated)`. Shared by [`Self::fail_pending_requests`]
+    /// and [`Self::message_loop`]'s exit-path cleanup (#458).
+    async fn drain_and_fail_pending(pending: &Arc<Mutex<PendingRequests>>) {
+        for (_, sender) in pending.lock().await.drain() {
             let _ = sender.send(Err(Error::ServerTerminated));
         }
     }
@@ -772,6 +772,17 @@ impl LspClient {
             .await
         };
         let _ = timeout(READER_TASK_ABORT_GRACE, reader_handle).await;
+        // Dropped before the drain, not just at fn-exit: otherwise a
+        // `register_and_send_request` racing the drain could still insert
+        // into `pending_requests` and succeed its `command_tx.send(..)`,
+        // leaving that entry unfailed until its own timeout (#458 S1). Once
+        // this is gone, every later `send` fails and the caller cleans up
+        // its own entry.
+        drop(command_rx);
+        // Runs after `message_loop_inner` returns, so a response the Shutdown
+        // drain (#451) already resolved is gone from the map by now -- only
+        // requests with no answer get failed here (#458).
+        Self::drain_and_fail_pending(&pending_requests).await;
         if let Err(ref e) = result {
             error!("Message loop exiting with error: {}", e);
         } else {
@@ -788,14 +799,14 @@ impl LspClient {
     }
 
     /// Truncate an LSP server's error message for the `tracing::error!` log
-    /// line, bounding it to at most [`MAX_ERROR_MESSAGE_LOG_BYTES`] bytes
-    /// (the full formatted string is slightly longer).
+    /// line, bounding it to at most [`crate::util::MAX_LOG_STRING_BYTES`]
+    /// bytes (the full formatted string is slightly longer).
     ///
     /// Log-line use only -- the message forwarded to the MCP caller in
     /// [`Error::LspServerError`] is truncated separately, to the larger
     /// [`MAX_ERROR_MESSAGE_CALLER_BYTES`] (#313).
     fn truncate_error_message_for_log(message: &str) -> String {
-        crate::util::truncate_str(message, MAX_ERROR_MESSAGE_LOG_BYTES)
+        crate::util::truncate_str(message, crate::util::MAX_LOG_STRING_BYTES)
     }
 
     /// Which of the two notification lanes (P3) `notification` belongs on,
@@ -2162,8 +2173,8 @@ mod tests {
         }
 
         /// #313 S2: a legitimate error message longer than the log-line cap
-        /// (`MAX_ERROR_MESSAGE_LOG_BYTES`, 200 bytes) but shorter than the
-        /// caller-facing cap must reach the MCP caller intact -- the
+        /// (`crate::util::MAX_LOG_STRING_BYTES`, 200 bytes) but shorter than
+        /// the caller-facing cap must reach the MCP caller intact -- the
         /// caller-facing budget must not silently collapse to the log
         /// budget.
         #[tokio::test]
@@ -2183,7 +2194,7 @@ mod tests {
             let mut reader = BufReader::new(&mut server.write_stdout);
             let request = read_framed_message(&mut reader).await;
             let id = request["id"].clone();
-            let message = "x".repeat(MAX_ERROR_MESSAGE_LOG_BYTES + 50);
+            let message = "x".repeat(crate::util::MAX_LOG_STRING_BYTES + 50);
             write_error_response(&mut server.read_half_stdin, &id, -32603, &message).await;
 
             let result = request_task.await.unwrap();
@@ -2356,6 +2367,57 @@ mod tests {
             );
         }
 
+        /// As above, with a real pending request parked at the time the
+        /// reader task disappears -- `message_loop_inner` itself never
+        /// touches `pending_requests` on this branch, so a caller blocked on
+        /// it only unblocks via `message_loop`'s post-loop
+        /// `drain_and_fail_pending` (#458), invoked here the same way
+        /// `message_loop` does after `message_loop_inner` returns. Driving
+        /// this exact branch through the real `message_loop` would require
+        /// the reader task to panic (the only other way `msg_rx.recv()`
+        /// returns `None`), which isn't reproducible without a production
+        /// seam -- see `test_message_loop_fails_pending_requests_on_transport_error_exit`
+        /// for the sibling exit path exercised through the real function.
+        #[tokio::test]
+        async fn test_message_loop_inner_reader_gone_then_drain_fails_pending_request() {
+            let (mut transport, _reader) = inert_transport();
+            let (_command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(1);
+            let (msg_tx, mut msg_rx) = mpsc::channel::<Result<InboundMessage>>(1);
+            let pending_requests: Arc<Mutex<PendingRequests>> =
+                Arc::new(Mutex::new(HashMap::new()));
+
+            let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
+            pending_requests
+                .lock()
+                .await
+                .insert(RequestId::Number(1), response_tx);
+
+            drop(msg_tx);
+
+            let result = LspClient::message_loop_inner(
+                &mut transport,
+                &mut msg_rx,
+                &mut command_rx,
+                &pending_requests,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(Error::ServerTerminated)),
+                "got {result:?}"
+            );
+
+            LspClient::drain_and_fail_pending(&pending_requests).await;
+
+            let received = response_rx.await.unwrap();
+            assert!(
+                matches!(received, Err(Error::ServerTerminated)),
+                "got {received:?}"
+            );
+            assert!(pending_requests.lock().await.is_empty());
+        }
+
         /// The reader task can run ahead of `select!` and have already queued
         /// a fully-decoded response in `msg_rx` by the time a concurrent
         /// `Shutdown` command is what `select!` happens to pick. Before the
@@ -2408,6 +2470,182 @@ mod tests {
             assert!(
                 pending_requests.lock().await.is_empty(),
                 "the drained response must resolve its pending request entry"
+            );
+        }
+
+        /// #458: before the fix, none of `message_loop`'s exit paths failed
+        /// requests still parked in `pending_requests` -- each caller stayed
+        /// blocked in its own `timeout(..)` until `request_timeout` elapsed.
+        /// Drives the real `message_loop` (not `_inner`) over
+        /// [`inert_transport`], whose reader side is dropped, so the reader
+        /// task hits a transport receive error immediately and
+        /// `message_loop` exits through that path.
+        #[tokio::test]
+        async fn test_message_loop_fails_pending_requests_on_transport_error_exit() {
+            let (transport, reader) = inert_transport();
+            let (_command_tx, command_rx) = mpsc::channel::<ClientCommand>(1);
+            let pending_requests: Arc<Mutex<PendingRequests>> =
+                Arc::new(Mutex::new(HashMap::new()));
+
+            let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
+            pending_requests
+                .lock()
+                .await
+                .insert(RequestId::Number(1), response_tx);
+
+            let result = LspClient::message_loop(
+                (transport, reader),
+                command_rx,
+                Arc::clone(&pending_requests),
+                None,
+                None,
+            )
+            .await;
+
+            assert!(result.is_err(), "got {result:?}");
+            let received = response_rx.await.unwrap();
+            assert!(
+                matches!(received, Err(Error::ServerTerminated)),
+                "got {received:?}"
+            );
+            assert!(pending_requests.lock().await.is_empty());
+        }
+
+        /// #458: unit-level check that composing `message_loop_inner`'s
+        /// Shutdown `try_recv` drain (#451) with a subsequent
+        /// `drain_and_fail_pending` call -- the same two pieces
+        /// `message_loop` itself calls in that order -- does not re-fail a
+        /// request already resolved by a buffered response, while still
+        /// failing a truly unanswered one. This does not exercise
+        /// `message_loop`'s own statement ordering (see
+        /// `test_message_loop_end_to_end_resolves_answered_then_fails_unanswered_on_shutdown`
+        /// for that, driven through the real function).
+        #[tokio::test]
+        async fn test_message_loop_shutdown_resolves_answered_and_fails_unanswered_pending() {
+            let (mut transport, _reader) = inert_transport();
+            let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(1);
+            let (msg_tx, mut msg_rx) = mpsc::channel::<Result<InboundMessage>>(1);
+            let pending_requests: Arc<Mutex<PendingRequests>> =
+                Arc::new(Mutex::new(HashMap::new()));
+
+            let answered_id = RequestId::Number(1);
+            let (answered_tx, answered_rx) = oneshot::channel::<Result<Value>>();
+            let unanswered_id = RequestId::Number(2);
+            let (unanswered_tx, unanswered_rx) = oneshot::channel::<Result<Value>>();
+            pending_requests
+                .lock()
+                .await
+                .insert(answered_id.clone(), answered_tx);
+            pending_requests
+                .lock()
+                .await
+                .insert(unanswered_id.clone(), unanswered_tx);
+
+            msg_tx
+                .send(Ok(InboundMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: answered_id,
+                    result: Some(serde_json::json!({ "ok": true })),
+                    error: None,
+                })))
+                .await
+                .unwrap();
+            command_tx.send(ClientCommand::Shutdown).await.unwrap();
+            drop(command_tx);
+
+            let inner_result = LspClient::message_loop_inner(
+                &mut transport,
+                &mut msg_rx,
+                &mut command_rx,
+                &pending_requests,
+                None,
+                None,
+            )
+            .await;
+            assert!(inner_result.is_ok(), "got {inner_result:?}");
+
+            // Mirrors the drain `message_loop` runs after `message_loop_inner`
+            // returns.
+            LspClient::drain_and_fail_pending(&pending_requests).await;
+
+            let answered = answered_rx.await.unwrap();
+            assert_eq!(answered.unwrap(), serde_json::json!({ "ok": true }));
+
+            let unanswered = unanswered_rx.await.unwrap();
+            assert!(
+                matches!(unanswered, Err(Error::ServerTerminated)),
+                "got {unanswered:?}"
+            );
+            assert!(pending_requests.lock().await.is_empty());
+        }
+
+        /// #458 S2: end-to-end proof that `message_loop`'s post-loop drain
+        /// runs *after* `message_loop_inner` returns, driven through the
+        /// real `message_loop` (via `fake_lsp_client`), not a hand-recreated
+        /// sequence. Deterministic without depending on `select!`
+        /// nondeterminism: the answered request is awaited to completion via
+        /// the loop's ordinary response path *before* `shutdown` is ever
+        /// sent, so nothing here relies on which branch `select!` happens to
+        /// pick when both are ready -- that race is unit-tested separately in
+        /// `test_message_loop_shutdown_resolves_answered_and_fails_unanswered_pending`.
+        #[tokio::test]
+        async fn test_message_loop_end_to_end_resolves_answered_then_fails_unanswered_on_shutdown()
+        {
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let answered_client = client.clone();
+            let answered_task = tokio::spawn(async move {
+                answered_client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let request = read_framed_message(&mut reader).await;
+            let id = request["id"].clone();
+            write_response(
+                &mut server.read_half_stdin,
+                &id,
+                serde_json::json!({ "ok": true }),
+            )
+            .await;
+
+            let answered = answered_task.await.unwrap().unwrap();
+            assert_eq!(answered, serde_json::json!({ "ok": true }));
+
+            let unanswered_client = client.clone();
+            let unanswered_task = tokio::spawn(async move {
+                unanswered_client
+                    .request::<_, Value>(
+                        "textDocument/definition",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            // Reading the framed bytes back confirms the request was fully
+            // sent, which only happens after it is already registered in
+            // `pending_requests` -- so shutdown below cannot race its insert.
+            let _unanswered_request = read_framed_message(&mut reader).await;
+
+            client.shutdown().await.unwrap();
+
+            let unanswered = tokio::time::timeout(Duration::from_millis(200), unanswered_task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "unanswered request must fail immediately on shutdown, not hang until its own timeout"
+                    )
+                })
+                .unwrap();
+            assert!(
+                matches!(unanswered, Err(Error::ServerTerminated)),
+                "got {unanswered:?}"
             );
         }
 
@@ -2473,6 +2711,40 @@ mod tests {
                     "response for request {i} carried the wrong payload -- id/response mismatch"
                 );
             }
+        }
+
+        /// #458: a request issued after the client has already shut down
+        /// must fail immediately via `register_and_send_request`'s
+        /// `command_tx.send(..)` check, not hang until its own
+        /// `request_timeout`. Wrapped in a short outer `timeout` so a
+        /// regression back to the slow path fails this test instead of
+        /// merely making it slow.
+        #[tokio::test]
+        async fn test_request_after_shutdown_fails_fast_instead_of_hanging() {
+            let (client, _server) = fake_lsp_client();
+            let post_shutdown_client = client.clone();
+
+            client.shutdown().await.unwrap();
+
+            let result = tokio::time::timeout(
+                Duration::from_millis(200),
+                post_shutdown_client.request::<_, Value>(
+                    "textDocument/hover",
+                    serde_json::json!({}),
+                    Duration::from_secs(30),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "request after shutdown must fail immediately, not hang until its own timeout"
+                )
+            });
+
+            assert!(
+                matches!(result, Err(Error::ServerTerminated)),
+                "got {result:?}"
+            );
         }
     }
 }

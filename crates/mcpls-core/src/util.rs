@@ -53,6 +53,15 @@ pub fn check_bounded_utf8(buf: Vec<u8>, max: u64) -> BoundedReadOutcome {
 /// `max_bytes + TRUNCATION_MARKER.len()` bytes, not exactly `max_bytes`.
 const TRUNCATION_MARKER: &str = "... (truncated)";
 
+/// Byte-length threshold for truncating an attacker-influenceable string
+/// (an LSP server's error message, a malformed protocol line, ...) before
+/// passing it to `truncate_str`/`truncate_string` for a single log line.
+/// Shared by every call site with this purpose so they don't each pick their
+/// own value -- see `lsp::client::MAX_ERROR_MESSAGE_CALLER_BYTES` for the
+/// separate, deliberately larger budget for text forwarded to the MCP
+/// caller rather than logged.
+pub const MAX_LOG_STRING_BYTES: usize = 200;
+
 /// Truncate `s` to at most `max_bytes` bytes, cutting on the last UTF-8 char
 /// boundary at or before the limit and appending a truncation marker. The
 /// returned string can be up to `max_bytes + TRUNCATION_MARKER.len()` bytes
