@@ -1062,7 +1062,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "kind_filter": {
-          "description": "Optional filter by symbol kind: a name (function, class, variable, etc.) or the numeric LSP SymbolKind value from a result's kind field.",
+          "description": "Optional filter by symbol kind: a name (function, class, variable, etc.) or the numeric LSP SymbolKind value from a result's kind field. A name is validated against the known kinds; a numeric value is accepted as-is with no validation, so one that matches no symbol returns an empty result rather than an error.",
           "type": [
             "string",
             "null"

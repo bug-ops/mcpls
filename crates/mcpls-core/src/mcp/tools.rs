@@ -125,10 +125,16 @@ pub struct WorkspaceSymbolParams {
     pub query: String,
     /// Optional filter by symbol kind: a name (function, class, variable,
     /// etc.) or the numeric LSP `SymbolKind` value from a result's `kind`
-    /// field.
+    /// field. A name is validated against the known kinds; a numeric value
+    /// is accepted as-is with no validation (it may name a server-specific
+    /// custom kind), so a value that matches no symbol returns an empty
+    /// result rather than an error.
     #[schemars(
         description = "Optional filter by symbol kind: a name (function, class, variable, etc.) \
-                        or the numeric LSP SymbolKind value from a result's kind field."
+                        or the numeric LSP SymbolKind value from a result's kind field. A name \
+                        is validated against the known kinds; a numeric value is accepted as-is \
+                        with no validation, so one that matches no symbol returns an empty \
+                        result rather than an error."
     )]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_filter: Option<String>,

@@ -34,11 +34,12 @@ fn validate_query_length(query: &str) -> Result<()> {
 /// Resolve a `kind_filter` value to the numeric LSP `SymbolKind` it names.
 ///
 /// Accepts either a `SymbolKind`'s `Debug`-derived name (case-insensitive,
-/// e.g. `"Function"`) -- the form the output `kind` field carried before
-/// #467, kept for client convenience -- or its numeric wire value directly
-/// (e.g. `"12"`), so a client can feed back the numeric `kind` a result
-/// actually carries, and so an otherwise-unfilterable `SymbolKind::Custom(n)`
-/// stays reachable.
+/// e.g. `"Function"`), validated against [`SUPPORTED_SYMBOL_KINDS`], or its
+/// numeric wire value directly (e.g. `"12"`) -- accepted as-is with no range
+/// check, since `SymbolKind::Custom(n)` is legitimately open-ended and has no
+/// fixed valid range to check against. A typo'd numeric filter therefore
+/// returns an empty result instead of `InvalidToolParams`, unlike a typo'd
+/// name.
 fn resolve_kind_filter(kind: &str) -> Result<u32> {
     if let Ok(numeric) = kind.parse::<u32>() {
         return Ok(numeric);
@@ -298,9 +299,7 @@ impl Translator {
             None => {}
         }
 
-        // Apply kind filter if specified. `kind_filter` was already resolved
-        // to the numeric target once, so this compares `s.kind` directly
-        // instead of allocating a `Debug` string per candidate.
+        // Apply kind filter if specified.
         if let Some(target) = kind_filter {
             symbols.retain(|s| s.kind == target);
         }
