@@ -111,14 +111,17 @@ impl ServerHeuristics {
     /// Search recursively for any marker file.
     fn find_any_marker_recursive(&self, workspace_root: &Path, max_depth: usize) -> bool {
         let mut builder = WalkBuilder::new(workspace_root);
+        // `standard_filters(false)` (bulk setter, last-write-wins) must run first or it
+        // undoes the overrides below; `.git_ignore(true)` itself is then a no-op outside
+        // an actual git repo (`require_git` defaults true).
         builder
+            .standard_filters(false)
             .max_depth(Some(max_depth))
             .hidden(false)
             .git_ignore(true)
             .git_global(false)
             .git_exclude(false)
             .follow_links(false)
-            .standard_filters(false)
             .filter_entry(|entry| {
                 // Skip excluded directories entirely (prevents descending into them)
                 if entry.file_type().is_some_and(|ft| ft.is_dir())
@@ -841,6 +844,29 @@ mod tests {
 
         let heuristics = ServerHeuristics::with_markers(["setup.py"]);
         assert!(!heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    /// #476: `standard_filters(false)` is a bulk setter that resets
+    /// `.git_ignore` (among others); it must run before the individual
+    /// overrides, or it silently negates the `.git_ignore(true)` set
+    /// afterward and the walk descends into gitignored directories.
+    #[test]
+    fn test_recursive_respects_gitignore_in_marker_search() {
+        let tmp = TempDir::new().unwrap();
+        // A bare `.git` directory is enough for the `ignore` crate to treat
+        // this fixture as a git repository and start honoring `.gitignore`.
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
+
+        let ignored_dir = tmp.path().join("ignored");
+        std::fs::create_dir_all(&ignored_dir).unwrap();
+        std::fs::write(ignored_dir.join("Cargo.toml"), "").unwrap();
+
+        let heuristics = ServerHeuristics::with_markers(["Cargo.toml"]);
+        assert!(
+            !heuristics.is_applicable_recursive(tmp.path(), None),
+            "marker inside a gitignored directory must not make the server applicable"
+        );
     }
 
     #[test]

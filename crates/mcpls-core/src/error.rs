@@ -219,6 +219,12 @@ pub enum Error {
     InvalidToolParams(String),
 
     /// File I/O error occurred.
+    ///
+    /// See [`Error::mcp_error_kind`] for the JSON-RPC classification: a
+    /// `source.kind() == ErrorKind::NotFound` failure -- whether `path` was
+    /// freshly supplied in this request or was tracked from an earlier one
+    /// and has since been deleted/moved on disk -- is caller-fault; any
+    /// other IO failure is not.
     #[error("file I/O error for {path:?}: {source}")]
     FileIo {
         /// Path to the file.
@@ -311,6 +317,176 @@ pub enum Error {
         /// How long mcpls waited for readiness before giving up.
         elapsed_secs: u64,
     },
+}
+
+/// Bespoke JSON-RPC code for [`Error::WorkspaceIndexing`].
+///
+/// Picked clear of rmcp's `-32002`/`-32020..-32022`; the range is convention, not a registry.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::WORKSPACE_INDEXING_ERROR_CODE;
+///
+/// assert_eq!(WORKSPACE_INDEXING_ERROR_CODE, -32050);
+/// ```
+pub const WORKSPACE_INDEXING_ERROR_CODE: i32 = -32050;
+
+/// Bespoke JSON-RPC code for [`Error::ServerInitializing`].
+///
+/// Distinct from [`WORKSPACE_INDEXING_ERROR_CODE`] so a client can tell "the
+/// server hasn't registered yet" apart from "the server registered but is
+/// still indexing" -- both retryable, but for different reasons.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::{SERVER_INITIALIZING_ERROR_CODE, WORKSPACE_INDEXING_ERROR_CODE};
+///
+/// assert_eq!(SERVER_INITIALIZING_ERROR_CODE, -32051);
+/// assert_ne!(SERVER_INITIALIZING_ERROR_CODE, WORKSPACE_INDEXING_ERROR_CODE);
+/// ```
+pub const SERVER_INITIALIZING_ERROR_CODE: i32 = -32051;
+
+/// JSON-RPC error-code classification for an [`Error`], returned by
+/// [`Error::mcp_error_kind`].
+///
+/// mcpls-core has no dependency on the MCP transport crate, so this carries
+/// only plain data; `crate::mcp` is responsible for turning it into the
+/// actual wire-level error type.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::{Error, McpErrorKind};
+///
+/// let err = Error::InvalidToolParams("missing `file_path`".to_string());
+/// assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpErrorKind {
+    /// Caller-fault: the request itself was invalid. Maps to JSON-RPC
+    /// `-32602` (`INVALID_PARAMS`).
+    InvalidParams,
+    /// A transient, retryable server-side condition, distinct from a crash.
+    /// Maps to a bespoke JSON-RPC `code` with a structured `data` payload a
+    /// caller can act on mechanically, rather than the generic
+    /// `INTERNAL_ERROR`.
+    Retryable {
+        /// Bespoke JSON-RPC error code.
+        code: i32,
+        /// Structured details about the retryable condition.
+        data: serde_json::Value,
+    },
+    /// An unexpected server-side failure. Maps to JSON-RPC `-32603`
+    /// (`INTERNAL_ERROR`).
+    Internal,
+}
+
+impl Error {
+    /// Classify this error for JSON-RPC error-code mapping.
+    ///
+    /// Matched exhaustively with no wildcard arm: a newly added [`Error`]
+    /// variant must be given an explicit classification here instead of
+    /// silently defaulting to [`McpErrorKind::Internal`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::config::ServerId;
+    /// use mcpls_core::error::{Error, McpErrorKind};
+    ///
+    /// let err = Error::WorkspaceIndexing {
+    ///     server_id: ServerId::from("rust"),
+    ///     elapsed_secs: 30,
+    /// };
+    /// let McpErrorKind::Retryable { code, data } = err.mcp_error_kind() else {
+    ///     panic!("expected a retryable classification");
+    /// };
+    /// assert_eq!(data["serverId"], "rust");
+    /// ```
+    #[must_use]
+    pub fn mcp_error_kind(&self) -> McpErrorKind {
+        match self {
+            Self::InvalidToolParams(_)
+            | Self::PathOutsideWorkspace(_)
+            | Self::NotARegularFile(_)
+            | Self::InvalidUri(_)
+            | Self::DocumentNotFound(_)
+            | Self::FileSizeLimitExceeded { .. } => McpErrorKind::InvalidParams,
+
+            // A path that doesn't exist -- whether freshly supplied in this
+            // request or tracked from an earlier request and then
+            // deleted/moved on disk since -- is caller-fault, same as
+            // `DocumentNotFound`, and matches the MCP spec's expectation
+            // that resource-not-found map to INVALID_PARAMS, not
+            // INTERNAL_ERROR (rmcp's `read_resource` handling, SEP-2164).
+            // Any other IO failure (permission denied, etc.) reaching here is
+            // a genuine server-side problem the caller cannot fix by
+            // changing their request.
+            Self::FileIo { source, .. } => {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    McpErrorKind::InvalidParams
+                } else {
+                    McpErrorKind::Internal
+                }
+            }
+
+            Self::WorkspaceIndexing {
+                server_id,
+                elapsed_secs,
+            } => McpErrorKind::Retryable {
+                code: WORKSPACE_INDEXING_ERROR_CODE,
+                data: serde_json::json!({
+                    "serverId": server_id.as_str(),
+                    "elapsedSecs": elapsed_secs,
+                }),
+            },
+            Self::ServerInitializing { server_id } => McpErrorKind::Retryable {
+                code: SERVER_INITIALIZING_ERROR_CODE,
+                data: serde_json::json!({
+                    "serverId": server_id.as_str(),
+                }),
+            },
+            // Same condition as `ServerInitializing` -- an expected LSP
+            // server hasn't registered yet, retry -- just without a single
+            // candidate server narrowed down (see the variant's doc), so
+            // there's no `serverId` to report.
+            Self::WorkspaceServersInitializing => McpErrorKind::Retryable {
+                code: SERVER_INITIALIZING_ERROR_CODE,
+                data: serde_json::json!({}),
+            },
+
+            Self::LspInitFailed { .. }
+            | Self::LspServerError { .. }
+            | Self::McpServer(_)
+            | Self::NoServerForLanguage(_)
+            | Self::NoServerForTool { .. }
+            | Self::NoServerConfigured
+            | Self::NoServerForWorkspaceTool { .. }
+            | Self::ConfigNotFound(_)
+            | Self::InvalidConfig(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::TomlDe(_)
+            | Self::TomlSer(_)
+            | Self::Transport(_)
+            | Self::Timeout(_)
+            | Self::ServerSpawnFailed { .. }
+            | Self::LspProtocolError(_)
+            | Self::ServerTerminated
+            | Self::ServerUnavailable { .. }
+            | Self::NoWorkspaceRoots(_)
+            // Unlike `FileSizeLimitExceeded`, this fires on aggregate tracker
+            // state, not this request's params -- it can succeed unchanged
+            // once other documents close, so `InvalidParams` is wrong; not
+            // `Retryable` either, since nothing evicts documents on a timer.
+            | Self::DocumentLimitExceeded { .. }
+            | Self::AllServersFailedToInit { .. }
+            | Self::NoServersAvailable(_)
+            | Self::CapabilityNotSupported { .. } => McpErrorKind::Internal,
+        }
+    }
 }
 
 /// A specialized Result type for mcpls-core operations.
@@ -622,5 +798,123 @@ mod tests {
             err.to_string(),
             "LSP server 'rust' is still indexing the workspace after 30s; wait and retry the request"
         );
+    }
+
+    /// #479: caller-fault variants must classify as `InvalidParams`, not fall
+    /// through to the generic `Internal` bucket.
+    #[test]
+    fn test_mcp_error_kind_caller_fault_variants_are_invalid_params() {
+        let caller_fault_errors = vec![
+            Error::InvalidToolParams("bad params".to_string()),
+            Error::PathOutsideWorkspace(PathBuf::from("/etc/passwd")),
+            Error::NotARegularFile(PathBuf::from("/dev/null")),
+            Error::InvalidUri("not a uri".to_string()),
+            Error::DocumentNotFound(PathBuf::from("/missing.rs")),
+            Error::FileSizeLimitExceeded { size: 100, max: 10 },
+        ];
+
+        for err in caller_fault_errors {
+            assert_eq!(
+                err.mcp_error_kind(),
+                McpErrorKind::InvalidParams,
+                "expected {err:?} to classify as InvalidParams"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mcp_error_kind_workspace_indexing_is_retryable_with_dedicated_code() {
+        let err = Error::WorkspaceIndexing {
+            server_id: ServerId::from("rust"),
+            elapsed_secs: 30,
+        };
+        let McpErrorKind::Retryable { code, data } = err.mcp_error_kind() else {
+            panic!("expected WorkspaceIndexing to classify as Retryable");
+        };
+        assert_eq!(code, WORKSPACE_INDEXING_ERROR_CODE);
+        assert_eq!(data["serverId"], "rust");
+        assert_eq!(data["elapsedSecs"], 30);
+    }
+
+    #[test]
+    fn test_mcp_error_kind_server_initializing_is_retryable_with_dedicated_code() {
+        let err = Error::ServerInitializing {
+            server_id: ServerId::from("python"),
+        };
+        let McpErrorKind::Retryable { code, data } = err.mcp_error_kind() else {
+            panic!("expected ServerInitializing to classify as Retryable");
+        };
+        assert_eq!(code, SERVER_INITIALIZING_ERROR_CODE);
+        assert_eq!(data["serverId"], "python");
+        assert_ne!(
+            code, WORKSPACE_INDEXING_ERROR_CODE,
+            "ServerInitializing must be distinguishable on the wire from WorkspaceIndexing"
+        );
+    }
+
+    /// `WorkspaceServersInitializing` is `ServerInitializing`'s counterpart
+    /// for a resolution that never narrowed down to a single server (see the
+    /// variant's doc comment), so it must be retryable too -- a client that
+    /// auto-retries on the bespoke retryable code must not treat this as a
+    /// hard failure just because no `server_id` was available.
+    #[test]
+    fn test_mcp_error_kind_workspace_servers_initializing_is_retryable() {
+        let err = Error::WorkspaceServersInitializing;
+        let McpErrorKind::Retryable { code, .. } = err.mcp_error_kind() else {
+            panic!("expected WorkspaceServersInitializing to classify as Retryable");
+        };
+        assert_eq!(code, SERVER_INITIALIZING_ERROR_CODE);
+    }
+
+    #[test]
+    fn test_mcp_error_kind_unretained_variants_stay_internal() {
+        let internal_errors = vec![
+            Error::NoServerForLanguage("python".to_string()),
+            Error::NoServerForTool {
+                language_id: "rust".to_string(),
+                tool: crate::config::ToolKind::Hover,
+            },
+            Error::CapabilityNotSupported {
+                server_id: ServerId::from("rust"),
+                capability: "renameProvider",
+            },
+            Error::NoWorkspaceRoots(PathBuf::from("/tmp")),
+            Error::DocumentLimitExceeded {
+                current: 150,
+                max: 100,
+            },
+        ];
+
+        for err in internal_errors {
+            assert_eq!(
+                err.mcp_error_kind(),
+                McpErrorKind::Internal,
+                "expected {err:?} to classify as Internal"
+            );
+        }
+    }
+
+    /// #479 regression: a client-supplied path that doesn't exist (the
+    /// common case behind `validate_path_against_roots`'s `canonicalize()`
+    /// failure) must classify as caller-fault, matching `DocumentNotFound`.
+    #[test]
+    fn test_mcp_error_kind_file_io_not_found_is_invalid_params() {
+        let err = Error::FileIo {
+            path: PathBuf::from("/no/such/file.rs"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory"),
+        };
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
+    }
+
+    /// Counterpart: a non-not-found IO failure (permission denied, etc.) is
+    /// a genuine server-side problem, not something the caller can fix by
+    /// changing their request.
+    #[test]
+    fn test_mcp_error_kind_file_io_other_kind_stays_internal() {
+        let err = Error::FileIo {
+            path: PathBuf::from("/root/secret.rs"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        };
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
     }
 }
