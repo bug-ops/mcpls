@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+use crate::bridge::{NotificationCache, ResourceSubscriptions, SubscriptionRegistry, Translator};
 use crate::config::McpConfig;
 
 /// Shared context for all tool handlers.
@@ -38,8 +38,22 @@ pub struct BridgeContext {
     /// `get_cached_diagnostics`, `read_resource`) can validate a path without
     /// locking anything.
     pub workspace_roots: Arc<[PathBuf]>,
-    /// Set of resource URIs the MCP client has subscribed to.
+    /// Set of resource URIs *this instance's* MCP client has subscribed to.
+    ///
+    /// Scoped to one `McplsServer` instance: obtained from
+    /// `subscription_registry` when this context was built, so
+    /// [`crate::bridge::resources::MAX_SUBSCRIPTIONS`] caps per instance and
+    /// one instance's subscribe/unsubscribe calls can never observe or affect
+    /// another's entries. That coincides with "per session" only on rmcp's
+    /// legacy session path -- on its stateless HTTP path a fresh instance
+    /// (and this field) is built and dropped per *request*; see
+    /// [`SubscriptionRegistry`]'s "Known limitation" section.
     pub subscriptions: Arc<ResourceSubscriptions>,
+    /// Process-wide registry every session's `subscriptions` set is
+    /// registered into, so the diagnostics pump can query "does any live
+    /// session want this URI?" without holding a long-lived reference to any
+    /// one session's set (see [`SubscriptionRegistry`]).
+    pub subscription_registry: SubscriptionRegistry,
     /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted when
     /// the active [`ServerConfig`](crate::config::ServerConfig) was loaded.
     ///
@@ -53,21 +67,24 @@ pub struct BridgeContext {
 }
 
 impl BridgeContext {
-    /// Create a new bridge context.
+    /// Create a new bridge context, registering a fresh per-session
+    /// subscription set into `subscription_registry`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
-        subscriptions: Arc<ResourceSubscriptions>,
+        subscription_registry: SubscriptionRegistry,
         project_config_ignored: bool,
         mcp: McpConfig,
     ) -> Self {
+        let subscriptions = subscription_registry.register();
         Self {
             translator,
             notification_cache,
             workspace_roots,
             subscriptions,
+            subscription_registry,
             project_config_ignored,
             mcp,
         }
@@ -84,12 +101,12 @@ mod tests {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
-        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let subscription_registry = SubscriptionRegistry::new();
         let context = BridgeContext::new(
             translator,
             notification_cache,
             workspace_roots,
-            subscriptions,
+            subscription_registry,
             false,
             McpConfig::default(),
         );

@@ -30,7 +30,7 @@ use super::tools::{
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
     DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, IndexingState,
-    NotificationCache, Position, PositionEncoding, ReferencesResult, ResourceSubscriptions,
+    NotificationCache, Position, PositionEncoding, ReferencesResult, SubscriptionRegistry,
     Translator, validate_path_against_roots,
 };
 use crate::config::{McpConfig, ToolPrefix};
@@ -130,16 +130,22 @@ struct CachedDiagnosticsResponse {
 }
 
 /// MCP server that exposes LSP capabilities as tools.
-#[derive(Clone)]
+///
+/// Deliberately not `Clone` (#478): each HTTP session must get its own
+/// [`ResourceSubscriptions`](crate::bridge::ResourceSubscriptions) set via
+/// [`Self::for_new_session`], not a shared instance a stray `.clone()` could
+/// hand to two sessions at once. `for_new_session` builds a new value field by
+/// field instead (each field an `Arc` bump except `subscriptions`), so this
+/// costs nothing at the one production call site (`transport::run_http`'s
+/// per-session factory closure).
 pub struct McplsServer {
     context: Arc<BridgeContext>,
 
-    /// `Arc`-wrapped so `Clone` stays an `Arc` bump (as it is today via
-    /// `context`) rather than a deep clone of every registered
-    /// `ToolRoute` on each new session (see `transport.rs`'s per-session
-    /// factory closure). `#[tool_handler(router = self.tool_router)]`'s
-    /// generated `self.tool_router.call(..)` auto-derefs through the `Arc`,
-    /// so this is transparent to the macro-generated code.
+    /// `Arc`-wrapped so building a new session in `for_new_session` is a
+    /// cheap `Arc` bump rather than a deep clone of every registered
+    /// `ToolRoute`. `#[tool_handler(router = self.tool_router)]`'s generated
+    /// `self.tool_router.call(..)` auto-derefs through the `Arc`, so this is
+    /// transparent to the macro-generated code.
     tool_router: Arc<ToolRouter<Self>>,
 }
 
@@ -363,7 +369,12 @@ fn build_resource_diagnostics_response(
 #[tool_router(router = declared_tool_router)]
 impl McplsServer {
     /// Create a new MCP server with the given translator, notification cache,
-    /// workspace roots, and subscriptions.
+    /// workspace roots, and subscription registry.
+    ///
+    /// A fresh, empty subscription set is registered into
+    /// `subscription_registry` for this instance -- see
+    /// [`Self::for_new_session`] for how per-HTTP-session isolation builds on
+    /// top of that.
     ///
     /// `project_config_ignored` reports whether a CWD-discovered
     /// `./mcpls.toml` was skipped as untrusted when the active config was
@@ -376,7 +387,7 @@ impl McplsServer {
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: Arc<[PathBuf]>,
-        subscriptions: Arc<ResourceSubscriptions>,
+        subscription_registry: SubscriptionRegistry,
         project_config_ignored: bool,
         mcp: McpConfig,
     ) -> Self {
@@ -385,7 +396,7 @@ impl McplsServer {
             translator,
             notification_cache,
             workspace_roots,
-            subscriptions,
+            subscription_registry,
             project_config_ignored,
             mcp,
         ));
@@ -393,6 +404,70 @@ impl McplsServer {
             context,
             tool_router,
         }
+    }
+
+    /// Build a new server instance for a new HTTP session, giving it its own
+    /// isolated [`ResourceSubscriptions`](crate::bridge::ResourceSubscriptions)
+    /// set registered into the same [`SubscriptionRegistry`].
+    ///
+    /// Every other piece of shared state (translator, notification cache,
+    /// workspace roots, config) is shared with the original via a cheap `Arc`
+    /// clone -- only the subscription set is fresh. Called from the HTTP
+    /// transport's service factory (see `transport::run_http`); stdio never
+    /// calls this, since it only ever serves the one session `McplsServer::new`
+    /// already built.
+    ///
+    /// "Per session" narrows to "per request" on rmcp's stateless HTTP path --
+    /// see [`SubscriptionRegistry`]'s "Known limitation" section for what that
+    /// means for the instance (and subscription set) this returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use mcpls_core::bridge::{NotificationCache, SubscriptionRegistry, Translator};
+    /// use mcpls_core::config::McpConfig;
+    /// use mcpls_core::mcp::McplsServer;
+    /// use tokio::sync::Mutex;
+    ///
+    /// let server = McplsServer::new(
+    ///     Arc::new(Translator::new()),
+    ///     Arc::new(Mutex::new(NotificationCache::new())),
+    ///     Arc::from(Vec::new()),
+    ///     SubscriptionRegistry::new(),
+    ///     false,
+    ///     McpConfig::default(),
+    /// );
+    /// // One `McplsServer` clone per HTTP session; each gets isolated resource
+    /// // subscriptions while still sharing the same LSP-facing state.
+    /// let _session = server.for_new_session();
+    /// ```
+    #[must_use]
+    pub fn for_new_session(&self) -> Self {
+        let subscriptions = self.context.subscription_registry.register();
+        let context = Arc::new(BridgeContext {
+            translator: Arc::clone(&self.context.translator),
+            notification_cache: Arc::clone(&self.context.notification_cache),
+            workspace_roots: Arc::clone(&self.context.workspace_roots),
+            subscriptions,
+            subscription_registry: self.context.subscription_registry.clone(),
+            project_config_ignored: self.context.project_config_ignored,
+            mcp: self.context.mcp.clone(),
+        });
+        Self {
+            context,
+            tool_router: Arc::clone(&self.tool_router),
+        }
+    }
+
+    /// This instance's [`SubscriptionRegistry`], so a test exercising the
+    /// real HTTP factory/session-close path (`transport.rs`'s integration
+    /// tests) can assert on registry state without reaching into private
+    /// `BridgeContext` fields cross-module.
+    #[cfg(test)]
+    pub(crate) fn subscription_registry(&self) -> SubscriptionRegistry {
+        self.context.subscription_registry.clone()
     }
 
     /// Router for every MCP tool, with the read-only classification applied
@@ -1098,11 +1173,15 @@ impl ServerHandler for McplsServer {
         // below catches them; if they arrive after, `diagnostics_pump`'s own
         // `subs.contains` check already sees this URI as subscribed and delivers the
         // update through the normal push path.
-        self.context
+        let newly_subscribed = self
+            .context
             .subscriptions
             .subscribe(canonical_uri.clone())
             .await
-            .map_err(|e| McpError::invalid_params(e, None))?;
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        if !newly_subscribed {
+            tracing::debug!("client re-subscribed to already-subscribed resource {canonical_uri}");
+        }
 
         // Build the URI from the canonicalized path, matching `read_resource` and
         // what `diagnostics_pump` stores from LSP notifications.
@@ -1198,6 +1277,7 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::bridge::ResourceSubscriptions;
 
     fn create_test_server() -> McplsServer {
         create_test_server_with_ignored_flag(false)
@@ -1226,12 +1306,11 @@ mod tests {
     ) -> McplsServer {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let subscriptions = Arc::new(ResourceSubscriptions::new());
         McplsServer::new(
             translator,
             notification_cache,
             workspace_roots,
-            subscriptions,
+            SubscriptionRegistry::new(),
             project_config_ignored,
             mcp,
         )
@@ -1493,7 +1572,7 @@ mod tests {
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
             Arc::from(vec![dir.path().to_path_buf()]),
-            Arc::new(ResourceSubscriptions::new()),
+            SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
         );
@@ -1558,7 +1637,7 @@ mod tests {
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
             Arc::from(vec![dir.path().to_path_buf()]),
-            Arc::new(ResourceSubscriptions::new()),
+            SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
         );
@@ -1631,7 +1710,7 @@ mod tests {
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
             Arc::from(vec![dir.path().to_path_buf()]),
-            Arc::new(ResourceSubscriptions::new()),
+            SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
         );
@@ -1723,7 +1802,7 @@ mod tests {
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
             Arc::from(vec![dir.path().to_path_buf()]),
-            Arc::new(ResourceSubscriptions::new()),
+            SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
         );
@@ -2178,7 +2257,7 @@ mod tests {
             translator,
             Arc::clone(&notification_cache),
             Arc::from([temp_dir.path().to_path_buf()]),
-            Arc::new(ResourceSubscriptions::new()),
+            SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
         );
@@ -2233,7 +2312,7 @@ mod tests {
             translator,
             Arc::clone(&notification_cache),
             Arc::from(vec![temp_dir.path().to_path_buf()]),
-            Arc::new(ResourceSubscriptions::new()),
+            SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
         );
@@ -2285,7 +2364,7 @@ mod tests {
             translator,
             Arc::clone(&notification_cache),
             Arc::from(vec![temp_dir.path().to_path_buf()]),
-            Arc::new(ResourceSubscriptions::new()),
+            SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
         );
@@ -2393,7 +2472,7 @@ sleep 0.3
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
             Arc::from([dir.path().to_path_buf()]),
-            Arc::new(ResourceSubscriptions::new()),
+            SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
         );
@@ -3174,6 +3253,79 @@ sleep 0.3
             .unsubscribe("lsp-diagnostics:///nonexistent.rs")
             .await;
         assert!(!removed);
+    }
+
+    /// `for_new_session` gives each HTTP session its own subscription set
+    /// (#478): subscribing on one clone must not be visible to another, and
+    /// unsubscribing from one clone must not affect another's entries.
+    #[tokio::test]
+    async fn test_for_new_session_isolates_subscriptions() {
+        let server = create_test_server();
+        let session_a = server.for_new_session();
+        let session_b = server.for_new_session();
+
+        session_a
+            .context
+            .subscriptions
+            .subscribe("lsp-diagnostics:///a.rs".to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            session_a
+                .context
+                .subscriptions
+                .contains("lsp-diagnostics:///a.rs")
+                .await
+        );
+        assert!(
+            !session_b
+                .context
+                .subscriptions
+                .contains("lsp-diagnostics:///a.rs")
+                .await
+        );
+        assert!(
+            !server
+                .context
+                .subscriptions
+                .contains("lsp-diagnostics:///a.rs")
+                .await
+        );
+
+        // Cross-session unsubscribe must not remove another session's entry.
+        session_b
+            .context
+            .subscriptions
+            .unsubscribe("lsp-diagnostics:///a.rs")
+            .await;
+        assert!(
+            session_a
+                .context
+                .subscriptions
+                .contains("lsp-diagnostics:///a.rs")
+                .await
+        );
+    }
+
+    /// A session's subscriptions are reclaimed from the shared registry as
+    /// soon as its `McplsServer` clone is dropped, without any explicit
+    /// close-time bookkeeping (#478).
+    #[tokio::test]
+    async fn test_dropped_session_subscriptions_are_reclaimed() {
+        let server = create_test_server();
+        let registry = server.context.subscription_registry.clone();
+        {
+            let session = server.for_new_session();
+            session
+                .context
+                .subscriptions
+                .subscribe("lsp-diagnostics:///a.rs".to_string())
+                .await
+                .unwrap();
+            assert!(registry.any_contains("lsp-diagnostics:///a.rs").await);
+        }
+        assert!(!registry.any_contains("lsp-diagnostics:///a.rs").await);
     }
 
     /// Server capabilities advertise resources support.
