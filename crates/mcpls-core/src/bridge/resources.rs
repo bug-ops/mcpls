@@ -5,7 +5,7 @@
 //! file whose diagnostics are cached from LSP `textDocument/publishDiagnostics`
 //! notifications.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
@@ -52,6 +52,16 @@ pub enum SubscriptionError {
     /// The session's subscription set has already reached [`MAX_SUBSCRIPTIONS`].
     #[error("subscription limit of {MAX_SUBSCRIPTIONS} reached")]
     LimitReached,
+}
+
+impl From<SubscriptionError> for crate::error::Error {
+    fn from(err: SubscriptionError) -> Self {
+        match err {
+            SubscriptionError::LimitReached => Self::SubscriptionLimitReached {
+                max: MAX_SUBSCRIPTIONS,
+            },
+        }
+    }
 }
 
 /// Encode an absolute filesystem path into a `lsp-diagnostics:///…` resource URI.
@@ -127,12 +137,27 @@ pub fn parse_uri(uri: &str) -> Result<PathBuf, ResourceUriError> {
         .map_err(|()| ResourceUriError::DecodeFailed(file_uri))
 }
 
+/// Internal state guarded by [`ResourceSubscriptions`]'s `RwLock`.
+#[derive(Debug, Default)]
+struct SubscriptionState {
+    /// Canonical resource URIs currently subscribed -- what the diagnostics
+    /// pump checks against.
+    canonical: HashSet<String>,
+    /// Client-supplied ("raw") URI -> canonical URI, recorded at subscribe
+    /// time for entries where the two differ (symlink, macOS `/var` vs
+    /// `/private/var`, ...). Lets a later `unsubscribe` for the same raw URI
+    /// still resolve to the right entry even if canonicalizing it at
+    /// unsubscribe time fails, e.g. because the file was deleted since
+    /// subscribing (#499).
+    aliases: HashMap<String, String>,
+}
+
 /// Tracks which MCP resource URIs the client has subscribed to.
 ///
 /// The hot read path (pump tasks checking before sending notifications) uses
 /// a `RwLock` so concurrent readers do not block each other.
 #[derive(Debug)]
-pub struct ResourceSubscriptions(RwLock<HashSet<String>>);
+pub struct ResourceSubscriptions(RwLock<SubscriptionState>);
 
 impl Default for ResourceSubscriptions {
     fn default() -> Self {
@@ -144,7 +169,7 @@ impl ResourceSubscriptions {
     /// Create an empty subscription set.
     #[must_use]
     pub fn new() -> Self {
-        Self(RwLock::new(HashSet::new()))
+        Self(RwLock::new(SubscriptionState::default()))
     }
 
     /// Add a URI to the subscription set.
@@ -156,11 +181,48 @@ impl ResourceSubscriptions {
     /// Returns [`SubscriptionError::LimitReached`] if the set has already
     /// reached [`MAX_SUBSCRIPTIONS`] and `uri` is not already a member.
     pub async fn subscribe(&self, uri: String) -> Result<bool, SubscriptionError> {
-        let mut set = self.0.write().await;
-        if !set.contains(&uri) && set.len() >= MAX_SUBSCRIPTIONS {
+        let mut state = self.0.write().await;
+        if !state.canonical.contains(&uri) && state.canonical.len() >= MAX_SUBSCRIPTIONS {
             return Err(SubscriptionError::LimitReached);
         }
-        Ok(set.insert(uri))
+        Ok(state.canonical.insert(uri))
+    }
+
+    /// Record that `raw_uri` (the client-supplied URI, before
+    /// canonicalization) currently corresponds to `canonical_uri`, so a
+    /// later [`Self::unsubscribe`] for the same raw URI still resolves even
+    /// if canonicalization fails by then (#499). A no-op when the two are
+    /// equal, or when `canonical_uri` is not (or is no longer) an actual
+    /// subscribed entry -- the latter also closes a race against a
+    /// concurrent [`Self::unsubscribe`] landing between a caller's own
+    /// `subscribe`/`record_alias` pair.
+    ///
+    /// Drops any existing alias that already points at `canonical_uri`
+    /// before inserting the new one, so at most one alias is kept per
+    /// canonical entry. This keeps the alias map's size structurally bounded
+    /// by the canonical set's size (itself capped at [`MAX_SUBSCRIPTIONS`] by
+    /// [`Self::subscribe`]), instead of an independent bound: without this,
+    /// re-subscribing under many distinct raw encodings of the same
+    /// already-subscribed file (each a no-op against the canonical set, so
+    /// never gated by the subscribe cap) could otherwise exhaust an
+    /// independent alias-count bound on a single file, starving aliases for
+    /// every other subscription.
+    ///
+    /// Residual (#499): one-alias-per-canonical narrows but does not fully
+    /// eliminate the leak this exists to close. A file subscribed under two
+    /// distinct raw URIs, then deleted, then unsubscribed via the
+    /// non-latest raw form still leaks one slot -- self-healing the moment
+    /// the client instead unsubscribes via the latest recorded form.
+    pub(crate) async fn record_alias(&self, raw_uri: String, canonical_uri: String) {
+        if raw_uri == canonical_uri {
+            return;
+        }
+        let mut state = self.0.write().await;
+        if !state.canonical.contains(&canonical_uri) {
+            return;
+        }
+        state.aliases.retain(|_, c| c != &canonical_uri);
+        state.aliases.insert(raw_uri, canonical_uri);
     }
 
     /// Check whether the subscription set is empty.
@@ -168,24 +230,39 @@ impl ResourceSubscriptions {
     /// Used as a fast path in the diagnostics pump to skip URI construction
     /// when no client has subscribed yet.
     pub async fn is_empty(&self) -> bool {
-        self.0.read().await.is_empty()
+        self.0.read().await.canonical.is_empty()
     }
 
     /// Remove a URI from the subscription set.
     ///
-    /// Returns `true` if the URI was present and removed.
+    /// Tries `uri` directly against the canonical set first, then falls back
+    /// to resolving it as a recorded raw alias (see `Self::record_alias`,
+    /// crate-private) -- covers a caller that could not canonicalize the path at
+    /// unsubscribe time (e.g. the file was deleted since subscribing) and so
+    /// passed the same raw URI it originally subscribed with.
+    ///
+    /// Returns `true` if a subscription was found and removed.
     pub async fn unsubscribe(&self, uri: &str) -> bool {
-        self.0.write().await.remove(uri)
+        let mut state = self.0.write().await;
+        if state.canonical.remove(uri) {
+            state.aliases.retain(|_, canonical| canonical != uri);
+            return true;
+        }
+        if let Some(canonical) = state.aliases.remove(uri) {
+            state.aliases.retain(|_, c| c != &canonical);
+            return state.canonical.remove(&canonical);
+        }
+        false
     }
 
     /// Check if a URI is currently subscribed.
     pub async fn contains(&self, uri: &str) -> bool {
-        self.0.read().await.contains(uri)
+        self.0.read().await.canonical.contains(uri)
     }
 
     /// Return a snapshot of all subscribed URIs (primarily for tests).
     pub async fn snapshot(&self) -> Vec<String> {
-        self.0.read().await.iter().cloned().collect()
+        self.0.read().await.canonical.iter().cloned().collect()
     }
 }
 
@@ -511,6 +588,121 @@ mod tests {
     async fn test_unsubscribe_nonexistent_returns_false() {
         let subs = ResourceSubscriptions::new();
         assert!(!subs.unsubscribe("lsp-diagnostics:///nonexistent.rs").await);
+    }
+
+    /// #499: a stale raw URI recorded via `record_alias` must still resolve
+    /// to the canonical entry `subscribe` created, even though the raw and
+    /// canonical strings differ (e.g. a symlink or macOS `/var` vs
+    /// `/private/var`).
+    #[tokio::test]
+    async fn test_unsubscribe_resolves_recorded_alias() {
+        let subs = ResourceSubscriptions::new();
+        let raw = "lsp-diagnostics:///var/tmp/file.rs".to_string();
+        let canonical = "lsp-diagnostics:///private/var/tmp/file.rs".to_string();
+
+        subs.subscribe(canonical.clone()).await.unwrap();
+        subs.record_alias(raw.clone(), canonical.clone()).await;
+        assert!(subs.contains(&canonical).await);
+
+        assert!(subs.unsubscribe(&raw).await);
+        assert!(!subs.contains(&canonical).await);
+    }
+
+    /// `record_alias` is a no-op when the raw and canonical URIs are equal
+    /// (the common case), so it never grows the alias map for entries that
+    /// don't need it.
+    #[tokio::test]
+    async fn test_record_alias_noop_when_raw_equals_canonical() {
+        let subs = ResourceSubscriptions::new();
+        let uri = "lsp-diagnostics:///tmp/file.rs".to_string();
+        subs.subscribe(uri.clone()).await.unwrap();
+        subs.record_alias(uri.clone(), uri.clone()).await;
+
+        // No alias was recorded, so unsubscribing under the canonical URI
+        // directly is still what resolves it.
+        assert!(subs.unsubscribe(&uri).await);
+    }
+
+    /// Unsubscribing under the canonical URI directly must also clear any
+    /// aliases that pointed at it, so the alias map does not accumulate
+    /// stale entries for already-removed subscriptions.
+    #[tokio::test]
+    async fn test_unsubscribe_by_canonical_clears_stale_aliases() {
+        let subs = ResourceSubscriptions::new();
+        let raw = "lsp-diagnostics:///var/tmp/file.rs".to_string();
+        let canonical = "lsp-diagnostics:///private/var/tmp/file.rs".to_string();
+
+        subs.subscribe(canonical.clone()).await.unwrap();
+        subs.record_alias(raw.clone(), canonical.clone()).await;
+
+        assert!(subs.unsubscribe(&canonical).await);
+        // The alias must no longer resolve to anything now that the
+        // canonical entry it pointed at is gone.
+        assert!(!subs.unsubscribe(&raw).await);
+    }
+
+    /// #499 site fix (impl-critic C1): re-subscribing to an already-subscribed
+    /// canonical URI under distinct genuine percent-encoding variants of the
+    /// same filename (`%66`/`%65`/`%2E` for `f`/`e`/`.` in `file.rs`) must not
+    /// grow the alias map without bound -- only the most recently recorded
+    /// alias for a given canonical URI is kept, so the alias map's size stays
+    /// structurally tied to the (already `MAX_SUBSCRIPTIONS`-capped) canonical
+    /// set's size, rather than an independent, exhaustible counter.
+    #[tokio::test]
+    async fn test_record_alias_keeps_only_latest_alias_per_canonical() {
+        let subs = ResourceSubscriptions::new();
+        let canonical = "lsp-diagnostics:///file.rs".to_string();
+        subs.subscribe(canonical.clone()).await.unwrap();
+
+        let raws = [
+            "lsp-diagnostics:///%66ile.rs".to_string(),
+            "lsp-diagnostics:///fil%65.rs".to_string(),
+            "lsp-diagnostics:///file%2Ers".to_string(),
+        ];
+        for raw in &raws {
+            subs.record_alias(raw.clone(), canonical.clone()).await;
+        }
+
+        // Every earlier alias for this canonical was displaced -- none of
+        // them resolve anymore.
+        for raw in &raws[..raws.len() - 1] {
+            assert!(!subs.unsubscribe(raw).await);
+        }
+        // Only the latest recorded alias still resolves, to the same
+        // canonical entry.
+        let latest = raws.last().unwrap();
+        assert!(subs.unsubscribe(latest).await);
+        assert!(!subs.contains(&canonical).await);
+    }
+
+    /// #499 site fix (impl-critic C3): `record_alias` is a no-op when its
+    /// `canonical_uri` argument is not (or is no longer) an actual
+    /// subscribed entry -- covers a concurrent `unsubscribe` landing between
+    /// a caller's own `subscribe` and `record_alias` calls, which would
+    /// otherwise record a dangling alias for an entry that no longer exists.
+    ///
+    /// Discriminating: `unsubscribe(&raw)` alone can't tell "the guard
+    /// skipped recording the alias" apart from "the alias was recorded but
+    /// its canonical target was never subscribed either" (both return
+    /// `false` from `unsubscribe`'s final `canonical.remove` either way).
+    /// Subscribing `canonical` *after* the no-op `record_alias` call
+    /// isolates the guard: if it had recorded the alias anyway, `raw` would
+    /// now resolve to the (now real) canonical entry; it must not.
+    #[tokio::test]
+    async fn test_record_alias_noop_for_unsubscribed_canonical() {
+        let subs = ResourceSubscriptions::new();
+        let raw = "lsp-diagnostics:///var/tmp/file.rs".to_string();
+        let canonical = "lsp-diagnostics:///private/var/tmp/file.rs".to_string();
+
+        // Never subscribed (or already unsubscribed by a racing task) --
+        // `record_alias` must not record anything for it.
+        subs.record_alias(raw.clone(), canonical.clone()).await;
+
+        // Now make `canonical` a real subscribed entry. If the guard above
+        // had not fired, `raw` would incorrectly resolve to it.
+        subs.subscribe(canonical.clone()).await.unwrap();
+        assert!(!subs.unsubscribe(&raw).await);
+        assert!(subs.unsubscribe(&canonical).await);
     }
 
     #[tokio::test]
