@@ -496,8 +496,10 @@
               ]
             },
             "kind": {
-              "description": "Kind of symbol.",
-              "type": "string"
+              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
             },
             "name": {
               "description": "Name of the symbol.",
@@ -1060,7 +1062,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "kind_filter": {
-          "description": "Optional filter by symbol kind (function, class, variable, etc.).",
+          "description": "Optional filter by symbol kind: a name (function, class, variable, etc.) or the numeric LSP SymbolKind value from a result's kind field.",
           "type": [
             "string",
             "null"

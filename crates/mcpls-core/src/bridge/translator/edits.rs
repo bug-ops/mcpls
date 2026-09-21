@@ -93,9 +93,9 @@ fn validate_code_action_params(
 ///
 /// `new_name` is forwarded to the routed LSP server as-is with no inherent
 /// bound of its own -- unlike `workspace_symbol_search`'s `query` (see
-/// `validate_workspace_symbol_params`), it previously relied entirely on
-/// outer transport limits (#309). No real identifier approaches this length
-/// in any language mcpls targets.
+/// `validate_query_length`), it previously relied entirely on outer
+/// transport limits (#309). No real identifier approaches this length in any
+/// language mcpls targets.
 pub(super) const MAX_NEW_NAME_LENGTH: usize = 1_000;
 
 /// Validate parameters for `handle_rename`.
