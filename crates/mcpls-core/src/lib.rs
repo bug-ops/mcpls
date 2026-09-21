@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bridge::resources::make_uri;
-use bridge::{NotificationCache, ResourceSubscriptions, Translator};
+use bridge::{NotificationCache, SubscriptionRegistry, Translator};
 pub use config::{ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
@@ -97,7 +97,11 @@ fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &[PathBuf]) -> bool 
 #[derive(Clone)]
 pub(crate) struct PumpShared {
     pub(crate) notification_cache: Arc<Mutex<NotificationCache>>,
-    pub(crate) subs: Arc<ResourceSubscriptions>,
+    /// Aggregated across every live MCP session's own subscription set (one
+    /// per HTTP session, or the single set stdio ever has), so the pump can
+    /// ask "does *any* live session want this URI?" without holding a
+    /// reference to any one session's set -- see [`SubscriptionRegistry`].
+    pub(crate) subs: SubscriptionRegistry,
     pub(crate) peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     /// Used to reject diagnostics for out-of-workspace URIs; see
     /// `diagnostic_path_in_workspace`.
@@ -199,8 +203,21 @@ pub(crate) async fn diagnostics_pump(
                             cache.store_diagnostics(&server_id, &p.uri, p.version, p.diagnostics);
                         }
 
+                        // One snapshot of live sessions, queried twice below
+                        // (empty check, then contains check), instead of
+                        // `is_all_empty`/`any_contains` each independently
+                        // locking the registry and re-upgrading every `Weak`.
+                        let sessions = subs.live_sessions();
+
                         // Fast path: skip URI construction when nothing is subscribed.
-                        if subs.is_empty().await {
+                        let mut any_subscribed = false;
+                        for session in &sessions {
+                            if !session.is_empty().await {
+                                any_subscribed = true;
+                                break;
+                            }
+                        }
+                        if !any_subscribed {
                             continue;
                         }
 
@@ -209,7 +226,14 @@ pub(crate) async fn diagnostics_pump(
                         let Some(path) = bridge::uri_to_path(&p.uri) else { continue };
                         let Ok(mcp_uri) = make_uri(&path) else { continue };
 
-                        if !subs.contains(&mcp_uri).await {
+                        let mut subscribed_here = false;
+                        for session in &sessions {
+                            if session.contains(&mcp_uri).await {
+                                subscribed_here = true;
+                                break;
+                            }
+                        }
+                        if !subscribed_here {
                             continue;
                         }
 
@@ -636,7 +660,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // conflicting `[[lsp_servers]]` entries, not a silent drop.
     let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
 
-    // Built here (rather than alongside `subscriptions`/`peer_cell` below) so
+    // Built here (rather than alongside `subscription_registry`/`peer_cell` below) so
     // it can be handed to the translator, which uses it to invalidate a
     // respawned server's stale cached diagnostics -- see
     // `Translator::with_notification_cache`. Independent of `translator`
@@ -683,7 +707,11 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
 
     let translator = Arc::new(translator);
-    let subscriptions = Arc::new(ResourceSubscriptions::new());
+    // Shared across every session (one per HTTP session, or the sole stdio
+    // session): `McplsServer::new` and `McplsServer::for_new_session` each
+    // register a fresh, isolated `ResourceSubscriptions` set into it -- see
+    // `SubscriptionRegistry`.
+    let subscription_registry = SubscriptionRegistry::new();
     // Peer cell is populated after the MCP transport is established (Phase B).
     let peer_cell = Arc::new(OnceCell::new());
 
@@ -702,7 +730,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             applicable_configs,
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::clone(&subscriptions),
+            subscription_registry.clone(),
             Arc::clone(&peer_cell),
             cancel_rx.clone(),
             Arc::clone(&workspace_roots_snapshot),
@@ -714,7 +742,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Arc::clone(&translator),
         Arc::clone(&notification_cache),
         Arc::clone(&workspace_roots_snapshot),
-        Arc::clone(&subscriptions),
+        subscription_registry,
         project_config_ignored,
         mcp,
     );
@@ -914,7 +942,7 @@ fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
     translator: Arc<Translator>,
     notification_cache: Arc<Mutex<NotificationCache>>,
-    subscriptions: Arc<ResourceSubscriptions>,
+    subscription_registry: SubscriptionRegistry,
     peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     workspace_roots: Arc<[PathBuf]>,
@@ -987,7 +1015,7 @@ fn spawn_lsp_servers_background(
         // Start diagnostics pump tasks now that servers are registered.
         let pump_shared = PumpShared {
             notification_cache,
-            subs: subscriptions,
+            subs: subscription_registry,
             peer_cell,
             workspace_roots,
         };
@@ -2016,8 +2044,8 @@ mod tests {
             Arc::new(Mutex::new(NotificationCache::new()))
         }
 
-        fn make_subs() -> Arc<ResourceSubscriptions> {
-            Arc::new(ResourceSubscriptions::new())
+        fn make_subs() -> SubscriptionRegistry {
+            SubscriptionRegistry::new()
         }
 
         type PeerCell = Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>;
@@ -2070,7 +2098,7 @@ mod tests {
                 true,
                 PumpShared {
                     notification_cache: c,
-                    subs: Arc::clone(&subs),
+                    subs: subs.clone(),
                     peer_cell: Arc::clone(&peer_cell),
                     workspace_roots: test_workspace_roots(),
                 },
@@ -2144,7 +2172,7 @@ mod tests {
                 true,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
-                    subs: Arc::clone(&subs),
+                    subs: subs.clone(),
                     peer_cell: Arc::clone(&peer_cell),
                     workspace_roots,
                 },

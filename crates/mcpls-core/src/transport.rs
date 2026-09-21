@@ -358,9 +358,10 @@ pub(crate) async fn run_stdio(
 /// Binds `cfg.bind`, mounts the MCP service at `cfg.path` (and `/`), and
 /// serves until `Ctrl-C` or `SIGTERM` is received.
 ///
-/// Each HTTP session receives its own `McplsServer` clone. The shared
-/// `Arc<Translator>` inside is the same across all sessions, so LSP state is
-/// still global per process.
+/// Each HTTP session receives its own `McplsServer` instance (see
+/// [`crate::mcp::McplsServer::for_new_session`]). The shared `Arc<Translator>`
+/// inside is the same across all sessions, so LSP state is still global per
+/// process.
 ///
 /// # Note
 ///
@@ -368,6 +369,11 @@ pub(crate) async fn run_stdio(
 /// HTTP sessions in this release — the single-peer pump architecture from
 /// stdio is kept as-is. Clients can still poll diagnostics via the existing
 /// MCP tools. A follow-up issue will add per-session broadcast.
+///
+/// On rmcp's stateless request path, "one instance per session" narrows to
+/// "one instance per request" -- see
+/// [`SubscriptionRegistry`](crate::bridge::SubscriptionRegistry)'s "Known
+/// limitation" section.
 ///
 /// # Resource limits
 ///
@@ -430,14 +436,24 @@ pub(crate) async fn run_http(
     let session_manager = Arc::new(CappedSessionManager::new(cfg.max_concurrent_sessions));
     let cancel = CancellationToken::new();
 
-    let mcp_for_factory = mcp_server.clone();
+    // `mcp_server` is moved (not cloned): `McplsServer` is deliberately not
+    // `Clone` (#478) so this is the only value the factory below can build
+    // new sessions from, rather than a shared instance a caller could
+    // accidentally hand to multiple sessions.
+    let mcp_for_factory = mcp_server;
     // StreamableHttpServerConfig is #[non_exhaustive]; construct via Default then mutate.
     let mut http_cfg = StreamableHttpServerConfig::default();
     http_cfg.cancellation_token = cancel.clone();
     http_cfg.max_request_body_bytes = cfg.max_request_body_bytes;
 
+    // `for_new_session`, not `.clone()`: every session must get its own
+    // `ResourceSubscriptions` set (#478) rather than sharing `mcp_for_factory`'s,
+    // while still sharing its `Arc<Translator>` and the rest of the LSP-facing
+    // state via a cheap `Arc` bump. On rmcp's stateless path this factory runs
+    // once per request, not per session -- see `SubscriptionRegistry`'s
+    // "Known limitation" doc.
     let service = StreamableHttpService::new(
-        move || Ok::<_, std::io::Error>(mcp_for_factory.clone()),
+        move || Ok::<_, std::io::Error>(mcp_for_factory.for_new_session()),
         session_manager,
         http_cfg,
     );
@@ -824,14 +840,14 @@ mod tests {
 
         use tokio::sync::Mutex;
 
-        use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+        use crate::bridge::{NotificationCache, SubscriptionRegistry, Translator};
         use crate::config::McpConfig;
         use crate::mcp::McplsServer;
 
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
-        let subs = Arc::new(ResourceSubscriptions::new());
+        let subs = SubscriptionRegistry::new();
         let server = McplsServer::new(
             translator,
             notification_cache,
@@ -932,14 +948,14 @@ mod tests {
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::bridge::{NotificationCache, SubscriptionRegistry, Translator};
             use crate::config::McpConfig;
             use crate::mcp::McplsServer;
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
-            let subs = Arc::new(ResourceSubscriptions::new());
+            let subs = SubscriptionRegistry::new();
             let server = McplsServer::new(
                 translator,
                 notification_cache,
@@ -1036,7 +1052,7 @@ mod tests {
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::bridge::{NotificationCache, SubscriptionRegistry, Translator};
             use crate::config::McpConfig;
             use crate::mcp::McplsServer;
 
@@ -1047,7 +1063,7 @@ mod tests {
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
-            let subs = Arc::new(ResourceSubscriptions::new());
+            let subs = SubscriptionRegistry::new();
             let server = McplsServer::new(
                 translator,
                 notification_cache,
@@ -1077,14 +1093,14 @@ mod tests {
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::bridge::{NotificationCache, SubscriptionRegistry, Translator};
             use crate::config::McpConfig;
             use crate::mcp::McplsServer;
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
-            let subs = Arc::new(ResourceSubscriptions::new());
+            let subs = SubscriptionRegistry::new();
             McplsServer::new(
                 translator,
                 notification_cache,
@@ -1432,6 +1448,67 @@ mod tests {
             assert!(
                 stateless.starts_with("HTTP/1.1 200"),
                 "stateless requests must bypass the session cap entirely, got: {stateless}"
+            );
+
+            server_task.abort();
+        }
+
+        /// #478/#482 regression pin: on rmcp's stateless path (see
+        /// `test_run_http_stateless_request_bypasses_session_cap` above), the
+        /// service factory -- and therefore `McplsServer::for_new_session` --
+        /// runs once per *request*, not once per session, registering a new
+        /// `ResourceSubscriptions` set each time. Firing many stateless
+        /// requests must not grow `SubscriptionRegistry` without bound (S2's
+        /// prune-before-push in `register`); it must stay pinned near the
+        /// handful of instances actually alive (the long-lived template
+        /// `McplsServer` this test built, plus at most one not-yet-pruned
+        /// stateless-request entry).
+        #[tokio::test]
+        async fn test_stateless_requests_do_not_grow_subscription_registry_unboundedly() {
+            const REQUEST_COUNT: u32 = 20;
+
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+
+            let server = test_server();
+            let registry = server.subscription_registry();
+
+            let cfg = HttpConfig::new(addr, "/mcp");
+            let server_task = tokio::spawn(super::super::run_http(
+                server,
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let stateless_headers = "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: resources/list\r\n";
+
+            for id in 0..REQUEST_COUNT {
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"resources/list","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+                );
+                let response =
+                    raw_http_post(addr, "/mcp", stateless_headers, body.as_bytes()).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 200"),
+                    "stateless request {id} should succeed, got: {response}"
+                );
+            }
+
+            // Let the background task each stateless request's handler is
+            // spawned on (`serve_directly_with_ct`'s `waiting()` task in rmcp)
+            // finish dropping its per-request `McplsServer`.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Raw (unpruned) length: nothing in this test ever calls
+            // `any_contains`/`is_all_empty` (no LSP server is running to
+            // publish diagnostics), so the only thing that can keep this
+            // bounded is `register` pruning dead entries on the way in.
+            let raw = registry.raw_len();
+            assert!(
+                raw <= 2,
+                "registry should stay bounded across {REQUEST_COUNT} stateless requests, got {raw} raw entries"
             );
 
             server_task.abort();
