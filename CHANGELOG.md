@@ -51,8 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`LspTransport::new`** — Breaking change: now returns `(LspTransport, LspTransportReader)` instead of one value; `LspClient`'s inbound read is cancel-safe, fixing LSP stream desync. (#451, #456)
 - In-flight LSP requests now fail immediately with `Error::ServerTerminated` when the message loop exits (transport error, reader task gone, or shutdown), instead of each caller blocking for the full request timeout. (#458, #463)
 - **`kind` fields on `get_document_symbols`, `workspace_symbol_search`, `get_completions`, and `get_inlay_hints`** — Breaking change: now the raw LSP numeric kind (`u32`) instead of a lossy `Debug`-string rendering or a narrowing `Option<u8>`; `workspace_symbol_search`'s `kind_filter` now also accepts that numeric value. (#467, #472)
-- Resource subscriptions are now scoped per HTTP session instead of shared process-wide, fixing cross-session unsubscribe and subscription-cap leakage. (#478)
-- **`ResourceSubscriptions::subscribe`** — Breaking change: now returns `Result<bool, SubscriptionError>` instead of `Result<bool, String>`. (#478)
+- Resource subscriptions are now scoped per HTTP session instead of shared process-wide, fixing cross-session unsubscribe and subscription-cap leakage. (#478, #484)
+- **`ResourceSubscriptions::subscribe`** — Breaking change: now returns `Result<bool, SubscriptionError>` instead of `Result<bool, String>`. (#478, #484)
 
 ### Security
 
