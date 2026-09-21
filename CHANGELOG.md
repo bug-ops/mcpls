@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - LSP frame header parsing is now bounded on both single-line length and header count per frame, closing an unbounded-memory-growth path from a malicious or malfunctioning spawned LSP server. (#457, #463)
 - CodeQL workflow now triggers on `pull_request` instead of `pull_request_target`, closing a "pwn request" path where a fork PR's `build.rs`/proc-macros ran during `autobuild` with a base-repository `GITHUB_TOKEN` and could poison the default-branch Actions cache. (#464, #469)
 - **Workspace-roots validation now fails closed** — Breaking change: the diagnostics pump and rename/code-action edit filtering previously allowed unrestricted access when no workspace roots were configured; both now reject with no unrestricted opt-in, so embedders must call `Translator::set_workspace_roots` with real roots before serving any path-taking request. (#449)
-- Position-encoding conversion no longer amplifies one LSP response into unbounded disk reads: line text is now cached and read incrementally per response, and a per-response byte budget bounds the disk I/O any navigation/references/workspace-symbol/call-hierarchy/inlay-hints/rename response can trigger; references, goto-X, and workspace-symbol are additionally capped on result count. (#474)
+- Position-encoding conversion no longer amplifies one LSP response into unbounded disk reads: line text is now cached and read incrementally per response, and a per-response byte budget bounds the disk I/O any navigation/references/workspace-symbol/call-hierarchy/inlay-hints/rename response can trigger; references, goto-X, and workspace-symbol are additionally capped on result count. (#474, #486)
 
 ## [0.5.0] - 2026-09-06
 
