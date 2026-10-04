@@ -339,8 +339,8 @@ impl Translator {
 
     /// Register an LSP client under its routing identity.
     ///
-    /// Only called once per server, from `register_servers` during initial
-    /// background init. The respawn path does not reuse this method: it
+    /// Used by [`Self::register_server_complete`] during initial background
+    /// init, and directly by tests. The respawn path does not reuse this method: it
     /// needs the previous client back (to fail its pending requests) and
     /// must also reset `document_tracker` for the swapped-in server, neither
     /// of which this method does.
@@ -379,9 +379,9 @@ impl Translator {
 
     /// Store the config needed to respawn `id` if its process dies later.
     ///
-    /// Called once per server, right after a successful spawn (see the
-    /// crate-root `register_servers`); [`Self::respawn_if_dead`] is the only
-    /// reader.
+    /// Called once per server, right after a successful spawn (via
+    /// [`Self::register_server_complete`]); [`Self::respawn_if_dead`] is the
+    /// only reader.
     pub(crate) fn register_server_config(&self, id: impl Into<ServerId>, config: ServerInitConfig) {
         lock_std(&self.server_configs).insert(id.into(), config);
     }
@@ -480,8 +480,8 @@ async fn join_shutdown_tasks(
 ) {
     while let Some(joined) = tasks.join_next_with_id().await {
         if let Err(e) = joined {
-            let id = ids.get(&e.id());
-            tracing::error!(?id, error = %e, "LSP server shutdown task failed");
+            let id = ids.get(&e.id()).map_or("unknown", ServerId::as_str);
+            tracing::error!(%id, error = %e, "LSP server shutdown task failed");
         }
     }
 }

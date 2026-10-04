@@ -242,8 +242,7 @@ impl EncodingConverter {
                 "Byte offset {byte_offset} exceeds text length {text_len}"
             ));
         }
-        // `text[..byte_offset]` below panics if `byte_offset` lands
-        // mid-character. A
+        // `text[..byte_offset]` below panics if `byte_offset` lands mid-character. A
         // server-reported offset should always be on a boundary, but this is
         // untrusted external input, so it is checked rather than trusted.
         if !text.is_char_boundary(byte_offset) {

@@ -158,7 +158,7 @@ type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
 /// they stop draining the channel -- see [`LspClient::message_loop`], the
 /// only caller -- otherwise it stays parked in a blocking read holding the
 /// underlying `ChildStdout` open indefinitely: not itself a correctness bug
-/// (`has_exited()`, lifecycle.rs, checks the child process directly via
+/// (`LspServer::is_dead`, lifecycle.rs, checks the child process directly via
 /// `try_wait()` and doesn't care whether we still hold its stdout open), but
 /// a leaked task and file descriptor for the lifetime of that connection.
 fn spawn_reader_task(

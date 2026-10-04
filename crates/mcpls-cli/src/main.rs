@@ -82,12 +82,8 @@ fn main() {
 /// drops every task and with it every LSP child (`kill_on_drop`).
 fn block_on_guarded(runtime: Runtime, future: impl Future<Output = Outcome>) -> Outcome {
     if let Ok(outcome) = panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on(future))) {
-        // The `Runtime` drop would block in `BlockingPool::shutdown` on
-        // every outstanding spawn_blocking thread -- including the one
-        // `rmcp::transport::stdio()` parks in an uncancellable `read()`
-        // on stdin, which only returns on more input or EOF. Leaking the
-        // runtime lets the caller `process::exit` right away. See #308.
-        std::mem::forget(runtime);
+        // Dropping the runtime would block on the uncancellable stdin read. See #308.
+        runtime.shutdown_background();
         outcome
     } else {
         tracing::error!("mcpls panicked, shutting down the runtime to reap LSP servers");

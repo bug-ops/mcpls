@@ -705,7 +705,7 @@ impl LspServer {
     /// # Errors
     ///
     /// Returns an error if the OS fails to report the process's status.
-    pub fn is_dead(&mut self) -> Result<bool> {
+    pub(crate) fn is_dead(&mut self) -> Result<bool> {
         if self.has_exited()? {
             return Ok(true);
         }

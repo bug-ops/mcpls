@@ -26,40 +26,33 @@ impl Platform {
 }
 
 /// Display suffix explaining how to fix a missing LSP server executable.
-struct NotFoundGuidance<'a>(&'a str);
+struct NotFoundGuidance<'a>(&'a str, Platform);
 
 impl fmt::Display for NotFoundGuidance<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_not_found_guidance(f, self.0, Platform::CURRENT)
-    }
-}
-
-fn write_not_found_guidance(
-    f: &mut fmt::Formatter<'_>,
-    command: &str,
-    platform: Platform,
-) -> fmt::Result {
-    if Path::new(command)
-        .parent()
-        .is_some_and(|p| !p.as_os_str().is_empty())
-    {
-        return f.write_str("; check that the configured path exists");
-    }
-    write!(
-        f,
-        "; '{command}' is not on the PATH mcpls runs with -- if it is installed, add its \
-         directory to the MCP client's PATH or set `command` to an absolute path"
-    )?;
-    let Some(builtin) = BuiltinServer::from_command(command) else {
-        return Ok(());
-    };
-    if platform == Platform::Windows && builtin.is_npm_package() {
+        let Self(command, platform) = *self;
+        if Path::new(command)
+            .parent()
+            .is_some_and(|p| !p.as_os_str().is_empty())
+        {
+            return f.write_str("; check that the configured path exists");
+        }
         write!(
             f,
-            " (npm-installed servers need the `.cmd` name, e.g. `{command}.cmd`)"
+            "; '{command}' is not on the PATH mcpls runs with -- if it is installed, add its \
+             directory to the MCP client's PATH or set `command` to an absolute path"
         )?;
+        let Some(builtin) = BuiltinServer::from_command(command) else {
+            return Ok(());
+        };
+        if platform == Platform::Windows && builtin.is_npm_package() {
+            write!(
+                f,
+                " (npm-installed servers need the `.cmd` name, e.g. `{command}.cmd`)"
+            )?;
+        }
+        write!(f, "; otherwise install it: {}", builtin.install_hint())
     }
-    write!(f, "; otherwise install it: {}", builtin.install_hint())
 }
 
 /// Substring rust-analyzer's raw error text carries when a position-based
@@ -254,7 +247,7 @@ pub enum Error {
     ///
     /// Distinct from [`Error::ServerSpawnFailed`] so the message can carry
     /// PATH and install guidance.
-    #[error("failed to spawn LSP server '{command}': {source}{}", NotFoundGuidance(.command))]
+    #[error("failed to spawn LSP server '{command}': {source}{}", NotFoundGuidance(.command, Platform::CURRENT))]
     ServerNotFound {
         /// Command that could not be found.
         command: String,
@@ -879,14 +872,6 @@ mod tests {
         }
     }
 
-    struct Guidance<'a>(&'a str, Platform);
-
-    impl fmt::Display for Guidance<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write_not_found_guidance(f, self.0, self.1)
-        }
-    }
-
     #[test]
     fn test_not_found_guidance_cmd_note_only_for_npm_builtins_on_windows() {
         let cases = [
@@ -898,7 +883,7 @@ mod tests {
             ("my-custom-lsp", Platform::Windows, false),
         ];
         for (command, platform, expects_cmd_note) in cases {
-            let msg = Guidance(command, platform).to_string();
+            let msg = NotFoundGuidance(command, platform).to_string();
             assert_eq!(
                 msg.contains(".cmd"),
                 expects_cmd_note,

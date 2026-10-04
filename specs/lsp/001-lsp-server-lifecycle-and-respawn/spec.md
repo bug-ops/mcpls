@@ -20,7 +20,7 @@ related:
 > [!info] Metadata
 > **Author**: retroactive spec, authored during the `.local/specs/` → `specs/` migration and gap
 > analysis (no single originating commit/PR — this documents already-shipped, working
-> functionality; the crash-detection/respawn mechanism references #249 (`has_exited`) and #359
+> functionality; the crash-detection/respawn mechanism references #249 (`has_exited`, `is_dead`) and #359
 > (respawn diagnostics-degradation flagging) in its own source comments, and the shutdown path is
 > the mechanism [[runtime/002-sigterm-stdin-blocking-pool-hang/spec|spec runtime/002]] fixed the *process-exit*
 > half of)
@@ -167,14 +167,14 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | FR-001 | WHEN spawning an LSP server child process THE SYSTEM SHALL clear the child's environment and pass through only an explicit allowlist (`PATH`, `HOME`/`USERPROFILE`, `TMPDIR`/`TEMP`/`TMP`, plus Windows-specific additions under `cfg(windows)`), then apply the server's configured `env` overrides last | must |
 | FR-002 | THE SYSTEM SHALL perform the `initialize` → capability-negotiation → `initialized` handshake for each server, using the server's configured `timeout_seconds` (clamped to `[1, MAX_TIMEOUT_SECONDS]`) as the handshake timeout | must |
 | FR-003 | WHEN spawning multiple configured servers (`spawn_batch`) THE SYSTEM SHALL attempt every server regardless of earlier failures and return both the successfully-initialized servers and a list of failures, never failing all-or-nothing | must |
-| FR-004 | THE SYSTEM SHALL expose `has_exited()` (non-blocking `try_wait`) so callers can detect a crashed child process without blocking on it | must |
+| FR-004 | THE SYSTEM SHALL expose `has_exited()` (non-blocking `try_wait`) so callers can detect a crashed child process without blocking on it, and `is_dead()`, which additionally reports a live child whose message loop has stopped (e.g. panicked); respawn is driven by `is_dead()` | must |
 | FR-005 | WHEN a tool call routes to a server whose child process has exited THE SYSTEM SHALL respawn and re-initialize it before the request proceeds, transparently to the caller | must |
 | FR-006 | WHEN two concurrent tool calls both route to the same dead server THE SYSTEM SHALL single-flight the respawn (via a per-server lock) so only one respawn attempt is made; the other caller waits for it and rechecks rather than racing a second, redundant spawn | must |
 | FR-007 | WHEN a respawn attempt fails THE SYSTEM SHALL record it and apply exponential backoff (base 1s, doubling per consecutive failure, capped at 30s) before permitting another respawn attempt for that server | must |
 | FR-008 | WHEN a respawn attempt succeeds but the server dies again before surviving at least the backoff base duration THE SYSTEM SHALL count this as a failure (extending the backoff), rather than treating "successfully re-initialized" as proof of stability | must |
 | FR-009 | WHEN a server is respawned THE SYSTEM SHALL clear that server's document-sync history in `DocumentTracker` (see [[bridge/002-document-tracker-synchronization/spec|spec bridge/002]]), since the new process has no memory of any document the old one had open, and must receive `didOpen` (not `didChange`) for every document going forward | must |
 | FR-010 | WHEN the diagnostics-route server for a language is respawned THE SYSTEM SHALL mark that language's cached diagnostics as push-degraded (`NotificationCache::mark_push_degraded`) rather than silently continuing to serve stale cached diagnostics as current | must |
-| FR-011 | WHEN shutting down a server THE SYSTEM SHALL send the LSP `shutdown` request, then the `exit` notification, then wait up to a fixed grace period (3s) for the child process to exit on its own, falling back to `kill_on_drop` (SIGKILL on drop) if it does not | must |
+| FR-011 | WHEN shutting down a server THE SYSTEM SHALL send the LSP `shutdown` request, then the `exit` notification, then stop the message loop and wait up to a fixed grace period (3s) for the child process to exit on its own, falling back to `kill_on_drop` (SIGKILL on drop) if it does not; the whole sequence is bounded by `lsp::SHUTDOWN_TIMEOUT`, and a message loop that does not stop by that deadline is aborted, its pending requests failed, and `Error::ShutdownTimeout` returned | must |
 | FR-012 | THE SYSTEM SHALL perform the graceful-shutdown sequence (FR-011) even if the `shutdown`/`exit` handshake itself fails or times out — the child process must still be torn down (killed if necessary) regardless of handshake outcome | must |
 | FR-013 | WHEN an in-flight LSP request receives a `-32802` (`ServerCancelled`) response, or a `-32801` (`ContentModified`) response for a read-only/idempotent method THE SYSTEM SHALL retry it, sharing one combined attempt budget across both error codes (e.g. a request that hits `-32801` then `-32802` does not get separate budgets, only one shared one); mutating requests (rename, formatting, code actions) are excluded from the `-32801` retry allowlist | must |
 | FR-014 | WHEN a transient error (`-32802`/allowlisted `-32801`) is about to be retried THE SYSTEM SHALL log it at `warn!`, and reserve `error!` for the case where retries are exhausted and the error actually surfaces to the caller — a request that is retried and then succeeds must never log at `error!` | must |
@@ -193,7 +193,7 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 
 | Entity | Description | Key Attributes |
 |--------|-------------|-----------------|
-| `LspServer` | One managed, initialized LSP server instance | `client: LspClient`, `capabilities: ServerCapabilities`, `position_encoding: PositionEncodingKind`, `notification_rx`, `child: tokio::process::Child` |
+| `LspServer` | One managed, initialized LSP server instance | `client: LspClient`, `capabilities: ServerCapabilities`, `position_encoding: PositionEncodingKind`, `notification_rx`, `child: tokio::process::Child`, `init_config: ServerInitConfig` |
 | `ServerInitConfig` | Everything needed to spawn+initialize one server | `server_config`, `workspace_roots`, `initialization_options`, `position_encodings`, `notification_tx` |
 | `ServerInitResult` | Outcome of `spawn_batch` across all configured servers | `servers: HashMap<ServerId, LspServer>`, `failures: Vec<ServerSpawnFailure>` |
 | `ServerState` | Coarse lifecycle state of a server connection | `Uninitialized`, `Initializing`, `Ready`, `ShuttingDown`, `Shutdown` |
@@ -205,11 +205,11 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 |----------|--------------------|
 | A server's command is not on `PATH` | `spawn` returns `Error::ServerNotFound` (other spawn errors stay `Error::ServerSpawnFailed`); `spawn_batch` records it as a failure and continues with the rest |
 | A large workspace makes `initialize` slow | Bounded by the server's configured `timeout_seconds` (clamped to `MAX_TIMEOUT_SECONDS`), not a hardcoded 30s |
-| Server crashes between two tool calls | First call after the crash detects it via `has_exited`, respawns, and proceeds; the crash is otherwise invisible to the caller beyond added latency |
+| Server crashes between two tool calls | First call after the crash detects it via `is_dead` (child exited or message loop stopped), respawns, and proceeds; the crash is otherwise invisible to the caller beyond added latency |
 | Two tool calls race a dead-server detection simultaneously | Single-flighted via `respawn_lock`; the loser waits for the winner's attempt and rechecks rather than double-spawning |
 | Server respawns successfully but crashes again within 1s | Counted as a failure (not a fresh, unbacked-off start), extending `consecutive_failures` |
 | Server proves stable (survives ≥1s after a successful respawn) | Backoff state cleared entirely; a later unrelated crash starts a fresh backoff sequence |
-| `shutdown`/`exit` handshake itself fails or times out | Child process is still torn down (gracefully within the grace period, or killed) regardless; the handshake error is still returned to the caller after teardown completes |
+| `shutdown`/`exit` handshake itself fails or times out | Child process is still torn down (gracefully within the grace period, or killed) regardless; the handshake error is still returned to the caller after teardown completes. If the overall `SHUTDOWN_TIMEOUT` deadline elapses first, the wedged message loop is aborted and `Error::ShutdownTimeout` is returned |
 | Child does not exit within the grace period after `exit` | `kill_on_drop` (SIGKILL) fires when the `Child` handle drops |
 | A respawned server is the diagnostics-route server for its language | That language's cached diagnostics are marked push-degraded; a healthy sibling server's own language's diagnostics are unaffected (scoped by per-server ownership, not a blanket cache clear) |
 | A respawned server is *not* the diagnostics-route server | No diagnostics-cache side effect — only document-sync history (FR-009) is cleared |

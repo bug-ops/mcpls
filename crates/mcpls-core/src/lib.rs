@@ -850,8 +850,8 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// default disposition. What it does instead: with no live [`ShutdownSignal`]
 /// subscribed, a signal delivered during `shutdown_servers`/
 /// `await_lsp_init_handle` (bounded by [`lsp::SHUTDOWN_TIMEOUT`] and
-/// [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst case) is recorded and then silently discarded — there is no receiver to
-/// broadcast it to. Before this fix, that made cleanup **uninterruptible**:
+/// [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst case) is recorded and then
+/// silently discarded — there is no receiver to broadcast it to. Before this fix, that made cleanup **uninterruptible**:
 /// an operator's repeat `Ctrl-C`/`SIGTERM` during that window was a no-op
 /// short of `SIGKILL`.
 ///
@@ -894,9 +894,9 @@ async fn shutdown(
         }
     });
     // Aborts `force_exit_on_signal` on every exit from this scope, including
-    // an unwind out of `shutdown_servers().await` below — otherwise that path would merely
-    // detach the task instead of stopping it, unlike the equivalent
-    // abort-on-timeout handling in `await_lsp_init_handle`.
+    // an unwind out of `shutdown_servers().await` below — otherwise that path
+    // would merely detach the task instead of stopping it, unlike the
+    // equivalent abort-on-timeout handling in `await_lsp_init_handle`.
     let _abort_force_exit_on_signal = AbortOnDrop(&force_exit_on_signal);
 
     info!("Shutting down LSP servers...");
