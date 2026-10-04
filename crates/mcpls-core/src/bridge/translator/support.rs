@@ -101,6 +101,12 @@ impl ToolSupportSnapshot {
             |lang| self.router.resolve(lang, tool).cloned(),
             |id| self.registered.contains(id).then_some(()),
             |id| self.expected.contains(id),
+            |lang| {
+                self.router
+                    .catch_all_for(lang)
+                    .filter(|id| self.expected.contains(*id))
+                    .cloned()
+            },
             |_| None,
         );
         match lookup {

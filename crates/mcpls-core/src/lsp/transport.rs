@@ -392,6 +392,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_skipped_non_object_frame_log_redacts_secrets() {
+        use tracing_subscriber::prelude::*;
+
+        let redactions = Arc::new(Redactions::new([(
+            "API_TOKEN".to_owned(),
+            "SuperSecretValue123".to_owned(),
+        )]));
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(move || writer.clone())
+                        .with_ansi(false),
+                ),
+        );
+        let body = "\"echo SuperSecretValue123\"";
+        let inbound = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+        let (_, mut reader) = LspTransport::with_redactions(
+            tokio::io::sink(),
+            std::io::Cursor::new(inbound.into_bytes()),
+            redactions,
+        );
+
+        assert!(reader.receive().await.is_err());
+
+        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("Skipping non-object"), "{output}");
+        assert!(!output.contains("SuperSecretValue123"), "{output}");
+    }
+
     #[test]
     fn test_header_parsing() {
         let headers_text = "Content-Length: 123\r\nContent-Type: application/json\r\n";

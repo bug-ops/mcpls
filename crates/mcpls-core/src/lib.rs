@@ -139,7 +139,8 @@ pub(crate) struct PumpShared {
 /// registered as `Secondary` becomes `Authoritative` when the explicit
 /// diagnostics server for its language fails afterwards. Pushes the catch-all
 /// made while it was `Secondary` are not replayed; the cache fills with its
-/// next publish for each file (the next `didOpen`/`didChange`).
+/// next publish for each file (the next `didOpen`/`didChange`). A file nobody
+/// opens may never get one, since mcpls sends no `didSave`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiagnosticsRole {
     /// The server is the language's diagnostics route: its pushes are cached
@@ -1117,6 +1118,9 @@ impl StartupSettler<'_> {
     /// before the server becomes visible, registers it, recomputes every
     /// diagnostics role, then starts its pump.
     async fn settle_started(&mut self, mut server: LspServer) {
+        if *self.cancel_rx.borrow() {
+            return;
+        }
         let notification_rx = server.take_notification_rx();
         let lifecycle_rx = server.take_lifecycle_rx();
         let policy = server.init_config().server_config.indexing;
@@ -1131,6 +1135,7 @@ impl StartupSettler<'_> {
         self.roles.insert(id.clone(), (language, role_tx));
         self.recompute_roles().await;
         self.tally.registered = self.tally.registered.saturating_add(1);
+        self.publish_routes_served_by(&id).await;
 
         let pump = self.pumps.spawn(diagnostics_pump(
             id.clone(),
@@ -1141,6 +1146,18 @@ impl StartupSettler<'_> {
             self.pump_shared.clone(),
         ));
         self.pump_servers.insert(pump.id(), id);
+    }
+
+    /// Tells subscribers of files now served by the freshly registered `id`
+    /// to re-read, so one that was told "starting" or "failed" while the route
+    /// was unbound learns it recovered. Re-reading is idempotent.
+    async fn publish_routes_served_by(&self, id: &ServerId) {
+        self.pump_shared
+            .subs
+            .publish_matching(|uri| {
+                self.translator.diagnostics_route_for_uri(uri).server_id() == Some(id)
+            })
+            .await;
     }
 
     /// Records the failure, then re-evaluates roles and tells subscribers of
@@ -2285,6 +2302,202 @@ mod tests {
     // diagnostics_pump unit tests
     // ------------------------------------------------------------------
 
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod settler_tests {
+        use super::*;
+        use crate::bridge::WorkspaceRoots;
+        use crate::config::{LspServerConfig, ToolKind};
+        use crate::error::StartupFailure;
+
+        fn settler_for<'a>(
+            translator: &'a Translator,
+            cache: &Arc<Mutex<NotificationCache>>,
+            subs: SubscriptionRegistry,
+            configs: &[&LspServerConfig],
+        ) -> StartupSettler<'a> {
+            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            StartupSettler {
+                translator,
+                notification_cache: Arc::clone(cache),
+                pump_shared: PumpShared {
+                    notification_cache: Arc::clone(cache),
+                    subs,
+                    workspace_roots: WorkspaceRoots::default(),
+                },
+                cancel_rx,
+                configured: configs
+                    .iter()
+                    .map(|c| (c.id(), c.language_id.clone()))
+                    .collect(),
+                roles: HashMap::new(),
+                pumps: JoinSet::new(),
+                pump_servers: HashMap::new(),
+                tally: StartupTally::default(),
+            }
+        }
+
+        fn failure_of(config: &LspServerConfig) -> ServerStartOutcome {
+            ServerStartOutcome::Failed(ServerSpawnFailure {
+                server_id: config.id(),
+                language_id: config.language_id.clone(),
+                command: config.command.clone(),
+                reason: StartupFailure::InitTaskPanicked,
+            })
+        }
+
+        fn explicit_and_catch_all_translator() -> (Translator, LspServerConfig, LspServerConfig) {
+            let mut explicit = LspServerConfig::rust_analyzer();
+            explicit.name = Some("explicit".to_string());
+            explicit.handles = Some(vec![ToolKind::Diagnostics]);
+            let mut catch_all = LspServerConfig::rust_analyzer();
+            catch_all.name = Some("catch-all".to_string());
+            let translator = Translator::new()
+                .with_extensions(crate::test_lsp::test_extensions())
+                .with_router(ToolRouter::from_configs([&explicit, &catch_all]).unwrap());
+            translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
+            (translator, explicit, catch_all)
+        }
+
+        async fn subscribe_to_main_rs(
+            registry: &SubscriptionRegistry,
+        ) -> (
+            crate::mcp::SessionHandle,
+            tokio::sync::mpsc::Receiver<String>,
+            crate::bridge::resources::DiagnosticsResourceUri,
+        ) {
+            use crate::bridge::resources::make_uri;
+            use crate::mcp::{SessionHandle, Target};
+
+            let session = SessionHandle::new(registry.clone());
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let uri = crate::test_lsp::diagnostics_uri(
+                &make_uri(&crate::test_lsp::absolute_path("main.rs")).unwrap(),
+            );
+            session
+                .subscribe_for_test(&uri, Target::Channel(tx))
+                .await
+                .unwrap();
+            (session, rx, uri)
+        }
+
+        /// FR-016: while the explicit diagnostics server is failed and the
+        /// catch-all still starting, subscribers hear nothing (the route is
+        /// merely starting); they are told once the catch-all fails too.
+        #[tokio::test]
+        async fn startup_failure_publish_reaches_routes_attributed_via_configured_router() {
+            let (translator, explicit, catch_all) = explicit_and_catch_all_translator();
+            let registry = SubscriptionRegistry::new();
+            let (_session, mut rx, uri) = subscribe_to_main_rs(&registry).await;
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let mut settler = settler_for(&translator, &cache, registry, &[&explicit, &catch_all]);
+
+            settler.settle(failure_of(&explicit)).await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err(),
+                "the route is only starting while the catch-all is pending"
+            );
+
+            settler.settle(failure_of(&catch_all)).await;
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("notified once the catch-all failed")
+                .unwrap();
+            assert_eq!(got, uri.as_str());
+        }
+
+        /// A subscriber of a file whose explicit server failed is told to
+        /// re-read once the catch-all registers and serves the route.
+        #[tokio::test]
+        async fn catch_all_registration_notifies_subscribers_of_recovered_routes() {
+            let (translator, explicit, catch_all) = explicit_and_catch_all_translator();
+            let registry = SubscriptionRegistry::new();
+            let (_session, mut rx, uri) = subscribe_to_main_rs(&registry).await;
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let mut settler = settler_for(&translator, &cache, registry, &[&explicit, &catch_all]);
+
+            settler.settle(failure_of(&explicit)).await;
+            settler
+                .settle(ServerStartOutcome::Started(Box::new(
+                    crate::lsp::fake_lsp_server_with_config(catch_all.clone()),
+                )))
+                .await;
+
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("notified when the catch-all registered")
+                .unwrap();
+            assert_eq!(got, uri.as_str());
+        }
+
+        /// Cancellation that lands while a server finishes starting drops it
+        /// instead of registering it after shutdown drained the registry.
+        #[tokio::test]
+        async fn settle_started_after_cancel_does_not_register() {
+            let config = LspServerConfig::rust_analyzer();
+            let translator = Translator::new();
+            translator.set_expected_servers(std::iter::once(config.id()).collect());
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut settler =
+                settler_for(&translator, &cache, SubscriptionRegistry::new(), &[&config]);
+            settler.cancel_rx = cancel_rx;
+            cancel_tx.send(true).unwrap();
+
+            settler
+                .settle(ServerStartOutcome::Started(Box::new(
+                    crate::lsp::fake_lsp_server_with_config(config.clone()),
+                )))
+                .await;
+
+            assert_eq!(translator.registered_server_count(), 0);
+        }
+
+        /// M4/M6: the catch-all registers as `Secondary` while the explicit
+        /// diagnostics server is pending, becomes `Authoritative` once that
+        /// server fails, and the route count equals the batch value.
+        #[tokio::test]
+        async fn catch_all_role_flips_when_explicit_diagnostics_server_fails() {
+            let mut explicit = LspServerConfig::rust_analyzer();
+            explicit.name = Some("explicit".to_string());
+            explicit.handles = Some(vec![ToolKind::Diagnostics]);
+            let mut catch_all = LspServerConfig::rust_analyzer();
+            catch_all.name = Some("catch-all".to_string());
+            let router = ToolRouter::from_configs([&explicit, &catch_all]).unwrap();
+            let translator = Translator::new().with_router(router);
+            translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let mut settler = settler_for(
+                &translator,
+                &cache,
+                SubscriptionRegistry::new(),
+                &[&explicit, &catch_all],
+            );
+
+            settler
+                .settle(ServerStartOutcome::Started(Box::new(
+                    crate::lsp::fake_lsp_server_with_config(catch_all.clone()),
+                )))
+                .await;
+            let role = |settler: &StartupSettler<'_>| *settler.roles[&catch_all.id()].1.borrow();
+            assert_eq!(role(&settler), DiagnosticsRole::Secondary);
+            assert_eq!(cache.lock().await.configured_route_count(), Some(1));
+
+            settler
+                .settle(ServerStartOutcome::Failed(ServerSpawnFailure {
+                    server_id: explicit.id(),
+                    language_id: "rust".to_string(),
+                    command: explicit.command.clone(),
+                    reason: StartupFailure::InitTaskPanicked,
+                }))
+                .await;
+
+            assert_eq!(role(&settler), DiagnosticsRole::Authoritative);
+            assert_eq!(cache.lock().await.configured_route_count(), Some(1));
+        }
+    }
+
     #[cfg(unix)]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     mod startup_tests {
@@ -2292,7 +2505,7 @@ mod tests {
 
         use super::*;
         use crate::bridge::{RouteSupport, WorkspaceRoots};
-        use crate::config::{LspServerConfig, ToolKind};
+        use crate::config::ToolKind;
         use crate::error::StartupFailure;
         use crate::test_lsp::{answer_initialize_script, named_sh_init_config};
 
@@ -2342,84 +2555,6 @@ mod tests {
             })
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
-        }
-
-        fn settler_for<'a>(
-            translator: &'a Translator,
-            cache: &Arc<Mutex<NotificationCache>>,
-            subs: SubscriptionRegistry,
-            configs: &[&LspServerConfig],
-        ) -> StartupSettler<'a> {
-            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-            StartupSettler {
-                translator,
-                notification_cache: Arc::clone(cache),
-                pump_shared: PumpShared {
-                    notification_cache: Arc::clone(cache),
-                    subs,
-                    workspace_roots: WorkspaceRoots::default(),
-                },
-                cancel_rx,
-                configured: configs
-                    .iter()
-                    .map(|c| (c.id(), c.language_id.clone()))
-                    .collect(),
-                roles: HashMap::new(),
-                pumps: JoinSet::new(),
-                pump_servers: HashMap::new(),
-                tally: StartupTally::default(),
-            }
-        }
-
-        fn failure_of(config: &LspServerConfig) -> ServerStartOutcome {
-            ServerStartOutcome::Failed(ServerSpawnFailure {
-                server_id: config.id(),
-                language_id: config.language_id.clone(),
-                command: config.command.clone(),
-                reason: StartupFailure::InitTaskPanicked,
-            })
-        }
-
-        /// S1 / review N1: subscribers of a file whose explicit diagnostics
-        /// server failed are told at that settlement, while the catch-all is
-        /// still initializing, and again once the catch-all fails too.
-        #[tokio::test]
-        async fn startup_failure_publish_reaches_routes_attributed_via_configured_router() {
-            use crate::bridge::resources::make_uri;
-            use crate::mcp::{SessionHandle, Target};
-
-            let mut explicit = LspServerConfig::rust_analyzer();
-            explicit.name = Some("explicit".to_string());
-            explicit.handles = Some(vec![ToolKind::Diagnostics]);
-            let mut catch_all = LspServerConfig::rust_analyzer();
-            catch_all.name = Some("catch-all".to_string());
-            let translator = Translator::new()
-                .with_extensions(crate::test_lsp::test_extensions())
-                .with_router(ToolRouter::from_configs([&explicit, &catch_all]).unwrap());
-            translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
-            let registry = SubscriptionRegistry::new();
-            let session = SessionHandle::new(registry.clone());
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-            let uri = crate::test_lsp::diagnostics_uri(
-                &make_uri(&crate::test_lsp::absolute_path("main.rs")).unwrap(),
-            );
-            session
-                .subscribe_for_test(&uri, Target::Channel(tx))
-                .await
-                .unwrap();
-            let cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let mut settler = settler_for(&translator, &cache, registry, &[&explicit, &catch_all]);
-
-            settler.settle(failure_of(&explicit)).await;
-            let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("notified at the explicit server's settlement")
-                .unwrap();
-            assert_eq!(first, uri.as_str());
-
-            settler.settle(failure_of(&catch_all)).await;
-            let second = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
-            assert!(second.is_ok(), "notified again once the catch-all failed");
         }
 
         /// US-001/US-002: the fast server is usable while the slow one is still
@@ -2522,18 +2657,19 @@ mod tests {
 
             let dir = tempfile::TempDir::new().unwrap();
             let never = dir.path().join("never");
+            let up = dir.path().join("up");
             let stuck = named_sh_init_config(
                 dir.path(),
                 "stuck",
                 "rust",
-                &answer_initialize_script(None, Some(&never)),
+                &answer_initialize_script(Some(&up), Some(&never)),
             );
             let logs = CapturedLogs::default();
             let subscriber = tracing_subscriber::registry().with(logs.clone());
             let guard = tracing::subscriber::set_default(subscriber);
             let startup = start(vec![stuck]);
 
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            wait_until("the stuck server to start", || up.exists()).await;
             startup.cancel_tx.send(true).unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), startup.task)
                 .await
@@ -2549,49 +2685,6 @@ mod tests {
                 .filter(|m| m.contains("Proceeding with") || m.contains("failed to initialize"))
                 .collect();
             assert!(aggregate.is_empty(), "{aggregate:?}");
-        }
-
-        /// M4/M6: the catch-all registers as `Secondary` while the explicit
-        /// diagnostics server is pending, becomes `Authoritative` once that
-        /// server fails, and the route count equals the batch value.
-        #[tokio::test]
-        async fn catch_all_role_flips_when_explicit_diagnostics_server_fails() {
-            let mut explicit = LspServerConfig::rust_analyzer();
-            explicit.name = Some("explicit".to_string());
-            explicit.handles = Some(vec![ToolKind::Diagnostics]);
-            let mut catch_all = LspServerConfig::rust_analyzer();
-            catch_all.name = Some("catch-all".to_string());
-            let router = ToolRouter::from_configs([&explicit, &catch_all]).unwrap();
-            let translator = Translator::new().with_router(router);
-            translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
-            let cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let mut settler = settler_for(
-                &translator,
-                &cache,
-                SubscriptionRegistry::new(),
-                &[&explicit, &catch_all],
-            );
-
-            settler
-                .settle(ServerStartOutcome::Started(Box::new(
-                    crate::lsp::fake_lsp_server_with_config(catch_all.clone()),
-                )))
-                .await;
-            let role = |settler: &StartupSettler<'_>| *settler.roles[&catch_all.id()].1.borrow();
-            assert_eq!(role(&settler), DiagnosticsRole::Secondary);
-            assert_eq!(cache.lock().await.configured_route_count(), Some(1));
-
-            settler
-                .settle(ServerStartOutcome::Failed(ServerSpawnFailure {
-                    server_id: explicit.id(),
-                    language_id: "rust".to_string(),
-                    command: explicit.command.clone(),
-                    reason: StartupFailure::InitTaskPanicked,
-                }))
-                .await;
-
-            assert_eq!(role(&settler), DiagnosticsRole::Authoritative);
-            assert_eq!(cache.lock().await.configured_route_count(), Some(1));
         }
     }
 

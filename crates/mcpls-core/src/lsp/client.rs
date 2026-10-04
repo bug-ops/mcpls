@@ -1181,6 +1181,63 @@ mod tests {
 
     use super::*;
 
+    /// The `trace!` of a forwarded notification must not print a configured
+    /// secret that the server echoed into an unrecognized notification.
+    #[tokio::test]
+    async fn test_forwarded_notification_trace_is_redacted() {
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let redactions =
+            Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]);
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(move || writer.clone())
+                        .with_ansi(false),
+                ),
+        );
+        let (mut transport, _reader) = LspTransport::new(tokio::io::sink(), tokio::io::empty());
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let notification = InboundMessage::Notification(JsonRpcNotification {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "custom/echo".to_string(),
+            params: Some(serde_json::json!({"env": "SuperSecretValue123"})),
+        });
+
+        LspClient::handle_inbound_message(
+            &mut transport,
+            notification,
+            &pending,
+            None,
+            Some(&lifecycle_tx),
+            &redactions,
+        )
+        .await
+        .unwrap();
+
+        assert!(lifecycle_rx.recv().await.is_some());
+        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("Forwarding notification"), "{output}");
+        assert!(!output.contains("SuperSecretValue123"), "{output}");
+    }
+
     #[test]
     fn test_request_id_generation() {
         let counter = AtomicI64::new(1);

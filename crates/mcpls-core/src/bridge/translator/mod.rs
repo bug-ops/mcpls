@@ -362,8 +362,11 @@ impl Translator {
     /// Returns its routing identity and language.
     ///
     /// The write order lets a reader that reads the expected set first and the
-    /// router last never see a server that is neither expected, registered
-    /// nor failed.
+    /// router last (the `get_tool_support` snapshot) never see a server that is
+    /// neither expected, registered nor failed. Per-call lookups read the
+    /// router first, so one that races a settlement can transiently see the
+    /// previous routes together with the new expected set; that window is a
+    /// few instructions wide and the next call sees the settled state.
     pub(crate) fn settle_started(&self, server: LspServer) -> (ServerId, String) {
         let id = server.init_config().server_config.id();
         let language = server.client().language_id().to_string();
@@ -789,11 +792,12 @@ mod tests {
     }
 
     /// FR-007 window: the explicit server failed, its catch-all is still
-    /// initializing. The route stays on the failed server, which reports its
-    /// own failure instead of a dangling-route error; once the catch-all
-    /// registers the route is served by it.
+    /// initializing. Nothing is bound to the catch-all, but the lookup reports
+    /// the retryable `ServerInitializing` naming it (not a terminal failure
+    /// and not a dangling-route error); once the catch-all registers the route
+    /// is served by it.
     #[tokio::test]
-    async fn dead_explicit_route_reports_its_failure_while_the_catch_all_initializes() {
+    async fn dead_explicit_route_is_retryable_while_the_catch_all_initializes() {
         use tracing_subscriber::prelude::*;
 
         use crate::test_lsp::CapturedLogs;
@@ -819,10 +823,19 @@ mod tests {
                 .client_for_file(&path, ToolKind::Hover)
                 .unwrap_err();
             assert!(
-                matches!(&hover, Error::ServerFailedToStart(failure) if failure.server_id == x.id()),
+                matches!(&hover, Error::ServerInitializing { server_id } if *server_id == c.id()),
                 "got {hover:?}"
             );
-            assert!(translator.diagnostics_route_for_path(&path).is_failed());
+            assert!(matches!(
+                translator.diagnostics_route_for_path(&path),
+                routing::DiagnosticsRoute::Initializing(id) if id == c.id()
+            ));
+            assert_eq!(
+                translator
+                    .tool_support_snapshot()
+                    .document_support("rust", ToolKind::Hover),
+                RouteSupport::Initializing
+            );
             assert!(
                 logs.entries()
                     .iter()

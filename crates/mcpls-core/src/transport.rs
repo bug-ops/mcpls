@@ -2749,7 +2749,12 @@ mod tests {
                 .await
             };
 
-            for rejected in ["http://evil.example", "null", "http://127.0.0.1:1"] {
+            for rejected in [
+                "http://evil.example",
+                "null",
+                "http://127.0.0.1:1",
+                "http://localhost:1",
+            ] {
                 let response = post(Some(rejected.to_owned())).await;
                 assert!(
                     response.starts_with("HTTP/1.1 403"),
@@ -2759,6 +2764,7 @@ mod tests {
             for accepted in [
                 Some(format!("http://127.0.0.1:{}", addr.port())),
                 Some(format!("http://localhost:{}", addr.port())),
+                Some(format!("http://[::1]:{}", addr.port())),
                 None,
             ] {
                 let response = post(accepted.clone()).await;
@@ -2768,18 +2774,20 @@ mod tests {
                 );
             }
 
-            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let request = format!(
-                "GET /mcp HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: text/event-stream\r\nOrigin: http://evil.example\r\n\r\n"
-            );
-            stream.write_all(request.as_bytes()).await.unwrap();
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.unwrap();
-            let response = String::from_utf8_lossy(&response);
-            assert!(
-                response.starts_with("HTTP/1.1 403"),
-                "GET with a foreign Origin should be rejected, got: {response}"
-            );
+            for method in ["GET", "DELETE"] {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let request = format!(
+                    "{method} /mcp HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: text/event-stream\r\nOrigin: http://evil.example\r\n\r\n"
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.unwrap();
+                let response = String::from_utf8_lossy(&response);
+                assert!(
+                    response.starts_with("HTTP/1.1 403"),
+                    "{method} with a foreign Origin should be rejected, got: {response}"
+                );
+            }
 
             server_task.abort();
         }
@@ -3732,12 +3740,12 @@ mod tests {
             }));
             assert_matches!(
                 manager.accept_message(&id, anonymous_error).await,
-                Err(CappedSessionManagerError::Inner(_))
+                Err(CappedSessionManagerError::SessionGone)
             );
             let foreign = message(serde_json::json!({"jsonrpc": "2.0", "id": 5, "result": {}}));
             assert_matches!(
                 manager.accept_message(&id, foreign).await,
-                Err(CappedSessionManagerError::Inner(_))
+                Err(CappedSessionManagerError::SessionGone)
             );
         }
 

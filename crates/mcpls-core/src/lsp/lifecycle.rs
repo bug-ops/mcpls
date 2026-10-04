@@ -947,52 +947,58 @@ impl LspServer {
     /// Runs on the caller's task: dropping the future drops the child
     /// process it owns.
     pub(crate) async fn start_contained(config: &ServerInitConfig) -> ServerStartOutcome {
-        let server_id = config.server_config.id();
-        let language_id = config.server_config.language_id.clone();
-        let command = config.server_config.command.clone();
-        let started = Instant::now();
-
-        let reason = match AssertUnwindSafe(Self::spawn(config.clone()))
-            .catch_unwind()
-            .await
-        {
-            Ok(Ok(server)) => {
-                info!(
-                    "Successfully spawned LSP server: {} ({}) in {:?}",
-                    server_id,
-                    command,
-                    started.elapsed()
-                );
-                return ServerStartOutcome::Started(Box::new(server));
-            }
-            Ok(Err(e)) => {
-                tracing::error!(
-                    "Failed to spawn LSP server: {} ({}) after {:?}: {}",
-                    server_id,
-                    command,
-                    started.elapsed(),
-                    e
-                );
-                StartupFailure::Spawn(Arc::new(e))
-            }
-            Err(payload) => {
-                tracing::error!(
-                    "Starting LSP server {} ({}) panicked after {:?}: {}",
-                    server_id,
-                    command,
-                    started.elapsed(),
-                    crate::panic_message(payload.as_ref())
-                );
-                StartupFailure::InitTaskPanicked
-            }
-        };
-        ServerStartOutcome::Failed(ServerSpawnFailure {
-            server_id,
-            language_id,
-            command,
-            reason,
-        })
+        contain(config, Self::spawn(config.clone())).await
     }
+}
+
+/// Drives `start` (one server's spawn and handshake) and classifies how it
+/// ended; see [`LspServer::start_contained`].
+async fn contain(
+    config: &ServerInitConfig,
+    start: impl std::future::Future<Output = Result<LspServer>>,
+) -> ServerStartOutcome {
+    let server_id = config.server_config.id();
+    let language_id = config.server_config.language_id.clone();
+    let command = config.server_config.command.clone();
+    let started = Instant::now();
+
+    let reason = match AssertUnwindSafe(start).catch_unwind().await {
+        Ok(Ok(server)) => {
+            info!(
+                "Successfully spawned LSP server: {} ({}) in {:?}",
+                server_id,
+                command,
+                started.elapsed()
+            );
+            return ServerStartOutcome::Started(Box::new(server));
+        }
+        Ok(Err(e)) => {
+            tracing::error!(
+                "Failed to spawn LSP server: {} ({}) after {:?}: {}",
+                server_id,
+                command,
+                started.elapsed(),
+                e
+            );
+            StartupFailure::Spawn(Arc::new(e))
+        }
+        Err(payload) => {
+            tracing::error!(
+                "Starting LSP server {} ({}) panicked after {:?}: {}",
+                server_id,
+                command,
+                started.elapsed(),
+                crate::panic_message(payload.as_ref())
+            );
+            StartupFailure::InitTaskPanicked
+        }
+    };
+    ServerStartOutcome::Failed(ServerSpawnFailure {
+        server_id,
+        language_id,
+        command,
+        reason,
+    })
 }
 
 /// Convert configured position-encoding strings into the ordered
@@ -2050,6 +2056,33 @@ echo 'fatal: bad toolchain' >&2
         let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert!(output.contains("(1 arg(s))"), "{output}");
         assert!(!output.contains("SuperSecretArg456"), "{output}");
+    }
+
+    /// FR-012: a panic while starting one server is that server's failure.
+    #[tokio::test]
+    async fn contain_attributes_a_panic_to_its_own_server() {
+        let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+
+        let outcome = contain(&config, async { panic!("start boom") }).await;
+
+        assert_matches!(
+            outcome,
+            ServerStartOutcome::Failed(failure)
+                if failure.server_id == config.server_config.id()
+                    && matches!(failure.reason, StartupFailure::InitTaskPanicked)
+        );
+    }
+
+    #[tokio::test]
+    async fn contain_reports_a_spawn_error_as_that_servers_failure() {
+        let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+
+        let outcome = contain(&config, async { Err(Error::ServerTerminated) }).await;
+
+        assert_matches!(
+            outcome,
+            ServerStartOutcome::Failed(failure) if matches!(failure.reason, StartupFailure::Spawn(_))
+        );
     }
 
     /// FR-001/FR-019: each server announces itself and waits for its sibling

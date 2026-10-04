@@ -436,7 +436,7 @@ pub struct DiagnosticInfo {
 struct SourceEntry {
     info: DiagnosticInfo,
     /// Whether the server published under the canonical spelling of the path.
-    is_canonical: bool,
+    spelling: Spelling,
 }
 
 /// Owned snapshot of the diagnostics cached for one file, possibly spread
@@ -483,7 +483,7 @@ impl DiagnosticSources {
         }
         let version = entries
             .iter()
-            .find(|entry| entry.is_canonical)
+            .find(|entry| entry.spelling == Spelling::Canonical)
             .and_then(|entry| entry.info.version);
 
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
@@ -1269,7 +1269,7 @@ impl NotificationCache {
                 let entry = self.entries.get(source)?;
                 Some(SourceEntry {
                     info: entry.info.clone(),
-                    is_canonical: entry.spelling == Spelling::Canonical,
+                    spelling: entry.spelling.clone(),
                 })
             })
             .collect();

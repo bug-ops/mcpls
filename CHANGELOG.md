@@ -66,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** HTTP bind failures are `Error::HttpBind` carrying the address and `io::Error`, and `Error::Timeout` carries a `Duration`. (#561)
 - **Breaking:** `ServerConfig::project_config_ignored` is `project_config_status: ProjectConfigStatus`, which `McplsServer::new` and `BridgeContext::new` take instead of a bool. (#561)
 - **Breaking:** the HTTP transport answers `403` to a request whose `Origin` is not a loopback origin on the bound port; requests without `Origin` are unaffected. (#556)
-- **Breaking:** with `--http-stream-liveness off` an open GET stream no longer keeps a session alive past 5 minutes without inbound requests. (#573)
+- **Breaking:** with `--http-stream-liveness off` an open GET stream no longer keeps a session alive past 5 minutes without inbound requests, and a POST or resume stream whose peer stalls holds its session until the connection fails, since rmcp's `keep_alive` is off. (#573)
 - **Breaking:** an invalid `MCPLS_HTTP_PATH` now exits with a usage error even in stdio mode. (#557)
 - **Breaking:** `NotificationCache::{diagnostics, diagnostic_sources, has_diagnostics, diagnostics_owner}` take `&Uri` and `Translator::cached_diagnostics_uri` returns `Uri`. (#559)
 - **Breaking:** `LspServer::spawn_batch` starts servers concurrently, and `ToolRouter::rebind` with `ServerSettlement` re-derives routes per settled server; a dead explicit route waits for a pending catch-all. (#572)
@@ -74,10 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Language servers start concurrently and each is usable as soon as its own `initialize` completes; a slow or failing server no longer blocks the others. (#572)
+- Language servers start concurrently and each is usable as soon as its own `initialize` completes; a slow or failing server no longer blocks the others. A catch-all that registers after a diagnostics-owning sibling's pending or failed state drops the pushes it made while secondary, which refill at the next publish per file. (#572)
 - An invalid `--http-path` is rejected at argument parsing instead of panicking at startup. (#557)
 - An HTTP client that answers liveness probes on an open GET stream is no longer dropped by rmcp's 5-minute `keep_alive`. (#573)
-- HTTP session ids are no longer written to logs at the default level. (#555)
+- HTTP session ids are no longer written to mcpls's own logs or to rmcp's session-creation event and spans at the default level; rare rmcp error lines outside mcpls's control may still print one. (#555)
 - Configured secrets are redacted from server log and show messages, initialize errors, trace-level wire logs and spawn arguments. (#554)
 - `escape_control` and stderr cleaning now share one set of deceptive format characters. (#560)
 - Abandoned HTTP sessions now expire after 5 min without client activity instead of living on while subscribed files change. (#536)

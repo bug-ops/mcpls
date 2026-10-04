@@ -459,8 +459,9 @@ pub(super) enum RouteLookup<T> {
     Registered(ServerId, T),
     /// The routed server is expected but has not registered yet.
     Initializing(ServerId),
-    /// The routed server failed to start while its language's catch-all is
-    /// still initializing, so the route has not been dropped yet.
+    /// The routed server failed to start and no catch-all is left to wait
+    /// for. Only seen while a router read races a settlement, since a settled
+    /// router drops such a route.
     Failed(Box<ServerSpawnFailure>),
     /// The router names a server that is neither registered, expected nor
     /// recorded as failed.
@@ -473,14 +474,19 @@ pub(super) enum RouteLookup<T> {
 }
 
 /// Resolve the first candidate language with a route, then classify that
-/// route's server. `resolve`, `registered`, `is_expected` and
-/// `startup_failure` are separate closures so a caller backed by independent
-/// locks never holds two at once.
+/// route's server. `resolve`, `registered`, `is_expected`,
+/// `pending_catch_all` and `startup_failure` are separate closures so a caller
+/// backed by independent locks never holds two at once.
+///
+/// A route naming a failed server whose language's catch-all is still
+/// initializing (FR-007: the route is not bound to it yet) is `Initializing`
+/// naming that catch-all, the retryable state, rather than a terminal failure.
 pub(super) fn lookup_route<T>(
     candidates: &LanguageCandidates,
     resolve: impl Fn(&str) -> Option<ServerId>,
     registered: impl Fn(&ServerId) -> Option<T>,
     is_expected: impl Fn(&ServerId) -> bool,
+    pending_catch_all: impl Fn(&str) -> Option<ServerId>,
     startup_failure: impl Fn(&ServerId) -> Option<ServerSpawnFailure>,
 ) -> RouteLookup<T> {
     for language in candidates.iter() {
@@ -491,6 +497,8 @@ pub(super) fn lookup_route<T>(
             RouteLookup::Registered(server_id, found)
         } else if is_expected(&server_id) {
             RouteLookup::Initializing(server_id)
+        } else if let Some(catch_all) = pending_catch_all(language) {
+            RouteLookup::Initializing(catch_all)
         } else if let Some(failure) = startup_failure(&server_id) {
             RouteLookup::Failed(Box::new(failure))
         } else {
@@ -676,6 +684,7 @@ impl Translator {
             |lang| lock_std(&self.router).resolve(lang, tool).cloned(),
             |id| lock_std(&self.lsp_clients).get(id).cloned(),
             |id| lock_std(&self.expected_servers).contains(id),
+            |lang| self.pending_catch_all(lang),
             |id| self.startup_failure(id),
         );
         match lookup {
@@ -725,6 +734,14 @@ impl Translator {
         }
     }
 
+    /// The catch-all of `language` if it is still expected to register.
+    fn pending_catch_all(&self, language: &str) -> Option<ServerId> {
+        let catch_all = lock_std(&self.router).catch_all_for(language).cloned()?;
+        lock_std(&self.expected_servers)
+            .contains(&catch_all)
+            .then_some(catch_all)
+    }
+
     /// The detected language of `path` plus its React base-language fallback.
     pub(super) fn language_candidates(&self, path: &Path) -> LanguageCandidates {
         LanguageCandidates::new(detect_language(path, &self.extension_map))
@@ -769,6 +786,7 @@ impl Translator {
             },
             |id| lock_std(&self.lsp_clients).contains_key(id).then_some(()),
             |id| lock_std(&self.expected_servers).contains(id),
+            |lang| self.pending_catch_all(lang),
             |id| self.startup_failure(id),
         );
         match lookup {

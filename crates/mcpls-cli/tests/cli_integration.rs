@@ -453,3 +453,15 @@ fn test_invalid_http_path_exits_with_usage_error_instead_of_panicking() {
             .stderr(predicate::str::contains("panicked").not());
     }
 }
+
+#[cfg(feature = "transport-http")]
+#[test]
+fn test_invalid_http_path_env_exits_with_usage_error_in_stdio_mode() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .env("MCPLS_HTTP_PATH", "mcp")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("panicked").not());
+}
