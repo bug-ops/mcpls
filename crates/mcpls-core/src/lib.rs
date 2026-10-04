@@ -1477,13 +1477,10 @@ mod tests {
             workspace_root_aliases(&[], &base, Some(&logical)),
             vec![base.clone(), logical.clone()]
         );
+        let abs = crate::test_lsp::absolute_path("abs");
         assert_eq!(
-            workspace_root_aliases(
-                &[PathBuf::from("sub"), PathBuf::from("/abs")],
-                &base,
-                Some(&logical)
-            ),
-            vec![base.join("sub"), logical.join("sub"), PathBuf::from("/abs")]
+            workspace_root_aliases(&[PathBuf::from("sub"), abs.clone()], &base, Some(&logical)),
+            vec![base.join("sub"), logical.join("sub"), abs]
         );
     }
 

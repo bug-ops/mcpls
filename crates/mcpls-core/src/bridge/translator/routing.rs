@@ -1519,7 +1519,7 @@ mod tests {
         );
         let uri: lsp_types::Uri = lsp_types::Uri::from(file_url.as_str());
         let result = translator.parse_file_uri(&uri).unwrap();
-        assert_eq!(result, test_file.canonicalize().unwrap());
+        assert_eq!(result, dunce::canonicalize(&test_file).unwrap());
     }
 
     /// #411: an authority-bearing `file://` URI (e.g. `file://host/path`)
@@ -2277,7 +2277,7 @@ mod tests {
         fs::write(&path_a, "content a").unwrap();
         let path_b = dir.path().join("b.aa");
         fs::write(&path_b, "content b").unwrap();
-        let canonical_a = path_a.canonicalize().unwrap();
+        let canonical_a = dunce::canonicalize(&path_a).unwrap();
 
         let first = translator
             .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
@@ -2328,7 +2328,7 @@ mod tests {
 
         let path_b = dir.path().join("b.bb");
         fs::write(&path_b, "content b").unwrap();
-        let canonical_b = path_b.canonicalize().unwrap();
+        let canonical_b = dunce::canonicalize(&path_b).unwrap();
 
         client.shutdown().await.unwrap();
         let err = translator

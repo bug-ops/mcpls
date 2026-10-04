@@ -222,15 +222,24 @@ mod tests {
         );
     }
 
+    /// An absolute path for the host platform (`/p` on Unix, `C:\p` on Windows).
+    fn abs(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", path.replace('/', "\\")))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
     #[test]
     fn test_new_drops_relative_duplicate_and_canonical_aliases() {
         let roots = WorkspaceRoots::new(
-            vec![PathBuf::from("/real")],
+            vec![abs("/real")],
             vec![
                 PathBuf::from("relative"),
-                PathBuf::from("/real"),
-                PathBuf::from("/alias"),
-                PathBuf::from("/alias/./"),
+                abs("/real"),
+                abs("/alias"),
+                abs("/alias/./"),
             ],
         );
         assert_eq!(roots.aliases.len(), 1);
@@ -238,14 +247,11 @@ mod tests {
 
     #[test]
     fn test_admits_lexically_alias_and_canonical() {
-        let roots = WorkspaceRoots::new(
-            vec![PathBuf::from("/real/ws")],
-            vec![PathBuf::from("/alias/ws")],
-        );
-        assert!(roots.admits_lexically(Path::new("/real/ws/a.rs")));
-        assert!(roots.admits_lexically(Path::new("/alias/ws/a.rs")));
-        assert!(!roots.admits_lexically(Path::new("/other/a.rs")));
-        assert!(!roots.admits_lexically(Path::new("/real/wsx/a.rs")));
+        let roots = WorkspaceRoots::new(vec![abs("/real/ws")], vec![abs("/alias/ws")]);
+        assert!(roots.admits_lexically(&abs("/real/ws/a.rs")));
+        assert!(roots.admits_lexically(&abs("/alias/ws/a.rs")));
+        assert!(!roots.admits_lexically(&abs("/other/a.rs")));
+        assert!(!roots.admits_lexically(&abs("/real/wsx/a.rs")));
     }
 
     #[test]

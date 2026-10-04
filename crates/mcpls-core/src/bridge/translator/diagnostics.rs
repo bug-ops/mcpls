@@ -777,13 +777,11 @@ mod tests {
 
     #[test]
     fn test_handle_cached_diagnostics_invalid_path() {
-        #[cfg(windows)]
-        let root = PathBuf::from(r"C:\");
-        #[cfg(not(windows))]
-        let root = PathBuf::from("/");
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent/path/file.rs");
         let result = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::resolve(vec![root]),
-            "/nonexistent/path/file.rs",
+            &WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            missing.to_str().unwrap(),
         );
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }

@@ -3179,17 +3179,18 @@ sleep 0.3
 
     #[tokio::test]
     async fn test_cached_diagnostics_tool_nonexistent_file() {
-        #[cfg(windows)]
-        let root = PathBuf::from(r"C:\");
-        #[cfg(not(windows))]
-        let root = PathBuf::from("/");
+        let dir = tempfile::TempDir::new().unwrap();
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![root]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
         );
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: "/nonexistent/file.rs".to_string(),
+            file_path: dir
+                .path()
+                .join("nonexistent/file.rs")
+                .to_string_lossy()
+                .to_string(),
         });
 
         let result = server.get_cached_diagnostics(params).await;
@@ -3954,16 +3955,12 @@ sleep 0.3
     /// `validate_path` rejects a non-existent path (canonicalize fails).
     #[tokio::test]
     async fn test_validate_path_rejects_nonexistent_path() {
-        use std::path::Path;
-
         use crate::error::Error;
 
+        let dir = tempfile::TempDir::new().unwrap();
         let mut translator = Translator::new();
-        #[cfg(windows)]
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![PathBuf::from(r"C:\")]));
-        #[cfg(not(windows))]
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![PathBuf::from("/")]));
-        let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        let result = translator.validate_path(&dir.path().join("this/path/does/not/exist.rs"));
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }
 
