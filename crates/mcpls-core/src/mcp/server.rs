@@ -43,8 +43,8 @@ use crate::bridge::{
     DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     IncomingCallsResult, IndexingState, InlayHintsResult, LocationsResult, NotificationCache,
     OutgoingCallsResult, Position, PositionEncoding, ReferencesResult, RenameResult,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator, WorkspaceSymbolResult,
-    validate_path_against_roots,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator, WorkspaceRoots,
+    WorkspaceSymbolResult, validate_path_against_roots,
 };
 use crate::config::{McpConfig, ToolPrefix};
 
@@ -389,7 +389,7 @@ impl McplsServer {
     pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
-        workspace_roots: Arc<[PathBuf]>,
+        workspace_roots: WorkspaceRoots,
         subscription_registry: SubscriptionRegistry,
         project_config_ignored: bool,
         mcp: McpConfig,
@@ -430,7 +430,7 @@ impl McplsServer {
     /// ```
     /// use std::sync::Arc;
     ///
-    /// use mcpls_core::bridge::{NotificationCache, Translator};
+    /// use mcpls_core::bridge::{NotificationCache, Translator, WorkspaceRoots};
     /// use mcpls_core::config::McpConfig;
     /// use mcpls_core::mcp::{McplsServer, SubscriptionRegistry};
     /// use tokio::sync::Mutex;
@@ -438,7 +438,7 @@ impl McplsServer {
     /// let server = McplsServer::new(
     ///     Arc::new(Translator::new()),
     ///     Arc::new(Mutex::new(NotificationCache::new())),
-    ///     Arc::from(Vec::new()),
+    ///     WorkspaceRoots::default(),
     ///     SubscriptionRegistry::new(),
     ///     false,
     ///     McpConfig::default(),
@@ -452,7 +452,7 @@ impl McplsServer {
         let context = Arc::new(BridgeContext {
             translator: Arc::clone(&self.context.translator),
             notification_cache: Arc::clone(&self.context.notification_cache),
-            workspace_roots: Arc::clone(&self.context.workspace_roots),
+            workspace_roots: self.context.workspace_roots.clone(),
             session: self.context.session.sibling(),
             project_config_ignored: self.context.project_config_ignored,
             mcp: self.context.mcp.clone(),
@@ -1136,7 +1136,7 @@ impl McplsServer {
             return Err(no_resolvable_listen_uris());
         }
         let permit = self.context.session.registry().try_reserve_listen()?;
-        let roots = Arc::clone(&self.context.workspace_roots);
+        let roots = self.context.workspace_roots.clone();
         let accepted = accepted.to_vec();
         let uris = tokio::task::spawn_blocking(move || ListenUris::resolve(&accepted, &roots))
             .await
@@ -1469,7 +1469,7 @@ mod tests {
         project_config_ignored: bool,
         mcp: McpConfig,
     ) -> McplsServer {
-        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let workspace_roots = WorkspaceRoots::default();
         create_test_server_with_workspace_roots(project_config_ignored, mcp, workspace_roots)
     }
 
@@ -1480,7 +1480,7 @@ mod tests {
     fn create_test_server_with_workspace_roots(
         project_config_ignored: bool,
         mcp: McpConfig,
-        workspace_roots: Arc<[PathBuf]>,
+        workspace_roots: WorkspaceRoots,
     ) -> McplsServer {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
@@ -1506,7 +1506,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
         (server, temp_dir, test_file)
     }
@@ -1888,7 +1888,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -1907,7 +1909,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -1958,7 +1960,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -1972,7 +1976,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2026,7 +2030,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2045,7 +2051,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2110,7 +2116,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
         let translator = Arc::new(translator);
         let (client, fake) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2122,7 +2130,7 @@ mod tests {
         let server = Arc::new(McplsServer::new(
             translator,
             Arc::clone(&cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2408,7 +2416,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2429,7 +2439,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2616,7 +2626,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
 
         let params = Parameters(CachedDiagnosticsParams {
@@ -2653,7 +2663,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
 
         let canonical_path = test_file.canonicalize().unwrap();
@@ -2727,7 +2737,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
         let owner = crate::config::ServerId::from("rust");
         server.context.translator.register_server(
@@ -2800,7 +2810,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
         // Deliberately not registered with `translator.register_server`.
         let owner = crate::config::ServerId::from("rust");
@@ -2884,7 +2894,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2939,7 +2949,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2991,7 +3001,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -3097,7 +3107,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from([dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -3150,7 +3160,7 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
 
         let params = Parameters(CachedDiagnosticsParams {
@@ -3170,8 +3180,11 @@ sleep 0.3
         let root = PathBuf::from(r"C:\");
         #[cfg(not(windows))]
         let root = PathBuf::from("/");
-        let server =
-            create_test_server_with_workspace_roots(false, McpConfig::default(), Arc::from([root]));
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            WorkspaceRoots::resolve(vec![root]),
+        );
         let params = Parameters(CachedDiagnosticsParams {
             file_path: "/nonexistent/file.rs".to_string(),
         });
@@ -3852,7 +3865,9 @@ sleep 0.3
         let noncanonical = link_dir.join("test.rs");
         assert_ne!(noncanonical, test_file);
 
-        let validated = validate_path_against_roots(&noncanonical, &[base]).unwrap();
+        let validated =
+            validate_path_against_roots(&noncanonical, &WorkspaceRoots::resolve(vec![base]))
+                .unwrap();
         assert_eq!(validated, test_file.canonicalize().unwrap());
 
         let uri_from_raw_path = crate::bridge::path_to_uri(&noncanonical).unwrap();
@@ -3873,9 +3888,13 @@ sleep 0.3
 
         let mut translator = Translator::new();
         #[cfg(windows)]
-        translator.set_workspace_roots(vec![PathBuf::from(r"C:\")]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            PathBuf::from(r"C:\"),
+        ]));
         #[cfg(not(windows))]
-        translator.set_workspace_roots(vec![PathBuf::from("/")]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            PathBuf::from("/"),
+        ]));
         let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }
@@ -3891,7 +3910,7 @@ sleep 0.3
     #[test]
     fn test_read_resource_nonexistent_path_maps_to_invalid_params() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let roots = [temp_dir.path().to_path_buf()];
+        let roots = WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]);
         let missing = temp_dir.path().join("does-not-exist.rs");
 
         let result = validate_path_against_roots(&missing, &roots);
@@ -3940,7 +3959,7 @@ sleep 0.3
         symlink(&real_dir, &link_dir).unwrap();
         let noncanonical = link_dir.join("test.rs");
 
-        let roots = std::slice::from_ref(&base);
+        let roots = &WorkspaceRoots::resolve(vec![base.clone()]);
         let validated = validate_path_against_roots(&noncanonical, roots).unwrap();
         let raw_uri = make_uri(&noncanonical).unwrap();
         let canonical_uri = DiagnosticsResourceUri::resolve(&raw_uri, roots)
@@ -4059,7 +4078,7 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from(vec![root]),
+            WorkspaceRoots::resolve(vec![root]),
         );
         (server, dir, uri)
     }
@@ -4302,7 +4321,7 @@ sleep 0.3
                 ("rs".to_string(), "rust".to_string()),
                 ("py".to_string(), "python".to_string()),
             ]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let mut fake_servers = Vec::new();
         for (id, _, caps) in servers {
             let (client, fake) = fake_lsp_client();
@@ -4313,7 +4332,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             mcp,
@@ -4774,7 +4793,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            Arc::from(Vec::new()),
+            WorkspaceRoots::default(),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),

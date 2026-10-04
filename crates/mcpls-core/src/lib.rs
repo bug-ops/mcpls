@@ -332,6 +332,72 @@ pub(crate) fn register_servers(
     }
 }
 
+/// Build the [`WorkspaceRoots`](bridge::WorkspaceRoots) for `config_roots`:
+/// the canonical roots plus the lexical aliases clients may name them by.
+///
+/// `current_dir()` always returns an absolute path. Configs loaded from a
+/// TOML file have already had relative roots rebased to that file's
+/// directory in `ServerConfig::load_from`; this second pass covers
+/// caller-built `ServerConfig`s, whose relative roots are defined against the
+/// process cwd. Only called when a root needs it (empty `roots`, which
+/// defaults to cwd, or at least one relative root): a fully-absolute
+/// `workspace.roots` must not fail startup just because cwd happens to be
+/// unreadable/removed (#348).
+fn build_workspace_roots(config_roots: &[PathBuf]) -> Result<bridge::WorkspaceRoots, Error> {
+    if config_roots.is_empty() || config_roots.iter().any(|root| root.is_relative()) {
+        let base_dir = std::env::current_dir().map_err(Error::Io)?;
+        let canonical = resolve_workspace_roots(config_roots, &base_dir)?;
+        let logical_cwd = logical_cwd_from(std::env::var_os("PWD"), &base_dir);
+        let aliases = workspace_root_aliases(config_roots, &base_dir, logical_cwd.as_deref());
+        Ok(bridge::WorkspaceRoots::new(canonical, aliases))
+    } else {
+        // Every root is absolute already, so `base_dir` is never joined
+        // against inside `canonicalize_workspace_roots` -- pass an
+        // arbitrary placeholder rather than paying for `current_dir()`.
+        let canonical = canonicalize_workspace_roots(config_roots, Path::new(""))?;
+        Ok(bridge::WorkspaceRoots::new(
+            canonical,
+            config_roots.to_vec(),
+        ))
+    }
+}
+
+/// `$PWD`, accepted only when it is absolute and names the same directory as
+/// `base_dir`; a forged or stale value is ignored.
+fn logical_cwd_from(pwd: Option<std::ffi::OsString>, base_dir: &Path) -> Option<PathBuf> {
+    let pwd = PathBuf::from(pwd?);
+    if !pwd.is_absolute() {
+        return None;
+    }
+    let same = dunce::canonicalize(&pwd).ok()? == dunce::canonicalize(base_dir).ok()?;
+    same.then_some(pwd)
+}
+
+/// The pre-canonical forms of the roots: as configured, resolved against
+/// `base_dir`, and (for relative roots) against the logical cwd.
+fn workspace_root_aliases(
+    config_roots: &[PathBuf],
+    base_dir: &Path,
+    logical_cwd: Option<&Path>,
+) -> Vec<PathBuf> {
+    if config_roots.is_empty() {
+        return std::iter::once(base_dir)
+            .chain(logical_cwd)
+            .map(Path::to_path_buf)
+            .collect();
+    }
+    let mut aliases = Vec::new();
+    for root in config_roots {
+        if root.is_relative() {
+            aliases.push(join_relative_root(base_dir, root));
+            aliases.extend(logical_cwd.map(|cwd| join_relative_root(cwd, root)));
+        } else {
+            aliases.push(root.clone());
+        }
+    }
+    aliases
+}
+
 /// Resolve workspace roots against an absolute base directory.
 ///
 /// If no workspace roots are provided, the base directory itself is used.
@@ -412,7 +478,7 @@ fn canonicalize_workspace_roots(roots: &[PathBuf], base_dir: &Path) -> Result<Ve
                         "Failed to canonicalize absolute workspace root {}: {source}, using non-canonical path",
                         resolved.display()
                     );
-                    Ok(resolved)
+                    Ok(bridge::canonicalize_existing_prefix(&resolved).unwrap_or(resolved))
                 }
             }
         })
@@ -576,17 +642,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // `roots`, which defaults to cwd, or at least one relative root): a
     // fully-absolute `workspace.roots` must not fail startup just because
     // cwd happens to be unreadable/removed (#348).
-    let workspace_roots = if config.workspace.roots.is_empty()
-        || config.workspace.roots.iter().any(|root| root.is_relative())
-    {
-        let workspace_base = std::env::current_dir().map_err(Error::Io)?;
-        resolve_workspace_roots(&config.workspace.roots, &workspace_base)?
-    } else {
-        // Every root is absolute already, so `base_dir` is never joined
-        // against inside `canonicalize_workspace_roots` -- pass an
-        // arbitrary placeholder rather than paying for `current_dir()`.
-        canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
-    };
+    let workspace_roots = build_workspace_roots(&config.workspace.roots)?;
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
@@ -595,6 +651,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         .iter()
         .filter_map(|lsp_config| {
             let should_spawn = workspace_roots
+                .canonical()
                 .iter()
                 .any(|root| lsp_config.should_spawn(root, max_depth));
 
@@ -608,7 +665,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
             Some(ServerInitConfig {
                 server_config: lsp_config.clone(),
-                workspace_roots: workspace_roots.clone(),
+                workspace_roots: workspace_roots.canonical().to_vec(),
                 initialization_options: lsp_config.initialization_options.clone(),
                 position_encodings: config.workspace.position_encodings.clone(),
                 notification_tx: None,
@@ -671,7 +728,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // paths. The snapshot can therefore stay allocation-only while preserving
     // `diagnostic_path_in_workspace`'s canonical-root precondition and avoiding
     // filesystem I/O on the hot per-notification path.
-    let workspace_roots_snapshot: Arc<[PathBuf]> = Arc::from(workspace_roots.clone());
+    let workspace_roots_snapshot: Arc<[PathBuf]> = workspace_roots.canonical_shared();
 
     let translator = Arc::new(translator);
     // Shared across every session (one per HTTP session, or the sole stdio
@@ -704,7 +761,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let mcp_server = mcp::McplsServer::new(
         Arc::clone(&translator),
         Arc::clone(&notification_cache),
-        Arc::clone(&workspace_roots_snapshot),
+        workspace_roots,
         subscription_registry,
         project_config_ignored,
         mcp,
@@ -1362,6 +1419,56 @@ mod tests {
 
         let result = canonicalize_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
         assert_eq!(result, vec![nested]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_logical_cwd_accepted_only_when_it_names_the_cwd() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+
+        assert_eq!(
+            logical_cwd_from(Some(link.clone().into_os_string()), &base),
+            Some(link)
+        );
+        assert_eq!(
+            logical_cwd_from(Some(other.path().as_os_str().to_owned()), &base),
+            None
+        );
+        assert_eq!(logical_cwd_from(Some(".".into()), &base), None);
+        assert_eq!(logical_cwd_from(None, &base), None);
+    }
+
+    #[test]
+    fn test_workspace_root_aliases_cover_configured_and_logical_forms() {
+        let base = PathBuf::from("/real/proj");
+        let logical = PathBuf::from("/logical/proj");
+
+        assert_eq!(
+            workspace_root_aliases(&[], &base, Some(&logical)),
+            vec![base.clone(), logical.clone()]
+        );
+        assert_eq!(
+            workspace_root_aliases(
+                &[PathBuf::from("sub"), PathBuf::from("/abs")],
+                &base,
+                Some(&logical)
+            ),
+            vec![base.join("sub"), logical.join("sub"), PathBuf::from("/abs")]
+        );
+    }
+
+    #[test]
+    fn test_build_workspace_roots_keeps_absolute_root_as_alias() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let raw = temp_dir.path().to_path_buf();
+
+        let roots = build_workspace_roots(std::slice::from_ref(&raw)).unwrap();
+
+        assert!(roots.admits_lexically(&raw.join("a.rs")));
     }
 
     #[test]
@@ -2828,7 +2935,7 @@ mod tests {
             let server = mcp::McplsServer::new(
                 Arc::new(Translator::new()),
                 make_cache(),
-                Arc::from(vec![root.clone()]),
+                bridge::WorkspaceRoots::resolve(vec![root.clone()]),
                 subs.clone(),
                 false,
                 config::McpConfig::default(),

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::Translator;
 use crate::bridge::state::detect_language;
-use crate::bridge::{InFlightGuard, lock_std};
+use crate::bridge::{InFlightGuard, WorkspaceRoots, lexically_normalize, lock_std};
 use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
@@ -58,34 +58,43 @@ impl PreparedDocument {
 /// full `Arc<Mutex<Translator>>`, which may be held elsewhere across a slow
 /// in-flight LSP round-trip.
 ///
+/// Containment is checked lexically first (absolute, `.`/`..` resolved, against
+/// the canonical roots and their aliases) so an out-of-workspace path is
+/// rejected without touching it; only an admitted path is canonicalized, and
+/// that canonical form must again lie under a canonical root. `..` following
+/// an in-root symlink is therefore resolved lexically by the pre-check.
+///
 /// # Errors
 ///
 /// Returns `Error::NoWorkspaceRoots` if `workspace_roots` is empty -- fails
 /// closed rather than allowing unrestricted access -- and
 /// `Error::PathOutsideWorkspace` if the path is outside all configured
-/// workspace roots.
-pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> Result<PathBuf> {
-    // Checked before canonicalizing so a rootless embedder can't use the
-    // canonicalize/FileIo error split to probe file existence.
+/// workspace roots. `Error::FileIo` is returned only for a path the lexical
+/// check admitted but that cannot be canonicalized.
+pub fn validate_path_against_roots(
+    path: &Path,
+    workspace_roots: &WorkspaceRoots,
+) -> Result<PathBuf> {
     if workspace_roots.is_empty() {
         return Err(Error::NoWorkspaceRoots(path.to_path_buf()));
     }
 
-    let canonical = path.canonicalize().map_err(|e| Error::FileIo {
+    let io_error = |source| Error::FileIo {
         path: path.to_path_buf(),
-        source: e,
-    })?;
-
-    // Check if path is within any workspace root
-    for root in workspace_roots {
-        if let Ok(canonical_root) = root.canonicalize()
-            && canonical.starts_with(&canonical_root)
-        {
-            return Ok(canonical);
-        }
+        source,
+    };
+    let absolute = std::path::absolute(path).map_err(io_error)?;
+    let normalized = lexically_normalize(dunce::simplified(&absolute));
+    if !workspace_roots.admits_lexically(&normalized) {
+        return Err(Error::PathOutsideWorkspace(path.to_path_buf()));
     }
 
-    Err(Error::PathOutsideWorkspace(path.to_path_buf()))
+    let canonical = dunce::canonicalize(path).map_err(io_error)?;
+    if workspace_roots.contains_canonical(&canonical) {
+        Ok(canonical)
+    } else {
+        Err(Error::PathOutsideWorkspace(path.to_path_buf()))
+    }
 }
 
 /// Whether a [`Translator::prepare_gated_document`] call site also needs
@@ -1255,7 +1264,8 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().to_path_buf();
-        translator.set_workspace_roots(vec![workspace_root]);
+        translator
+            .set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![workspace_root]));
 
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1271,13 +1281,93 @@ mod tests {
         let temp_dir2 = TempDir::new().unwrap();
 
         // Set workspace root to temp_dir1
-        translator.set_workspace_roots(vec![temp_dir1.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            temp_dir1.path().to_path_buf(),
+        ]));
 
         // Create file in temp_dir2 (outside workspace)
         let test_file = temp_dir2.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = translator.validate_path(&test_file);
+        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+    }
+
+    /// #533: an outside path that does not exist must be rejected as outside
+    /// the workspace, not leak its absence as `FileIo`.
+    #[test]
+    fn test_validate_path_nonexistent_outside_path_is_outside_workspace() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let roots = WorkspaceRoots::resolve(vec![root.path().to_path_buf()]);
+
+        let result = validate_path_against_roots(&outside.path().join("missing.rs"), &roots);
+
+        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+    }
+
+    #[test]
+    fn test_validate_path_dotdot_escape_is_outside_workspace() {
+        let root = TempDir::new().unwrap();
+        let roots = WorkspaceRoots::resolve(vec![root.path().to_path_buf()]);
+
+        let result = validate_path_against_roots(&root.path().join("../escape.rs"), &roots);
+
+        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+    }
+
+    #[test]
+    fn test_validate_path_dot_segments_inside_root_are_accepted() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir(root.path().join("a")).unwrap();
+        fs::write(root.path().join("b.rs"), "").unwrap();
+        let roots = WorkspaceRoots::resolve(vec![root.path().to_path_buf()]);
+
+        let result = validate_path_against_roots(&root.path().join("./a/../b.rs"), &roots);
+
+        assert_eq!(
+            result.unwrap(),
+            dunce::canonicalize(root.path().join("b.rs")).unwrap()
+        );
+    }
+
+    /// A client naming the workspace through a symlinked alias of the
+    /// canonical root is admitted when the alias was precomputed.
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_path_symlink_alias_of_root_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("a.rs"), "").unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let roots = WorkspaceRoots::new(
+            vec![dunce::canonicalize(&real).unwrap()],
+            vec![alias.clone()],
+        );
+
+        let result = validate_path_against_roots(&alias.join("a.rs"), &roots);
+
+        assert_eq!(
+            result.unwrap(),
+            dunce::canonicalize(real.join("a.rs")).unwrap()
+        );
+    }
+
+    /// A symlink inside the root pointing outside passes the lexical
+    /// pre-check but must still fail the authoritative canonical check.
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_path_symlink_escaping_root_is_outside_workspace() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.rs"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        let roots = WorkspaceRoots::resolve(vec![root.path().to_path_buf()]);
+
+        let result = validate_path_against_roots(&root.path().join("link/secret.rs"), &roots);
+
         assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
     }
 
@@ -1328,7 +1418,9 @@ mod tests {
     async fn test_parse_file_uri_valid_scheme() {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            temp_dir.path().to_path_buf(),
+        ]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1347,7 +1439,9 @@ mod tests {
     async fn test_parse_file_uri_percent_decodes_space_and_non_ascii() {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            temp_dir.path().to_path_buf(),
+        ]));
         let test_file = temp_dir.path().join("my file café.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1633,7 +1727,9 @@ mod tests {
                     (ServerId::from("lang_a"), "lang_a".to_string()),
                     (ServerId::from("lang_b"), "lang_b".to_string()),
                 ]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
 
         let (client_a, mut server_a) = fake_lsp_client();
         let (client_b, mut server_b) = fake_lsp_client();
@@ -1733,7 +1829,9 @@ mod tests {
                     ServerId::from("lang_a"),
                     "lang_a".to_string(),
                 )]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client);
@@ -1804,7 +1902,9 @@ mod tests {
                 max_documents: 1,
                 max_file_size: 0,
             });
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
 
         let (client, server) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client);
@@ -1996,7 +2096,9 @@ mod tests {
                     ServerId::from("lang_b"),
                     "lang_b".to_string(),
                 )]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
 
         let (client, _server) = fake_lsp_client();
         translator.register_client("lang_b".to_string(), client.clone());
@@ -2042,7 +2144,9 @@ mod tests {
                 max_documents: 1,
                 max_file_size: 0,
             });
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
 
         let (client_a, mut server_a) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client_a);
@@ -2135,7 +2239,9 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(extensions)
             .with_router(router);
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            dir.path().to_path_buf(),
+        ]));
 
         let (client_pyright, mut server_pyright) = fake_lsp_client();
         let (client_pylsp, mut server_pylsp) = fake_lsp_client();

@@ -892,7 +892,7 @@ mod tests {
             ..Default::default()
         };
         let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
-        let inside_uri = Url::from_file_path(dir.path().join("inside.rs"))
+        let inside_uri = Url::from_file_path(canonical_dir(&dir).join("inside.rs"))
             .unwrap()
             .to_string();
         let outside_uri = "file:///outside/workspace/evil.rs";

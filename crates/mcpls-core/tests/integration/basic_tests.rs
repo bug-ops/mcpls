@@ -62,7 +62,7 @@ fn test_workspace_roots_configuration() {
     let mut translator = Translator::new();
     let roots = vec![PathBuf::from("/tmp/test1"), PathBuf::from("/tmp/test2")];
 
-    translator.set_workspace_roots(roots);
+    translator.set_workspace_roots(mcpls_core::bridge::WorkspaceRoots::resolve(roots));
 }
 
 #[test]

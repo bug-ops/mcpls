@@ -17,7 +17,7 @@ use self::encoding_ctx::EncodingCtx;
 use self::respawn::RespawnBackoff;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
-use crate::bridge::{DocumentTracker, NotificationCache, lock_std};
+use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots, lock_std};
 use crate::config::{ServerId, ToolKind, ToolRouter};
 use crate::error::{ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
@@ -78,7 +78,7 @@ pub struct Translator {
     resource_limits: ResourceLimits,
     /// Allowed workspace roots for path validation. Read-only after `serve()`
     /// setup, so no lock is needed.
-    workspace_roots: Arc<Vec<PathBuf>>,
+    workspace_roots: WorkspaceRoots,
     /// Custom file extension to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
     extension_map: Arc<HashMap<String, String>>,
@@ -166,7 +166,7 @@ impl Translator {
                 HashMap::new(),
             )),
             resource_limits: ResourceLimits::default(),
-            workspace_roots: Arc::new(Vec::new()),
+            workspace_roots: WorkspaceRoots::default(),
             extension_map: Arc::new(HashMap::new()),
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(Arc::new(ToolRouter::default()))),
@@ -196,14 +196,14 @@ impl Translator {
     /// Set the workspace roots for path validation.
     ///
     /// Only called during single-owner setup, before the translator is
-    /// shared, so this replaces the `Arc` wholesale rather than locking.
+    /// shared, so this replaces the roots wholesale rather than locking.
     ///
     /// Mandatory for any embedder that will serve path-taking requests:
     /// leaving `roots` empty (or never calling this) makes every such
     /// operation reject with `Error::NoWorkspaceRoots` instead of allowing
     /// unrestricted access.
-    pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
-        self.workspace_roots = Arc::new(roots);
+    pub fn set_workspace_roots(&mut self, roots: WorkspaceRoots) {
+        self.workspace_roots = roots;
     }
 
     /// Give the translator a handle to the shared diagnostics cache, so the
@@ -358,7 +358,7 @@ impl Translator {
         EncodingCtx::new(
             self.position_encoding_for(server_id),
             self.document_tracker.clone(),
-            self.workspace_roots.clone(),
+            self.workspace_roots.canonical_shared(),
         )
     }
 
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn test_translator_new() {
         let translator = Translator::new();
-        assert_eq!(translator.workspace_roots.len(), 0);
+        assert!(translator.workspace_roots.is_empty());
         assert_eq!(lock_std(&translator.lsp_clients).len(), 0);
         assert_eq!(lock_std(&translator.lsp_servers).len(), 0);
     }
@@ -689,8 +689,8 @@ mod tests {
     fn test_set_workspace_roots() {
         let mut translator = Translator::new();
         let roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
-        translator.set_workspace_roots(roots.clone());
-        assert_eq!(*translator.workspace_roots, roots);
+        translator.set_workspace_roots(WorkspaceRoots::new(roots.clone(), Vec::new()));
+        assert_eq!(translator.workspace_roots.canonical(), roots);
     }
 
     #[test]

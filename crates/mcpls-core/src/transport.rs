@@ -1473,7 +1473,6 @@ mod tests {
     /// missing a branch, or awaiting the wrong future) would look like.
     #[tokio::test]
     async fn test_run_stdio_returns_promptly_when_stdin_is_already_closed() {
-        use std::path::PathBuf;
         use std::sync::Arc;
 
         use tokio::sync::Mutex;
@@ -1484,7 +1483,7 @@ mod tests {
 
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let workspace_roots = crate::bridge::WorkspaceRoots::default();
         let subs = SubscriptionRegistry::new();
         let server = McplsServer::new(
             translator,
@@ -1585,7 +1584,6 @@ mod tests {
         /// Verifies `run_http` binds successfully and accepts TCP connections.
         #[tokio::test]
         async fn test_run_http_binds() {
-            use std::path::PathBuf;
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
@@ -1596,7 +1594,7 @@ mod tests {
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+            let workspace_roots = crate::bridge::WorkspaceRoots::default();
             let subs = SubscriptionRegistry::new();
             let server = McplsServer::new(
                 translator,
@@ -1678,7 +1676,6 @@ mod tests {
         /// Verifies `run_http` returns an error when the bind address is already in use.
         #[tokio::test]
         async fn test_run_http_bind_error() {
-            use std::path::PathBuf;
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
@@ -1693,7 +1690,7 @@ mod tests {
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+            let workspace_roots = crate::bridge::WorkspaceRoots::default();
             let subs = SubscriptionRegistry::new();
             let server = McplsServer::new(
                 translator,
@@ -1940,7 +1937,7 @@ mod tests {
         /// workspace roots, matching the setup shared by every
         /// `run_http`-driving test in this module.
         fn test_server_with_roots(
-            workspace_roots: std::sync::Arc<[std::path::PathBuf]>,
+            workspace_roots: crate::bridge::WorkspaceRoots,
         ) -> crate::mcp::McplsServer {
             use std::sync::Arc;
 
@@ -1965,7 +1962,7 @@ mod tests {
 
         /// [`test_server_with_roots`] with no workspace roots configured.
         fn test_server() -> crate::mcp::McplsServer {
-            test_server_with_roots(std::sync::Arc::from(Vec::new()))
+            test_server_with_roots(crate::bridge::WorkspaceRoots::default())
         }
 
         /// Polls a TCP connect until it succeeds or the 5s budget runs out;
@@ -2368,8 +2365,9 @@ mod tests {
             std::fs::write(&file_path, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file_path).unwrap();
 
-            let server =
-                test_server_with_roots(std::sync::Arc::from(vec![workspace.path().to_path_buf()]));
+            let server = test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+                workspace.path().to_path_buf(),
+            ]));
             let registry = server.subscription_registry();
 
             let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
@@ -2694,7 +2692,8 @@ mod tests {
             let uri_x = crate::bridge::resources::make_uri(&file_x).unwrap();
             let uri_y = crate::bridge::resources::make_uri(&file_y).unwrap();
 
-            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let server =
+                test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
 
@@ -2954,7 +2953,8 @@ mod tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let server =
+                test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
@@ -2998,7 +2998,8 @@ mod tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let server =
+                test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
@@ -3048,7 +3049,8 @@ mod tests {
             let file = root.join("main.rs");
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
-            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let server =
+                test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
             ListenFixture {
@@ -3197,7 +3199,7 @@ mod tests {
             let server = crate::mcp::McplsServer::new(
                 std::sync::Arc::new(crate::bridge::Translator::new()),
                 cache,
-                std::sync::Arc::from(vec![root]),
+                crate::bridge::WorkspaceRoots::resolve(vec![root]),
                 crate::mcp::SubscriptionRegistry::new(),
                 false,
                 crate::config::McpConfig::default(),

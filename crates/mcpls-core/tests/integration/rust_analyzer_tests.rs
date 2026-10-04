@@ -81,7 +81,9 @@ fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
             ServerId::from("rust"),
             "rust".to_string(),
         )]));
-    translator.set_workspace_roots(vec![workspace_path]);
+    translator.set_workspace_roots(mcpls_core::bridge::WorkspaceRoots::resolve(vec![
+        workspace_path,
+    ]));
     translator.register_server_complete(server);
 
     Arc::new(Mutex::new(translator))

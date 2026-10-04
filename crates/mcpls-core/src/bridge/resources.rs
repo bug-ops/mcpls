@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use super::state::{encode_rfc3986_path_chars, uri_to_path};
-use super::validate_path_against_roots;
+use super::{WorkspaceRoots, validate_path_against_roots};
 
 /// URI scheme used for diagnostic resources.
 const SCHEME: &str = "lsp-diagnostics";
@@ -192,7 +192,10 @@ impl DiagnosticsResourceUri {
     /// Returns [`crate::Error::InvalidUri`] when `raw` is not a well-formed
     /// `lsp-diagnostics:///` URI, or the workspace validation error when the
     /// path is missing or outside `roots`.
-    pub(crate) fn resolve(raw: &str, roots: &[PathBuf]) -> crate::error::Result<ResolvedResource> {
+    pub(crate) fn resolve(
+        raw: &str,
+        roots: &WorkspaceRoots,
+    ) -> crate::error::Result<ResolvedResource> {
         let parsed = parse_uri(raw)?;
         // `canonicalize` yields a `\\?\` verbatim path on Windows, which LSP
         // servers never publish; `dunce` strips it where that is safe.
@@ -514,15 +517,22 @@ mod tests {
     #[test]
     fn test_resolve_rejects_foreign_scheme() {
         let (_dir, root, _file) = workspace();
-        let err = DiagnosticsResourceUri::resolve("file:///tmp/main.rs", &[root]).unwrap_err();
+        let err = DiagnosticsResourceUri::resolve(
+            "file:///tmp/main.rs",
+            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+        )
+        .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidUri(_)), "got {err:?}");
     }
 
     #[test]
     fn test_resolve_rejects_non_empty_authority() {
         let (_dir, root, _file) = workspace();
-        let err =
-            DiagnosticsResourceUri::resolve("lsp-diagnostics://host/main.rs", &[root]).unwrap_err();
+        let err = DiagnosticsResourceUri::resolve(
+            "lsp-diagnostics://host/main.rs",
+            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+        )
+        .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidUri(_)), "got {err:?}");
     }
 
@@ -531,21 +541,37 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let (_other_dir, _other_root, other_file) = workspace();
         let raw = make_uri(&other_file).unwrap();
-        assert!(DiagnosticsResourceUri::resolve(&raw, &[root]).is_err());
+        assert!(
+            DiagnosticsResourceUri::resolve(
+                &raw,
+                &crate::bridge::WorkspaceRoots::resolve(vec![root])
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_resolve_rejects_missing_file() {
         let (_dir, root, _file) = workspace();
         let raw = make_uri(&root.join("missing.rs")).unwrap();
-        assert!(DiagnosticsResourceUri::resolve(&raw, &[root]).is_err());
+        assert!(
+            DiagnosticsResourceUri::resolve(
+                &raw,
+                &crate::bridge::WorkspaceRoots::resolve(vec![root])
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_resolve_yields_canonical_path_and_uri() {
         let (_dir, root, file) = workspace();
         let raw = make_uri(&file).unwrap();
-        let resolved = DiagnosticsResourceUri::resolve(&raw, &[root]).unwrap();
+        let resolved = DiagnosticsResourceUri::resolve(
+            &raw,
+            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+        )
+        .unwrap();
         assert_eq!(resolved.path, file);
         assert_eq!(resolved.uri.as_str(), raw);
     }
@@ -557,14 +583,22 @@ mod tests {
         let link = root.join("link.rs");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let raw = make_uri(&link).unwrap();
-        let resolved = DiagnosticsResourceUri::resolve(&raw, &[root]).unwrap();
+        let resolved = DiagnosticsResourceUri::resolve(
+            &raw,
+            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+        )
+        .unwrap();
         assert_eq!(resolved.uri.as_str(), make_uri(&file).unwrap());
     }
 
     #[test]
     fn test_for_published_matches_resolve_for_same_file() {
         let (_dir, root, file) = workspace();
-        let resolved = DiagnosticsResourceUri::resolve(&make_uri(&file).unwrap(), &[root]).unwrap();
+        let resolved = DiagnosticsResourceUri::resolve(
+            &make_uri(&file).unwrap(),
+            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+        )
+        .unwrap();
         let published = crate::bridge::path_to_uri(&file).unwrap();
         assert_eq!(
             DiagnosticsResourceUri::for_published(&published),

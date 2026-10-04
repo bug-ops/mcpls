@@ -16,7 +16,6 @@
 //! never become a delivery target.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
@@ -27,11 +26,11 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, warn};
 
-use crate::bridge::lock_std;
 use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_LISTEN_STREAMS, MAX_SUBSCRIPTIONS, ResourceSubscriptions,
     SubscriptionError, parse_uri,
 };
+use crate::bridge::{WorkspaceRoots, lock_std};
 
 /// Whether `meta` carries rmcp's discover-lifecycle keys -- the same test
 /// `tower.rs::is_legacy_request` uses to route a request through its
@@ -296,7 +295,7 @@ impl ListenUris {
     /// `roots` (the acknowledgment is advisory) are dropped.
     ///
     /// Touches the filesystem; call from a blocking context.
-    pub(crate) fn resolve(accepted: &[String], roots: &[PathBuf]) -> Self {
+    pub(crate) fn resolve(accepted: &[String], roots: &WorkspaceRoots) -> Self {
         let mut map: HashMap<DiagnosticsResourceUri, ListenEntry> = HashMap::new();
         let mut dropped = 0_usize;
         for raw in accepted {
@@ -366,7 +365,7 @@ struct RegistryInner {
 /// ```
 /// use std::sync::Arc;
 ///
-/// use mcpls_core::bridge::{NotificationCache, Translator};
+/// use mcpls_core::bridge::{NotificationCache, Translator, WorkspaceRoots};
 /// use mcpls_core::config::McpConfig;
 /// use mcpls_core::mcp::{McplsServer, SubscriptionRegistry};
 /// use tokio::sync::Mutex;
@@ -377,7 +376,7 @@ struct RegistryInner {
 /// let server = McplsServer::new(
 ///     Arc::new(Translator::new()),
 ///     Arc::new(Mutex::new(NotificationCache::new())),
-///     Arc::from(Vec::new()),
+///     WorkspaceRoots::default(),
 ///     registry.clone(),
 ///     false,
 ///     McpConfig::default(),
@@ -937,7 +936,10 @@ mod tests {
         let (_other_dir, _other_root, outside) = workspace_file();
         let outside = crate::bridge::resources::make_uri(&outside).unwrap();
 
-        let uris = ListenUris::resolve(&[canonical.clone(), alias.clone(), outside], &[root]);
+        let uris = ListenUris::resolve(
+            &[canonical.clone(), alias.clone(), outside],
+            &WorkspaceRoots::resolve(vec![root]),
+        );
 
         let entries: Vec<_> = uris.canonical().collect();
         assert_eq!(entries.len(), 1, "the outside URI must be dropped");
@@ -952,8 +954,10 @@ mod tests {
     #[test]
     fn test_listen_uris_resolve_to_nothing_is_empty() {
         let (_dir, root, _file) = workspace_file();
-        let uris =
-            ListenUris::resolve(&[crate::test_lsp::absolute_uri("no/such/file.rs")], &[root]);
+        let uris = ListenUris::resolve(
+            &[crate::test_lsp::absolute_uri("no/such/file.rs")],
+            &WorkspaceRoots::resolve(vec![root]),
+        );
         assert!(uris.is_empty());
     }
 
@@ -975,7 +979,10 @@ mod tests {
     async fn test_listen_registration_delivers_then_unregisters_and_frees_slot() {
         let (_dir, root, file) = workspace_file();
         let raw = crate::bridge::resources::make_uri(&file).unwrap();
-        let uris = Arc::new(ListenUris::resolve(std::slice::from_ref(&raw), &[root]));
+        let uris = Arc::new(ListenUris::resolve(
+            std::slice::from_ref(&raw),
+            &WorkspaceRoots::resolve(vec![root]),
+        ));
         let canonical = uris.canonical().next().unwrap().0.clone();
 
         let registry = SubscriptionRegistry::new();

@@ -4,13 +4,12 @@
 //! The actual tool implementations use the `#[tool]` macro from rmcp
 //! and are defined in the `server` module.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
 use super::session::{SessionHandle, SubscriptionRegistry};
-use crate::bridge::{NotificationCache, Translator};
+use crate::bridge::{NotificationCache, Translator, WorkspaceRoots};
 use crate::config::McpConfig;
 
 /// Shared context for all tool handlers.
@@ -38,7 +37,7 @@ pub struct BridgeContext {
     /// Shared as a lock-free snapshot so cache-only handlers (e.g.
     /// `get_cached_diagnostics`, `read_resource`) can validate a path without
     /// locking anything.
-    pub workspace_roots: Arc<[PathBuf]>,
+    pub workspace_roots: WorkspaceRoots,
     /// This instance's subscription state and delivery handle.
     ///
     /// Scoped to one `McplsServer` instance, which coincides with "per
@@ -65,7 +64,7 @@ impl BridgeContext {
     pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
-        workspace_roots: Arc<[PathBuf]>,
+        workspace_roots: WorkspaceRoots,
         subscription_registry: SubscriptionRegistry,
         project_config_ignored: bool,
         mcp: McpConfig,
@@ -90,7 +89,7 @@ mod tests {
     fn test_bridge_context_creation() {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let workspace_roots = WorkspaceRoots::default();
         let subscription_registry = SubscriptionRegistry::new();
         let context = BridgeContext::new(
             translator,
