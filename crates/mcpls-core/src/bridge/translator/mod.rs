@@ -137,11 +137,6 @@ pub struct Translator {
     indexing_ready_timeout: std::time::Duration,
 }
 
-/// Upper bound on how long [`Translator::shutdown_servers`] waits for a
-/// single LSP server's graceful `shutdown`/`exit` handshake before giving up
-/// and letting `kill_on_drop` terminate it instead.
-const SERVER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 impl Translator {
     /// Create a new translator.
     ///
@@ -403,8 +398,8 @@ impl Translator {
     ///
     /// Drains the registered LSP servers and, for each one concurrently,
     /// sends the LSP `shutdown` request and `exit` notification via
-    /// [`LspServer::shutdown`], bounded by a fixed per-server timeout. A
-    /// server that errors or fails to respond in time is simply dropped
+    /// [`LspServer::shutdown`], which is bounded by [`crate::lsp::SHUTDOWN_TIMEOUT`].
+    /// A server that errors or fails to respond in time is simply dropped
     /// instead: its child process handle is `kill_on_drop(true)`, so the
     /// process is killed rather than left running. Call this once, from the
     /// top-level shutdown path, after the MCP transport has stopped
@@ -435,22 +430,35 @@ impl Translator {
         }
 
         let mut tasks = tokio::task::JoinSet::new();
+        let mut ids = HashMap::new();
         for (id, server) in servers {
-            tasks.spawn(async move {
-                match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, server.shutdown()).await {
-                    Ok(Ok(())) => tracing::debug!(%id, "LSP server shut down gracefully"),
-                    Ok(Err(e)) => tracing::warn!(
+            let task_id = id.clone();
+            let handle = tasks.spawn(async move {
+                match server.shutdown().await {
+                    Ok(()) => tracing::debug!(%id, "LSP server shut down gracefully"),
+                    Err(e) => tracing::warn!(
                         %id, error = %e,
-                        "LSP server shutdown handshake failed, killing process instead"
-                    ),
-                    Err(_) => tracing::warn!(
-                        %id, timeout = ?SERVER_SHUTDOWN_TIMEOUT,
-                        "LSP server did not shut down in time, killing process instead"
+                        "LSP server shutdown failed, killing process instead"
                     ),
                 }
             });
+            ids.insert(handle.id(), task_id);
         }
-        tasks.join_all().await;
+        join_shutdown_tasks(tasks, &ids).await;
+    }
+}
+
+/// Awaits every shutdown task, logging a panicked or cancelled one with its
+/// server id instead of re-raising it into the caller.
+async fn join_shutdown_tasks(
+    mut tasks: tokio::task::JoinSet<()>,
+    ids: &HashMap<tokio::task::Id, ServerId>,
+) {
+    while let Some(joined) = tasks.join_next_with_id().await {
+        if let Err(e) = joined {
+            let id = ids.get(&e.id());
+            tracing::error!(?id, error = %e, "LSP server shutdown task failed");
+        }
     }
 }
 
@@ -477,6 +485,18 @@ mod tests {
     use crate::config::{ServerId, ToolKind, ToolRouter};
     use crate::error::Error;
     use crate::test_lsp::fake_lsp_client;
+
+    /// A panicking shutdown task must be logged, not re-raised into the caller.
+    #[tokio::test]
+    async fn test_join_shutdown_tasks_survives_panicking_task() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let handle = tasks.spawn(async { panic!("shutdown task boom") });
+        let mut ids = HashMap::new();
+        ids.insert(handle.id(), ServerId::from("rust"));
+        tasks.spawn(async {});
+
+        join_shutdown_tasks(tasks, &ids).await;
+    }
 
     #[test]
     fn test_translator_new() {
@@ -540,7 +560,7 @@ mod tests {
         translator.register_server("server-b", crate::lsp::fake_lsp_server());
         assert_eq!(lock_std(&translator.lsp_servers).len(), 2);
 
-        // Bounded well above `SERVER_SHUTDOWN_TIMEOUT` (10s) so a genuine
+        // Bounded well above `lsp::SHUTDOWN_TIMEOUT` (10s) so a genuine
         // regression (a hang) still fails the test instead of the harness
         // itself timing out ambiguously.
         let result =

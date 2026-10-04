@@ -253,6 +253,10 @@ pub enum Error {
     #[error("LSP server process terminated unexpectedly")]
     ServerTerminated,
 
+    /// LSP server shutdown did not complete before its deadline.
+    #[error("LSP server shutdown did not complete before its deadline")]
+    ShutdownTimeout,
+
     /// A crashed server could not be automatically respawned.
     ///
     /// Distinct from [`Self::ServerTerminated`] so a caller (or a log
@@ -616,6 +620,7 @@ impl Error {
             | Self::ServerNotFound { .. }
             | Self::LspProtocolError(_)
             | Self::ServerTerminated
+            | Self::ShutdownTimeout
             | Self::ServerUnavailable { .. }
             | Self::NoWorkspaceRoots(_)
             // Unlike `FileSizeLimitExceeded`, this fires on aggregate tracker
@@ -843,6 +848,14 @@ mod tests {
         assert!(msg.contains("configured path exists"), "{msg}");
         assert!(!msg.contains("PATH"), "{msg}");
         assert!(!msg.contains("install it"), "{msg}");
+    }
+
+    #[test]
+    fn test_shutdown_timeout_maps_to_internal() {
+        assert_eq!(
+            Error::ShutdownTimeout.mcp_error_kind(),
+            McpErrorKind::Internal
+        );
     }
 
     #[test]

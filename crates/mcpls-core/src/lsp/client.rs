@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, error, trace, warn};
 
 use crate::config::LspServerConfig;
@@ -54,6 +54,14 @@ const READER_CHANNEL_CAPACITY: usize = 100;
 /// pattern. Short: the task is either already parked in a cancel-safe
 /// `.await` (aborts promptly) or has nothing left to do.
 const READER_TASK_ABORT_GRACE: Duration = Duration::from_secs(1);
+
+/// Upper bound on a full LSP server shutdown (`shutdown` request, `exit`
+/// notification, message-loop stop and child exit).
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`LspClient::shutdown_until`] waits for an aborted message loop
+/// to drop its command receiver before failing the pending requests.
+const SHUTDOWN_ABORT_SETTLE: Duration = Duration::from_millis(50);
 
 /// LSP request methods for which a `-32801` (`ContentModified`) error
 /// response is safe to retry automatically -- also declared to servers via
@@ -720,26 +728,54 @@ impl LspClient {
         self.notify(N::METHOD.as_str(), params).await
     }
 
-    /// Shutdown client gracefully.
+    /// Shutdown client gracefully, bounded by [`SHUTDOWN_TIMEOUT`].
     ///
     /// This sends a shutdown command to the background task and waits for it to complete.
+    /// Only the client that owns the message loop (the one held by
+    /// [`LspServer`](crate::lsp::LspServer)) can abort a wedged loop; calling this on a
+    /// clone still stops the shared loop for every clone but cannot abort it.
     ///
     /// # Errors
     ///
-    /// Returns an error if the background task failed.
-    pub async fn shutdown(mut self) -> Result<()> {
+    /// Returns [`Error::ShutdownTimeout`] if the loop did not stop in time (it is then
+    /// aborted and every pending request fails with [`Error::ServerTerminated`]), or
+    /// another error if the background task failed.
+    pub async fn shutdown(self) -> Result<()> {
+        self.shutdown_until(Instant::now() + SHUTDOWN_TIMEOUT).await
+    }
+
+    /// As [`Self::shutdown`], with a caller-chosen absolute deadline.
+    pub(crate) async fn shutdown_until(mut self, deadline: Instant) -> Result<()> {
         debug!("Shutting down LSP client");
 
-        let _ = self.command_tx.send(ClientCommand::Shutdown).await;
+        let mut task = self.receiver_task.take();
+        let command_tx = &self.command_tx;
+        let outcome = timeout_at(deadline, async {
+            let _ = command_tx.send(ClientCommand::Shutdown).await;
+            match task.as_mut() {
+                Some(task) => match task.await {
+                    Ok(result) => result,
+                    Err(e) => Err(Error::Transport(format!("Receiver task failed: {e}"))),
+                },
+                None => Ok(()),
+            }
+        })
+        .await;
 
-        if let Some(task) = self.receiver_task.take() {
-            task.await
-                .map_err(|e| Error::Transport(format!("Receiver task failed: {e}")))??;
+        let result = outcome.unwrap_or(Err(Error::ShutdownTimeout));
+        if matches!(result, Err(Error::ShutdownTimeout)) {
+            if let Some(task) = task {
+                task.abort();
+                // Lets the aborted loop drop `command_rx`, so a racing
+                // request cannot enqueue after the drain below (#458).
+                let _ = timeout(SHUTDOWN_ABORT_SETTLE, task).await;
+            }
+            Self::drain_and_fail_pending(&self.pending_requests).await;
         }
 
         *self.state.lock().await = super::ServerState::Shutdown;
 
-        Ok(())
+        result
     }
 
     /// Background task: handle message I/O.
@@ -2711,6 +2747,51 @@ mod tests {
                     "response for request {i} carried the wrong payload -- id/response mismatch"
                 );
             }
+        }
+
+        /// A message loop wedged writing to a server that never reads must not
+        /// hang `shutdown_until`: it returns `ShutdownTimeout` at the deadline
+        /// and fails the requests still in flight.
+        #[tokio::test]
+        async fn test_shutdown_until_aborts_wedged_loop_and_fails_pending() {
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let in_flight_client = client.clone();
+            let in_flight = tokio::spawn(async move {
+                in_flight_client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+            let _ = read_framed_message(&mut reader).await;
+
+            // Larger than the mock pipe's capacity, so the loop blocks in `send`.
+            client
+                .notify("x/wedge", serde_json::json!({ "p": "a".repeat(1 << 20) }))
+                .await
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let result = timeout(Duration::from_secs(5), client.shutdown_until(deadline))
+                .await
+                .unwrap_or_else(|_| panic!("shutdown_until must honor its deadline"));
+            assert!(
+                matches!(result, Err(Error::ShutdownTimeout)),
+                "got {result:?}"
+            );
+
+            let in_flight = timeout(Duration::from_secs(1), in_flight)
+                .await
+                .unwrap_or_else(|_| panic!("in-flight request must be failed by the drain"))
+                .unwrap();
+            assert!(
+                matches!(in_flight, Err(Error::ServerTerminated)),
+                "got {in_flight:?}"
+            );
         }
 
         /// #458: a request issued after the client has already shut down

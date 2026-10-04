@@ -19,14 +19,14 @@ use lsp_types::{
 };
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
-use crate::lsp::client::LspClient;
+use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 
@@ -684,37 +684,45 @@ impl LspServer {
         }
     }
 
-    /// Shutdown server gracefully.
+    /// Shutdown server gracefully, bounded in total by [`SHUTDOWN_TIMEOUT`].
     ///
     /// Sends the LSP `shutdown` request, waits for the response, sends the
-    /// `exit` notification, then waits up to a fixed grace period for the
-    /// child process to exit on its own. If it hasn't by then, or if the
-    /// `shutdown`/`exit` handshake itself fails, the child is simply dropped
-    /// here — `kill_on_drop` terminates it via SIGKILL (a no-op if it has
-    /// already exited). A test fixture with no real backing process (`child`
-    /// is `None`) skips this step entirely -- there is nothing to wait for or
-    /// kill.
+    /// `exit` notification, stops the message loop, then waits up to a grace
+    /// period (never past the overall deadline) for the child process to exit
+    /// on its own. If it hasn't by then, or if the handshake itself fails or
+    /// times out, the child is simply dropped here — `kill_on_drop`
+    /// terminates it via SIGKILL (a no-op if it has already exited). A test
+    /// fixture with no real backing process (`child` is `None`) skips this
+    /// step entirely -- there is nothing to wait for or kill.
     ///
     /// # Errors
     ///
-    /// Returns an error if the `shutdown`/`exit` handshake fails. The child
-    /// process is still torn down (gracefully if it exits in time, killed
-    /// otherwise) regardless of whether this returns `Ok` or `Err`.
+    /// Returns the first error of the handshake or the message-loop stop,
+    /// including [`Error::ShutdownTimeout`] when the deadline elapsed. The
+    /// child process is still torn down (gracefully if it exits in time,
+    /// killed otherwise) regardless of whether this returns `Ok` or `Err`.
     pub async fn shutdown(self) -> Result<()> {
         debug!("Shutting down LSP server");
 
-        let handshake: Result<()> = async move {
-            let _: serde_json::Value = self
-                .client
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let client = self.client;
+
+        let handshake: Result<()> = timeout_at(deadline, async {
+            let _: serde_json::Value = client
                 .request(ShutdownRequest::METHOD.as_str(), (), Duration::from_secs(5))
                 .await?;
-            self.client.notify_typed::<ExitNotification>(()).await?;
-            self.client.shutdown().await
-        }
-        .await;
+            client.notify_typed::<ExitNotification>(()).await
+        })
+        .await
+        .unwrap_or(Err(Error::ShutdownTimeout));
+        let handshake = match client.shutdown_until(deadline).await {
+            Ok(()) => handshake,
+            Err(e) => handshake.and(Err(e)),
+        };
 
         if let Some(mut child) = self.child {
-            match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
+            let child_deadline = deadline.min(Instant::now() + CHILD_EXIT_GRACE);
+            match timeout_at(child_deadline, child.wait()).await {
                 Ok(Ok(status)) => {
                     debug!(
                         ?status,
