@@ -20,7 +20,7 @@ use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
 use crate::bridge::uri_in_workspace_roots;
-use crate::config::{ServerId, ToolKind};
+use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
 
@@ -540,12 +540,7 @@ impl Translator {
         validate_rename_params(&new_name)?;
 
         let doc = self
-            .prepare_gated_document(
-                &file_path,
-                ToolKind::Rename,
-                Capability::Rename,
-                IndexingGate::Required,
-            )
+            .prepare_gated_document(&file_path, Capability::Rename, IndexingGate::Required)
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -599,7 +594,6 @@ impl Translator {
         let doc = self
             .prepare_gated_document(
                 &file_path,
-                ToolKind::FormatDocument,
                 Capability::FormatDocument,
                 IndexingGate::NotRequired,
             )
@@ -662,12 +656,7 @@ impl Translator {
         validate_code_action_params(start, end, kind_filter.as_deref())?;
 
         let doc = self
-            .prepare_gated_document(
-                &file_path,
-                ToolKind::CodeActions,
-                Capability::CodeActions,
-                IndexingGate::Required,
-            )
+            .prepare_gated_document(&file_path, Capability::CodeActions, IndexingGate::Required)
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);

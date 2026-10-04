@@ -21,7 +21,7 @@ use crate::bridge::indexing::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE,
     PROGRESS_SETTLE,
 };
-use crate::config::{ServerId, ToolKind};
+use crate::config::ServerId;
 use crate::error::{Error, Result};
 
 /// Default maximum time [`Translator::wait_for_indexing_ready`] waits for a
@@ -442,12 +442,7 @@ impl Translator {
     /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_hover(&self, file_path: String, position: Position) -> Result<HoverResult> {
         let doc = self
-            .prepare_gated_document(
-                &file_path,
-                ToolKind::Hover,
-                Capability::Hover,
-                IndexingGate::Required,
-            )
+            .prepare_gated_document(&file_path, Capability::Hover, IndexingGate::Required)
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -506,7 +501,6 @@ impl Translator {
         &self,
         file_path: &str,
         position: Position,
-        tool: ToolKind,
         capability: Capability,
     ) -> Result<NormalizedLocations>
     where
@@ -515,7 +509,7 @@ impl Translator {
         T: GotoResponse,
     {
         let doc = self
-            .prepare_gated_document(file_path, tool, capability, IndexingGate::Required)
+            .prepare_gated_document(file_path, capability, IndexingGate::Required)
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -554,7 +548,6 @@ impl Translator {
             .handle_goto::<lsp_types::DefinitionRequest, _>(
                 &file_path,
                 position,
-                ToolKind::Definition,
                 Capability::Definition,
             )
             .await?;
@@ -581,12 +574,7 @@ impl Translator {
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
         let doc = self
-            .prepare_gated_document(
-                &file_path,
-                ToolKind::References,
-                Capability::References,
-                IndexingGate::Required,
-            )
+            .prepare_gated_document(&file_path, Capability::References, IndexingGate::Required)
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -645,7 +633,6 @@ impl Translator {
             .handle_goto::<lsp_types::ImplementationRequest, _>(
                 &file_path,
                 position,
-                ToolKind::Implementation,
                 Capability::Implementation,
             )
             .await?;
@@ -681,7 +668,6 @@ impl Translator {
             .handle_goto::<lsp_types::TypeDefinitionRequest, _>(
                 &file_path,
                 position,
-                ToolKind::TypeDefinition,
                 Capability::TypeDefinition,
             )
             .await?;

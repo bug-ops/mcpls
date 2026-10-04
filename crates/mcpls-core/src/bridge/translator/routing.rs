@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use super::Translator;
 use crate::bridge::state::detect_language;
 use crate::bridge::{InFlightGuard, lock_std};
-use crate::config::{ServerId, ToolKind, base_language_id};
+use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
 
@@ -177,6 +177,79 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// Every capability, in a fixed order.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 14] = [
+        Self::Completions,
+        Self::SignatureHelp,
+        Self::InlayHints,
+        Self::Hover,
+        Self::Definition,
+        Self::References,
+        Self::Implementation,
+        Self::TypeDefinition,
+        Self::CallHierarchy,
+        Self::Rename,
+        Self::FormatDocument,
+        Self::CodeActions,
+        Self::DocumentSymbols,
+        Self::WorkspaceSymbols,
+    ];
+
+    /// The [`ToolKind`] whose route this capability gates -- the single
+    /// source tying a gated handler's routing to its capability check.
+    pub(crate) const fn tool_kind(self) -> ToolKind {
+        match self {
+            Self::Completions => ToolKind::Completions,
+            Self::SignatureHelp => ToolKind::SignatureHelp,
+            Self::InlayHints => ToolKind::InlayHints,
+            Self::Hover => ToolKind::Hover,
+            Self::Definition => ToolKind::Definition,
+            Self::References => ToolKind::References,
+            Self::Implementation => ToolKind::Implementation,
+            Self::TypeDefinition => ToolKind::TypeDefinition,
+            Self::CallHierarchy => ToolKind::CallHierarchy,
+            Self::Rename => ToolKind::Rename,
+            Self::FormatDocument => ToolKind::FormatDocument,
+            Self::CodeActions => ToolKind::CodeActions,
+            Self::DocumentSymbols => ToolKind::DocumentSymbols,
+            Self::WorkspaceSymbols => ToolKind::WorkspaceSymbols,
+        }
+    }
+
+    /// The capability gating `tool`, or `None` for a tool dispatched without
+    /// a capability check (`Diagnostics`).
+    pub(crate) const fn for_tool(tool: ToolKind) -> Option<Self> {
+        match tool {
+            ToolKind::Completions => Some(Self::Completions),
+            ToolKind::SignatureHelp => Some(Self::SignatureHelp),
+            ToolKind::InlayHints => Some(Self::InlayHints),
+            ToolKind::Hover => Some(Self::Hover),
+            ToolKind::Definition => Some(Self::Definition),
+            ToolKind::References => Some(Self::References),
+            ToolKind::Implementation => Some(Self::Implementation),
+            ToolKind::TypeDefinition => Some(Self::TypeDefinition),
+            ToolKind::CallHierarchy => Some(Self::CallHierarchy),
+            ToolKind::Rename => Some(Self::Rename),
+            ToolKind::FormatDocument => Some(Self::FormatDocument),
+            ToolKind::CodeActions => Some(Self::CodeActions),
+            ToolKind::DocumentSymbols => Some(Self::DocumentSymbols),
+            ToolKind::WorkspaceSymbols => Some(Self::WorkspaceSymbols),
+            ToolKind::Diagnostics => None,
+        }
+    }
+
+    /// Whether a request gated on this capability may be dispatched against
+    /// a server with `caps`. Unknown capabilities (`None`) are assumed
+    /// supported, mirroring [`Translator::require_capability`]'s fail-open
+    /// stance.
+    pub(crate) const fn is_available(self, caps: Option<&lsp_types::ServerCapabilities>) -> bool {
+        match caps {
+            Some(caps) => self.is_supported(caps),
+            None => true,
+        }
+    }
+
     /// The `ServerCapabilities` field name, as reported to the MCP caller in
     /// [`Error::CapabilityNotSupported`].
     pub(crate) const fn name(self) -> &'static str {
@@ -301,6 +374,143 @@ impl std::fmt::Display for Capability {
     }
 }
 
+impl serde::Serialize for Capability {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// A file's detected language plus its React base-language fallback
+/// (`typescriptreact` -> `typescript`), in resolution order.
+///
+/// Single source of the candidate order for enforcement and the
+/// `get_tool_support` snapshot, so an explicit `typescriptreact` server still
+/// wins over the `typescript` fallback in both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LanguageCandidates {
+    language: String,
+    base: Option<&'static str>,
+}
+
+impl LanguageCandidates {
+    pub(super) fn new(language: String) -> Self {
+        let base = base_language_id(&language);
+        Self { language, base }
+    }
+
+    pub(super) fn language(&self) -> &str {
+        &self.language
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.language.as_str()).chain(self.base)
+    }
+}
+
+/// Outcome of resolving a per-document tool route against the registries,
+/// shared by enforcement ([`Translator::client_for_file`]) and the
+/// `get_tool_support` snapshot so the two cannot disagree.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RouteLookup<T> {
+    /// The routed server is registered; `T` is whatever the registry lookup returned.
+    Registered(ServerId, T),
+    /// The routed server is expected but has not registered yet.
+    Initializing(ServerId),
+    /// The router names a server that is neither registered nor expected.
+    Dangling {
+        language: String,
+        server_id: ServerId,
+    },
+    /// No candidate language has a route for the tool.
+    Unrouted,
+}
+
+/// Resolve the first candidate language with a route, then classify that
+/// route's server. `resolve`, `registered` and `is_expected` are separate
+/// closures so a caller backed by independent locks never holds two at once.
+pub(super) fn lookup_route<T>(
+    candidates: &LanguageCandidates,
+    resolve: impl Fn(&str) -> Option<ServerId>,
+    registered: impl Fn(&ServerId) -> Option<T>,
+    is_expected: impl Fn(&ServerId) -> bool,
+) -> RouteLookup<T> {
+    for language in candidates.iter() {
+        let Some(server_id) = resolve(language) else {
+            continue;
+        };
+        return if let Some(found) = registered(&server_id) {
+            RouteLookup::Registered(server_id, found)
+        } else if is_expected(&server_id) {
+            RouteLookup::Initializing(server_id)
+        } else {
+            RouteLookup::Dangling {
+                language: language.to_string(),
+                server_id,
+            }
+        };
+    }
+    RouteLookup::Unrouted
+}
+
+/// Outcome of resolving a workspace-wide tool route; see [`RouteLookup`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WorkspaceRouteLookup {
+    /// The resolved server is registered.
+    Registered(ServerId),
+    /// The resolved server is expected but has not registered yet.
+    Initializing(ServerId),
+    /// The router resolved a server that is neither registered nor expected.
+    Dangling(ServerId),
+    /// Nothing is registered yet, but servers are still expected.
+    AllInitializing,
+    /// Nothing is registered and nothing is expected.
+    NothingConfigured,
+    /// Servers are registered, but none claims the tool and none is a catch-all.
+    NoClaimant,
+}
+
+/// Resolve a workspace-wide tool route and classify the resolved server.
+///
+/// The closures are separate so a caller backed by independent locks never
+/// holds two at once, as with [`lookup_route`].
+pub(super) fn lookup_workspace_route(
+    resolve: impl FnOnce() -> std::result::Result<ServerId, NoServerReason>,
+    is_registered: impl Fn(&ServerId) -> bool,
+    is_expected: impl Fn(&ServerId) -> bool,
+    expected_is_empty: impl FnOnce() -> bool,
+) -> WorkspaceRouteLookup {
+    match resolve() {
+        Ok(id) if is_registered(&id) => WorkspaceRouteLookup::Registered(id),
+        Ok(id) if is_expected(&id) => WorkspaceRouteLookup::Initializing(id),
+        Ok(id) => WorkspaceRouteLookup::Dangling(id),
+        Err(NoServerReason::NothingRegistered) if expected_is_empty() => {
+            WorkspaceRouteLookup::NothingConfigured
+        }
+        Err(NoServerReason::NothingRegistered) => WorkspaceRouteLookup::AllInitializing,
+        Err(NoServerReason::NoClaimant) => WorkspaceRouteLookup::NoClaimant,
+    }
+}
+
+/// Fail with [`Error::CapabilityNotSupported`] if `caps` is known and does
+/// not advertise `capability`.
+pub(super) fn check_capability(
+    server_id: &ServerId,
+    caps: Option<&lsp_types::ServerCapabilities>,
+    capability: Capability,
+) -> Result<()> {
+    if capability.is_available(caps) {
+        Ok(())
+    } else {
+        Err(Error::CapabilityNotSupported {
+            server_id: server_id.clone(),
+            capability: capability.name(),
+        })
+    }
+}
+
 impl Translator {
     /// Validate that a path is within allowed workspace boundaries.
     ///
@@ -352,58 +562,62 @@ impl Translator {
         path: &Path,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient)> {
-        let language = detect_language(path, &self.extension_map);
-        let mut candidates: Vec<&str> = vec![language.as_str()];
-        if let Some(base) = base_language_id(&language) {
-            candidates.push(base);
-        }
-
-        for lang in &candidates {
-            let resolved = lock_std(&self.router).resolve(lang, tool).cloned();
-            let Some(id) = resolved else { continue };
-
-            let found = lock_std(&self.lsp_clients).get(&id).cloned();
-            if let Some(client) = found {
-                return Ok((id, client));
-            }
+        let candidates = self.language_candidates(path);
+        let lookup = lookup_route(
+            &candidates,
+            |lang| lock_std(&self.router).resolve(lang, tool).cloned(),
+            |id| lock_std(&self.lsp_clients).get(id).cloned(),
+            |id| lock_std(&self.expected_servers).contains(id),
+        );
+        match lookup {
+            RouteLookup::Registered(id, client) => Ok((id, client)),
             // A route naming a server that is still initializing (e.g. a
             // large Unity solution loading via OmniSharp) -- tell the caller
             // to wait and retry rather than implying no server is configured.
-            if lock_std(&self.expected_servers).contains(&id) {
-                return Err(Error::ServerInitializing { server_id: id });
-            }
+            RouteLookup::Initializing(server_id) => Err(Error::ServerInitializing { server_id }),
             // Unreachable once registration has rebound the router
             // (`Translator::rebind_router`) -- a route can only name a
             // registered server after that point. Logged rather than
             // `debug_assert!`-panicked: this method is reachable by any
             // library consumer calling `with_router` without registering
             // matching clients, not just internal misuse.
-            tracing::error!(
-                "router route names server '{id}' for tool '{tool}' that is neither \
-                 registered nor expected"
-            );
-            return Err(Error::NoServerForTool {
-                language_id: (*lang).to_string(),
-                tool,
-            });
+            RouteLookup::Dangling {
+                language,
+                server_id,
+            } => {
+                tracing::error!(
+                    "router route names server '{server_id}' for tool '{tool}' that is neither \
+                     registered nor expected"
+                );
+                Err(Error::NoServerForTool {
+                    language_id: language,
+                    tool,
+                })
+            }
+            RouteLookup::Unrouted => {
+                if let Some(failure) = self.startup_failure_for_candidates(&candidates, tool) {
+                    return Err(Error::ServerFailedToStart(Box::new(failure)));
+                }
+                let has_language = {
+                    let router = lock_std(&self.router);
+                    candidates.iter().any(|lang| router.has_language(lang))
+                };
+                let language = candidates.language().to_string();
+                if has_language {
+                    Err(Error::NoServerForTool {
+                        language_id: language,
+                        tool,
+                    })
+                } else {
+                    Err(Error::NoServerForLanguage(language))
+                }
+            }
         }
+    }
 
-        if let Some(failure) = self.startup_failure_for_candidates(&candidates, tool) {
-            return Err(Error::ServerFailedToStart(Box::new(failure)));
-        }
-
-        let has_language = {
-            let router = lock_std(&self.router);
-            candidates.iter().any(|lang| router.has_language(lang))
-        };
-        if has_language {
-            Err(Error::NoServerForTool {
-                language_id: language,
-                tool,
-            })
-        } else {
-            Err(Error::NoServerForLanguage(language))
-        }
+    /// The detected language of `path` plus its React base-language fallback.
+    pub(super) fn language_candidates(&self, path: &Path) -> LanguageCandidates {
+        LanguageCandidates::new(detect_language(path, &self.extension_map))
     }
 
     /// The startup failure of the server the pre-rebind routing table would
@@ -413,10 +627,10 @@ impl Translator {
     /// still serves the request, so a failed explicit server never masks it.
     fn startup_failure_for_candidates(
         &self,
-        languages: &[&str],
+        candidates: &LanguageCandidates,
         tool: ToolKind,
     ) -> Option<ServerSpawnFailure> {
-        languages.iter().find_map(|lang| {
+        candidates.iter().find_map(|lang| {
             let id = self.configured_router.resolve(lang, tool)?;
             self.startup_failure(id)
         })
@@ -438,12 +652,7 @@ impl Translator {
     #[must_use]
     // TODO(#535): diagnostics tools return an empty list for a server that failed to start.
     pub(crate) fn diagnostics_route_id_for_path(&self, path: &Path) -> Option<ServerId> {
-        let language = detect_language(path, &self.extension_map);
-        let mut candidates: Vec<&str> = vec![language.as_str()];
-        if let Some(base) = base_language_id(&language) {
-            candidates.push(base);
-        }
-
+        let candidates = self.language_candidates(path);
         let router = lock_std(&self.router);
         candidates
             .iter()
@@ -562,12 +771,11 @@ impl Translator {
     pub(super) async fn prepare_gated_document(
         &self,
         file_path: &str,
-        tool: ToolKind,
         capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
         let (server_id, client, validated_path) = self
-            .resolve_validated_client_for_file(file_path, tool)
+            .resolve_validated_client_for_file(file_path, capability.tool_kind())
             .await?;
         self.finish_prepare_gated_document(
             server_id,
@@ -586,12 +794,12 @@ impl Translator {
     pub(super) async fn prepare_gated_document_for_path(
         &self,
         path: &Path,
-        tool: ToolKind,
         capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
-        let (server_id, client, validated_path) =
-            self.resolve_validated_client_for_path(path, tool).await?;
+        let (server_id, client, validated_path) = self
+            .resolve_validated_client_for_path(path, capability.tool_kind())
+            .await?;
         self.finish_prepare_gated_document(
             server_id,
             client,
@@ -716,15 +924,13 @@ impl Translator {
         capability: Capability,
     ) -> Result<()> {
         let servers = lock_std(&self.lsp_servers);
-        match servers.get(server_id) {
-            Some(server) if !capability.is_supported(server.capabilities()) => {
-                Err(Error::CapabilityNotSupported {
-                    server_id: server_id.clone(),
-                    capability: capability.name(),
-                })
-            }
-            _ => Ok(()),
-        }
+        check_capability(
+            server_id,
+            servers
+                .get(server_id)
+                .map(crate::lsp::LspServer::capabilities),
+            capability,
+        )
     }
 
     /// Returns true when the routed server's `codeActionProvider` capability

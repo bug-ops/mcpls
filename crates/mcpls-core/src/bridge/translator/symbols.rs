@@ -12,9 +12,9 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::MAX_NORMALIZED_LOCATIONS;
-use super::routing::{Capability, IndexingGate};
+use super::routing::{Capability, IndexingGate, WorkspaceRouteLookup, lookup_workspace_route};
 use crate::bridge::lock_std;
-use crate::config::{NoServerReason, ToolKind};
+use crate::config::ToolKind;
 use crate::error::{Error, Result};
 use crate::lsp::SUPPORTED_SYMBOL_KINDS;
 
@@ -111,7 +111,6 @@ impl Translator {
         let doc = self
             .prepare_gated_document(
                 &file_path,
-                ToolKind::DocumentSymbols,
                 Capability::DocumentSymbols,
                 IndexingGate::NotRequired,
             )
@@ -203,29 +202,36 @@ impl Translator {
         // rather than a per-language route. If the resolved server is not
         // registered yet but is expected, tell the caller to wait and retry
         // rather than implying nothing is configured.
-        let server_id = lock_std(&self.router)
-            .resolve_any(ToolKind::WorkspaceSymbols)
-            .cloned()
-            .map_err(|reason| match reason {
-                // `resolve_any` reports "nothing registered", which also
-                // covers a server that is configured but has not finished
-                // spawning yet -- check `expected_servers` (unavailable to
-                // `ToolRouter` itself) to tell the two apart, mirroring
-                // `client_for_file`'s `ServerInitializing` check below.
-                NoServerReason::NothingRegistered => {
-                    if !lock_std(&self.expected_servers).is_empty() {
-                        return Error::WorkspaceServersInitializing;
-                    }
-                    let failures = self.startup_failures();
-                    if failures.is_empty() {
-                        Error::NoServerConfigured
-                    } else {
-                        Error::AllServersFailedToInit { failures }
-                    }
-                }
-                // A claimant that failed to start was rebound away, so the live
-                // router sees no claimant for it -- report the failure instead.
-                NoServerReason::NoClaimant => self
+        let server_id = match lookup_workspace_route(
+            || {
+                lock_std(&self.router)
+                    .resolve_any(ToolKind::WorkspaceSymbols)
+                    .cloned()
+            },
+            |id| lock_std(&self.lsp_clients).contains_key(id),
+            |id| lock_std(&self.expected_servers).contains(id),
+            || lock_std(&self.expected_servers).is_empty(),
+        ) {
+            WorkspaceRouteLookup::Registered(id) => id,
+            WorkspaceRouteLookup::Initializing(server_id) => {
+                return Err(Error::ServerInitializing { server_id });
+            }
+            WorkspaceRouteLookup::AllInitializing => {
+                return Err(Error::WorkspaceServersInitializing);
+            }
+            WorkspaceRouteLookup::Dangling(_) => return Err(Error::NoServerConfigured),
+            WorkspaceRouteLookup::NothingConfigured => {
+                let failures = self.startup_failures();
+                return Err(if failures.is_empty() {
+                    Error::NoServerConfigured
+                } else {
+                    Error::AllServersFailedToInit { failures }
+                });
+            }
+            // A claimant that failed to start was rebound away, so the live
+            // router sees no claimant for it -- report the failure instead.
+            WorkspaceRouteLookup::NoClaimant => {
+                return Err(self
                     .configured_router
                     .resolve_any(ToolKind::WorkspaceSymbols)
                     .ok()
@@ -235,8 +241,9 @@ impl Translator {
                             tool: ToolKind::WorkspaceSymbols,
                         },
                         |failure| Error::ServerFailedToStart(Box::new(failure)),
-                    ),
-            })?;
+                    ));
+            }
+        };
         self.respawn_if_dead(&server_id).await?;
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
         let client = client.ok_or_else(|| {

@@ -34,13 +34,15 @@ pub use state::{
     uri_to_path,
 };
 pub(crate) use state::{InFlightGuard, try_path_to_uri};
-pub(crate) use translator::validate_path_against_roots;
+#[cfg(test)]
+pub(crate) use translator::Capability;
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, DroppedEdits, FormatDocumentResult,
     HoverResult, Location, Position, Position2D, PositionDegradation, Range, ReferencesResult,
     RenameResult, Symbol, TextEdit, Translator,
 };
+pub(crate) use translator::{RouteSupport, ToolSupportSnapshot, validate_path_against_roots};
 
 /// Whether `uri` resolves to a path within one of `workspace_roots`.
 ///

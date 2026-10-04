@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete reference for all 20 MCP tools provided by mcpls.
+Complete reference for all 21 MCP tools provided by mcpls.
 
 ## Overview
 
@@ -93,6 +93,7 @@ array, `selectionRange` on call hierarchy items (so they round-trip into `get_in
 |------|-------------|
 | [get_server_logs](#get_server_logs) | Get LSP server log messages |
 | [get_server_messages](#get_server_messages) | Get LSP server show messages |
+| [get_tool_support](#get_tool_support) | Report which tools are usable for which languages |
 
 ---
 
@@ -986,6 +987,58 @@ Get recent show messages from LSP servers.
 
 - Contains user-facing messages from LSP servers
 - Useful for tracking server status and important notifications
+
+---
+
+## get_tool_support
+
+Report which tools are usable for which languages in the current session, so an agent can avoid a call that is certain to be refused. Call it before using a tool on a new language.
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/project/src/main.rs"
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | No | Restrict the report to the language of this file (must exist and be inside a workspace root); pass it when the language is not obvious, e.g. `.tsx` files |
+
+### Returns
+
+```json
+{
+  "languages": ["python", "rust"],
+  "tools": [
+    {
+      "name": "get_hover",
+      "coverage": "some",
+      "routes": [
+        {"language": "python", "status": "capability_not_advertised", "server": "pyright", "capability": "hoverProvider"},
+        {"language": "rust", "status": "supported", "server": "rust-analyzer"}
+      ]
+    },
+    {"name": "get_diagnostics", "coverage": "all"},
+    {"name": "get_server_logs", "coverage": "always"}
+  ]
+}
+```
+
+| Field | Values |
+|-------|--------|
+| `coverage` | `all` (every listed language), `some`, `none`, `unknown` (a server is still initializing), `always` (needs no language server) |
+| `routes[].status` | `supported`, `capability_not_advertised`, `initializing`, `no_server` |
+
+### Notes
+
+- `languages` lists every configured language (or only the language of `file_path`); an empty list means no server is configured
+- `routes` is omitted for tools with `all` or `always` coverage; workspace-wide tools such as `workspace_symbol_search` have one route without a `language`
+- `supported` means the call will be dispatched to a server that advertises the capability, not that it will succeed: indexing, push-only diagnostics, and respawn backoff can still fail it
+- Capabilities a server registers dynamically after `initialize` are not reflected, here or in per-call enforcement
+- `unknown` coverage is transient (a server is still starting): call the tool again later instead of caching the report
+- Tool names include the configured `mcp.tool_prefix`
 
 ---
 

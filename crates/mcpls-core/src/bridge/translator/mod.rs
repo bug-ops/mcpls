@@ -34,13 +34,17 @@ mod encoding_ctx;
 mod navigation;
 mod respawn;
 mod routing;
+mod support;
 mod symbols;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod testing;
 
 pub use dto::*;
+#[cfg(test)]
+pub use routing::Capability;
 pub use routing::validate_path_against_roots;
+pub use support::{RouteSupport, ToolSupportSnapshot};
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 ///

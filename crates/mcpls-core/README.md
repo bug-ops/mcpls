@@ -43,7 +43,7 @@ flowchart LR
 
 | Module | Responsibility |
 |--------|----------------|
-| `mcp/` | MCP server implementation with rmcp, 20 tool handlers |
+| `mcp/` | MCP server implementation with rmcp, 21 tool handlers |
 | `bridge/` | Position encoding, document state, notification cache, request translation |
 | `lsp/` | JSON-RPC 2.0 client, process management, notification handling, protocol types |
 | `config/` | TOML parsing, server discovery, workspace configuration |

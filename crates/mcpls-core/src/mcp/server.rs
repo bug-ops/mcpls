@@ -28,11 +28,12 @@ use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
 use super::session::{ListenPermit, ListenUris, SubscriptionRegistry, Target};
+use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
     DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, InlayHintsParams,
     PositionParams, RangeParams, ReferencesParams, RenameParams, ServerLogsParams,
-    ServerMessagesParams, WorkspaceSymbolParams,
+    ServerMessagesParams, ToolSupportParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
@@ -61,13 +62,13 @@ const DEFAULT_INSTRUCTIONS: &str = concat!(
     "completions, symbols, and formatting."
 );
 
-/// Byte length of the longest tool name currently registered
-/// (`workspace_symbol_search`), used only to keep
-/// [`crate::config::MAX_MCP_TOOL_PREFIX_BYTES`] safe (see the compile-time
-/// assertion below). Bumping this when a longer tool name is added is
-/// always safe on its own; the assertion is what catches the case where
-/// that growth would no longer leave enough room for the configured prefix.
-const MAX_TOOL_NAME_BYTES: usize = 23;
+/// Byte length of the longest tool name currently registered, used only to
+/// keep [`crate::config::MAX_MCP_TOOL_PREFIX_BYTES`] safe (see the
+/// compile-time assertion below). Derived from [`McpTool::ALL`], so a longer
+/// tool name is picked up automatically; the assertion is what catches the
+/// case where that growth would no longer leave enough room for the
+/// configured prefix.
+const MAX_TOOL_NAME_BYTES: usize = McpTool::MAX_NAME_BYTES;
 
 /// The stricter of the two ceilings a joined `{prefix}_{tool_name}` must fit
 /// under: not rmcp's own 128-byte `SHOULD`-level limit (see the second
@@ -475,7 +476,7 @@ impl McplsServer {
     /// Every mcpls tool is a read-only LSP query: `rename_symbol`,
     /// `format_document` and `get_code_actions` return a *proposed*
     /// `WorkspaceEdit` and never write to disk. Applying that once here
-    /// replaces an identical `annotations(...)` block on all 20 `#[tool]`
+    /// replaces an identical `annotations(...)` block on all 21 `#[tool]`
     /// attributes. A tool declaring its own annotations keeps them;
     /// `test_tool_annotation_classifications_match_intent` forces a future
     /// mutating tool to write down an explicit classification rather than
@@ -506,7 +507,7 @@ impl McplsServer {
             let unprefixed = std::mem::take(&mut router.map);
             let entry_count = unprefixed.len();
             for (_, mut route) in unprefixed {
-                route.attr.name = Cow::Owned(format!("{prefix}_{}", route.attr.name));
+                route.attr.name = Cow::Owned(prefixed_tool_name(Some(prefix), &route.attr.name));
                 router.add_route(route);
             }
             debug_assert_eq!(router.map.len(), entry_count);
@@ -972,6 +973,28 @@ impl McplsServer {
         )
     }
 
+    /// Report which tools are usable for which languages.
+    #[tool(
+        description = "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` lists each language's `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
+        title = "Tool Support"
+    )]
+    fn get_tool_support(
+        &self,
+        Parameters(ToolSupportParams { file_path }): Parameters<ToolSupportParams>,
+    ) -> Result<String, McpError> {
+        let translator = &self.context.translator;
+        let file_language = file_path
+            .as_deref()
+            .map(|path| translator.language_for_path(path))
+            .transpose();
+        let snapshot = translator.tool_support_snapshot();
+        to_tool_result(file_language.map(|file_language| {
+            let languages =
+                file_language.map_or_else(|| snapshot.languages(), |language| vec![language]);
+            ToolSupportReport::build(&snapshot, languages, self.context.mcp.tool_prefix.as_ref())
+        }))
+    }
+
     /// Get inlay hints for a range.
     #[tool(
         description = concat!("Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Capped at a fixed maximum; `truncated: true` on the result means more hints exist than are returned. Keep the range end inside the file. ", positions_note_request!()),
@@ -1399,12 +1422,15 @@ impl ServerHandler for McplsServer {
             .build();
         let mut server_info = RmcpServerConfig::new(capabilities);
         server_info.server_info = implementation;
-        let mut instructions = self
-            .context
-            .mcp
-            .instructions
-            .clone()
-            .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string());
+        let mut instructions = self.context.mcp.instructions.clone().unwrap_or_else(|| {
+            format!(
+                "{DEFAULT_INSTRUCTIONS} Call {} to see which tools work for which languages.",
+                prefixed_tool_name(
+                    self.context.mcp.tool_prefix.as_ref(),
+                    McpTool::GetToolSupport.name()
+                )
+            )
+        });
 
         if self.context.project_config_ignored {
             instructions.push_str(
@@ -1424,7 +1450,9 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::bridge::Capability;
     use crate::bridge::resources::ResourceSubscriptions;
+    use crate::mcp::tool_support::ToolBackend;
 
     fn create_test_server() -> McplsServer {
         create_test_server_with_ignored_flag(false)
@@ -1674,7 +1702,20 @@ mod tests {
             info.server_info.description.as_deref(),
             Some(DEFAULT_SERVER_DESCRIPTION)
         );
-        assert_eq!(info.instructions.as_deref(), Some(DEFAULT_INSTRUCTIONS));
+        let instructions = info.instructions.unwrap();
+        assert!(instructions.starts_with(DEFAULT_INSTRUCTIONS));
+        assert!(instructions.contains("get_tool_support"));
+    }
+
+    #[tokio::test]
+    async fn test_get_info_default_instructions_name_the_prefixed_tool_support_tool() {
+        let mcp = McpConfig {
+            tool_prefix: Some("p".parse().unwrap()),
+            ..McpConfig::default()
+        };
+        let info = create_test_server_with_mcp_config(false, mcp).get_info();
+
+        assert!(info.instructions.unwrap().contains("p_get_tool_support"));
     }
 
     #[tokio::test]
@@ -3413,6 +3454,7 @@ sleep 0.3
             ("go_to_implementation", true, false, true),
             ("go_to_type_definition", true, false, true),
             ("get_inlay_hints", true, false, true),
+            ("get_tool_support", true, false, true),
         ];
 
         assert_eq!(
@@ -4178,6 +4220,464 @@ sleep 0.3
                 tool.name
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // get_tool_support tests
+    // ------------------------------------------------------------------
+
+    const CAPABILITY_REFUSAL: &str = "does not support capability";
+
+    /// `McpTool` must name exactly the tools the macro-generated router
+    /// registers, so the report can neither omit nor invent a tool.
+    #[test]
+    fn test_mcp_tool_catalogue_matches_declared_router() {
+        let mut declared: Vec<String> = McplsServer::declared_tool_router()
+            .map
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        let mut catalogued: Vec<String> = McpTool::ALL
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        declared.sort_unstable();
+        catalogued.sort_unstable();
+        assert_eq!(declared, catalogued);
+    }
+
+    /// Server advertising exactly `capability` (an `{}` options object where
+    /// LSP has no boolean form, `true` otherwise), built from the LSP field
+    /// name so it cross-checks `Capability::name` against `is_supported`.
+    fn capabilities_advertising(capability: Capability) -> lsp_types::ServerCapabilities {
+        let value = match capability {
+            Capability::Completions | Capability::SignatureHelp => serde_json::json!({}),
+            _ => serde_json::json!(true),
+        };
+        serde_json::from_value(serde_json::json!({ capability.name(): value })).unwrap()
+    }
+
+    struct SupportFixture {
+        server: McplsServer,
+        dir: tempfile::TempDir,
+        file: PathBuf,
+        _fake_servers: Vec<crate::test_lsp::FakeServer>,
+    }
+
+    /// One live (registered, non-dead) catch-all server per `(id, language,
+    /// capabilities)` entry, behind a real workspace file `a.rs`.
+    fn support_fixture(
+        servers: Vec<(&str, &str, lsp_types::ServerCapabilities)>,
+        mcp: McpConfig,
+    ) -> SupportFixture {
+        use crate::config::{ServerId, ToolRouter};
+        use crate::lsp::LspServer;
+        use crate::test_lsp::fake_lsp_client;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let mut translator = Translator::new()
+            .with_router(ToolRouter::catch_all(servers.iter().map(
+                |(id, language, _)| (ServerId::from(*id), (*language).to_string()),
+            )))
+            .with_extensions(std::collections::HashMap::from([
+                ("rs".to_string(), "rust".to_string()),
+                ("py".to_string(), "python".to_string()),
+            ]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        let mut fake_servers = Vec::new();
+        for (id, _, caps) in servers {
+            let (client, fake) = fake_lsp_client();
+            translator.register_client(id, client);
+            translator.register_server(id, LspServer::new_for_test(caps));
+            fake_servers.push(fake);
+        }
+        let server = McplsServer::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            Arc::from(vec![dir.path().to_path_buf()]),
+            SubscriptionRegistry::new(),
+            false,
+            mcp,
+        );
+        SupportFixture {
+            server,
+            dir,
+            file,
+            _fake_servers: fake_servers,
+        }
+    }
+
+    /// Calls the real handler for `tool` with canned params against `file`,
+    /// discarding the payload. The exhaustive match makes a new `McpTool`
+    /// variant fail to compile until it is wired into the parity matrix.
+    // One arm per tool; splitting it would only scatter the exhaustive match.
+    #[allow(clippy::too_many_lines)]
+    async fn call_tool(server: &McplsServer, tool: McpTool, file: &Path) -> Result<(), McpError> {
+        let file_path = file.to_str().unwrap().to_string();
+        let position = || PositionParams {
+            file_path: file_path.clone(),
+            line: 1,
+            character: 1,
+        };
+        let range = || RangeParams {
+            start_line: 1,
+            start_character: 1,
+            end_line: 1,
+            end_character: 2,
+        };
+        let item = || {
+            let uri = url::Url::from_file_path(file).unwrap().to_string();
+            let range = serde_json::json!({
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 10}
+            });
+            CallHierarchyCallsParams {
+                item: serde_json::json!({
+                    "name": "f", "kind": 12, "uri": uri,
+                    "range": range, "selectionRange": range
+                }),
+            }
+        };
+        match tool {
+            McpTool::GetHover => server.get_hover(Parameters(position())).await.map(|_| ()),
+            McpTool::GetDefinition => server
+                .get_definition(Parameters(position()))
+                .await
+                .map(|_| ()),
+            McpTool::GetReferences => server
+                .get_references(Parameters(ReferencesParams {
+                    position: position(),
+                    include_declaration: false,
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::GetDiagnostics => server
+                .get_diagnostics(Parameters(DiagnosticsParams {
+                    file_path: file_path.clone(),
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::RenameSymbol => server
+                .rename_symbol(Parameters(RenameParams {
+                    position: position(),
+                    new_name: "renamed".to_string(),
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::GetCompletions => server
+                .get_completions(Parameters(CompletionsParams {
+                    position: position(),
+                    trigger: None,
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::GetDocumentSymbols => server
+                .get_document_symbols(Parameters(DocumentSymbolsParams {
+                    file_path: file_path.clone(),
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::FormatDocument => server
+                .format_document(Parameters(FormatDocumentParams {
+                    file_path: file_path.clone(),
+                    tab_size: 4,
+                    insert_spaces: true,
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::WorkspaceSymbolSearch => server
+                .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                    query: "main".to_string(),
+                    kind_filter: None,
+                    limit: 10,
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::GetCodeActions => server
+                .get_code_actions(Parameters(CodeActionsParams {
+                    file_path: file_path.clone(),
+                    range: range(),
+                    kind_filter: None,
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::PrepareCallHierarchy => server
+                .prepare_call_hierarchy(Parameters(position()))
+                .await
+                .map(|_| ()),
+            McpTool::GetIncomingCalls => server
+                .get_incoming_calls(Parameters(item()))
+                .await
+                .map(|_| ()),
+            McpTool::GetOutgoingCalls => server
+                .get_outgoing_calls(Parameters(item()))
+                .await
+                .map(|_| ()),
+            McpTool::GetCachedDiagnostics => server
+                .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+                    file_path: file_path.clone(),
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::GetServerLogs => server
+                .get_server_logs(Parameters(ServerLogsParams {
+                    limit: 1,
+                    min_level: None,
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::GetServerMessages => server
+                .get_server_messages(Parameters(ServerMessagesParams { limit: 1 }))
+                .await
+                .map(|_| ()),
+            McpTool::GetSignatureHelp => server
+                .get_signature_help(Parameters(position()))
+                .await
+                .map(|_| ()),
+            McpTool::GoToImplementation => server
+                .go_to_implementation(Parameters(position()))
+                .await
+                .map(|_| ()),
+            McpTool::GoToTypeDefinition => server
+                .go_to_type_definition(Parameters(position()))
+                .await
+                .map(|_| ()),
+            McpTool::GetInlayHints => server
+                .get_inlay_hints(Parameters(InlayHintsParams {
+                    file_path: file_path.clone(),
+                    range: range(),
+                }))
+                .await
+                .map(|_| ()),
+            McpTool::GetToolSupport => server
+                .get_tool_support(Parameters(ToolSupportParams::default()))
+                .map(|_| ()),
+        }
+    }
+
+    /// The report and enforcement must agree for every tool under every
+    /// single-capability server: a tool is reported `capability_not_advertised`
+    /// iff its real handler is refused with `CapabilityNotSupported`.
+    /// Advertising one capability at a time (plus none) is what catches a
+    /// tool mapped to the wrong `ToolKind`, which an empty-capability table
+    /// cannot. The client is live because `respawn_if_dead` runs before
+    /// `require_capability`; tools passing the gate then fail on the silent
+    /// fake server, which is irrelevant to the comparison.
+    #[tokio::test(start_paused = true)]
+    async fn test_tool_support_report_matches_enforcement_for_every_capability() {
+        use crate::bridge::RouteSupport;
+
+        let advertised_cases = std::iter::once(None).chain(Capability::ALL.map(Some));
+        for advertised in advertised_cases {
+            let caps = advertised.map_or_else(
+                lsp_types::ServerCapabilities::default,
+                capabilities_advertising,
+            );
+            let fixture = support_fixture(vec![("rust", "rust", caps)], McpConfig::default());
+            let snapshot = fixture.server.context.translator.tool_support_snapshot();
+
+            for tool in McpTool::ALL {
+                let refused = call_tool(&fixture.server, tool, &fixture.file)
+                    .await
+                    .is_err_and(|e| e.message.contains(CAPABILITY_REFUSAL));
+                let (reported, expected_refusal) = match tool.backend() {
+                    ToolBackend::Local => (None, false),
+                    ToolBackend::Document(kind) => (
+                        Some(snapshot.document_support("rust", kind)),
+                        Capability::for_tool(kind).is_some_and(|cap| Some(cap) != advertised),
+                    ),
+                    ToolBackend::Workspace(kind) => (
+                        Some(snapshot.workspace_support(kind)),
+                        Capability::for_tool(kind).is_some_and(|cap| Some(cap) != advertised),
+                    ),
+                };
+                let report_says_refused =
+                    matches!(reported, Some(RouteSupport::CapabilityNotAdvertised { .. }));
+                assert_eq!(
+                    refused,
+                    report_says_refused,
+                    "{} with only {advertised:?} advertised: handler refused={refused}, \
+                     report={reported:?}",
+                    tool.name()
+                );
+                assert_eq!(
+                    refused,
+                    expected_refusal,
+                    "{} with only {advertised:?} advertised",
+                    tool.name()
+                );
+                assert!(
+                    !matches!(
+                        reported,
+                        Some(RouteSupport::Initializing | RouteSupport::NoServer)
+                    ),
+                    "{} reported {reported:?} for a live server",
+                    tool.name()
+                );
+            }
+        }
+    }
+
+    fn report_json(server: &McplsServer, file_path: Option<String>) -> serde_json::Value {
+        let text = server
+            .get_tool_support(Parameters(ToolSupportParams { file_path }))
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn tool_entry<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        report["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool `{name}` missing from report"))
+    }
+
+    #[tokio::test]
+    async fn test_get_tool_support_distinguishes_all_some_none_and_always() {
+        let hover = lsp_types::ServerCapabilities {
+            hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
+            ..Default::default()
+        };
+        let fixture = support_fixture(
+            vec![
+                ("rust-srv", "rust", hover),
+                ("py-srv", "python", lsp_types::ServerCapabilities::default()),
+            ],
+            McpConfig::default(),
+        );
+        let report = report_json(&fixture.server, None);
+
+        assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
+        assert_eq!(report["tools"].as_array().unwrap().len(), 21);
+
+        let hover = tool_entry(&report, "get_hover");
+        assert_eq!(hover["coverage"], "some");
+        assert_eq!(
+            hover["routes"],
+            serde_json::json!([
+                {"language": "python", "status": "capability_not_advertised",
+                 "server": "py-srv", "capability": "hoverProvider"},
+                {"language": "rust", "status": "supported", "server": "rust-srv"},
+            ])
+        );
+
+        let diagnostics = tool_entry(&report, "get_diagnostics");
+        assert_eq!(diagnostics["coverage"], "all");
+        assert!(diagnostics.get("routes").is_none());
+
+        let workspace = tool_entry(&report, "workspace_symbol_search");
+        assert_eq!(workspace["coverage"], "none");
+        assert!(workspace["routes"][0].get("language").is_none());
+
+        let logs = tool_entry(&report, "get_server_logs");
+        assert_eq!(logs["coverage"], "always");
+        assert!(logs.get("routes").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_tool_support_file_path_restricts_languages() {
+        let fixture = support_fixture(
+            vec![
+                ("rust-srv", "rust", lsp_types::ServerCapabilities::default()),
+                ("py-srv", "python", lsp_types::ServerCapabilities::default()),
+            ],
+            McpConfig::default(),
+        );
+        let report = report_json(
+            &fixture.server,
+            Some(fixture.file.to_str().unwrap().to_string()),
+        );
+        assert_eq!(report["languages"], serde_json::json!(["rust"]));
+
+        let outside = fixture
+            .server
+            .get_tool_support(Parameters(ToolSupportParams {
+                file_path: Some("/definitely/not/in/workspace.rs".to_string()),
+            }));
+        assert!(outside.is_err());
+        drop(fixture.dir);
+    }
+
+    #[tokio::test]
+    async fn test_get_tool_support_uses_prefixed_tool_names() {
+        let mcp = McpConfig {
+            tool_prefix: Some("p".parse().unwrap()),
+            ..McpConfig::default()
+        };
+        let fixture = support_fixture(
+            vec![("rust", "rust", lsp_types::ServerCapabilities::default())],
+            mcp,
+        );
+        let report = report_json(&fixture.server, None);
+        assert_eq!(tool_entry(&report, "p_get_hover")["coverage"], "none");
+    }
+
+    #[test]
+    fn test_get_tool_support_with_nothing_configured_reports_no_languages() {
+        let server = create_test_server();
+        let report = report_json(&server, None);
+        assert_eq!(report["languages"], serde_json::json!([]));
+        assert_eq!(tool_entry(&report, "get_hover")["coverage"], "none");
+        assert_eq!(tool_entry(&report, "get_server_logs")["coverage"], "always");
+    }
+
+    /// A language whose only server failed to spawn is still listed, as
+    /// `no_server`, rather than silently dropped from the report.
+    #[tokio::test]
+    async fn test_get_tool_support_lists_language_whose_server_failed_to_spawn() {
+        use std::collections::HashSet;
+
+        use crate::config::ServerId;
+
+        let fixture = support_fixture(
+            vec![
+                ("rust", "rust", lsp_types::ServerCapabilities::default()),
+                ("py-srv", "python", lsp_types::ServerCapabilities::default()),
+            ],
+            McpConfig::default(),
+        );
+        fixture
+            .server
+            .context
+            .translator
+            .rebind_router(&HashSet::from([ServerId::from("rust")]));
+        let report = report_json(&fixture.server, None);
+        assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
+        assert_eq!(
+            tool_entry(&report, "get_hover")["routes"][0],
+            serde_json::json!({"language": "python", "status": "no_server"})
+        );
+    }
+
+    /// Before registration completes, an expected server reads as
+    /// `initializing`/`unknown`, not as unsupported.
+    #[test]
+    fn test_get_tool_support_reports_expected_unregistered_server_as_unknown() {
+        use std::collections::HashSet;
+
+        use crate::config::{ServerId, ToolRouter};
+
+        let translator = Translator::new().with_router(ToolRouter::catch_all([(
+            ServerId::from("rust"),
+            "rust".to_string(),
+        )]));
+        translator.set_expected_servers(HashSet::from([ServerId::from("rust")]));
+        let server = McplsServer::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            Arc::from(Vec::new()),
+            SubscriptionRegistry::new(),
+            false,
+            McpConfig::default(),
+        );
+        let report = report_json(&server, None);
+        let hover = tool_entry(&report, "get_hover");
+        assert_eq!(hover["coverage"], "unknown");
+        assert_eq!(hover["routes"][0]["status"], "initializing");
     }
 
     // ------------------------------------------------------------------

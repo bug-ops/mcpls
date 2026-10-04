@@ -187,7 +187,7 @@ fn describe_entry(cfg: &LspServerConfig) -> String {
 }
 
 /// Per-language routing table: which server handles which tool.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default, Clone)]
 struct LanguageRoutes {
     /// Tools explicitly claimed via a server's `handles` list.
     explicit: HashMap<ToolKind, ServerId>,
@@ -220,7 +220,7 @@ pub enum NoServerReason {
 /// (post-heuristics) server configs, then rebound once at registration time
 /// by [`Self::rebind_to_registered`] so that no route ever points at a
 /// server that failed to spawn.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ToolRouter {
     by_language: HashMap<String, LanguageRoutes>,
     /// Config declaration order, used by `resolve_any` for a deterministic
@@ -485,6 +485,29 @@ impl ToolRouter {
         self.by_language
             .get(language_id)
             .is_some_and(|r| r.default.is_some() || !r.explicit.is_empty())
+    }
+
+    /// Every language this router was built with, sorted, including
+    /// languages whose routes [`Self::rebind_to_registered`] has since
+    /// emptied -- so a language whose servers all failed to spawn is still
+    /// listed (and can be reported as having no server) rather than vanishing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::config::{ServerId, ToolRouter};
+    ///
+    /// let router = ToolRouter::catch_all([
+    ///     (ServerId::from("pyright"), "python".to_string()),
+    ///     (ServerId::from("rust-analyzer"), "rust".to_string()),
+    /// ]);
+    /// assert_eq!(router.configured_languages(), ["python", "rust"]);
+    /// ```
+    #[must_use]
+    pub fn configured_languages(&self) -> Vec<String> {
+        let mut languages: Vec<String> = self.by_language.keys().cloned().collect();
+        languages.sort_unstable();
+        languages
     }
 }
 
