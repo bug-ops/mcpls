@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HttpConfig` gains a header/body-stall timeout and a connection cap. (#546)
 - `proptest` properties and a `cargo-fuzz` target for the LSP frame parser. (#546)
 - HTTP GET streams are probed with an MCP ping and closed when the client stops answering, portably and behind proxies; new `--http-stream-liveness` flag and `HttpConfig::with_stream_liveness`. (#543, #553)
+- `go_to_declaration` tool (`textDocument/declaration`) and a `declaration` `handles` value. (#591)
+- `restart_server` tool restarting one, several or all LSP servers (kill-then-respawn, pump re-wired); annotated destructive and not read-only; new retryable error `-32054` for requests in flight. (#591)
+- Symbol-name addressing: `get_hover`, `get_definition`, `get_references`, `go_to_implementation`, `go_to_type_definition`, `prepare_call_hierarchy` and `rename_symbol` accept `symbol_name` (+ `symbol_kind`, `container`) and report `resolved_symbol`. (#591)
 
 ### Changed
 
@@ -62,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `validate_path_against_roots`, `Translator::set_workspace_roots`, `McplsServer::new` and `BridgeContext::new` take the new `WorkspaceRoots`; a path is accepted only under a canonical root, its configured form or the logical `$PWD`. (#533, #552)
 - **Breaking:** `Error::LspInitFailed` and `Error::ServerExitedDuringInit` gain `stderr: Option<StderrExcerpt>`, a bounded excerpt of the server's stderr with secret-named env, flag and option values redacted. (#534, #552)
 - Accepted HTTP sockets set `TCP_USER_TIMEOUT` to 60 s on Linux and Android, bounding half-open SSE streams; no effect elsewhere or behind a reverse proxy. (#531, #552)
+- **Breaking:** the seven name-addressable tools take a position or a `symbol_name` and return an optional `resolved_symbol`. (#591)
+- **Breaking:** on Unix each LSP server leads its own process group behind its own watchdog, and respawn, restart and shutdown kill that whole group, shared daemons such as Gradle and Bloop included (#542). (#591)
+- **Breaking:** `Error`, `McpErrorKind`, `RetryableErrorData` and `ToolKind` gain variants for symbol resolution, server restart and declaration. (#591)
 - **Breaking:** `HttpConfig::new` takes only the bind address; the path is a validated `HttpPath` and `max_concurrent_sessions` a `SessionLimit`. (#590)
 - **Breaking:** bind failures are `Error::HttpBind` and `Error::Timeout` carries a `Duration`. (#590)
 - **Breaking:** `project_config_ignored: bool` is now `ProjectConfigStatus` on `ServerConfig`, `McplsServer::new` and `BridgeContext::new`. (#590)
@@ -103,6 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_cached_diagnostics` and the diagnostics resource now report a server startup failure instead of an empty list. (#535, #552)
 - Paths outside every workspace root are rejected before any filesystem access, narrowing the existence oracle for outside paths. (#533, #552)
 - Diagnostics published under a symlink spelling are keyed by the canonical path, merged per source on read, and now match subscriptions. (#532, #552)
+- A respawned LSP server's surviving child processes are now killed on Unix (#542). (#591)
 
 ## [0.6.0] - 2026-09-21
 

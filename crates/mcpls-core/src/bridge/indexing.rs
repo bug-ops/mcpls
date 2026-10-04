@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use lsp_types::{ProgressParams, ProgressToken};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
@@ -41,7 +42,8 @@ use crate::lsp::types::ProgressKind;
 /// server's protocol support, so both stay unblocked. Only `Loading` -- a
 /// positive signal that indexing is actively in progress -- triggers a
 /// bounded wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum IndexingState {
     /// No recognized workspace-readiness signal has been observed for this
     /// server yet.

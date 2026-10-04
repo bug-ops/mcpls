@@ -152,6 +152,11 @@ name gains that prefix (`{tool_prefix}_{tool}`).
 structured `outputSchema`, so MCP clients that support structured tool output get typed
 `structuredContent` alongside the text response.
 
+Position-based tools (`get_hover`, `get_definition`, `get_references`, `go_to_implementation`,
+`go_to_type_definition`, `prepare_call_hierarchy`, `rename_symbol`) also accept a `symbol_name`
+(optionally narrowed by `symbol_kind` and `container`) instead of `line`/`character`; see the
+[tools reference](docs/user-guide/tools-reference.md#addressing-a-symbol-by-name).
+
 <details>
 <summary><strong>Code Intelligence</strong></summary>
 
@@ -166,6 +171,7 @@ structured `outputSchema`, so MCP clients that support structured tool output ge
 | `get_signature_help` | Parameter info and active signature while typing a call |
 | `go_to_implementation` | Jump to implementations of a trait method or interface member |
 | `go_to_type_definition` | Jump to the type definition of an expression, distinct from `get_definition` for variable bindings |
+| `go_to_declaration` | Jump to the declaration of a symbol (C/C++ headers, interface members) |
 | `get_inlay_hints` | Inferred type/parameter annotations an editor would render inline |
 
 </details>
@@ -202,6 +208,7 @@ structured `outputSchema`, so MCP clients that support structured tool output ge
 | `get_server_logs` | Debug LSP issues with internal log messages |
 | `get_server_messages` | User-facing messages from the language server |
 | `get_tool_support` | Which tools are usable for which languages in this session, before calling them |
+| `restart_server` | Restart a wedged or stale language server (kills its whole process group) without restarting mcpls |
 
 </details>
 
@@ -353,8 +360,8 @@ location / {
 
 When mcpls exits for any reason, including `SIGKILL` and OOM kills, LSP servers and the descendants that stay in their process tree are killed. This includes processes that are meant to outlive their server, such as shared build daemons. Caveats:
 
-- **Unix:** servers share one process group that a watchdog kills. A descendant that calls `setsid()` or `setpgid()` leaves the group and survives `kill -9` of mcpls. This includes the `cargo check` that rust-analyzer's flycheck runs in its own session. Tracked in #541.
-- **Unix:** when a server crashes and is respawned, its surviving descendants stay alive until mcpls exits (#542).
+- **Unix:** each server leads its own process group behind a per-server watchdog that kills the group. A descendant that calls `setsid()` or `setpgid()` leaves the group and survives `kill -9` of mcpls. This includes the `cargo check` that rust-analyzer's flycheck runs in its own session. Tracked in #541.
+- **Unix:** when a server crashes, is restarted or is shut down, its whole process group is killed, including shared daemons such as Gradle or Bloop that the server started.
 - **Unix:** servers run in their own process group, so Ctrl-C in the terminal no longer reaches them directly. A descendant that reads `/dev/tty` (for example an ssh or git credential prompt) while mcpls runs in an interactive terminal may be stopped by `SIGTTIN`.
 - **Unix:** if the watchdog cannot be started, mcpls logs a warning and spawns the server unbound, in its own fresh process group. Ctrl-C does not reach servers in either case.
 - **Windows:** servers run in a job object without breakaway, and the whole tree is killed. A descendant that requests `CREATE_BREAKAWAY_FROM_JOB` fails to spawn. If the job cannot be created or assigned, the server spawn fails.

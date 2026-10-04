@@ -1,8 +1,8 @@
 //! LSP client implementation with async request/response handling.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use lsp_types::LspErrorCodes;
 use serde::Serialize;
@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, error, trace, warn};
 
-use crate::config::LspServerConfig;
+use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader};
 use crate::lsp::types::{
@@ -178,6 +178,28 @@ fn spawn_reader_task(
     (handle, rx)
 }
 
+/// Why requests still pending on a client are being failed, and so which
+/// error they resolve with.
+#[derive(Debug, Clone, Default)]
+pub enum PendingFailure {
+    /// The connection is gone.
+    #[default]
+    Terminated,
+    /// The server was deliberately restarted; the caller may retry.
+    Restarted(ServerId),
+}
+
+impl PendingFailure {
+    fn error(&self) -> Error {
+        match self {
+            Self::Terminated => Error::ServerTerminated,
+            Self::Restarted(server_id) => Error::ServerRestarted {
+                server_id: server_id.clone(),
+            },
+        }
+    }
+}
+
 /// LSP client with async request/response handling.
 ///
 /// This client manages communication with an LSP server, handling:
@@ -208,6 +230,10 @@ pub struct LspClient {
     /// that only when its own timeout elapses.
     pending_requests: Arc<Mutex<PendingRequests>>,
 
+    /// The error stragglers in `pending_requests` fail with, shared by every
+    /// clone and by the message loop's exit-path drain.
+    pending_failure: Arc<StdMutex<PendingFailure>>,
+
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
 }
@@ -224,6 +250,7 @@ impl Clone for LspClient {
             request_counter: Arc::clone(&self.request_counter),
             command_tx: self.command_tx.clone(),
             pending_requests: Arc::clone(&self.pending_requests),
+            pending_failure: Arc::clone(&self.pending_failure),
             receiver_task: None,
         }
     }
@@ -260,6 +287,7 @@ impl LspClient {
             request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_failure: Arc::default(),
             receiver_task: None,
         }
     }
@@ -275,6 +303,7 @@ impl LspClient {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_failure = Arc::<StdMutex<PendingFailure>>::default();
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
@@ -282,6 +311,7 @@ impl LspClient {
             transport,
             command_rx,
             Arc::clone(&pending_requests),
+            Arc::clone(&pending_failure),
             None,
             None,
             Arc::default(),
@@ -293,6 +323,7 @@ impl LspClient {
             request_counter,
             command_tx,
             pending_requests,
+            pending_failure,
             receiver_task: Some(receiver_task),
         }
     }
@@ -315,6 +346,7 @@ impl LspClient {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_failure = Arc::<StdMutex<PendingFailure>>::default();
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
@@ -322,6 +354,7 @@ impl LspClient {
             transport,
             command_rx,
             Arc::clone(&pending_requests),
+            Arc::clone(&pending_failure),
             Some(notification_tx),
             Some(lifecycle_tx),
             redactions,
@@ -333,6 +366,7 @@ impl LspClient {
             request_counter,
             command_tx,
             pending_requests,
+            pending_failure,
             receiver_task: Some(receiver_task),
         }
     }
@@ -694,15 +728,32 @@ impl LspClient {
     /// superseded by a respawned replacement for the same server -- so
     /// callers still waiting on it unblock immediately.
     pub(crate) async fn fail_pending_requests(&self) {
-        Self::drain_and_fail_pending(&self.pending_requests).await;
+        Self::drain_and_fail_pending(&self.pending_requests, &self.pending_failure).await;
+    }
+
+    /// Make every request still pending, or failed later by the loop's exit
+    /// drain, resolve with [`Error::ServerRestarted`] instead of
+    /// [`Error::ServerTerminated`].
+    pub(crate) fn mark_restarted(&self, server_id: ServerId) {
+        *self
+            .pending_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = PendingFailure::Restarted(server_id);
     }
 
     /// Drains `pending`, resolving each remaining sender to
     /// `Err(Error::ServerTerminated)`. Shared by [`Self::fail_pending_requests`]
     /// and [`Self::message_loop`]'s exit-path cleanup (#458).
-    async fn drain_and_fail_pending(pending: &Arc<Mutex<PendingRequests>>) {
+    async fn drain_and_fail_pending(
+        pending: &Arc<Mutex<PendingRequests>>,
+        failure: &StdMutex<PendingFailure>,
+    ) {
         for (_, sender) in pending.lock().await.drain() {
-            let _ = sender.send(Err(Error::ServerTerminated));
+            let error = failure
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .error();
+            let _ = sender.send(Err(error));
         }
     }
 
@@ -760,12 +811,12 @@ impl LspClient {
         clippy::arithmetic_side_effects,
         reason = "SHUTDOWN_TIMEOUT is a small constant"
     )]
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
         self.shutdown_until(Instant::now() + SHUTDOWN_TIMEOUT).await
     }
 
     /// As [`Self::shutdown`], with a caller-chosen absolute deadline.
-    pub(crate) async fn shutdown_until(mut self, deadline: Instant) -> Result<()> {
+    pub(crate) async fn shutdown_until(&mut self, deadline: Instant) -> Result<()> {
         debug!("Shutting down LSP client");
 
         let mut task = self.receiver_task.take();
@@ -790,7 +841,7 @@ impl LspClient {
                 // request cannot enqueue after the drain below (#458).
                 let _ = timeout(SHUTDOWN_ABORT_SETTLE, task).await;
             }
-            Self::drain_and_fail_pending(&self.pending_requests).await;
+            Self::drain_and_fail_pending(&self.pending_requests, &self.pending_failure).await;
         }
 
         *self.state.lock().await = super::ServerState::Shutdown;
@@ -808,6 +859,7 @@ impl LspClient {
         transport: (LspTransport, LspTransportReader),
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
+        pending_failure: Arc<StdMutex<PendingFailure>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<mpsc::Sender<LspNotification>>,
         redactions: Arc<Redactions>,
@@ -840,7 +892,7 @@ impl LspClient {
         // Runs after `message_loop_inner` returns, so a response the Shutdown
         // drain (#451) already resolved is gone from the map by now -- only
         // requests with no answer get failed here (#458).
-        Self::drain_and_fail_pending(&pending_requests).await;
+        Self::drain_and_fail_pending(&pending_requests, &pending_failure).await;
         if let Err(ref e) = result {
             error!("Message loop exiting with error: {}", e);
         } else {
@@ -1712,6 +1764,7 @@ mod tests {
             request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
             pending_requests: Arc::clone(&pending_requests),
+            pending_failure: Arc::default(),
             receiver_task: None,
         };
 
@@ -2623,7 +2676,7 @@ mod tests {
             .await;
             assert_matches!(result, Err(Error::ServerTerminated), "got {result:?}");
 
-            LspClient::drain_and_fail_pending(&pending_requests).await;
+            LspClient::drain_and_fail_pending(&pending_requests, &StdMutex::default()).await;
 
             let received = response_rx.await.unwrap();
             assert_matches!(received, Err(Error::ServerTerminated), "got {received:?}");
@@ -2710,6 +2763,7 @@ mod tests {
                 (transport, reader),
                 command_rx,
                 Arc::clone(&pending_requests),
+                Arc::default(),
                 None,
                 None,
                 Arc::default(),
@@ -2778,7 +2832,7 @@ mod tests {
 
             // Mirrors the drain `message_loop` runs after `message_loop_inner`
             // returns.
-            LspClient::drain_and_fail_pending(&pending_requests).await;
+            LspClient::drain_and_fail_pending(&pending_requests, &StdMutex::default()).await;
 
             let answered = answered_rx.await.unwrap();
             assert_eq!(answered.unwrap(), serde_json::json!({ "ok": true }));
@@ -2950,7 +3004,7 @@ mod tests {
         /// `ShutdownTimeout`, and leaves the client in the `Shutdown` state.
         #[tokio::test]
         async fn test_shutdown_until_expired_deadline_reports_timeout() {
-            let (client, _server) = fake_lsp_client();
+            let (mut client, _server) = fake_lsp_client();
             let probe = client.clone();
 
             let result = client
@@ -2966,7 +3020,7 @@ mod tests {
         /// and fails the requests still in flight.
         #[tokio::test]
         async fn test_shutdown_until_aborts_wedged_loop_and_fails_pending() {
-            let (client, mut server) = fake_lsp_client();
+            let (mut client, mut server) = fake_lsp_client();
             let mut reader = BufReader::new(&mut server.write_stdout);
 
             let in_flight_client = client.clone();
@@ -2998,6 +3052,42 @@ mod tests {
                 .unwrap_or_else(|_| panic!("in-flight request must be failed by the drain"))
                 .unwrap();
             assert_matches!(in_flight, Err(Error::ServerTerminated), "got {in_flight:?}");
+        }
+
+        /// A client marked restarted fails its stragglers with the retryable
+        /// `ServerRestarted`, both from the explicit drain and from the
+        /// message loop's exit drain.
+        #[tokio::test]
+        async fn test_marked_restarted_client_fails_pending_with_server_restarted() {
+            let (mut client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let in_flight_client = client.clone();
+            let in_flight = tokio::spawn(async move {
+                in_flight_client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+            let _ = read_framed_message(&mut reader).await;
+
+            client.mark_restarted(ServerId::from("rust"));
+            client
+                .shutdown_until(Instant::now() + Duration::from_millis(200))
+                .await
+                .ok();
+
+            let in_flight = timeout(Duration::from_secs(1), in_flight)
+                .await
+                .unwrap_or_else(|_| panic!("in-flight request must be failed by the drain"))
+                .unwrap();
+            assert!(
+                matches!(&in_flight, Err(Error::ServerRestarted { server_id }) if server_id.as_str() == "rust"),
+                "got {in_flight:?}"
+            );
         }
 
         /// #458: a request issued after the client has already shut down
