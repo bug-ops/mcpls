@@ -419,7 +419,7 @@ mod tests {
 
         assert_eq!(config.language_id, "rust");
         assert_eq!(config.command, "rust-analyzer");
-        assert!(config.args.is_empty());
+        assert_eq!(config.args.len(), 0);
         assert!(config.env.is_empty());
         assert_eq!(config.file_patterns, vec!["**/*.rs"]);
         assert!(config.initialization_options.is_none());
@@ -711,7 +711,7 @@ mod tests {
 
         assert_eq!(config.language_id, "cpp");
         assert_eq!(config.command, "clangd");
-        assert!(config.args.is_empty());
+        assert_eq!(config.args.len(), 0);
         assert!(config.heuristics.is_some());
         let markers = &config.heuristics.unwrap().project_markers;
         assert!(markers.contains(&"CMakeLists.txt".to_string()));
@@ -724,7 +724,7 @@ mod tests {
 
         assert_eq!(config.language_id, "zig");
         assert_eq!(config.command, "zls");
-        assert!(config.args.is_empty());
+        assert_eq!(config.args.len(), 0);
         assert!(config.heuristics.is_some());
         let markers = &config.heuristics.unwrap().project_markers;
         assert!(markers.contains(&"build.zig".to_string()));

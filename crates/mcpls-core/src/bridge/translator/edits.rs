@@ -396,6 +396,7 @@ async fn convert_code_action(
         CommandDescription {
             title: cmd.title,
             command: cmd.command,
+    action
             arguments,
         }
     });
@@ -1095,7 +1096,7 @@ mod tests {
         let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
         assert_eq!(result.title, "Fix issue");
         assert!(result.kind.is_none());
-        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.diagnostics.len(), 0);
         assert!(result.edit.is_none());
         assert!(result.command.is_none());
         assert!(!result.is_preferred);

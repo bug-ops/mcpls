@@ -1740,7 +1740,7 @@ mod tests {
 
         let result = call.await.unwrap().unwrap();
         assert!(result.0.indexing_in_progress);
-        assert!(result.0.result.diagnostics.is_empty());
+        assert_eq!(result.0.result.diagnostics.len(), 0);
     }
 
     /// Counterpart to the above: once the server has no active `Loading`
@@ -3091,7 +3091,7 @@ sleep 0.3
     fn test_paginate_out_of_range_cursor_yields_empty_page_not_error() {
         let p = paths(5);
         let (page, next_cursor) = paginate_resource_paths(&p, Some("9999"), 100).unwrap();
-        assert!(page.is_empty());
+        assert_eq!(page.len(), 0);
         assert!(next_cursor.is_none());
     }
 
@@ -3102,7 +3102,7 @@ sleep 0.3
         let p = paths(5);
         let cursor = usize::MAX.to_string();
         let (page, next_cursor) = paginate_resource_paths(&p, Some(&cursor), 100).unwrap();
-        assert!(page.is_empty());
+        assert_eq!(page.len(), 0);
         assert!(next_cursor.is_none());
     }
 
@@ -3144,7 +3144,7 @@ sleep 0.3
         let response = ResourceDiagnosticsResponse::new(false, None, false, false);
         assert!(!response.tracked);
         assert!(response.version.is_none());
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics.len(), 0);
 
         // #132's contract is the wire shape, not the Rust struct -- assert the JSON directly.
         let json = serde_json::to_value(&response).unwrap();
@@ -3158,7 +3158,7 @@ sleep 0.3
         let response = ResourceDiagnosticsResponse::new(true, None, false, false);
         assert!(response.tracked);
         assert!(response.version.is_none());
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics.len(), 0);
 
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["tracked"], true);
@@ -3216,14 +3216,14 @@ sleep 0.3
     fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
         let response = build_resource_diagnostics_response(false, None, false, false);
         assert!(!response.tracked);
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics.len(), 0);
     }
 
     #[test]
     fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
         let response = build_resource_diagnostics_response(true, None, false, false);
         assert!(response.tracked);
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics.len(), 0);
     }
 
     /// Regression: an LSP server can publish diagnostics for a file mcpls never
