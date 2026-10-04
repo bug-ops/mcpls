@@ -30,7 +30,6 @@ pub const LIFELINE_SWEEP_BUDGET: Duration = Duration::from_secs(8);
 pub enum Binding {
     /// A live watchdog sweeps the server's tree if mcpls dies, so the server
     /// must not be handed the mcpls pid to watch.
-    #[cfg(unix)]
     Bound,
     /// No watchdog: the server sees the real mcpls pid.
     Unbound,
@@ -145,9 +144,9 @@ impl ServerProcess {
     }
 
     /// Freeze and record the descendants that escaped the server's process
-    /// group, before the server is told to exit. Returns `false` when that
-    /// failed, in which case the server must not be allowed to exit on its
-    /// own: the caller should [`Self::terminate_tree`] it instead.
+    /// group, before the server is told to exit. Anything but
+    /// [`MarkOutcome::Confirmed`] means the server must not be allowed to exit
+    /// on its own: the caller should [`Self::terminate_tree`] it instead.
     pub(crate) async fn mark_escapees(&mut self) -> MarkOutcome {
         match &mut self.lifeline {
             Some(lifeline) => lifeline.mark().await,
