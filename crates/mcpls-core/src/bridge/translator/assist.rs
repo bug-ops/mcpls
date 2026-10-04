@@ -73,7 +73,8 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let lsp_position = self.encoding_ctx(&server_id).to_lsp(&uri, position).await;
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, position).await;
 
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
             trigger_kind: CompletionTriggerKind::TriggerCharacter,
@@ -113,6 +114,7 @@ impl Translator {
                     }),
                 })
                 .collect(),
+            positions_degraded: ctx.positions_degraded(),
         };
 
         Ok(result)
@@ -140,7 +142,8 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
-        let lsp_position = self.encoding_ctx(&server_id).to_lsp(&uri, position).await;
+        let ctx = self.encoding_ctx(&server_id);
+        let lsp_position = ctx.to_lsp(&uri, position).await;
 
         let params = LspSignatureHelpParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -171,6 +174,7 @@ impl Translator {
                                 label: match p.label {
                                     lsp_types::ParameterInformationLabel::String(s) => s,
                                     lsp_types::ParameterInformationLabel::Tuple((start, end)) => {
+                                        // TODO(#511): offsets are in the server's encoding, not label text
                                         format!("[{start},{end}]")
                                     }
                                 },
@@ -184,11 +188,13 @@ impl Translator {
                     lsp_types::ActiveParameter::Int(n) => Some(n),
                     lsp_types::ActiveParameter::Null => None,
                 }),
+                positions_degraded: ctx.positions_degraded(),
             },
             None => SignatureHelpResult {
                 signatures: vec![],
                 active_signature: None,
                 active_parameter: None,
+                positions_degraded: ctx.positions_degraded(),
             },
         };
 
@@ -472,5 +478,95 @@ mod tests {
             Some(300u32),
             "a custom InlayHintKind above u8::MAX must not be truncated or dropped"
         );
+    }
+
+    async fn utf8_degradation(
+        content: &str,
+        line: u32,
+        character: u32,
+        method: &str,
+    ) -> serde_json::Value {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            completion_provider: Some(lsp_types::CompletionOptions::default()),
+            signature_help_provider: Some(lsp_types::SignatureHelpOptions::default()),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities_and_encoding(
+            &dir,
+            &server_id,
+            caps,
+            lsp_types::PositionEncodingKind::UTF8,
+        );
+        let path = dir.path().join("main.rs");
+        fs::write(&path, content).unwrap();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            let method = method.to_string();
+            tokio::spawn(async move {
+                if method == "textDocument/completion" {
+                    translator
+                        .handle_completions(path, pos(line, character), None)
+                        .await
+                        .map(|r| serde_json::to_value(r).unwrap())
+                } else {
+                    translator
+                        .handle_signature_help(path, pos(line, character))
+                        .await
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], method);
+        let response = if method == "textDocument/completion" {
+            serde_json::json!([])
+        } else {
+            serde_json::Value::Null
+        };
+        write_response(&mut server.read_half_stdin, &request["id"], response).await;
+
+        handle.await.unwrap().unwrap()
+    }
+
+    /// S1 regression: the empty line after a final newline is a real LSP
+    /// line, so column 1 on it converts exactly and must not be flagged.
+    #[tokio::test]
+    async fn test_handle_completions_trailing_empty_line_is_not_degraded() {
+        let wire = utf8_degradation("fn main() {}\n", 2, 1, "textDocument/completion").await;
+        assert!(wire.get("positions_degraded").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_completions_line_past_eof_with_column_is_request_degraded() {
+        let wire = utf8_degradation("fn main() {}", 5, 3, "textDocument/completion").await;
+        assert_eq!(wire["positions_degraded"], "request");
+    }
+
+    #[tokio::test]
+    async fn test_handle_signature_help_line_past_eof_with_column_is_request_degraded() {
+        let wire = utf8_degradation("fn main() {}", 5, 3, "textDocument/signatureHelp").await;
+        assert_eq!(wire["positions_degraded"], "request");
+    }
+
+    #[tokio::test]
+    async fn test_handle_signature_help_in_range_position_is_not_degraded() {
+        let wire = utf8_degradation("fn main() {}", 1, 4, "textDocument/signatureHelp").await;
+        assert!(wire.get("positions_degraded").is_none());
     }
 }

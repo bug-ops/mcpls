@@ -357,6 +357,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
 
@@ -694,8 +695,9 @@ mod tests {
             .expect("document symbol response should still succeed, just degraded");
 
         assert_eq!(result.symbols.len(), 1);
-        assert!(
+        assert_eq!(
             result.positions_degraded,
+            Some(PositionDegradation::Response),
             "a range whose line can't be resolved must mark the result degraded"
         );
     }

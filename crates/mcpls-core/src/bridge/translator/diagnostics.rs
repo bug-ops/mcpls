@@ -144,7 +144,7 @@ impl Translator {
     /// whole-workspace LSP request, so blocking it on
     /// `Translator::wait_for_indexing_ready` would be the wrong fix shape.
     /// The `get_diagnostics` MCP tool instead surfaces the routed server's
-    /// indexing state as an explicit `indexingInProgress` flag alongside this
+    /// indexing state as an explicit `indexing_in_progress` flag alongside this
     /// method's result.
     ///
     /// # Errors
@@ -259,7 +259,7 @@ impl Translator {
             }
             None => DiagnosticsResult {
                 diagnostics: Vec::new(),
-                positions_degraded: false,
+                positions_degraded: None,
             },
         }
     }
@@ -334,7 +334,7 @@ impl Translator {
         }
 
         let cached = Self::diagnostics_from_cache_entry(diag_info, encoding, tracker).await;
-        pull.positions_degraded |= cached.positions_degraded;
+        pull.positions_degraded = pull.positions_degraded.max(cached.positions_degraded);
         let new_diagnostics: Vec<_> = cached
             .diagnostics
             .into_iter()
@@ -423,6 +423,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
 
@@ -784,7 +785,7 @@ mod tests {
     async fn test_merge_diagnostics_cache_only_appends_to_empty_pull() {
         let pull = DiagnosticsResult {
             diagnostics: vec![],
-            positions_degraded: false,
+            positions_degraded: None,
         };
         let cache = diag_info(vec![lsp_diag(
             0,
@@ -831,7 +832,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
-            positions_degraded: false,
+            positions_degraded: None,
         };
         let cache = diag_info(vec![lsp_diag(
             0,
@@ -853,15 +854,15 @@ mod tests {
         assert_eq!(merged.diagnostics[0], pull_diag);
     }
 
-    /// #497 test gap: `merge_diagnostics`'s `pull.positions_degraded |=
-    /// cached.positions_degraded` must actually OR the two sides, not just
+    /// #497 test gap: `merge_diagnostics` must actually take the worse of the
+    /// pull and cache `positions_degraded` values, not just
     /// pass one through -- exercised here with the pull side degraded and
     /// the cache side (UTF-16, never degradable) not.
     #[tokio::test]
     async fn test_merge_diagnostics_positions_degraded_true_when_pull_side_is_degraded() {
         let pull = DiagnosticsResult {
             diagnostics: vec![],
-            positions_degraded: true,
+            positions_degraded: Some(PositionDegradation::Response),
         };
         let cache = diag_info(vec![lsp_diag(
             0,
@@ -879,8 +880,9 @@ mod tests {
         )
         .await;
 
-        assert!(
+        assert_eq!(
             merged.positions_degraded,
+            Some(PositionDegradation::Response),
             "the pull side's degraded flag must survive the merge even when the cache side \
              isn't degraded"
         );
@@ -895,7 +897,7 @@ mod tests {
     async fn test_merge_diagnostics_positions_degraded_true_when_cache_side_is_degraded() {
         let pull = DiagnosticsResult {
             diagnostics: vec![],
-            positions_degraded: false,
+            positions_degraded: None,
         };
         let cache = diag_info(vec![lsp_diag(
             0,
@@ -913,8 +915,9 @@ mod tests {
         )
         .await;
 
-        assert!(
+        assert_eq!(
             merged.positions_degraded,
+            Some(PositionDegradation::Response),
             "the cache side's degraded flag must be OR-ed into the merged result even when the \
              pull side isn't degraded"
         );
@@ -939,7 +942,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
-            positions_degraded: false,
+            positions_degraded: None,
         };
 
         let merged =
@@ -953,7 +956,7 @@ mod tests {
     async fn test_merge_diagnostics_multiple_distinct_cache_entries_all_appear() {
         let pull = DiagnosticsResult {
             diagnostics: vec![],
-            positions_degraded: false,
+            positions_degraded: None,
         };
         let cache = diag_info(vec![
             lsp_diag(
@@ -1014,7 +1017,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag],
-            positions_degraded: false,
+            positions_degraded: None,
         };
         // Same range and severity as the pull diagnostic, but a different
         // message — must be treated as a distinct diagnostic, not a duplicate.
@@ -1063,7 +1066,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
-            positions_degraded: false,
+            positions_degraded: None,
         };
         // Same code and severity, but a different range and a longer,
         // differently-worded message -- the rustc-rendered push side of the
@@ -1122,7 +1125,7 @@ mod tests {
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
-            positions_degraded: false,
+            positions_degraded: None,
         };
         // A second, unrelated E0308 at a completely different location with
         // a completely different message -- a real, distinct diagnostic,

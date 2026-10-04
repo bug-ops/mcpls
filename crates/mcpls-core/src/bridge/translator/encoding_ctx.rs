@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use super::dto::{Position, Position2D, Range};
-use crate::bridge::encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
+use super::dto::{Position, Position2D, PositionDegradation, Range};
+use crate::bridge::encoding::{
+    ColumnFidelity, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position,
+};
 use crate::bridge::state::{DEFAULT_MAX_FILE_SIZE, uri_to_path};
 use crate::bridge::{DocumentTracker, lock_std};
 
@@ -64,16 +66,15 @@ pub(super) struct LineCacheState {
     /// column (an unresolvable/non-`file:` URI, a path over
     /// `max_file_size`, invalid UTF-8, or a line past EOF).
     budget_exhausted_logged: bool,
-    /// Whether any position conversion in this response passed a column
-    /// through unconverted because its line text could not be resolved --
-    /// set directly at the point that decision is made
-    /// ([`EncodingCtx::to_lsp`]/[`EncodingCtx::to_mcp`]'s `text.is_none()`
-    /// branch), covering every cause uniformly (disk-read budget
-    /// exhaustion, an unresolvable/non-`file:` URI, a path over
-    /// `max_file_size`, invalid UTF-8, a line past EOF, or the tracked
-    /// document's own line not existing) rather than only the one
-    /// `budget_exhausted_logged` covers. See [`EncodingCtx::positions_degraded`].
-    positions_degraded: bool,
+    /// Worst degradation of any position conversion in this response -- set
+    /// directly where a column could not be converted exactly
+    /// ([`EncodingCtx::to_lsp`]/[`EncodingCtx::to_mcp`]), covering every
+    /// cause uniformly (disk-read budget exhaustion, an unresolvable or
+    /// non-`file:` URI, a path over `max_file_size`, invalid UTF-8, a line
+    /// past EOF, or a column inside a multi-unit character) rather than
+    /// only the one `budget_exhausted_logged` covers. See
+    /// [`EncodingCtx::positions_degraded`].
+    positions_degraded: Option<PositionDegradation>,
 }
 
 impl LineCacheState {
@@ -82,7 +83,7 @@ impl LineCacheState {
             entries: HashMap::new(),
             bytes_remaining: MAX_LINE_READ_BYTES_PER_RESPONSE,
             budget_exhausted_logged: false,
-            positions_degraded: false,
+            positions_degraded: None,
         }
     }
 }
@@ -257,69 +258,90 @@ impl EncodingCtx {
         !crate::bridge::uri_in_workspace_roots(uri, &self.workspace_roots)
     }
 
-    /// Whether any position conversion made through this context so far
-    /// passed a column through unconverted because its line text could not
-    /// be resolved, for any reason -- surfaced to the caller via a
-    /// `positions_degraded`-style field on the affected result DTOs (#497),
-    /// since that was previously visible only as a `tracing::warn!`.
+    /// Worst degradation among the position conversions made through this
+    /// context so far, or `None` if every column converted exactly --
+    /// surfaced to the caller via a `positions_degraded` field on the
+    /// affected result DTOs (#497).
     ///
-    /// Sticky for the context's lifetime -- once `true`, stays `true` for
-    /// the rest of the response, even if a later lookup for a *different*
-    /// `(path, line)` succeeds.
-    pub(super) fn positions_degraded(&self) -> bool {
+    /// A failed [`Self::to_lsp`] is [`PositionDegradation::Request`] (the
+    /// queried position itself may be wrong), a failed [`Self::to_mcp`] is
+    /// [`PositionDegradation::Response`]; `Request` subsumes `Response`.
+    /// Sticky for the context's lifetime -- once set, it never improves, even
+    /// if a later lookup for a *different* `(path, line)` succeeds.
+    pub(super) fn positions_degraded(&self) -> Option<PositionDegradation> {
         lock_std(&self.line_cache).positions_degraded
+    }
+
+    /// Records `degradation`, returning whether it raised the recorded level
+    /// (so callers log once per level rather than per position).
+    fn record_degradation(&self, degradation: PositionDegradation) -> bool {
+        let mut state = lock_std(&self.line_cache);
+        let raised = state.positions_degraded < Some(degradation);
+        state.positions_degraded = state.positions_degraded.max(Some(degradation));
+        raised
     }
 
     /// Convert an MCP position for the document at `uri` into an LSP
     /// position in this context's negotiated encoding.
+    ///
+    /// Column 0 (MCP `character <= 1`) never needs line text, so it skips the
+    /// lookup entirely.
     pub(super) async fn to_lsp(
         &self,
         uri: &lsp_types::Uri,
         position: Position,
     ) -> lsp_types::Position {
-        let line_text = if self.encoding == PositionEncoding::Utf16 {
+        let line_text = if self.encoding == PositionEncoding::Utf16 || position.character <= 1 {
             None
         } else {
-            let text = read_line_text(uri, position.line.saturating_sub(1), self).await;
-            if text.is_none() {
-                lock_std(&self.line_cache).positions_degraded = true;
-                tracing::warn!(
-                    uri = uri.as_ref(),
-                    line = position.line,
-                    encoding = self.encoding.to_lsp(),
-                    "could not resolve line text for position conversion; passing MCP column \
-                     through unconverted, which is wrong for a non-UTF-16 server"
-                );
-            }
-            text
+            read_line_text(uri, position.line.saturating_sub(1), self).await
         };
-        mcp_to_lsp_position(position, line_text.as_deref(), self.encoding)
+        let converted = mcp_to_lsp_position(position, line_text.as_deref(), self.encoding);
+        if converted.fidelity == ColumnFidelity::PassedThrough
+            && self.record_degradation(PositionDegradation::Request)
+        {
+            tracing::warn!(
+                uri = uri.as_ref(),
+                line = position.line,
+                encoding = self.encoding.to_lsp(),
+                "could not convert MCP column exactly; passing it through unconverted, which \
+                 is wrong for a non-UTF-16 server (logged once per response)"
+            );
+        }
+        converted.value
     }
 
     /// Convert an LSP position (in this context's negotiated encoding) from
     /// the document at `uri` into an MCP position.
+    ///
+    /// Column 0 and the `u32::MAX` end-of-line sentinel never need line text,
+    /// so they skip the lookup entirely.
     pub(super) async fn to_mcp(
         &self,
         uri: &lsp_types::Uri,
         pos: lsp_types::Position,
     ) -> Position2D {
-        let line_text = if self.encoding == PositionEncoding::Utf16 {
-            None
+        let needs_text = self.encoding != PositionEncoding::Utf16
+            && pos.character != 0
+            && pos.character != u32::MAX;
+        let line_text = if needs_text {
+            read_line_text(uri, pos.line, self).await
         } else {
-            let text = read_line_text(uri, pos.line, self).await;
-            if text.is_none() {
-                lock_std(&self.line_cache).positions_degraded = true;
-                tracing::warn!(
-                    uri = uri.as_ref(),
-                    line = pos.line,
-                    encoding = self.encoding.to_lsp(),
-                    "could not resolve line text for position conversion; passing server \
-                     column through unconverted, which is wrong for a non-UTF-16 server"
-                );
-            }
-            text
+            None
         };
-        lsp_to_mcp_position(pos, line_text.as_deref(), self.encoding)
+        let converted = lsp_to_mcp_position(pos, line_text.as_deref(), self.encoding);
+        if converted.fidelity == ColumnFidelity::PassedThrough
+            && self.record_degradation(PositionDegradation::Response)
+        {
+            tracing::warn!(
+                uri = uri.as_ref(),
+                line = pos.line,
+                encoding = self.encoding.to_lsp(),
+                "could not convert server column exactly; passing it through unconverted, \
+                 which is wrong for a non-UTF-16 server (logged once per response)"
+            );
+        }
+        converted.value
     }
 
     /// Convert an LSP range (in this context's negotiated encoding) from the
@@ -676,7 +698,7 @@ mod tests {
         let ctx = test_ctx_with(PositionEncoding::Utf8);
         lock_std(&ctx.line_cache).bytes_remaining = 10;
 
-        assert!(!ctx.positions_degraded(), "no lookup has happened yet");
+        assert_eq!(ctx.positions_degraded(), None, "no lookup has happened yet");
 
         ctx.to_lsp(
             &uri,
@@ -687,8 +709,9 @@ mod tests {
         )
         .await;
 
-        assert!(
+        assert_eq!(
             ctx.positions_degraded(),
+            Some(PositionDegradation::Request),
             "a line too long for the remaining budget must mark positions_degraded, even on \
              the very first such lookup"
         );
@@ -706,18 +729,136 @@ mod tests {
         let uri = path_to_uri(&dir.path().join("does_not_exist.rs")).unwrap();
 
         let ctx = test_ctx_with(PositionEncoding::Utf8);
-        assert!(!ctx.positions_degraded());
+        assert_eq!(ctx.positions_degraded(), None);
 
         ctx.to_mcp(
             &uri,
             lsp_types::Position {
                 line: 0,
-                character: 0,
+                character: 1,
             },
         )
         .await;
 
-        assert!(ctx.positions_degraded());
+        assert_eq!(
+            ctx.positions_degraded(),
+            Some(PositionDegradation::Response)
+        );
+    }
+
+    fn lsp_position(line: u32, character: u32) -> lsp_types::Position {
+        lsp_types::Position { line, character }
+    }
+
+    /// Column 0 is identical in every encoding, so an unresolvable line must
+    /// not be reported as degraded for it -- and must not cost any I/O.
+    #[tokio::test]
+    async fn test_column_zero_on_unresolvable_line_is_not_degraded_and_skips_io() {
+        let dir = TempDir::new().unwrap();
+        let uri = path_to_uri(&dir.path().join("does_not_exist.rs")).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        let before = lock_std(&ctx.line_cache).bytes_remaining;
+
+        assert_eq!(ctx.to_lsp(&uri, pos(3, 1)).await.character, 0);
+        assert_eq!(ctx.to_mcp(&uri, lsp_position(2, 0)).await.character, 1);
+
+        assert_eq!(ctx.positions_degraded(), None);
+        assert_eq!(lock_std(&ctx.line_cache).bytes_remaining, before);
+        assert!(lock_std(&ctx.line_cache).entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_to_lsp_nonzero_column_on_unresolvable_line_is_request() {
+        let dir = TempDir::new().unwrap();
+        let uri = path_to_uri(&dir.path().join("does_not_exist.rs")).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        let _ = ctx.to_lsp(&uri, pos(1, 2)).await;
+        assert_eq!(ctx.positions_degraded(), Some(PositionDegradation::Request));
+    }
+
+    #[tokio::test]
+    async fn test_request_degradation_subsumes_response_in_either_order() {
+        let dir = TempDir::new().unwrap();
+        let uri = path_to_uri(&dir.path().join("does_not_exist.rs")).unwrap();
+
+        let response_first = test_ctx_with(PositionEncoding::Utf8);
+        let _ = response_first.to_mcp(&uri, lsp_position(0, 3)).await;
+        assert_eq!(
+            response_first.positions_degraded(),
+            Some(PositionDegradation::Response)
+        );
+        let _ = response_first.to_lsp(&uri, pos(1, 3)).await;
+        assert_eq!(
+            response_first.positions_degraded(),
+            Some(PositionDegradation::Request)
+        );
+
+        let request_first = test_ctx_with(PositionEncoding::Utf8);
+        let _ = request_first.to_lsp(&uri, pos(1, 3)).await;
+        let _ = request_first.to_mcp(&uri, lsp_position(0, 3)).await;
+        assert_eq!(
+            request_first.positions_degraded(),
+            Some(PositionDegradation::Request)
+        );
+    }
+
+    fn tracked_ctx(content: &str) -> (EncodingCtx, lsp_types::Uri, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tracked.rs");
+        let tracker = Arc::new(DocumentTracker::new(
+            ResourceLimits::default(),
+            HashMap::new(),
+        ));
+        let uri = tracker.open(path, content.to_string()).unwrap();
+        let ctx = EncodingCtx {
+            encoding: PositionEncoding::Utf8,
+            tracker,
+            workspace_roots: Arc::new(Vec::new()),
+            line_cache: new_line_cache(),
+        };
+        (ctx, uri, dir)
+    }
+
+    /// A column past the end of a tracked line clamps exactly: `"éééé"` is 8
+    /// bytes, so MCP column 6 (UTF-16 offset 5, past the 4 units) is byte 8.
+    #[tokio::test]
+    async fn test_to_lsp_past_end_of_tracked_line_clamps_without_degradation() {
+        let (ctx, uri, _dir) = tracked_ctx("éééé");
+        assert_eq!(ctx.to_lsp(&uri, pos(1, 6)).await.character, 8);
+        assert_eq!(ctx.positions_degraded(), None);
+    }
+
+    /// The empty line after a final newline exists in the tracker, so a
+    /// position on it converts exactly.
+    #[tokio::test]
+    async fn test_to_lsp_on_trailing_empty_line_is_exact() {
+        let (ctx, uri, _dir) = tracked_ctx("fn main() {}\n");
+        assert_eq!(ctx.to_lsp(&uri, pos(2, 1)).await.character, 0);
+        assert_eq!(ctx.to_lsp(&uri, pos(2, 4)).await.character, 0);
+        assert_eq!(ctx.positions_degraded(), None);
+    }
+
+    #[tokio::test]
+    async fn test_to_lsp_mid_surrogate_column_is_request() {
+        let (ctx, uri, _dir) = tracked_ctx("𝄞x");
+        let _ = ctx.to_lsp(&uri, pos(1, 2)).await;
+        assert_eq!(ctx.positions_degraded(), Some(PositionDegradation::Request));
+    }
+
+    #[tokio::test]
+    async fn test_to_mcp_end_of_line_sentinel_is_not_degraded_and_skips_io() {
+        let dir = TempDir::new().unwrap();
+        let uri = path_to_uri(&dir.path().join("does_not_exist.rs")).unwrap();
+
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        assert_eq!(
+            ctx.to_mcp(&uri, lsp_position(0, u32::MAX)).await.character,
+            u32::MAX
+        );
+        assert_eq!(ctx.positions_degraded(), None);
+        assert!(lock_std(&ctx.line_cache).entries.is_empty());
     }
 
     /// Regression for the S1 budget-bypass fix (security re-audit): an

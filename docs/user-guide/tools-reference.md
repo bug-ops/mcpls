@@ -20,10 +20,27 @@ neither blocks or filters the result, they just tell the caller when to apply ex
   `workspace_symbol_search` results, `true` when that location falls outside every configured
   workspace root (e.g. it points into the standard library or a dependency). This is expected and
   common — the location is still valid, just outside the roots you configured.
-- **`positions_degraded`** — set on any result whose position/range could not be reliably
-  converted between LSP's 0-based and MCP's 1-based encoding (disk-read budget exhausted, an
-  unresolvable server-reported path, an oversized file, invalid UTF-8, or a line past EOF), `true`
-  when at least one returned column may be inaccurate.
+- **`positions_degraded`** — set on any result where a column could not be converted exactly
+  between MCP's UTF-16 columns and a non-UTF-16 server's encoding (disk-read budget exhausted, an
+  unresolvable server-reported path, an oversized file, invalid UTF-8, a line past EOF, or a
+  column inside a multi-unit character). It is a string and is omitted when every column converted
+  exactly:
+  - `"request"` — the queried position was sent to the server unconverted, so the result may
+    describe a different symbol; do not trust it.
+  - `"response"` — only returned `character` offsets may be inexact; the result still describes
+    the symbol you asked about and can be kept.
+
+  Column 1 and columns past the end of a line never trigger it (the latter clamp to the line end).
+  For range tools (`get_inlay_hints`, `get_code_actions`), keep the range end inside the file.
+
+### Output Key Naming
+
+Every key mcpls defines in tool results, in the `mcpls-diagnostics://` resource payload, and in
+retryable error `data` is `snake_case` (`indexing_in_progress`, `push_notifications_degraded`,
+`server_id`, `elapsed_secs`), matching tool inputs. Objects passed through unchanged from the
+language server keep LSP's own casing: the `Diagnostic` items inside the resource's `diagnostics`
+array, `selectionRange` on call hierarchy items (so they round-trip into `get_incoming_calls` /
+`get_outgoing_calls`), and the opaque `data` and command `arguments` fields.
 
 ## Tool Index
 
@@ -293,7 +310,7 @@ Get compiler errors, warnings, and hints for a file, including diagnostics from 
 
 ### Returns
 
-An object with a `diagnostics` array plus an `indexingInProgress` flag:
+An object with a `diagnostics` array plus `indexing_in_progress` and `push_notifications_degraded` flags:
 
 ```json
 {
@@ -317,13 +334,16 @@ An object with a `diagnostics` array plus an `indexingInProgress` flag:
       "code": "unused_variables"
     }
   ],
-  "indexingInProgress": false
+  "indexing_in_progress": false,
+  "push_notifications_degraded": false
 }
 ```
 
 Severity levels: `error`, `warning`, `information`, `hint`.
 
-`indexingInProgress` is `true` when the routed language server had an active signal showing its initial workspace indexing was still in progress at any point during this read (checked both before and after the underlying request, so a server that finishes mid-read is still caught) — the diagnostics above may reflect a partial index (still-loading references/types can surface as false errors, or a genuine error can be silently missing). `get_cached_diagnostics` and the `mcpls-diagnostics://` resource carry the same flag. This is independent of the whole-workspace-query readiness gate other tools (`get_hover`, `get_definition`, etc.) block on, configured via `workspace.indexing_ready_timeout_seconds` (see [Configuration Reference](configuration.md)) — `get_diagnostics` never blocks on it, it only flags the result.
+`push_notifications_degraded` is `true` if the language server publishing this file's diagnostics crashed and was restarted during this mcpls session: diagnostics it delivers only by push (e.g. rust-analyzer's flycheck/clippy) are no longer received, so the result may be incomplete until mcpls restarts. Checked both before and after the underlying request, since the request itself can trigger a restart.
+
+`indexing_in_progress` is `true` when the routed language server had an active signal showing its initial workspace indexing was still in progress at any point during this read (checked both before and after the underlying request, so a server that finishes mid-read is still caught) — the diagnostics above may reflect a partial index (still-loading references/types can surface as false errors, or a genuine error can be silently missing). `get_cached_diagnostics` and the `mcpls-diagnostics://` resource carry the same flags. This is independent of the whole-workspace-query readiness gate other tools (`get_hover`, `get_definition`, etc.) block on, configured via `workspace.indexing_ready_timeout_seconds` (see [Configuration Reference](configuration.md)) — `get_diagnostics` never blocks on it, it only flags the result.
 
 ### Example Use Cases
 
@@ -506,6 +526,8 @@ Array of completion items:
   }
 ]
 ```
+
+The result also carries `positions_degraded: "request"` (see [Advisory Flags](#advisory-flags-on-position-bearing-results)) when the queried position could not be converted exactly for a non-UTF-16 server.
 
 Completion kinds:
 - `1` - Text
@@ -757,6 +779,8 @@ Get available code actions (quick fixes, refactorings) for a range.
 | `end_character` | integer | Yes | End character (1-based) |
 | `kind_filter` | string | No | Filter by action kind (quickfix, refactor, source) |
 
+Keep the range end inside the file.
+
 ### Returns
 
 Array of available code actions with edits. An action's `edit.dropped` field, when present and non-empty, means some of that action's changes were withheld (e.g. out-of-workspace files) -- see `rename_symbol`'s Returns section for the shape of `dropped`.
@@ -869,12 +893,12 @@ Get diagnostics from LSP server push notifications (cached), without making a ne
       "range": { "start": { "line": 10, "character": 5 }, "end": { "line": 10, "character": 10 } }
     }
   ],
-  "pushNotificationsDegraded": false,
-  "indexingInProgress": false
+  "push_notifications_degraded": false,
+  "indexing_in_progress": false
 }
 ```
 
-`pushNotificationsDegraded` is `true` if the file's routed server crashed and was respawned since it last published, so this cache entry can no longer be refreshed by a later push until mcpls restarts. `indexingInProgress` is the same signal `get_diagnostics` returns (see that tool's `Returns` section) -- `true` means the routed server was still indexing as of this read, so the cached diagnostics above may reflect a partial index.
+`push_notifications_degraded` is `true` if the file's routed server crashed and was respawned since it last published, so push-only diagnostics are no longer received and the cached diagnostics above may be incomplete until mcpls restarts. `indexing_in_progress` is the same signal `get_diagnostics` returns (see that tool's `Returns` section) -- `true` means the routed server was still indexing as of this read, so the cached diagnostics above may reflect a partial index.
 
 ### Notes
 
@@ -1007,6 +1031,8 @@ Signature help with active parameter highlighted:
 }
 ```
 
+The result also carries `positions_degraded: "request"` (see [Advisory Flags](#advisory-flags-on-position-bearing-results)) when the queried position could not be converted exactly for a non-UTF-16 server.
+
 ### Notes
 
 - Useful when the cursor is inside a function call's argument list
@@ -1136,6 +1162,7 @@ Array of inlay hints with positions and labels:
 
 - Inlay hints show inferred types, parameter names, and other implicit information
 - Request only the lines visible to the AI agent to keep response size manageable
+- Keep the range end inside the file
 
 ---
 
