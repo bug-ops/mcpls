@@ -194,7 +194,10 @@ impl DiagnosticsResourceUri {
     /// path is missing or outside `roots`.
     pub(crate) fn resolve(raw: &str, roots: &[PathBuf]) -> crate::error::Result<ResolvedResource> {
         let parsed = parse_uri(raw)?;
-        let path = validate_path_against_roots(&parsed, roots)?;
+        // `canonicalize` yields a `\\?\` verbatim path on Windows, which LSP
+        // servers never publish; `dunce` strips it where that is safe.
+        let validated = validate_path_against_roots(&parsed, roots)?;
+        let path = dunce::simplified(&validated).to_path_buf();
         let uri = Self(make_uri(&path)?);
         Ok(ResolvedResource { path, uri })
     }

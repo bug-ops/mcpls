@@ -898,19 +898,18 @@ mod tests {
 
     #[test]
     fn test_syntactic_filter_dedupes_and_drops_invalid_keeping_raw_verbatim() {
+        let plain = crate::test_lsp::absolute_uri("a.rs");
+        let encoded = plain.replace("a.rs", "%61.rs");
         let requested = vec![
-            "lsp-diagnostics:///a.rs".to_owned(),
-            "lsp-diagnostics:///%61.rs".to_owned(),
-            "lsp-diagnostics:///a.rs".to_owned(),
+            plain.clone(),
+            encoded.clone(),
+            plain.clone(),
             "file:///b.rs".to_owned(),
             "lsp-diagnostics://host/c.rs".to_owned(),
         ];
         assert_eq!(
             ListenUris::syntactic_filter(&requested),
-            Some(vec![
-                "lsp-diagnostics:///a.rs".to_owned(),
-                "lsp-diagnostics:///%61.rs".to_owned(),
-            ])
+            Some(vec![plain, encoded])
         );
     }
 
@@ -953,7 +952,8 @@ mod tests {
     #[test]
     fn test_listen_uris_resolve_to_nothing_is_empty() {
         let (_dir, root, _file) = workspace_file();
-        let uris = ListenUris::resolve(&["lsp-diagnostics:///no/such/file.rs".to_owned()], &[root]);
+        let uris =
+            ListenUris::resolve(&[crate::test_lsp::absolute_uri("no/such/file.rs")], &[root]);
         assert!(uris.is_empty());
     }
 

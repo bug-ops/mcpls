@@ -3857,7 +3857,7 @@ sleep 0.3
 
     fn listen_test_server() -> (McplsServer, tempfile::TempDir, String) {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         let file = root.join("main.rs");
         std::fs::write(&file, "fn main() {}").unwrap();
         let uri = make_uri(&file).unwrap();
@@ -3873,15 +3873,10 @@ sleep 0.3
     fn test_accepted_subscription_filter_is_always_some_and_syntax_only() {
         let server = create_test_server();
         let mut requested = SubscriptionFilter::new();
-        requested.resource_subscriptions = Some(vec![
-            "lsp-diagnostics:///no/such/file.rs".to_owned(),
-            "file:///bad.rs".to_owned(),
-        ]);
+        let missing = crate::test_lsp::absolute_uri("no/such/file.rs");
+        requested.resource_subscriptions = Some(vec![missing.clone(), "file:///bad.rs".to_owned()]);
         let accepted = server.accepted_subscription_filter(&requested).unwrap();
-        assert_eq!(
-            accepted.resource_subscriptions,
-            Some(vec!["lsp-diagnostics:///no/such/file.rs".to_owned()])
-        );
+        assert_eq!(accepted.resource_subscriptions, Some(vec![missing]));
 
         requested.resource_subscriptions = Some(vec![
             "lsp-diagnostics:///a.rs".to_owned();
@@ -3971,7 +3966,7 @@ sleep 0.3
     #[tokio::test]
     async fn test_prepare_listen_unresolvable_uris_fail_and_release_the_slot() {
         let (server, _dir, _uri) = listen_test_server();
-        let missing = "lsp-diagnostics:///no/such/file.rs".to_owned();
+        let missing = crate::test_lsp::absolute_uri("no/such/file.rs");
         let err = server
             .prepare_listen(
                 std::slice::from_ref(&missing),

@@ -293,6 +293,18 @@ pub fn workspace_with_main_rs() -> (tempfile::TempDir, std::path::PathBuf, std::
     (dir, root, file)
 }
 
+/// An absolute path that is valid on the host platform (Windows needs a drive
+/// letter for `lsp-diagnostics:///` URIs to parse), for URIs that never touch disk.
+pub fn absolute_path(relative: &str) -> std::path::PathBuf {
+    let root = if cfg!(windows) { r"C:\" } else { "/" };
+    std::path::PathBuf::from(root).join(relative)
+}
+
+/// The `lsp-diagnostics:///` URI of the path [`absolute_path`] returns.
+pub fn absolute_uri(relative: &str) -> String {
+    crate::bridge::resources::make_uri(&absolute_path(relative)).unwrap()
+}
+
 /// A diagnostics resource URI built from a literal, bypassing resolution.
 pub fn diagnostics_uri(uri: &str) -> crate::bridge::resources::DiagnosticsResourceUri {
     crate::bridge::resources::DiagnosticsResourceUri::for_test(uri)
