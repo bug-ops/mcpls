@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `workspace.max_file_size` is capped at 1 GiB (`MAX_FILE_SIZE_LIMIT`), and the per-response disk-read budget now derives from it (4x, at most 256 MiB). (#489, #537)
 - **Breaking:** a lone `\r` now ends a line in tracked and on-disk documents, following the LSP line model. (#513, #537)
 - **Breaking:** `SignatureParameter.label` is now `Option<String>` holding the label text for tuple labels, and `CallHierarchyPrepareResult` gains `truncated`; `DocumentTracker::take_evicted` and `EvictedDocument` are removed and `apply_lifecycle_notification` is now public. (#511, #516, #515, #517, #537)
+- **Breaking:** `validate_path_against_roots`, `Translator::set_workspace_roots`, `McplsServer::new` and `BridgeContext::new` take the new `WorkspaceRoots`; a path is accepted only under a canonical root, its configured form or the logical `$PWD`. (#533, #552)
+- **Breaking:** `Error::LspInitFailed` and `Error::ServerExitedDuringInit` gain `stderr: Option<StderrExcerpt>`, a bounded excerpt of the server's stderr with secret-named env, flag and option values redacted. (#534, #552)
+- Accepted HTTP sockets set `TCP_USER_TIMEOUT` to 60 s on Linux and Android, bounding half-open SSE streams; no effect elsewhere or behind a reverse proxy. (#531, #552)
 
 ### Fixed
 
@@ -72,6 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tuple signature-parameter labels are returned as label text instead of raw server-encoding offsets. (#511, #537)
 - Tracker line lookups use a sparse line index instead of an O(offset) scan under the global mutex. (#488, #537)
 - HTTP transport tests bind their own listener and no longer sleep, the timeout test is replaced by deterministic paused-clock tests, and the diagnostics test polls only while indexing. (#524, #518, #517, #537)
+- `get_cached_diagnostics` and the diagnostics resource now report a server startup failure instead of an empty list. (#535, #552)
+- Paths outside every workspace root are rejected before any filesystem access, narrowing the existence oracle for outside paths. (#533, #552)
+- Diagnostics published under a symlink spelling are keyed by the canonical path, merged per source on read, and now match subscriptions. (#532, #552)
 
 ## [0.6.0] - 2026-09-21
 
