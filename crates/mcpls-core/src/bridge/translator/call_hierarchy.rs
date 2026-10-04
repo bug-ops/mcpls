@@ -12,6 +12,7 @@ use super::dto::{
     OutgoingCall, OutgoingCallsResult, Position, lsp_kind_to_u32,
 };
 use super::encoding_ctx::EncodingCtx;
+use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
@@ -119,7 +120,7 @@ impl Translator {
             )));
         }
 
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::CallHierarchy,
@@ -127,12 +128,13 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, position).await;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
+        let lsp_position = ctx.to_lsp(uri, position).await;
 
         let params = LspCallHierarchyPrepareParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: lsp_position,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -186,7 +188,7 @@ impl Translator {
 
         // Same ToolKind/route as `handle_call_hierarchy_prepare`.
         let path = self.parse_file_uri(&parsed.uri)?;
-        let (server_id, client, _uri) = self
+        let doc = self
             .prepare_gated_document_for_path(
                 &path,
                 ToolKind::CallHierarchy,
@@ -194,7 +196,8 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
+        let (server_id, client, _uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
         let lsp_item = call_hierarchy_item_to_lsp(parsed, &ctx).await;
 
         let params = CallHierarchyIncomingCallsParams {
@@ -212,20 +215,21 @@ impl Translator {
 
         // Pre-allocate and build result. Not filtered to workspace roots --
         // see `handle_call_hierarchy_prepare`'s comment above.
-        let lsp_calls = response.unwrap_or_default();
-        let mut calls = Vec::with_capacity(lsp_calls.len());
+        let mut budget = ItemBudget::new();
+        let mut calls = Vec::new();
 
-        for call in lsp_calls {
+        for call in response.unwrap_or_default() {
+            // A call is kept together with all its ranges or not at all.
+            if !budget.spend_whole(1 + call.from_ranges.len()) {
+                continue;
+            }
             // Per the LSP spec, `fromRanges` are ranges within the *caller's*
             // document (`call.from.uri`), not the queried item's document.
             let from_uri = call.from.uri.clone();
-            let from_ranges = {
-                let mut ranges = Vec::with_capacity(call.from_ranges.len());
-                for range in call.from_ranges {
-                    ranges.push(ctx.normalize_range(&from_uri, range).await);
-                }
-                ranges
-            };
+            let mut from_ranges = Vec::with_capacity(call.from_ranges.len());
+            for range in call.from_ranges {
+                from_ranges.push(ctx.normalize_range(&from_uri, range).await);
+            }
 
             calls.push(IncomingCall {
                 from: convert_call_hierarchy_item(call.from, &ctx).await,
@@ -235,6 +239,7 @@ impl Translator {
 
         Ok(IncomingCallsResult {
             calls,
+            truncated: budget.truncated(),
             positions_degraded: ctx.positions_degraded(),
         })
     }
@@ -261,7 +266,7 @@ impl Translator {
         // `handle_incoming_calls` -- see that function's comment (#423).
         // Same ToolKind/route as `prepare`.
         let path = self.parse_file_uri(&parsed.uri)?;
-        let (server_id, client, _uri) = self
+        let doc = self
             .prepare_gated_document_for_path(
                 &path,
                 ToolKind::CallHierarchy,
@@ -269,7 +274,8 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
+        let (server_id, client, _uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
         // Per the LSP spec, an outgoing call's `fromRanges` are ranges within
         // the *queried* item's own document, not the callee's (`call.to.uri`).
         let source_uri = parsed.uri.clone();
@@ -290,17 +296,17 @@ impl Translator {
 
         // Pre-allocate and build result. Not filtered to workspace roots --
         // see `handle_call_hierarchy_prepare`'s comment above.
-        let lsp_calls = response.unwrap_or_default();
-        let mut calls = Vec::with_capacity(lsp_calls.len());
+        let mut budget = ItemBudget::new();
+        let mut calls = Vec::new();
 
-        for call in lsp_calls {
-            let from_ranges = {
-                let mut ranges = Vec::with_capacity(call.from_ranges.len());
-                for range in call.from_ranges {
-                    ranges.push(ctx.normalize_range(&source_uri, range).await);
-                }
-                ranges
-            };
+        for call in response.unwrap_or_default() {
+            if !budget.spend_whole(1 + call.from_ranges.len()) {
+                continue;
+            }
+            let mut from_ranges = Vec::with_capacity(call.from_ranges.len());
+            for range in call.from_ranges {
+                from_ranges.push(ctx.normalize_range(&source_uri, range).await);
+            }
 
             calls.push(OutgoingCall {
                 to: convert_call_hierarchy_item(call.to, &ctx).await,
@@ -310,6 +316,7 @@ impl Translator {
 
         Ok(OutgoingCallsResult {
             calls,
+            truncated: budget.truncated(),
             positions_degraded: ctx.positions_degraded(),
         })
     }
@@ -1261,5 +1268,190 @@ mod tests {
             incoming_result.is_ok(),
             "expected success resolving the percent-encoded path, got {incoming_result:?}"
         );
+    }
+
+    #[derive(Clone, Copy)]
+    enum Direction {
+        Incoming,
+        Outgoing,
+    }
+
+    impl Direction {
+        const fn lsp_method(self) -> &'static str {
+            match self {
+                Self::Incoming => "callHierarchy/incomingCalls",
+                Self::Outgoing => "callHierarchy/outgoingCalls",
+            }
+        }
+
+        /// Name of the call's item field in the LSP response (`from`/`to`).
+        const fn item_field(self) -> &'static str {
+            match self {
+                Self::Incoming => "from",
+                Self::Outgoing => "to",
+            }
+        }
+    }
+
+    /// Drives `handle_incoming_calls`/`handle_outgoing_calls` against a
+    /// server answering with `response`, returning the JSON-serialized result.
+    async fn calls_with_response(
+        direction: Direction,
+        response: impl FnOnce(&str) -> serde_json::Value,
+    ) -> serde_json::Value {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let queried_path = dir.path().join("queried.rs");
+        fs::write(&queried_path, "fn queried() {}").unwrap();
+        let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
+        let item = call_hierarchy_item_json(&queried_uri);
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                match direction {
+                    Direction::Incoming => {
+                        serde_json::to_value(translator.handle_incoming_calls(item).await.unwrap())
+                    }
+                    Direction::Outgoing => {
+                        serde_json::to_value(translator.handle_outgoing_calls(item).await.unwrap())
+                    }
+                }
+                .unwrap()
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], direction.lsp_method());
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            response(&queried_uri),
+        )
+        .await;
+
+        timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("handler call should not hang")
+            .unwrap()
+    }
+
+    fn hierarchy_call_json(uri: &str, direction: Direction, ranges: usize) -> serde_json::Value {
+        let range = serde_json::json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 1}
+        });
+        serde_json::json!({
+            direction.item_field(): {
+                "name": "f", "kind": 12, "uri": uri,
+                "range": range, "selectionRange": range
+            },
+            "fromRanges": vec![range; ranges]
+        })
+    }
+
+    fn range_count(call: &serde_json::Value) -> usize {
+        call["from_ranges"].as_array().unwrap().len()
+    }
+
+    /// #487: a call and its `fromRanges` draw on one budget; a call that does
+    /// not fit with all its ranges is dropped whole, never returned with
+    /// fewer (or no) ranges.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_drops_call_whole_when_ranges_exceed_budget() {
+        use crate::bridge::translator::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let result = calls_with_response(Direction::Incoming, |uri| {
+            serde_json::json!([hierarchy_call_json(
+                uri,
+                Direction::Incoming,
+                MAX_NORMALIZED_LOCATIONS
+            )])
+        })
+        .await;
+
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["calls"].as_array().unwrap().len(), 0);
+    }
+
+    /// #487 I1: when several calls jointly exceed the cap, every returned call
+    /// still carries all its ranges and the rest are dropped.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_never_returns_call_with_ranges_cut() {
+        use crate::bridge::translator::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let ranges_per_call = MAX_NORMALIZED_LOCATIONS / 2;
+        let result = calls_with_response(Direction::Incoming, |uri| {
+            let call = hierarchy_call_json(uri, Direction::Incoming, ranges_per_call);
+            serde_json::Value::Array(vec![call; 3])
+        })
+        .await;
+
+        assert_eq!(result["truncated"], true);
+        let calls = result["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(range_count(&calls[0]), ranges_per_call);
+    }
+
+    /// #487: one call plus `MAX_NORMALIZED_LOCATIONS - 1` ranges is exactly
+    /// the cap and must not be flagged.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_exactly_at_cap_is_not_truncated() {
+        use crate::bridge::translator::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let result = calls_with_response(Direction::Incoming, |uri| {
+            serde_json::json!([hierarchy_call_json(
+                uri,
+                Direction::Incoming,
+                MAX_NORMALIZED_LOCATIONS - 1
+            )])
+        })
+        .await;
+
+        assert!(result.get("truncated").is_none());
+        assert_eq!(
+            range_count(&result["calls"][0]),
+            MAX_NORMALIZED_LOCATIONS - 1
+        );
+    }
+
+    /// #487: outgoing calls beyond the cap are dropped and reported.
+    #[tokio::test]
+    async fn test_handle_outgoing_calls_caps_item_count_and_reports_truncation() {
+        use crate::bridge::translator::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let result = calls_with_response(Direction::Outgoing, |uri| {
+            let call = hierarchy_call_json(uri, Direction::Outgoing, 0);
+            serde_json::Value::Array(vec![call; MAX_NORMALIZED_LOCATIONS + 500])
+        })
+        .await;
+
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["calls"].as_array().unwrap().len(),
+            MAX_NORMALIZED_LOCATIONS
+        );
+    }
+
+    /// #487: a response within the cap is not flagged.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_within_cap_is_not_truncated() {
+        let result = calls_with_response(Direction::Incoming, |uri| {
+            serde_json::json!([hierarchy_call_json(uri, Direction::Incoming, 0)])
+        })
+        .await;
+
+        assert!(result.get("truncated").is_none());
     }
 }

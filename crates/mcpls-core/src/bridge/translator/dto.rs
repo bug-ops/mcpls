@@ -254,6 +254,16 @@ pub struct DroppedEdits {
     /// advertises no `snippetEditSupport`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unsupported_snippet_edit: usize,
+    /// Edits not admitted because the response exceeded
+    /// `MAX_NORMALIZED_LOCATIONS` (#487), including whole files skipped once
+    /// the budget was spent.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub exceeds_item_cap: usize,
+    /// `documentChanges` text-document edits ignored because a non-empty
+    /// `changes` map took precedence and did not already name their URI
+    /// (#498).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shadowed_by_changes: usize,
 }
 
 impl DroppedEdits {
@@ -421,6 +431,12 @@ pub struct CommandDescription {
 pub struct CodeActionsResult {
     /// Available code actions.
     pub actions: Vec<CodeAction>,
+    /// Whether `actions`, their diagnostics, or their edits were capped below
+    /// the LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487);
+    /// a per-action `dropped.exceeds_item_cap` pinpoints dropped edits.
+    /// Omitted (defaults to `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// Whether a position in this response could not be resolved for
     /// encoding conversion -- disk-read budget exhaustion, an unresolvable
     /// server-supplied path, a line past EOF, or invalid UTF-8 content can
@@ -492,6 +508,11 @@ pub struct IncomingCall {
 pub struct IncomingCallsResult {
     /// List of incoming calls.
     pub calls: Vec<IncomingCall>,
+    /// Whether `calls` (together with their `from_ranges`) was capped below
+    /// the LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487).
+    /// Omitted (defaults to `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// Whether a position in this response could not be resolved for
     /// encoding conversion -- disk-read budget exhaustion, an unresolvable
     /// server-supplied path, a line past EOF, or invalid UTF-8 content can
@@ -516,6 +537,11 @@ pub struct OutgoingCall {
 pub struct OutgoingCallsResult {
     /// List of outgoing calls.
     pub calls: Vec<OutgoingCall>,
+    /// Whether `calls` (together with their `from_ranges`) was capped below
+    /// the LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487).
+    /// Omitted (defaults to `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// Whether a position in this response could not be resolved for
     /// encoding conversion -- disk-read budget exhaustion, an unresolvable
     /// server-supplied path, a line past EOF, or invalid UTF-8 content can
@@ -623,6 +649,11 @@ pub struct InlayHintEntry {
 pub struct InlayHintsResult {
     /// List of inlay hints.
     pub hints: Vec<InlayHintEntry>,
+    /// Whether `hints` was capped below the LSP server's full response (see
+    /// `MAX_NORMALIZED_LOCATIONS`, #487). Omitted (defaults to `false`) when
+    /// serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// Whether a position in this response could not be resolved for
     /// encoding conversion -- disk-read budget exhaustion, an unresolvable
     /// server-supplied path, a line past EOF, or invalid UTF-8 content can

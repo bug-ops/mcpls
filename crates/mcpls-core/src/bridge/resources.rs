@@ -427,7 +427,7 @@ impl SubscriptionRegistry {
     /// length is what lets an integration test tell "many dead entries piled
     /// up because nothing ever called a pruning method" apart from "the
     /// registry stayed bounded".
-    #[cfg(test)]
+    #[cfg(all(test, feature = "transport-http"))]
     pub(crate) fn raw_len(&self) -> usize {
         lock_std(&self.0).len()
     }

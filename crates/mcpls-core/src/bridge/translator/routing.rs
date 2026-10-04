@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use super::Translator;
-use crate::bridge::lock_std;
 use crate::bridge::state::detect_language;
+use crate::bridge::{InFlightGuard, lock_std};
 use crate::config::{ServerId, ToolKind, base_language_id};
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
@@ -15,6 +15,37 @@ pub(super) const MAX_POSITION_VALUE: u32 = 1_000_000;
 
 /// Maximum allowed range size in lines.
 pub(super) const MAX_RANGE_LINES: u32 = 10_000;
+
+/// A document opened for a handler's LSP round-trip, together with the
+/// routed server and client.
+///
+/// Owns an [`InFlightGuard`], so the document cannot be evicted by the
+/// document tracker's LRU while this value is alive (#503). Fields are
+/// reachable only through borrowing accessors, so a handler must keep the
+/// whole `PreparedDocument` bound until its request completes -- destructuring
+/// it would drop the guard early.
+#[derive(Debug)]
+#[must_use = "dropping a PreparedDocument makes its document evictable mid-request"]
+pub(super) struct PreparedDocument {
+    server_id: ServerId,
+    client: LspClient,
+    uri: lsp_types::Uri,
+    _in_flight: InFlightGuard,
+}
+
+impl PreparedDocument {
+    pub(super) const fn server_id(&self) -> &ServerId {
+        &self.server_id
+    }
+
+    pub(super) const fn client(&self) -> &LspClient {
+        &self.client
+    }
+
+    pub(super) const fn uri(&self) -> &lsp_types::Uri {
+        &self.uri
+    }
+}
 
 /// Validate that `path` is within one of `workspace_roots`.
 ///
@@ -450,10 +481,25 @@ impl Translator {
         &self,
         file_path: &str,
         tool: ToolKind,
-    ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
+    ) -> Result<PreparedDocument> {
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
+        self.open_prepared(server_id, client, &validated_path).await
+    }
+
+    /// Marks `validated_path` in flight, then opens it via `ensure_open`.
+    ///
+    /// The guard is taken before `ensure_open` so there is no window between
+    /// the path lock releasing and the guard taking effect (#503); it is
+    /// dropped with the error on failure.
+    async fn open_prepared(
+        &self,
+        server_id: ServerId,
+        client: LspClient,
+        validated_path: &Path,
+    ) -> Result<PreparedDocument> {
+        let in_flight = self.document_tracker.mark_in_flight(validated_path);
         // Drained unconditionally, before propagating `ensure_open`'s
         // result: even on its error path (e.g. a `didOpen`/`didChange`
         // notify failure), `DocumentTracker::open` may already have evicted
@@ -462,11 +508,16 @@ impl Translator {
         // leaving the tracker desynced from that server (#495 S5).
         let result = self
             .document_tracker
-            .ensure_open(&validated_path, &server_id, &client)
+            .ensure_open(validated_path, &server_id, &client)
             .await;
         self.notify_evicted_documents().await;
         let uri = result?;
-        Ok((server_id, client, uri))
+        Ok(PreparedDocument {
+            server_id,
+            client,
+            uri,
+            _in_flight: in_flight,
+        })
     }
 
     /// Like [`Self::prepare_document`], but checks `capability` against the
@@ -490,7 +541,7 @@ impl Translator {
         tool: ToolKind,
         capability: Capability,
         indexing_gate: IndexingGate,
-    ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
+    ) -> Result<PreparedDocument> {
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
@@ -514,7 +565,7 @@ impl Translator {
         tool: ToolKind,
         capability: Capability,
         indexing_gate: IndexingGate,
-    ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
+    ) -> Result<PreparedDocument> {
         let (server_id, client, validated_path) =
             self.resolve_validated_client_for_path(path, tool).await?;
         self.finish_prepare_gated_document(
@@ -537,21 +588,12 @@ impl Translator {
         validated_path: PathBuf,
         capability: Capability,
         indexing_gate: IndexingGate,
-    ) -> Result<(ServerId, LspClient, lsp_types::Uri)> {
+    ) -> Result<PreparedDocument> {
         self.require_capability(&server_id, capability)?;
         if indexing_gate == IndexingGate::Required {
             self.wait_for_indexing_ready(&server_id).await?;
         }
-        // See `prepare_document`'s matching comment (#495 S5): drained
-        // unconditionally, before propagating the result, so a queued
-        // eviction from this call is never lost on `ensure_open`'s error path.
-        let result = self
-            .document_tracker
-            .ensure_open(&validated_path, &server_id, &client)
-            .await;
-        self.notify_evicted_documents().await;
-        let uri = result?;
-        Ok((server_id, client, uri))
+        self.open_prepared(server_id, client, &validated_path).await
     }
 
     /// Sends `textDocument/didClose` to every server that had a document
@@ -1306,16 +1348,11 @@ mod tests {
         }
     }
 
-    /// #495: once `DocumentTracker::open`'s LRU eviction reclaims a document
-    /// to make room under `max_documents`, `prepare_document` must notify
-    /// that document's server with `textDocument/didClose` -- `DocumentTracker`
-    /// itself has no `LspClient` access to do this, so it's `Translator`'s
-    /// job (`notify_evicted_documents`) once `ensure_open` returns.
-    #[tokio::test]
-    async fn test_prepare_document_sends_didclose_for_evicted_document() {
+    /// Translator routing `.aa` files to one fake server, tracking at most one
+    /// document so a second open must evict or be refused.
+    fn single_document_translator(dir: &TempDir) -> (Translator, crate::test_lsp::FakeServer) {
         use crate::bridge::state::ResourceLimits;
 
-        let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
         extensions.insert("aa".to_string(), "lang_a".to_string());
 
@@ -1331,27 +1368,43 @@ mod tests {
             });
         translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
 
-        let (client, mut server) = fake_lsp_client();
+        let (client, server) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client);
+        (translator, server)
+    }
+
+    /// #495: once `DocumentTracker::open`'s LRU eviction reclaims a document
+    /// to make room under `max_documents`, `prepare_document` must notify
+    /// that document's server with `textDocument/didClose` -- `DocumentTracker`
+    /// itself has no `LspClient` access to do this, so it's `Translator`'s
+    /// job (`notify_evicted_documents`) once `ensure_open` returns.
+    #[tokio::test]
+    async fn test_prepare_document_sends_didclose_for_evicted_document() {
+        let dir = TempDir::new().unwrap();
+        let (translator, mut server) = single_document_translator(&dir);
 
         let path_a = dir.path().join("a.aa");
         fs::write(&path_a, "content a").unwrap();
         let path_b = dir.path().join("b.aa");
         fs::write(&path_b, "content b").unwrap();
 
-        translator
-            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
-            .await
-            .unwrap();
+        drop(
+            translator
+                .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+                .await
+                .unwrap(),
+        );
 
         let mut wire = BufReader::new(&mut server.write_stdout);
         let opened_a = read_framed_message(&mut wire).await;
         assert_eq!(opened_a["method"], "textDocument/didOpen");
 
-        translator
-            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
-            .await
-            .unwrap();
+        drop(
+            translator
+                .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+                .await
+                .unwrap(),
+        );
 
         let opened_b = read_framed_message(&mut wire).await;
         assert_eq!(opened_b["method"], "textDocument/didOpen");
@@ -1364,6 +1417,115 @@ mod tests {
             closed_a["params"]["textDocument"]["uri"], opened_a["params"]["textDocument"]["uri"],
             "the didClose must name the evicted document, not the newly opened one"
         );
+    }
+
+    /// #503: a handler still holding its `PreparedDocument` (i.e. mid LSP
+    /// round-trip) keeps that document out of eviction, so a concurrent
+    /// `prepare_document` for another path at `max_documents: 1` fails with
+    /// `DocumentLimitExceeded` instead of evicting it; once the first
+    /// `PreparedDocument` drops, the second path opens and evicts the first.
+    #[tokio::test]
+    async fn test_prepared_document_blocks_eviction_until_dropped() {
+        let dir = TempDir::new().unwrap();
+        let (translator, _server) = single_document_translator(&dir);
+
+        let path_a = dir.path().join("a.aa");
+        fs::write(&path_a, "content a").unwrap();
+        let path_b = dir.path().join("b.aa");
+        fs::write(&path_b, "content b").unwrap();
+
+        let doc_a = translator
+            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap();
+
+        let err = translator
+            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DocumentLimitExceeded { .. }));
+
+        drop(doc_a);
+        drop(
+            translator
+                .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+                .await
+                .unwrap(),
+        );
+    }
+
+    /// #503: two handlers holding the same path concurrently each own a
+    /// guard; the path stays protected until the *second* one drops.
+    #[tokio::test]
+    async fn test_two_prepared_documents_on_same_path_are_refcounted() {
+        let dir = TempDir::new().unwrap();
+        let (translator, _server) = single_document_translator(&dir);
+
+        let path_a = dir.path().join("a.aa");
+        fs::write(&path_a, "content a").unwrap();
+        let path_b = dir.path().join("b.aa");
+        fs::write(&path_b, "content b").unwrap();
+        let canonical_a = path_a.canonicalize().unwrap();
+
+        let first = translator
+            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap();
+        let second = translator
+            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap();
+        assert_eq!(translator.document_tracker.in_flight_count(&canonical_a), 2);
+
+        drop(first);
+        let err = translator
+            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DocumentLimitExceeded { .. }));
+
+        drop(second);
+        assert_eq!(translator.document_tracker.in_flight_count(&canonical_a), 0);
+        drop(
+            translator
+                .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+                .await
+                .unwrap(),
+        );
+    }
+
+    /// #503: when `ensure_open` fails, `prepare_document` returns the error
+    /// without leaving the path marked in flight.
+    #[tokio::test]
+    async fn test_prepare_document_releases_in_flight_guard_when_ensure_open_fails() {
+        let dir = TempDir::new().unwrap();
+        let mut extensions = HashMap::new();
+        extensions.insert("bb".to_string(), "lang_b".to_string());
+
+        let mut translator =
+            Translator::new()
+                .with_extensions(extensions)
+                .with_router(ToolRouter::catch_all([(
+                    ServerId::from("lang_b"),
+                    "lang_b".to_string(),
+                )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let (client, _server) = fake_lsp_client();
+        translator.register_client("lang_b".to_string(), client.clone());
+
+        let path_b = dir.path().join("b.bb");
+        fs::write(&path_b, "content b").unwrap();
+        let canonical_b = path_b.canonicalize().unwrap();
+
+        client.shutdown().await.unwrap();
+        let err = translator
+            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::ServerTerminated));
+        assert_eq!(translator.document_tracker.in_flight_count(&canonical_b), 0);
     }
 
     /// #495 S5: even when `ensure_open` itself fails for the document being
@@ -1405,10 +1567,12 @@ mod tests {
         let path_b = dir.path().join("b.bb");
         fs::write(&path_b, "content b").unwrap();
 
-        translator
-            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
-            .await
-            .unwrap();
+        drop(
+            translator
+                .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+                .await
+                .unwrap(),
+        );
 
         let mut wire_a = BufReader::new(&mut server_a.write_stdout);
         let opened_a = read_framed_message(&mut wire_a).await;

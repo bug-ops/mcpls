@@ -523,7 +523,7 @@ impl McplsServer {
     /// real HTTP factory/session-close path (`transport.rs`'s integration
     /// tests) can assert on registry state without reaching into private
     /// `BridgeContext` fields cross-module.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "transport-http"))]
     pub(crate) fn subscription_registry(&self) -> SubscriptionRegistry {
         self.context.subscription_registry.clone()
     }
@@ -706,7 +706,7 @@ impl McplsServer {
     // read-only: returns a proposed WorkspaceEdit, does not apply it -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty. `positions_degraded: true` means some returned edit ranges' `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. `positions_degraded: true` means some returned edit ranges' `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Rename Symbol"
     )]
     async fn rename_symbol(
@@ -819,7 +819,7 @@ impl McplsServer {
     // read-only: returns proposed CodeAction edits, does not apply them --
     // mcpls has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). `positions_degraded: true` on the result means some returned `character` offsets (diagnostic or edit ranges) may be inexact (only possible for a non-UTF-16 server).",
+        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). `positions_degraded: true` on the result means some returned `character` offsets (diagnostic or edit ranges) may be inexact (only possible for a non-UTF-16 server).",
         title = "Code Actions"
     )]
     async fn get_code_actions(
@@ -878,7 +878,7 @@ impl McplsServer {
 
     /// Get incoming calls (callers).
     #[tool(
-        description = "Functions calling the specified item. Takes call hierarchy item, returns all callers. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = "Functions calling the specified item. Takes call hierarchy item, returns callers, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Incoming Calls"
     )]
     async fn get_incoming_calls(
@@ -890,7 +890,7 @@ impl McplsServer {
 
     /// Get outgoing calls (callees).
     #[tool(
-        description = "Functions called by the specified item. Takes call hierarchy item, returns all callees. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = "Functions called by the specified item. Takes call hierarchy item, returns callees, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Outgoing Calls"
     )]
     async fn get_outgoing_calls(
@@ -1059,7 +1059,7 @@ impl McplsServer {
 
     /// Get inlay hints for a range.
     #[tool(
-        description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. `positions_degraded: true` on the result means some returned hint `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Capped at a fixed maximum; `truncated: true` on the result means more hints exist than are returned. `positions_degraded: true` on the result means some returned hint `character` offsets may be inexact (only possible for a non-UTF-16 server).",
         title = "Inlay Hints"
     )]
     async fn get_inlay_hints(

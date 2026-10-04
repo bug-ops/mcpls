@@ -11,6 +11,7 @@ use super::dto::{
     Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, SignatureHelpResult,
     SignatureInfo, SignatureParameter, lsp_kind_to_u32,
 };
+use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
@@ -65,7 +66,7 @@ impl Translator {
     ) -> Result<CompletionsResult> {
         validate_completions_params(trigger.as_deref())?;
 
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Completions,
@@ -73,7 +74,8 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let lsp_position = self.encoding_ctx(&server_id).to_lsp(&uri, position).await;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let lsp_position = self.encoding_ctx(server_id).to_lsp(uri, position).await;
 
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
             trigger_kind: CompletionTriggerKind::TriggerCharacter,
@@ -82,7 +84,7 @@ impl Translator {
 
         let params = CompletionParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: lsp_position,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -132,7 +134,7 @@ impl Translator {
         file_path: String,
         position: Position,
     ) -> Result<SignatureHelpResult> {
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::SignatureHelp,
@@ -140,11 +142,12 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
-        let lsp_position = self.encoding_ctx(&server_id).to_lsp(&uri, position).await;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let lsp_position = self.encoding_ctx(server_id).to_lsp(uri, position).await;
 
         let params = LspSignatureHelpParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: lsp_position,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -210,7 +213,7 @@ impl Translator {
         start: Position,
         end: Position,
     ) -> Result<InlayHintsResult> {
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::InlayHints,
@@ -218,14 +221,15 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
         let response_uri = uri.clone();
 
-        let lsp_start = ctx.to_lsp(&uri, start).await;
-        let lsp_end = ctx.to_lsp(&uri, end).await;
+        let lsp_start = ctx.to_lsp(uri, start).await;
+        let lsp_end = ctx.to_lsp(uri, end).await;
 
         let params = InlayHintParams {
-            text_document: TextDocumentIdentifier { uri },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             range: lsp_types::Range {
                 start: lsp_start,
                 end: lsp_end,
@@ -237,8 +241,10 @@ impl Translator {
             .request_typed::<lsp_types::InlayHintRequest>(params, client.request_timeout())
             .await?;
 
-        let mut hints = Vec::new();
-        for hint in response.unwrap_or_default() {
+        let mut budget = ItemBudget::new();
+        let lsp_hints = budget.admit(response.unwrap_or_default());
+        let mut hints = Vec::with_capacity(lsp_hints.len());
+        for hint in lsp_hints {
             let position = ctx.to_mcp(&response_uri, hint.position).await;
             let label = match hint.label {
                 lsp_types::Label::String(s) => s,
@@ -264,6 +270,7 @@ impl Translator {
 
         Ok(InlayHintsResult {
             hints,
+            truncated: budget.truncated(),
             positions_degraded: ctx.positions_degraded(),
         })
     }
@@ -472,5 +479,76 @@ mod tests {
             Some(300u32),
             "a custom InlayHintKind above u8::MAX must not be truncated or dropped"
         );
+    }
+
+    async fn inlay_hints_with_response(count: usize) -> InlayHintsResult {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+
+        use crate::bridge::translator::testing::pos;
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            inlay_hint_provider: Some(lsp_types::InlayHintProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move {
+                translator
+                    .handle_inlay_hints(path, pos(1, 1), pos(1, 13))
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/inlayHint");
+
+        let hints: Vec<_> = (0..count)
+            .map(|_| serde_json::json!({"position": {"line": 0, "character": 5}, "label": "h"}))
+            .collect();
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::Value::Array(hints),
+        )
+        .await;
+
+        handle.await.unwrap().unwrap()
+    }
+
+    /// #487: inlay hints beyond `MAX_NORMALIZED_LOCATIONS` are dropped and
+    /// reported via `truncated`.
+    #[tokio::test]
+    async fn test_handle_inlay_hints_caps_item_count_and_reports_truncation() {
+        use crate::bridge::translator::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let result = inlay_hints_with_response(MAX_NORMALIZED_LOCATIONS + 500).await;
+        assert_eq!(result.hints.len(), MAX_NORMALIZED_LOCATIONS);
+        assert!(result.truncated);
+    }
+
+    /// #487: exactly `MAX_NORMALIZED_LOCATIONS` hints is not truncation.
+    #[tokio::test]
+    async fn test_handle_inlay_hints_at_cap_is_not_truncated() {
+        use crate::bridge::translator::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let result = inlay_hints_with_response(MAX_NORMALIZED_LOCATIONS).await;
+        assert_eq!(result.hints.len(), MAX_NORMALIZED_LOCATIONS);
+        assert!(!result.truncated);
     }
 }

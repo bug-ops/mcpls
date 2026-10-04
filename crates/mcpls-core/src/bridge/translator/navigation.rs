@@ -87,17 +87,87 @@ fn definition_link_to_location(link: lsp_types::DefinitionLink) -> lsp_types::Lo
     }
 }
 
-/// Hard cap on the number of `Location`s/symbols a single call normalizes
-/// (`goto`, `references`, `workspace_symbol_search`). Without a limit, a
-/// response naming an unbounded number of locations turns one MCP tool call
-/// into an unbounded number of range conversions -- each one a potential
-/// disk read on a cache miss -- letting a hostile or misbehaving LSP server
-/// amplify one request into massive I/O (see #474). Applied before
-/// normalization, not after, so it bounds the work actually done rather
-/// than just the size of the returned list. Also used by
-/// `Translator::handle_workspace_symbol` to clamp its caller-supplied
-/// `limit`, which otherwise has no upper bound of its own.
+/// Hard cap on the number of items a single call normalizes (`goto`,
+/// `references`, `workspace_symbol_search`, call hierarchy, inlay hints,
+/// workspace-edit entries). Without a limit, a response naming an unbounded
+/// number of items turns one MCP tool call into an unbounded number of range
+/// conversions -- each one a potential disk read on a cache miss -- letting a
+/// hostile or misbehaving LSP server amplify one request into massive I/O
+/// (see #474, #487). Applied before normalization, not after, so it bounds
+/// the work actually done rather than just the size of the returned list.
+/// Also used by `Translator::handle_workspace_symbol` to clamp its
+/// caller-supplied `limit`, which otherwise has no upper bound of its own.
 pub(super) const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
+
+/// Per-response allowance of [`MAX_NORMALIZED_LOCATIONS`] items.
+///
+/// Every item a handler normalizes must first pass through [`Self::admit`],
+/// so nested loops (e.g. call hierarchy `fromRanges`, workspace-edit
+/// per-file edit lists) share one budget and total work stays within the cap
+/// rather than multiplying per level (#487).
+#[derive(Debug)]
+pub(super) struct ItemBudget {
+    remaining: usize,
+    truncated: bool,
+}
+
+impl ItemBudget {
+    /// A fresh budget holding the full [`MAX_NORMALIZED_LOCATIONS`].
+    pub(super) const fn new() -> Self {
+        Self {
+            remaining: MAX_NORMALIZED_LOCATIONS,
+            truncated: false,
+        }
+    }
+
+    /// Keeps at most the remaining allowance of `items`, spending it, and
+    /// records whether anything was dropped. Logs one `warn!` on the first
+    /// drop of the response.
+    pub(super) fn admit<T>(&mut self, mut items: Vec<T>) -> Vec<T> {
+        if items.len() > self.remaining {
+            self.record_drop(items.len());
+            items.truncate(self.remaining);
+        }
+        self.remaining -= items.len();
+        items
+    }
+
+    /// Admits `items` only if all of them fit the remaining allowance;
+    /// otherwise admits none and records the drop. For lists that must not be
+    /// cut midway, such as one file's workspace edits.
+    pub(super) fn admit_whole<T>(&mut self, items: Vec<T>) -> Option<Vec<T>> {
+        self.spend_whole(items.len()).then_some(items)
+    }
+
+    /// Spends `count` items of the allowance if all of them fit, otherwise
+    /// spends nothing and records the drop. For a group, such as a call and
+    /// its ranges, that must be kept or dropped together.
+    pub(super) fn spend_whole(&mut self, count: usize) -> bool {
+        if count > self.remaining {
+            self.record_drop(count);
+            return false;
+        }
+        self.remaining -= count;
+        true
+    }
+
+    fn record_drop(&mut self, reported: usize) {
+        if !self.truncated {
+            tracing::warn!(
+                reported,
+                cap = MAX_NORMALIZED_LOCATIONS,
+                "LSP response item count exceeds MAX_NORMALIZED_LOCATIONS; truncating"
+            );
+        }
+        self.truncated = true;
+    }
+
+    /// Whether any admission ([`Self::admit`], [`Self::admit_whole`], or
+    /// [`Self::spend_whole`]) dropped items.
+    pub(super) const fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
 
 /// Converts raw LSP locations into MCP-facing `Location` values, normalizing
 /// each range into the caller's 1-based coordinate space.
@@ -116,18 +186,12 @@ pub(super) const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
 /// `validate_path_against_roots` gate (`mcp/server.rs`), which fails closed,
 /// so the untrusted-URI concern is already covered downstream.
 async fn lsp_locations_to_mcp(
-    mut locs: Vec<lsp_types::Location>,
+    locs: Vec<lsp_types::Location>,
     ctx: &EncodingCtx,
 ) -> NormalizedLocations {
-    let truncated = locs.len() > MAX_NORMALIZED_LOCATIONS;
-    if truncated {
-        tracing::warn!(
-            reported = locs.len(),
-            cap = MAX_NORMALIZED_LOCATIONS,
-            "LSP response location count exceeds MAX_NORMALIZED_LOCATIONS; truncating"
-        );
-    }
-    locs.truncate(MAX_NORMALIZED_LOCATIONS);
+    let mut budget = ItemBudget::new();
+    let locs = budget.admit(locs);
+    let truncated = budget.truncated();
     let mut locations = Vec::with_capacity(locs.len());
     for loc in locs {
         locations.push(Location {
@@ -376,7 +440,7 @@ impl Translator {
     /// server is still indexing the workspace after
     /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_hover(&self, file_path: String, position: Position) -> Result<HoverResult> {
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Hover,
@@ -384,13 +448,14 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, position).await;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
+        let lsp_position = ctx.to_lsp(uri, position).await;
         let response_uri = uri.clone();
 
         let params = LspHoverParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: lsp_position,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -448,14 +513,15 @@ impl Translator {
         R::Params: GotoParams,
         T: GotoResponse,
     {
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(file_path, tool, capability, IndexingGate::Required)
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, position).await;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
+        let lsp_position = ctx.to_lsp(uri, position).await;
 
         let params = R::Params::from_position(TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             position: lsp_position,
         });
 
@@ -513,7 +579,7 @@ impl Translator {
         position: Position,
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::References,
@@ -521,12 +587,13 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, position).await;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
+        let lsp_position = ctx.to_lsp(uri, position).await;
 
         let params = ReferenceParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: lsp_position,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -1762,5 +1829,40 @@ mod tests {
             result.truncated,
             "a response naming more than MAX_NORMALIZED_LOCATIONS must report truncated: true"
         );
+    }
+
+    #[test]
+    fn test_item_budget_admit_spends_shared_allowance() {
+        let mut budget = ItemBudget::new();
+        let first = budget.admit(vec![0u8; MAX_NORMALIZED_LOCATIONS - 1]);
+        assert_eq!(first.len(), MAX_NORMALIZED_LOCATIONS - 1);
+        assert!(!budget.truncated());
+
+        let second = budget.admit(vec![0u8; 5]);
+        assert_eq!(second.len(), 1);
+        assert!(budget.truncated());
+
+        assert_eq!(budget.admit(vec![0u8; 3]).len(), 0);
+    }
+
+    #[test]
+    fn test_item_budget_admit_whole_never_splits_a_list() {
+        let mut budget = ItemBudget::new();
+        assert!(
+            budget
+                .admit_whole(vec![0u8; MAX_NORMALIZED_LOCATIONS - 2])
+                .is_some()
+        );
+        assert!(budget.admit_whole(vec![0u8; 3]).is_none());
+        assert!(budget.truncated());
+        assert!(budget.admit_whole(vec![0u8; 2]).is_some());
+    }
+
+    #[test]
+    fn test_item_budget_exactly_at_cap_is_not_truncated() {
+        let mut budget = ItemBudget::new();
+        let items = budget.admit(vec![0u8; MAX_NORMALIZED_LOCATIONS]);
+        assert_eq!(items.len(), MAX_NORMALIZED_LOCATIONS);
+        assert!(!budget.truncated());
     }
 }
