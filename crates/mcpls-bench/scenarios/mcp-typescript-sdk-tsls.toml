@@ -1,0 +1,59 @@
+name = "mcp-typescript-sdk-tsls"
+setup = [
+    { command = "pnpm", args = ["install", "--frozen-lockfile", "--ignore-scripts"] },
+]
+
+[source]
+kind = "git"
+url = "https://github.com/modelcontextprotocol/typescript-sdk"
+commit = "a202a3621fcb97918e09fa45d0f9efd2dbdee19b" # v2.3.0
+
+[server]
+language_id = "typescript"
+file_patterns = ["**/*.ts", "**/*.tsx"]
+args = ["--stdio"]
+
+[server.executable]
+command = "typescript-language-server"
+version_args = ["--version"]
+
+[[runtime]]
+command = "node"
+version_args = ["--version"]
+
+[[runtime]]
+command = "pnpm"
+version_args = ["--version"]
+
+[ready_probe]
+kind = "hover"
+file = "packages/server/src/server/mcp.ts"
+position = { line = 53, character = 11 }
+contains = "Server"
+symbol = "Server"
+
+[[probes]]
+kind = "hover"
+file = "packages/server/src/server/mcp.ts"
+position = { line = 53, character = 11 }
+contains = "Server"
+symbol = "Server"
+
+[[probes]]
+kind = "definition"
+file = "packages/server/src/server/mcp.ts"
+position = { line = 53, character = 11 }
+uri_suffix = "packages/server/src/server/server.ts"
+symbol = "Server"
+
+[[probes]]
+kind = "references"
+file = "packages/server/src/server/mcp.ts"
+position = { line = 112, character = 16 }
+min_count = 2
+symbol = "McpServer"
+
+[[probes]]
+kind = "document_symbols"
+file = "packages/server/src/server/mcp.ts"
+symbol = "McpServer"

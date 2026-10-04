@@ -18,6 +18,7 @@ pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
 pub(crate) use lifecycle::{SUPPORTED_SYMBOL_KINDS, ServerStartOutcome};
 #[cfg(test)]
 pub(crate) use lifecycle::{fake_lsp_server, fake_lsp_server_with_config};
+pub use process::LIFELINE_SWEEP_BUDGET;
 pub use transport::{LspTransport, LspTransportReader};
 pub use types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,

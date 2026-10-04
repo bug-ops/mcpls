@@ -1,66 +1,196 @@
 //! Spawned LSP server process bound to the lifetime of the mcpls process.
 //!
-//! On Unix every server joins the process group of a single `/bin/sh`
-//! watchdog that SIGKILLs the whole group once mcpls's end of its stdin pipe
-//! closes, which the kernel does on any exit (clean, panic, `exit(1)`,
-//! `SIGKILL`, OOM). On Windows every server is assigned to a Job Object with
-//! `KILL_ON_JOB_CLOSE`. See `specs/lsp/007-lsp-child-process-lifetime`.
+//! On Unix every server gets its own lifeline (see `lifeline`): an anchor
+//! that leads the server's process group and a watchdog that, once mcpls's end
+//! of its socket closes (which the kernel does on any exit, clean, panic,
+//! `exit(1)`, `SIGKILL`, OOM), freezes the group, finds descendants that left
+//! it through `setsid`/`setpgid`, and SIGKILLs the whole tree. On Windows every
+//! server is assigned to a Job Object with `KILL_ON_JOB_CLOSE`. See
+//! `specs/lsp/007-lsp-child-process-lifetime`.
 
 use std::io;
 use std::process::ExitStatus;
+use std::time::Duration;
 
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
+
+#[cfg(unix)]
+mod lifeline;
+
+/// Upper bound on how long dropping or terminating a server may take to sweep
+/// its whole process tree.
+///
+/// Callers that wait for descendants to disappear after killing mcpls (for
+/// example a benchmark harness) should allow at least this long.
+pub const LIFELINE_SWEEP_BUDGET: Duration = Duration::from_secs(8);
+
+/// Whether an out-of-process watchdog guards a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    /// A live watchdog sweeps the server's tree if mcpls dies, so the server
+    /// must not be handed the mcpls pid to watch.
+    #[cfg(unix)]
+    Bound,
+    /// No watchdog: the server sees the real mcpls pid.
+    Unbound,
+}
+
+/// Why a server must not be allowed to exit gracefully after a mark.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkFailure {
+    /// The watchdog could not be reached or ended its socket first.
+    Unreachable,
+    /// The watchdog did not confirm in time.
+    NoConfirmation,
+    /// The watchdog's process snapshot timed out, so escapees may be unmarked.
+    SnapshotTimedOut,
+}
+
+/// Result of freezing and recording a server's escapees before `exit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkOutcome {
+    /// The escapees are recorded (or there are none to record): `exit` may go.
+    Confirmed,
+    /// `exit` must be withheld and the tree terminated at once.
+    #[cfg(unix)]
+    Failed(MarkFailure),
+}
+
+/// Read end of a server's stderr.
+#[cfg(unix)]
+pub type ServerStderr = tokio::net::unix::pipe::Receiver;
+/// Read end of a server's stderr.
+#[cfg(windows)]
+pub type ServerStderr = tokio::process::ChildStderr;
 
 /// One spawned LSP server, bound to the mcpls process lifetime.
 ///
-/// Dropping it kills the server (and, on Windows, its whole process tree).
+/// Dropping it sweeps the server's whole process tree (on Unix asynchronously,
+/// through the watchdog; on Windows through the job).
 #[derive(Debug)]
 pub struct ServerProcess {
     #[cfg(unix)]
-    child: tokio::process::Child,
+    child: Option<tokio::process::Child>,
+    #[cfg(unix)]
+    stderr: Option<ServerStderr>,
+    #[cfg(unix)]
+    lifeline: Option<lifeline::Lifeline>,
     #[cfg(windows)]
     child: Box<dyn process_wrap::tokio::ChildWrapper>,
 }
 
 #[cfg(unix)]
 impl ServerProcess {
-    /// Spawn `command` into the lifeline process group.
+    /// Spawn `command` bound to a fresh per-server lifeline.
     ///
-    /// If the watchdog cannot be started, the server is spawned unbound.
-    pub(crate) fn spawn(mut command: Command) -> io::Result<Self> {
-        command.kill_on_drop(true);
-        lifeline::spawn(&lifeline::LIFELINE, command).map(|child| Self { child })
+    /// If the lifeline cannot be started, the server is spawned unbound in its
+    /// own process group.
+    pub(crate) fn spawn(command: Command) -> io::Result<Self> {
+        Self::spawn_with(command, &lifeline::Options::default())
     }
 
-    pub(crate) const fn take_stdin(&mut self) -> Option<ChildStdin> {
-        self.child.stdin.take()
+    fn spawn_with(command: Command, options: &lifeline::Options) -> io::Result<Self> {
+        let spawned = lifeline::spawn(command, options)?;
+        Ok(Self {
+            child: Some(spawned.child),
+            stderr: Some(spawned.stderr),
+            lifeline: spawned.lifeline,
+        })
     }
 
-    pub(crate) const fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.child.stdout.take()
+    /// Whether an out-of-process watchdog still guards this server.
+    pub(crate) fn binding(&mut self) -> Binding {
+        self.lifeline
+            .as_mut()
+            .map_or(Binding::Unbound, lifeline::Lifeline::binding)
     }
 
-    pub(crate) const fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.child.stderr.take()
+    pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.as_mut()?.stdin.take()
     }
 
+    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.as_mut()?.stdout.take()
+    }
+
+    pub(crate) const fn take_stderr(&mut self) -> Option<ServerStderr> {
+        self.stderr.take()
+    }
+
+    /// Non-blocking status check of the leader. Once the leader is gone its
+    /// remaining tree is swept at once, since nothing can use it any more.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        let status = self.leader()?.try_wait()?;
+        if let Some(lifeline) = &mut self.lifeline {
+            lifeline.warn_if_watchdog_lost();
+        }
+        if status.is_some()
+            && let Some(mut lifeline) = self.lifeline.take()
+        {
+            lifeline.forget_leader();
+            lifeline.release(None);
+        }
+        Ok(status)
     }
 
     /// Wait for the leader process only, not its descendants.
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
+        let status = self.leader()?.wait().await?;
+        if let Some(lifeline) = &mut self.lifeline {
+            lifeline.forget_leader();
+        }
+        Ok(status)
+    }
+
+    /// Freeze and record the descendants that escaped the server's process
+    /// group, before the server is told to exit. Returns `false` when that
+    /// failed, in which case the server must not be allowed to exit on its
+    /// own: the caller should [`Self::terminate`] it instead.
+    pub(crate) async fn mark_escapees(&mut self) -> MarkOutcome {
+        match &mut self.lifeline {
+            Some(lifeline) => lifeline.mark().await,
+            None => MarkOutcome::Confirmed,
+        }
+    }
+
+    /// Sweep the server's whole process tree and wait for it to be gone, up
+    /// to `budget` (at most [`LIFELINE_SWEEP_BUDGET`] is ever useful); after
+    /// that whatever the watchdog has not finished is killed from here. A
+    /// shorter budget trades attribution time for a lower worst case.
+    pub(crate) async fn terminate(mut self, budget: Duration) {
+        if let Some(lifeline) = self.lifeline.take() {
+            lifeline.terminate(self.child.take(), budget).await;
+        }
+    }
+
+    fn leader(&mut self) -> io::Result<&mut tokio::process::Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("server process already torn down"))
     }
 
     #[cfg(test)]
     pub(crate) const fn from_unbound(child: tokio::process::Child) -> Self {
-        Self { child }
+        Self {
+            child: Some(child),
+            stderr: None,
+            lifeline: None,
+        }
     }
 
     #[cfg(test)]
     pub(crate) async fn kill(&mut self) -> io::Result<()> {
-        self.child.kill().await
+        self.leader()?.kill().await
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        if let Some(lifeline) = self.lifeline.take() {
+            lifeline.release(self.child.take());
+        }
     }
 }
 
@@ -75,6 +205,11 @@ impl ServerProcess {
         wrapped.spawn().map(|child| Self { child })
     }
 
+    /// Windows servers always see the real mcpls pid; the job kills the tree.
+    pub(crate) const fn binding(&mut self) -> Binding {
+        Binding::Unbound
+    }
+
     pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.stdin().take()
     }
@@ -83,7 +218,7 @@ impl ServerProcess {
         self.child.stdout().take()
     }
 
-    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
+    pub(crate) fn take_stderr(&mut self) -> Option<ServerStderr> {
         self.child.stderr().take()
     }
 
@@ -96,252 +231,22 @@ impl ServerProcess {
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.inner_mut().wait().await
     }
-}
 
-#[cfg(unix)]
-mod lifeline {
-    use std::io;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Child, Stdio};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, PoisonError};
-
-    use tokio::process::Command;
-    use tracing::warn;
-
-    /// Ignores the usual termination signals, blocks until stdin reaches EOF,
-    /// then SIGKILLs its own process group (itself included).
-    const WATCHDOG_SCRIPT: &str = "trap '' HUP INT TERM QUIT USR1 USR2 ALRM PIPE\nwhile read -r _; do :; done\nkill -s KILL 0\n";
-
-    static WARNED: AtomicBool = AtomicBool::new(false);
-
-    /// Process-wide watchdog; never dropped while valid, since dropping it
-    /// closes the pipe and kills every server in its group.
-    pub(super) static LIFELINE: Mutex<Option<Lifeline>> = Mutex::new(None);
-
-    /// A process group id that is only constructed from a live watchdog's pid.
-    #[derive(Debug, Clone, Copy)]
-    pub(super) struct ProcessGroupId(i32);
-
-    /// The watchdog child, which holds the pipe whose write end only mcpls has.
-    #[derive(Debug)]
-    pub(super) struct Lifeline {
-        watchdog: Child,
-        group: ProcessGroupId,
+    /// Nothing to freeze: the job covers every descendant.
+    #[allow(
+        clippy::unused_async,
+        reason = "mirrors the Unix signature so callers are platform independent"
+    )]
+    pub(crate) async fn mark_escapees(&mut self) -> MarkOutcome {
+        MarkOutcome::Confirmed
     }
 
-    impl Lifeline {
-        fn start() -> io::Result<Self> {
-            let watchdog = std::process::Command::new("/bin/sh")
-                .args(["-c", WATCHDOG_SCRIPT])
-                .env_clear()
-                .current_dir("/")
-                .process_group(0)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
-            let group = i32::try_from(watchdog.id())
-                .map(ProcessGroupId)
-                .map_err(io::Error::other)?;
-            Ok(Self { watchdog, group })
-        }
-
-        fn is_alive(&mut self) -> bool {
-            !is_gone(&self.watchdog.try_wait())
-        }
-    }
-
-    /// Only a reaped watchdog is gone: a failed status query must not replace a
-    /// possibly live lifeline, since dropping it SIGKILLs every running server.
-    const fn is_gone(status: &io::Result<Option<std::process::ExitStatus>>) -> bool {
-        matches!(status, Ok(Some(_)))
-    }
-
-    /// Returns the group of a live watchdog, starting a replacement if needed.
-    fn ensure_group(slot: &mut Option<Lifeline>) -> Option<ProcessGroupId> {
-        if slot.as_mut().is_some_and(Lifeline::is_alive) {
-            return slot.as_ref().map(|l| l.group);
-        }
-        match Lifeline::start() {
-            Ok(lifeline) => {
-                let group = lifeline.group;
-                *slot = Some(lifeline);
-                Some(group)
-            }
-            Err(e) => {
-                *slot = None;
-                if !WARNED.swap(true, Ordering::Relaxed) {
-                    warn!(error = %e, "failed to start LSP child watchdog; servers are spawned unbound");
-                }
-                None
-            }
-        }
-    }
-
-    /// Spawn `command` into the lifeline group under `slot`'s lock, so no
-    /// server inherits the watchdog pipe's write end between `pipe()` and
-    /// `FD_CLOEXEC` on platforms where std sets it non-atomically.
-    pub(super) fn spawn(
-        slot: &Mutex<Option<Lifeline>>,
-        command: Command,
-    ) -> io::Result<tokio::process::Child> {
-        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        let group = ensure_group(&mut guard);
-        let spawned = spawn_bound(&mut guard, group, command);
-        drop(guard);
-        spawned
-    }
-
-    fn spawn_bound(
-        slot: &mut Option<Lifeline>,
-        group: Option<ProcessGroupId>,
-        mut command: Command,
-    ) -> io::Result<tokio::process::Child> {
-        command.process_group(group.map_or(0, |g| g.0));
-        match command.spawn() {
-            // EPERM from `setpgid` and EACCES from `exec` are both PermissionDenied;
-            // a live watchdog means the latter, and discarding it would kill the other servers.
-            Err(e)
-                if e.kind() == io::ErrorKind::PermissionDenied
-                    && group.is_some()
-                    && slot.as_mut().is_some_and(|l| !l.is_alive()) =>
-            {
-                warn!(error = %e, "LSP child watchdog group vanished; restarting it");
-                *slot = None;
-                command.process_group(ensure_group(slot).map_or(0, |g| g.0));
-                command.spawn()
-            }
-            other => other,
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
-    mod tests {
-        use std::os::unix::fs::PermissionsExt;
-        use std::os::unix::process::ExitStatusExt;
-        use std::time::Duration;
-
-        use tokio::time::timeout;
-
-        use super::*;
-
-        fn sleeper(group: ProcessGroupId) -> Command {
-            let mut command = Command::new("sleep");
-            command.arg("600").process_group(group.0).kill_on_drop(true);
-            command
-        }
-
-        #[tokio::test]
-        async fn test_closing_lifeline_pipe_kills_group_members() {
-            let lifeline = Lifeline::start().unwrap();
-            let mut member = sleeper(lifeline.group).spawn().unwrap();
-
-            drop(lifeline);
-
-            let status = timeout(Duration::from_secs(5), member.wait())
-                .await
-                .expect("group member must die within 5s of the pipe closing")
-                .unwrap();
-            assert_eq!(status.signal(), Some(9));
-        }
-
-        #[tokio::test]
-        async fn test_spawn_retries_once_when_group_vanished() {
-            let mut leader = std::process::Command::new("sh")
-                .args(["-c", "exit 0"])
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            let dead = ProcessGroupId(i32::try_from(leader.id()).unwrap());
-            leader.wait().unwrap();
-            let mut slot = Some(Lifeline {
-                watchdog: leader,
-                group: dead,
-            });
-
-            let member = spawn_bound(&mut slot, Some(dead), sleeper(dead))
-                .expect("spawn must succeed after the FR-007 retry");
-
-            let fresh = slot.as_ref().expect("a replacement watchdog is installed");
-            assert_ne!(fresh.group.0, dead.0);
-            drop(member);
-        }
-
-        #[tokio::test]
-        async fn test_permission_denied_with_live_watchdog_keeps_lifeline() {
-            let dir = tempfile::tempdir().unwrap();
-            let not_executable = dir.path().join("server");
-            std::fs::write(&not_executable, "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644))
-                .unwrap();
-            let lifeline = Lifeline::start().unwrap();
-            let group = lifeline.group;
-            let mut slot = Some(lifeline);
-
-            let err = spawn_bound(&mut slot, Some(group), Command::new(&not_executable))
-                .expect_err("a non-executable file must not spawn");
-
-            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-            let kept = slot.as_mut().unwrap();
-            assert!(kept.is_alive());
-            assert_eq!(kept.group.0, group.0);
-        }
-
-        #[test]
-        fn test_failed_status_query_does_not_count_as_gone() {
-            assert!(!is_gone(&Err(io::Error::from(io::ErrorKind::Other))));
-            assert!(!is_gone(&Ok(None)));
-        }
-
-        #[tokio::test]
-        async fn test_spawn_replaces_reaped_watchdog_before_spawning() {
-            let mut leader = std::process::Command::new("sh")
-                .args(["-c", "exit 0"])
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            let dead = ProcessGroupId(i32::try_from(leader.id()).unwrap());
-            leader.wait().unwrap();
-            let slot = Mutex::new(Some(Lifeline {
-                watchdog: leader,
-                group: dead,
-            }));
-
-            let member = spawn(&slot, sleeper(dead)).expect("FR-005: a fresh watchdog is started");
-
-            let fresh = slot.lock().unwrap();
-            assert_ne!(fresh.as_ref().unwrap().group.0, dead.0);
-            drop(fresh);
-            drop(member);
-        }
-    }
-}
-
-#[cfg(all(test, unix))]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use std::process::Stdio;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_spawn_exposes_pipes_and_leader_exit() {
-        let mut command = Command::new("true");
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut process = ServerProcess::spawn(command).unwrap();
-
-        assert!(process.take_stdin().is_some());
-        assert!(process.take_stdout().is_some());
-        assert!(process.take_stdin().is_none());
-        assert!(process.wait().await.unwrap().success());
-        assert!(process.try_wait().unwrap().is_some());
-    }
+    /// Dropping the job handle kills the whole tree.
+    #[allow(
+        clippy::unused_async,
+        reason = "mirrors the Unix signature so callers are platform independent"
+    )]
+    pub(crate) async fn terminate(self, _budget: Duration) {}
 }
 
 #[cfg(all(test, windows))]

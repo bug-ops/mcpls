@@ -82,6 +82,41 @@ impl Probe {
         }
     }
 
+    /// The file this probe queries.
+    #[must_use]
+    pub const fn file(&self) -> &RepoPath {
+        match self {
+            Self::Hover { file, .. }
+            | Self::Definition { file, .. }
+            | Self::References { file, .. }
+            | Self::DocumentSymbols { file, .. }
+            | Self::Diagnostics { file, .. } => file,
+        }
+    }
+
+    /// The 1-based position this probe queries, for the kinds that have one.
+    #[must_use]
+    pub const fn position(&self) -> Option<&Position2D> {
+        match self {
+            Self::Hover { position, .. }
+            | Self::Definition { position, .. }
+            | Self::References { position, .. } => Some(position),
+            Self::DocumentSymbols { .. } | Self::Diagnostics { .. } => None,
+        }
+    }
+
+    /// The identifier this probe is about, for targets that address symbols by name.
+    #[must_use]
+    pub fn symbol(&self) -> Option<&str> {
+        match self {
+            Self::Hover { symbol, .. }
+            | Self::Definition { symbol, .. }
+            | Self::References { symbol, .. } => symbol.as_deref(),
+            Self::DocumentSymbols { symbol, .. } => Some(symbol),
+            Self::Diagnostics { .. } => None,
+        }
+    }
+
     /// Builds the MCP `tools/call` request for this probe against the repository at `repo`.
     ///
     /// # Examples
@@ -244,6 +279,7 @@ mod tests {
                 character: 1,
             },
             contains: contains.to_owned(),
+            symbol: None,
         }
     }
 
@@ -265,6 +301,7 @@ mod tests {
                 character: 1,
             },
             min_count: 1,
+            symbol: None,
         };
         let result = CallToolResult::structured(json!({"locations": []}));
         assert!(probe.verdict(&result).is_err());

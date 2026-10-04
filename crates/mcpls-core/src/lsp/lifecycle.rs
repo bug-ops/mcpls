@@ -30,7 +30,7 @@ use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
-use crate::lsp::process::ServerProcess;
+use crate::lsp::process::{Binding, MarkOutcome, ServerProcess};
 use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
@@ -55,6 +55,11 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 /// killing it on drop. Only the leader is awaited; descendants are reaped by
 /// the lifeline binding.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// Least time the final process-tree sweep may take even when the shutdown
+/// deadline is already spent, so a whole shutdown stays within
+/// `SHUTDOWN_TIMEOUT` plus this.
+const MIN_SWEEP_BUDGET: Duration = Duration::from_secs(3);
 
 /// How long a failed `initialize` waits for the child to be reaped before
 /// concluding it is still running and keeping the original error.
@@ -462,40 +467,42 @@ impl LspServer {
             lifecycle_tx,
             Arc::clone(&redactions),
         );
-        let (capabilities, position_encoding) = match Self::initialize(&client, &config).await {
-            Ok(negotiated) => negotiated,
-            Err(init_error) if is_connection_loss(&init_error) => {
-                let exit_status = early_exit_status(&mut child).await;
-                let eof_wait = if exit_status.is_some() {
-                    EofWait::Grace
-                } else {
-                    EofWait::Skip
-                };
-                let stderr = stderr_capture.finish(eof_wait, &redactions).await;
-                return Err(match exit_status {
-                    Some(status) => Error::ServerExitedDuringInit {
-                        command: config.server_config.command.clone(),
-                        exit_code: status.code(),
-                        stderr,
-                    },
-                    None => Error::LspInitFailed {
-                        message: redactions
-                            .apply(&format!("Initialize request failed: {init_error}"))
-                            .into_owned(),
-                        stderr,
-                    },
-                });
-            }
-            Err(Error::LspInitFailed { message, .. }) => {
-                // The server may be about to exit after printing its reason,
-                // so wait the (bounded) end-of-file grace whether or not it
-                // has exited yet.
-                let stderr = stderr_capture.finish(EofWait::Grace, &redactions).await;
-                let message = redactions.apply(&message).into_owned();
-                return Err(Error::LspInitFailed { message, stderr });
-            }
-            Err(init_error) => return Err(init_error),
-        };
+        let process_id = initialize_process_id(child.binding());
+        let (capabilities, position_encoding) =
+            match Self::initialize_as(&client, &config, process_id).await {
+                Ok(negotiated) => negotiated,
+                Err(init_error) if is_connection_loss(&init_error) => {
+                    let exit_status = early_exit_status(&mut child).await;
+                    let eof_wait = if exit_status.is_some() {
+                        EofWait::Grace
+                    } else {
+                        EofWait::Skip
+                    };
+                    let stderr = stderr_capture.finish(eof_wait, &redactions).await;
+                    return Err(match exit_status {
+                        Some(status) => Error::ServerExitedDuringInit {
+                            command: config.server_config.command.clone(),
+                            exit_code: status.code(),
+                            stderr,
+                        },
+                        None => Error::LspInitFailed {
+                            message: redactions
+                                .apply(&format!("Initialize request failed: {init_error}"))
+                                .into_owned(),
+                            stderr,
+                        },
+                    });
+                }
+                Err(Error::LspInitFailed { message, .. }) => {
+                    // The server may be about to exit after printing its reason,
+                    // so wait the (bounded) end-of-file grace whether or not it
+                    // has exited yet.
+                    let stderr = stderr_capture.finish(EofWait::Grace, &redactions).await;
+                    let message = redactions.apply(&message).into_owned();
+                    return Err(Error::LspInitFailed { message, stderr });
+                }
+                Err(init_error) => return Err(init_error),
+            };
 
         info!("LSP server initialized successfully");
 
@@ -659,9 +666,22 @@ impl LspServer {
     /// Perform LSP initialization handshake.
     ///
     /// Sends initialize request and waits for response, then sends initialized notification.
+    #[cfg(test)]
     async fn initialize(
         client: &LspClient,
         config: &ServerInitConfig,
+    ) -> Result<(ServerCapabilities, PositionEncodingKind)> {
+        Self::initialize_as(client, config, Some(mcpls_process_id())).await
+    }
+
+    /// As [`Self::initialize`], reporting `process_id` as the parent process
+    /// the server may watch (`None` is allowed by LSP and sent while a
+    /// lifeline watchdog is bound: a server that exits when mcpls vanishes
+    /// would otherwise race the watchdog's freeze of its descendants).
+    async fn initialize_as(
+        client: &LspClient,
+        config: &ServerInitConfig,
+        process_id: Option<i32>,
     ) -> Result<(ServerCapabilities, PositionEncodingKind)> {
         debug!("Sending initialize request");
 
@@ -672,7 +692,7 @@ impl LspServer {
             .collect::<Result<Vec<_>>>()?;
 
         let params = InitializeParams {
-            process_id: Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
+            process_id,
             #[allow(deprecated)]
             root_uri: None,
             initialization_options: config.initialization_options.clone(),
@@ -807,13 +827,15 @@ impl LspServer {
 
     /// Shutdown server gracefully, with an overall deadline of [`SHUTDOWN_TIMEOUT`].
     ///
-    /// Sends the LSP `shutdown` request, waits for the response, sends the
-    /// `exit` notification, stops the message loop, then waits up to a grace
-    /// period (never past the overall deadline) for the child process to exit
-    /// on its own. If it hasn't by then, or if the handshake itself fails or
-    /// times out, the child is simply dropped here — `kill_on_drop`
-    /// terminates it via SIGKILL (a no-op if it has already exited); on Windows
-    /// this also kills its descendants. A test
+    /// Sends the LSP `shutdown` request, waits for the response, has the
+    /// lifeline watchdog freeze and record descendants that escaped the
+    /// server's process group (Unix), sends the `exit` notification, stops the
+    /// message loop, then waits up to a grace period (never past the overall
+    /// deadline) for the child process to exit on its own. Whatever is left,
+    /// including those escapees, is then killed and waited for, up to
+    /// [`crate::lsp::LIFELINE_SWEEP_BUDGET`] beyond the deadline, so when this
+    /// returns the server's whole tree is gone. If the escapee mark fails the
+    /// `exit` notification is skipped and the tree is killed right away. A test
     /// fixture with no real backing process (`child` is `None`) skips this
     /// step entirely -- there is nothing to wait for or kill.
     ///
@@ -833,10 +855,18 @@ impl LspServer {
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         let client = self.client;
 
+        let mut child = self.child;
+        let mut mark = MarkOutcome::Confirmed;
         let handshake: Result<()> = timeout_at(deadline, async {
             let _: serde_json::Value = client
                 .request(ShutdownRequest::METHOD.as_str(), (), Duration::from_secs(5))
                 .await?;
+            if let Some(child) = child.as_mut() {
+                mark = child.mark_escapees().await;
+                if mark != MarkOutcome::Confirmed {
+                    return Ok(());
+                }
+            }
             client.notify_typed::<ExitNotification>(()).await
         })
         .await
@@ -846,24 +876,28 @@ impl LspServer {
             Err(e) => handshake.and(Err(e)),
         };
 
-        if let Some(mut child) = self.child {
-            let child_deadline = deadline.min(Instant::now() + CHILD_EXIT_GRACE);
-            match timeout_at(child_deadline, child.wait()).await {
-                Ok(Ok(status)) => {
-                    debug!(
-                        ?status,
-                        "LSP server process exited after `exit` notification"
-                    );
+        if let Some(mut child) = child {
+            if mark == MarkOutcome::Confirmed {
+                let child_deadline = deadline.min(Instant::now() + CHILD_EXIT_GRACE);
+                match timeout_at(child_deadline, child.wait()).await {
+                    Ok(Ok(status)) => {
+                        debug!(
+                            ?status,
+                            "LSP server process exited after `exit` notification"
+                        );
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
+                    Err(_) => warn!(
+                        timeout = ?CHILD_EXIT_GRACE,
+                        "LSP server process did not exit within grace period after `exit` \
+                         notification, killing it"
+                    ),
                 }
-                Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
-                Err(_) => warn!(
-                    timeout = ?CHILD_EXIT_GRACE,
-                    "LSP server process did not exit within grace period after `exit` \
-                     notification, killing it"
-                ),
             }
-            // `child` drops here: it kills the leader (and on Windows the job) if still
-            // running, and is a no-op if `wait()` above already reaped it.
+            let sweep_budget = deadline
+                .saturating_duration_since(Instant::now())
+                .clamp(MIN_SWEEP_BUDGET, crate::lsp::LIFELINE_SWEEP_BUDGET);
+            child.terminate(sweep_budget).await;
         }
 
         handshake?;
@@ -999,6 +1033,20 @@ async fn contain(
         command,
         reason,
     })
+}
+
+fn mcpls_process_id() -> i32 {
+    i32::try_from(std::process::id()).unwrap_or(i32::MAX)
+}
+
+/// The `processId` to send: none while a lifeline watchdog is bound, the real
+/// mcpls pid otherwise.
+fn initialize_process_id(binding: Binding) -> Option<i32> {
+    match binding {
+        #[cfg(unix)]
+        Binding::Bound => None,
+        Binding::Unbound => Some(mcpls_process_id()),
+    }
 }
 
 /// Convert configured position-encoding strings into the ordered
@@ -1915,6 +1963,39 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
             },
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_unbound_server_gets_the_real_process_id() {
+        assert_eq!(
+            initialize_process_id(Binding::Unbound),
+            Some(i32::try_from(std::process::id()).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bound_server_gets_no_process_id() {
+        assert_eq!(initialize_process_id(Binding::Bound), None);
+    }
+
+    /// A server guarded by a lifeline watchdog must not be handed the mcpls
+    /// pid to watch: it could exit before the watchdog has frozen its tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_sends_null_process_id_while_a_lifeline_is_bound() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dump = dir.path().join("request");
+        let script = format!(
+            "read -r header\nread -r _\nhead -c \"$(printf %s \"$header\" | tr -dc 0-9)\" > '{}'\nexit 1\n",
+            dump.display()
+        );
+        let config = crate::test_lsp::sh_script_init_config(dir.path(), &script);
+
+        LspServer::spawn(config).await.unwrap_err();
+
+        let request = std::fs::read_to_string(&dump).unwrap();
+        assert!(request.contains(r#""processId":null"#), "got {request}");
     }
 
     /// #534: what the server printed before exiting reaches the error.

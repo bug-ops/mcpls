@@ -121,8 +121,9 @@ pub struct Args {
     /// `probe` pings each GET stream with an MCP `ping` request and closes it
     /// when the client stops answering, which frees streams of vanished
     /// peers. Use `off` for a client that ignores server `ping` requests and
-    /// would otherwise be disconnected periodically. Only meaningful when
-    /// `--listen` is set.
+    /// would otherwise be disconnected periodically. `off` also disables the
+    /// lease (15 to 30 minutes) that ends stateless `subscriptions/listen`
+    /// streams so clients re-listen. Only meaningful when `--listen` is set.
     #[cfg(feature = "transport-http")]
     #[arg(
         long,

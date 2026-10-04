@@ -39,7 +39,7 @@ const FAR_FUTURE: Duration = Duration::from_hours(262_800);
 
 /// `delay` from now, saturating at [`FAR_FUTURE`] so an absurd configured
 /// duration cannot overflow `Instant`.
-fn after(delay: Duration) -> Instant {
+pub(super) fn after(delay: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(delay)
         .or_else(|| now.checked_add(FAR_FUTURE))

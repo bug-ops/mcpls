@@ -71,7 +71,7 @@ impl ShutdownSignals {
     ///
     /// Returns an error when the OS refuses the registration.
     #[cfg(not(unix))]
-    pub fn install() -> io::Result<Self> {
+    pub const fn install() -> io::Result<Self> {
         Ok(Self {})
     }
 

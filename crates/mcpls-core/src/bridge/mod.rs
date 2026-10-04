@@ -11,6 +11,7 @@ use lsp_types::Uri;
 mod encoding;
 mod indexing;
 mod notifications;
+mod published_uri;
 pub mod resources;
 mod state;
 mod translator;
@@ -30,6 +31,9 @@ pub use notifications::{
     DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
     ServerMessage, apply_lifecycle_notification,
 };
+#[cfg(test)]
+pub(crate) use published_uri::{CanonicalizeFn, resolve_one};
+pub(crate) use published_uri::{Publication, PublicationKind, PublishedPathResolver};
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, ResourceLimits, path_to_uri,
     uri_to_path,

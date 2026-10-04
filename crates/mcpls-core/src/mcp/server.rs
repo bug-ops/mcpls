@@ -1198,6 +1198,25 @@ impl McplsServer {
     }
 }
 
+/// Starts the HTTP listen lease of this request, if its transport attached
+/// one; over stdio, or with the lease off, there is no slot and nothing
+/// happens.
+#[cfg(feature = "transport-http")]
+fn start_listen_lease(context: &SubscriptionContext) {
+    if let Some(slot) = context
+        .request_context()
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| {
+            parts
+                .extensions
+                .get::<Arc<crate::transport::ListenLeaseSlot>>()
+        })
+    {
+        slot.start();
+    }
+}
+
 fn no_resolvable_listen_uris() -> crate::error::Error {
     crate::error::Error::InvalidUri(
         "none of the requested resource URIs resolve inside the workspace".to_owned(),
@@ -1428,6 +1447,10 @@ impl ServerHandler for McplsServer {
     /// for, until the request is cancelled or its connection closes. Works on
     /// every transport and, unlike `resources/subscribe`, needs no session.
     ///
+    /// Over HTTP a stream also ends abruptly after its lease
+    /// ([`ListenLease`](crate::transport::ListenLease)); a live client listens
+    /// again and the replay below covers the gap.
+    ///
     /// Streams are capped at `MAX_LISTEN_STREAMS` (shared by stdio and HTTP,
     /// independent of `max_concurrent_sessions`); beyond it the request fails
     /// with a retryable error after the acknowledgment. Over stdio, closing
@@ -1452,6 +1475,9 @@ impl ServerHandler for McplsServer {
             return Ok(());
         };
 
+        #[cfg(feature = "transport-http")]
+        start_listen_lease(&context);
+
         let uris = Arc::new(uris);
         let sink = context.sink().clone();
         let registration = permit.register(Arc::clone(&uris), |uris| Target::Sink { sink, uris });
@@ -1464,7 +1490,7 @@ impl ServerHandler for McplsServer {
         let cached: Vec<&DiagnosticsResourceUri> = {
             let cache = self.context.notification_cache.lock().await;
             uris.canonical()
-                .filter(|(_, lsp_uri)| cache.has_diagnostics(lsp_uri))
+                .filter(|(_, lsp_uri)| cache.is_listen_replayable(lsp_uri))
                 .map(|(uri, _)| uri)
                 .collect()
         };

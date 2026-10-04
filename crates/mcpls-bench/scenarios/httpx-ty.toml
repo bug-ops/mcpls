@@ -1,0 +1,52 @@
+name = "httpx-ty"
+
+[source]
+kind = "git"
+url = "https://github.com/encode/httpx"
+commit = "26d48e0634e6ee9cdc0533996db289ce4b430177" # 0.28.1
+
+[server]
+language_id = "python"
+file_patterns = ["**/*.py"]
+args = ["server"]
+
+[server.executable]
+command = "ty"
+version_args = ["--version"]
+
+[[runtime]]
+command = "python3"
+version_args = ["--version"]
+
+[ready_probe]
+kind = "hover"
+file = "httpx/_client.py"
+position = { line = 29, character = 42 }
+contains = "Request"
+symbol = "Request"
+
+[[probes]]
+kind = "hover"
+file = "httpx/_client.py"
+position = { line = 29, character = 42 }
+contains = "Request"
+symbol = "Request"
+
+[[probes]]
+kind = "definition"
+file = "httpx/_client.py"
+position = { line = 29, character = 42 }
+uri_suffix = "httpx/_models.py"
+symbol = "Request"
+
+[[probes]]
+kind = "references"
+file = "httpx/_client.py"
+position = { line = 1001, character = 12 }
+min_count = 2
+symbol = "_send_single_request"
+
+[[probes]]
+kind = "document_symbols"
+file = "httpx/_client.py"
+symbol = "BaseClient"

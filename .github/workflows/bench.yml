@@ -1,0 +1,63 @@
+name: Bench
+
+on:
+  schedule:
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Bench (${{ matrix.scenario }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [fd-rust-analyzer, react-hook-form-tsls]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
+        with:
+          toolchain: stable
+          components: rust-analyzer, rust-src
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: "bench"
+      - name: Install TypeScript toolchain
+        if: matrix.scenario == 'react-hook-form-tsls'
+        run: |
+          corepack enable pnpm
+          npm install --global typescript-language-server@5.1.3 typescript@5.9.3
+      - name: Build
+        run: cargo build --release --locked -p mcpls -p mcpls-bench
+      - name: Prepare
+        run: target/release/mcpls-bench prepare "crates/mcpls-bench/scenarios/${{ matrix.scenario }}.toml" --work-dir "$RUNNER_TEMP/bench"
+      - name: Run
+        run: >
+          target/release/mcpls-bench run "crates/mcpls-bench/scenarios/${{ matrix.scenario }}.toml"
+          --work-dir "$RUNNER_TEMP/bench"
+          --runs 5
+          --warmup-runs 1
+          --iterations 10
+          --output "$RUNNER_TEMP/${{ matrix.scenario }}.json"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/${{ matrix.scenario }}.json
+          if-no-files-found: ignore
+          retention-days: 30

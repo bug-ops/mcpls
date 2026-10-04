@@ -4,12 +4,17 @@
 //! process: dropping it early would hand the server `EPIPE`/`SIGPIPE` on its
 //! next diagnostic write. Only the first [`HEAD_BYTES`] and last
 //! [`TAIL_BYTES`] bytes are kept.
+//!
+//! On Unix the lifeline anchor additionally holds a copy of the read end, and
+//! the watchdog holds copies of the server's stdin and stdout pipe ends: if
+//! mcpls stops draining while it is alive (this drain gave up after repeated
+//! read errors, or an embedder's runtime shut down), the server blocks on its
+//! next write instead of dying from `EPIPE`, until the lifeline sweep kills it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _};
-use tokio::process::ChildStderr;
 use tokio::sync::watch;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
@@ -97,7 +102,7 @@ pub(super) enum EofWait {
 
 impl StderrCapture {
     /// Starts draining `stderr` on a detached task.
-    pub(super) fn start(stderr: ChildStderr) -> Self {
+    pub(super) fn start<R: AsyncRead + Unpin + Send + 'static>(stderr: R) -> Self {
         let ring = Arc::new(StdMutex::new(Ring::new()));
         let (eof_tx, eof) = watch::channel(false);
         tokio::spawn(drain(stderr, Arc::clone(&ring), eof_tx));

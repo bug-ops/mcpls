@@ -733,6 +733,15 @@ more often than that. A POST response stream whose peer vanished mid-write
 keeps its session until the connection fails (`TCP_USER_TIMEOUT` on Linux and
 Android, the OS default elsewhere, or the reverse proxy timeout).
 
+Stateless `subscriptions/listen` streams (MCP 2026-07-28) have no session and a
+client cannot answer a server `ping`, so they are bounded by a lease instead:
+after a random 15 to 30 minutes the HTTP response ends abruptly, without a final
+result, which a client reads as a dropped connection and answers by listening
+again. mcpls replays the cached diagnostics URIs plus any clear evicted from the
+cache in the last two minutes (at most 256), so nothing is lost across the gap.
+A client that never listens again stops receiving push updates after one lease
+but can still read resources. `off` disables both the probe and the lease.
+
 **Default**: `probe`
 
 ```bash

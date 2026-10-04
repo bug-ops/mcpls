@@ -4,11 +4,15 @@
 //! a real language server, and records per-call latency with correctness
 //! checks. See `docs/benchmarks.md` for methodology.
 
+pub mod lock;
 pub mod pin;
 pub mod prepare;
 pub mod probe;
+pub mod process_table;
 pub mod process_tree;
 pub mod report;
 pub mod run;
 pub mod scenario;
 pub mod signals;
+pub mod stderr_log;
+pub mod target;

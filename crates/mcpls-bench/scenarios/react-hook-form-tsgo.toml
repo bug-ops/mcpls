@@ -1,4 +1,4 @@
-name = "react-hook-form-tsls"
+name = "react-hook-form-tsgo"
 setup = [
     { command = "pnpm", args = ["install", "--frozen-lockfile", "--ignore-scripts"] },
 ]
@@ -11,10 +11,10 @@ commit = "3e6f6815f7ac8f4ef3df429a7157844f69e514fb" # v7.69.0
 [server]
 language_id = "typescript"
 file_patterns = ["**/*.ts", "**/*.tsx"]
-args = ["--stdio"]
+args = ["--lsp", "--stdio"]
 
 [server.executable]
-command = "typescript-language-server"
+command = "tsgo"
 version_args = ["--version"]
 
 [[runtime]]

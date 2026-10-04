@@ -34,6 +34,7 @@ url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 socket2 = { workspace = true, features = ["all"], optional = true }
@@ -49,6 +50,7 @@ winapi-util = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 proptest = { workspace = true }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 rstest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

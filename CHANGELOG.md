@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HttpConfig` gains a header/body-stall timeout and a connection cap. (#546)
 - `proptest` properties and a `cargo-fuzz` target for the LSP frame parser. (#546)
 - HTTP GET streams are probed with an MCP ping and closed when the client stops answering, portably and behind proxies; new `--http-stream-liveness` flag and `HttpConfig::with_stream_liveness`. (#543, #553)
+- HTTP `subscriptions/listen` streams end after a jittered 15 to 30 minutes so half-open streams are released; `--http-stream-liveness off` disables it; new `LeaseWindow`, `ListenLease` and `HttpConfig::with_listen_lease`. (#551, #PR)
+- `lsp::LIFELINE_SWEEP_BUDGET` public constant bounding the Unix process-tree sweep. (#541, #PR)
+- `mcpls-bench` gains `--target` comparison targets for Serena and lsmcp, eight more scenarios, process-tree RSS with a Windows Job Object, work-dir locking, capped stderr logs and a scheduled `bench.yml` workflow. (#548, #PR)
 
 ### Changed
 
@@ -38,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** the workspace sets `unsafe_code = "forbid"`. (#546)
 - **Breaking:** LSP servers leave mcpls's process group and are killed with their descendants, daemons included. (#546)
 - **Breaking:** the HTTP transport serves HTTP/1 only; prior-knowledge h2c is no longer accepted. (#546)
+- **Breaking:** `HttpConfig` gains a `listen_lease` field, and HTTP listen streams now end after 15 to 30 minutes unless liveness is `off`; clients must re-listen. (#551, #PR)
+- **Breaking:** Unix servers get `processId: null` in `initialize` while the watchdog is bound, and shared daemons that call `setsid` are killed with their server. (#541, #542, #PR)
+- `LspServer::shutdown` and `serve()` can take up to 8 s longer on Unix while the server's process tree is swept. (#541, #PR)
+- **Breaking:** `mcpls-bench` reports replace `mcpls`, `mcpls_binary` and `server` with `target`, `stderr_log` becomes an object and `summary` rows gain `unsupported`. (#548, #PR)
+- The diagnostics pump resolves published paths through a bounded memo with parallel canonicalization, so slow filesystems no longer stall it or drop publications. (#550, #PR)
 - Server-supplied control characters are escaped in error messages, and `mcpls` escapes every text-mode log field; `escape_control` is public. (#546)
 - Counter and indexing arithmetic saturates or uses checked access, enforced by clippy in non-test code. (#546)
 - CI actions are pinned to commit SHAs, a weekly advisory scan runs, and `deny.toml` rejects unknown registries and sources. (#546)
@@ -80,6 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP session ids are no longer logged at the default level. (#590)
 - Configured secrets are redacted from server messages, errors, wire traces and spawn arguments. (#590)
 - `escape_control` and stderr cleaning share one deceptive-character set. (#590)
+- Unix: descendants of an LSP server that call `setsid` or `setpgid`, such as rust-analyzer's flycheck, are killed when mcpls exits, and a respawn reaps the previous server's descendants. (#541, #542, #PR)
 - Abandoned HTTP sessions now expire after 5 min without client activity instead of living on while subscribed files change. (#536)
 - Columns past the end of a line now clamp to the line length, and column 1 or the empty line after a final newline no longer raise a false `positions_degraded`. (#520)
 - Call-hierarchy, inlay-hint, code-action, and rename handlers now cap normalized items with one shared budget, reporting overflow via `truncated` / `dropped.exceeds_item_cap`. (#487, #519)

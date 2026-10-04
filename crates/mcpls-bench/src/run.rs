@@ -1,6 +1,7 @@
 //! Driving mcpls over MCP stdio and recording timed samples (`mcpls-bench run`).
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,16 +15,19 @@ use rmcp::service::{RunningService, ServiceError};
 use rmcp::{RoleClient, ServiceExt};
 use tokio::process::Command;
 
+use crate::lock::WorkDirLock;
 use crate::pin::{ensure_matches, pin};
 use crate::prepare::{absolute, repo_dir, verify_prepared};
 use crate::probe::Incorrect;
-use crate::process_tree::{ProcessGroup, ProcessGroupId, SHUTDOWN_GRACE, sample_rss};
+use crate::process_tree::{ProcessGroup, SHUTDOWN_GRACE, SessionEnd, TreeWatch};
 use crate::report::{
-    BinaryRecord, BuildProfile, MemoryCheckpoint, MemoryRecord, Micros, Outcome, PinRecord,
-    ReadyRecord, Region, RunParams, RunRecord, RunReport, Sample, SourceRecord, summarize,
+    BinaryRecord, BuildProfile, MemoryCheckpoint, MemoryRecord, Micros, Outcome, ReadyRecord,
+    Region, RunParams, RunRecord, RunReport, Sample, SourceRecord, TargetRecord, summarize,
     summarize_memory,
 };
 use crate::scenario::{Executable, Probe, Scenario};
+use crate::stderr_log::{DRAIN_GRACE, StderrDrain, StderrLogCap};
+use crate::target::{ProbeCall, Target};
 
 const READY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const LSP_TIMEOUT_SECS: u64 = 60;
@@ -31,8 +35,10 @@ const LSP_TIMEOUT_SECS: u64 = 60;
 /// Options of one `run` invocation.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
-    /// The mcpls binary under test.
-    pub mcpls: PathBuf,
+    /// What is measured: mcpls or a comparison server.
+    pub target: Target,
+    /// Largest stderr log kept per run.
+    pub stderr_log_cap: StderrLogCap,
     /// Measured runs.
     pub runs: u32,
     /// Warm-up runs executed first and excluded from the summary.
@@ -100,30 +106,28 @@ pub async fn run(
 ) -> Result<RunReport> {
     let work_dir = absolute(work_dir)?;
     let work_dir = work_dir.as_path();
+    let _lock = WorkDirLock::acquire(work_dir, &scenario.name).await?;
     let repo = repo_dir(scenario, scenario_dir, work_dir)?;
     let observed_commit = verify_prepared(scenario, &repo, work_dir).await?;
 
-    let mcpls = pin(&mcpls_executable(&options.mcpls)?, &repo).await?;
-    let mcpls_binary = binary_record(&mcpls.path)?;
-    let server = pin(&scenario.server.executable, &repo).await?;
     let mut runtime = Vec::new();
     for executable in &scenario.runtime {
         runtime.push(pin(executable, &repo).await?);
     }
+    let (launch, target_record) = launch_target(&options.target, scenario, &repo, work_dir).await?;
     ensure_matches(
-        std::iter::once(&server).chain(&runtime),
+        target_record.pins().into_iter().chain(&runtime),
         options.allow_version_mismatch,
     )?;
-
-    let config_path = write_config(scenario, &repo, work_dir, &server.path)?;
+    let ready_probe = ready_probe_for(scenario, &options.target)?;
 
     let log_dir = invocation_log_dir(work_dir, scenario, SystemTime::now());
     let env = RunEnv {
         scenario,
+        ready_probe,
         repo: &repo,
-        config_path: &config_path,
+        launch: &launch,
         log_dir: &log_dir,
-        mcpls: &mcpls,
         options,
     };
     let total = options.warmup_runs.saturating_add(options.runs);
@@ -152,9 +156,7 @@ pub async fn run(
             || SourceRecord::Unpinned { path: repo.clone() },
             |commit| SourceRecord::Pinned { commit },
         ),
-        mcpls,
-        mcpls_binary,
-        server,
+        target: target_record,
         runtime,
         params: RunParams {
             runs: options.runs,
@@ -165,6 +167,7 @@ pub async fn run(
             ready_retry_interval_ms: u64::try_from(READY_RETRY_INTERVAL.as_millis())
                 .unwrap_or(u64::MAX),
             allow_version_mismatch: options.allow_version_mismatch,
+            stderr_log_cap_bytes: options.stderr_log_cap.bytes(),
         },
         aborted,
         summary: summarize(&runs),
@@ -179,6 +182,7 @@ fn mcpls_executable(path: &Path) -> Result<Executable> {
     Ok(Executable {
         command: absolute(path)?.to_string_lossy().into_owned(),
         version_args: vec!["--version".to_owned()],
+        version_command: None,
         expected_version: None,
     })
 }
@@ -224,28 +228,118 @@ fn write_config(
     Ok(path)
 }
 
+/// The process to spawn for every run.
+struct Launch {
+    program: PathBuf,
+    args: Vec<OsString>,
+}
+
+/// Pins the target and builds how to launch it.
+async fn launch_target(
+    target: &Target,
+    scenario: &Scenario,
+    repo: &Path,
+    work_dir: &Path,
+) -> Result<(Launch, TargetRecord)> {
+    match target {
+        Target::Mcpls { binary } => {
+            let binary = pin(&mcpls_executable(binary)?, repo).await?;
+            let build = binary_record(&binary.path)?;
+            let server = pin(&scenario.server.executable, repo).await?;
+            let config = write_config(scenario, repo, work_dir, &server.path)?;
+            let launch = Launch {
+                program: binary.path.clone(),
+                args: vec!["--config".into(), config.into_os_string()],
+            };
+            Ok((
+                launch,
+                TargetRecord::Mcpls {
+                    binary,
+                    build,
+                    server,
+                },
+            ))
+        }
+        Target::External(external) => {
+            let launcher = pin(&external.launcher, repo).await?;
+            let launch = Launch {
+                program: launcher.path.clone(),
+                args: external.launch_args(repo),
+            };
+            Ok((
+                launch,
+                TargetRecord::External {
+                    name: external.name.clone(),
+                    launcher,
+                    pinned: external.pinned.clone(),
+                    verification: target.verification(),
+                },
+            ))
+        }
+    }
+}
+
+/// The scenario's ready probe, or the first probe the target can answer if it cannot answer that one.
+fn ready_probe_for<'a>(scenario: &'a Scenario, target: &Target) -> Result<&'a Probe> {
+    let answerable =
+        |probe: &&Probe| matches!(target.request(probe, Path::new("")), Ok(ProbeCall::Call(_)));
+    std::iter::once(&scenario.ready_probe)
+        .chain(&scenario.probes)
+        .find(answerable)
+        .with_context(|| {
+            format!(
+                "the target supports none of the probes of scenario `{}`",
+                scenario.name.as_str()
+            )
+        })
+}
+
+/// Removes the paths the target writes into the repository, so one run never sees another's state.
+fn clear_target_state(target: &Target, repo: &Path) -> Result<()> {
+    let Target::External(external) = target else {
+        return Ok(());
+    };
+    for path in external.cleanup_paths(repo) {
+        let removal = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(_) => continue,
+        };
+        removal.with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Everything one run needs besides its index.
 struct RunEnv<'a> {
     scenario: &'a Scenario,
+    ready_probe: &'a Probe,
     repo: &'a Path,
-    config_path: &'a Path,
+    launch: &'a Launch,
     log_dir: &'a Path,
-    mcpls: &'a PinRecord,
     options: &'a RunOptions,
 }
 
 /// What a session records besides its samples.
-#[derive(Default)]
 struct Recorder {
     samples: Vec<Sample>,
     memory: Vec<MemoryRecord>,
+    watch: TreeWatch,
 }
 
 impl Recorder {
-    async fn sample_memory(&mut self, checkpoint: MemoryCheckpoint, group: ProcessGroupId) {
+    const fn new(leader_pid: u32) -> Self {
+        Self {
+            samples: Vec::new(),
+            memory: Vec::new(),
+            watch: TreeWatch::new(leader_pid),
+        }
+    }
+
+    async fn sample_memory(&mut self, checkpoint: MemoryCheckpoint) {
         self.memory.push(MemoryRecord {
             checkpoint,
-            reading: sample_rss(group).await,
+            reading: self.watch.sample().await,
         });
     }
 }
@@ -265,33 +359,31 @@ fn stderr_log_path(log_dir: &Path, index: u32) -> PathBuf {
     log_dir.join(format!("run-{index}.log"))
 }
 
-fn create_stderr_log(path: &Path) -> Result<Stdio> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    Ok(Stdio::from(file))
-}
-
 async fn one_run(index: u32, warmup: bool, env: &RunEnv<'_>) -> Result<RunRecord> {
+    clear_target_state(&env.options.target, env.repo)?;
     let started = Instant::now();
-    let stderr_log = stderr_log_path(env.log_dir, index);
-    let mut command = Command::new(&env.mcpls.path);
+    let stderr_path = stderr_log_path(env.log_dir, index);
+    let mut command = Command::new(&env.launch.program);
     command
-        .arg("--config")
-        .arg(env.config_path)
+        .args(&env.launch.args)
         .current_dir(env.repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(create_stderr_log(&stderr_log)?);
-    let mut group = ProcessGroup::spawn(&mut command)
-        .with_context(|| format!("failed to spawn {}", env.mcpls.path.display()))?;
+        .stderr(Stdio::piped());
+    let mut group = ProcessGroup::spawn(command)
+        .with_context(|| format!("failed to spawn {}", env.launch.program.display()))?;
     let transport = group.take_stdio()?;
+    let drain = StderrDrain::start(
+        group.take_stderr()?,
+        &stderr_path,
+        env.options.stderr_log_cap,
+    )?;
 
-    let mut recorder = Recorder::default();
-    let session = drive(transport, env, started, group.pgid(), &mut recorder).await;
+    let mut recorder = Recorder::new(group.leader_pid());
+    let session = drive(transport, env, started, &mut recorder).await;
+    let shutdown = group.finish(session.end, &recorder.watch).await;
+    let stderr_log = drain.finish(DRAIN_GRACE).await;
+    clear_target_state(&env.options.target, env.repo)?;
     Ok(RunRecord {
         index,
         warmup,
@@ -300,14 +392,51 @@ async fn one_run(index: u32, warmup: bool, env: &RunEnv<'_>) -> Result<RunRecord
         samples: recorder.samples,
         memory: recorder.memory,
         stderr_log,
-        shutdown: group.finish(session.closed).await,
+        shutdown,
     })
 }
 
 struct Session {
     ready: ReadyRecord,
     truncated: bool,
-    closed: bool,
+    end: SessionEnd,
+}
+
+impl Session {
+    /// A session that never got going: the failure is both the startup sample and the ready verdict.
+    fn failed(error: String, started: Instant, recorder: &mut Recorder, end: SessionEnd) -> Self {
+        let failure = Outcome::Failed { error };
+        recorder.samples.push(Sample {
+            region: Region::Startup,
+            outcome: failure.clone(),
+            elapsed_us: started.elapsed().into(),
+            iteration: 0,
+        });
+        Self {
+            ready: ReadyRecord {
+                attempts: 0,
+                last_failure: Some(failure),
+            },
+            truncated: false,
+            end,
+        }
+    }
+}
+
+/// The tools of `target` that `client` does not export, so a drifted pin fails fast.
+async fn missing_tools(client: &Client, target: &Target, timeout: Duration) -> Result<Vec<String>> {
+    let Target::External(external) = target else {
+        return Ok(Vec::new());
+    };
+    let listed = tokio::time::timeout(timeout, client.list_all_tools())
+        .await
+        .context("tools/list timed out")?
+        .context("tools/list failed")?;
+    Ok(external
+        .required_tools()
+        .filter(|name| !listed.iter().any(|tool| tool.name == *name))
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Runs one MCP session, recording its samples and memory readings.
@@ -315,11 +444,11 @@ async fn drive(
     transport: (tokio::process::ChildStdout, tokio::process::ChildStdin),
     env: &RunEnv<'_>,
     started: Instant,
-    group: ProcessGroupId,
     recorder: &mut Recorder,
 ) -> Session {
     let RunEnv {
         scenario,
+        ready_probe,
         repo,
         options,
         ..
@@ -327,62 +456,63 @@ async fn drive(
     let client = match ().serve(transport).await {
         Ok(client) => client,
         Err(error) => {
-            let failure = Outcome::Failed {
-                error: error.to_string(),
-            };
-            recorder.samples.push(Sample {
-                region: Region::Startup,
-                outcome: failure.clone(),
-                elapsed_us: started.elapsed().into(),
-                iteration: 0,
-            });
-            return Session {
-                ready: ReadyRecord {
-                    attempts: 0,
-                    last_failure: Some(failure),
-                },
-                truncated: false,
-                closed: false,
-            };
+            return Session::failed(error.to_string(), started, recorder, SessionEnd::Abandoned);
         }
     };
+    match missing_tools(&client, &options.target, options.call_timeout).await {
+        Ok(missing) if missing.is_empty() => {}
+        Ok(missing) => {
+            let error = format!("the target does not export the tools {missing:?}");
+            let end = close(client).await;
+            return Session::failed(error, started, recorder, end);
+        }
+        Err(error) => {
+            let end = close(client).await;
+            return Session::failed(format!("{error:#}"), started, recorder, end);
+        }
+    }
     recorder.samples.push(Sample {
         region: Region::Startup,
         outcome: Outcome::Ok,
         elapsed_us: started.elapsed().into(),
         iteration: 0,
     });
-    let (ready, ready_sample) = wait_until_ready(&client, scenario, repo, started, options).await;
+    let (ready, ready_sample) =
+        wait_until_ready(&client, ready_probe, repo, started, options).await;
     let is_ready = ready.last_failure.is_none();
     recorder.samples.push(ready_sample);
     let truncated = if is_ready {
-        recorder.sample_memory(MemoryCheckpoint::Ready, group).await;
+        recorder.sample_memory(MemoryCheckpoint::Ready).await;
         let truncated =
             measure_probes(&client, scenario, repo, options, &mut recorder.samples).await;
         if !truncated {
-            recorder
-                .sample_memory(MemoryCheckpoint::AfterProbes, group)
-                .await;
+            recorder.sample_memory(MemoryCheckpoint::AfterProbes).await;
         }
         truncated
     } else {
         false
     };
-    let closed = matches!(
-        tokio::time::timeout(SHUTDOWN_GRACE, client.cancel()).await,
-        Ok(Ok(_))
-    );
+    // One last look before shutdown records helpers that appeared after the checkpoints.
+    recorder.watch.sample().await;
+    let end = close(client).await;
     Session {
         ready,
         truncated,
-        closed,
+        end,
+    }
+}
+
+async fn close(client: Client) -> SessionEnd {
+    match tokio::time::timeout(SHUTDOWN_GRACE, client.cancel()).await {
+        Ok(Ok(_)) => SessionEnd::Closed,
+        _ => SessionEnd::Abandoned,
     }
 }
 
 /// Retries the ready probe until it passes, fails permanently, or the deadline passes.
 async fn wait_until_ready(
     client: &Client,
-    scenario: &Scenario,
+    ready_probe: &Probe,
     repo: &Path,
     started: Instant,
     options: &RunOptions,
@@ -395,7 +525,7 @@ async fn wait_until_ready(
             d.saturating_duration_since(Instant::now())
                 .min(options.call_timeout)
         });
-        let call = timed_call(client, &scenario.ready_probe, repo, budget, 0).await;
+        let call = timed_call(client, ready_probe, repo, budget, 0, &options.target).await;
         let ready_sample = |outcome| Sample {
             region: Region::Ready,
             outcome,
@@ -439,11 +569,21 @@ async fn measure_probes(
 ) -> bool {
     for probe in &scenario.probes {
         for iteration in 0..options.iterations {
-            let call = timed_call(client, probe, repo, options.call_timeout, iteration).await;
-            let timed_out = call.sample.outcome == Outcome::TimedOut;
+            let call = timed_call(
+                client,
+                probe,
+                repo,
+                options.call_timeout,
+                iteration,
+                &options.target,
+            )
+            .await;
+            let outcome = call.sample.outcome.clone();
             samples.push(call.sample);
-            if timed_out {
-                return true;
+            match outcome {
+                Outcome::TimedOut => return true,
+                Outcome::Unsupported => break,
+                _ => {}
             }
         }
     }
@@ -470,10 +610,22 @@ async fn timed_call(
     repo: &Path,
     timeout: Duration,
     iteration: u32,
+    target: &Target,
 ) -> Call {
     let region = probe.region();
-    let request = match probe.request(repo) {
-        Ok(request) => request,
+    let request = match target.request(probe, repo) {
+        Ok(ProbeCall::Call(request)) => request,
+        Ok(ProbeCall::Unsupported) => {
+            return Call {
+                sample: Sample {
+                    region,
+                    outcome: Outcome::Unsupported,
+                    elapsed_us: Micros(0),
+                    iteration,
+                },
+                permanent: true,
+            };
+        }
         Err(error) => {
             return Call {
                 sample: Sample {
@@ -509,7 +661,7 @@ async fn timed_call(
             },
             false,
         ),
-        Ok(Ok(result)) => match probe.verdict(&result) {
+        Ok(Ok(result)) => match target.verdict(probe, &result) {
             Ok(()) => (Outcome::Ok, false),
             Err(Incorrect(detail)) => (Outcome::Incorrect { detail }, false),
         },

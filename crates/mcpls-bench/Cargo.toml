@@ -27,7 +27,14 @@ toml = { workspace = true }
 url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { workspace = true, features = [
+    "tokio1",
+    "job-object",
+    "kill-on-drop",
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

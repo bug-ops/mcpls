@@ -38,11 +38,38 @@ pub fn resolve_in_path(command: &str) -> Result<PathBuf> {
             .with_context(|| format!("failed to resolve `{command}`"));
     }
     let path = std::env::var_os("PATH").context("PATH is not set")?;
+    let pathext = cfg!(windows)
+        .then(|| std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_owned()));
+    let names = candidate_names(command, pathext.as_deref());
     std::env::split_paths(&path)
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(format!("{command}{}", std::env::consts::EXE_SUFFIX)))
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .find(|candidate| candidate.is_file())
         .with_context(|| format!("`{command}` was not found in an absolute PATH entry"))
+}
+
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// File names under which `command` may be installed, in lookup order.
+///
+/// With `pathext` (Windows), the command as written comes first when it already
+/// carries an extension, then the command with each `PATHEXT` extension appended,
+/// so `pnpm` finds `pnpm.cmd`. Without it, only the command itself.
+fn candidate_names(command: &str, pathext: Option<&str>) -> Vec<String> {
+    let Some(pathext) = pathext else {
+        return vec![command.to_owned()];
+    };
+    let mut names = Vec::new();
+    if Path::new(command).extension().is_some() {
+        names.push(command.to_owned());
+    }
+    names.extend(
+        pathext
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| format!("{command}{ext}")),
+    );
+    names
 }
 
 /// Resolves `executable`, runs its version command in `cwd`, and records the result.
@@ -52,16 +79,20 @@ pub fn resolve_in_path(command: &str) -> Result<PathBuf> {
 /// Returns an error when the executable cannot be resolved or run, or exits unsuccessfully.
 pub async fn pin(executable: &Executable, cwd: &Path) -> Result<PinRecord> {
     let path = resolve_in_path(&executable.command)?;
-    let output = Command::new(&path)
+    let version_path = match &executable.version_command {
+        Some(command) => resolve_in_path(command)?,
+        None => path.clone(),
+    };
+    let output = Command::new(&version_path)
         .args(&executable.version_args)
         .current_dir(cwd)
         .output()
         .await
-        .with_context(|| format!("failed to run {}", path.display()))?;
+        .with_context(|| format!("failed to run {}", version_path.display()))?;
     if !output.status.success() {
         bail!(
             "`{} {}` exited with {}",
-            path.display(),
+            version_path.display(),
             executable.version_args.join(" "),
             output.status
         );
@@ -137,8 +168,39 @@ mod tests {
     }
 
     #[test]
+    fn pathext_extensions_are_tried_in_order() {
+        assert_eq!(candidate_names("git", None), ["git"]);
+        assert_eq!(
+            candidate_names("pnpm", Some(".EXE;;.CMD")),
+            ["pnpm.EXE", "pnpm.CMD"]
+        );
+        assert_eq!(
+            candidate_names("tool.bat", Some(".EXE")),
+            ["tool.bat", "tool.bat.EXE"]
+        );
+    }
+
+    #[test]
     fn missing_command_is_reported() {
         assert!(resolve_in_path("definitely-not-a-real-command-xyz").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_separate_version_command_supplies_the_version() {
+        let exe = Executable {
+            command: "sh".to_owned(),
+            version_args: vec!["-c".to_owned(), "echo viaecho 3".to_owned()],
+            version_command: Some("sh".to_owned()),
+            expected_version: None,
+        };
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(pin(&exe, &cwd).await.unwrap().version_output, "viaecho 3");
+        let missing = Executable {
+            version_command: Some("no-such-version-command-xyz".to_owned()),
+            ..exe
+        };
+        assert!(pin(&missing, &cwd).await.is_err());
     }
 
     #[cfg(unix)]
@@ -147,6 +209,7 @@ mod tests {
         let exe = Executable {
             command: "sh".to_owned(),
             version_args: vec!["-c".to_owned(), "echo shver 9".to_owned()],
+            version_command: None,
             expected_version: Some("shver 9".to_owned()),
         };
         let cwd = std::env::current_dir().unwrap();

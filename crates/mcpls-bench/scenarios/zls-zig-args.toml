@@ -1,0 +1,51 @@
+name = "zls-zig-args"
+
+[source]
+kind = "git"
+url = "https://github.com/MasterQ32/zig-args"
+commit = "ad3c89ecdb2979b8b5d52b43b78e79bf51293235"
+
+[server]
+language_id = "zig"
+file_patterns = ["**/*.zig"]
+
+[server.executable]
+command = "zls"
+version_args = ["--version"]
+
+[[runtime]]
+command = "zig"
+version_args = ["version"]
+
+[ready_probe]
+kind = "hover"
+file = "args.zig"
+position = { line = 7, character = 105 }
+contains = "ErrorHandling"
+symbol = "ErrorHandling"
+
+[[probes]]
+kind = "hover"
+file = "args.zig"
+position = { line = 7, character = 105 }
+contains = "ErrorHandling"
+symbol = "ErrorHandling"
+
+[[probes]]
+kind = "definition"
+file = "args.zig"
+position = { line = 7, character = 105 }
+uri_suffix = "args.zig"
+symbol = "ErrorHandling"
+
+[[probes]]
+kind = "references"
+file = "args.zig"
+position = { line = 7, character = 105 }
+min_count = 2
+symbol = "ErrorHandling"
+
+[[probes]]
+kind = "document_symbols"
+file = "args.zig"
+symbol = "parseInt"
