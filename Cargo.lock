@@ -949,6 +949,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcpls-bench"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "dunce",
+ "mcpls-core",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "mcpls-core"
 version = "0.6.0"
 dependencies = [

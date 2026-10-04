@@ -987,6 +987,30 @@
     }
   },
   {
+    "name": "get_tool_support",
+    "title": "Tool Support",
+    "description": "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` lists each language's `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "file_path": {
+          "description": "Absolute path to a file; restricts the report to its language.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Tool Support",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
     "name": "go_to_implementation",
     "title": "Go to Implementation",
     "description": "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",

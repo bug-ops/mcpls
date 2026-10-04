@@ -35,7 +35,7 @@ related:
 > there is no single lock two call paths could acquire in conflicting order. `NotificationCache`
 > (FR-004) is likewise its own independently-locked structure, not nested inside `Translator`. The
 > `mcp/server.rs` tool count referenced in the Problem Statement below is also stale — the surface
-> is now 20 tools (see `specs/constitution.md`), not 16. Kept for historical context; do not use
+> is now 21 tools (see `specs/constitution.md`), not 16. Kept for historical context; do not use
 > this spec's FR/NFR table as a description of the current locking architecture.
 
 ## 1. Overview

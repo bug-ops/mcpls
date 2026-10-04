@@ -1184,6 +1184,34 @@ fn sc_get_inlay_hints(client: &mut McpClient, workspace: &Path) -> Result<(), St
     }
 }
 
+/// Tool 21: `get_tool_support` — rust-analyzer's capabilities make hover and
+/// diagnostics dispatchable for `rust`.
+fn sc_get_tool_support(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
+    let resp = client
+        .call_tool("get_tool_support", &json!({}))
+        .map_err(|e| format!("call failed: {e}"))?;
+
+    let text = assertions::assert_tool_ok(&resp);
+    let report: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+    if !report["languages"]
+        .as_array()
+        .is_some_and(|langs| langs.iter().any(|l| l == "rust"))
+    {
+        return Err(format!("expected 'rust' in languages, got {report}"));
+    }
+    for tool in ["get_hover", "get_diagnostics"] {
+        let entry = report["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|t| t["name"] == tool))
+            .ok_or_else(|| format!("{tool} missing from report {report}"))?;
+        if entry["coverage"] != "all" {
+            return Err(format!("{tool}: expected coverage 'all', got {entry}"));
+        }
+    }
+    Ok(())
+}
+
 /// Resource sub-case 1: `list_resources` — at least one lib.rs resource exposed.
 ///
 /// Precondition: `sc_get_hover` and earlier sub-cases have triggered didOpen for
@@ -1445,6 +1473,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_go_to_implementation),
         sub_case!(sc_go_to_type_definition),
         sub_case!(sc_get_inlay_hints),
+        sub_case!(sc_get_tool_support),
         sub_case!(sc_list_resources),
         sub_case!(sc_read_resource),
         sub_case!(sc_subscribe_unsubscribe_resource),

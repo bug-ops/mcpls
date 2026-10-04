@@ -1,0 +1,158 @@
+//! `mcpls-bench` command-line entry point.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use mcpls_bench::prepare::{WorkDir, prepare};
+use mcpls_bench::report::{Micros, RunReport};
+use mcpls_bench::run::{RunOptions, run};
+use mcpls_bench::scenario::Scenario;
+
+#[derive(Debug, Parser)]
+#[command(name = "mcpls-bench", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, clap::Args)]
+struct ScenarioArgs {
+    /// Scenario TOML file.
+    scenario: PathBuf,
+    /// Directory for cloned repositories and generated configs; must not be inside a Cargo workspace.
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Check out the pinned repository and run the untimed setup steps.
+    Prepare(ScenarioArgs),
+    /// Measure mcpls against a prepared scenario and print a JSON report.
+    Run {
+        #[command(flatten)]
+        scenario: ScenarioArgs,
+        /// The mcpls binary; defaults to the `mcpls` next to this executable (never one from PATH).
+        #[arg(long)]
+        mcpls: Option<PathBuf>,
+        /// Measured runs, each a fresh mcpls process.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(..=1000))]
+        runs: u32,
+        /// Warm-up runs executed first and excluded from the summary.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(..=1000))]
+        warmup_runs: u32,
+        /// Iterations of every probe per run.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        iterations: u32,
+        /// Seconds to wait for the ready probe to pass.
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        ready_timeout_secs: u64,
+        /// Seconds before a single tool call counts as timed out.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        call_timeout_secs: u64,
+        /// Continue when an executable's version differs from the scenario pin.
+        #[arg(long)]
+        allow_version_mismatch: bool,
+        /// Also write the JSON report to this file.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+fn default_mcpls() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot locate the current executable")?;
+    let sibling = exe.with_file_name(format!("mcpls{}", std::env::consts::EXE_SUFFIX));
+    if sibling.is_file() {
+        Ok(sibling)
+    } else {
+        bail!(
+            "no `mcpls` next to {}; build it (`cargo build -p mcpls`) or pass --mcpls",
+            exe.display()
+        )
+    }
+}
+
+fn scenario_dir(path: &Path) -> Result<PathBuf> {
+    let dir = dunce::canonicalize(path)
+        .with_context(|| format!("failed to resolve {}", path.display()))?
+        .parent()
+        .map(Path::to_path_buf)
+        .context("scenario path has no parent directory")?;
+    Ok(dir)
+}
+
+fn print_summary(report: &RunReport) {
+    let cell = |us: Option<Micros>| us.map_or_else(|| "-".to_owned(), |m| m.0.to_string());
+    eprintln!(
+        "{:<16} {:>4} {:>6} {:>11} {:>10} {:>10} {:>10}",
+        "region", "ok", "not_ok", "first_med", "steady_min", "steady_med", "steady_max"
+    );
+    for row in &report.summary {
+        eprintln!(
+            "{:<16} {:>4} {:>6} {:>11} {:>10} {:>10} {:>10}",
+            row.region,
+            row.ok,
+            row.not_ok,
+            cell(row.first.as_ref().map(|s| s.median_us)),
+            cell(row.steady.as_ref().map(|s| s.min_us)),
+            cell(row.steady.as_ref().map(|s| s.median_us)),
+            cell(row.steady.as_ref().map(|s| s.max_us)),
+        );
+    }
+    if report.aborted {
+        eprintln!("ABORTED: the server never became ready; later runs were skipped");
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    match Cli::parse().command {
+        Command::Prepare(args) => {
+            let scenario = Scenario::load(&args.scenario)?;
+            let work_dir = args.work_dir.map_or_else(WorkDir::default_path, Ok)?;
+            let repo = prepare(&scenario, &scenario_dir(&args.scenario)?, &work_dir).await?;
+            eprintln!("prepared {}", repo.display());
+        }
+        Command::Run {
+            scenario: args,
+            mcpls,
+            runs,
+            warmup_runs,
+            iterations,
+            ready_timeout_secs,
+            call_timeout_secs,
+            allow_version_mismatch,
+            output,
+        } => {
+            let scenario = Scenario::load(&args.scenario)?;
+            let work_dir = args.work_dir.map_or_else(WorkDir::default_path, Ok)?;
+            let options = RunOptions {
+                mcpls: mcpls.map_or_else(default_mcpls, Ok)?,
+                runs,
+                warmup_runs,
+                iterations,
+                ready_timeout: Duration::from_secs(ready_timeout_secs),
+                call_timeout: Duration::from_secs(call_timeout_secs),
+                allow_version_mismatch,
+            };
+            let report = run(
+                &scenario,
+                &scenario_dir(&args.scenario)?,
+                &work_dir,
+                &options,
+            )
+            .await?;
+            let json =
+                serde_json::to_string_pretty(&report).context("failed to serialize report")?;
+            if let Some(path) = output {
+                std::fs::write(&path, &json)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+            }
+            println!("{json}");
+            print_summary(&report);
+        }
+    }
+    Ok(())
+}

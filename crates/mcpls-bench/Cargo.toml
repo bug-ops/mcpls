@@ -1,0 +1,32 @@
+[package]
+name = "mcpls-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Latency benchmark harness for mcpls driven over MCP against real language servers"
+publish = false
+
+[[bin]]
+name = "mcpls-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+dirs = { workspace = true }
+dunce = { workspace = true }
+mcpls-core = { workspace = true }
+rmcp = { workspace = true, features = ["client", "transport-async-rw"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

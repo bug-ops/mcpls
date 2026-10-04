@@ -1,0 +1,55 @@
+name = "react-hook-form-tsls"
+setup = [
+    { command = "pnpm", args = ["install", "--frozen-lockfile", "--ignore-scripts"] },
+]
+
+[source]
+kind = "git"
+url = "https://github.com/react-hook-form/react-hook-form"
+commit = "3e6f6815f7ac8f4ef3df429a7157844f69e514fb" # v7.69.0
+
+[server]
+language_id = "typescript"
+file_patterns = ["**/*.ts", "**/*.tsx"]
+args = ["--stdio"]
+
+[server.executable]
+command = "typescript-language-server"
+version_args = ["--version"]
+
+[[runtime]]
+command = "node"
+version_args = ["--version"]
+
+[[runtime]]
+command = "pnpm"
+version_args = ["--version"]
+
+[ready_probe]
+kind = "hover"
+file = "src/useForm.ts"
+position = { line = 4, character = 9 }
+contains = "deepEqual"
+
+[[probes]]
+kind = "hover"
+file = "src/useForm.ts"
+position = { line = 4, character = 9 }
+contains = "deepEqual"
+
+[[probes]]
+kind = "definition"
+file = "src/useForm.ts"
+position = { line = 4, character = 9 }
+uri_suffix = "src/utils/deepEqual.ts"
+
+[[probes]]
+kind = "references"
+file = "src/useForm.ts"
+position = { line = 13, character = 13 }
+min_count = 2
+
+[[probes]]
+kind = "document_symbols"
+file = "src/useForm.ts"
+symbol = "useForm"

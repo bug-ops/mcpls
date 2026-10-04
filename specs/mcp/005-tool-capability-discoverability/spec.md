@@ -9,7 +9,7 @@ tags:
   - mcp
   - discoverability
 created: 2026-09-21
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/001-mcp-tool-surface-and-routing/spec|mcp-tool-surface-and-routing]]"
@@ -27,7 +27,7 @@ related:
 ### Problem Statement
 
 mcpls's MCP `tools/list` response is generated once from a static, compile-time table of all
-20 `#[tool]`-annotated handlers (`declared_tool_router()` in
+20 `#[tool]`-annotated handlers (21 since `get_tool_support`) (`declared_tool_router()` in
 `crates/mcpls-core/src/mcp/server.rs:363`, built via `build_tool_router` at `:423`). The list is
 identical regardless of which LSP servers are actually configured for the session or what
 capabilities those servers advertise in their `initialize` response.
@@ -78,16 +78,14 @@ currently cares about.
 
 ### Out of Scope
 
-- Choosing and implementing the exact discovery mechanism (tool annotations vs. a meta-tool vs.
-  enriched `description` text) — left open, see FR-001 and Open Questions.
+- Alternatives to the `get_tool_support` meta-tool (tool annotations, enriched `description` text) — rejected in the plan.
 - Changing or weakening `Translator::require_capability` / the existing per-call capability error
   behavior in `crates/mcpls-core/src/bridge/translator/routing.rs:568` — that path is already
   correct and is explicitly preserved (see NFR-002).
 - Any change to how LSP servers are discovered, spawned, or matched to file types
   (`crates/mcpls-core/src/config/`) — this spec only concerns what the MCP layer *communicates*
   about capabilities already known to the bridge.
-- A `/sdd plan` technical design — per this project's research-spec threshold, this finding stops
-  at `specify`; a plan phase is deferred until a mechanism is chosen (see Open Questions).
+- Technical design — recorded in [[mcp/005-tool-capability-discoverability/plan|plan]].
 
 ## 2. User Stories
 
@@ -133,7 +131,7 @@ marked clarification below — because this is a research/parity spec, not an im
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN an AI agent needs to determine whether a tool is usable for a given configured LSP server/language THE SYSTEM SHALL provide a way to answer this without a failing `tools/call` [NEEDS CLARIFICATION: exact discovery mechanism — tool annotations on the existing `tools/list` entries vs. a dedicated meta-tool (e.g. `get_server_capabilities`) vs. enriched per-tool `description` text listing supporting servers] | must |
+| FR-001 | WHEN an AI agent needs to determine whether a tool is usable for a given configured LSP server/language THE SYSTEM SHALL provide a way to answer this without a failing `tools/call` (resolved: a dedicated meta-tool, `get_tool_support` — see [[mcp/005-tool-capability-discoverability/plan|plan]]) | must |
 | FR-002 | WHEN a tool is not supported by *any* currently configured LSP server THE SYSTEM SHALL surface that distinctly from "supported by some but not all configured servers" (per US-002's three-way distinction) | should |
 | FR-003 | WHEN LSP servers are added, removed, or respawned during a session (see `lsp/001-lsp-server-lifecycle-and-respawn`) THE SYSTEM SHALL keep any exposed capability-discovery information consistent with the currently connected servers' actual `initialize` responses | should |
 | FR-004 | IF a chosen mechanism changes the shape or contents of the standard MCP `tools/list` response THEN THE SYSTEM SHALL verify the change stays within valid MCP protocol schema (tool `name`, `description`, `inputSchema`, and optional fields only) — no invention of non-standard top-level fields the MCP spec does not define | must |
@@ -156,9 +154,8 @@ No new persistent data entities are introduced by this spec. The relevant existi
 | LSP `ServerCapabilities` | Already received and held per-server after `initialize`, per LSP 3.17 | `callHierarchyProvider`, `renameProvider`, `definitionProvider`, etc. (booleans or options) |
 | MCP `Tool` | Standard MCP tool descriptor returned in `tools/list` | `name`, `description`, `inputSchema` — any FR-001 mechanism must fit within or extend this shape in a spec-conformant way |
 
-A future plan phase will need to define how per-server `ServerCapabilities` (already tracked
-somewhere in the LSP client layer) gets correlated with the static tool table to produce whatever
-FR-001's chosen output is.
+The plan correlates per-server `ServerCapabilities` with the static tool table through a snapshot
+of the live registries; see [[mcp/005-tool-capability-discoverability/plan|plan]].
 
 ## 6. Edge Cases and Error Handling
 
@@ -173,17 +170,16 @@ FR-001's chosen output is.
 
 | ID | Metric | Target |
 |----|--------|--------|
-| SC-001 | This spec is re-evaluated once a mechanism is chosen and a `/sdd plan` is produced | Before any implementation PR touching `crates/mcpls-core/src/mcp/server.rs`'s tool router for this purpose |
-| SC-002 | Any implementation of FR-001 passes NFR-001 through NFR-004 | 100% — verified in the future plan's testing strategy |
+| SC-001 | The mechanism was chosen with user approval and recorded in the plan before implementation | Met: [[mcp/005-tool-capability-discoverability/plan|plan]] |
+| SC-002 | The implementation of FR-001 passes NFR-001 through NFR-004 | Met: verified by the plan's section 6 tests |
 
 ## 8. Agent Boundaries
 
 ### Always (without asking)
-- Treat this spec as read-only research context; do not modify `crates/mcpls-core/src/mcp/server.rs` or `crates/mcpls-core/src/bridge/translator/routing.rs` as a side effect of filing or refining this spec.
+- Keep `get_tool_support` and `Translator::require_capability` on the same shared decision functions (`lookup_route`, `lookup_workspace_route`, `check_capability`); the parity matrix in `mcp/server.rs` tests guards this.
 
 ### Ask First
-- Choosing the FR-001 discovery mechanism and promoting this spec into an implementation-ready plan.
-- Filing a GitHub issue for this finding, if one does not already exist.
+- Replacing the `get_tool_support` mechanism (chosen and approved for #461) or changing the shape of `tools/list`.
 
 ### Never
 - Weaken or bypass `Translator::require_capability` (`crates/mcpls-core/src/bridge/translator/routing.rs:568`) as a side effect of implementing any FR-001 mechanism (NFR-002).
@@ -191,9 +187,12 @@ FR-001's chosen output is.
 
 ## 9. Open Questions
 
-- [NEEDS CLARIFICATION: exact discovery mechanism — tool annotations on `tools/list` entries vs. a dedicated meta-tool vs. enriched per-tool `description` text listing which configured servers support it]
-- [NEEDS CLARIFICATION: should capability-discovery information be computed lazily per query, or maintained incrementally as servers connect/respawn — ties into NFR-004 and FR-003]
-- [NEEDS CLARIFICATION: is there operator/agent demand for this at all, or does the existing well-typed per-call capability error (already hardened by #412/#436) suffice in practice — tracked as #461, still open as of 2026-09-21]
+- Resolved (#461): the mechanism is a dedicated `get_tool_support` meta-tool; tool annotations and
+  enriched `description` text were rejected (see [[mcp/005-tool-capability-discoverability/plan|plan]]).
+- Resolved (#461): computed lazily per query from a snapshot of the live registries, so respawns
+  and late registrations are reflected without invalidation (NFR-004).
+- Resolved (#461): implemented as the P4 follow-up to the per-call error rather than as a reaction
+  to measured demand; the per-call `CapabilityNotSupported` error is unchanged.
 
 ## 10. See Also
 

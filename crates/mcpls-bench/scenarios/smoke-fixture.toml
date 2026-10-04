@@ -1,0 +1,47 @@
+name = "smoke-fixture"
+
+[source]
+kind = "local"
+path = "../../mcpls-core/tests/fixtures/rust_workspace"
+
+[server]
+language_id = "rust"
+file_patterns = ["**/*.rs"]
+
+[server.executable]
+command = "rust-analyzer"
+version_args = ["--version"]
+
+[ready_probe]
+kind = "hover"
+file = "src/lib.rs"
+position = { line = 18, character = 12 }
+contains = "User"
+
+[[probes]]
+kind = "hover"
+file = "src/lib.rs"
+position = { line = 18, character = 12 }
+contains = "User"
+
+[[probes]]
+kind = "definition"
+file = "src/functions.rs"
+position = { line = 8, character = 17 }
+uri_suffix = "src/lib.rs"
+
+[[probes]]
+kind = "references"
+file = "src/lib.rs"
+position = { line = 18, character = 12 }
+min_count = 3
+
+[[probes]]
+kind = "document_symbols"
+file = "src/lib.rs"
+symbol = "User"
+
+[[probes]]
+kind = "diagnostics"
+file = "src/lib.rs"
+expect = { kind = "at_least", count = 1 }

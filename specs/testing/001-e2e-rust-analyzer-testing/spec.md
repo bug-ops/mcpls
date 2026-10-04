@@ -49,8 +49,8 @@ related:
 > - PR #225 — fixed off-by-one hover positions and a diagnostics-replay-on-subscribe bug the
 >   suite itself surfaced, demonstrating the suite catching a real regression before release.
 >
-> As of this writing `tests/ra_e2e.rs` runs 24 sub-cases (`sc_*` functions in a `sub_cases`
-> registry) covering all 20 current MCP tools plus the four resource-protocol sub-cases, still
+> As of this writing `tests/ra_e2e.rs` runs 25 sub-cases (`sc_*` functions in a `sub_cases`
+> registry) covering all 21 current MCP tools plus the four resource-protocol sub-cases, still
 > as the single `#[test] fn ra_e2e_suite()` driver this doc's Section 1 (C1) specified — cold-start
 > amortization holds under both `cargo test` and `cargo nextest run`, one rust-analyzer spawn per
 > full suite run (plus the documented second spawn for the empty-workspace edge case).
@@ -122,7 +122,7 @@ number of MCP tools
 
 **Acceptance criteria:**
 ```
-GIVEN the e2e suite covers N tools (N = 20 as of this writing)
+GIVEN the e2e suite covers N tools (N = 21 as of this writing)
 WHEN the suite runs under cargo nextest (process-per-test by default)
 THEN rust-analyzer is spawned at most twice for the whole run (main suite + the dedicated
      empty-workspace edge case), not once per tool
@@ -194,7 +194,7 @@ Not a data-model feature — the relevant "entities" are test-harness constructs
 
 | ID | Metric | Target |
 |----|--------|--------|
-| SC-001 | `cargo nextest run --workspace --all-features -- --ignored` (or the dedicated e2e CI job) with rust-analyzer installed | Suite runs, exercises all 20 current MCP tools + 4 resource sub-cases, exits 0 |
+| SC-001 | `cargo nextest run --workspace --all-features -- --ignored` (or the dedicated e2e CI job) with rust-analyzer installed | Suite runs, exercises all 21 current MCP tools + 4 resource sub-cases, exits 0 |
 | SC-002 | `cargo nextest run --workspace --all-features` (default, no `--ignored`) | `ra_e2e_suite` does not run; suite completes without requiring rust-analyzer |
 | SC-003 | rust-analyzer spawn count per full suite run | At most 2 (main suite + empty-workspace edge case) |
 | SC-004 | A deliberately broken sub-case assertion | Suite fails with a report naming the specific failed sub-case, not a generic failure |

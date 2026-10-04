@@ -115,7 +115,7 @@ grown alongside the tool surface: PR #139 added sub-cases for the four LSP 3.17-
 [[lsp/002-lsp317-missing-tools/spec|spec lsp/002]]) and four MCP-resources sub-cases
 (`sc_list_resources`, `sc_read_resource`, `sc_subscribe_unsubscribe_resource`,
 `sc_subscribe_no_replay_without_cached_diagnostics` — [[mcp/002-mcp-resources-diagnostics/spec|spec
-002]]), bringing the registry to 24 sub-cases covering all 20 current MCP tools plus the resource
+002]]), bringing the registry to 25 sub-cases covering all 21 current MCP tools (`sc_get_tool_support` added by #461) plus the resource
 protocol. See `tests/ra_e2e.rs`'s `sub_cases` registry for the authoritative, current list — do
 not rely on the original design doc's 16-row table as current.
 

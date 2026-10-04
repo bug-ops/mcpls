@@ -149,6 +149,34 @@ fn test_e2e_tool_prefix_reaches_real_wiring() -> Result<()> {
     Ok(())
 }
 
+/// `get_tool_support` is callable through the real binary and reports every
+/// tool, with language-independent tools as `always` (#461).
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_get_tool_support_reports_every_tool() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+    client.initialize()?;
+
+    let response = client.call_tool("get_tool_support", &json!({}))?;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no text content in {response}"))?;
+    let report: serde_json::Value = serde_json::from_str(text)?;
+
+    assert!(report["languages"].is_array(), "{report}");
+    let tools = report["tools"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tools should be an array: {report}"))?;
+    assert_eq!(tools.len(), 21, "{report}");
+    let logs = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_server_logs")
+        .ok_or_else(|| anyhow::anyhow!("get_server_logs missing: {report}"))?;
+    assert_eq!(logs["coverage"], "always");
+
+    Ok(())
+}
+
 /// Test listing all available MCP tools.
 ///
 /// Validates that:
@@ -166,7 +194,7 @@ fn test_e2e_list_tools() -> Result<()> {
         .as_array()
         .unwrap_or_else(|| panic!("tools should be an array"));
 
-    assert_eq!(tools.len(), 20, "Should have exactly 20 tools");
+    assert_eq!(tools.len(), 21, "Should have exactly 21 tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
@@ -191,6 +219,7 @@ fn test_e2e_list_tools() -> Result<()> {
         "go_to_implementation",
         "go_to_type_definition",
         "get_inlay_hints",
+        "get_tool_support",
     ] {
         assert!(tool_names.contains(expected), "Should have {expected} tool");
     }

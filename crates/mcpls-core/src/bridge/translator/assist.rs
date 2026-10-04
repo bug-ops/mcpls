@@ -13,7 +13,6 @@ use super::dto::{
 };
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
-use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
 /// Extract hover contents as markdown string.
@@ -67,12 +66,7 @@ impl Translator {
         validate_completions_params(trigger.as_deref())?;
 
         let doc = self
-            .prepare_gated_document(
-                &file_path,
-                ToolKind::Completions,
-                Capability::Completions,
-                IndexingGate::Required,
-            )
+            .prepare_gated_document(&file_path, Capability::Completions, IndexingGate::Required)
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -139,7 +133,6 @@ impl Translator {
         let doc = self
             .prepare_gated_document(
                 &file_path,
-                ToolKind::SignatureHelp,
                 Capability::SignatureHelp,
                 IndexingGate::NotRequired,
             )
@@ -222,7 +215,6 @@ impl Translator {
         let doc = self
             .prepare_gated_document(
                 &file_path,
-                ToolKind::InlayHints,
                 Capability::InlayHints,
                 IndexingGate::NotRequired,
             )

@@ -201,6 +201,7 @@ structured `outputSchema`, so MCP clients that support structured tool output ge
 |------|--------------|
 | `get_server_logs` | Debug LSP issues with internal log messages |
 | `get_server_messages` | User-facing messages from the language server |
+| `get_tool_support` | Which tools are usable for which languages in this session, before calling them |
 
 </details>
 

@@ -1,0 +1,56 @@
+name = "fd-rust-analyzer"
+setup = [
+    { command = "cargo", args = ["fetch", "--locked"] },
+    { command = "cargo", args = ["check", "--all-targets", "--locked"] },
+]
+
+[source]
+kind = "git"
+url = "https://github.com/sharkdp/fd"
+commit = "4f81778774463bf414a184cbe6d5219ad2229646" # v10.5.0
+
+[server]
+language_id = "rust"
+file_patterns = ["**/*.rs"]
+
+[server.executable]
+command = "rust-analyzer"
+version_args = ["--version"]
+
+[[runtime]]
+command = "cargo"
+version_args = ["--version"]
+
+[ready_probe]
+kind = "hover"
+file = "src/main.rs"
+position = { line = 63, character = 18 }
+contains = "ExitCode"
+
+[[probes]]
+kind = "hover"
+file = "src/main.rs"
+position = { line = 63, character = 18 }
+contains = "ExitCode"
+
+[[probes]]
+kind = "definition"
+file = "src/main.rs"
+position = { line = 63, character = 18 }
+uri_suffix = "src/main.rs"
+
+[[probes]]
+kind = "references"
+file = "src/main.rs"
+position = { line = 218, character = 4 }
+min_count = 2
+
+[[probes]]
+kind = "document_symbols"
+file = "src/main.rs"
+symbol = "build_pattern_regex"
+
+[[probes]]
+kind = "diagnostics"
+file = "src/main.rs"
+expect = { kind = "no_errors" }

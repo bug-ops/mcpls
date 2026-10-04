@@ -64,14 +64,14 @@ After adding the configuration, restart Claude Code to load mcpls.
 
 Ask Claude: "What tools are available?"
 
-You should see 20 mcpls tools, including:
+You should see 21 mcpls tools, including:
 - get_hover, get_definition, get_references, get_completions
 - get_diagnostics, get_cached_diagnostics
 - get_document_symbols, workspace_symbol_search
 - rename_symbol, format_document, get_code_actions
 - get_signature_help, go_to_implementation, go_to_type_definition, get_inlay_hints
 - prepare_call_hierarchy, get_incoming_calls, get_outgoing_calls
-- get_server_logs, get_server_messages
+- get_server_logs, get_server_messages, get_tool_support
 
 ### 4. Try It Out
 

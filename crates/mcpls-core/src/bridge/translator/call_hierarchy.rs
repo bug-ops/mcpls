@@ -14,7 +14,6 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE};
-use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
 /// Parsed form of an MCP-facing `CallHierarchyItemResult` JSON value (1-based
@@ -123,7 +122,6 @@ impl Translator {
         let doc = self
             .prepare_gated_document(
                 &file_path,
-                ToolKind::CallHierarchy,
                 Capability::CallHierarchy,
                 IndexingGate::NotRequired,
             )
@@ -191,7 +189,6 @@ impl Translator {
         let doc = self
             .prepare_gated_document_for_path(
                 &path,
-                ToolKind::CallHierarchy,
                 Capability::CallHierarchy,
                 IndexingGate::Required,
             )
@@ -269,7 +266,6 @@ impl Translator {
         let doc = self
             .prepare_gated_document_for_path(
                 &path,
-                ToolKind::CallHierarchy,
                 Capability::CallHierarchy,
                 IndexingGate::Required,
             )

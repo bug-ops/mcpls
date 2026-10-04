@@ -222,6 +222,16 @@ const fn default_message_limit() -> usize {
     20
 }
 
+/// Parameters for the `get_tool_support` tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for reporting which tools are usable for which languages.")]
+pub struct ToolSupportParams {
+    /// Restrict the report to the language of this file.
+    #[schemars(description = "Absolute path to a file; restricts the report to its language.")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+}
+
 /// Parameters for the `get_inlay_hints` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting inlay hints in a range.")]
