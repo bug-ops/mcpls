@@ -169,7 +169,7 @@ fn test_e2e_get_tool_support_reports_every_tool() -> Result<()> {
     let tools = report["tools"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("tools should be an array: {report}"))?;
-    assert_eq!(tools.len(), 21, "{report}");
+    assert_eq!(tools.len(), 23, "{report}");
     let logs = tools
         .iter()
         .find(|tool| tool["name"] == "get_server_logs")
@@ -182,7 +182,7 @@ fn test_e2e_get_tool_support_reports_every_tool() -> Result<()> {
 /// Test listing all available MCP tools.
 ///
 /// Validates that:
-/// - tools/list returns an array of 16 tools
+/// - tools/list returns the full tool array
 /// - All expected tool names are present
 #[test]
 #[ignore = "Requires mcpls binary built"]
@@ -196,7 +196,7 @@ fn test_e2e_list_tools() -> Result<()> {
         .as_array()
         .unwrap_or_else(|| panic!("tools should be an array"));
 
-    assert_eq!(tools.len(), 21, "Should have exactly 21 tools");
+    assert_eq!(tools.len(), 23, "Should have exactly 23 tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
@@ -222,6 +222,8 @@ fn test_e2e_list_tools() -> Result<()> {
         "go_to_type_definition",
         "get_inlay_hints",
         "get_tool_support",
+        "go_to_declaration",
+        "restart_server",
     ] {
         assert!(tool_names.contains(expected), "Should have {expected} tool");
     }

@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete reference for all 21 MCP tools provided by mcpls.
+Complete reference for all 23 MCP tools provided by mcpls.
 
 ## Overview
 
@@ -9,6 +9,30 @@ mcpls exposes semantic code intelligence from Language Server Protocol (LSP) ser
 Names below are the defaults; if the bridge is configured with `mcp.tool_prefix` (see
 [Configuration Reference](configuration.md#mcp-section)), every tool name gains that prefix
 (`{tool_prefix}_{tool}`).
+
+### Addressing a Symbol by Name
+
+`get_hover`, `get_definition`, `get_references`, `go_to_implementation`, `go_to_type_definition`,
+`prepare_call_hierarchy` and `rename_symbol` accept either a position (`line` + `character`,
+both 1-based) or a symbol name. Give exactly one form; a request with both, neither, or half a
+position is rejected with `-32602`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `symbol_name` | string | Name of a symbol defined in the file; may be qualified (`Type::method`, `Type.method`) |
+| `symbol_kind` | string | Optional. Keep only symbols of this kind, by name (`function`, `method`, `struct`, ...) or numeric LSP `SymbolKind` |
+| `container` | string | Optional. Keep only symbols directly inside a type, impl, class or module of this name |
+
+The name is resolved against the file's `textDocument/documentSymbol` answer and the identifier
+position is verified against the document text before the tool runs. A name-addressed result
+carries `resolved_symbol` (`name`, `kind`, `container`, the queried `position`, and
+`position_source`: `selection_range` or `inferred`). Resolution never guesses: a name that
+matches several symbols, none, or whose identifier cannot be located unambiguously fails with
+`-32602` and a structured `data.resolution` of `ambiguous` (with every candidate and its
+position), `not_found`, `not_defined_in_file` (an import or plain reference; use
+`workspace_symbol_search` or a position) or `position_unverified`. `rename_symbol` by name never
+produces an edit for an ambiguous name. `get_signature_help` and `get_completions` take a
+position only.
 
 ### Advisory Flags on Position-Bearing Results
 
@@ -85,12 +109,14 @@ array, `selectionRange` on call hierarchy items (so they round-trip into `get_in
 | [get_signature_help](#get_signature_help) | `textDocument/signatureHelp` | Parameter signatures at a call site |
 | [go_to_implementation](#go_to_implementation) | `textDocument/implementation` | Jump to trait/interface implementations |
 | [go_to_type_definition](#go_to_type_definition) | `textDocument/typeDefinition` | Jump to the type definition of a value |
+| [go_to_declaration](#go_to_declaration) | `textDocument/declaration` | Jump to the declaration of a symbol |
 | [get_inlay_hints](#get_inlay_hints) | `textDocument/inlayHint` | Inline type and parameter hints for a range |
 
-### Server Monitoring Tools
+### Server Monitoring & Control Tools
 
 | Tool | Description |
 |------|-------------|
+| [restart_server](#restart_server) | Restart LSP servers (not read-only) |
 | [get_server_logs](#get_server_logs) | Get LSP server log messages |
 | [get_server_messages](#get_server_messages) | Get LSP server show messages |
 | [get_tool_support](#get_tool_support) | Report which tools are usable for which languages |
@@ -114,8 +140,10 @@ Get type information and documentation for a symbol at a specific position.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `line` | integer | Yes | Line number (1-based) |
-| `character` | integer | Yes | Character position (1-based, UTF-8) |
+| `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
+| `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
+
+Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
 ### Returns
 
@@ -172,8 +200,10 @@ Jump to the definition of a symbol at a specific position.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `line` | integer | Yes | Line number (1-based) |
-| `character` | integer | Yes | Character position (1-based, UTF-8) |
+| `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
+| `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
+
+Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
 ### Returns
 
@@ -235,9 +265,11 @@ Find all references to a symbol in the workspace.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `line` | integer | Yes | Line number (1-based) |
-| `character` | integer | Yes | Character position (1-based, UTF-8) |
+| `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
+| `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
 | `include_declaration` | boolean | No | Include the declaration site (default: false) |
+
+Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
 ### Returns
 
@@ -392,9 +424,11 @@ Rename a symbol across the entire workspace.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `line` | integer | Yes | Line number (1-based) |
-| `character` | integer | Yes | Character position (1-based, UTF-8) |
+| `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
+| `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
 | `new_name` | string | Yes | New name for the symbol |
+
+Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
 ### Returns
 
@@ -1116,8 +1150,10 @@ Jump to all implementations of a trait, interface, or abstract method.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `line` | integer | Yes | Line number (1-based) |
-| `character` | integer | Yes | Character position (1-based, UTF-8) |
+| `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
+| `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
+
+Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
 ### Returns
 
@@ -1164,8 +1200,10 @@ Jump to the type definition of the value under the cursor (e.g. follow a typedef
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `line` | integer | Yes | Line number (1-based) |
-| `character` | integer | Yes | Character position (1-based, UTF-8) |
+| `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
+| `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
+
+Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
 ### Returns
 
@@ -1175,6 +1213,34 @@ Array of type definition locations (same shape as [get_definition](#get_definiti
 
 - Differs from `get_definition`: navigates to the *type* of an expression, not the expression itself
 - Useful for following type aliases, `impl Trait` return types, or generic bounds
+
+---
+
+## go_to_declaration
+
+Jump to the declaration of the symbol at a position (C/C++ headers, interface members). Servers
+without a declaration concept may return the definition; an empty result is valid.
+
+### Parameters
+
+```json
+{
+  "file_path": "/path/to/file.cpp",
+  "line": 10,
+  "character": 5
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `line` | integer | Yes | Line number (1-based) |
+| `character` | integer | Yes | Character position (1-based) |
+
+### Returns
+
+Locations in the same shape as [go_to_implementation](#go_to_implementation), including
+`truncated` and `positions_degraded`.
 
 ---
 
@@ -1222,6 +1288,54 @@ Array of inlay hints with positions and labels:
 - Inlay hints show inferred types, parameter names, and other implicit information
 - Request only the lines visible to the AI agent to keep response size manageable
 - Keep the range end inside the file
+
+---
+
+## restart_server
+
+Restart one or more LSP servers without restarting mcpls. The old process is stopped (graceful
+`shutdown`/`exit`, then a kill of its whole process group on Unix or job object on Windows) and a
+replacement is spawned and initialized from the server's existing configuration. Use it when a
+server is wedged or serves a stale index, e.g. after editing `Cargo.toml` or `package.json`.
+
+This is the only tool that is not read-only. It is annotated `readOnlyHint: false`, `destructiveHint: true` (the process-group kill also kills shared daemons other clients may use) and `idempotentHint: false`, so MCP clients should ask before running it.
+
+### Parameters
+
+```json
+{ "servers": ["rust", "python"] }
+```
+
+or
+
+```json
+{ "all": true }
+```
+
+Give exactly one of `servers` (non-empty list of server ids) or `all: true`. An unknown id is
+rejected with `-32602` listing the configured ids, and nothing is restarted.
+
+### Returns
+
+One entry per targeted server, sorted by id:
+
+| `status` | Meaning |
+|----------|---------|
+| `restarted` | A fresh process is running. `indexing_state` is `unknown`, `loading` or `ready`; `coalesced: true` means another restart of the same server finished while this request waited; `push_notifications_degraded: true` means push diagnostics are still not live, so call it again |
+| `failed` | The replacement did not start; `reason.kind` is `spawn_failed`, `initialize_failed` or `shutting_down`. The server stays registered and the next tool call retries under the crash-loop backoff |
+| `throttled` | Restarted within the last 5 seconds; retry after `retry_in_ms` |
+| `initializing` | The server has not finished its initial startup; retry shortly |
+| `not_running` | The server never started (or failed at startup); fix the cause and restart mcpls |
+
+### Notes
+
+- Requests in flight on the old process fail with the retryable error code `-32054`
+  (`server_restarted`); retry them.
+- While the old process stops, the server's tools return the retryable `server_initializing` error.
+- Documents are re-opened on the new process on next access, and the tool is gated on the new
+  process's indexing readiness like any other.
+- On Unix the whole process group is killed, including shared daemons the server started (for
+  example the Gradle daemon behind jdtls); descendants that call `setsid()` may survive.
 
 ---
 

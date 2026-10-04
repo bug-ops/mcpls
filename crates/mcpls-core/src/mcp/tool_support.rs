@@ -57,11 +57,13 @@ pub(super) enum McpTool {
     GoToTypeDefinition,
     GetInlayHints,
     GetToolSupport,
+    GoToDeclaration,
+    RestartServer,
 }
 
 impl McpTool {
     /// Every tool, in registration order.
-    pub(super) const ALL: [Self; 21] = [
+    pub(super) const ALL: [Self; 23] = [
         Self::GetHover,
         Self::GetDefinition,
         Self::GetReferences,
@@ -83,6 +85,8 @@ impl McpTool {
         Self::GoToTypeDefinition,
         Self::GetInlayHints,
         Self::GetToolSupport,
+        Self::GoToDeclaration,
+        Self::RestartServer,
     ];
 
     /// Byte length of the longest unprefixed tool name.
@@ -139,6 +143,8 @@ impl McpTool {
             }
             Self::GetInlayHints => ("get_inlay_hints", Document(ToolKind::InlayHints)),
             Self::GetToolSupport => ("get_tool_support", Local),
+            Self::GoToDeclaration => ("go_to_declaration", Document(ToolKind::Declaration)),
+            Self::RestartServer => ("restart_server", Local),
         };
         ToolSpec { name, backend }
     }

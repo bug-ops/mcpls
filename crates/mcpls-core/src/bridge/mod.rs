@@ -30,6 +30,7 @@ pub use notifications::{
     DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
     ServerMessage, apply_lifecycle_notification,
 };
+pub(crate) use notifications::{DiagnosticsKey, diagnostics_cache_key};
 #[cfg(test)]
 pub(crate) use published_uri::{CanonicalizeFn, resolve_one};
 pub(crate) use published_uri::{Publication, PublicationKind, PublishedPathResolver};
@@ -40,16 +41,21 @@ pub use state::{
 pub(crate) use state::{InFlightGuard, try_path_to_uri};
 #[cfg(test)]
 pub(crate) use translator::Capability;
+pub use translator::{
+    AddressableTool, Addressed, Completion, CompletionsResult, DefinitionResult, Diagnostic,
+    DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, DroppedEdits,
+    FormatDocumentResult, HoverResult, Location, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
+    MAX_SYMBOL_NAME_BYTES, Position, Position2D, PositionDegradation, PositionSource, Range,
+    ReferencesResult, RenameResult, ResolvedSymbol, ResolvedTarget, RestartFailure, RestartOutcome,
+    RestartServerResult, RestartTarget, ServerIds, ServerIdsError, ServerRestartEntry, Symbol,
+    SymbolName, SymbolNameError, SymbolQuery, SymbolTarget, TextEdit, Translator,
+    parse_symbol_kind,
+};
 pub(crate) use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, IncomingCallsResult, InlayHintsResult,
-    LocationsResult, OutgoingCallsResult, RouteSupport, ServerLogsResult, ServerMessagesResult,
-    SignatureHelpResult, ToolSupportSnapshot, WorkspaceSymbolResult, validate_path_against_roots,
-};
-pub use translator::{
-    Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
-    DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, DroppedEdits, FormatDocumentResult,
-    HoverResult, Location, Position, Position2D, PositionDegradation, Range, ReferencesResult,
-    RenameResult, Symbol, TextEdit, Translator,
+    LocationsResult, NotificationReceivers, NotificationWiring, OutgoingCallsResult, RouteSupport,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, ToolSupportSnapshot,
+    WorkspaceSymbolResult, validate_path_against_roots,
 };
 #[cfg(test)]
 pub(crate) use workspace_roots::ProcessCwd;

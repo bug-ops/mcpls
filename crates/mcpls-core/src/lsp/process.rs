@@ -147,7 +147,7 @@ impl ServerProcess {
     /// Freeze and record the descendants that escaped the server's process
     /// group, before the server is told to exit. Returns `false` when that
     /// failed, in which case the server must not be allowed to exit on its
-    /// own: the caller should [`Self::terminate`] it instead.
+    /// own: the caller should [`Self::terminate_tree`] it instead.
     pub(crate) async fn mark_escapees(&mut self) -> MarkOutcome {
         match &mut self.lifeline {
             Some(lifeline) => lifeline.mark().await,
@@ -155,13 +155,22 @@ impl ServerProcess {
         }
     }
 
-    /// Sweep the server's whole process tree and wait for it to be gone, up
-    /// to `budget` (at most [`LIFELINE_SWEEP_BUDGET`] is ever useful); after
-    /// that whatever the watchdog has not finished is killed from here. A
-    /// shorter budget trades attribution time for a lower worst case.
-    pub(crate) async fn terminate(mut self, budget: Duration) {
+    /// Kill the leader and the server's whole process tree (including
+    /// descendants that left its group) and wait for it to be gone, up to
+    /// `within` (at most [`LIFELINE_SWEEP_BUDGET`] is ever useful); after that
+    /// whatever the watchdog has not finished is killed from here. A shorter
+    /// budget trades attribution time for a lower worst case. Idempotent: the
+    /// reaped leader stays in place, so `try_wait` keeps reporting its status.
+    pub(crate) async fn terminate_tree(&mut self, within: Duration) {
         if let Some(lifeline) = self.lifeline.take() {
-            lifeline.terminate(self.child.take(), budget).await;
+            self.child = lifeline.terminate(self.child.take(), within).await;
+        } else if let Some(child) = self.child.as_mut() {
+            if let Err(e) = child.start_kill() {
+                tracing::debug!(error = %e, "leader kill signal failed during tree termination");
+            }
+            if tokio::time::timeout(within, child.wait()).await.is_err() {
+                tracing::warn!("LSP server leader did not exit after tree termination");
+            }
         }
     }
 
@@ -228,12 +237,18 @@ impl ServerProcess {
         self.child.inner_mut().wait().await
     }
 
-    /// Dropping the job handle kills the whole tree.
-    #[allow(
-        clippy::unused_async,
-        reason = "mirrors the Unix signature so callers are platform independent"
-    )]
-    pub(crate) async fn terminate(self, _budget: Duration) {}
+    /// Terminate the whole job, waiting up to `within` for the leader to exit.
+    pub(crate) async fn terminate_tree(&mut self, within: Duration) {
+        if let Err(e) = self.child.start_kill() {
+            tracing::debug!(error = %e, "job termination failed during tree termination");
+        }
+        if tokio::time::timeout(within, self.child.inner_mut().wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!("LSP server leader did not exit after tree termination");
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

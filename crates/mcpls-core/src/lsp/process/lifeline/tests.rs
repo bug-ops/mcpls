@@ -207,11 +207,11 @@ async fn test_drop_sweeps_setsid_escapee_of_eof_exiting_server() {
 
 #[tokio::test]
 async fn test_terminate_returns_after_the_tree_is_gone() {
-    let fixture = Fixture::start(&Options::default()).await;
+    let mut fixture = Fixture::start(&Options::default()).await;
     let pids = fixture.all();
 
     let started = Instant::now();
-    fixture.process.terminate(LIFELINE_SWEEP_BUDGET).await;
+    fixture.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
 
     assert!(started.elapsed() < LIFELINE_SWEEP_BUDGET);
     for pid in pids {
@@ -348,7 +348,7 @@ async fn test_mark_freezes_escapees_but_lets_the_server_run() {
     assert!(!is_stopped(fixture.helper));
 
     let pids = fixture.all();
-    fixture.process.terminate(LIFELINE_SWEEP_BUDGET).await;
+    fixture.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
     for pid in pids {
         assert!(pid_state(pid).is_none(), "pid {pid} survived terminate");
     }
@@ -385,7 +385,7 @@ async fn test_mark_timeout_reports_failure_and_terminate_leaves_nothing_stopped(
     assert_eq!(confirmed, MarkOutcome::Failed(MarkFailure::NoConfirmation));
 
     let in_group = [fixture.leader, fixture.helper];
-    fixture.process.terminate(LIFELINE_SWEEP_BUDGET).await;
+    fixture.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
     for pid in in_group {
         assert!(pid_state(pid).is_none(), "pid {pid} survived terminate");
     }
@@ -685,11 +685,58 @@ async fn test_a_timed_out_snapshot_downgrades_mark_so_exit_is_withheld() {
     );
     let in_group = [fixture.leader, fixture.helper];
     let escapee = fixture.escapee;
-    fixture.process.terminate(LIFELINE_SWEEP_BUDGET).await;
+    fixture.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
     for pid in in_group {
         assert!(pid_state(pid).is_none(), "pid {pid} survived terminate");
     }
     kill_leftover(escapee);
+}
+
+#[tokio::test]
+async fn test_terminate_tree_keeps_the_reaped_leader_reportable_and_is_idempotent() {
+    let mut fixture = Fixture::start(&Options::default()).await;
+
+    fixture.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
+    fixture.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
+
+    assert!(fixture.process.try_wait().unwrap().is_some());
+    assert_gone_within_budget(&[fixture.helper, fixture.escapee]).await;
+}
+
+#[tokio::test]
+async fn test_terminate_tree_of_an_unbound_server_kills_the_leader() {
+    let dir = TempDir::new().unwrap();
+    let mut process = ServerProcess::spawn_with(
+        server_command("exec sleep 608", dir.path()),
+        &Options {
+            watchdog_shell: PathBuf::from("/nonexistent/sh"),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+
+    process.terminate_tree(Duration::from_secs(5)).await;
+
+    assert!(process.try_wait().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_terminating_one_server_leaves_the_other_servers_tree_alive() {
+    let mut first = Fixture::start(&Options::default()).await;
+    let second = Fixture::start(&Options::default()).await;
+
+    first.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
+
+    assert_gone_within_budget(&first.all()).await;
+    for pid in second.all() {
+        assert!(
+            pid_state(pid).is_some(),
+            "pid {pid} of the other server died"
+        );
+    }
+    let pids = second.all();
+    drop(second.process);
+    assert_gone_within_budget(&pids).await;
 }
 
 #[tokio::test]
@@ -700,11 +747,14 @@ async fn test_a_short_terminate_budget_bounds_the_wait_and_kills_from_here() {
         scan_timeout: Duration::from_secs(5),
         ..ps
     };
-    let fixture = Fixture::start(&options).await;
+    let mut fixture = Fixture::start(&options).await;
     let in_group = [fixture.leader, fixture.helper];
 
     let started = Instant::now();
-    fixture.process.terminate(Duration::from_millis(500)).await;
+    fixture
+        .process
+        .terminate_tree(Duration::from_millis(500))
+        .await;
 
     assert!(started.elapsed() < Duration::from_secs(3));
     for pid in in_group {
@@ -746,7 +796,7 @@ async fn test_missing_ps_is_reported_as_a_failed_scan_while_mark_still_confirms(
     assert_eq!(channel.scan, ScanOutcome::Failed);
     assert!(channel.targets.is_empty());
     let pids = fixture.all();
-    fixture.process.terminate(LIFELINE_SWEEP_BUDGET).await;
+    fixture.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
     for pid in [pids[0], pids[2]] {
         assert!(pid_state(pid).is_none(), "pid {pid} survived terminate");
     }

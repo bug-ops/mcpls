@@ -28,10 +28,11 @@ related:
 > [!info] Metadata
 > **Type**: enhancement / competitor-gap
 > **Priority**: P3 (declaration), P4 (type hierarchy, prepare rename, document highlight, range formatting)
+> **Implemented**: group A (declaration) with #567 as the `go_to_declaration` tool, routed through the `declaration` `handles` value, gated on `declarationProvider` and on indexing readiness like `get_definition`, taking a position only; link results are flattened like definition links. Groups B and C remain draft.
 > **Related issues**: #567 (declaration, P3), #568 (type hierarchy, P4), #569 (minor methods: prepare rename, document highlight, range formatting, P4)
 
 > [!abstract]
-> mcpls exposes 21 MCP tools covering most LSP 3.17 navigation and editing requests. Six
+> mcpls exposed 21 MCP tools when this was written (23 now, including `go_to_declaration`), covering most LSP 3.17 navigation and editing requests. Six
 > request methods remain unexposed while competing bridges already ship them:
 > `textDocument/declaration`, `textDocument/prepareTypeHierarchy` with
 > `typeHierarchy/supertypes` and `typeHierarchy/subtypes`, `textDocument/prepareRename`,

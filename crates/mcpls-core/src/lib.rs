@@ -125,6 +125,17 @@ pub(crate) enum DiagnosticsRole {
     Secondary,
 }
 
+impl DiagnosticsRole {
+    /// The role of a server that is, or is not, the language's diagnostics route.
+    pub(crate) const fn from_route(is_diagnostics_route: bool) -> Self {
+        if is_diagnostics_route {
+            Self::Authoritative
+        } else {
+            Self::Secondary
+        }
+    }
+}
+
 /// Background task that drains LSP notifications, writes them to the cache,
 /// and queues `resources/updated` for each MCP session subscribed to the URI.
 ///
@@ -385,6 +396,72 @@ async fn apply_notification(
         }
         // Never classified onto this lane -- see `LspClient::message_loop_inner`'s routing.
         LspNotification::Progress(_) | LspNotification::Other { .. } => {}
+    }
+}
+
+/// Re-starts diagnostics pumps for manually restarted servers over the same
+/// shared state and shutdown watch the initial pumps use.
+#[derive(Clone)]
+pub(crate) struct PumpWiring {
+    shared: PumpShared,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl std::fmt::Debug for PumpWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PumpWiring").finish_non_exhaustive()
+    }
+}
+
+impl bridge::NotificationWiring for PumpWiring {
+    fn spawn_pump(
+        &self,
+        id: ServerId,
+        receivers: bridge::NotificationReceivers,
+        role: DiagnosticsRole,
+    ) -> tokio::task::AbortHandle {
+        let shared = self.shared.clone();
+        let cancel_rx = self.cancel_rx.clone();
+        let (_role_tx, role_rx) = tokio::sync::watch::channel(role);
+        let cache = Arc::clone(&shared.notification_cache);
+        tokio::spawn(async move {
+            let pump = diagnostics_pump(
+                id.clone(),
+                receivers.notifications,
+                receivers.lifecycle,
+                cancel_rx,
+                role_rx,
+                shared,
+            );
+            if let Err(payload) = AssertUnwindSafe(pump).catch_unwind().await {
+                error!(
+                    "Diagnostics pump for LSP server '{id}' panicked: {}",
+                    panic_message(payload.as_ref())
+                );
+                let mut cache = cache.lock().await;
+                cache.mark_push_degraded(&id);
+                cache.reset_indexing_state(&id);
+            }
+        })
+        .abort_handle()
+    }
+
+    fn publish_invalidated<'a>(
+        &'a self,
+        cleared: &'a [bridge::DiagnosticsKey],
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if cleared.is_empty() {
+                return;
+            }
+            let cleared: HashSet<&bridge::DiagnosticsKey> = cleared.iter().collect();
+            self.shared
+                .subs
+                .publish_matching(|uri| {
+                    bridge::diagnostics_cache_key(uri).is_some_and(|key| cleared.contains(&key))
+                })
+                .await;
+        })
     }
 }
 
@@ -767,6 +844,7 @@ async fn shutdown(
     translator: &Translator,
     lsp_init_handle: Option<JoinHandle<()>>,
 ) {
+    translator.begin_shutdown();
     let _ = cancel_tx.send(true);
 
     let mut cleanup_signal = ShutdownSignal::new();
@@ -911,14 +989,22 @@ async fn init_lsp_servers(
         return;
     }
     let mut pending: FuturesUnordered<_> = configs.iter().map(LspServer::start_contained).collect();
+    let pump_shared = PumpShared {
+        notification_cache: Arc::clone(&notification_cache),
+        subs: subscription_registry,
+        workspace_roots,
+    };
+    // Installed before the first server settles, so every settled server can
+    // be restarted and no init path leaves a registered server unwired.
+    let mut startup = Some(translator.begin_startup());
+    translator.install_wiring(Arc::new(PumpWiring {
+        shared: pump_shared.clone(),
+        cancel_rx: cancel_rx.clone(),
+    }));
     let mut settler = StartupSettler {
         translator,
-        notification_cache: Arc::clone(&notification_cache),
-        pump_shared: PumpShared {
-            notification_cache,
-            subs: subscription_registry,
-            workspace_roots,
-        },
+        notification_cache,
+        pump_shared,
         cancel_rx: cancel_rx.clone(),
         configured: configs
             .iter()
@@ -941,8 +1027,11 @@ async fn init_lsp_servers(
         pending = FuturesUnordered::new();
     }
     loop {
-        if pending.is_empty() && settler.pumps.is_empty() {
-            break;
+        if pending.is_empty() {
+            drop(startup.take());
+            if settler.pumps.is_empty() {
+                break;
+            }
         }
         tokio::select! {
             biased;
@@ -1025,13 +1114,16 @@ impl StartupSettler<'_> {
             return;
         }
 
+        // A restart waits on this lock, so it never runs between the server
+        // becoming visible and its initial pump being registered.
+        let respawn_lock = self
+            .translator
+            .respawn_lock(&server.init_config().server_config.id());
+        let serialized = respawn_lock.lock().await;
         let (id, language) = self.translator.settle_started(server);
         let (role_tx, role_rx) = tokio::sync::watch::channel(self.diagnostics_role(&language, &id));
         self.roles.insert(id.clone(), (language, role_tx));
         self.recompute_roles().await;
-        self.tally.registered = self.tally.registered.saturating_add(1);
-        self.publish_routes_served_by(&id).await;
-
         let pump = self.pumps.spawn(diagnostics_pump(
             id.clone(),
             notification_rx,
@@ -1040,7 +1132,12 @@ impl StartupSettler<'_> {
             role_rx,
             self.pump_shared.clone(),
         ));
-        self.pump_servers.insert(pump.id(), id);
+        self.translator
+            .set_notification_task(id.clone(), pump.clone());
+        drop(serialized);
+        self.pump_servers.insert(pump.id(), id.clone());
+        self.tally.registered = self.tally.registered.saturating_add(1);
+        self.publish_routes_served_by(&id).await;
     }
 
     /// Notifies subscribers of files now served by `id`, which may have been
@@ -1064,11 +1161,7 @@ impl StartupSettler<'_> {
     }
 
     fn diagnostics_role(&self, language: &str, id: &ServerId) -> DiagnosticsRole {
-        if self.translator.is_diagnostics_route(language, id) {
-            DiagnosticsRole::Authoritative
-        } else {
-            DiagnosticsRole::Secondary
-        }
+        DiagnosticsRole::from_route(self.translator.is_diagnostics_route(language, id))
     }
 
     /// Pending servers count toward the route count, so it equals the batch
@@ -2876,6 +2969,76 @@ mod tests {
             tx.send(publish("y.rs")).await.unwrap();
             assert_eq!(recv_within(&mut rx_b).await, y.as_str());
             assert_eq!(recv_within(&mut rx_a).await, y.as_str());
+        }
+
+        /// A restart tells the subscribers of the diagnostics it cleared to
+        /// re-read them, matching the cache key to the subscription URI even
+        /// for a percent-encoded path, and leaves other subscribers alone.
+        #[tokio::test]
+        async fn test_publish_invalidated_notifies_only_subscribers_of_cleared_files() {
+            use crate::mcp::{SessionHandle, Target};
+
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let cleared_file = root.join("a b.rs");
+            let other_file = root.join("other.rs");
+            for file in [&cleared_file, &other_file] {
+                std::fs::write(file, "fn main() {}").unwrap();
+            }
+
+            let cache = make_cache();
+            let id = ServerId::from("rust");
+            let roots = WorkspaceRoots::from_configured(&[root]).unwrap();
+            let published =
+                bridge::resolve_one(&bridge::path_to_uri(&cleared_file).unwrap(), &roots)
+                    .await
+                    .unwrap();
+            let error = lsp_types::Diagnostic {
+                message: "boom".to_owned().into(),
+                ..Default::default()
+            };
+            let cleared = {
+                let mut cache = cache.lock().await;
+                cache.store_published_diagnostics(&id, &published, None, vec![error]);
+                cache.clear_server_diagnostics(&id)
+            };
+            assert!(!cleared.is_empty());
+
+            let subs = make_subs();
+            let session = SessionHandle::new(subs.clone());
+            let (tx_cleared, mut rx_cleared) = mpsc::channel(8);
+            let (tx_other, mut rx_other) = mpsc::channel(8);
+            let cleared_uri = bridge::resources::make_uri(&cleared_file).unwrap();
+            let other_uri = bridge::resources::make_uri(&other_file).unwrap();
+            session
+                .subscribe_for_test(
+                    &DiagnosticsResourceUri::for_test(&cleared_uri),
+                    Target::Channel(tx_cleared.clone()),
+                )
+                .await
+                .unwrap();
+            session
+                .subscribe_for_test(
+                    &DiagnosticsResourceUri::for_test(&other_uri),
+                    Target::Channel(tx_other.clone()),
+                )
+                .await
+                .unwrap();
+            let (_cancel, cancel_rx) = watch::channel(false);
+            let wiring = PumpWiring {
+                shared: PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    workspace_roots: roots,
+                },
+                cancel_rx,
+            };
+
+            bridge::NotificationWiring::publish_invalidated(&wiring, &cleared).await;
+
+            assert_eq!(recv_within(&mut rx_cleared).await, cleared_uri);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_matches!(rx_other.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         }
 
         /// #532: diagnostics a server publishes through a symlinked spelling

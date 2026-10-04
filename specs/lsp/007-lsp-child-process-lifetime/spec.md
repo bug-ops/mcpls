@@ -18,7 +18,7 @@ related:
 
 > [!info] Metadata
 > **Author**: Andrei G.
-> **Issue**: #526 (residual scope of #470); #541 (descendants that `setsid`); #542 (respawn leaves the previous server's descendants)
+> **Issue**: #526 (residual scope of #470); #541 (descendants that `setsid`); #542 (respawn leaves the previous server's descendants); #591 (restart_server and respawn reap the tree)
 
 ## 1. Overview
 
@@ -151,7 +151,7 @@ sweep; the leader is reaped by Rust and its pid reused before `forget-leader` is
 |----|-------------|----------|
 | FR-001 | WHEN the mcpls process exits by any means on Unix THE SYSTEM SHALL SIGKILL every LSP server process and every descendant, including descendants that left the server's process group through `setsid`/`setpgid` while their ancestry was still attributable | must |
 | FR-002 | WHEN mcpls exits by any means on Windows THE SYSTEM SHALL terminate every process in each LSP server's job object | must |
-| FR-003 | WHEN an individual LSP server is shut down or respawned THE SYSTEM SHALL terminate that server's whole process tree (Windows: its job; Unix: its lifeline sweep) | must |
+| FR-003 | WHEN an individual LSP server is shut down, restarted (`restart_server`) or respawned THE SYSTEM SHALL terminate that server's whole process tree (Windows: its job; Unix: its lifeline sweep) | must |
 | FR-004 | WHEN the anchor cannot be started THE SYSTEM SHALL log one warning and spawn the server unbound in a fresh separate process group (`process_group(0)`, so Ctrl-C does not reach it; killed on drop), never failing the spawn because of the binding. WHEN only the watchdog cannot be started THE SYSTEM SHALL keep the server in the anchor's group, log one warning, and kill that group (and the leader) from Rust when the server is dropped; `processId` then carries the real pid | must |
 | FR-005 | THE SYSTEM SHALL start a fresh anchor and watchdog for every server spawn, so a dead helper of one server never affects another | must |
 | FR-006 | THE SYSTEM SHALL create the lifeline fds (anchor pipe, stderr pipe, socketpair) and spawn the anchor, the server and the watchdog under one lock, so no LSP child can inherit another server's lifeline fds through the non-atomic `FD_CLOEXEC` sequence std uses on macOS | must |
@@ -160,6 +160,7 @@ sweep; the leader is reaped by Rust and its pid reused before `forget-leader` is
 | FR-009 | WHEN the leader is reaped THE SYSTEM SHALL tell the watchdog to forget its pid (`forget-leader`); WHEN `try_wait` observes the leader gone THE SYSTEM SHALL release the lifeline immediately | must |
 | FR-010 | WHEN `LspServer::shutdown` runs THE SYSTEM SHALL freeze and record the escapees before sending `exit`, skip `exit` if that fails within 3 s, and not return before the tree is gone or `LIFELINE_SWEEP_BUDGET` has elapsed | must |
 | FR-011 | THE SYSTEM SHALL never signal pid or pgid <= 1, mcpls's own pid or process group, the anchor's group or the watchdog's own group as an escapee, SHALL ignore `ps` rows that are not exactly three numeric fields with pid > 1, SHALL seed the closure from the leader only while it is registered (never from an empty value), SHALL NOT propagate through ppid <= 1, and SHALL signal a group only when its leader belongs to the frozen closure. The final group signals are sent only while the anchor is alive | must |
+| FR-012 | THE SYSTEM SHALL provide an idempotent, bounded tree termination for one server (`ServerProcess::terminate_tree(within)`) used by shutdown, manual restart and respawn: it sweeps the lifeline including escapees, keeps the reaped leader reportable through `try_wait` (so `is_dead` is true afterwards), and for an unbound server kills the leader | must |
 
 ## 4. Non-Functional Requirements
 
@@ -228,6 +229,7 @@ sweep; the leader is reaped by Rust and its pid reused before `forget-leader` is
 | SC-007 | Unix e2e (#542): a server that crashes and is respawned has the helper it left in its group killed |
 | SC-008 | Unix unit tests: `mark` freezes the escapee and lets the server run; mcpls dying after `mark` leaves nothing stopped; a `mark` timeout reports failure; a hung `ps` still kills the group within the budget; a killed watchdog falls back to killing by hand; reaping the leader sends `forget-leader` and a forgotten pid survives the sweep; the awk program's fixtures (escaped group, foreign group, own tree, pids <= 1, reparented orphans, leader root) hold |
 | SC-009 | Unit test: `initialize` carries `processId: null` while a watchdog is bound |
+| SC-010 | Unix unit tests: `terminate_tree` kills the whole tree, is idempotent and keeps `try_wait` reporting; terminating one server leaves another server's tree alive; an unbound server's leader is killed; a respawn kills the crashed server's helper (e2e SC-007) |
 
 ## 8. Agent Boundaries
 

@@ -12,7 +12,9 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::MAX_NORMALIZED_LOCATIONS;
-use super::routing::{Capability, IndexingGate, WorkspaceRouteLookup, lookup_workspace_route};
+use super::routing::{
+    Capability, IndexingGate, PreparedDocument, WorkspaceRouteLookup, lookup_workspace_route,
+};
 use crate::bridge::{ClientPath, lock_std};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
@@ -62,6 +64,28 @@ fn resolve_kind_filter(kind: &str) -> Result<u32> {
         })
 }
 
+/// Resolve a symbol kind given by name or by numeric LSP value, validating a
+/// name the way `workspace_symbol_search`'s `kind_filter` does.
+///
+/// # Errors
+///
+/// A message naming the valid kinds when `kind` is neither a known name nor a
+/// number.
+pub fn parse_symbol_kind(kind: &str) -> std::result::Result<lsp_types::SymbolKind, String> {
+    resolve_kind_filter(kind)
+        .map(lsp_types::SymbolKind::from)
+        .map_err(|error| error.to_string())
+}
+
+/// A `textDocument/documentSymbol` answer together with what is needed to
+/// interpret it: the prepared document (kept alive so the document stays
+/// tracked) and the encoding context of the routed server.
+pub(super) struct FetchedSymbols {
+    pub(super) doc: PreparedDocument,
+    pub(super) ctx: EncodingCtx,
+    pub(super) response: Option<lsp_types::DocumentSymbolResponse>,
+}
+
 /// Convert LSP document symbol to MCP symbol. `uri` is the queried
 /// document's own URI: nested `DocumentSymbol` entries have no URI of their
 /// own, since `textDocument/documentSymbol` is always scoped to one file.
@@ -108,26 +132,9 @@ impl Translator {
         &self,
         file_path: ClientPath,
     ) -> Result<DocumentSymbolsResult> {
-        let doc = self
-            .prepare_gated_document(
-                &file_path,
-                Capability::DocumentSymbols,
-                IndexingGate::NotRequired,
-            )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-
-        let params = DocumentSymbolParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::DocumentSymbolRequest>(params, client.request_timeout())
-            .await?;
+        let FetchedSymbols { doc, ctx, response } =
+            self.request_document_symbols(&file_path).await?;
+        let response_uri = doc.uri().clone();
 
         let symbols = match response {
             Some(lsp_types::DocumentSymbolResponse::SymbolInformationList(symbols)) => {
@@ -169,6 +176,39 @@ impl Translator {
             symbols,
             positions_degraded: ctx.positions_degraded(),
         })
+    }
+
+    /// Request `textDocument/documentSymbol` for `file_path`, gated on the
+    /// routed server's `documentSymbolProvider` but not on indexing (the
+    /// answer is file-local).
+    ///
+    /// # Errors
+    ///
+    /// Routing, capability and document errors, or the LSP request's error.
+    pub(super) async fn request_document_symbols(
+        &self,
+        file_path: &ClientPath,
+    ) -> Result<FetchedSymbols> {
+        let doc = self
+            .prepare_gated_document(
+                file_path,
+                Capability::DocumentSymbols,
+                IndexingGate::NotRequired,
+            )
+            .await?;
+        let ctx = self.encoding_ctx(doc.server_id());
+        let params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier {
+                uri: doc.uri().clone(),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let client = doc.client();
+        let response = client
+            .request_typed::<lsp_types::DocumentSymbolRequest>(params, client.request_timeout())
+            .await?;
+        Ok(FetchedSymbols { doc, ctx, response })
     }
 
     /// Handle workspace symbol search.

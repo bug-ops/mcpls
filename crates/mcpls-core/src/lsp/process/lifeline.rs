@@ -662,8 +662,10 @@ impl Lifeline {
     }
 
     /// Sweeps the tree and returns once it is gone (or the sweep budget ran out).
-    pub(super) async fn terminate(self, leader: Option<Child>, budget: Duration) {
-        self.begin(leader, budget).finish().await;
+    ///
+    /// Hands the reaped leader back so the owner can still report its exit status.
+    pub(super) async fn terminate(self, leader: Option<Child>, budget: Duration) -> Option<Child> {
+        self.begin(leader, budget).finish().await
     }
 
     /// Starts the sweep without waiting for it. The tree is gone only once
@@ -672,7 +674,9 @@ impl Lifeline {
     pub(super) fn release(self, leader: Option<Child>) {
         let sweep = self.begin(leader, LIFELINE_SWEEP_BUDGET);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(sweep.finish());
+            runtime.spawn(async move {
+                sweep.finish().await;
+            });
         } else {
             debug!("no runtime to finish the LSP child sweep; the watchdog runs alone");
         }
@@ -726,7 +730,7 @@ impl Sweep {
 
     /// Waits for the watchdog, collecting what it reports meanwhile, then
     /// kills whatever it left and reaps the helpers.
-    async fn finish(mut self) {
+    async fn finish(mut self) -> Option<Child> {
         if !self.await_watchdog().await {
             warn!(
                 budget = ?self.budget,
@@ -741,6 +745,7 @@ impl Sweep {
         if let Some(watchdog) = &mut self.watchdog {
             reap(watchdog).await;
         }
+        self.leader
     }
 
     async fn await_watchdog(&mut self) -> bool {

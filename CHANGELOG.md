@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP `subscriptions/listen` streams end after a jittered 15 to 30 minutes so half-open streams are released; `--http-stream-liveness off` disables it; new `LeaseWindow`, `ListenLease` and `HttpConfig::with_listen_lease`. (#551, #596)
 - `lsp::LIFELINE_SWEEP_BUDGET` public constant bounding the Unix process-tree sweep. (#541, #596)
 - `mcpls-bench` gains `--target` comparison targets for Serena and lsmcp, eight more scenarios, process-tree RSS with a Windows Job Object, work-dir locking, capped stderr logs and a scheduled `bench.yml` workflow. (#548, #596)
+- `go_to_declaration` tool (`textDocument/declaration`) and a `declaration` `handles` value. (#591)
+- `restart_server` tool restarting one, several or all LSP servers (kill-then-respawn, pump re-wired); annotated destructive and not read-only; new retryable error `-32054` for requests in flight. (#591)
+- Symbol-name addressing: `get_hover`, `get_definition`, `get_references`, `go_to_implementation`, `go_to_type_definition`, `prepare_call_hierarchy` and `rename_symbol` accept `symbol_name` (+ `symbol_kind`, `container`) and report `resolved_symbol`. (#591)
 
 ### Changed
 
@@ -42,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** LSP servers leave mcpls's process group and are killed with their descendants, daemons included. (#546)
 - **Breaking:** the HTTP transport serves HTTP/1 only; prior-knowledge h2c is no longer accepted. (#546)
 - **Breaking:** `HttpConfig` gains a `listen_lease` field, and HTTP listen streams now end after 15 to 30 minutes unless liveness is `off`; clients must re-listen. (#551, #596)
-- **Breaking:** Unix servers get `processId: null` in `initialize` while the watchdog is bound, and shared daemons that call `setsid` are killed with their server. (#541, #542, #596)
+- **Breaking:** Unix servers get `processId: null` in `initialize` while the watchdog is bound, and the whole server tree, including descendants that call `setsid` or `setpgid`, is frozen and killed on exit, shutdown and respawn. (#541, #596)
 - `LspServer::shutdown` and `serve()` can take up to 8 s longer on Unix while the server's process tree is swept. (#541, #596)
 - **Breaking:** `mcpls-bench` reports replace `mcpls`, `mcpls_binary` and `server` with `target`, `stderr_log` becomes an object and `summary` rows gain `unsupported`. (#548, #596)
 - The diagnostics pump resolves published paths through a bounded memo with parallel canonicalization, so slow filesystems no longer stall it or drop publications. (#550, #596)
@@ -70,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `validate_path_against_roots`, `Translator::set_workspace_roots`, `McplsServer::new` and `BridgeContext::new` take the new `WorkspaceRoots`; a path is accepted only under a canonical root, its configured form or the logical `$PWD`. (#533, #552)
 - **Breaking:** `Error::LspInitFailed` and `Error::ServerExitedDuringInit` gain `stderr: Option<StderrExcerpt>`, a bounded excerpt of the server's stderr with secret-named env, flag and option values redacted. (#534, #552)
 - Accepted HTTP sockets set `TCP_USER_TIMEOUT` to 60 s on Linux and Android, bounding half-open SSE streams; no effect elsewhere or behind a reverse proxy. (#531, #552)
+- **Breaking:** the seven name-addressable tools take a position or a `symbol_name` and return an optional `resolved_symbol`. (#591)
+- **Breaking:** on Unix each LSP server leads its own process group behind its own watchdog, and respawn, restart and shutdown kill that whole group, shared daemons such as Gradle and Bloop included (#542). (#591)
+- **Breaking:** `Error`, `McpErrorKind`, `RetryableErrorData` and `ToolKind` gain variants for symbol resolution, server restart and declaration. (#591)
 - **Breaking:** `HttpConfig::new` takes only the bind address; the path is a validated `HttpPath` and `max_concurrent_sessions` a `SessionLimit`. (#590)
 - **Breaking:** bind failures are `Error::HttpBind` and `Error::Timeout` carries a `Duration`. (#590)
 - **Breaking:** `project_config_ignored: bool` is now `ProjectConfigStatus` on `ServerConfig`, `McplsServer::new` and `BridgeContext::new`. (#590)
@@ -92,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP session ids are no longer logged at the default level. (#590)
 - Configured secrets are redacted from server messages, errors, wire traces and spawn arguments. (#590)
 - `escape_control` and stderr cleaning share one deceptive-character set. (#590)
-- Unix: descendants of an LSP server that call `setsid` or `setpgid`, such as rust-analyzer's flycheck, are killed when mcpls exits, and a respawn reaps the previous server's descendants. (#541, #542, #596)
+- Unix: descendants of an LSP server that call `setsid` or `setpgid`, such as rust-analyzer's flycheck, are killed when mcpls exits, including on shutdown and respawn. (#541, #596)
 - Roots from a config file are admitted under their configured symlinked spelling again, including relative roots of a relative config path. (#580)
 - An empty, NUL-containing or not-a-directory `file_path` returns `-32602` instead of `-32603`, including an empty `get_tool_support` `file_path`, which no longer acts as no filter. (#580)
 - Abandoned HTTP sessions now expire after 5 min without client activity instead of living on while subscribed files change. (#536)
@@ -112,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_cached_diagnostics` and the diagnostics resource now report a server startup failure instead of an empty list. (#535, #552)
 - Paths outside every workspace root are rejected before any filesystem access, narrowing the existence oracle for outside paths. (#533, #552)
 - Diagnostics published under a symlink spelling are keyed by the canonical path, merged per source on read, and now match subscriptions. (#532, #552)
+- A respawned LSP server's surviving child processes are now killed on Unix (#542). (#591)
 
 ## [0.6.0] - 2026-09-21
 

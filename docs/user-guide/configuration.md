@@ -573,7 +573,7 @@ handles = ["diagnostics"]
 **Default**: unset (catch-all — serves every tool no other server for this language explicitly claims)
 
 Restricts a server to exactly the listed routing values. Valid values:
-`hover`, `definition`, `type_definition`, `implementation`, `references`,
+`hover`, `definition`, `type_definition`, `declaration`, `implementation`, `references`,
 `diagnostics`, `rename`, `completions`, `signature_help`,
 `document_symbols`, `workspace_symbols`, `format_document`, `code_actions`,
 `call_hierarchy`, `inlay_hints`. These are routing identifiers, not MCP tool
@@ -585,6 +585,7 @@ names — several MCP tools map to a shorter routing value:
 | `workspace_symbols` | `workspace_symbol_search` |
 | `implementation` | `go_to_implementation` |
 | `type_definition` | `go_to_type_definition` |
+| `declaration` | `go_to_declaration` |
 | `call_hierarchy` | `prepare_call_hierarchy`, `get_incoming_calls`, `get_outgoing_calls` (one route: the item `prepare_call_hierarchy` returns is only meaningful to the server that produced it) |
 | `diagnostics` | `get_diagnostics` (pull) **and** `get_cached_diagnostics` (the push-notification cache is filtered by the same route, so both are always served by the same server) |
 

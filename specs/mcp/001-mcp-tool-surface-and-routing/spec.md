@@ -35,20 +35,20 @@ related:
 > **Priority**: P1 (retroactive — reflects centrality, not an open defect)
 
 > [!success] Resolution
-> This is a retroactive spec: `crates/mcpls-core/src/mcp/server.rs` (21 `#[tool]` handlers plus
+> This is a retroactive spec: `crates/mcpls-core/src/mcp/server.rs` (23 `#[tool]` handlers plus
 > the `resources/*` handlers), `crates/mcpls-core/src/mcp/tools.rs` (parameter schemas),
 > `crates/mcpls-core/src/config/routing.rs` (`ToolRouter`, `ServerId`, `ToolKind`), and
 > `crates/mcpls-core/src/bridge/translator/routing.rs` (`client_for_file`,
 > `resolve_client_for_file`, path validation) already implement everything described below.
 > [[mcp/002-mcp-resources-diagnostics/spec|spec mcp/002]] already covers the `resources/*` MCP surface in
-> detail; this spec covers the *tool* surface (the 21 `#[tool]` handlers) and the request-routing
+> detail; this spec covers the *tool* surface (the 23 `#[tool]` handlers) and the request-routing
 > layer beneath both, which spec mcp/002 references but does not itself specify.
 
 ## 1. Overview
 
 ### Problem Statement
 
-mcpls exposes 21 MCP tools spanning navigation (hover, definition, type definition,
+mcpls exposes 23 MCP tools spanning navigation (hover, definition, type definition,
 implementation, references), mutation-proposing operations (rename, format, code actions — all of
 which return a *proposed* edit rather than writing to disk), symbol search (document and
 workspace-wide), diagnostics (both pull and cache-only), call hierarchy (prepare/incoming/
@@ -71,7 +71,7 @@ not be duplicated 20 times.
 
 Every MCP tool call is dispatched to the single correct LSP server for its target file's language
 and the specific tool being invoked (respecting explicit multi-server-per-language routing where
-configured), with consistent path validation and error mapping shared across all 21 tool handlers,
+configured), with consistent path validation and error mapping shared across all 23 tool handlers,
 and with a server that failed to spawn or crashed never silently receiving a request it cannot
 serve.
 
@@ -126,7 +126,7 @@ THEN the response reports no server available for that tool/language combination
 ### US-003: A tool request for a file outside the workspace is rejected consistently
 
 AS A mcpls operator
-I WANT every one of the 21 tool handlers to reject a request for a file outside configured
+I WANT every one of the 23 tool handlers to reject a request for a file outside configured
 workspace roots the same way
 SO THAT path validation can't accidentally be skipped or duplicated inconsistently across handlers
 
@@ -135,24 +135,24 @@ SO THAT path validation can't accidentally be skipped or duplicated inconsistent
 GIVEN configured workspace roots that do not include /etc
 WHEN any position- or file-based tool is called with file_path = "/etc/passwd"
 THEN the request is rejected with the same PathOutsideWorkspace error regardless of which of the
-     21 tools was called
+     23 tools was called
 ```
 
 ## 3. Functional Requirements
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE SYSTEM SHALL expose 21 MCP tools covering hover, definition, type definition, implementation, references, diagnostics (pull + cached), rename, completions, signature help, document symbols, workspace symbol search, format document, code actions, call hierarchy (prepare/incoming/outgoing), inlay hints, server logs, server messages, and the `get_tool_support` capability report | must |
+| FR-001 | THE SYSTEM SHALL expose 23 MCP tools covering hover, definition, type definition, declaration, implementation, references, diagnostics (pull + cached), rename, completions, signature help, document symbols, workspace symbol search, format document, code actions, call hierarchy (prepare/incoming/outgoing), inlay hints, server logs, server messages, the `get_tool_support` capability report and server restart (`restart_server`) | must |
 | FR-002 | THE SYSTEM SHALL resolve, for every routable tool call, the server that should handle it via `ToolRouter`: an explicit `handles` claim wins over a language's catch-all server; if neither exists, the request fails naming the language and tool | must |
 | FR-003 | THE SYSTEM SHALL reject a workspace whose applicable server configs contain two servers sharing one `ServerId` (name defaulting to `language_id`), two catch-all servers for one language, or two servers explicitly claiming the same tool for one language, at workspace-scoped validation time (`ToolRouter::from_configs`), distinct from and later than `ServerConfig::validate`'s workspace-independent checks | must |
 | FR-004 | WHEN a server fails to spawn or is dropped from the registered set THE SYSTEM SHALL rebind any route pointing at it to that language's live catch-all if one exists, or drop the route entirely (reporting no server available) if not — never silently conscripting a narrowly-scoped live server outside its declared `handles` | must |
 | FR-005 | FOR a workspace-wide tool with no per-file language to route by (e.g. `workspace_symbol_search`) THE SYSTEM SHALL resolve in two tiers, in config declaration order: first the first server explicitly claiming the tool, else the first catch-all server — never falling back to "the first server at all" if neither tier matches | must |
 | FR-006 | THE SYSTEM SHALL resolve a file's server via its detected language first, falling back to its React base language (`.tsx`→`typescriptreact`→`typescript`, `.jsx`→`javascriptreact`→`javascript`) only if the language itself has no route, so an explicit `typescriptreact` server still wins over a `typescript` fallback when both are configured | must |
 | FR-007 | THE SYSTEM SHALL validate every tool-handler's `file_path` against configured workspace roots via one shared function, used by every handler that takes a file path, rather than each handler duplicating validation logic | must |
-| FR-008 | THE SYSTEM SHALL map every bridge-layer `Result<T, Error>` to the MCP tool response shape via one shared function, so error formatting stays consistent across all 21 tool handlers | must |
-| FR-009 | THE SYSTEM SHALL classify all 21 tools as read-only (`ToolAnnotations`) at the router level, once, rather than repeating an identical annotation block on every `#[tool]` attribute, since every mcpls tool is a query or a proposed-edit generator that never itself writes to disk | must |
+| FR-008 | THE SYSTEM SHALL map every bridge-layer `Result<T, Error>` to the MCP tool response shape via one shared function, so error formatting stays consistent across all 23 tool handlers | must |
+| FR-009 | THE SYSTEM SHALL classify the read-only tools (every tool except `restart_server`, which declares its own annotations) as read-only (`ToolAnnotations`) at the router level, once, rather than repeating an identical annotation block on every `#[tool]` attribute, since every mcpls tool is a query or a proposed-edit generator that never itself writes to disk | must |
 | FR-010 | WHEN a tool call resolves to a server whose process has died THE SYSTEM SHALL attempt to respawn it (per [[lsp/001-lsp-server-lifecycle-and-respawn/spec|spec lsp/001]]) before the request is treated as failed | must |
-| FR-011 | THE SYSTEM SHALL advertise `outputSchema` and return `structuredContent` (via `to_structured_tool_result`/`Json<T>` handler signatures, with an object root) for all 21 tools | must |
+| FR-011 | THE SYSTEM SHALL advertise `outputSchema` and return `structuredContent` (via `to_structured_tool_result`/`Json<T>` handler signatures, with an object root) for all 23 tools | must |
 | FR-012 | WHEN the optional `[mcp].tool_prefix` config value is set THE SYSTEM SHALL prefix every tool's registered name with `{tool_prefix}_` at `build_tool_router` time, so a client can tell apart tools exposed by multiple concurrently running mcpls bridges; omitting it SHALL leave tool names unprefixed | must |
 
 ## 4. Non-Functional Requirements
@@ -188,14 +188,14 @@ THEN the request is rejected with the same PathOutsideWorkspace error regardless
 | A server explicitly claiming a tool fails to spawn, no catch-all sibling | The route is dropped entirely (not rebound to some other unrelated server); that tool reports no server available for the language |
 | A `.tsx` file with only a plain `typescript` server configured (no dedicated `typescriptreact` server) | Falls back to the `typescript` server via the React base-language fallback |
 | A `.tsx` file with both `typescriptreact` and `typescript` servers configured | Routes to the `typescriptreact` server — the exact-match language wins over the fallback |
-| A tool call for a file outside every configured workspace root | Rejected with `PathOutsideWorkspace`, identically regardless of which of the 21 tools was called |
+| A tool call for a file outside every configured workspace root | Rejected with `PathOutsideWorkspace`, identically regardless of which of the 23 tools was called |
 
 ## 7. Success Criteria
 
 | ID | Metric | Target |
 |----|--------|--------|
 | SC-001 | `cargo nextest run -E 'package(mcpls-core) and (test(routing) or test(server))'` | All existing `ToolRouter` and MCP tool-handler unit/integration tests pass |
-| SC-002 | A workspace configuring two servers per language across several languages, with a mix of explicit `handles` and catch-alls | Every one of the 21 tools resolves to the correct server per FR-002/FR-005/FR-006 |
+| SC-002 | A workspace configuring two servers per language across several languages, with a mix of explicit `handles` and catch-alls | Every one of the 23 tools resolves to the correct server per FR-002/FR-005/FR-006 |
 | SC-003 | A deliberately conflicting config (duplicate `ServerId`, two catch-alls, or duplicate tool claim) | `ToolRouter::from_configs` rejects it with a message identifying the colliding entries |
 
 ## 8. Agent Boundaries
@@ -230,13 +230,13 @@ None — this is a retroactive spec documenting stable, already-shipped, well-te
 - [[MOC-specs]] — all specifications
 - [[mcp/002-mcp-resources-diagnostics/spec|spec mcp/002]] — the `resources/*` MCP surface, a sibling
   concern this spec does not duplicate
-- [[lsp/002-lsp317-missing-tools/spec|spec lsp/002]] — history of 4 of the 21 tools this spec documents
+- [[lsp/002-lsp317-missing-tools/spec|spec lsp/002]] — history of 4 of the 23 tools this spec documents
   (`get_signature_help`, `go_to_implementation`, `go_to_type_definition`, `get_inlay_hints`)
 - [[config/001-config-discovery-and-heuristics/spec|spec config/001]] — `LspServerConfig`/`ServerId` this
   spec's `ToolRouter` is built from
 - [[lsp/001-lsp-server-lifecycle-and-respawn/spec|spec lsp/001]] — respawn mechanics triggered when a
   routed-to server has crashed (FR-010)
-- `crates/mcpls-core/src/mcp/server.rs` — the 21 `#[tool]` handlers, `to_tool_result`,
+- `crates/mcpls-core/src/mcp/server.rs` — the 23 `#[tool]` handlers, `to_tool_result`,
   `declared_tool_router`
 - `crates/mcpls-core/src/mcp/tools.rs` — MCP tool parameter schemas
 - `crates/mcpls-core/src/mcp/handlers.rs` — `BridgeContext`

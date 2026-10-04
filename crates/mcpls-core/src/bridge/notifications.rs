@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::bridge::indexing::{IndexingPolicy, IndexingState, IndexingTracker};
-use crate::bridge::resources::PublishedDiagnosticsUri;
+use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::config::ServerId;
 use crate::util::{truncate_str, truncate_string};
 
@@ -92,7 +92,7 @@ const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 /// Lowercasing the entire URI is safe for `file://` URIs because they have
 /// no case-sensitive query or fragment components.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct DiagnosticsKey(String);
+pub struct DiagnosticsKey(String);
 
 impl DiagnosticsKey {
     fn of(uri: &Uri) -> Self {
@@ -134,6 +134,15 @@ impl CachedEntry {
             Spelling::Alias(canonical) => canonical,
         }
     }
+}
+
+/// The cache key under which diagnostics for the file behind `uri` are
+/// stored, for matching [`NotificationCache::clear_server_diagnostics`]
+/// results against a subscription.
+pub fn diagnostics_cache_key(uri: &DiagnosticsResourceUri) -> Option<DiagnosticsKey> {
+    let path = crate::bridge::resources::parse_uri(uri.as_str()).ok()?;
+    let lsp_uri = crate::bridge::try_path_to_uri(path.as_path())?;
+    Some(DiagnosticsKey::of(&lsp_uri))
 }
 
 /// Maximum number of distinct published URIs (a canonical path and its
@@ -1395,14 +1404,18 @@ impl NotificationCache {
     ///
     /// Used when a server crashes and respawns: its own stale entries must
     /// be invalidated without disturbing any other server's cache entries
-    /// (#266).
-    pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) {
+    /// (#266). Returns the cleared cache keys so a caller can tell
+    /// subscribers which resources changed (see [`diagnostics_cache_key`]).
+    pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) -> Vec<DiagnosticsKey> {
         let Some(order) = self.order.remove(server_id) else {
-            return;
+            return Vec::new();
         };
+        let mut cleared = Vec::with_capacity(order.len());
         for key in order.into_values() {
             self.evict_entry(&key);
+            cleared.push(key);
         }
+        cleared
     }
 
     /// Marks `server_id`'s push-based diagnostics as no longer live -- see
@@ -1410,6 +1423,12 @@ impl NotificationCache {
     /// of the cache.
     pub(crate) fn mark_push_degraded(&mut self, server_id: &ServerId) {
         self.push_degraded.insert(server_id.clone());
+    }
+
+    /// Marks `server_id`'s push-based diagnostics as live again, after its
+    /// notification pump was re-wired by a manual restart.
+    pub(crate) fn clear_push_degraded(&mut self, server_id: &ServerId) {
+        self.push_degraded.remove(server_id);
     }
 
     /// Whether `server_id`'s push-based diagnostics are known to be
@@ -3486,5 +3505,20 @@ mod tests {
         assert!(cache.diagnostics(&file_uri("a0.rs")).is_none());
         assert_eq!(cache.recent_evictions.len(), 1);
         assert!(cache.is_listen_replayable(&file_uri("main.rs")));
+    }
+
+    #[test]
+    fn test_clearing_a_server_records_its_empty_entries() {
+        let mut cache = NotificationCache::new();
+        let empty = file_uri("empty.rs");
+        let broken = file_uri("broken.rs");
+        cache.store_diagnostics(&test_server(), &empty, None, vec![]);
+        cache.store_diagnostics(&test_server(), &broken, None, vec![error_diagnostic()]);
+
+        let cleared = cache.clear_server_diagnostics(&test_server());
+
+        assert_eq!(cleared.len(), 2);
+        assert!(cache.is_listen_replayable(&empty));
+        assert!(!cache.is_listen_replayable(&broken));
     }
 }

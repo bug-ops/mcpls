@@ -403,7 +403,7 @@ impl WorkspaceRoots {
     /// the filesystem nor resolves symlinks, and on case-insensitive
     /// platforms it folds case. It suits callers that either follow it with a
     /// canonical check (the diagnostics pump, via
-    /// `PublishedDiagnosticsUri::resolve`) or only annotate (the advisory
+    /// `PublishedPathResolver::resolve_batch`) or only annotate (the advisory
     /// `out_of_workspace` flag). Anything that writes through a
     /// server-supplied URI must use [`Self::admits_edit_uri`] instead.
     /// Read-only navigation results are deliberately not filtered (standard
