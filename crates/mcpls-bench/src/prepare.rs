@@ -555,10 +555,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_components_are_created_and_dotdot_is_refused() {
+    fn missing_components_are_created() {
         let tmp = tempfile::tempdir().unwrap();
         let work = WorkDir::new(&tmp.path().join("a/b/c")).unwrap();
         assert!(work.0.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dotdot_below_a_missing_component_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
         assert!(WorkDir::new(&tmp.path().join("missing/../x")).is_err());
     }
 
