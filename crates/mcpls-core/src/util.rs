@@ -106,20 +106,23 @@ pub fn truncate_string(mut s: String, max_bytes: usize) -> String {
     s
 }
 
-/// Whether `c` could forge a log line or reorder displayed text: a control
-/// character, a Unicode line or paragraph separator, or a bidi control.
+/// Characters that forge or reorder text without being visible: zero-width
+/// and bidirectional marks, line/paragraph separators and bidi overrides.
+pub const fn is_deceptive_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Whether `c` could forge a log line or reorder displayed text.
 const fn needs_escape(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{2028}'
-                | '\u{2029}'
-                | '\u{200E}'
-                | '\u{200F}'
-                | '\u{061C}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-        )
+    c.is_control() || is_deceptive_format_char(c)
 }
 
 /// Escape every control character, line/paragraph separator and bidi control

@@ -373,20 +373,6 @@ fn decode_cut_head(head: &[u8]) -> String {
     }
 }
 
-/// Characters that forge or reorder text without being visible: zero-width
-/// and bidirectional marks, line/paragraph separators and bidi overrides.
-const fn is_deceptive_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-    )
-}
-
 /// Redacts secrets, drops control and deceptive format characters (other than
 /// `\n`/`\t`: they could forge log lines or drive a terminal) and trims.
 /// Redaction runs before and after the filter so a dropped character cannot
@@ -395,7 +381,10 @@ fn clean_stderr(text: &str, redactions: &Redactions) -> String {
     let filtered: String = redactions
         .apply(text)
         .chars()
-        .filter(|c| (!c.is_control() || matches!(c, '\n' | '\t')) && !is_deceptive_format_char(*c))
+        .filter(|c| {
+            (!c.is_control() || matches!(c, '\n' | '\t'))
+                && !crate::util::is_deceptive_format_char(*c)
+        })
         .collect();
     redactions.apply(&filtered).trim().to_owned()
 }
@@ -1190,6 +1179,26 @@ mod tests {
         let excerpt = StderrExcerpt::complete(text.as_bytes(), &Redactions::default()).unwrap();
 
         assert_eq!(excerpt.head(), "abcdefgh");
+    }
+
+    #[test]
+    fn test_escape_control_and_stderr_agree_on_deceptive_characters() {
+        let deceptive = [
+            '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{2028}',
+            '\u{2029}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}',
+            '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}',
+        ];
+        for c in deceptive {
+            let text = format!("a{c}b");
+            let escaped = crate::util::escape_control(&text);
+            assert!(
+                !escaped.contains(c),
+                "escape_control kept U+{:04X}",
+                c as u32
+            );
+            let excerpt = StderrExcerpt::complete(text.as_bytes(), &Redactions::default()).unwrap();
+            assert_eq!(excerpt.head(), "ab", "stderr kept U+{:04X}", c as u32);
+        }
     }
 
     #[test]
