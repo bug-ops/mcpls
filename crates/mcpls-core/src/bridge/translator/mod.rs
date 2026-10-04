@@ -812,14 +812,14 @@ mod tests {
             let hover = translator
                 .client_for_file(&path, ToolKind::Hover)
                 .unwrap_err();
-            assert!(
-                matches!(&hover, Error::ServerInitializing { server_id } if *server_id == c.id()),
-                "got {hover:?}"
+            std::assert_matches!(
+                hover,
+                Error::ServerInitializing { server_id } if server_id == c.id()
             );
-            assert!(matches!(
+            std::assert_matches!(
                 translator.diagnostics_route_for_path(&path),
                 routing::DiagnosticsRoute::Initializing(id) if id == c.id()
-            ));
+            );
             assert_eq!(
                 translator
                     .tool_support_snapshot()
