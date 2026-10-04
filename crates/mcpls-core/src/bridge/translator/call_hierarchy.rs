@@ -219,7 +219,7 @@ impl Translator {
 
         for call in response.unwrap_or_default() {
             // A call is kept together with all its ranges or not at all.
-            if !budget.spend_whole(1 + call.from_ranges.len()) {
+            if !budget.spend_whole(call.from_ranges.len().saturating_add(1)) {
                 continue;
             }
             // Per the LSP spec, `fromRanges` are ranges within the *caller's*
@@ -298,7 +298,7 @@ impl Translator {
         let mut calls = Vec::new();
 
         for call in response.unwrap_or_default() {
-            if !budget.spend_whole(1 + call.from_ranges.len()) {
+            if !budget.spend_whole(call.from_ranges.len().saturating_add(1)) {
                 continue;
             }
             let mut from_ranges = Vec::with_capacity(call.from_ranges.len());

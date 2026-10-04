@@ -79,7 +79,8 @@ fn main() {
 /// [`Outcome::Panicked`] instead of unwinding out of `main`.
 ///
 /// On a panic the runtime is shut down with a bounded grace period, which
-/// drops every task and with it every LSP child (`kill_on_drop`).
+/// drops every task and with it every LSP child (`kill_on_drop`); the
+/// lifeline/job binding covers exits that skip this path.
 fn block_on_guarded(runtime: Runtime, future: impl Future<Output = Outcome>) -> Outcome {
     if let Ok(outcome) = panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on(future))) {
         // Dropping the runtime would block on the uncancellable stdin read. See #308.

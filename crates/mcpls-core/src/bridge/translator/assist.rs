@@ -82,7 +82,7 @@ fn signature_parameters(
                         .substring(start, end)
                         .filter(|text| text.len() <= resolved_budget);
                     if let Some(text) = resolved {
-                        resolved_budget -= text.len();
+                        resolved_budget = resolved_budget.saturating_sub(text.len());
                     } else {
                         tracing::warn!(
                             start,

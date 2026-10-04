@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use lsp_types::ServerCapabilities;
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Translator;
@@ -26,7 +27,7 @@ use crate::error::Result;
 ///
 /// `Supported` means "will be dispatched", not "will succeed": push-only
 /// diagnostics, respawn backoff and indexing can still fail the call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RouteSupport {
     /// The routed server is registered and advertises the tool's capability.

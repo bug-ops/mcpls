@@ -552,8 +552,6 @@ impl IndexingTracker {
     }
 }
 
-// TODO(critic): mock LSP harness for $/progress sequences -- see follow-up issue
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1057,5 +1055,113 @@ mod tests {
         auto_tracker.observe_progress(&server, &progress("begin", 1));
         auto_tracker.reset(&server);
         assert_eq!(auto_tracker.state(&server), IndexingState::Unknown);
+    }
+
+    /// End-to-end `$/progress` handling over a real [`LspClient`] on a mock
+    /// transport: the server-initiated `create` request, the lane routing of
+    /// `begin`/`report`/`end`, and the tracked [`IndexingState`] through the
+    /// real notification pump.
+    mod mock_server {
+        use std::time::Duration;
+
+        use serde_json::json;
+        use tokio::io::BufReader;
+
+        use super::*;
+        use crate::lsp::LspNotification;
+        use crate::test_lsp::{
+            FakeServer, fake_lsp_client_with_lanes, read_framed_message,
+            spawn_test_pump_over_lanes, write_notification, write_request,
+        };
+
+        async fn assert_create_request_is_acknowledged(server: &mut FakeServer) {
+            write_request(
+                &mut server.read_half_stdin,
+                &json!(7),
+                "window/workDoneProgress/create",
+                json!({ "token": "idx" }),
+            )
+            .await;
+
+            let reply = read_framed_message(&mut BufReader::new(&mut server.write_stdout)).await;
+            assert_eq!(reply["id"], 7);
+            assert_eq!(reply.get("result"), Some(&serde_json::Value::Null));
+            assert!(reply.get("error").is_none(), "unexpected error: {reply}");
+        }
+
+        async fn send_progress(server: &mut FakeServer, kind: &str) {
+            write_notification(
+                &mut server.read_half_stdin,
+                "$/progress",
+                json!({ "token": "idx", "value": { "kind": kind, "title": "Indexing" } }),
+            )
+            .await;
+        }
+
+        fn kind_of(notification: &LspNotification) -> &str {
+            let LspNotification::Progress(params) = notification else {
+                panic!("expected a progress notification, got {notification:?}");
+            };
+            params.value["kind"].as_str().unwrap()
+        }
+
+        async fn wait_for(
+            cache: &tokio::sync::Mutex<crate::bridge::NotificationCache>,
+            id: &ServerId,
+            expected: IndexingState,
+        ) {
+            for _ in 0..200 {
+                if cache.lock().await.indexing_state(id) == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            panic!("indexing state never became {expected:?}");
+        }
+
+        #[tokio::test]
+        async fn test_report_frame_never_reaches_the_lifecycle_lane() {
+            let (_client, mut server, mut lanes) = fake_lsp_client_with_lanes();
+            assert_create_request_is_acknowledged(&mut server).await;
+
+            for kind in ["begin", "report", "end"] {
+                send_progress(&mut server, kind).await;
+            }
+
+            let first = tokio::time::timeout(Duration::from_secs(5), lanes.lifecycle_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let second = tokio::time::timeout(Duration::from_secs(5), lanes.lifecycle_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((kind_of(&first), kind_of(&second)), ("begin", "end"));
+            assert!(lanes.lifecycle_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn test_progress_sequence_moves_tracker_from_loading_to_ready() {
+            let (_client, mut server, lanes) = fake_lsp_client_with_lanes();
+            assert_create_request_is_acknowledged(&mut server).await;
+            let (cache, _cancel) = spawn_test_pump_over_lanes(lanes);
+            let id = ServerId::from("rust");
+            tokio::time::pause();
+
+            send_progress(&mut server, "begin").await;
+            wait_for(&cache, &id, IndexingState::Loading).await;
+
+            send_progress(&mut server, "report").await;
+            send_progress(&mut server, "end").await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(
+                cache.lock().await.indexing_state(&id),
+                IndexingState::Loading,
+                "still inside the settle window after `end`"
+            );
+
+            tokio::time::advance(PROGRESS_SETTLE + Duration::from_secs(1)).await;
+            assert_eq!(cache.lock().await.indexing_state(&id), IndexingState::Ready);
+        }
     }
 }

@@ -317,6 +317,34 @@ fn sc_get_hover(client: &mut McpClient, workspace: &Path) -> Result<(), String> 
     Ok(())
 }
 
+/// A position far past the end of the document is a caller fault: `-32602`
+/// carrying the server's raw error as `data.raw_message` (#465.6).
+fn sc_out_of_range_position_is_invalid_params_with_raw_error(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let result = client.call_tool(
+        "get_hover",
+        &json!({
+            "file_path": lib.to_string_lossy(),
+            "line": 100_000,
+            "character": 1,
+        }),
+    );
+    match result {
+        Err(e) => {
+            let message = e.to_string();
+            if message.contains("-32602") && message.contains("raw_message") {
+                Ok(())
+            } else {
+                Err(format!("expected -32602 with raw_message, got: {message}"))
+            }
+        }
+        Ok(resp) => Err(format!("expected an error, got: {resp}")),
+    }
+}
+
 /// Tool 2: `get_definition` — go to definition of `add` from inside `caller`.
 fn sc_get_definition(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
@@ -1333,8 +1361,24 @@ fn sc_subscribe_unsubscribe_resource(
         ));
     }
 
-    // TODO(critic): add negative case with "file:///tmp/x.rs" (wrong scheme) once error envelope shape confirmed
-    // TODO(critic): assert idempotent unsubscribe — second unsubscribe of same URI returns Ok
+    let again = client
+        .unsubscribe_resource(&uri)
+        .map_err(|e| format!("second unsubscribe of the same URI failed: {e}"))?;
+    if again.get("result").is_none() {
+        return Err(format!(
+            "second unsubscribe: no 'result' field in response: {again}"
+        ));
+    }
+
+    // `send_request` surfaces a JSON-RPC error as `Err` carrying the error object.
+    match client.subscribe_resource("file:///tmp/x.rs") {
+        Err(e) if e.to_string().contains("-32602") => {}
+        other => {
+            return Err(format!(
+                "subscribe with a non-lsp-diagnostics scheme: expected a -32602 error, got {other:?}"
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -1454,6 +1498,7 @@ fn ra_e2e_suite() {
     // Sub-case registry.
     let sub_cases: &[SubCase] = &[
         sub_case!(sc_get_hover),
+        sub_case!(sc_out_of_range_position_is_invalid_params_with_raw_error),
         sub_case!(sc_get_definition),
         sub_case!(sc_get_references),
         sub_case!(sc_get_diagnostics),

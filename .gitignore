@@ -33,3 +33,10 @@ criterion/
 # Environment
 .env
 .env.local
+
+# Key and certificate material
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/

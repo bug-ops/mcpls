@@ -35,6 +35,10 @@
 //! }
 //! ```
 
+#![cfg_attr(
+    not(test),
+    warn(clippy::arithmetic_side_effects, clippy::indexing_slicing)
+)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod bridge;
@@ -67,13 +71,14 @@ use mcp::SubscriptionRegistry;
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
-#[cfg(feature = "transport-http")]
-#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
-pub use transport::HttpConfig;
 pub use transport::Transport;
 #[cfg(feature = "transport-http")]
 use transport::run_http;
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+pub use transport::{ConnectionLimit, HeaderReadTimeout, HttpConfig};
 use transport::{ShutdownSignal, run_stdio};
+pub use util::escape_control;
 
 /// Whether `uri` falls within one of `workspace_roots`.
 ///
@@ -540,8 +545,9 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // concurrently on another worker thread -- so a `SIGTERM`/`SIGINT`
     // arriving during config validation, workspace-root heuristics, or LSP
     // spawning is caught rather than hitting the OS's default disposition
-    // (immediate termination, orphaning any LSP child mid-spawn; see #270)
-    // and skipping the `shutdown()` cleanup below entirely. See
+    // (immediate termination, skipping the `shutdown()` cleanup below
+    // entirely; any LSP child mid-spawn still dies with the lifeline/job
+    // binding, see #270 and #526). See
     // `ShutdownSignal`'s docs for why this must be a single instance carried
     // through by value rather than re-registered later.
     let shutdown_signal = ShutdownSignal::new();
@@ -840,10 +846,10 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// in the re-registration gap above is silently dropped rather than
 /// counted, requiring a second repeat before acting would let an unlucky
 /// operator's second press go unnoticed too. `exit(1)` skips unwinding, so
-/// it forfeits `Drop` (`kill_on_drop` on any still-running LSP child), one of
-/// the gaps documented on [`Translator::shutdown_servers`]'s "Limitations"
-/// section — an explicit trade the operator is asking for, not a case this
-/// fix silently regresses.
+/// it forfeits `Drop` (`kill_on_drop`) and the graceful LSP `exit`, but any
+/// still-running LSP child is killed by the lifeline/job binding (see
+/// [`Translator::shutdown_servers`]'s "Limitations" section) — an explicit
+/// trade the operator is asking for, not a case this fix silently regresses.
 async fn shutdown(
     cancel_tx: &tokio::sync::watch::Sender<bool>,
     translator: &Translator,
@@ -856,7 +862,7 @@ async fn shutdown(
         let mut repeat_signals = 0u32;
         loop {
             cleanup_signal.recv().await;
-            repeat_signals += 1;
+            repeat_signals = repeat_signals.saturating_add(1);
             if should_escalate(repeat_signals) {
                 error!("shutdown signal received during cleanup, forcing immediate exit");
                 std::process::exit(1);
@@ -1340,13 +1346,12 @@ mod tests {
 
         // Built from `base`'s own drive prefix so the test doesn't depend on
         // which drive CI happens to check the repo out onto.
-        let drive_prefix = base
-            .components()
-            .find_map(|c| match c {
-                Component::Prefix(p) => Some(p.as_os_str().to_owned()),
-                _ => None,
-            })
-            .expect("temp dir path should have a Windows drive prefix");
+        let Some(drive_prefix) = base.components().find_map(|c| match c {
+            Component::Prefix(p) => Some(p.as_os_str().to_owned()),
+            _ => None,
+        }) else {
+            panic!("temp dir path should have a Windows drive prefix");
+        };
         let mut root = drive_prefix;
         root.push("workspace");
         let root = PathBuf::from(root);

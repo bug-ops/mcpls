@@ -78,6 +78,10 @@ pub struct HttpConfig {
     /// TCP address to bind (e.g. `127.0.0.1:3000`).
     pub bind: std::net::SocketAddr,
     /// URL path prefix the MCP service is mounted at (e.g. `"/mcp"`).
+    ///
+    /// The same service also answers at the root path `/`, regardless of
+    /// this value, so a reverse proxy must not rely on `path` alone to
+    /// restrict which URLs reach mcpls.
     pub path: String,
     /// Maximum size, in bytes, of a single POST request body.
     ///
@@ -102,6 +106,23 @@ pub struct HttpConfig {
     pub max_concurrent_sessions: usize,
     /// How long a session may go without client activity before it is closed.
     pub(crate) session_idle_timeout: IdleTimeout,
+    /// Longest a client may take to send a complete request header, and
+    /// the longest it may pause between request-body chunks. It is also how
+    /// long an idle keep-alive connection stays open.
+    ///
+    /// Bounds slow-header and slow-body ("slowloris") clients: a stalled
+    /// header closes the connection, a stalled body is answered with
+    /// `408 Request Timeout`. It never interrupts a response, so long-lived
+    /// SSE streams are unaffected, and it does not bound a client that
+    /// stops *reading* a response. Defaults to [`HeaderReadTimeout::DEFAULT`].
+    pub header_read_timeout: HeaderReadTimeout,
+    /// Maximum number of concurrently open TCP connections.
+    ///
+    /// Further connections wait in the kernel accept queue until one
+    /// closes. Defaults to [`ConnectionLimit::DEFAULT`]. Values above what
+    /// the underlying semaphore supports are clamped by
+    /// [`ConnectionLimit::new`].
+    pub max_concurrent_connections: ConnectionLimit,
 }
 
 #[cfg(feature = "transport-http")]
@@ -112,7 +133,8 @@ impl HttpConfig {
     /// Default concurrent HTTP session cap.
     pub const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 100;
 
-    /// Create an [`HttpConfig`] with default body-size and session caps.
+    /// Create an [`HttpConfig`] with default body-size, session, timeout and
+    /// connection caps.
     ///
     /// # Examples
     ///
@@ -128,6 +150,8 @@ impl HttpConfig {
             max_request_body_bytes: Self::DEFAULT_MAX_REQUEST_BODY_BYTES,
             max_concurrent_sessions: Self::DEFAULT_MAX_CONCURRENT_SESSIONS,
             session_idle_timeout: IdleTimeout::DEFAULT,
+            header_read_timeout: HeaderReadTimeout::DEFAULT,
+            max_concurrent_connections: ConnectionLimit::DEFAULT,
         }
     }
 
@@ -143,6 +167,97 @@ impl HttpConfig {
     pub const fn with_max_concurrent_sessions(mut self, max: usize) -> Self {
         self.max_concurrent_sessions = max;
         self
+    }
+
+    /// Override the request read (header, body pause, idle keep-alive) timeout.
+    #[must_use]
+    pub const fn with_header_read_timeout(mut self, timeout: HeaderReadTimeout) -> Self {
+        self.header_read_timeout = timeout;
+        self
+    }
+
+    /// Override the maximum number of concurrently open connections.
+    #[must_use]
+    pub const fn with_max_concurrent_connections(mut self, max: ConnectionLimit) -> Self {
+        self.max_concurrent_connections = max;
+        self
+    }
+}
+
+/// Non-zero request read timeout for [`HttpConfig::header_read_timeout`].
+///
+/// A zero duration would drop every connection, so it is unrepresentable.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use mcpls_core::HeaderReadTimeout;
+///
+/// assert!(HeaderReadTimeout::new(Duration::ZERO).is_none());
+/// let timeout = HeaderReadTimeout::new(Duration::from_secs(10)).unwrap();
+/// assert_eq!(timeout.get(), Duration::from_secs(10));
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderReadTimeout(std::time::Duration);
+
+#[cfg(feature = "transport-http")]
+impl HeaderReadTimeout {
+    /// 30 seconds.
+    pub const DEFAULT: Self = Self(std::time::Duration::from_secs(30));
+
+    /// `None` for a zero duration.
+    #[must_use]
+    pub const fn new(timeout: std::time::Duration) -> Option<Self> {
+        if timeout.is_zero() {
+            None
+        } else {
+            Some(Self(timeout))
+        }
+    }
+
+    /// The wrapped duration, never zero.
+    #[must_use]
+    pub const fn get(self) -> std::time::Duration {
+        self.0
+    }
+}
+
+/// Non-zero open-connection cap for [`HttpConfig::max_concurrent_connections`],
+/// clamped to what [`tokio::sync::Semaphore`] supports.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::ConnectionLimit;
+///
+/// assert!(ConnectionLimit::new(0).is_none());
+/// assert_eq!(ConnectionLimit::new(8).unwrap().get(), 8);
+/// assert!(ConnectionLimit::new(usize::MAX).is_some());
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionLimit(usize);
+
+#[cfg(feature = "transport-http")]
+impl ConnectionLimit {
+    /// 512: room for 100 sessions each holding a GET stream, a
+    /// `subscriptions/listen` stream and one in-flight POST.
+    pub const DEFAULT: Self = Self(512);
+
+    /// `None` for zero; larger values are clamped to the semaphore maximum.
+    #[must_use]
+    pub fn new(max: usize) -> Option<Self> {
+        (max > 0).then(|| Self(max.min(tokio::sync::Semaphore::MAX_PERMITS)))
+    }
+
+    /// The wrapped limit, between 1 and the semaphore maximum.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
     }
 }
 
@@ -423,7 +538,7 @@ pub(crate) async fn run_stdio(
 /// predates this function's own `TcpListener::bind` call — a signal between
 /// bind and the graceful-shutdown future's first poll is still caught.
 /// `shutdown_signal` is moved into (and dropped by) the
-/// `with_graceful_shutdown` closure below once it resolves — i.e. as soon as
+/// shutdown-signal future below once it resolves — i.e. as soon as
 /// the *first* signal is received, well before this function returns. A
 /// second, freshly constructed `ShutdownSignal` then covers the
 /// connection-drain wait that follows (bounded by
@@ -441,8 +556,8 @@ pub(crate) async fn run_stdio(
 /// any *further* repeat signal — so an operator wanting a true immediate exit
 /// needs a third signal, not a second. This is a deliberate choice, not an
 /// oversight: calling `exit(1)` directly from this branch would skip
-/// unwinding and forfeit `kill_on_drop` cleanup of any still-running LSP
-/// child processes, which is worse than requiring one more signal.
+/// unwinding and cut short the graceful LSP `exit` delivery to still-running
+/// servers, which is worse than requiring one more signal.
 #[cfg(feature = "transport-http")]
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,
@@ -513,7 +628,11 @@ pub(crate) async fn serve_http(
     let app = axum::Router::new()
         .nest_service(&cfg.path, service.clone())
         .route_service("/", service)
-        .layer(axum::middleware::from_fn(enforce_session_cap));
+        .layer(axum::middleware::from_fn(enforce_session_cap))
+        .layer(axum::middleware::from_fn_with_state(
+            cfg.header_read_timeout,
+            enforce_body_inactivity,
+        ));
 
     let local_addr = listener
         .local_addr()
@@ -530,21 +649,35 @@ pub(crate) async fn serve_http(
             addr = %local_addr,
             "binding to a non-loopback address: mcpls performs no authentication of its own on \
              any transport — place this endpoint behind a reverse proxy that enforces \
-             authentication. The proxy must also rewrite the Host header, since rmcp's Host \
-             validation allows only localhost/127.0.0.1/::1 by default"
+             authentication. mcpls itself enforces only a header-read/idle timeout and a connection \
+             cap. The proxy must also rewrite the Host header, since rmcp's Host validation \
+             allows only localhost/127.0.0.1/::1 by default"
         );
     }
 
     // `cancel` is cancelled exactly once, when the shutdown signal fires
     // (below). Cloned first so the force-timeout and repeat-signal branches
     // can each observe that same moment independently of the
-    // `with_graceful_shutdown` closure, which consumes its own clone.
+    // shutdown-signal future, which consumes its own clone.
     let cancel_for_force_timeout = cancel.clone();
     let cancel_for_repeat_signal = cancel.clone();
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-        shutdown_signal.recv().await;
-        cancel.cancel();
-    });
+    let cancel_for_serve = cancel.clone();
+    let serve = async move {
+        let signal = async move {
+            shutdown_signal.recv().await;
+            cancel.cancel();
+        };
+        tokio::join!(
+            serve_http1(
+                listener,
+                app,
+                cancel_for_serve,
+                cfg.header_read_timeout,
+                cfg.max_concurrent_connections,
+            ),
+            signal
+        );
+    };
 
     // The force-timeout only starts counting once `cancel` is actually
     // cancelled — i.e. once a shutdown signal has been received — not from
@@ -556,7 +689,7 @@ pub(crate) async fn serve_http(
     // stuck SSE stream) can't hang the caller's post-shutdown cleanup
     // (draining/closing LSP servers) indefinitely.
     tokio::select! {
-        result = serve => result.map_err(|e| crate::Error::McpServer(format!("http serve: {e}"))),
+        () = serve => Ok(()),
         () = async move {
             cancel_for_force_timeout.cancelled().await;
             tokio::time::sleep(HTTP_GRACEFUL_SHUTDOWN_TIMEOUT).await;
@@ -597,9 +730,199 @@ pub(crate) async fn serve_http(
     }
 }
 
+/// Accepts connections on `listener` and serves `app` over HTTP/1 until
+/// `cancel` fires, then drains the open connections gracefully.
+///
+/// Replaces `axum::serve` because it never installs a hyper timer, which
+/// leaves `header_read_timeout` inert: a client that opens a connection and
+/// stalls would hold it (and, with the cap, a permit) forever. A permit is
+/// taken before `accept` so a full house leaves new connections queued in
+/// the kernel rather than accepted-and-idle.
+#[cfg(feature = "transport-http")]
+async fn serve_http1(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    cancel: tokio_util::sync::CancellationToken,
+    header_read_timeout: HeaderReadTimeout,
+    max_connections: ConnectionLimit,
+) {
+    use std::sync::Arc;
+
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout.get());
+    let permits = Arc::new(Semaphore::new(max_connections.get()));
+    // A `JoinSet` aborts its tasks when dropped, so a force-timeout in
+    // `run_http` cannot leave connections being served after it returns.
+    let mut connections = JoinSet::new();
+
+    loop {
+        while connections.try_join_next().is_some() {}
+        let permit = tokio::select! {
+            () = cancel.cancelled() => break,
+            permit = Arc::clone(&permits).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let stream = tokio::select! {
+            () = cancel.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(e) if is_connection_error(&e) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "HTTP accept failed, backing off");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+        };
+
+        let conn =
+            builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone()));
+        let cancel = cancel.clone();
+        connections.spawn(async move {
+            let _permit = permit;
+            let mut conn = std::pin::pin!(conn);
+            tokio::select! {
+                result = conn.as_mut() => {
+                    if let Err(e) = result {
+                        tracing::trace!(error = %e, "HTTP connection ended with error");
+                    }
+                }
+                () = cancel.cancelled() => {
+                    conn.as_mut().graceful_shutdown();
+                    if let Err(e) = conn.as_mut().await {
+                        tracing::trace!(error = %e, "HTTP connection ended with error");
+                    }
+                }
+            }
+        });
+    }
+
+    while connections.join_next().await.is_some() {}
+}
+
+/// Request body that fails once no frame has arrived for `timeout`, flagging
+/// `expired` so [`enforce_body_inactivity`] can answer `408`.
+#[cfg(feature = "transport-http")]
+struct InactivityBody {
+    inner: axum::body::Body,
+    timeout: std::time::Duration,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "transport-http")]
+#[derive(Debug)]
+struct BodyInactivity;
+
+#[cfg(feature = "transport-http")]
+impl std::fmt::Display for BodyInactivity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body stalled")
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl std::error::Error for BodyInactivity {}
+
+#[cfg(feature = "transport-http")]
+impl http_body::Body for InactivityBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                this.sleep = Box::pin(tokio::time::sleep(this.timeout));
+                Poll::Ready(frame)
+            }
+            Poll::Pending => {
+                if this.sleep.as_mut().poll(cx).is_ready() {
+                    this.expired
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Poll::Ready(Some(Err(axum::Error::new(BodyInactivity))))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Bounds the pause between request-body chunks by `timeout`, answering
+/// `408 Request Timeout` when a client stalls mid-body.
+///
+/// `header_read_timeout` only covers the request head, so without this a POST
+/// announcing a body it never sends would pin its connection and permit
+/// forever.
+#[cfg(feature = "transport-http")]
+async fn enforce_body_inactivity(
+    axum::extract::State(timeout): axum::extract::State<HeaderReadTimeout>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let expired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (parts, body) = request.into_parts();
+    let body = if http_body::Body::is_end_stream(&body) {
+        body
+    } else {
+        axum::body::Body::new(InactivityBody {
+            inner: body,
+            timeout: timeout.get(),
+            sleep: Box::pin(tokio::time::sleep(timeout.get())),
+            expired: std::sync::Arc::clone(&expired),
+        })
+    };
+
+    let response = next
+        .run(axum::extract::Request::from_parts(parts, body))
+        .await;
+    if expired.load(std::sync::atomic::Ordering::Relaxed) {
+        return axum::http::StatusCode::REQUEST_TIMEOUT.into_response();
+    }
+    response
+}
+
+/// Whether an `accept` error is about the one peer's connection rather than
+/// the listener, so the loop can retry at once instead of backing off.
+#[cfg(feature = "transport-http")]
+fn is_connection_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
 /// Upper bound [`run_http`] waits, once shutdown has been signaled, for
-/// `axum`'s graceful shutdown to finish draining in-flight connections
-/// before giving up and returning anyway.
+/// in-flight connections to finish draining before giving up and returning
+/// anyway.
 #[cfg(feature = "transport-http")]
 const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -760,7 +1083,10 @@ impl IdleTimeout {
     /// A fifth of the timeout, so an idle session closes within 1.2x of it;
     /// never zero, which `tokio::time::interval` rejects.
     fn sweep_interval(self) -> std::time::Duration {
-        (self.0 / 5).max(std::time::Duration::from_millis(1))
+        self.0
+            .checked_div(5)
+            .unwrap_or_default()
+            .max(std::time::Duration::from_millis(1))
     }
 }
 
@@ -791,7 +1117,9 @@ impl SessionActivity {
     }
 
     fn open_stream(self: &std::sync::Arc<Self>) -> StreamGuard {
-        lock_std(&self.0).open_streams += 1;
+        let mut state = lock_std(&self.0);
+        state.open_streams = state.open_streams.saturating_add(1);
+        drop(state);
         StreamGuard(std::sync::Arc::clone(self))
     }
 
@@ -1081,7 +1409,7 @@ mod tests {
     /// This is the closest portable coverage of `run_stdio`'s non-signal
     /// path achievable here: `run_stdio` is hardcoded to the process's real
     /// stdin/stdout (no injectable transport), and this crate is
-    /// `deny(unsafe_code)`, so a test can't redirect the fd to simulate "the
+    /// `forbid(unsafe_code)`, so a test can't redirect the fd to simulate "the
     /// MCP handshake completes, *then* stdin closes" — the specific
     /// scenario that would drive `service.waiting()` to resolve inside the
     /// `tokio::select!` and hit its `Ok(())` arm. What a test *can* rely on:
@@ -1139,8 +1467,9 @@ mod tests {
         use rmcp::model::ClientJsonRpcMessage;
 
         use super::super::{
-            CappedSessionManager, CappedSessionManagerError, HttpConfig, IdleTimeout,
-            SessionActivity, SessionManager as _, Transport, run_idle_reaper,
+            CappedSessionManager, CappedSessionManagerError, ConnectionLimit, HeaderReadTimeout,
+            HttpConfig, IdleTimeout, SessionActivity, SessionManager as _, Transport,
+            run_idle_reaper,
         };
         use crate::test_lsp::CapturedLogs;
 
@@ -1334,6 +1663,226 @@ mod tests {
             );
 
             drop(occupied);
+        }
+
+        /// Spawns `run_http` on a fresh loopback port.
+        async fn spawn_run_http(
+            cfg_for: impl FnOnce(SocketAddr) -> HttpConfig,
+        ) -> (
+            SocketAddr,
+            tokio::task::JoinHandle<Result<(), crate::Error>>,
+        ) {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+            let task = tokio::spawn(super::super::run_http(
+                test_server(),
+                cfg_for(addr),
+                super::super::ShutdownSignal::new(),
+            ));
+            let mut listening = false;
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    listening = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(listening, "run_http never started listening on {addr}");
+            (addr, task)
+        }
+
+        /// #465: a client that sends an incomplete request header and stalls
+        /// is disconnected once `header_read_timeout` elapses.
+        #[tokio::test]
+        async fn test_run_http_closes_connection_that_stalls_mid_header() {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let timeout = std::time::Duration::from_millis(200);
+            let (addr, server_task) = spawn_run_http(|addr| {
+                HttpConfig::new(addr, "/mcp")
+                    .with_header_read_timeout(HeaderReadTimeout::new(timeout).unwrap())
+            })
+            .await;
+
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+
+            let mut sink = Vec::new();
+            tokio::time::timeout(
+                timeout + std::time::Duration::from_secs(1),
+                stream.read_to_end(&mut sink),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("server must close a stalled connection within the header timeout")
+            })
+            .ok();
+
+            server_task.abort();
+        }
+
+        /// #465: with `max_concurrent_connections = 1`, a second connection is
+        /// not served until the first closes.
+        #[tokio::test]
+        async fn test_run_http_connection_cap_queues_second_connection() {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let (addr, server_task) = spawn_run_http(|addr| {
+                HttpConfig::new(addr, "/mcp")
+                    .with_max_concurrent_connections(ConnectionLimit::new(1).unwrap())
+            })
+            .await;
+
+            let first = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+            let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request =
+                format!("GET /nowhere HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+            second.write_all(request.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 64];
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(300), second.read(&mut buf))
+                    .await
+                    .is_err(),
+                "second connection must not be served while the cap is held"
+            );
+
+            drop(first);
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), second.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("second connection must be served once the first closes")
+                })
+                .unwrap();
+            assert!(n > 0);
+
+            server_task.abort();
+        }
+
+        /// Security M1: a POST announcing a body it never sends is answered
+        /// `408` after the inactivity timeout and releases its connection
+        /// permit, so a one-connection cap still serves the next client.
+        #[tokio::test]
+        async fn test_run_http_answers_408_to_stalled_request_body_and_frees_the_permit() {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let timeout = std::time::Duration::from_millis(200);
+            let (addr, server_task) = spawn_run_http(|addr| {
+                HttpConfig::new(addr, "/mcp")
+                    .with_header_read_timeout(HeaderReadTimeout::new(timeout).unwrap())
+                    .with_max_concurrent_connections(ConnectionLimit::new(1).unwrap())
+            })
+            .await;
+
+            let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let head = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
+            );
+            stalled.write_all(head.as_bytes()).await.unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                timeout + std::time::Duration::from_secs(2),
+                stalled.read_to_end(&mut response),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("a stalled body must not pin the connection"))
+            .ok();
+            assert!(
+                String::from_utf8_lossy(&response).starts_with("HTTP/1.1 408"),
+                "got {:?}",
+                String::from_utf8_lossy(&response)
+            );
+
+            let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request =
+                format!("GET /nowhere HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+            next.write_all(request.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), next.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("the permit must be free after the 408"))
+                .unwrap();
+            assert!(n > 0);
+
+            server_task.abort();
+        }
+
+        #[test]
+        fn test_connection_settings_reject_zero_and_clamp_to_the_semaphore_maximum() {
+            assert_eq!(HeaderReadTimeout::new(std::time::Duration::ZERO), None);
+            assert_eq!(ConnectionLimit::new(0), None);
+            assert_eq!(
+                ConnectionLimit::new(usize::MAX).unwrap().get(),
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
+            let semaphore =
+                tokio::sync::Semaphore::new(ConnectionLimit::new(usize::MAX).unwrap().get());
+            assert_eq!(
+                semaphore.available_permits(),
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
+        }
+
+        /// Starts `serve_http1` over an empty router (every path is a 404).
+        async fn spawn_serve_http1(
+            limit: ConnectionLimit,
+        ) -> (
+            SocketAddr,
+            tokio_util::sync::CancellationToken,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = tokio::spawn(super::super::serve_http1(
+                listener,
+                axum::Router::new(),
+                cancel.clone(),
+                HeaderReadTimeout::DEFAULT,
+                limit,
+            ));
+            (addr, cancel, task)
+        }
+
+        /// Cancelling drains an idle keep-alive connection instead of
+        /// waiting on it, and closes it.
+        #[tokio::test]
+        async fn test_serve_http1_cancel_closes_idle_keep_alive_connection_and_returns() {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let (addr, cancel, task) = spawn_serve_http1(ConnectionLimit::DEFAULT).await;
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = format!("GET /nowhere HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 512];
+            assert!(stream.read(&mut buf).await.unwrap() > 0);
+
+            cancel.cancel();
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap_or_else(|_| panic!("serve_http1 must return after cancel"))
+                .unwrap();
+            assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+        }
+
+        /// A cancel arriving while every permit is taken and another client
+        /// waits in the accept queue must still end the loop.
+        #[tokio::test]
+        async fn test_serve_http1_cancel_while_at_the_connection_cap_returns() {
+            let (addr, cancel, task) = spawn_serve_http1(ConnectionLimit::new(1).unwrap()).await;
+            let _held = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _queued = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            cancel.cancel();
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap_or_else(|_| panic!("serve_http1 must return after cancel at the cap"))
+                .unwrap();
         }
 
         /// Builds a `McplsServer` with default collaborators and the given

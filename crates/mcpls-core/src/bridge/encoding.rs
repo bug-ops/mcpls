@@ -247,20 +247,26 @@ impl<'a> LabelOffsets<'a> {
                     break;
                 }
                 resolved.push((offset, (offset as usize == unit).then_some(byte)));
-                next += 1;
+                next = next.saturating_add(1);
             }
         };
         let mut unit = 0;
         for (byte, ch) in label.char_indices() {
             settle(unit, byte);
-            unit += match encoding {
+            unit = unit.saturating_add(match encoding {
                 PositionEncoding::Utf8 => ch.len_utf8(),
                 PositionEncoding::Utf16 => ch.len_utf16(),
                 PositionEncoding::Utf32 => 1,
-            };
+            });
         }
         settle(unit, label.len());
-        resolved.extend(wanted[next..].iter().map(|&offset| (offset, None)));
+        resolved.extend(
+            wanted
+                .get(next..)
+                .unwrap_or_default()
+                .iter()
+                .map(|&offset| (offset, None)),
+        );
         Self { label, resolved }
     }
 
@@ -275,7 +281,7 @@ impl<'a> LabelOffsets<'a> {
                 .resolved
                 .binary_search_by_key(&unit, |&(offset, _)| offset)
                 .ok()?;
-            self.resolved[index].1
+            self.resolved.get(index)?.1
         };
         self.label.get(at(start)?..at(end)?)
     }
@@ -375,7 +381,7 @@ impl EncodingConverter {
                     if utf16_count >= character_offset {
                         return Ok(byte_idx);
                     }
-                    utf16_count += ch.len_utf16() as u32;
+                    utf16_count = utf16_count.saturating_add(ch.len_utf16() as u32);
                 }
                 if utf16_count == character_offset {
                     Ok(text.len())

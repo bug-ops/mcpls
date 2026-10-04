@@ -1,5 +1,6 @@
 //! Small helpers shared across `mcpls-core` modules.
 
+use std::borrow::Cow;
 use std::string::FromUtf8Error;
 
 /// Byte cap for a bounded read against a `max`-byte size limit: `max + 1`
@@ -114,9 +115,85 @@ pub fn truncate_string(mut s: String, max_bytes: usize) -> String {
     s
 }
 
+/// Whether `c` could forge a log line or reorder displayed text: a control
+/// character, a Unicode line or paragraph separator, or a bidi control.
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{061C}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Escape every control character, line/paragraph separator and bidi control
+/// in `s` (`\n`, `\r`, `\t` by name, the rest as `\u{..}`), borrowing `s`
+/// unchanged when it has none.
+///
+/// Applied wherever attacker-influenceable text (an LSP server's message)
+/// reaches an error `Display`, and by the `mcpls` binary to every log field,
+/// so it cannot forge log lines or reorder what an operator reads.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(mcpls_core::escape_control("ok\nERROR forged"), "ok\\nERROR forged");
+/// assert_eq!(mcpls_core::escape_control("plain"), "plain");
+/// ```
+pub fn escape_control(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(needs_escape) {
+        return Cow::Borrowed(s);
+    }
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if needs_escape(c) => escaped.extend(c.escape_unicode()),
+            c => escaped.push(c),
+        }
+    }
+    Cow::Owned(escaped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_control_borrows_clean_text() {
+        assert!(matches!(
+            escape_control("plain ✓"),
+            Cow::Borrowed("plain ✓")
+        ));
+    }
+
+    #[test]
+    fn escape_control_escapes_newlines_and_escape_sequences() {
+        assert_eq!(
+            escape_control("a\nb\r\tc\x1b[31m"),
+            "a\\nb\\r\\tc\\u{1b}[31m"
+        );
+    }
+
+    #[test]
+    fn escape_control_escapes_line_separators_and_bidi_controls() {
+        assert_eq!(
+            escape_control("a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200F}f\u{061C}g"),
+            "a\\u{2028}b\\u{2029}c\\u{202e}d\\u{2066}e\\u{200f}f\\u{61c}g"
+        );
+    }
+
+    #[test]
+    fn escape_control_escapes_forged_log_line() {
+        assert_eq!(escape_control("ok\nERROR forged"), "ok\\nERROR forged");
+    }
 
     #[test]
     fn bounded_read_cap_is_max_plus_one() {

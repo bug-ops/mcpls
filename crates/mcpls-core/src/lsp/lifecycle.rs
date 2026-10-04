@@ -18,7 +18,7 @@ use lsp_types::{
     PositionEncodingKind, Request, ServerCapabilities, ShutdownRequest, StaleRequestSupportOptions,
     SymbolKind, WorkspaceFolder,
 };
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, info, warn};
@@ -28,6 +28,7 @@ use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
+use crate::lsp::process::ServerProcess;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 
@@ -47,7 +48,8 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 
 /// Upper bound [`LspServer::shutdown`] waits for the child process to exit on
 /// its own after sending the LSP `exit` notification, before falling back to
-/// `kill_on_drop`.
+/// killing it on drop. Only the leader is awaited; descendants are reaped by
+/// the lifeline binding.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// How long a failed `initialize` waits for the child to be reaped before
@@ -312,12 +314,13 @@ pub struct LspServer {
     /// queried by [`Self::has_exited`] to detect a crash. [`LspServer::shutdown`]
     /// waits for it to exit after sending `exit`; otherwise, or if that wait
     /// times out, dropping it terminates the process via SIGKILL
-    /// (`kill_on_drop`).
+    /// (`kill_on_drop`). The process is also bound to the mcpls process
+    /// lifetime (see [`ServerProcess`]), so it dies with mcpls on any exit.
     ///
     /// `None` only for test fixtures that never spawn a real server process
     /// (see `crate::test_lsp`, `Self::new_for_test_with_encoding`) --
     /// [`Self::spawn`] always populates this with `Some`.
-    child: Option<tokio::process::Child>,
+    child: Option<ServerProcess>,
     /// Config this server was spawned from; the single source of its routing
     /// identity, respawn config and indexing policy.
     init_config: ServerInitConfig,
@@ -389,7 +392,7 @@ impl LspServer {
             config.server_config.command, config.server_config.args
         );
 
-        let mut command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
+        let command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
 
         // Log allowlist presence and an override count only — never the
         // configured keys themselves, since `config.server_config.env` may
@@ -407,7 +410,7 @@ impl LspServer {
                 .count();
             #[cfg(not(windows))]
             let windows = 0;
-            base + windows
+            base.saturating_add(windows)
         };
         debug!(
             "Effective LSP server env: {passthrough_present} allowlisted key(s) present, \
@@ -415,17 +418,14 @@ impl LspServer {
             config.server_config.env.len()
         );
 
-        let mut child = command
-            .spawn()
+        let mut child = ServerProcess::spawn(command)
             .map_err(|e| spawn_error(config.server_config.command.clone(), e))?;
 
         let stdin = child
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| Error::Transport("Failed to capture stdin".to_string()))?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
@@ -495,8 +495,7 @@ impl LspServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // TODO(#534): capture a bounded stderr tail during initialize
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .stderr(Stdio::null());
 
         command
     }
@@ -699,7 +698,7 @@ impl LspServer {
 
     /// Non-blocking check for whether the child process has already exited.
     ///
-    /// Uses [`tokio::process::Child::try_wait`], which never blocks waiting
+    /// Uses [`tokio::process::Child::try_wait`] on the leader process, which never blocks waiting
     /// for the process: `true` means it is gone (crashed, killed, or exited
     /// on its own), and any [`LspClient`] obtained from [`Self::client`] is
     /// now permanently disconnected -- new requests through it fail with
@@ -746,7 +745,8 @@ impl LspServer {
     /// period (never past the overall deadline) for the child process to exit
     /// on its own. If it hasn't by then, or if the handshake itself fails or
     /// times out, the child is simply dropped here — `kill_on_drop`
-    /// terminates it via SIGKILL (a no-op if it has already exited). A test
+    /// terminates it via SIGKILL (a no-op if it has already exited); on Windows
+    /// this also kills its descendants. A test
     /// fixture with no real backing process (`child` is `None`) skips this
     /// step entirely -- there is nothing to wait for or kill.
     ///
@@ -756,6 +756,10 @@ impl LspServer {
     /// including [`Error::ShutdownTimeout`] when the deadline elapsed. The
     /// child process is still torn down (gracefully if it exits in time,
     /// killed otherwise) regardless of whether this returns `Ok` or `Err`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "SHUTDOWN_TIMEOUT and CHILD_EXIT_GRACE are small constants"
+    )]
     pub async fn shutdown(self) -> Result<()> {
         debug!("Shutting down LSP server");
 
@@ -791,8 +795,8 @@ impl LspServer {
                      notification, killing it"
                 ),
             }
-            // `child` drops here: `kill_on_drop` kills it if still running, and is a
-            // no-op if `wait()` above already reaped it.
+            // `child` drops here: it kills the leader (and on Windows the job) if still
+            // running, and is a no-op if `wait()` above already reaped it.
         }
 
         handshake?;
@@ -925,7 +929,7 @@ const fn is_connection_loss(error: &Error) -> bool {
 
 /// [`Error::ServerExitedDuringInit`] if `child` has exited (or does so within
 /// [`EARLY_EXIT_PROBE`]), `None` if it is still running.
-async fn early_exit_error(child: &mut Child, command: &str) -> Option<Error> {
+async fn early_exit_error(child: &mut ServerProcess, command: &str) -> Option<Error> {
     let status = timeout(EARLY_EXIT_PROBE, child.wait()).await.ok()?.ok()?;
     Some(Error::ServerExitedDuringInit {
         command: command.to_string(),
@@ -1009,7 +1013,7 @@ pub fn fake_lsp_server_with_dead_loop_and_live_child() -> LspServer {
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn sleep: {e}"));
     let mut server = fake_lsp_server();
-    server.child = Some(child);
+    server.child = Some(ServerProcess::from_unbound(child));
     server
 }
 
@@ -1341,7 +1345,7 @@ mod tests {
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
-            child: Some(mock_child),
+            child: Some(ServerProcess::from_unbound(mock_child)),
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
 

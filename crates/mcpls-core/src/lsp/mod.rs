@@ -5,10 +5,11 @@
 
 mod client;
 mod lifecycle;
+mod process;
 mod transport;
 pub(crate) mod types;
 
-pub(crate) use client::CONTENT_MODIFIED_RETRY_METHODS;
+pub(crate) use client::{CONTENT_MODIFIED_RETRY_METHODS, MAX_ERROR_MESSAGE_CALLER_BYTES};
 pub use client::{LspClient, SHUTDOWN_TIMEOUT};
 pub(crate) use lifecycle::SUPPORTED_SYMBOL_KINDS;
 #[cfg(all(test, unix))]

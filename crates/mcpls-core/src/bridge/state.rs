@@ -63,12 +63,16 @@ const fn is_line_terminator(byte: u8) -> bool {
 /// `None` for the last line. `\r\n` is one terminator.
 fn line_bounds(content: &str, start: usize) -> (usize, Option<usize>) {
     let bytes = content.as_bytes();
-    let Some(offset) = bytes[start..].iter().position(|&b| is_line_terminator(b)) else {
+    let Some(offset) = bytes
+        .get(start..)
+        .and_then(|rest| rest.iter().position(|&b| is_line_terminator(b)))
+    else {
         return (content.len(), None);
     };
-    let end = start + offset;
-    let crlf = bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n');
-    (end, Some(end + 1 + usize::from(crlf)))
+    let end = start.saturating_add(offset);
+    let next = end.saturating_add(1);
+    let crlf = bytes.get(end) == Some(&b'\r') && bytes.get(next) == Some(&b'\n');
+    (end, Some(next.saturating_add(usize::from(crlf))))
 }
 
 /// A document's text together with sparse line checkpoints, so a line lookup
@@ -119,7 +123,7 @@ impl DocumentText {
         let mut line = 0usize;
         while let (_, Some(next)) = line_bounds(&content, start) {
             start = next;
-            line += 1;
+            line = line.saturating_add(1);
             if line.is_multiple_of(stride) {
                 checkpoints.push(start);
             }
@@ -152,8 +156,8 @@ impl DocumentText {
     /// checkpoint plus the target line itself.
     pub(super) fn line(&self, n: u32) -> Option<&str> {
         let n = n as usize;
-        let mut start = *self.checkpoints.get(n / self.stride)?;
-        for _ in 0..n % self.stride {
+        let mut start = *self.checkpoints.get(n.checked_div(self.stride)?)?;
+        for _ in 0..n.checked_rem(self.stride)? {
             start = line_bounds(&self.content, start).1?;
         }
         let (end, _) = line_bounds(&self.content, start);
@@ -190,19 +194,22 @@ fn mtime_settled(mtime: Option<SystemTime>, read_at: SystemTime) -> bool {
 /// indefinitely on read, so this bounds the read -- not the open itself,
 /// which Win32 has no non-blocking equivalent for (see #442).
 #[cfg(windows)]
-fn check_disk_file_type(file: &fs::File, path: &Path) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
+async fn check_disk_file_type(file: &fs::File, path: &Path) -> Result<()> {
+    // `winapi_util` only accepts `std::fs::File`; the duplicate handle reports the same type.
+    let std_file = file
+        .try_clone()
+        .await
+        .map_err(|e| Error::FileIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?
+        .into_std()
+        .await;
 
-    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
-
-    #[allow(unsafe_code)]
-    // SAFETY: `file` is a valid, still-open handle just obtained from open(); GetFileType's only precondition.
-    let file_type = unsafe { GetFileType(file.as_raw_handle().cast()) };
-
-    if file_type != FILE_TYPE_DISK {
-        return Err(Error::NotARegularFile(path.to_path_buf()));
+    match winapi_util::file::typ(&std_file) {
+        Ok(file_type) if file_type.is_disk() => Ok(()),
+        _ => Err(Error::NotARegularFile(path.to_path_buf())),
     }
-    Ok(())
 }
 
 /// A snapshot of a document's on-disk filesystem state, captured the last
@@ -582,9 +589,10 @@ impl DocumentTracker {
     /// the LSP round-trip that follows; guards for the same path stack, and
     /// the path is evictable again only once all of them have dropped.
     pub(crate) fn mark_in_flight(&self, path: &Path) -> InFlightGuard {
-        *lock_std(&self.in_flight)
-            .entry(path.to_path_buf())
-            .or_insert(0) += 1;
+        let mut in_flight = lock_std(&self.in_flight);
+        let count = in_flight.entry(path.to_path_buf()).or_insert(0);
+        *count = count.saturating_add(1);
+        drop(in_flight);
         InFlightGuard {
             in_flight: Arc::clone(&self.in_flight),
             path: path.to_path_buf(),
@@ -818,9 +826,10 @@ impl DocumentTracker {
     /// its `synced` write if the generation moved in the meantime, closing
     /// that race regardless of exactly when the notify "succeeds".
     pub fn forget_server(&self, server: &ServerId) {
-        *lock_std(&self.generations)
-            .entry(server.clone())
-            .or_insert(0) += 1;
+        let mut generations = lock_std(&self.generations);
+        let generation = generations.entry(server.clone()).or_insert(0);
+        *generation = generation.saturating_add(1);
+        drop(generations);
         for state in lock_std(&self.documents).values_mut() {
             state.forget_server(server);
         }
@@ -1191,7 +1200,7 @@ impl DocumentTracker {
         })?;
         // Must precede metadata() below: GetFileInformationByHandle may fail for non-disk handles.
         #[cfg(windows)]
-        check_disk_file_type(&file, path)?;
+        check_disk_file_type(&file, path).await?;
         let meta = file.metadata().await.map_err(|e| Error::FileIo {
             path: path.to_path_buf(),
             source: e,
@@ -1512,6 +1521,11 @@ impl DocumentTracker {
 /// rather than returning a line the cap may have cut. A `\r` ending a skipped
 /// line at a chunk boundary is remembered, so a `\n` opening the next chunk
 /// still counts as part of the same `\r\n` terminator.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "every index derives from `position()` over the same chunk and stays within `chunk.len()`"
+)]
 async fn read_nth_line<R>(reader: &mut R, line: u32, cap: u64) -> std::io::Result<LineRead>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -1591,7 +1605,7 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         let mut in_flight = lock_std(&self.in_flight);
         if let Some(count) = in_flight.get_mut(&self.path) {
-            *count -= 1;
+            *count = count.saturating_sub(1);
             if *count == 0 {
                 in_flight.remove(&self.path);
             }
@@ -3569,12 +3583,12 @@ mod tests {
         std::fs::write(&path, "hello").unwrap();
 
         let regular = fs::File::open(&path).await.unwrap();
-        assert!(check_disk_file_type(&regular, &path).is_ok());
+        assert!(check_disk_file_type(&regular, &path).await.is_ok());
 
         let nul_path = PathBuf::from("NUL");
         let nul = fs::File::open(&nul_path).await.unwrap();
         assert!(matches!(
-            check_disk_file_type(&nul, &nul_path),
+            check_disk_file_type(&nul, &nul_path).await,
             Err(Error::NotARegularFile(_))
         ));
     }

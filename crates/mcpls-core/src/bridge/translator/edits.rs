@@ -194,7 +194,7 @@ impl WorkspaceEditConverter<'_> {
                 "dropping out-of-workspace {}",
                 self.edit_kind
             );
-            self.dropped.out_of_workspace += 1;
+            self.dropped.out_of_workspace = self.dropped.out_of_workspace.saturating_add(1);
         }
         in_workspace
     }
@@ -206,7 +206,7 @@ impl WorkspaceEditConverter<'_> {
         let total = edits.len();
         let admitted = self.budget.admit_whole(edits);
         if admitted.is_none() {
-            self.dropped.exceeds_item_cap += total;
+            self.dropped.exceeds_item_cap = self.dropped.exceeds_item_cap.saturating_add(total);
         }
         admitted
     }
@@ -252,7 +252,8 @@ impl WorkspaceEditConverter<'_> {
                 | lsp_types::DocumentChange::RenameFile(_)
                 | lsp_types::DocumentChange::DeleteFile(_) => {
                     tracing::debug!("dropping unsupported file-operation document change");
-                    self.dropped.unsupported_file_operation += 1;
+                    self.dropped.unsupported_file_operation =
+                        self.dropped.unsupported_file_operation.saturating_add(1);
                     continue;
                 }
             };
@@ -263,7 +264,7 @@ impl WorkspaceEditConverter<'_> {
             let Some(edits) = self.admit_edits(tde.edits) else {
                 continue;
             };
-            let mut entry_dropped = 0;
+            let mut entry_dropped = 0usize;
             let mut text_edits = Vec::with_capacity(edits.len());
             for one_of in edits {
                 let text_edit = match one_of {
@@ -289,8 +290,9 @@ impl WorkspaceEditConverter<'_> {
                     // dropped above rather than mistranslated.
                     lsp_types::Edit::SnippetTextEdit(_) => {
                         tracing::debug!("dropping unsupported snippet text edit");
-                        self.dropped.unsupported_snippet_edit += 1;
-                        entry_dropped += 1;
+                        self.dropped.unsupported_snippet_edit =
+                            self.dropped.unsupported_snippet_edit.saturating_add(1);
+                        entry_dropped = entry_dropped.saturating_add(1);
                         continue;
                     }
                 };
@@ -315,14 +317,16 @@ impl WorkspaceEditConverter<'_> {
                             "ignoring documentChanges entry shadowed by a non-empty changes map in {}",
                             self.edit_kind
                         );
-                        self.dropped.shadowed_by_changes += 1;
+                        self.dropped.shadowed_by_changes =
+                            self.dropped.shadowed_by_changes.saturating_add(1);
                     }
                 }
                 lsp_types::DocumentChange::CreateFile(_)
                 | lsp_types::DocumentChange::RenameFile(_)
                 | lsp_types::DocumentChange::DeleteFile(_) => {
                     tracing::debug!("dropping unsupported file-operation document change");
-                    self.dropped.unsupported_file_operation += 1;
+                    self.dropped.unsupported_file_operation =
+                        self.dropped.unsupported_file_operation.saturating_add(1);
                 }
             }
         }
@@ -425,7 +429,7 @@ async fn resolve_deferred_code_actions(
             continue;
         }
         if resolve_tasks.len() >= MAX_CODE_ACTION_RESOLVES {
-            skipped_due_to_cap += 1;
+            skipped_due_to_cap = skipped_due_to_cap.saturating_add(1);
             continue;
         }
         let client = client.clone();
@@ -450,7 +454,9 @@ async fn resolve_deferred_code_actions(
     while let Some(result) = resolve_tasks.join_next().await {
         match result {
             Ok((index, resolved_action)) => {
-                entries[index] = lsp_types::CodeActionResponse::CodeAction(resolved_action);
+                if let Some(slot) = entries.get_mut(index) {
+                    *slot = lsp_types::CodeActionResponse::CodeAction(resolved_action);
+                }
             }
             Err(join_err) => {
                 // The original, edit-less action already in `entries` is

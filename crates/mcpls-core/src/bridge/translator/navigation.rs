@@ -129,7 +129,7 @@ impl ItemBudget {
             self.record_drop(items.len());
             items.truncate(self.remaining);
         }
-        self.remaining -= items.len();
+        self.remaining = self.remaining.saturating_sub(items.len());
         items
     }
 
@@ -148,7 +148,7 @@ impl ItemBudget {
             self.record_drop(count);
             return false;
         }
-        self.remaining -= count;
+        self.remaining = self.remaining.saturating_sub(count);
         true
     }
 
@@ -415,6 +415,10 @@ impl Translator {
         };
 
         let start = Instant::now();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "production passes the fixed INDEXING_READY_TIMEOUT"
+        )]
         let deadline = start + timeout;
         loop {
             let state = cache.lock().await.indexing_state(server_id);
