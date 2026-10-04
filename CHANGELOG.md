@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - HTTP sessions now receive `resources/updated` on their GET stream for the resources they subscribed to; `subscriptions/listen` for 2026-07-28 clients is tracked in #522. (#525)
-- `get_tool_support` tool reporting which tools are usable for which languages, per configured server capabilities. (#TBD)
-- Default server `instructions` now point to `get_tool_support`; `ToolRouter` is `Clone` and gains `configured_languages()`. (#TBD)
-- `mcpls-bench` (unpublished) latency benchmark harness with `fd`/rust-analyzer and `react-hook-form`/typescript-language-server scenarios (repository commit enforced, tool versions recorded), documented in `docs/benchmarks.md`. (#TBD)
+- `get_tool_support` tool reporting which tools are usable for which languages, per configured server capabilities. (#540)
+- Default server `instructions` now point to `get_tool_support`; `ToolRouter` is `Clone` and gains `configured_languages()`. (#540)
+- `mcpls-bench` (unpublished) latency benchmark harness with `fd`/rust-analyzer and `react-hook-form`/typescript-language-server scenarios (repository commit enforced, tool versions recorded), documented in `docs/benchmarks.md`. (#540)
 - `get_diagnostics` now reports `push_notifications_degraded`, sampled before and after the pull so a restart triggered by the call itself is caught. (#520)
 - Completions and signature help now report `positions_degraded`. (#520)
 - Install and PATH guidance in the error for a missing LSP server executable, with a per-server install hint for the six builtin servers (`BuiltinServer`). (#530)
