@@ -101,7 +101,7 @@ impl Translator {
     /// As [`Self::cached_diagnostics_uri`], but also returns the validated,
     /// canonicalized path -- for a caller (e.g. `get_cached_diagnostics`,
     /// `read_resource`) that needs it too, such as to resolve a
-    /// diagnostics-route server via [`Self::diagnostics_route_id_for_path`]
+    /// diagnostics-route server via [`Self::diagnostics_route_for_path`]
     /// from the same canonical path the URI itself is derived from, rather
     /// than re-canonicalizing or (worse) using an unvalidated raw path.
     ///

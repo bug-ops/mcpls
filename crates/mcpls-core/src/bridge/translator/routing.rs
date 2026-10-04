@@ -676,23 +676,39 @@ impl Translator {
     /// `path`'s detected language, without requiring that server to be
     /// currently registered.
     ///
-    /// Mirrors [`Self::client_for_file`]'s language-candidate order (the
-    /// detected language, then its React base language) but only queries the
-    /// router: a cache-only caller (`get_cached_diagnostics`) has no LSP
+    /// Mirrors [`Self::client_for_file`]'s language-candidate order but only
+    /// queries the router: a cache-only caller (`get_cached_diagnostics`) has no LSP
     /// round trip to gate a resolved server's registration on, and only
     /// needs the id to check [`crate::bridge::NotificationCache::is_push_degraded`]
     /// (#359) -- the id itself is stable across a respawn (the routing
     /// identity doesn't change, only the registered client behind it does),
     /// unlike `NotificationCache::diagnostics_owner`, which a respawn clears
     /// along with the crashed server's stale entries.
-    #[must_use]
-    // TODO(#535): diagnostics tools return an empty list for a server that failed to start.
-    pub(crate) fn diagnostics_route_id_for_path(&self, path: &Path) -> Option<ServerId> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ServerFailedToStart`] when no live route exists and
+    /// the server the configured routing would have used failed to start, so
+    /// a cache-only read reports the failure instead of an empty list. A
+    /// surviving catch-all route wins, as in [`Self::client_for_file`].
+    // TODO(#544): `resources/subscribe` still succeeds for a language whose server failed to start.
+    // TODO(#545): cached reads during initialization return an empty list, not `ServerInitializing`.
+    pub(crate) fn diagnostics_route_for_path(&self, path: &Path) -> Result<Option<ServerId>> {
         let candidates = self.language_candidates(path);
-        let router = lock_std(&self.router);
-        candidates
-            .iter()
-            .find_map(|lang| router.resolve(lang, ToolKind::Diagnostics).cloned())
+
+        let live = {
+            let router = lock_std(&self.router);
+            candidates
+                .iter()
+                .find_map(|lang| router.resolve(lang, ToolKind::Diagnostics).cloned())
+        };
+        if live.is_some() {
+            return Ok(live);
+        }
+        self.startup_failure_for_candidates(&candidates, ToolKind::Diagnostics)
+            .map_or(Ok(None), |failure| {
+                Err(Error::ServerFailedToStart(Box::new(failure)))
+            })
     }
 
     /// Validate `file_path`, then resolve its routed client via
@@ -1582,13 +1598,13 @@ mod tests {
         assert_eq!(client.language_id(), "typescriptreact");
     }
 
-    /// #359: `diagnostics_route_id_for_path` must resolve the same id
+    /// #359: `diagnostics_route_for_path` must resolve the same id
     /// `is_diagnostics_route`/the router would, without requiring a
     /// registered client -- `get_cached_diagnostics` relies on this to look
     /// up `NotificationCache::is_push_degraded` even when the file's server
     /// is currently down (mid-respawn or crash-looping).
     #[test]
-    fn test_diagnostics_route_id_for_path_resolves_without_registered_client() {
+    fn test_diagnostics_route_for_path_resolves_without_registered_client() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("main.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1604,22 +1620,76 @@ mod tests {
         // require a live registration, unlike `client_for_file`.
 
         assert_eq!(
-            translator.diagnostics_route_id_for_path(&test_file),
+            translator.diagnostics_route_for_path(&test_file).unwrap(),
             Some(id)
+        );
+    }
+
+    /// #535: with no live route and a recorded startup failure, the
+    /// diagnostics route is an error naming the failed server, not `None`.
+    #[test]
+    fn test_diagnostics_route_for_path_reports_startup_failure() {
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.record_startup_failures(&[not_found_failure(&id, "rust", "sh")]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        let err = translator
+            .diagnostics_route_for_path(Path::new("/ws/main.rs"))
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
+            "got {err:?}"
+        );
+    }
+
+    /// A surviving catch-all still serves diagnostics, so a failed explicit
+    /// server never masks it.
+    #[test]
+    fn test_diagnostics_route_for_path_prefers_live_catch_all_over_failure() {
+        let configs = [
+            router_config("rust", "explicit", Some(vec![ToolKind::Diagnostics])),
+            router_config("rust", "catch-all", None),
+        ];
+        let router = ToolRouter::from_configs(configs.iter()).unwrap();
+        let live_id = ServerId::from("catch-all");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(router);
+        translator.record_startup_failures(&[not_found_failure(
+            &ServerId::from("explicit"),
+            "rust",
+            "sh",
+        )]);
+        translator.rebind_router(&HashSet::from([live_id.clone()]));
+        translator.clear_expected_servers();
+
+        assert_eq!(
+            translator
+                .diagnostics_route_for_path(Path::new("/ws/main.rs"))
+                .unwrap(),
+            Some(live_id)
         );
     }
 
     /// A file whose language has no configured route resolves to `None`
     /// rather than panicking or falling back to some default server.
     #[test]
-    fn test_diagnostics_route_id_for_path_returns_none_for_unrouted_language() {
+    fn test_diagnostics_route_for_path_returns_none_for_unrouted_language() {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("unknown.xyz");
         fs::write(&test_file, "content").unwrap();
 
         let translator = Translator::new();
 
-        assert_eq!(translator.diagnostics_route_id_for_path(&test_file), None);
+        assert_eq!(
+            translator.diagnostics_route_for_path(&test_file).unwrap(),
+            None
+        );
     }
 
     #[test]

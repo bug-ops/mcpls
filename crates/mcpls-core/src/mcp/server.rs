@@ -607,7 +607,9 @@ impl McplsServer {
                 .and_then(|validated_path| {
                     self.context
                         .translator
-                        .diagnostics_route_id_for_path(&validated_path)
+                        .diagnostics_route_for_path(&validated_path)
+                        .ok()
+                        .flatten()
                 });
 
         // Sampled before and after the pull: indexing may finish, or a respawn may mark push-degraded, mid-pull.
@@ -841,22 +843,23 @@ impl McplsServer {
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<Json<CachedDiagnosticsResponse>, McpError> {
-        let result = match Translator::cached_diagnostics_path_and_uri(
-            &self.context.workspace_roots,
-            &file_path,
-        ) {
-            Ok((validated_path, uri)) => {
-                // Resolved independently of the cache lookup below: a
-                // respawn clears `diagnostics_owner` for this server's
-                // entries along with its stale diagnostics (#359), so
-                // the degraded flag can't be keyed on ownership -- the
-                // routing identity is what stays stable across a
-                // respawn.
-                let route_id = self
-                    .context
-                    .translator
-                    .diagnostics_route_id_for_path(&validated_path);
-
+        // The route is resolved independently of the cache lookup below: a
+        // respawn clears `diagnostics_owner` for this server's entries along
+        // with its stale diagnostics (#359), so the degraded flag can't be
+        // keyed on ownership -- the routing identity is what stays stable
+        // across a respawn. A server that failed to start is an error here,
+        // not an empty list (#535).
+        let resolved =
+            Translator::cached_diagnostics_path_and_uri(&self.context.workspace_roots, &file_path)
+                .and_then(|(validated_path, uri)| {
+                    let route_id = self
+                        .context
+                        .translator
+                        .diagnostics_route_for_path(&validated_path)?;
+                    Ok((route_id, uri))
+                });
+        let result = match resolved {
+            Ok((route_id, uri)) => {
                 // Lock only long enough for the map lookup + clone: no
                 // canonicalize() or Vec mapping while `notification_cache`
                 // is held, since `diagnostics_pump` needs the same lock.
@@ -1058,7 +1061,8 @@ impl McplsServer {
         let route_id = self
             .context
             .translator
-            .diagnostics_route_id_for_path(&validated_path);
+            .diagnostics_route_for_path(&validated_path)
+            .map_err(map_bridge_error)?;
 
         // Only the snapshot is taken under the cache lock: merging the sources
         // (dedupe, sort, size cap) runs after it is released, since
@@ -2881,7 +2885,7 @@ mod tests {
         use crate::config::{ServerId, ToolRouter};
 
         // A router + extension map is required: the degraded flag is keyed
-        // on `Translator::diagnostics_route_id_for_path` (the file's
+        // on `Translator::diagnostics_route_for_path` (the file's
         // *routed* server, resolved from its detected language), not on
         // `NotificationCache::diagnostics_owner` -- see #359's C1 fix. This
         // is a fast unit test of that wiring alone; the slower
@@ -3203,6 +3207,75 @@ sleep 0.3
             "expected a file I/O error for a nonexistent path, got: {}",
             err.message
         );
+    }
+
+    /// Server whose only language server failed to start, with a real file
+    /// under its workspace root.
+    fn server_with_failed_rust_server() -> (tempfile::TempDir, std::path::PathBuf, McplsServer) {
+        use crate::config::{ServerId, ToolRouter};
+        use crate::error::{ServerSpawnFailure, StartupFailure};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+            .with_extensions(crate::test_lsp::test_extensions());
+        translator.record_startup_failures(&[ServerSpawnFailure {
+            server_id: id,
+            language_id: "rust".to_string(),
+            command: "rust-analyzer".to_string(),
+            reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
+                command: "rust-analyzer".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })),
+        }]);
+        translator.rebind_router(&std::collections::HashSet::new());
+        translator.clear_expected_servers();
+
+        let server = McplsServer::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            WorkspaceRoots::resolve(vec![root]),
+            SubscriptionRegistry::new(),
+            false,
+            McpConfig::default(),
+        );
+        (dir, file, server)
+    }
+
+    /// #535: a cached read for a language whose server failed to start
+    /// reports the failure instead of an empty diagnostics list.
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_reports_failed_server_start() {
+        let (_dir, file, server) = server_with_failed_rust_server();
+
+        let result = server
+            .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+                file_path: file.to_string_lossy().to_string(),
+            }))
+            .await;
+
+        let Err(err) = result else {
+            panic!("expected the startup failure to be reported");
+        };
+        assert!(err.message.contains("failed to start"), "{}", err.message);
+    }
+
+    /// #535: the diagnostics resource read reports the same failure.
+    #[tokio::test]
+    async fn test_diagnostics_resource_reports_failed_server_start() {
+        let (_dir, file, server) = server_with_failed_rust_server();
+
+        let result = server.resource_diagnostics_response(&file).await;
+
+        let Err(err) = result else {
+            panic!("expected the startup failure to be reported");
+        };
+        assert!(err.message.contains("failed to start"), "{}", err.message);
     }
 
     #[tokio::test]
