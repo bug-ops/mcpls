@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Once};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{NotificationCache, Position, Translator};
@@ -823,33 +824,34 @@ async fn test_timeout_handling() {
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
-    let lib_file = workspace_path.join("src/lib.rs");
+    let lib_file = workspace_path
+        .join("src/lib.rs")
+        .to_string_lossy()
+        .to_string();
 
     let hover_position = Position {
         line: 20,
         character: 19,
     };
 
-    // Paused after setup: the idle runtime auto-advances to the 1ms deadline before RA replies.
-    tokio::time::pause();
-    let result = timeout(
-        Duration::from_millis(1),
-        translator
-            .lock()
-            .await
-            .handle_hover(lib_file.to_string_lossy().to_string(), hover_position),
-    )
-    .await;
-    tokio::time::resume();
-
-    assert!(result.is_err(), "Should timeout with 1ms timeout");
+    // A handler cancelled after one poll models a timeout independent of rust-analyzer's
+    // speed: a single poll can never complete, as it needs a reply from another process.
+    let bridge = translator.lock().await;
+    let mut hover = Box::pin(bridge.handle_hover(lib_file.clone(), hover_position));
+    let first_poll = std::future::poll_fn(|cx| Poll::Ready(hover.as_mut().poll(cx))).await;
+    assert!(
+        first_poll.is_pending(),
+        "handle_hover cannot complete within a single poll"
+    );
+    drop(hover);
+    drop(bridge);
 
     let follow_up = timeout(
         Duration::from_secs(30),
         translator
             .lock()
             .await
-            .handle_hover(lib_file.to_string_lossy().to_string(), hover_position),
+            .handle_hover(lib_file, hover_position),
     )
     .await;
     assert!(
