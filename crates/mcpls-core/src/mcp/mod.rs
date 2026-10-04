@@ -5,9 +5,13 @@
 
 mod handlers;
 mod server;
+mod session;
 mod tools;
 
 pub use server::McplsServer;
+pub use session::SubscriptionRegistry;
+#[cfg(test)]
+pub(crate) use session::{SessionHandle, Target};
 
 // `mcp::tools`'s param structs (e.g. `PositionParams`, `ReferencesParams`)
 // are intentionally not re-exported here: every tool handler in `server.rs`

@@ -62,6 +62,8 @@ SO THAT my implementation can be event-driven rather than polling-based.
 | FR-003 | mcpls must implement `resources/read` for `lsp-diagnostics://` URIs, returning the current `NotificationCache` contents for that path as JSON | must |
 | FR-004 | mcpls must implement `resources/subscribe` — when a client subscribes, the notification pump must emit `notifications/resources/updated` whenever the diagnostics cache for that path changes | must |
 | FR-005 | Existing `get_cached_diagnostics` tool must remain for clients that do not support resources | must |
+| FR-006 | `notifications/resources/updated` must be delivered per session: a session receives it only for URIs that session itself subscribed to, and a stalled session must not delay or lose updates for any other session (#468) | must |
+| FR-007 | Over HTTP, `notifications/resources/updated` must be sent on the session's standalone GET (SSE) stream; subscriptions require a session established via the `initialize` handshake (#468, #482) | must |
 
 ## 4. Non-Functional Requirements
 

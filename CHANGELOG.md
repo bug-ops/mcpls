@@ -7,11 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- HTTP sessions now receive `resources/updated` on their GET stream for the resources they subscribed to; `subscriptions/listen` for 2026-07-28 clients is tracked in #522. (#NNN)
+
 ### Changed
 
 - **Breaking:** `NotificationCache`/`DocumentTracker`/`DocumentState` internals are no longer public; removed `NotificationCache::{clear_diagnostics, clear_all_diagnostics, clear_logs, clear_messages}` and `DocumentTracker::{update, close_all}`. (#512)
 - **Breaking:** `mcp_to_lsp_position` takes the typed `Position` and `lsp_to_mcp_position` returns `Position2D` instead of bare `u32` pairs/tuples. (#512)
 - **Breaking:** `workspace.heuristics_max_depth` is now bounded by `MAX_HEURISTICS_DEPTH` (64); larger values fail config validation. (#512)
+- **Breaking:** `SubscriptionRegistry` moved from `mcpls_core::bridge` to `mcpls_core::mcp`; its `register`, `any_contains` and `is_all_empty` methods are removed, and `ResourceSubscriptions` and `SubscriptionError` are no longer public. (#NNN)
 
 ## [0.6.0] - 2026-09-21
 

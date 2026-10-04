@@ -21,6 +21,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
+use super::session::SubscriptionRegistry;
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
     DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, InlayHintsParams,
@@ -30,8 +31,8 @@ use super::tools::{
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{
     DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, IndexingState,
-    NotificationCache, Position, PositionEncoding, ReferencesResult, SubscriptionRegistry,
-    Translator, validate_path_against_roots,
+    NotificationCache, Position, PositionEncoding, ReferencesResult, Translator,
+    validate_path_against_roots,
 };
 use crate::config::{McpConfig, ToolPrefix};
 
@@ -132,12 +133,11 @@ struct CachedDiagnosticsResponse {
 /// MCP server that exposes LSP capabilities as tools.
 ///
 /// Deliberately not `Clone` (#478): each HTTP session must get its own
-/// [`ResourceSubscriptions`](crate::bridge::ResourceSubscriptions) set via
-/// [`Self::for_new_session`], not a shared instance a stray `.clone()` could
-/// hand to two sessions at once. `for_new_session` builds a new value field by
-/// field instead (each field an `Arc` bump except `subscriptions`), so this
-/// costs nothing at the one production call site (`transport::run_http`'s
-/// per-session factory closure).
+/// subscription state via [`Self::for_new_session`], not a shared instance a
+/// stray `.clone()` could hand to two sessions at once. `for_new_session`
+/// builds a new value field by field instead (each field an `Arc` bump except
+/// `session`), so this costs nothing at the one production call site
+/// (`transport::run_http`'s per-session factory closure).
 pub struct McplsServer {
     context: Arc<BridgeContext>,
 
@@ -147,65 +147,6 @@ pub struct McplsServer {
     /// `self.tool_router.call(..)` auto-derefs through the `Arc`, so this is
     /// transparent to the macro-generated code.
     tool_router: Arc<ToolRouter<Self>>,
-}
-
-/// Whether `meta` carries rmcp's discover-lifecycle keys -- the same test
-/// `tower.rs::is_legacy_request` uses to route a request through its
-/// stateless per-request HTTP path instead of a durable session (#482). An
-/// attached `Mcp-Session-Id` header proves nothing here: rmcp never reads it
-/// on that path, so it must not be trusted as a counter-signal.
-#[cfg(feature = "transport-http")]
-fn request_uses_discover_lifecycle_meta(meta: &rmcp::model::RequestMetaObject) -> bool {
-    meta.missing_required_keys(&rmcp::model::ProtocolVersion::V_2026_07_28)
-        .is_empty()
-}
-
-/// Whether this HTTP-served request must be rejected as effectively
-/// stateless (#482): its `_meta` matches [`request_uses_discover_lifecycle_meta`],
-/// or it never echoes an `Mcp-Session-Id` header. Gated on the `Parts`
-/// extension being present so a non-HTTP transport (stdio) is never affected.
-#[cfg(feature = "transport-http")]
-fn is_stateless_http_request(
-    extensions: &rmcp::model::Extensions,
-    meta: &rmcp::model::RequestMetaObject,
-) -> bool {
-    extensions
-        .get::<axum::http::request::Parts>()
-        .is_some_and(|parts| {
-            request_uses_discover_lifecycle_meta(meta)
-                || !parts
-                    .headers
-                    .contains_key(rmcp::transport::common::http_header::HEADER_SESSION_ID)
-        })
-}
-
-#[cfg(not(feature = "transport-http"))]
-const fn is_stateless_http_request(
-    _extensions: &rmcp::model::Extensions,
-    _meta: &rmcp::model::RequestMetaObject,
-) -> bool {
-    false
-}
-
-/// Reject a subscription request rmcp served over the stateless per-request
-/// HTTP path (#482): the state it would write is dropped the moment the
-/// request completes, so this surfaces an explicit error instead of a
-/// silent no-op.
-fn reject_if_stateless_http(
-    context: &rmcp::service::RequestContext<RoleServer>,
-) -> Result<(), McpError> {
-    if is_stateless_http_request(&context.extensions, &context.meta) {
-        return Err(McpError::new(
-            ErrorCode(crate::error::STATELESS_SUBSCRIPTION_ERROR_CODE),
-            "resource subscriptions require a stateful session; this request was served over \
-             the stateless per-request HTTP path, which never persists a subscription past the \
-             response that acknowledges it -- retry over a session established via the MCP \
-             `initialize` handshake, and without per-request `_meta` protocol negotiation"
-                .to_string(),
-            None,
-        ));
-    }
-    Ok(())
 }
 
 /// Maps an [`crate::error::Error`] onto the wire-level MCP error, via
@@ -429,8 +370,8 @@ impl McplsServer {
     /// Create a new MCP server with the given translator, notification cache,
     /// workspace roots, and subscription registry.
     ///
-    /// A fresh, empty subscription set is registered into
-    /// `subscription_registry` for this instance -- see
+    /// This instance starts with an empty subscription set and joins
+    /// `subscription_registry` on its first subscribe -- see
     /// [`Self::for_new_session`] for how per-HTTP-session isolation builds on
     /// top of that.
     ///
@@ -465,28 +406,29 @@ impl McplsServer {
     }
 
     /// Build a new server instance for a new HTTP session, giving it its own
-    /// isolated [`ResourceSubscriptions`](crate::bridge::ResourceSubscriptions)
-    /// set registered into the same [`SubscriptionRegistry`].
+    /// isolated subscription state that joins the same [`SubscriptionRegistry`]
+    /// on its first subscribe.
     ///
     /// Every other piece of shared state (translator, notification cache,
     /// workspace roots, config) is shared with the original via a cheap `Arc`
-    /// clone -- only the subscription set is fresh. Called from the HTTP
-    /// transport's service factory (see `transport::run_http`); stdio never
-    /// calls this, since it only ever serves the one session `McplsServer::new`
-    /// already built.
+    /// clone -- only the subscription state is fresh. A new `BridgeContext`
+    /// field must be listed here; see that type's docs for the state rule.
+    /// Called from the HTTP transport's service factory (see
+    /// `transport::run_http`); stdio never calls this, since it only ever
+    /// serves the one session `McplsServer::new` already built.
     ///
-    /// "Per session" narrows to "per request" on rmcp's stateless HTTP path --
-    /// see [`SubscriptionRegistry`]'s "Known limitation" section for what that
-    /// means for the instance (and subscription set) this returns.
+    /// "Per session" narrows to "per request" on rmcp's stateless HTTP path;
+    /// such an instance is rejected by `subscribe`/`unsubscribe` and so never
+    /// registers.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::sync::Arc;
     ///
-    /// use mcpls_core::bridge::{NotificationCache, SubscriptionRegistry, Translator};
+    /// use mcpls_core::bridge::{NotificationCache, Translator};
     /// use mcpls_core::config::McpConfig;
-    /// use mcpls_core::mcp::McplsServer;
+    /// use mcpls_core::mcp::{McplsServer, SubscriptionRegistry};
     /// use tokio::sync::Mutex;
     ///
     /// let server = McplsServer::new(
@@ -503,13 +445,11 @@ impl McplsServer {
     /// ```
     #[must_use]
     pub fn for_new_session(&self) -> Self {
-        let subscriptions = self.context.subscription_registry.register();
         let context = Arc::new(BridgeContext {
             translator: Arc::clone(&self.context.translator),
             notification_cache: Arc::clone(&self.context.notification_cache),
             workspace_roots: Arc::clone(&self.context.workspace_roots),
-            subscriptions,
-            subscription_registry: self.context.subscription_registry.clone(),
+            session: self.context.session.sibling(),
             project_config_ignored: self.context.project_config_ignored,
             mcp: self.context.mcp.clone(),
         });
@@ -525,7 +465,7 @@ impl McplsServer {
     /// `BridgeContext` fields cross-module.
     #[cfg(test)]
     pub(crate) fn subscription_registry(&self) -> SubscriptionRegistry {
-        self.context.subscription_registry.clone()
+        self.context.session.registry()
     }
 
     /// Router for every MCP tool, with the read-only classification applied
@@ -1198,16 +1138,18 @@ impl ServerHandler for McplsServer {
         Ok(ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into())
     }
 
-    /// When cached diagnostics exist, the replay notification is flushed to the client
+    /// When cached diagnostics exist, the replay notification is sent to the client
     /// before this call returns its own response; this is legal per JSON-RPC/MCP, which
     /// permits notifications to interleave with in-flight requests, so a conformant
     /// client must demultiplex by request `id` rather than assume response-before-notification ordering.
+    /// Over stdio the replay is flushed on the same stream as the response; over HTTP it goes
+    /// to the session's standalone GET stream, not the POST response.
     async fn subscribe(
         &self,
         request: SubscribeRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        reject_if_stateless_http(&context)?;
+        let session = self.context.session.require_stateful(&context)?;
 
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
@@ -1232,24 +1174,17 @@ impl ServerHandler for McplsServer {
         // below catches them; if they arrive after, `diagnostics_pump`'s own
         // `subs.contains` check already sees this URI as subscribed and delivers the
         // update through the normal push path.
-        let newly_subscribed = self
-            .context
-            .subscriptions
-            .subscribe(canonical_uri.clone())
+        //
+        // The raw request URI is recorded as an alias of the canonical one so a later
+        // `unsubscribe` for the same raw URI still resolves even if canonicalizing it then
+        // fails, e.g. because the file was deleted since subscribing (#499).
+        let newly_subscribed = session
+            .subscribe(canonical_uri.clone(), request.uri.clone())
             .await
             .map_err(|e| map_bridge_error(e.into()))?;
         if !newly_subscribed {
             tracing::debug!("client re-subscribed to already-subscribed resource {canonical_uri}");
         }
-
-        // Record the raw request URI as an alias of the canonical one so a
-        // later `unsubscribe` for the same raw URI still resolves even if
-        // canonicalizing it then fails, e.g. because the file was deleted
-        // since subscribing (#499). No-op when the two already match.
-        self.context
-            .subscriptions
-            .record_alias(request.uri.clone(), canonical_uri.clone())
-            .await;
 
         // Build the URI from the canonicalized path, matching `read_resource` and
         // what `diagnostics_pump` stores from LSP notifications.
@@ -1278,7 +1213,7 @@ impl ServerHandler for McplsServer {
         request: UnsubscribeRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        reject_if_stateless_http(&context)?;
+        let session = self.context.session.require_stateful(&context)?;
 
         // Parse the URI for consistency with subscribe validation.
         let path =
@@ -1287,14 +1222,14 @@ impl ServerHandler for McplsServer {
         // Remove under the same canonical URI `subscribe` recorded under. Best-effort
         // fall back to the raw URI if canonicalization fails (e.g. the file was
         // deleted since subscribing) so unsubscribing a stale entry never errors --
-        // `ResourceSubscriptions::unsubscribe` then resolves it via the alias
+        // the session's unsubscribe then resolves it via the alias
         // `subscribe` recorded for this raw URI (#499).
         let key = validate_path_against_roots(&path, &self.context.workspace_roots)
             .ok()
             .and_then(|validated_path| make_uri(&validated_path).ok())
             .unwrap_or_else(|| request.uri.clone());
 
-        if !self.context.subscriptions.unsubscribe(&key).await {
+        if !session.unsubscribe(&key).await {
             tracing::debug!(
                 "client unsubscribed from resource with no matching subscription: {key}"
             );
@@ -1352,7 +1287,7 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::bridge::ResourceSubscriptions;
+    use crate::bridge::resources::ResourceSubscriptions;
 
     fn create_test_server() -> McplsServer {
         create_test_server_with_ignored_flag(false)
@@ -3302,129 +3237,6 @@ sleep 0.3
         assert!(result.is_err());
     }
 
-    /// A request with no `http::request::Parts` extension at all (e.g. served
-    /// over stdio) is never mistaken for a stateless HTTP request, even with
-    /// an empty `_meta`.
-    #[test]
-    fn test_is_stateless_http_request_false_without_http_extension() {
-        let extensions = rmcp::model::Extensions::new();
-        let meta = rmcp::model::RequestMetaObject::new();
-        assert!(!super::is_stateless_http_request(&extensions, &meta));
-    }
-
-    /// #482 regression: a stdio request (no `Parts` extension) whose `_meta`
-    /// carries discover-lifecycle keys must still be allowed through -- see
-    /// [`super::is_stateless_http_request`]'s docs for why.
-    #[test]
-    fn test_is_stateless_http_request_false_without_http_extension_even_with_discover_meta() {
-        let extensions = rmcp::model::Extensions::new();
-        let meta = rmcp::model::RequestMetaObject::with_client_context(
-            rmcp::model::ProtocolVersion::V_2025_03_26,
-            rmcp::model::Implementation::default(),
-            rmcp::model::ClientCapabilities::default(),
-        );
-        assert!(!super::is_stateless_http_request(&extensions, &meta));
-    }
-
-    /// #482: an HTTP-served request that never echoes `Mcp-Session-Id` is
-    /// detected as stateless -- the secondary, unioned signal (see
-    /// [`super::request_uses_discover_lifecycle_meta`] for the primary,
-    /// exhaustive one).
-    #[cfg(feature = "transport-http")]
-    #[test]
-    fn test_is_stateless_http_request_true_without_session_header() {
-        let (parts, ()) = axum::http::Request::builder()
-            .body(())
-            .unwrap()
-            .into_parts();
-        let mut extensions = rmcp::model::Extensions::new();
-        extensions.insert(parts);
-        let meta = rmcp::model::RequestMetaObject::new();
-        assert!(super::is_stateless_http_request(&extensions, &meta));
-    }
-
-    /// A request that echoes an `Mcp-Session-Id` header and carries no
-    /// discover-lifecycle `_meta` is not flagged -- the ordinary legacy
-    /// session case.
-    #[cfg(feature = "transport-http")]
-    #[test]
-    fn test_is_stateless_http_request_false_with_session_header_and_no_discover_meta() {
-        let (mut parts, ()) = axum::http::Request::builder()
-            .body(())
-            .unwrap()
-            .into_parts();
-        parts.headers.insert(
-            rmcp::transport::common::http_header::HEADER_SESSION_ID,
-            axum::http::HeaderValue::from_static("test-session-id"),
-        );
-        let mut extensions = rmcp::model::Extensions::new();
-        extensions.insert(parts);
-        let meta = rmcp::model::RequestMetaObject::new();
-        assert!(!super::is_stateless_http_request(&extensions, &meta));
-    }
-
-    /// A request that echoes an `Mcp-Session-Id` header is still flagged if
-    /// its `_meta` carries discover-lifecycle keys -- proving the session
-    /// header alone is *not* a sufficient counter-signal: rmcp never
-    /// validates that header on the stateless branch #482 targets, so a
-    /// request can carry one (fabricated, stale, or even genuinely live)
-    /// while still being served statelessly.
-    #[cfg(feature = "transport-http")]
-    #[test]
-    fn test_is_stateless_http_request_true_with_session_header_and_discover_meta() {
-        let (mut parts, ()) = axum::http::Request::builder()
-            .body(())
-            .unwrap()
-            .into_parts();
-        parts.headers.insert(
-            rmcp::transport::common::http_header::HEADER_SESSION_ID,
-            axum::http::HeaderValue::from_static("test-session-id"),
-        );
-        let mut extensions = rmcp::model::Extensions::new();
-        extensions.insert(parts);
-        let meta = rmcp::model::RequestMetaObject::with_client_context(
-            rmcp::model::ProtocolVersion::V_2025_03_26,
-            rmcp::model::Implementation::default(),
-            rmcp::model::ClientCapabilities::default(),
-        );
-        assert!(super::is_stateless_http_request(&extensions, &meta));
-    }
-
-    /// #482 primary signal: `_meta` carrying both discover-lifecycle keys
-    /// (`protocolVersion` + `clientCapabilities`) is detected regardless of
-    /// the declared protocol version's value -- mirroring rmcp's own
-    /// `missing_required_keys`, which only checks presence.
-    #[cfg(feature = "transport-http")]
-    #[test]
-    fn test_request_uses_discover_lifecycle_meta_true_with_both_keys_present() {
-        let meta = rmcp::model::RequestMetaObject::with_client_context(
-            rmcp::model::ProtocolVersion::V_2025_03_26,
-            rmcp::model::Implementation::default(),
-            rmcp::model::ClientCapabilities::default(),
-        );
-        assert!(super::request_uses_discover_lifecycle_meta(&meta));
-    }
-
-    /// Only one of the two required keys present is not enough -- matching
-    /// rmcp's own `missing_required_keys`, which requires both.
-    #[cfg(feature = "transport-http")]
-    #[test]
-    fn test_request_uses_discover_lifecycle_meta_false_with_only_one_key() {
-        let mut meta = rmcp::model::RequestMetaObject::new();
-        meta.set_protocol_version(rmcp::model::ProtocolVersion::V_2025_03_26);
-        assert!(!super::request_uses_discover_lifecycle_meta(&meta));
-    }
-
-    /// Empty `_meta` (typical for a legacy session's ordinary request, which
-    /// relies on the session's own handshake state instead of per-request
-    /// metadata) is not flagged.
-    #[cfg(feature = "transport-http")]
-    #[test]
-    fn test_request_uses_discover_lifecycle_meta_false_when_empty() {
-        let meta = rmcp::model::RequestMetaObject::new();
-        assert!(!super::request_uses_discover_lifecycle_meta(&meta));
-    }
-
     /// Regression test for `read_resource`'s canonical-path fix: a path reached
     /// through a symlink must resolve, via `validate_path_against_roots`, to the
     /// same URI as its canonical (symlink-resolved) form -- matching what
@@ -3575,7 +3387,7 @@ sleep 0.3
         // Mirrors `unsubscribe`'s handler: falls back to the raw URI once
         // canonicalization fails.
         let key = raw_uri;
-        assert!(subscriptions.unsubscribe(&key).await);
+        assert!(subscriptions.unsubscribe(&key).await.is_some());
         assert!(!subscriptions.contains(&canonical_uri).await);
     }
 
@@ -3604,80 +3416,48 @@ sleep 0.3
         let removed = subscriptions
             .unsubscribe("lsp-diagnostics:///nonexistent.rs")
             .await;
-        assert!(!removed);
+        assert!(removed.is_none());
     }
 
-    /// `for_new_session` gives each HTTP session its own subscription set
-    /// (#478): subscribing on one clone must not be visible to another, and
-    /// unsubscribing from one clone must not affect another's entries.
+    /// `for_new_session` gives each HTTP session its own subscription state
+    /// (#478): subscribing on one instance must not be visible to another.
     #[tokio::test]
     async fn test_for_new_session_isolates_subscriptions() {
         let server = create_test_server();
         let session_a = server.for_new_session();
         let session_b = server.for_new_session();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
 
         session_a
             .context
-            .subscriptions
-            .subscribe("lsp-diagnostics:///a.rs".to_string())
+            .session
+            .subscribe_for_test("lsp-diagnostics:///a.rs", super::super::Target::Channel(tx))
             .await
             .unwrap();
 
-        assert!(
-            session_a
-                .context
-                .subscriptions
-                .contains("lsp-diagnostics:///a.rs")
-                .await
-        );
-        assert!(
-            !session_b
-                .context
-                .subscriptions
-                .contains("lsp-diagnostics:///a.rs")
-                .await
-        );
-        assert!(
-            !server
-                .context
-                .subscriptions
-                .contains("lsp-diagnostics:///a.rs")
-                .await
-        );
-
-        // Cross-session unsubscribe must not remove another session's entry.
-        session_b
-            .context
-            .subscriptions
-            .unsubscribe("lsp-diagnostics:///a.rs")
-            .await;
-        assert!(
-            session_a
-                .context
-                .subscriptions
-                .contains("lsp-diagnostics:///a.rs")
-                .await
-        );
+        assert!(!session_a.context.session.state().is_empty().await);
+        assert!(session_b.context.session.state().is_empty().await);
+        assert!(server.context.session.state().is_empty().await);
     }
 
-    /// A session's subscriptions are reclaimed from the shared registry as
-    /// soon as its `McplsServer` clone is dropped, without any explicit
-    /// close-time bookkeeping (#478).
+    /// A session leaves the shared registry once its `McplsServer` is
+    /// dropped, without any explicit close-time bookkeeping (#478).
     #[tokio::test]
     async fn test_dropped_session_subscriptions_are_reclaimed() {
         let server = create_test_server();
-        let registry = server.context.subscription_registry.clone();
+        let registry = server.subscription_registry();
         {
             let session = server.for_new_session();
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
             session
                 .context
-                .subscriptions
-                .subscribe("lsp-diagnostics:///a.rs".to_string())
+                .session
+                .subscribe_for_test("lsp-diagnostics:///a.rs", super::super::Target::Channel(tx))
                 .await
                 .unwrap();
-            assert!(registry.any_contains("lsp-diagnostics:///a.rs").await);
+            assert_eq!(registry.live_sessions().len(), 1);
         }
-        assert!(!registry.any_contains("lsp-diagnostics:///a.rs").await);
+        assert!(registry.live_sessions().is_empty());
     }
 
     /// Server capabilities advertise resources support.
