@@ -18,7 +18,9 @@ use super::encoding_ctx::EncodingCtx;
 use super::routing::validate_path_against_roots;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::notifications::message_as_str;
-use crate::bridge::{DiagnosticInfo, DocumentTracker, NotificationCache, path_to_uri};
+use crate::bridge::{
+    DiagnosticInfo, DocumentTracker, NotificationCache, WorkspaceRoots, path_to_uri,
+};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
@@ -46,7 +48,7 @@ enum DocumentDiagnosticReportResult {
 
 /// Shared, never-mutated empty `workspace_roots` for an `EncodingCtx` built
 /// where it's documented as never read -- avoids a per-poll `Arc` allocation.
-static EMPTY_WORKSPACE_ROOTS: LazyLock<Arc<Vec<PathBuf>>> = LazyLock::new(|| Arc::new(Vec::new()));
+static EMPTY_WORKSPACE_ROOTS: LazyLock<Arc<[PathBuf]>> = LazyLock::new(|| Arc::from(Vec::new()));
 
 /// Convert an LSP diagnostic into the MCP-facing `Diagnostic` shape.
 ///
@@ -89,14 +91,17 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the path is invalid or outside workspace boundaries.
-    pub fn cached_diagnostics_uri(workspace_roots: &[PathBuf], file_path: &str) -> Result<String> {
+    pub fn cached_diagnostics_uri(
+        workspace_roots: &WorkspaceRoots,
+        file_path: &str,
+    ) -> Result<String> {
         Self::cached_diagnostics_path_and_uri(workspace_roots, file_path).map(|(_, uri)| uri)
     }
 
     /// As [`Self::cached_diagnostics_uri`], but also returns the validated,
     /// canonicalized path -- for a caller (e.g. `get_cached_diagnostics`,
     /// `read_resource`) that needs it too, such as to resolve a
-    /// diagnostics-route server via [`Self::diagnostics_route_id_for_path`]
+    /// diagnostics-route server via [`Self::diagnostics_route_for_path`]
     /// from the same canonical path the URI itself is derived from, rather
     /// than re-canonicalizing or (worse) using an unvalidated raw path.
     ///
@@ -104,7 +109,7 @@ impl Translator {
     ///
     /// Returns an error if the path is invalid or outside workspace boundaries.
     pub(crate) fn cached_diagnostics_path_and_uri(
-        workspace_roots: &[PathBuf],
+        workspace_roots: &WorkspaceRoots,
         file_path: &str,
     ) -> Result<(PathBuf, String)> {
         let path = PathBuf::from(file_path);
@@ -174,10 +179,11 @@ impl Translator {
             .request("textDocument/diagnostic", params, client.request_timeout())
             .await;
 
-        let diag_info = {
+        let sources = {
             let cache = notification_cache.lock().await;
-            cache.diagnostics(uri.as_ref()).cloned()
+            cache.diagnostic_sources(uri.as_ref())
         };
+        let diag_info = sources.merge();
 
         match pull_response {
             Ok(response) => {
@@ -455,7 +461,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &[temp_dir.path().to_path_buf()],
+            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             test_file.to_str().unwrap(),
         )
         .unwrap();
@@ -571,7 +577,7 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &[temp_dir.path().to_path_buf()],
+            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             test_file.to_str().unwrap(),
         )
         .unwrap();
@@ -690,7 +696,7 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), diagnostics);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &[temp_dir.path().to_path_buf()],
+            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             test_file.to_str().unwrap(),
         )
         .unwrap();
@@ -754,7 +760,7 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &[temp_dir.path().to_path_buf()],
+            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             test_file.to_str().unwrap(),
         )
         .unwrap();
@@ -771,11 +777,12 @@ mod tests {
 
     #[test]
     fn test_handle_cached_diagnostics_invalid_path() {
-        #[cfg(windows)]
-        let root = PathBuf::from(r"C:\");
-        #[cfg(not(windows))]
-        let root = PathBuf::from("/");
-        let result = Translator::cached_diagnostics_uri(&[root], "/nonexistent/path/file.rs");
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent/path/file.rs");
+        let result = Translator::cached_diagnostics_uri(
+            &WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            missing.to_str().unwrap(),
+        );
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }
 
@@ -1326,8 +1333,10 @@ mod tests {
         let test_file = temp_dir2.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result =
-            Translator::cached_diagnostics_uri(&workspace_roots, test_file.to_str().unwrap());
+        let result = Translator::cached_diagnostics_uri(
+            &WorkspaceRoots::resolve(workspace_roots),
+            test_file.to_str().unwrap(),
+        );
         assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
     }
 
@@ -1348,7 +1357,7 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);
@@ -1436,7 +1445,7 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);
@@ -1500,7 +1509,7 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);

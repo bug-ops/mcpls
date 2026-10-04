@@ -134,7 +134,7 @@ pub(super) struct EncodingCtx {
     /// [`Self::is_out_of_workspace`] to annotate (never filter) a read-only
     /// navigation result -- see `crate::bridge::uri_in_workspace_roots`'s
     /// docs for why filtering is deliberately not done here.
-    pub(super) workspace_roots: Arc<Vec<PathBuf>>,
+    pub(super) workspace_roots: Arc<[PathBuf]>,
     /// Memoizes [`read_line_text`]'s result (both the tracker hit and the
     /// disk-read fallback) per `(path, line)` for the lifetime of this
     /// context, and tracks the shared disk-read byte budget -- one
@@ -249,7 +249,7 @@ impl EncodingCtx {
     pub(super) fn new(
         encoding: PositionEncoding,
         tracker: Arc<DocumentTracker>,
-        workspace_roots: Arc<Vec<PathBuf>>,
+        workspace_roots: Arc<[PathBuf]>,
     ) -> Self {
         let line_cache = new_line_cache(line_read_budget(tracker.limits()));
         Self {
@@ -525,7 +525,7 @@ mod tests {
                 },
                 HashMap::new(),
             )),
-            Arc::new(Vec::new()),
+            Arc::from(Vec::new()),
         );
         assert!(
             read_line_text(&uri, 0, &ctx).await.is_none(),
@@ -553,7 +553,7 @@ mod tests {
         ));
         let uri = tracker.open(path.clone(), "héllo".to_string()).unwrap(); // live: accent
 
-        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::new(Vec::new()));
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::from(Vec::new()));
         let lsp_pos = ctx
             .to_lsp(
                 &uri,
@@ -836,7 +836,7 @@ mod tests {
             HashMap::new(),
         ));
         let uri = tracker.open(path, content.to_string()).unwrap();
-        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::new(Vec::new()));
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::from(Vec::new()));
         (ctx, uri, dir)
     }
 
@@ -978,7 +978,7 @@ mod tests {
             },
             HashMap::new(),
         ));
-        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::new(Vec::new()));
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::from(Vec::new()));
         assert_eq!(lock_std(&ctx.line_cache).bytes_remaining, 4 * 4096);
     }
 }

@@ -569,7 +569,7 @@ impl Translator {
             convert_workspace_edit(
                 edit,
                 &ctx,
-                &self.workspace_roots,
+                self.workspace_roots.canonical(),
                 "rename edit",
                 &mut ItemBudget::new(),
             )
@@ -710,7 +710,7 @@ impl Translator {
                         action,
                         &ctx,
                         &response_uri,
-                        &self.workspace_roots,
+                        self.workspace_roots.canonical(),
                         &mut budget,
                     )
                     .await
@@ -748,6 +748,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::bridge::WorkspaceRoots;
     use crate::bridge::translator::dto::DiagnosticSeverity;
     use crate::bridge::translator::testing::*;
 
@@ -778,7 +779,7 @@ mod tests {
         };
         let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
 
-        let file_path = dir.path().join("main.rs");
+        let file_path = canonical_dir(&dir).join("main.rs");
         fs::write(&file_path, "fn old_name() {}").unwrap();
 
         let translator = Arc::new(translator);
@@ -888,7 +889,7 @@ mod tests {
         };
         let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
 
-        let file_path = dir.path().join("main.rs");
+        let file_path = canonical_dir(&dir).join("main.rs");
         fs::write(&file_path, "fn old_name() {}").unwrap();
         let inside_uri = Url::from_file_path(&file_path).unwrap().to_string();
         let outside_uri = "file:///outside/workspace/evil.rs";
@@ -1024,7 +1025,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1053,7 +1055,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1081,7 +1084,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1109,7 +1113,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1177,7 +1182,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(vec![temp_dir.path().to_path_buf()]);
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -2308,7 +2314,7 @@ mod tests {
         );
         let translator = Arc::new(translator.with_notification_cache(cache));
 
-        let file_path = dir.path().join("main.rs");
+        let file_path = canonical_dir(&dir).join("main.rs");
         fs::write(&file_path, "fn main() {}").unwrap();
         let file_uri = Url::from_file_path(&file_path).unwrap().to_string();
 
@@ -2610,7 +2616,7 @@ mod tests {
         );
         let translator = Arc::new(translator.with_notification_cache(cache));
 
-        let file_path = dir.path().join("main.rs");
+        let file_path = canonical_dir(&dir).join("main.rs");
         fs::write(&file_path, "fn main() {}").unwrap();
         let file_uri = Url::from_file_path(&file_path).unwrap().to_string();
 

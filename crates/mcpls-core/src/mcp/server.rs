@@ -43,8 +43,8 @@ use crate::bridge::{
     DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     IncomingCallsResult, IndexingState, InlayHintsResult, LocationsResult, NotificationCache,
     OutgoingCallsResult, Position, PositionEncoding, ReferencesResult, RenameResult,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator, WorkspaceSymbolResult,
-    validate_path_against_roots,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator, WorkspaceRoots,
+    WorkspaceSymbolResult, validate_path_against_roots,
 };
 use crate::config::{McpConfig, ToolPrefix};
 
@@ -389,7 +389,7 @@ impl McplsServer {
     pub fn new(
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
-        workspace_roots: Arc<[PathBuf]>,
+        workspace_roots: WorkspaceRoots,
         subscription_registry: SubscriptionRegistry,
         project_config_ignored: bool,
         mcp: McpConfig,
@@ -430,7 +430,7 @@ impl McplsServer {
     /// ```
     /// use std::sync::Arc;
     ///
-    /// use mcpls_core::bridge::{NotificationCache, Translator};
+    /// use mcpls_core::bridge::{NotificationCache, Translator, WorkspaceRoots};
     /// use mcpls_core::config::McpConfig;
     /// use mcpls_core::mcp::{McplsServer, SubscriptionRegistry};
     /// use tokio::sync::Mutex;
@@ -438,7 +438,7 @@ impl McplsServer {
     /// let server = McplsServer::new(
     ///     Arc::new(Translator::new()),
     ///     Arc::new(Mutex::new(NotificationCache::new())),
-    ///     Arc::from(Vec::new()),
+    ///     WorkspaceRoots::default(),
     ///     SubscriptionRegistry::new(),
     ///     false,
     ///     McpConfig::default(),
@@ -452,7 +452,7 @@ impl McplsServer {
         let context = Arc::new(BridgeContext {
             translator: Arc::clone(&self.context.translator),
             notification_cache: Arc::clone(&self.context.notification_cache),
-            workspace_roots: Arc::clone(&self.context.workspace_roots),
+            workspace_roots: self.context.workspace_roots.clone(),
             session: self.context.session.sibling(),
             project_config_ignored: self.context.project_config_ignored,
             mcp: self.context.mcp.clone(),
@@ -600,14 +600,18 @@ impl McplsServer {
         // language `handle_diagnostics`'s own validation resolves, or this
         // could observe the wrong server's (or no server's) indexing state.
         // Best-effort (`.ok()`): an invalid/out-of-workspace path just reads
-        // `false` here and fails properly inside `handle_diagnostics` below.
+        // `false` here and fails properly inside `handle_diagnostics` below,
+        // and a failed-to-start server's `ServerFailedToStart` is likewise
+        // reported there by the pull request itself.
         let route_id =
             validate_path_against_roots(Path::new(&file_path), &self.context.workspace_roots)
                 .ok()
                 .and_then(|validated_path| {
                     self.context
                         .translator
-                        .diagnostics_route_id_for_path(&validated_path)
+                        .diagnostics_route_for_path(&validated_path)
+                        .ok()
+                        .flatten()
                 });
 
         // Sampled before and after the pull: indexing may finish, or a respawn may mark push-degraded, mid-pull.
@@ -841,31 +845,33 @@ impl McplsServer {
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<Json<CachedDiagnosticsResponse>, McpError> {
-        let result = match Translator::cached_diagnostics_path_and_uri(
-            &self.context.workspace_roots,
-            &file_path,
-        ) {
-            Ok((validated_path, uri)) => {
-                // Resolved independently of the cache lookup below: a
-                // respawn clears `diagnostics_owner` for this server's
-                // entries along with its stale diagnostics (#359), so
-                // the degraded flag can't be keyed on ownership -- the
-                // routing identity is what stays stable across a
-                // respawn.
-                let route_id = self
-                    .context
-                    .translator
-                    .diagnostics_route_id_for_path(&validated_path);
-
+        // The route is resolved independently of the cache lookup below: a
+        // respawn clears `diagnostics_owner` for this server's entries along
+        // with its stale diagnostics (#359), so the degraded flag can't be
+        // keyed on ownership -- the routing identity is what stays stable
+        // across a respawn. A server that failed to start is an error here,
+        // not an empty list (#535).
+        let resolved =
+            Translator::cached_diagnostics_path_and_uri(&self.context.workspace_roots, &file_path)
+                .and_then(|(validated_path, uri)| {
+                    let route_id = self
+                        .context
+                        .translator
+                        .diagnostics_route_for_path(&validated_path)?;
+                    Ok((route_id, uri))
+                });
+        let result = match resolved {
+            Ok((route_id, uri)) => {
                 // Lock only long enough for the map lookup + clone: no
                 // canonicalize() or Vec mapping while `notification_cache`
                 // is held, since `diagnostics_pump` needs the same lock.
-                let (diag_info, owner, signals) = {
+                let (sources, owner, signals) = {
                     let cache = self.context.notification_cache.lock().await;
                     let owner = cache.diagnostics_owner(&uri).cloned();
                     let signals = DiagnosticsRouteSignals::sample(&cache, route_id.as_ref());
-                    (cache.diagnostics(&uri).cloned(), owner, signals)
+                    (cache.diagnostic_sources(&uri), owner, signals)
                 };
+                let diag_info = sources.merge();
                 let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
                     self.context.translator.position_encoding_for(&server_id)
                 });
@@ -1057,17 +1063,24 @@ impl McplsServer {
         let route_id = self
             .context
             .translator
-            .diagnostics_route_id_for_path(&validated_path);
+            .diagnostics_route_for_path(&validated_path)
+            .map_err(map_bridge_error)?;
 
-        // Built from a borrow of the cache entry rather than `.cloned()`-ing the
-        // whole `DiagnosticInfo` first: `build_resource_diagnostics_response`
-        // only ever needs `version` (Copy) and its own clone of `diagnostics`,
-        // so cloning the entry up front would clone `diagnostics` twice.
-        let cache = self.context.notification_cache.lock().await;
+        // Only the snapshot is taken under the cache lock: merging the sources
+        // (dedupe, sort, size cap) runs after it is released, since
+        // `diagnostics_pump` needs the same lock.
+        let (sources, signals) = {
+            let cache = self.context.notification_cache.lock().await;
+            (
+                cache.diagnostic_sources(lsp_uri.as_ref()),
+                DiagnosticsRouteSignals::sample(&cache, route_id.as_ref()),
+            )
+        };
+        let diag_info = sources.merge();
         Ok(build_resource_diagnostics_response(
             self.context.translator.is_document_open(&validated_path),
-            cache.diagnostics(lsp_uri.as_ref()),
-            DiagnosticsRouteSignals::sample(&cache, route_id.as_ref()),
+            diag_info.as_ref(),
+            signals,
         ))
     }
 
@@ -1136,7 +1149,7 @@ impl McplsServer {
             return Err(no_resolvable_listen_uris());
         }
         let permit = self.context.session.registry().try_reserve_listen()?;
-        let roots = Arc::clone(&self.context.workspace_roots);
+        let roots = self.context.workspace_roots.clone();
         let accepted = accepted.to_vec();
         let uris = tokio::task::spawn_blocking(move || ListenUris::resolve(&accepted, &roots))
             .await
@@ -1279,7 +1292,7 @@ impl ServerHandler for McplsServer {
                     crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
                 let has_cached_diagnostics = {
                     let cache = self.context.notification_cache.lock().await;
-                    cache.diagnostics(lsp_uri.as_ref()).is_some()
+                    cache.has_diagnostics(lsp_uri.as_ref())
                 };
 
                 if has_cached_diagnostics
@@ -1387,7 +1400,7 @@ impl ServerHandler for McplsServer {
         let cached: Vec<&DiagnosticsResourceUri> = {
             let cache = self.context.notification_cache.lock().await;
             uris.canonical()
-                .filter(|(_, lsp_uri)| cache.diagnostics(lsp_uri.as_ref()).is_some())
+                .filter(|(_, lsp_uri)| cache.has_diagnostics(lsp_uri.as_ref()))
                 .map(|(uri, _)| uri)
                 .collect()
         };
@@ -1469,7 +1482,7 @@ mod tests {
         project_config_ignored: bool,
         mcp: McpConfig,
     ) -> McplsServer {
-        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let workspace_roots = WorkspaceRoots::default();
         create_test_server_with_workspace_roots(project_config_ignored, mcp, workspace_roots)
     }
 
@@ -1480,7 +1493,7 @@ mod tests {
     fn create_test_server_with_workspace_roots(
         project_config_ignored: bool,
         mcp: McpConfig,
-        workspace_roots: Arc<[PathBuf]>,
+        workspace_roots: WorkspaceRoots,
     ) -> McplsServer {
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
@@ -1506,7 +1519,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
         (server, temp_dir, test_file)
     }
@@ -1888,7 +1901,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -1907,7 +1920,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -1958,7 +1971,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -1972,7 +1985,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2026,7 +2039,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2045,7 +2058,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2110,7 +2123,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, fake) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2122,7 +2135,7 @@ mod tests {
         let server = Arc::new(McplsServer::new(
             translator,
             Arc::clone(&cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2408,7 +2421,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2429,7 +2442,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2616,7 +2629,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
 
         let params = Parameters(CachedDiagnosticsParams {
@@ -2653,7 +2666,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
 
         let canonical_path = test_file.canonicalize().unwrap();
@@ -2727,7 +2740,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
         let owner = crate::config::ServerId::from("rust");
         server.context.translator.register_server(
@@ -2800,7 +2813,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
         // Deliberately not registered with `translator.register_server`.
         let owner = crate::config::ServerId::from("rust");
@@ -2864,7 +2877,7 @@ mod tests {
         use crate::config::{ServerId, ToolRouter};
 
         // A router + extension map is required: the degraded flag is keyed
-        // on `Translator::diagnostics_route_id_for_path` (the file's
+        // on `Translator::diagnostics_route_for_path` (the file's
         // *routed* server, resolved from its detected language), not on
         // `NotificationCache::diagnostics_owner` -- see #359's C1 fix. This
         // is a fast unit test of that wiring alone; the slower
@@ -2884,7 +2897,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2939,7 +2952,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -2991,7 +3004,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            Arc::from(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -3097,7 +3110,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            Arc::from([dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),
@@ -3150,7 +3163,7 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from([temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
 
         let params = Parameters(CachedDiagnosticsParams {
@@ -3166,14 +3179,18 @@ sleep 0.3
 
     #[tokio::test]
     async fn test_cached_diagnostics_tool_nonexistent_file() {
-        #[cfg(windows)]
-        let root = PathBuf::from(r"C:\");
-        #[cfg(not(windows))]
-        let root = PathBuf::from("/");
-        let server =
-            create_test_server_with_workspace_roots(false, McpConfig::default(), Arc::from([root]));
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+        );
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: "/nonexistent/file.rs".to_string(),
+            file_path: dir
+                .path()
+                .join("nonexistent/file.rs")
+                .to_string_lossy()
+                .to_string(),
         });
 
         let result = server.get_cached_diagnostics(params).await;
@@ -3183,6 +3200,75 @@ sleep 0.3
             "expected a file I/O error for a nonexistent path, got: {}",
             err.message
         );
+    }
+
+    /// Server whose only language server failed to start, with a real file
+    /// under its workspace root.
+    fn server_with_failed_rust_server() -> (tempfile::TempDir, std::path::PathBuf, McplsServer) {
+        use crate::config::{ServerId, ToolRouter};
+        use crate::error::{ServerSpawnFailure, StartupFailure};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+            .with_extensions(crate::test_lsp::test_extensions());
+        translator.record_startup_failures(&[ServerSpawnFailure {
+            server_id: id,
+            language_id: "rust".to_string(),
+            command: "rust-analyzer".to_string(),
+            reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
+                command: "rust-analyzer".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })),
+        }]);
+        translator.rebind_router(&std::collections::HashSet::new());
+        translator.clear_expected_servers();
+
+        let server = McplsServer::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            WorkspaceRoots::resolve(vec![root]),
+            SubscriptionRegistry::new(),
+            false,
+            McpConfig::default(),
+        );
+        (dir, file, server)
+    }
+
+    /// #535: a cached read for a language whose server failed to start
+    /// reports the failure instead of an empty diagnostics list.
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_reports_failed_server_start() {
+        let (_dir, file, server) = server_with_failed_rust_server();
+
+        let result = server
+            .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+                file_path: file.to_string_lossy().to_string(),
+            }))
+            .await;
+
+        let Err(err) = result else {
+            panic!("expected the startup failure to be reported");
+        };
+        assert!(err.message.contains("failed to start"), "{}", err.message);
+    }
+
+    /// #535: the diagnostics resource read reports the same failure.
+    #[tokio::test]
+    async fn test_diagnostics_resource_reports_failed_server_start() {
+        let (_dir, file, server) = server_with_failed_rust_server();
+
+        let result = server.resource_diagnostics_response(&file).await;
+
+        let Err(err) = result else {
+            panic!("expected the startup failure to be reported");
+        };
+        assert!(err.message.contains("failed to start"), "{}", err.message);
     }
 
     #[tokio::test]
@@ -3852,7 +3938,9 @@ sleep 0.3
         let noncanonical = link_dir.join("test.rs");
         assert_ne!(noncanonical, test_file);
 
-        let validated = validate_path_against_roots(&noncanonical, &[base]).unwrap();
+        let validated =
+            validate_path_against_roots(&noncanonical, &WorkspaceRoots::resolve(vec![base]))
+                .unwrap();
         assert_eq!(validated, test_file.canonicalize().unwrap());
 
         let uri_from_raw_path = crate::bridge::path_to_uri(&noncanonical).unwrap();
@@ -3867,16 +3955,12 @@ sleep 0.3
     /// `validate_path` rejects a non-existent path (canonicalize fails).
     #[tokio::test]
     async fn test_validate_path_rejects_nonexistent_path() {
-        use std::path::Path;
-
         use crate::error::Error;
 
+        let dir = tempfile::TempDir::new().unwrap();
         let mut translator = Translator::new();
-        #[cfg(windows)]
-        translator.set_workspace_roots(vec![PathBuf::from(r"C:\")]);
-        #[cfg(not(windows))]
-        translator.set_workspace_roots(vec![PathBuf::from("/")]);
-        let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        let result = translator.validate_path(&dir.path().join("this/path/does/not/exist.rs"));
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }
 
@@ -3891,7 +3975,7 @@ sleep 0.3
     #[test]
     fn test_read_resource_nonexistent_path_maps_to_invalid_params() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let roots = [temp_dir.path().to_path_buf()];
+        let roots = WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]);
         let missing = temp_dir.path().join("does-not-exist.rs");
 
         let result = validate_path_against_roots(&missing, &roots);
@@ -3940,7 +4024,7 @@ sleep 0.3
         symlink(&real_dir, &link_dir).unwrap();
         let noncanonical = link_dir.join("test.rs");
 
-        let roots = std::slice::from_ref(&base);
+        let roots = &WorkspaceRoots::resolve(vec![base.clone()]);
         let validated = validate_path_against_roots(&noncanonical, roots).unwrap();
         let raw_uri = make_uri(&noncanonical).unwrap();
         let canonical_uri = DiagnosticsResourceUri::resolve(&raw_uri, roots)
@@ -4059,7 +4143,7 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             false,
             McpConfig::default(),
-            Arc::from(vec![root]),
+            WorkspaceRoots::resolve(vec![root]),
         );
         (server, dir, uri)
     }
@@ -4302,7 +4386,7 @@ sleep 0.3
                 ("rs".to_string(), "rust".to_string()),
                 ("py".to_string(), "python".to_string()),
             ]));
-        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let mut fake_servers = Vec::new();
         for (id, _, caps) in servers {
             let (client, fake) = fake_lsp_client();
@@ -4313,7 +4397,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            Arc::from(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
             false,
             mcp,
@@ -4774,7 +4858,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            Arc::from(Vec::new()),
+            WorkspaceRoots::default(),
             SubscriptionRegistry::new(),
             false,
             McpConfig::default(),

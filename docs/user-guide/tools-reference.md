@@ -35,7 +35,7 @@ neither blocks or filters the result, they just tell the caller when to apply ex
 
 ### Output Key Naming
 
-Every key mcpls defines in tool results, in the `mcpls-diagnostics://` resource payload, and in
+Every key mcpls defines in tool results, in the `lsp-diagnostics://` resource payload, and in
 retryable error `data` is `snake_case` (`indexing_in_progress`, `push_notifications_degraded`,
 `server_id`, `elapsed_secs`), matching tool inputs. Objects passed through unchanged from the
 language server keep LSP's own casing: the `Diagnostic` items inside the resource's `diagnostics`
@@ -344,7 +344,7 @@ Severity levels: `error`, `warning`, `information`, `hint`.
 
 `push_notifications_degraded` is `true` if the language server publishing this file's diagnostics crashed and was restarted during this mcpls session: diagnostics it delivers only by push (e.g. rust-analyzer's flycheck/clippy) are no longer received, so the result may be incomplete until mcpls restarts. Checked both before and after the underlying request, since the request itself can trigger a restart.
 
-`indexing_in_progress` is `true` when the routed language server had an active signal showing its initial workspace indexing was still in progress at any point during this read (checked both before and after the underlying request, so a server that finishes mid-read is still caught) — the diagnostics above may reflect a partial index (still-loading references/types can surface as false errors, or a genuine error can be silently missing). `get_cached_diagnostics` and the `mcpls-diagnostics://` resource carry the same flags. This is independent of the whole-workspace-query readiness gate other tools (`get_hover`, `get_definition`, etc.) block on, configured via `workspace.indexing_ready_timeout_seconds` (see [Configuration Reference](configuration.md)) — `get_diagnostics` never blocks on it, it only flags the result.
+`indexing_in_progress` is `true` when the routed language server had an active signal showing its initial workspace indexing was still in progress at any point during this read (checked both before and after the underlying request, so a server that finishes mid-read is still caught) — the diagnostics above may reflect a partial index (still-loading references/types can surface as false errors, or a genuine error can be silently missing). `get_cached_diagnostics` and the `lsp-diagnostics://` resource carry the same flags. This is independent of the whole-workspace-query readiness gate other tools (`get_hover`, `get_definition`, etc.) block on, configured via `workspace.indexing_ready_timeout_seconds` (see [Configuration Reference](configuration.md)) — `get_diagnostics` never blocks on it, it only flags the result.
 
 ### Example Use Cases
 
@@ -905,7 +905,9 @@ Get diagnostics from LSP server push notifications (cached), without making a ne
 
 - Returns only diagnostics pushed by the LSP server via `textDocument/publishDiagnostics`, without making a new pull request
 - Filtered by the same routing rules as `get_diagnostics`, so both tools use the same server when routed explicitly
-- Returns empty array if the file hasn't been analyzed yet or no push notifications have been received
+- Returns an empty array if the file hasn't been analyzed yet or no push notifications have been received
+- If the server for the file's language failed to start, returns that startup error (`... failed to start: ...`, including the server's stderr when it printed any) instead of an empty array; the `lsp-diagnostics://` resource read behaves the same. Startup failures are not retried: fix the server and restart mcpls
+- A server may publish diagnostics for one file under several spellings (a symlink and its target, for example). mcpls keys them by the file's canonical path and returns the union, with exact duplicates removed and entries ordered by range, so errors published under a symlink path are visible when you ask for the real path. A symlink pointing outside the workspace roots is ignored
 - Useful when you want fast, cached-only results without waiting for a fresh pull request
 
 ---
@@ -1228,6 +1230,8 @@ Array of inlay hints with positions and labels:
 **Type**: String
 **Format**: Absolute path
 **Validation**: Must exist within workspace roots
+
+A path is accepted when it names a location under a workspace root through one of these spellings: the root's canonical (symlink-free) path, the root exactly as configured, or the logical working directory (`$PWD`) when it resolves to the same directory as the real working directory. The path is then resolved on disk and must still lie under a root, so a symlink inside a root that points elsewhere is rejected. A path that reaches a root only through some other symlink spelling is rejected with `PathOutsideWorkspace`, even though earlier versions accepted it; use one of the spellings above. Paths outside every root are rejected before the filesystem is consulted, so the error does not reveal whether such a file exists.
 
 ```json
 {

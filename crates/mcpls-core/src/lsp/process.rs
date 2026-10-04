@@ -9,7 +9,7 @@
 use std::io;
 use std::process::ExitStatus;
 
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// One spawned LSP server, bound to the mcpls process lifetime.
 ///
@@ -38,6 +38,10 @@ impl ServerProcess {
 
     pub(crate) const fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout.take()
+    }
+
+    pub(crate) const fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
     }
 
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -77,6 +81,10 @@ impl ServerProcess {
 
     pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout().take()
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr().take()
     }
 
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {

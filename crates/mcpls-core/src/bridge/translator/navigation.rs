@@ -1360,9 +1360,9 @@ mod tests {
         };
         let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
 
-        let path = dir.path().join("main.rs");
+        let path = canonical_dir(&dir).join("main.rs");
         fs::write(&path, "fn main() {}").unwrap();
-        let target_path = dir.path().join("target.rs");
+        let target_path = canonical_dir(&dir).join("target.rs");
         fs::write(&target_path, "fn target() {}").unwrap();
         let target_uri = Url::from_file_path(&target_path).unwrap().to_string();
 
@@ -1505,9 +1505,9 @@ mod tests {
         };
         let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
 
-        let path = dir.path().join("main.rs");
+        let path = canonical_dir(&dir).join("main.rs");
         fs::write(&path, "fn main() {}").unwrap();
-        let inside_path = dir.path().join("inside.rs");
+        let inside_path = canonical_dir(&dir).join("inside.rs");
         fs::write(&inside_path, "fn used() {}").unwrap();
         let inside_uri = Url::from_file_path(&inside_path).unwrap().to_string();
         let outside_uri = "file:///outside/workspace/stdlib.rs";

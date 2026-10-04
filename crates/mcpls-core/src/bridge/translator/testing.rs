@@ -13,12 +13,18 @@ use super::dto::Position;
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
-use crate::bridge::{DiagnosticInfo, DocumentTracker};
+use crate::bridge::{DiagnosticInfo, DocumentTracker, WorkspaceRoots};
 use crate::config::{ServerId, ToolRouter};
 use crate::lsp::LspServer;
 pub(super) use crate::test_lsp::{
     FakeServer, fake_lsp_client, read_framed_message, write_error_response, write_response,
 };
+
+/// The canonical form of `dir`: URIs servers publish, and so the paths
+/// workspace-containment checks see, are canonical (`/var` vs `/private/var`).
+pub(super) fn canonical_dir(dir: &TempDir) -> PathBuf {
+    dunce::canonicalize(dir.path()).unwrap()
+}
 
 /// Shorthand for building a [`Position`] test fixture.
 pub(super) const fn pos(line: u32, character: u32) -> Position {
@@ -50,7 +56,7 @@ pub(super) fn test_ctx_with_roots(
             ResourceLimits::default(),
             HashMap::new(),
         )),
-        Arc::new(workspace_roots),
+        Arc::from(workspace_roots),
     )
 }
 
@@ -121,7 +127,7 @@ pub(super) fn translator_with_capabilities(
                 server_id.clone(),
                 "rust".to_string(),
             )]));
-    translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+    translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
     let (client, server) = fake_lsp_client();
     translator.register_client(server_id.clone(), client);
@@ -149,7 +155,7 @@ pub(super) fn translator_with_capabilities_and_encoding(
                 server_id.clone(),
                 "rust".to_string(),
             )]));
-    translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+    translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
     let (client, server) = fake_lsp_client();
     translator.register_client(server_id.clone(), client);

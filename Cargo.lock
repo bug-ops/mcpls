@@ -1029,6 +1029,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

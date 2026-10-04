@@ -14,6 +14,7 @@ mod notifications;
 pub mod resources;
 mod state;
 mod translator;
+mod workspace_roots;
 
 pub use encoding::PositionEncoding;
 // Not part of the crate's public API surface (unlike `IndexingPolicy`/`IndexingState`
@@ -26,8 +27,8 @@ pub(crate) use indexing::{
 };
 pub use indexing::{IndexingPolicy, IndexingState};
 pub use notifications::{
-    DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
-    apply_lifecycle_notification,
+    DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
+    ServerMessage, apply_lifecycle_notification,
 };
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, ResourceLimits, path_to_uri,
@@ -47,6 +48,8 @@ pub use translator::{
     HoverResult, Location, Position, Position2D, PositionDegradation, Range, ReferencesResult,
     RenameResult, Symbol, TextEdit, Translator,
 };
+pub use workspace_roots::WorkspaceRoots;
+pub(crate) use workspace_roots::{canonicalize_existing_prefix, lexically_normalize};
 
 /// Whether `uri` resolves to a path within one of `workspace_roots`.
 ///

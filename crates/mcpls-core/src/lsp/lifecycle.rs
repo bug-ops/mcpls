@@ -29,8 +29,10 @@ use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 use crate::lsp::process::ServerProcess;
+use crate::lsp::stderr::StderrCapture;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
+use crate::redaction::Redactions;
 
 /// Environment variables passed through to a spawned LSP server even though
 /// its environment is otherwise cleared.
@@ -428,6 +430,11 @@ impl LspServer {
             .take_stdout()
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
+        let stderr = child
+            .take_stderr()
+            .ok_or_else(|| Error::Transport("Failed to capture stderr".to_string()))?;
+        let stderr_capture = StderrCapture::start(stderr);
+
         let transport = LspTransport::new(stdin, stdout);
         let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
@@ -438,13 +445,41 @@ impl LspServer {
             lifecycle_tx,
         );
 
+        // Only needed on the failure paths below, so the environment scan is
+        // not paid for by a successful start.
+        let redactions = || {
+            Redactions::for_server(
+                &config.server_config,
+                std::env::vars_os().filter_map(|(name, value)| {
+                    Some((name.into_string().ok()?, value.into_string().ok()?))
+                }),
+            )
+        };
         let (capabilities, position_encoding) = match Self::initialize(&client, &config).await {
             Ok(negotiated) => negotiated,
             Err(init_error) if is_connection_loss(&init_error) => {
-                let early_exit = early_exit_error(&mut child, &config.server_config.command).await;
-                return Err(early_exit.unwrap_or_else(|| Error::LspInitFailed {
-                    message: format!("Initialize request failed: {init_error}"),
-                }));
+                let exit_status = early_exit_status(&mut child).await;
+                let stderr = stderr_capture
+                    .finish(exit_status.is_some(), &redactions())
+                    .await;
+                return Err(match exit_status {
+                    Some(status) => Error::ServerExitedDuringInit {
+                        command: config.server_config.command.clone(),
+                        exit_code: status.code(),
+                        stderr,
+                    },
+                    None => Error::LspInitFailed {
+                        message: format!("Initialize request failed: {init_error}"),
+                        stderr,
+                    },
+                });
+            }
+            Err(Error::LspInitFailed { message, .. }) => {
+                // The server may be about to exit after printing its reason,
+                // so wait the (bounded) end-of-file grace whether or not it
+                // has exited yet.
+                let stderr = stderr_capture.finish(true, &redactions()).await;
+                return Err(Error::LspInitFailed { message, stderr });
             }
             Err(init_error) => return Err(init_error),
         };
@@ -494,8 +529,7 @@ impl LspServer {
             .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // TODO(#534): capture a bounded stderr tail during initialize
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         command
     }
@@ -653,6 +687,7 @@ impl LspServer {
                 } else {
                     Error::LspInitFailed {
                         message: format!("Initialize request failed: {e}"),
+                        stderr: None,
                     }
                 }
             })?;
@@ -673,6 +708,7 @@ impl LspServer {
             .await
             .map_err(|e| Error::LspInitFailed {
                 message: format!("Initialized notification failed: {e}"),
+                stderr: None,
             })?;
 
         Ok((result.capabilities, position_encoding))
@@ -927,14 +963,10 @@ const fn is_connection_loss(error: &Error) -> bool {
     matches!(error, Error::ServerTerminated | Error::Transport(_))
 }
 
-/// [`Error::ServerExitedDuringInit`] if `child` has exited (or does so within
+/// Exit status of `child` if it has exited (or does so within
 /// [`EARLY_EXIT_PROBE`]), `None` if it is still running.
-async fn early_exit_error(child: &mut ServerProcess, command: &str) -> Option<Error> {
-    let status = timeout(EARLY_EXIT_PROBE, child.wait()).await.ok()?.ok()?;
-    Some(Error::ServerExitedDuringInit {
-        command: command.to_string(),
-        exit_code: status.code(),
-    })
+async fn early_exit_status(child: &mut ServerProcess) -> Option<std::process::ExitStatus> {
+    timeout(EARLY_EXIT_PROBE, child.wait()).await.ok()?.ok()
 }
 
 /// Classify a spawn failure: a missing executable gets its own variant so the
@@ -1773,7 +1805,7 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
         let err = LspServer::spawn(config).await.unwrap_err();
 
         assert!(
-            matches!(&err, Error::LspInitFailed { message } if message.contains("rejected by server")),
+            matches!(&err, Error::LspInitFailed { message, .. } if message.contains("rejected by server")),
             "got {err:?}"
         );
     }
@@ -1789,7 +1821,7 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
         let err = LspServer::spawn(config).await.unwrap_err();
 
         assert!(
-            matches!(&err, Error::LspInitFailed { message } if message.contains("Initialize request failed")),
+            matches!(&err, Error::LspInitFailed { message, .. } if message.contains("Initialize request failed")),
             "got {err:?}"
         );
     }
@@ -1812,6 +1844,146 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
             ),
             "got {err:?}"
         );
+    }
+
+    /// #534: what the server printed before exiting reaches the error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_exit_during_init_carries_stderr() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            "echo 'fatal: bad toolchain' >&2\nexit 1\n",
+        );
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let Error::ServerExitedDuringInit {
+            stderr: Some(stderr),
+            ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(stderr.head(), "fatal: bad toolchain");
+        assert!(err.to_string().contains("stderr: fatal: bad toolchain"));
+    }
+
+    /// A server that rejects `initialize` and prints its reason just before
+    /// exiting must not lose that last line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_rejection_keeps_stderr_written_just_before_exit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(
+                r#"body='{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"rejected by server"}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 0.02
+echo 'fatal: bad toolchain' >&2
+"#,
+            ),
+        );
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let Error::LspInitFailed {
+            stderr: Some(stderr),
+            ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(stderr.head(), "fatal: bad toolchain");
+    }
+
+    /// #534: a server that hangs after writing to stderr times out with its
+    /// output attached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_initialize_timeout_carries_stderr() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            "echo 'indexing forever' >&2\nsleep 5\n",
+        );
+        config.server_config.timeout_seconds = 1;
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let Error::LspInitFailed {
+            stderr: Some(stderr),
+            ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(stderr.head(), "indexing forever");
+    }
+
+    /// Values configured in `env` never reach the error text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_stderr_redacts_configured_env_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            "echo \"token=$API_TOKEN toolchain=$RUSTUP_TOOLCHAIN\" >&2\nexit 1\n",
+        );
+        config.server_config.env.insert(
+            "RUSTUP_TOOLCHAIN".to_string(),
+            "nightly-2024-01-01".to_string(),
+        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("token=[redacted:API_TOKEN]"), "{text}");
+        assert!(text.contains("toolchain=nightly-2024-01-01"), "{text}");
+        assert!(!text.contains("s3cr3t-value"), "{text}");
+    }
+
+    /// Regression guard for the drain: a server flooding stderr both before
+    /// and after it answers `initialize` must never block or lose its pipe
+    /// (`EPIPE`/`SIGPIPE`) once `spawn` has returned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_keeps_draining_stderr_after_initialize() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("flooded");
+        let script = format!(
+            r#"head -c 200000 /dev/zero | tr '\0' 'e' >&2
+body='{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{}}}}}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${{#body}} "$body"
+sleep 0.3
+head -c 200000 /dev/zero | tr '\0' 'e' >&2 && echo done > '{}'
+sleep 5
+"#,
+            marker.display()
+        );
+        let config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(&script),
+        );
+
+        let mut server = LspServer::spawn(config).await.unwrap();
+
+        let flooded = tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            flooded.is_ok(),
+            "server's post-initialize stderr flood did not complete"
+        );
+        assert!(!server.has_exited().unwrap());
     }
 
     #[tokio::test]

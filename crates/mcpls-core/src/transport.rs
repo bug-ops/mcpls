@@ -501,11 +501,18 @@ pub(crate) async fn run_stdio(
 /// the next write, at most one SSE keep-alive (15 s) later. A silently vanished
 /// peer (half-open TCP: sleeping laptop, dropped NAT mapping) keeps its stream,
 /// and with it the session, open until the OS gives up retransmitting
-/// (roughly 15-30 minutes on Linux) -- bounded, but not by the idle timeout
-/// (see #531). A client with a GET stream open is never reaped by mcpls, but
-/// rmcp's own 5-minute `keep_alive` still ends a session that sees no event at
-/// all in that time (SSE pings do not count). Clients should send `DELETE` on
-/// shutdown; after an expiry they must re-initialize and re-subscribe.
+/// (roughly 15-30 minutes on Linux) -- bounded, but not by the idle timeout.
+/// On Linux and Android every accepted socket gets `TCP_USER_TIMEOUT` of
+/// `HALF_OPEN_TIMEOUT` (60 s), so unacknowledged data (the 15 s SSE pings
+/// guarantee some) drops the connection about 75 s after the peer vanishes
+/// (#531). macOS and Windows keep the kernel default. Behind the recommended
+/// reverse proxy the accepted socket faces the proxy, so the proxy's own
+/// timeouts govern instead. A client that stops reading with a full receive
+/// window for longer than the timeout may be dropped too. A client with a GET
+/// stream open is never reaped by mcpls, but rmcp's own 5-minute `keep_alive`
+/// still ends a session that sees no event at all in that time (SSE pings do
+/// not count). Clients should send `DELETE` on shutdown; after an expiry they
+/// must re-initialize and re-subscribe.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
 /// "one instance per request"; `resources/subscribe`/`unsubscribe` detect
@@ -564,7 +571,6 @@ pub(crate) async fn run_http(
     cfg: HttpConfig,
     shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
-    // TODO(#531): bound half-open GET/listen streams via TCP_USER_TIMEOUT
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
@@ -784,6 +790,10 @@ async fn serve_http1(
             },
         };
 
+        // TODO(#543): portable half-open detection via MCP ping
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        set_half_open_timeout(&stream);
+
         let conn =
             builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone()));
         let cancel = cancel.clone();
@@ -918,6 +928,28 @@ fn is_connection_error(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::ConnectionReset
     )
+}
+
+/// `TCP_USER_TIMEOUT` applied to accepted HTTP sockets on Linux and Android.
+///
+/// Must exceed the 15 s SSE keep-alive interval so a healthy but quiet stream
+/// is never dropped.
+#[cfg(all(
+    feature = "transport-http",
+    any(target_os = "linux", target_os = "android")
+))]
+const HALF_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bounds how long unacknowledged data may linger on `stream` before the
+/// kernel drops the connection; failures are logged and the connection kept.
+#[cfg(all(
+    feature = "transport-http",
+    any(target_os = "linux", target_os = "android")
+))]
+fn set_half_open_timeout(stream: &tokio::net::TcpStream) {
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_user_timeout(Some(HALF_OPEN_TIMEOUT)) {
+        tracing::debug!(error = %e, "failed to set TCP_USER_TIMEOUT on accepted connection");
+    }
 }
 
 /// Upper bound [`run_http`] waits, once shutdown has been signaled, for
@@ -1343,6 +1375,28 @@ async fn enforce_session_cap(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::bridge::WorkspaceRoots;
+
+    /// An accepted stream must read back the half-open `TCP_USER_TIMEOUT`.
+    #[cfg(all(
+        feature = "transport-http",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[tokio::test]
+    async fn test_set_half_open_timeout_applies_tcp_user_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+
+        super::set_half_open_timeout(&accepted);
+
+        let timeout = socket2::SockRef::from(&accepted)
+            .tcp_user_timeout()
+            .unwrap();
+        assert_eq!(timeout, Some(super::HALF_OPEN_TIMEOUT));
+    }
+
     /// `Transport::Stdio` is always constructible regardless of feature flags.
     #[test]
     fn test_transport_stdio_variant() {
@@ -1422,7 +1476,6 @@ mod tests {
     /// missing a branch, or awaiting the wrong future) would look like.
     #[tokio::test]
     async fn test_run_stdio_returns_promptly_when_stdin_is_already_closed() {
-        use std::path::PathBuf;
         use std::sync::Arc;
 
         use tokio::sync::Mutex;
@@ -1433,7 +1486,7 @@ mod tests {
 
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+        let workspace_roots = WorkspaceRoots::default();
         let subs = SubscriptionRegistry::new();
         let server = McplsServer::new(
             translator,
@@ -1471,6 +1524,7 @@ mod tests {
             HttpConfig, IdleTimeout, SessionActivity, SessionManager as _, Transport,
             run_idle_reaper,
         };
+        use crate::bridge::WorkspaceRoots;
         use crate::test_lsp::CapturedLogs;
 
         #[test]
@@ -1534,7 +1588,6 @@ mod tests {
         /// Verifies `run_http` binds successfully and accepts TCP connections.
         #[tokio::test]
         async fn test_run_http_binds() {
-            use std::path::PathBuf;
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
@@ -1545,7 +1598,7 @@ mod tests {
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+            let workspace_roots = WorkspaceRoots::default();
             let subs = SubscriptionRegistry::new();
             let server = McplsServer::new(
                 translator,
@@ -1627,7 +1680,6 @@ mod tests {
         /// Verifies `run_http` returns an error when the bind address is already in use.
         #[tokio::test]
         async fn test_run_http_bind_error() {
-            use std::path::PathBuf;
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
@@ -1642,7 +1694,7 @@ mod tests {
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
+            let workspace_roots = WorkspaceRoots::default();
             let subs = SubscriptionRegistry::new();
             let server = McplsServer::new(
                 translator,
@@ -1888,9 +1940,7 @@ mod tests {
         /// Builds a `McplsServer` with default collaborators and the given
         /// workspace roots, matching the setup shared by every
         /// `run_http`-driving test in this module.
-        fn test_server_with_roots(
-            workspace_roots: std::sync::Arc<[std::path::PathBuf]>,
-        ) -> crate::mcp::McplsServer {
+        fn test_server_with_roots(workspace_roots: WorkspaceRoots) -> crate::mcp::McplsServer {
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
@@ -1914,7 +1964,7 @@ mod tests {
 
         /// [`test_server_with_roots`] with no workspace roots configured.
         fn test_server() -> crate::mcp::McplsServer {
-            test_server_with_roots(std::sync::Arc::from(Vec::new()))
+            test_server_with_roots(WorkspaceRoots::default())
         }
 
         /// Polls a TCP connect until it succeeds or the 5s budget runs out;
@@ -2317,8 +2367,9 @@ mod tests {
             std::fs::write(&file_path, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file_path).unwrap();
 
-            let server =
-                test_server_with_roots(std::sync::Arc::from(vec![workspace.path().to_path_buf()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![
+                workspace.path().to_path_buf(),
+            ]));
             let registry = server.subscription_registry();
 
             let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
@@ -2643,7 +2694,7 @@ mod tests {
             let uri_x = crate::bridge::resources::make_uri(&file_x).unwrap();
             let uri_y = crate::bridge::resources::make_uri(&file_y).unwrap();
 
-            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
 
@@ -2654,7 +2705,7 @@ mod tests {
             subscribe_in_session(addr, &session_b, &uri_y).await;
 
             let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
             let publish = |file: &std::path::Path| {
                 let notification = crate::lsp::LspNotification::PublishDiagnostics(
                     lsp_types::PublishDiagnosticsParams {
@@ -2903,7 +2954,7 @@ mod tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
@@ -2912,7 +2963,7 @@ mod tests {
             drop(stream);
 
             let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
             let accept_headers =
                 "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
             let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
@@ -2947,14 +2998,14 @@ mod tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
             let (session, mut stream) = establish_session(addr).await;
             subscribe_in_session(addr, &session, &uri).await;
             let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
 
             let started = tokio::time::Instant::now();
             while started.elapsed() < TEST_IDLE * 3 {
@@ -2997,7 +3048,7 @@ mod tests {
             let file = root.join("main.rs");
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
-            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
             ListenFixture {
@@ -3071,7 +3122,7 @@ mod tests {
             }
             let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
                 fx.registry.clone(),
-                std::sync::Arc::from(vec![fx.root.clone()]),
+                WorkspaceRoots::resolve(vec![fx.root.clone()]),
             );
             tx.send(publish_notification(&fx.file)).await.unwrap();
 
@@ -3146,7 +3197,7 @@ mod tests {
             let server = crate::mcp::McplsServer::new(
                 std::sync::Arc::new(crate::bridge::Translator::new()),
                 cache,
-                std::sync::Arc::from(vec![root]),
+                WorkspaceRoots::resolve(vec![root]),
                 crate::mcp::SubscriptionRegistry::new(),
                 false,
                 crate::config::McpConfig::default(),
