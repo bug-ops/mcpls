@@ -9,6 +9,7 @@ mod server;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 
 pub use language::{base_language_id, react_variant_language_id};
@@ -359,6 +360,77 @@ pub struct WorkspaceConfig {
     /// Default: 30
     #[serde(default = "default_indexing_ready_timeout_seconds")]
     pub indexing_ready_timeout_seconds: u64,
+
+    /// Maximum number of LSP servers started at the same time; the rest
+    /// start as earlier ones settle.
+    /// Default: 8
+    #[serde(default)]
+    pub max_concurrent_server_starts: ServerStartConcurrency,
+}
+
+/// Why a value is not a valid [`ServerStartConcurrency`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("max_concurrent_server_starts must be at least 1")]
+pub struct InvalidServerStartConcurrency;
+
+/// How many LSP servers may be starting at the same time.
+///
+/// A fixed default keeps a generated configuration machine-independent.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::ServerStartConcurrency;
+///
+/// assert!(ServerStartConcurrency::new(0).is_none());
+/// assert_eq!(ServerStartConcurrency::new(2).unwrap().get(), 2);
+/// assert_eq!(ServerStartConcurrency::default(), ServerStartConcurrency::DEFAULT);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "usize", into = "usize")]
+pub struct ServerStartConcurrency(NonZeroUsize);
+
+impl ServerStartConcurrency {
+    /// Eight servers at a time.
+    pub const DEFAULT: Self = match Self::new(8) {
+        Some(limit) => limit,
+        None => panic!("the default concurrency must be non-zero"),
+    };
+
+    /// `None` for zero.
+    #[must_use]
+    pub const fn new(limit: usize) -> Option<Self> {
+        match NonZeroUsize::new(limit) {
+            Some(limit) => Some(Self(limit)),
+            None => None,
+        }
+    }
+
+    /// The wrapped limit, at least 1.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Default for ServerStartConcurrency {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl TryFrom<usize> for ServerStartConcurrency {
+    type Error = InvalidServerStartConcurrency;
+
+    fn try_from(limit: usize) -> std::result::Result<Self, Self::Error> {
+        Self::new(limit).ok_or(InvalidServerStartConcurrency)
+    }
+}
+
+impl From<ServerStartConcurrency> for usize {
+    fn from(limit: ServerStartConcurrency) -> Self {
+        limit.get()
+    }
 }
 
 impl Default for WorkspaceConfig {
@@ -371,6 +443,7 @@ impl Default for WorkspaceConfig {
             max_documents: default_max_documents(),
             max_file_size: default_max_file_size(),
             indexing_ready_timeout_seconds: default_indexing_ready_timeout_seconds(),
+            max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         }
     }
 }
@@ -1968,6 +2041,26 @@ mod tests {
     }
 
     #[test]
+    fn test_max_concurrent_server_starts_default_and_toml() {
+        assert_eq!(
+            ServerConfig::default()
+                .workspace
+                .max_concurrent_server_starts,
+            ServerStartConcurrency::DEFAULT
+        );
+        let config: ServerConfig =
+            toml::from_str("[workspace]\nmax_concurrent_server_starts = 3").unwrap();
+        assert_eq!(config.workspace.max_concurrent_server_starts.get(), 3);
+    }
+
+    #[test]
+    fn test_max_concurrent_server_starts_rejects_zero() {
+        let err = toml::from_str::<ServerConfig>("[workspace]\nmax_concurrent_server_starts = 0")
+            .unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err}");
+    }
+
+    #[test]
     fn test_load_from_nonexistent_file() {
         let result = ServerConfig::load_from(Path::new("/nonexistent/config.toml"));
         assert!(result.is_err());
@@ -2424,6 +2517,7 @@ mod tests {
             max_documents: DEFAULT_MAX_DOCUMENTS,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+            max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         };
 
         let map = workspace.build_extension_map();
@@ -2584,6 +2678,7 @@ mod tests {
             max_documents: DEFAULT_MAX_DOCUMENTS,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+            max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         };
 
         assert_eq!(
@@ -3055,6 +3150,7 @@ mod tests {
             max_documents: 500,
             max_file_size: 0,
             indexing_ready_timeout_seconds: 45,
+            max_concurrent_server_starts: ServerStartConcurrency::new(3).unwrap(),
         };
 
         let toml_content = toml::to_string_pretty(&original).unwrap();

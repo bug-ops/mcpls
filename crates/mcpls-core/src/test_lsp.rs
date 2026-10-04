@@ -80,6 +80,13 @@ pub struct FakeLanes {
 /// As [`fake_lsp_client`], but the client forwards notifications onto real
 /// lanes, returned for the test to drain or hand to a pump.
 pub fn fake_lsp_client_with_lanes() -> (LspClient, FakeServer, FakeLanes) {
+    fake_lsp_client_with_redactions(crate::redaction::Redactions::default())
+}
+
+/// As [`fake_lsp_client_with_lanes`], with the secrets the client hides.
+pub fn fake_lsp_client_with_redactions(
+    redactions: crate::redaction::Redactions,
+) -> (LspClient, FakeServer, FakeLanes) {
     let (transport, fake_server) = fake_transport();
     let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(32);
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
@@ -88,7 +95,7 @@ pub fn fake_lsp_client_with_lanes() -> (LspClient, FakeServer, FakeLanes) {
         transport,
         notification_tx,
         lifecycle_tx,
-        std::sync::Arc::default(),
+        std::sync::Arc::new(redactions),
     );
     (
         client,
@@ -297,7 +304,6 @@ pub const fn init_config_for(server_config: LspServerConfig) -> ServerInitConfig
         workspace_roots: vec![],
         initialization_options: None,
         position_encodings: vec![],
-        notification_tx: None,
     }
 }
 

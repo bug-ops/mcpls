@@ -93,6 +93,15 @@ fn block_on_guarded(runtime: Runtime, future: impl Future<Output = Outcome>) -> 
     }
 }
 
+/// The HTTP transport configuration selected by the command line.
+#[cfg(feature = "transport-http")]
+fn http_config(args: &Args, bind: std::net::SocketAddr) -> mcpls_core::HttpConfig {
+    mcpls_core::HttpConfig::new(bind)
+        .with_path(args.http_path.clone())
+        .with_stream_liveness(args.http_stream_liveness.into())
+        .with_allowed_origins(args.allowed_origins())
+}
+
 async fn run(args: Args) -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
 
@@ -118,14 +127,9 @@ async fn run(args: Args) -> Result<()> {
     let transport = {
         #[cfg(feature = "transport-http")]
         {
-            match args.listen {
-                Some(bind) => mcpls_core::Transport::Http(
-                    mcpls_core::HttpConfig::new(bind)
-                        .with_path(args.http_path.clone())
-                        .with_stream_liveness(args.http_stream_liveness.into()),
-                ),
-                None => mcpls_core::Transport::Stdio,
-            }
+            args.listen.map_or(mcpls_core::Transport::Stdio, |bind| {
+                mcpls_core::Transport::Http(http_config(&args, bind))
+            })
         }
         #[cfg(not(feature = "transport-http"))]
         {
@@ -154,6 +158,33 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_http_config_carries_the_allowed_origins_of_the_command_line() {
+        use clap::Parser as _;
+
+        let args = Args::parse_from([
+            "mcpls",
+            "--http-allowed-origin",
+            "https://app.example.com, http://[::1]:8080",
+            "--http-path",
+            "/api/mcp",
+        ]);
+
+        let cfg = http_config(&args, "127.0.0.1:3000".parse().unwrap());
+
+        let origins: Vec<String> = cfg
+            .allowed_origins
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            origins,
+            ["https://app.example.com:443", "http://[::1]:8080"]
+        );
+        assert_eq!(cfg.path.as_str(), "/api/mcp");
     }
 
     #[test]

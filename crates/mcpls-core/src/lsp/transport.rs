@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{Level, debug, trace, warn};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, RedactedText, Result};
 use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use crate::redaction::Redactions;
 
@@ -186,13 +186,16 @@ impl LspTransportReader {
             let content_length = headers
                 .get("content-length")
                 .ok_or_else(|| {
-                    Error::LspProtocolError("Missing Content-Length header".to_string())
+                    Error::LspProtocolError(RedactedText::fixed("Missing Content-Length header"))
                 })?
                 .parse::<usize>()
-                .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
+                .map_err(|e| {
+                    self.redactions
+                        .protocol_error(format_args!("Invalid Content-Length: {e}"))
+                })?;
 
             if content_length > MAX_CONTENT_LENGTH {
-                return Err(Error::LspProtocolError(format!(
+                return Err(self.redactions.protocol_error(format_args!(
                     "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
                 )));
             }
@@ -219,7 +222,7 @@ impl LspTransportReader {
                 continue;
             }
 
-            return parse_inbound_message(value);
+            return parse_inbound_message(value, &self.redactions);
         }
     }
 
@@ -253,7 +256,7 @@ impl LspTransportReader {
             // short final line truncated by a genuine EOF (caught above on
             // the next iteration) -- see `MAX_HEADER_LINE_BYTES`.
             if bytes_read == MAX_HEADER_LINE_BYTES && !line.ends_with('\n') {
-                return Err(Error::LspProtocolError(format!(
+                return Err(self.redactions.protocol_error(format_args!(
                     "LSP header line exceeded {MAX_HEADER_LINE_BYTES} bytes without a newline"
                 )));
             }
@@ -264,7 +267,7 @@ impl LspTransportReader {
 
             lines_read = lines_read.saturating_add(1);
             if lines_read > MAX_HEADERS {
-                return Err(Error::LspProtocolError(format!(
+                return Err(self.redactions.protocol_error(format_args!(
                     "LSP frame exceeded {MAX_HEADERS} header lines"
                 )));
             }
@@ -289,36 +292,41 @@ impl LspTransportReader {
         let mut buffer = vec![0u8; length];
         self.stdout.read_exact(&mut buffer).await?;
 
-        String::from_utf8(buffer)
-            .map_err(|e| Error::LspProtocolError(format!("Invalid UTF-8 in content: {e}")))
+        String::from_utf8(buffer).map_err(|e| {
+            self.redactions
+                .protocol_error(format_args!("Invalid UTF-8 in content: {e}"))
+        })
     }
 }
 
-fn parse_inbound_message(value: Value) -> Result<InboundMessage> {
+fn parse_inbound_message(value: Value, redactions: &Redactions) -> Result<InboundMessage> {
+    let invalid = |what: &str, e: serde_json::Error| {
+        redactions.protocol_error(format_args!("Invalid {what}: {e}"))
+    };
     if value.get("method").is_some() {
         if value.get("id").is_some() {
-            let request: JsonRpcRequest = serde_json::from_value(value)
-                .map_err(|e| Error::LspProtocolError(format!("Invalid request: {e}")))?;
+            let request: JsonRpcRequest =
+                serde_json::from_value(value).map_err(|e| invalid("request", e))?;
             Ok(InboundMessage::Request(request))
         } else {
-            let notification: JsonRpcNotification = serde_json::from_value(value)
-                .map_err(|e| Error::LspProtocolError(format!("Invalid notification: {e}")))?;
+            let notification: JsonRpcNotification =
+                serde_json::from_value(value).map_err(|e| invalid("notification", e))?;
             Ok(InboundMessage::Notification(notification))
         }
     } else if value.get("id").is_some()
         && (value.get("result").is_some() || value.get("error").is_some())
     {
-        let response: JsonRpcResponse = serde_json::from_value(value)
-            .map_err(|e| Error::LspProtocolError(format!("Invalid response: {e}")))?;
+        let response: JsonRpcResponse =
+            serde_json::from_value(value).map_err(|e| invalid("response", e))?;
         Ok(InboundMessage::Response(response))
     } else if value.get("id").is_some() {
-        Err(Error::LspProtocolError(
-            "Response messages with an id must include either result or error".to_string(),
-        ))
+        Err(Error::LspProtocolError(RedactedText::fixed(
+            "Response messages with an id must include either result or error",
+        )))
     } else {
-        Err(Error::LspProtocolError(
-            "Message must be a request, response, or notification".to_string(),
-        ))
+        Err(Error::LspProtocolError(RedactedText::fixed(
+            "Message must be a request, response, or notification",
+        )))
     }
 }
 
@@ -513,7 +521,7 @@ mod tests {
             "params": {"registrations": []}
         });
 
-        let message = parse_inbound_message(value).unwrap();
+        let message = parse_inbound_message(value, &Redactions::default()).unwrap();
         match message {
             InboundMessage::Request(request) => {
                 assert_eq!(request.id, RequestId::String("ts1".to_string()));
@@ -524,13 +532,30 @@ mod tests {
     }
 
     #[test]
+    fn test_protocol_error_redacts_secret_echoed_by_serde() {
+        let redactions =
+            Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]);
+        let value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": "SuperSecretValue123", "message": "boom"}
+        });
+
+        let error = parse_inbound_message(value, &redactions).unwrap_err();
+
+        let text = error.to_string();
+        assert!(text.contains("[redacted:API_TOKEN]"), "{text}");
+        assert!(!text.contains("SuperSecretValue123"), "{text}");
+    }
+
+    #[test]
     fn test_id_only_message_is_protocol_error() {
         let value = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1
         });
 
-        let error = parse_inbound_message(value).unwrap_err();
+        let error = parse_inbound_message(value, &Redactions::default()).unwrap_err();
         assert_matches!(error, Error::LspProtocolError(_));
         assert!(
             error

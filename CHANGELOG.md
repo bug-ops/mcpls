@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace roots admit root-level system symlink spellings of every root (for example `/tmp` on macOS), each verified to resolve to the root. (#609)
 - `SECURITY.md` and a documented trust model for workspace-supplied code execution. (#609)
 - User guide section "Verifying an edit" documents the apply, save and poll `get_diagnostics` loop; a speculative-edit preview tool is a documented non-goal. (#609)
+- `--http-allowed-origin` and `HttpConfig::with_allowed_origins` accept extra browser origins as the typed `AllowedOrigin`; a non-loopback `Host` is still rejected.
 
 ### Changed
 
@@ -99,6 +100,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `WorkspaceRoots::resolve` is replaced by the fallible `WorkspaceRoots::from_configured`, and `canonical_shared` is removed. (#580)
 - **Breaking:** `ServerConfig::load_from`, `load` and `load_with_trust` keep `workspace.roots` as written (not canonical; relative for a relative config path or the global config); `WorkspaceRoots::from_configured` canonicalizes at startup. (#580)
 - **Breaking:** `Translator` path handlers, `validate_path_against_roots` and `bridge::resources::parse_uri` use the new `ClientPath`; `Error` gains `InvalidClientPath` and `MalformedPath`. (#580)
+- **Breaking:** removed `LspServer::spawn_batch`, `ServerInitResult` and `ServerInitConfig::notification_tx`.
+- **Breaking:** `WorkspaceConfig` gains `max_concurrent_server_starts` (default 8), which bounds how many language servers start at once.
+- **Breaking:** `Error::LspProtocolError` carries `RedactedText`, so secrets echoed in protocol errors are redacted.
+- **Breaking:** JSON logs escape control and deceptive characters in every string, so a multi-line value reads as the literal `\n`.
+- **Breaking:** `get_server_logs` `min_level` is a lowercase enum, anything else is rejected, and `Translator::handle_server_logs` takes `Option<LogLevel>`.
+- **Breaking:** `HttpConfig::max_request_body` (`RequestBodyLimit`, clamped to 64 MiB) replaces `max_request_body_bytes`, `with_max_request_body_bytes` and `DEFAULT_MAX_REQUEST_BODY_BYTES`.
 
 ### Fixed
 
@@ -130,6 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Paths outside every workspace root are rejected before any filesystem access, narrowing the existence oracle for outside paths. (#533, #552)
 - Diagnostics published under a symlink spelling are keyed by the canonical path, merged per source on read, and now match subscriptions. (#532, #552)
 - A respawned LSP server's surviving child processes are now killed on Unix (#542). (#591)
+- Servers that wait for a configuration push, such as pyright, answer requests: `workspace/didChangeConfiguration` with null settings follows `initialized`.
+- Configured secrets echoed in pushed and pulled diagnostics (message, source, code, related information, `data`) and `$/progress` text are redacted before caching.
+- POST and resume response streams are cut 1 hour after they open (`ResponseStreamDeadline`), so a vanished peer no longer pins its session slot; a peer that stops reading a response still holds it until TCP gives up (#600).
 
 ## [0.6.0] - 2026-09-21
 

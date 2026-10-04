@@ -133,6 +133,51 @@ pub struct Args {
         env = "MCPLS_HTTP_STREAM_LIVENESS"
     )]
     pub http_stream_liveness: HttpStreamLiveness,
+
+    /// Browser origin allowed to reach the HTTP transport, besides loopback
+    /// origins on the bound port (repeatable or comma-separated).
+    ///
+    /// Must be `http://` or `https://` with a host and optional port, and no
+    /// path, query or user information; a missing port means the scheme
+    /// default. For pages whose requests reach mcpls with a loopback `Host`
+    /// (a tunnel, or a proxy that rewrites `Host`); a non-loopback `Host` is
+    /// still rejected. Only meaningful when `--listen` is set.
+    #[cfg(feature = "transport-http")]
+    #[arg(
+        long = "http-allowed-origin",
+        value_name = "ORIGIN",
+        env = "MCPLS_HTTP_ALLOWED_ORIGINS",
+        value_delimiter = ',',
+        value_parser = parse_allowed_origin
+    )]
+    http_allowed_origins: Vec<Option<mcpls_core::AllowedOrigin>>,
+}
+
+#[cfg(feature = "transport-http")]
+impl Args {
+    /// The extra allowed origins, without the empty segments an empty
+    /// variable, `,,` or a trailing comma leave behind.
+    #[must_use]
+    pub fn allowed_origins(&self) -> Vec<mcpls_core::AllowedOrigin> {
+        self.http_allowed_origins
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Parses one `--http-allowed-origin` value; a blank one is `None`, so
+/// `MCPLS_HTTP_ALLOWED_ORIGINS=` and a trailing comma are no-ops.
+#[cfg(feature = "transport-http")]
+fn parse_allowed_origin(
+    value: &str,
+) -> Result<Option<mcpls_core::AllowedOrigin>, mcpls_core::InvalidAllowedOrigin> {
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        value.parse().map(Some)
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +423,84 @@ mod tests {
             assert!(
                 Args::try_parse_from(["mcpls", "--http-stream-liveness", "sometimes"]).is_err()
             );
+        }
+
+        #[test]
+        fn test_http_allowed_origin_defaults_to_none() {
+            let args = Args::parse_from(["mcpls"]);
+            assert!(args.allowed_origins().is_empty());
+        }
+
+        #[test]
+        fn test_http_allowed_origin_ignores_empty_segments() {
+            for value in [
+                "",
+                ",,",
+                " , ",
+                ",https://a.example.com,",
+                "https://a.example.com,",
+            ] {
+                let args = Args::try_parse_from(["mcpls", "--http-allowed-origin", value])
+                    .unwrap_or_else(|e| panic!("{value:?} rejected: {e}"));
+                let expected = usize::from(value.contains("a.example.com"));
+                assert_eq!(args.allowed_origins().len(), expected, "{value:?}");
+            }
+        }
+
+        #[test]
+        fn test_http_allowed_origin_still_rejects_a_non_empty_invalid_segment() {
+            for value in [
+                "https://a.example.com,*",
+                "ftp://x,",
+                ",https://a.example.com/path",
+            ] {
+                assert!(
+                    Args::try_parse_from(["mcpls", "--http-allowed-origin", value]).is_err(),
+                    "{value:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_http_allowed_origin_repeats_and_splits_on_commas() {
+            let args = Args::parse_from([
+                "mcpls",
+                "--http-allowed-origin",
+                "https://a.example.com",
+                "--http-allowed-origin",
+                "http://b.example.com:8080, https://C.example.com",
+            ]);
+            let origins: Vec<String> = args
+                .allowed_origins()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(
+                origins,
+                [
+                    "https://a.example.com:443",
+                    "http://b.example.com:8080",
+                    "https://c.example.com:443"
+                ]
+            );
+        }
+
+        #[test]
+        fn test_http_allowed_origin_rejected_by_clap() {
+            for bad in [
+                "*",
+                "null",
+                "ftp://a.example.com",
+                "https://a.example.com/x",
+            ] {
+                let err =
+                    Args::try_parse_from(["mcpls", "--http-allowed-origin", bad]).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{bad:?}"
+                );
+            }
         }
 
         #[test]

@@ -25,7 +25,8 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 006 | [[lsp/006-server-spawn-install-hint/spec\|server-spawn-install-hint]] | research | P3 | implemented (#530) | #494 |
 | 007 | [[lsp/007-lsp-child-process-lifetime/spec\|lsp-child-process-lifetime]] | enhancement | P2 | implemented (#546) | #526 |
 | 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | implemented (declaration #567, type hierarchy, prepare rename, highlights, range formatting); semanticTokens and others non-goals | #567, #568, #569 |
-| 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | implemented | #572 |
+| 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | implemented | #572; #588, #589 (FR-019, FR-021) |
+| 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578 |
 
 ## mcp
 
@@ -42,6 +43,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 009 | [[mcp/009-speculative-edit-diagnostic-preview/spec\|speculative-edit-diagnostic-preview]] | research | P4 | decided (non-goal, verify loop documented) | #570 |
 | 010 | [[mcp/010-http-session-keepalive-with-live-stream/spec\|http-session-keepalive-with-live-stream]] | enhancement | P3 | implemented | #573 |
 | 011 | [[mcp/011-client-path-boundary-parsing/spec\|client-path-boundary-parsing]] | bug | P2 | implemented (#580) | #575 |
+| 012 | [[mcp/012-http-typed-limits-origins-stream-deadline/spec\|http-typed-limits-origins-stream-deadline]] | enhancement | P3 | implemented | #584, #585, #587 |
 
 ## bridge
 
@@ -68,6 +70,7 @@ neither belongs to a single `config`/`lsp`/`mcp`/`bridge` module.
 | 001 | [[runtime/001-log-json-bool-env-parsing/spec\|log-json-bool-env-parsing]] | bug | P2 | implemented (#314) | — |
 | 002 | [[runtime/002-sigterm-stdin-blocking-pool-hang/spec\|sigterm-stdin-blocking-pool-hang]] | bug | P1 | implemented (#321, #328) | — |
 | 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | implemented (tsserver pin, docs, SECURITY.md); untrusted-workspace mode deferred | #566 |
+| 004 | [[runtime/004-server-text-hygiene/spec\|server-text-hygiene]] | bug | P3 | implemented | #581, #582, #583 |
 
 ## testing
 

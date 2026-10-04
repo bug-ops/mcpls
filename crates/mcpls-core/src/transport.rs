@@ -62,10 +62,15 @@ pub enum Transport {
 /// use a reverse proxy that rewrites the `Host` header.
 ///
 /// A request carrying an `Origin` header is accepted only when it names a
-/// loopback origin (`localhost`, `127.0.0.1`, `[::1]`) on the bound port;
-/// anything else, including `Origin: null`, is answered with `403`. A request
-/// without `Origin` (every non-browser client) is unaffected, so a proxy in
-/// front of browser clients must rewrite or strip `Origin`.
+/// loopback origin (`localhost`, `127.0.0.1`, `[::1]`) on the bound port or
+/// one of [`HttpConfig::allowed_origins`]; anything else, including
+/// `Origin: null`, is answered with `403`. A request without `Origin` (every
+/// non-browser client) is unaffected.
+///
+/// [`HttpConfig::allowed_origins`] serves browser pages whose requests reach
+/// mcpls with a loopback `Host`, through a tunnel or a reverse proxy that
+/// rewrites `Host`. It does not make a non-loopback `Host` acceptable: that
+/// check runs first and stays loopback-only.
 ///
 /// # Examples
 ///
@@ -89,17 +94,16 @@ pub struct HttpConfig {
     /// this value, so a reverse proxy must not rely on `path` alone to
     /// restrict which URLs reach mcpls.
     pub path: HttpPath,
-    /// Maximum size, in bytes, of a single POST request body.
+    /// Maximum size of a single POST request body.
     ///
     /// Enforced by `rmcp`'s `StreamableHttpService` while streaming the body,
     /// independent of `Content-Length` or chunked transfer encoding. Requests
     /// exceeding this limit receive `413 Payload Too Large`. Defaults to
-    /// [`HttpConfig::DEFAULT_MAX_REQUEST_BODY_BYTES`] (4 MiB), which
-    /// comfortably covers MCP tool-call request bodies (large results, e.g.
-    /// from `workspace/symbol` or bulk edits, are returned in the response,
-    /// which this limit does not constrain). A value of `0` rejects every
-    /// POST body.
-    pub max_request_body_bytes: usize,
+    /// [`RequestBodyLimit::DEFAULT`] (4 MiB), which comfortably covers MCP
+    /// tool-call request bodies (large results, e.g. from `workspace/symbol`
+    /// or bulk edits, are returned in the response, which this limit does not
+    /// constrain). Larger values are clamped by [`RequestBodyLimit::new`].
+    pub max_request_body: RequestBodyLimit,
     /// Maximum number of concurrent HTTP sessions.
     ///
     /// This is a hard bound, enforced atomically at session creation via a
@@ -137,14 +141,25 @@ pub struct HttpConfig {
     /// default lease while probing, none when it is
     /// [`StreamLiveness::Disabled`].
     pub listen_lease: Option<ListenLease>,
+    /// Browser origins accepted in addition to the loopback origins on the
+    /// bound port. Empty by default.
+    pub allowed_origins: Box<[AllowedOrigin]>,
+    /// Longest a POST or request-wise resume response stream stays open,
+    /// counted from when it opens.
+    ///
+    /// A total lifetime bound, not an idle timeout: the stream is cut when it
+    /// elapses however much it is still sending, which releases its hold on
+    /// the session so the idle reaper can expire it. While the connection's
+    /// write to a peer that stopped reading is stuck the body is not polled,
+    /// so the cut cannot fire and the session slot and the
+    /// [`HttpConfig::max_concurrent_connections`] permit wait for TCP (#600).
+    /// Defaults to [`ResponseStreamDeadline::DEFAULT`].
+    pub response_stream_deadline: ResponseStreamDeadline,
 }
 
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 impl HttpConfig {
-    /// Default request body size cap (4 MiB), matching `rmcp`'s own default.
-    pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
-
     /// Create an [`HttpConfig`] mounted at [`HttpPath::default`] with default
     /// body-size, session, timeout and connection caps.
     ///
@@ -161,13 +176,15 @@ impl HttpConfig {
         Self {
             bind,
             path: HttpPath::default(),
-            max_request_body_bytes: Self::DEFAULT_MAX_REQUEST_BODY_BYTES,
+            max_request_body: RequestBodyLimit::DEFAULT,
             max_concurrent_sessions: SessionLimit::DEFAULT,
             session_idle_timeout: IdleTimeout::DEFAULT,
             header_read_timeout: HeaderReadTimeout::DEFAULT,
             max_concurrent_connections: ConnectionLimit::DEFAULT,
             stream_liveness: StreamLiveness::DEFAULT,
             listen_lease: None,
+            allowed_origins: Box::default(),
+            response_stream_deadline: ResponseStreamDeadline::DEFAULT,
         }
     }
 
@@ -188,10 +205,20 @@ impl HttpConfig {
         self
     }
 
-    /// Override the maximum POST request body size in bytes.
+    /// Override the maximum POST request body size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::{HttpConfig, RequestBodyLimit};
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap())
+    ///     .with_max_request_body(RequestBodyLimit::new(1024).unwrap());
+    /// assert_eq!(cfg.max_request_body.get(), 1024);
+    /// ```
     #[must_use]
-    pub const fn with_max_request_body_bytes(mut self, bytes: usize) -> Self {
-        self.max_request_body_bytes = bytes;
+    pub const fn with_max_request_body(mut self, limit: RequestBodyLimit) -> Self {
+        self.max_request_body = limit;
         self
     }
 
@@ -213,6 +240,45 @@ impl HttpConfig {
     #[must_use]
     pub const fn with_max_concurrent_connections(mut self, max: ConnectionLimit) -> Self {
         self.max_concurrent_connections = max;
+        self
+    }
+
+    /// Accept browser requests from `origins` in addition to the loopback
+    /// origins on the bound port.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::{AllowedOrigin, HttpConfig};
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap())
+    ///     .with_allowed_origins(["https://app.example.com".parse::<AllowedOrigin>().unwrap()]);
+    /// assert_eq!(cfg.allowed_origins.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn with_allowed_origins(
+        mut self,
+        origins: impl IntoIterator<Item = AllowedOrigin>,
+    ) -> Self {
+        self.allowed_origins = origins.into_iter().collect();
+        self
+    }
+
+    /// Override how long a POST or resume response stream may stay open.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::{HttpConfig, ResponseStreamDeadline};
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap())
+    ///     .with_response_stream_deadline(ResponseStreamDeadline::new(Duration::from_mins(30)).unwrap());
+    /// assert_eq!(cfg.response_stream_deadline.get(), Duration::from_mins(30));
+    /// ```
+    #[must_use]
+    pub const fn with_response_stream_deadline(mut self, deadline: ResponseStreamDeadline) -> Self {
+        self.response_stream_deadline = deadline;
         self
     }
 
@@ -312,23 +378,29 @@ macro_rules! non_zero_duration {
 
 #[cfg(feature = "transport-http")]
 macro_rules! non_zero_limit {
-    ($(#[$meta:meta])* $name:ident, $default:expr, $default_doc:literal) => {
+    (
+        $(#[$meta:meta])* $name:ident,
+        $default:expr, $default_doc:literal,
+        $max:expr, $max_doc:literal
+    ) => {
         $(#[$meta])*
         #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name(usize);
 
+        const _: () = assert!($default <= $max, "the default limit must not exceed the maximum");
+
         impl $name {
             #[doc = $default_doc]
             pub const DEFAULT: Self = Self($default);
 
-            /// `None` for zero; larger values are clamped to the semaphore maximum.
+            #[doc = concat!("`None` for zero; larger values are clamped to ", $max_doc, ".")]
             #[must_use]
             pub fn new(max: usize) -> Option<Self> {
-                (max > 0).then(|| Self(max.min(tokio::sync::Semaphore::MAX_PERMITS)))
+                (max > 0).then(|| Self(max.min($max)))
             }
 
-            /// The wrapped limit, between 1 and the semaphore maximum.
+            #[doc = concat!("The wrapped limit, between 1 and ", $max_doc, ".")]
             #[must_use]
             pub const fn get(self) -> usize {
                 self.0
@@ -371,6 +443,38 @@ non_zero_duration! {
     /// ```
     pub ProbeDeadline, 30, "30 seconds."
 }
+
+#[cfg(feature = "transport-http")]
+non_zero_duration! {
+    /// Non-zero time a POST (or request-wise resume) response stream may stay
+    /// open before it is cut, for [`HttpConfig::response_stream_deadline`].
+    ///
+    /// A zero deadline would cut every stream at once, so it is
+    /// unrepresentable. The default covers the longest single tool call: two
+    /// maximum-length respawn or request waits, an indexing wait and margin.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::ResponseStreamDeadline;
+    ///
+    /// assert!(ResponseStreamDeadline::new(Duration::ZERO).is_none());
+    /// let deadline = ResponseStreamDeadline::new(Duration::from_mins(5)).unwrap();
+    /// assert_eq!(deadline.get(), Duration::from_mins(5));
+    /// assert_eq!(ResponseStreamDeadline::DEFAULT.get(), Duration::from_hours(1));
+    /// ```
+    pub ResponseStreamDeadline, 3600, "1 hour."
+}
+
+#[cfg(feature = "transport-http")]
+const _: () = assert!(
+    ResponseStreamDeadline::DEFAULT.get().as_secs()
+        >= 2 * crate::config::MAX_TIMEOUT_SECONDS
+            + crate::bridge::INDEXING_STALENESS_BOUND.as_secs()
+            + 300,
+    "the default response stream deadline must outlast the longest single tool call"
+);
 
 /// Why a string is not a valid [`HttpPath`].
 ///
@@ -477,6 +581,184 @@ impl std::str::FromStr for HttpPath {
     }
 }
 
+/// Why a string is not a valid [`AllowedOrigin`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::{AllowedOrigin, InvalidAllowedOrigin};
+///
+/// assert_eq!("*".parse::<AllowedOrigin>(), Err(InvalidAllowedOrigin::Wildcard));
+/// assert_eq!("null".parse::<AllowedOrigin>(), Err(InvalidAllowedOrigin::Null));
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidAllowedOrigin {
+    /// The string is not a URI, or its authority is not a host with an
+    /// optional port (an IPv6 host needs brackets).
+    #[error("not a valid origin")]
+    Malformed,
+    /// `null`, the origin of sandboxed and opaque contexts.
+    #[error("`null` is not an origin")]
+    Null,
+    /// A wildcard such as `*` or `:*`.
+    #[error("wildcards are not allowed")]
+    Wildcard,
+    /// The scheme is missing or is neither `http` nor `https`.
+    #[error("the scheme must be `http` or `https`")]
+    UnsupportedScheme,
+    /// The authority carries `user:password@`.
+    #[error("user information is not allowed")]
+    UserInfo,
+    /// The host is empty.
+    #[error("the host is missing")]
+    MissingHost,
+    /// A path other than `/`.
+    #[error("a path is not allowed")]
+    Path,
+    /// A query string.
+    #[error("a query is not allowed")]
+    Query,
+}
+
+/// `http` or `https`, the schemes a browser page can have.
+#[cfg(feature = "transport-http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginScheme {
+    Http,
+    Https,
+}
+
+#[cfg(feature = "transport-http")]
+impl OriginScheme {
+    const fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+/// A browser origin allowed to reach the HTTP transport, validated so it
+/// round-trips through `rmcp`'s allowlist.
+///
+/// `rmcp` silently drops allowlist entries it cannot parse, so an invalid
+/// string would leave the origin blocked with no error. This type is built
+/// only from `http://` or `https://` origins with a host and no userinfo,
+/// path or query. The host is lowercased, IPv6 hosts keep their brackets, and
+/// a missing port becomes the scheme default, and a port that is not a
+/// number up to 65535 is rejected, so every entry names exactly one
+/// `(scheme, host, port)`. Surrounding whitespace is ignored.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::AllowedOrigin;
+///
+/// let origin: AllowedOrigin = "https://App.Example.com".parse().unwrap();
+/// assert_eq!(origin.to_string(), "https://app.example.com:443");
+/// assert_eq!("http://[::1]:8080".parse::<AllowedOrigin>().unwrap().to_string(), "http://[::1]:8080");
+/// assert!("https://example.com/path".parse::<AllowedOrigin>().is_err());
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedOrigin {
+    scheme: OriginScheme,
+    host: Box<str>,
+    port: u16,
+}
+
+#[cfg(feature = "transport-http")]
+impl AllowedOrigin {
+    /// The origins of a page served by a loopback listener on `port`:
+    /// `localhost`, `127.0.0.1` and `[::1]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::AllowedOrigin;
+    ///
+    /// let origins = AllowedOrigin::loopback(3000);
+    /// assert_eq!(origins[1].to_string(), "http://127.0.0.1:3000");
+    /// ```
+    #[must_use]
+    pub fn loopback(port: u16) -> [Self; 3] {
+        ["localhost", "127.0.0.1", "[::1]"].map(|host| Self {
+            scheme: OriginScheme::Http,
+            host: host.into(),
+            port,
+        })
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl std::fmt::Display for AllowedOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}://{}:{}", self.scheme.as_str(), self.host, self.port)
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl std::str::FromStr for AllowedOrigin {
+    type Err = InvalidAllowedOrigin;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use axum::http::Uri;
+
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("null") {
+            return Err(InvalidAllowedOrigin::Null);
+        }
+        if s.contains('*') {
+            return Err(InvalidAllowedOrigin::Wildcard);
+        }
+        let uri: Uri = s.parse().map_err(|_| InvalidAllowedOrigin::Malformed)?;
+        let scheme = match uri.scheme_str() {
+            Some("http") => OriginScheme::Http,
+            Some("https") => OriginScheme::Https,
+            _ => return Err(InvalidAllowedOrigin::UnsupportedScheme),
+        };
+        let authority = uri.authority().ok_or(InvalidAllowedOrigin::Malformed)?;
+        if authority.as_str().contains('@') {
+            return Err(InvalidAllowedOrigin::UserInfo);
+        }
+        if uri.path() != "/" {
+            return Err(InvalidAllowedOrigin::Path);
+        }
+        if uri.query().is_some() {
+            return Err(InvalidAllowedOrigin::Query);
+        }
+        let host = authority.host();
+        if host.is_empty() {
+            return Err(InvalidAllowedOrigin::MissingHost);
+        }
+        let port = match authority.as_str().get(host.len()..) {
+            Some("" | ":") => scheme.default_port(),
+            Some(suffix) => suffix
+                .strip_prefix(':')
+                .filter(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|digits| digits.parse().ok())
+                .ok_or(InvalidAllowedOrigin::Malformed)?,
+            None => return Err(InvalidAllowedOrigin::Malformed),
+        };
+        Ok(Self {
+            scheme,
+            host: host.to_ascii_lowercase().into(),
+            port,
+        })
+    }
+}
+
 /// How a session's standalone GET (SSE) stream is checked for a dead peer.
 ///
 /// With [`StreamLiveness::Probe`], mcpls sends an MCP `ping` request on the
@@ -504,10 +786,13 @@ impl std::str::FromStr for HttpPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamLiveness {
     /// Never probe; a vanished peer is noticed only when the OS gives up on
-    /// the connection. Without proof of life an open GET stream does not keep
-    /// its session alive: the session expires after the idle timeout (5
-    /// minutes) without inbound requests, even while the stream receives
-    /// notifications.
+    /// the connection. A POST or resume stream is still cut once it has been
+    /// open for [`ResponseStreamDeadline`]; a peer that stopped reading a
+    /// response keeps its session slot and connection permit until TCP gives
+    /// up (#600), which no probe could free either. Without proof of life an
+    /// open GET stream does not keep its session alive: the session expires
+    /// after the idle timeout (5 minutes) without inbound requests, even while
+    /// the stream receives notifications.
     Disabled,
     /// Probe every `interval`; close the stream when unanswered for
     /// `deadline`.
@@ -570,7 +855,9 @@ non_zero_limit! {
     /// ```
     ConnectionLimit,
     512,
-    "512: room for 100 sessions each holding a GET stream, a `subscriptions/listen` stream and one in-flight POST."
+    "512: room for 100 sessions each holding a GET stream, a `subscriptions/listen` stream and one in-flight POST.",
+    tokio::sync::Semaphore::MAX_PERMITS,
+    "the most a [`tokio::sync::Semaphore`] supports"
 }
 
 #[cfg(feature = "transport-http")]
@@ -592,7 +879,35 @@ non_zero_limit! {
     /// ```
     SessionLimit,
     100,
-    "100 concurrent sessions."
+    "100 concurrent sessions.",
+    tokio::sync::Semaphore::MAX_PERMITS,
+    "the most a [`tokio::sync::Semaphore`] supports"
+}
+
+#[cfg(feature = "transport-http")]
+non_zero_limit! {
+    /// Non-zero cap, in bytes, on a single POST request body for
+    /// [`HttpConfig::max_request_body`], clamped to 64 MiB.
+    ///
+    /// `rmcp` buffers a body in memory while enforcing the cap, so the
+    /// maximum bounds that buffering. A zero cap would reject every POST
+    /// body, so it is unrepresentable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::RequestBodyLimit;
+    ///
+    /// assert!(RequestBodyLimit::new(0).is_none());
+    /// assert_eq!(RequestBodyLimit::new(1024).unwrap().get(), 1024);
+    /// assert_eq!(RequestBodyLimit::DEFAULT.get(), 4 * 1024 * 1024);
+    /// assert_eq!(RequestBodyLimit::new(usize::MAX).unwrap().get(), 64 * 1024 * 1024);
+    /// ```
+    RequestBodyLimit,
+    4 * 1024 * 1024,
+    "4 MiB, matching `rmcp`'s own default.",
+    64 * 1024 * 1024,
+    "64 MiB"
 }
 
 #[cfg(feature = "transport-http")]
@@ -903,11 +1218,17 @@ pub(crate) async fn run_stdio(
 /// open GET stream does not hold its session: the session expires
 /// [`IdleTimeout::DEFAULT`] after the last inbound request even while the stream
 /// receives notifications, and such clients must send a request (any `POST`,
-/// for example a `ping`) more often than that. A POST response stream whose
-/// peer vanished mid-write keeps its session until TCP gives up on the
-/// connection (the `TCP_USER_TIMEOUT` above on Linux and Android, the OS
-/// default elsewhere, or the reverse proxy's timeout), since rmcp's `keep_alive`
-/// no longer frees it after 5 minutes. Clients should send `DELETE` on
+/// for example a `ping`) more often than that. A POST or request-wise resume
+/// response stream is cut [`ResponseStreamDeadline::DEFAULT`] (1 hour) after it
+/// opens, in both liveness modes, whatever it is still sending (a stream
+/// lifetime bound sized for the longest legitimate tool call): the stream then
+/// stops holding the session open and the reaper expires the session after the
+/// idle timeout, so a vanished peer no longer pins its slot for good. While
+/// hyper's write of a response to a peer that stopped reading is stuck, the
+/// body is not polled and the cut cannot fire: the session slot and the
+/// `max_concurrent_connections` permit wait for TCP to give up (the
+/// `TCP_USER_TIMEOUT` above on Linux and Android, the OS default elsewhere, or
+/// the reverse proxy's timeout; #600). Clients should send `DELETE` on
 /// shutdown; after an expiry they must re-initialize and re-subscribe.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
@@ -923,7 +1244,7 @@ pub(crate) async fn run_stdio(
 ///
 /// # Resource limits
 ///
-/// POST bodies exceeding `cfg.max_request_body_bytes` are rejected with
+/// POST bodies exceeding `cfg.max_request_body` are rejected with
 /// `413 Payload Too Large` (enforced by `rmcp`). Once `cfg.max_concurrent_sessions`
 /// sessions are active, a request that would start a new one is rejected with
 /// `429 Too Many Requests` — enforced as a hard bound at session creation by
@@ -976,19 +1297,6 @@ pub(crate) async fn run_http(
     serve_http(listener, mcp_server, cfg, shutdown_signal).await
 }
 
-/// Browser origins of a page served by this process's own loopback listener.
-///
-/// rmcp accepts a request without an `Origin` header, so non-browser clients
-/// are unaffected; a browser page on any other origin gets `403`.
-#[cfg(feature = "transport-http")]
-fn loopback_origins(port: u16) -> [String; 3] {
-    [
-        format!("http://localhost:{port}"),
-        format!("http://127.0.0.1:{port}"),
-        format!("http://[::1]:{port}"),
-    ]
-}
-
 /// Serves the MCP HTTP transport on an already-bound `listener`.
 ///
 /// Split out of [`run_http`] so callers (tests in particular) can bind the
@@ -1016,7 +1324,8 @@ pub(crate) async fn serve_http(
 
     let session_manager = Arc::new(
         CappedSessionManager::new(cfg.max_concurrent_sessions, cfg.session_idle_timeout)
-            .with_stream_liveness(cfg.stream_liveness),
+            .with_stream_liveness(cfg.stream_liveness)
+            .with_response_stream_deadline(cfg.response_stream_deadline),
     );
     let reaper_manager = Arc::clone(&session_manager);
     let cancel = CancellationToken::new();
@@ -1028,11 +1337,18 @@ pub(crate) async fn serve_http(
     let mcp_for_factory = mcp_server;
     let local_addr = listener.local_addr()?;
     // StreamableHttpServerConfig is #[non_exhaustive]; construct via Default then mutate.
+    // rmcp accepts a request without `Origin`, so non-browser clients are
+    // unaffected; a browser page on any origin outside this list gets `403`.
+    // TODO(#597): `allowed_hosts` stays loopback-only and is checked before `Origin`
+    let allowed_origins = AllowedOrigin::loopback(local_addr.port())
+        .into_iter()
+        .chain(cfg.allowed_origins.iter().cloned())
+        .map(|origin| origin.to_string());
     let mut http_cfg = StreamableHttpServerConfig::default()
-        .with_allowed_origins(loopback_origins(local_addr.port()))
+        .with_allowed_origins(allowed_origins)
         .enforce_origin_validation();
     http_cfg.cancellation_token = cancel.clone();
-    http_cfg.max_request_body_bytes = cfg.max_request_body_bytes;
+    http_cfg.max_request_body_bytes = cfg.max_request_body.get();
 
     // `for_new_session`, not `.clone()`: every session must get its own
     // subscription state (#478) rather than sharing `mcp_for_factory`'s, while
@@ -1072,9 +1388,8 @@ pub(crate) async fn serve_http(
              any transport — place this endpoint behind a reverse proxy that enforces \
              authentication. mcpls itself enforces only a header-read/idle timeout and a connection \
              cap. The proxy must also rewrite the Host header, since rmcp's Host validation \
-             allows only localhost/127.0.0.1/::1 by default, and rewrite or strip the Origin \
-             header of browser clients, since only loopback origins on the bound port are \
-             allowed"
+             allows only localhost/127.0.0.1/::1 by default, and browser clients may use only \
+             loopback origins on the bound port or the configured allowed origins"
         );
     }
 
@@ -1162,6 +1477,7 @@ pub(crate) async fn serve_http(
 /// taken before `accept` so a full house leaves new connections queued in
 /// the kernel rather than accepted-and-idle.
 #[cfg(feature = "transport-http")]
+// TODO(#600): a peer that stops reading holds its connection permit and session slot
 async fn serve_http1(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -1419,6 +1735,7 @@ struct CappedSessionManager {
     slots: StdMutex<std::collections::HashMap<SessionId, SessionSlot>>,
     idle: IdleTimeout,
     stream_liveness: StreamLiveness,
+    response_stream_deadline: ResponseStreamDeadline,
 }
 
 #[cfg(feature = "transport-http")]
@@ -1432,11 +1749,17 @@ impl CappedSessionManager {
             slots: StdMutex::new(std::collections::HashMap::new()),
             idle,
             stream_liveness: StreamLiveness::Disabled,
+            response_stream_deadline: ResponseStreamDeadline::DEFAULT,
         }
     }
 
     const fn with_stream_liveness(mut self, stream_liveness: StreamLiveness) -> Self {
         self.stream_liveness = stream_liveness;
+        self
+    }
+
+    const fn with_response_stream_deadline(mut self, deadline: ResponseStreamDeadline) -> Self {
+        self.response_stream_deadline = deadline;
         self
     }
 
@@ -1519,6 +1842,26 @@ impl CappedSessionManager {
         stream.map(move |message| {
             let _keep_open = &guard;
             message
+        })
+    }
+
+    /// [`Self::guarded`], cut once the response stream deadline, counted from
+    /// this call, passes.
+    fn bounded<S: futures::Stream>(
+        guard: Option<StreamGuard>,
+        stream: S,
+        deadline: ResponseStreamDeadline,
+        session: SessionId,
+    ) -> impl futures::Stream<Item = S::Item> + use<S> {
+        use futures::StreamExt as _;
+
+        let timer = tokio::time::sleep(deadline.get());
+        Self::guarded(guard, stream).take_until(async move {
+            timer.await;
+            tracing::debug!(
+                session = %SessionFingerprint(&session),
+                "closing response stream at its deadline"
+            );
         })
     }
 
@@ -1763,7 +2106,12 @@ impl SessionManager for CappedSessionManager {
     {
         let guard = self.open_guard(id);
         let stream = self.inner.create_stream(id, message).await?;
-        Ok(Self::guarded(guard, stream))
+        Ok(Self::bounded(
+            guard,
+            stream,
+            self.response_stream_deadline,
+            id.clone(),
+        ))
     }
 
     async fn accept_message(
@@ -1805,7 +2153,7 @@ impl SessionManager for CappedSessionManager {
         Ok(if common {
             self.standalone(id, guard, stream)?.left_stream()
         } else {
-            Self::guarded(guard, stream).right_stream()
+            Self::bounded(guard, stream, self.response_stream_deadline, id.clone()).right_stream()
         })
     }
 }
@@ -2116,18 +2464,15 @@ mod tests {
         #[test]
         fn test_http_config_new_uses_default_limits() {
             let cfg = HttpConfig::new("127.0.0.1:3003".parse().unwrap());
-            assert_eq!(
-                cfg.max_request_body_bytes,
-                HttpConfig::DEFAULT_MAX_REQUEST_BODY_BYTES
-            );
+            assert_eq!(cfg.max_request_body, crate::RequestBodyLimit::DEFAULT);
             assert_eq!(cfg.max_concurrent_sessions, crate::SessionLimit::DEFAULT);
         }
 
         #[test]
-        fn test_http_config_with_max_request_body_bytes_overrides_default() {
+        fn test_http_config_with_max_request_body_overrides_default() {
             let cfg = HttpConfig::new("127.0.0.1:3004".parse().unwrap())
-                .with_max_request_body_bytes(1024);
-            assert_eq!(cfg.max_request_body_bytes, 1024);
+                .with_max_request_body(crate::RequestBodyLimit::new(1024).unwrap());
+            assert_eq!(cfg.max_request_body.get(), 1024);
             assert_eq!(cfg.max_concurrent_sessions, crate::SessionLimit::DEFAULT);
         }
 
@@ -2136,10 +2481,7 @@ mod tests {
             let cfg = HttpConfig::new("127.0.0.1:3005".parse().unwrap())
                 .with_max_concurrent_sessions(crate::SessionLimit::new(5).unwrap());
             assert_eq!(cfg.max_concurrent_sessions.get(), 5);
-            assert_eq!(
-                cfg.max_request_body_bytes,
-                HttpConfig::DEFAULT_MAX_REQUEST_BODY_BYTES
-            );
+            assert_eq!(cfg.max_request_body, crate::RequestBodyLimit::DEFAULT);
         }
 
         /// Verifies `run_http` binds successfully and accepts TCP connections.
@@ -2581,8 +2923,10 @@ mod tests {
                 "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{extra_headers}Content-Length: {}\r\n\r\n",
                 body.len()
             );
-            stream.write_all(request.as_bytes()).await.unwrap();
-            stream.write_all(body).await.unwrap();
+            // One write, so a server that answers from the headers alone does
+            // not close on an unread body and reset the connection.
+            let wire = [request.as_bytes(), body].concat();
+            stream.write_all(&wire).await.unwrap();
 
             let mut response = Vec::new();
             let mut buf = [0u8; 8192];
@@ -2605,13 +2949,15 @@ mod tests {
             String::from_utf8_lossy_owned(response)
         }
 
-        /// A POST body exceeding `cfg.max_request_body_bytes` must be rejected
+        /// A POST body exceeding `cfg.max_request_body` must be rejected
         /// with `413 Payload Too Large`, proving the config value reaches
         /// `StreamableHttpServerConfig::max_request_body_bytes`.
         #[tokio::test]
         async fn test_run_http_rejects_oversized_body_with_413() {
-            let (addr, server_task) =
-                spawn_http_server(test_server(), |cfg| cfg.with_max_request_body_bytes(64)).await;
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_max_request_body(crate::RequestBodyLimit::new(64).unwrap())
+            })
+            .await;
 
             let oversized_body = vec![b'a'; 65];
             let response = raw_http_post(
@@ -2630,14 +2976,16 @@ mod tests {
             server_task.abort();
         }
 
-        /// A POST body within `cfg.max_request_body_bytes` must not be rejected
+        /// A POST body within `cfg.max_request_body` must not be rejected
         /// for size — it reaches JSON deserialization instead (the body here is
         /// intentionally not valid JSON-RPC, so a non-413 error distinguishes
         /// "passed the size check" from "was a valid request").
         #[tokio::test]
         async fn test_run_http_accepts_body_within_limit() {
-            let (addr, server_task) =
-                spawn_http_server(test_server(), |cfg| cfg.with_max_request_body_bytes(64)).await;
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_max_request_body(crate::RequestBodyLimit::new(64).unwrap())
+            })
+            .await;
 
             let small_body = vec![b'a'; 32];
             let response = raw_http_post(
@@ -2861,6 +3209,121 @@ mod tests {
                 assert!(
                     response.starts_with("HTTP/1.1 403"),
                     "{method} with a foreign Origin should be rejected, got: {response}"
+                );
+            }
+
+            server_task.abort();
+        }
+
+        #[test]
+        fn test_allowed_origin_normalizes_scheme_host_and_port() {
+            for (input, expected) in [
+                ("https://app.example.com", "https://app.example.com:443"),
+                ("http://app.example.com", "http://app.example.com:80"),
+                (
+                    "HTTPS://App.Example.COM:8443",
+                    "https://app.example.com:8443",
+                ),
+                ("http://app.example.com/", "http://app.example.com:80"),
+                ("http://[::1]:8080", "http://[::1]:8080"),
+                ("http://[2001:DB8::1]", "http://[2001:db8::1]:80"),
+                ("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
+                ("  https://a.example.com  ", "https://a.example.com:443"),
+            ] {
+                let origin: crate::AllowedOrigin = input.parse().unwrap();
+                assert_eq!(origin.to_string(), expected, "{input}");
+                assert_eq!(origin.to_string().parse(), Ok(origin), "{input}");
+            }
+        }
+
+        #[test]
+        fn test_allowed_origin_rejects_each_invalid_shape() {
+            use crate::InvalidAllowedOrigin as Invalid;
+
+            for (input, expected) in [
+                ("null", Invalid::Null),
+                ("NULL", Invalid::Null),
+                ("*", Invalid::Wildcard),
+                ("http://example.com:*", Invalid::Wildcard),
+                ("http://*.example.com", Invalid::Wildcard),
+                ("ftp://example.com", Invalid::UnsupportedScheme),
+                ("example.com", Invalid::UnsupportedScheme),
+                ("//example.com", Invalid::UnsupportedScheme),
+                ("http://user:pass@example.com", Invalid::UserInfo),
+                ("http://example.com/app", Invalid::Path),
+                ("http://example.com?x=1", Invalid::Query),
+                ("http://::1:8080", Invalid::Malformed),
+                ("https://a.com:99999", Invalid::Malformed),
+                ("https://a.com:+80", Invalid::Malformed),
+                ("https://[::1]x:80", Invalid::Malformed),
+                ("http://", Invalid::Malformed),
+                ("", Invalid::Malformed),
+            ] {
+                assert_eq!(
+                    input.parse::<crate::AllowedOrigin>(),
+                    Err(expected),
+                    "{input:?}"
+                );
+            }
+        }
+
+        /// #584: every configured origin is matched by rmcp's own parser, which
+        /// silently drops entries it cannot read, against the `Origin` a
+        /// browser would send; unlisted origins stay rejected.
+        #[tokio::test]
+        async fn test_run_http_accepts_configured_allowed_origins() {
+            let configured = [
+                "https://app.example.com",
+                "http://[::1]:8080",
+                "http://[2001:db8::1]:8080",
+                "HTTPS://Cased.Example.com:8443",
+                "http://example.org:9000",
+            ];
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_allowed_origins(
+                    configured
+                        .iter()
+                        .map(|origin| origin.parse::<crate::AllowedOrigin>().unwrap()),
+                )
+            })
+            .await;
+            let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+            let post = |origin: &'static str| async move {
+                raw_http_post(
+                    addr,
+                    "/mcp",
+                    &format!(
+                        "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nOrigin: {origin}\r\n"
+                    ),
+                    initialize_body,
+                )
+                .await
+            };
+
+            for accepted in [
+                "https://app.example.com",
+                "https://app.example.com:443",
+                "http://[::1]:8080",
+                "http://[2001:db8::1]:8080",
+                "https://cased.example.com:8443",
+                "http://example.org:9000",
+            ] {
+                let response = post(accepted).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 200"),
+                    "Origin {accepted} should be accepted, got: {response}"
+                );
+            }
+            for rejected in [
+                "http://app.example.com",
+                "https://app.example.com:444",
+                "http://example.org:9001",
+                "http://evil.example",
+            ] {
+                let response = post(rejected).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 403"),
+                    "Origin {rejected} should be rejected, got: {response}"
                 );
             }
 
@@ -3512,11 +3975,22 @@ mod tests {
             rmcp::transport::streamable_http_server::session::SessionId,
             tokio::task::JoinHandle<()>,
         ) {
+            initialized_session_serving(manager, test_server()).await
+        }
+
+        /// [`initialized_session`] serving `server`.
+        async fn initialized_session_serving(
+            manager: &CappedSessionManager,
+            server: crate::mcp::McplsServer,
+        ) -> (
+            rmcp::transport::streamable_http_server::session::SessionId,
+            tokio::task::JoinHandle<()>,
+        ) {
             use rmcp::ServiceExt as _;
 
             let (id, transport) = manager.create_session().await.unwrap();
             let serving = tokio::spawn(async move {
-                if let Ok(running) = test_server().serve(transport).await {
+                if let Ok(running) = server.serve(transport).await {
                     running.waiting().await.ok();
                 }
             });
@@ -3549,6 +4023,156 @@ mod tests {
             tokio::task::yield_now().await;
             tokio::time::advance(std::time::Duration::from_secs(10)).await;
             assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 1);
+        }
+
+        /// #587: a response stream ends at its deadline, and only then does
+        /// the session become reapable (after the idle timeout).
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_bounded_stream_ends_at_deadline_then_session_is_reaped() {
+            use futures::StreamExt as _;
+
+            let deadline =
+                crate::ResponseStreamDeadline::new(std::time::Duration::from_secs(20)).unwrap();
+            let manager =
+                CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10))
+                    .with_response_stream_deadline(deadline);
+            let (id, _transport) = manager.create_session().await.unwrap();
+            let mut stream = Box::pin(CappedSessionManager::bounded(
+                manager.open_guard(&id),
+                futures::stream::pending::<u8>(),
+                deadline,
+                id.clone(),
+            ));
+            let reader = tokio::spawn(async move { stream.next().await });
+
+            tokio::time::advance(std::time::Duration::from_secs(19)).await;
+            tokio::task::yield_now().await;
+            assert!(!reader.is_finished());
+            assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 0);
+
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            assert_eq!(reader.await.unwrap(), None);
+            assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 0);
+
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 1);
+        }
+
+        /// A server whose only language server never answers, and a `tools/call`
+        /// that therefore keeps its response stream open.
+        fn hung_tool_call() -> (
+            tempfile::TempDir,
+            crate::test_lsp::FakeServer,
+            crate::mcp::McplsServer,
+            ClientJsonRpcMessage,
+        ) {
+            use std::sync::Arc;
+
+            use tokio::sync::Mutex;
+
+            use crate::bridge::{NotificationCache, Translator};
+            use crate::config::{McpConfig, ServerId, ToolRouter};
+            use crate::mcp::{McplsServer, SubscriptionRegistry};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let file = dir.path().join("lib.rs");
+            std::fs::write(&file, "fn main() {}").unwrap();
+            let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+            let mut translator = Translator::new()
+                .with_extensions(crate::test_lsp::test_extensions())
+                .with_router(ToolRouter::catch_all([(
+                    ServerId::from("rust"),
+                    "rust".to_string(),
+                )]));
+            translator.set_workspace_roots(roots.clone());
+            let (client, fake_lsp) = crate::test_lsp::fake_lsp_client();
+            translator.register_client("rust".to_string(), client);
+            let server = McplsServer::new(
+                Arc::new(translator),
+                Arc::new(Mutex::new(NotificationCache::new())),
+                roots,
+                SubscriptionRegistry::new(),
+                crate::ProjectConfigStatus::NotIgnored,
+                McpConfig::default(),
+            );
+            let call = serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {
+                    "name": "get_hover",
+                    "arguments": {"file_path": file.to_string_lossy(), "line": 1, "character": 4}
+                }
+            }))
+            .unwrap();
+            (dir, fake_lsp, server, call)
+        }
+
+        /// A session manager whose response streams are cut after 20 s.
+        fn manager_with_short_deadline() -> CappedSessionManager {
+            let deadline =
+                crate::ResponseStreamDeadline::new(std::time::Duration::from_secs(20)).unwrap();
+            CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(3600))
+                .with_response_stream_deadline(deadline)
+        }
+
+        /// #587 wiring: `create_stream` hands out a bounded stream. The tool
+        /// call never completes, so only the deadline can end the stream.
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_create_stream_is_cut_at_the_response_stream_deadline() {
+            use futures::StreamExt as _;
+
+            let manager = manager_with_short_deadline();
+            let (_dir, _unread_lsp, server, call) = hung_tool_call();
+            let (id, serving) = initialized_session_serving(&manager, server).await;
+
+            let mut stream = Box::pin(manager.create_stream(&id, call).await.unwrap());
+            assert!(
+                stream.next().await.is_some(),
+                "the open stream announces itself"
+            );
+            let early =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await;
+            assert!(
+                early.is_err(),
+                "control: open before the deadline, got {early:?}"
+            );
+
+            let late =
+                tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await;
+            assert_matches!(late, Ok(None), "stream outlived its deadline");
+            serving.abort();
+        }
+
+        /// #587 wiring: a request-wise `resume` (not the common channel) is
+        /// bounded too.
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_request_wise_resume_is_cut_at_the_response_stream_deadline() {
+            use futures::StreamExt as _;
+
+            let manager = manager_with_short_deadline();
+            let (_dir, _unread_lsp, server, call) = hung_tool_call();
+            let (id, serving) = initialized_session_serving(&manager, server).await;
+            let mut first = Box::pin(manager.create_stream(&id, call).await.unwrap());
+            let primed = tokio::time::timeout(std::time::Duration::from_secs(1), first.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let primed_id = primed.event_id.unwrap();
+            let (_, request) = primed_id.split_once('/').unwrap();
+
+            let mut resumed = Box::pin(manager.resume(&id, format!("0/{request}")).await.unwrap());
+
+            let late = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while resumed.next().await.is_some() {}
+            })
+            .await;
+            assert!(late.is_ok(), "resumed stream outlived its deadline");
+            serving.abort();
         }
 
         /// A one-session manager with a 10 s idle timeout whose probes are far

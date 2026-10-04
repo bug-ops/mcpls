@@ -2178,6 +2178,7 @@ mod tests {
                 max_documents: DEFAULT_MAX_DOCUMENTS,
                 max_file_size: DEFAULT_MAX_FILE_SIZE,
                 indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                max_concurrent_server_starts: crate::config::ServerStartConcurrency::DEFAULT,
             },
             lsp_servers: vec![],
             project_config_status: crate::ProjectConfigStatus::NotIgnored,

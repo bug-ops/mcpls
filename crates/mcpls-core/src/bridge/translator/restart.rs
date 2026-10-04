@@ -464,7 +464,7 @@ impl Translator {
             .collect();
         let mut servers: Vec<ServerRestartEntry> = futures::stream::iter(requests)
             .map(|(id, generation)| async move {
-                let outcome = self.restart_one(&id, generation).await;
+                let outcome = Box::pin(self.restart_one(&id, generation)).await;
                 ServerRestartEntry {
                     server_id: id,
                     outcome,

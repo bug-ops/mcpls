@@ -7,7 +7,6 @@
 //! 4. Active request handling
 //! 5. Graceful shutdown sequence
 
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,7 +14,8 @@ use std::sync::Arc;
 
 use futures::FutureExt as _;
 use lsp_types::{
-    ClientCapabilities, ClientInfo, ExitNotification, GeneralClientCapabilities, InitializeParams,
+    ClientCapabilities, ClientInfo, DidChangeConfigurationNotification,
+    DidChangeConfigurationParams, ExitNotification, GeneralClientCapabilities, InitializeParams,
     InitializeRequest, InitializeResult, InitializedNotification, InitializedParams,
     PositionEncodingKind, Request, ServerCapabilities, ShutdownRequest, StaleRequestSupportOptions,
     SymbolKind, WorkspaceFolder,
@@ -26,7 +26,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
-use crate::config::{LspServerConfig, ServerId};
+use crate::config::LspServerConfig;
 use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
@@ -201,19 +201,12 @@ pub struct ServerInitConfig {
     /// as a valid [`PositionEncodingKind`] are skipped with a warning rather than
     /// failing the handshake: `serve`/`serve_with` validate the top-level
     /// `ServerConfig` via [`crate::config::ServerConfig::validate`] before this
-    /// is ever built, but `LspServer::spawn`/`spawn_batch` are `pub` and
+    /// is ever built, but `LspServer::spawn` is `pub` and
     /// reachable directly by a library embedder bypassing that validation
     /// entirely (same reasoning as the `initialize` timeout clamp below), so
     /// this can't assume the value was already checked. If nothing parses,
     /// falls back to `config::default_position_encodings()`'s default.
     pub position_encodings: Vec<String>,
-    /// Optional channel for forwarding LSP notifications to the notification cache.
-    ///
-    /// When `Some`, the spawned LSP client sends every notification it receives
-    /// (publishDiagnostics, logMessage, showMessage, …) through this sender.
-    /// The caller is responsible for draining the corresponding receiver and
-    /// storing entries in [`crate::bridge::NotificationCache`].
-    pub notification_tx: Option<mpsc::Sender<LspNotification>>,
 }
 
 /// The terminal outcome of starting one configured server.
@@ -226,103 +219,6 @@ pub enum ServerStartOutcome {
     Started(Box<LspServer>),
     /// The server failed to start.
     Failed(ServerSpawnFailure),
-}
-
-/// Result of attempting to spawn multiple LSP servers.
-///
-/// This type enables graceful degradation by collecting both
-/// successful initializations and failures. Use the helper methods
-/// to inspect the outcome and make decisions about how to proceed.
-///
-/// # Examples
-///
-/// ```
-/// use mcpls_core::lsp::ServerInitResult;
-/// use mcpls_core::error::ServerSpawnFailure;
-///
-/// let mut result = ServerInitResult::new();
-///
-/// // Check for different scenarios
-/// if result.all_failed() {
-///     eprintln!("All servers failed to initialize");
-/// } else if result.partial_success() {
-///     println!("Some servers succeeded, some failed");
-/// } else if result.has_servers() {
-///     println!("All servers initialized successfully");
-/// }
-/// ```
-#[derive(Debug)]
-pub struct ServerInitResult {
-    /// Successfully initialized servers, keyed by routing identity.
-    pub servers: HashMap<ServerId, LspServer>,
-    /// Failures that occurred during spawn attempts.
-    pub failures: Vec<ServerSpawnFailure>,
-}
-
-impl ServerInitResult {
-    /// Create a new empty result.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            servers: HashMap::new(),
-            failures: Vec::new(),
-        }
-    }
-
-    /// Check if any servers were successfully initialized.
-    ///
-    /// Returns `true` if at least one server is available for use.
-    #[must_use]
-    pub fn has_servers(&self) -> bool {
-        !self.servers.is_empty()
-    }
-
-    /// Check if all attempted servers failed.
-    ///
-    /// Returns `true` only if there were failures and no servers succeeded.
-    /// Returns `false` for empty results (no servers configured).
-    #[must_use]
-    pub fn all_failed(&self) -> bool {
-        self.servers.is_empty() && !self.failures.is_empty()
-    }
-
-    /// Check if some but not all servers failed.
-    ///
-    /// Returns `true` if there are both successful servers and failures.
-    #[must_use]
-    pub fn partial_success(&self) -> bool {
-        !self.servers.is_empty() && !self.failures.is_empty()
-    }
-
-    /// Get the number of successfully initialized servers.
-    #[must_use]
-    pub fn server_count(&self) -> usize {
-        self.servers.len()
-    }
-
-    /// Get the number of failures.
-    #[must_use]
-    pub const fn failure_count(&self) -> usize {
-        self.failures.len()
-    }
-
-    /// Add a successful server.
-    ///
-    /// If a server with the same [`ServerId`] already exists, it will be replaced.
-    pub fn add_server(&mut self, id: impl Into<ServerId>, server: LspServer) {
-        self.servers.insert(id.into(), server);
-    }
-
-    /// Add a failure.
-    pub fn add_failure(&mut self, failure: ServerSpawnFailure) {
-        self.failures.push(failure);
-    }
-}
-
-impl Default for ServerInitResult {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Managed LSP server instance with capabilities and encoding.
@@ -431,6 +327,9 @@ impl LspServer {
     /// 2. Sends initialize request with client capabilities
     /// 3. Receives server capabilities from initialize response
     /// 4. Sends initialized notification
+    /// 5. Sends `workspace/didChangeConfiguration` with null settings, which
+    ///    servers that wait for a configuration push (pyright) need before
+    ///    they answer requests
     ///
     /// # Errors
     ///
@@ -438,6 +337,8 @@ impl LspServer {
     /// - Server process fails to spawn
     /// - Initialize request fails or times out
     /// - Server returns error during initialization
+    /// - The `initialized` or `workspace/didChangeConfiguration` notification
+    ///   cannot be written ([`Error::LspInitFailed`])
     pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
         let redactions = Arc::new(Redactions::for_server(
             &config.server_config,
@@ -713,7 +614,12 @@ impl LspServer {
 
     /// Perform LSP initialization handshake.
     ///
-    /// Sends initialize request and waits for response, then sends initialized notification.
+    /// Sends initialize request and waits for response, then sends the
+    /// initialized and `workspace/didChangeConfiguration` notifications.
+    ///
+    /// The settings are null rather than `{}`: some servers rebuild their
+    /// preferences from an empty settings map and so drop their
+    /// `initialization_options`, while a non-map value is ignored.
     #[cfg(test)]
     async fn initialize(
         client: &LspClient,
@@ -767,7 +673,7 @@ impl LspServer {
                 // `serve()`/`serve_with()` now validate the top-level
                 // `ServerConfig` via `ServerConfig::validate()`, but this call
                 // operates on the per-server `config.server_config` reached
-                // through `LspServer::spawn`/`spawn_batch`, which bypass that
+                // through `LspServer::spawn`, which bypasses that
                 // top-level validation entirely, so an out-of-range value (0,
                 // or an unbounded one that would silently disable the timeout
                 // via tokio's `Instant::far_future()` fallback) is still
@@ -802,13 +708,15 @@ impl LspServer {
             position_encoding
         );
 
-        client
-            .notify_typed::<InitializedNotification>(InitializedParams {})
-            .await
-            .map_err(|e| Error::LspInitFailed {
-                message: format!("Initialized notification failed: {e}"),
-                stderr: None,
-            })?;
+        notify_handshake::<InitializedNotification>(client, InitializedParams {}).await?;
+        // TODO(#598): push the configured per-server settings instead of null
+        notify_handshake::<DidChangeConfigurationNotification>(
+            client,
+            DidChangeConfigurationParams {
+                settings: serde_json::Value::Null,
+            },
+        )
+        .await?;
 
         Ok((result.capabilities, position_encoding))
     }
@@ -991,75 +899,6 @@ impl LspServer {
         Ok(())
     }
 
-    /// Spawn multiple LSP servers concurrently with graceful degradation.
-    ///
-    /// Attempts to spawn and initialize all configured servers at once, each
-    /// bounded by its own `timeout_seconds`, so the wall clock is the slowest
-    /// single server rather than the sum. If some servers fail to spawn, the
-    /// successful servers are still returned. This enables graceful
-    /// degradation where the system can continue to operate with partial
-    /// functionality.
-    ///
-    /// # Behavior
-    ///
-    /// - Spawns every server concurrently on the calling task, so dropping
-    ///   the returned future drops every not-yet-registered child process
-    /// - Logs success (info) and failure (error) for each server
-    /// - Accumulates successful servers and failures; failures are listed in
-    ///   configuration order
-    /// - Never panics or returns early - attempts all servers; a panic while
-    ///   starting one server is recorded as that server's failure
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mcpls_core::lsp::{LspServer, ServerInitConfig};
-    /// use mcpls_core::config::LspServerConfig;
-    /// use std::path::PathBuf;
-    ///
-    /// # async fn example() {
-    /// let configs = vec![
-    ///     ServerInitConfig {
-    ///         server_config: LspServerConfig::rust_analyzer(),
-    ///         workspace_roots: vec![PathBuf::from("/workspace")],
-    ///         initialization_options: None,
-    ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-    ///         notification_tx: None,
-    ///     },
-    ///     ServerInitConfig {
-    ///         server_config: LspServerConfig::pyright(),
-    ///         workspace_roots: vec![PathBuf::from("/workspace")],
-    ///         initialization_options: None,
-    ///         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-    ///         notification_tx: None,
-    ///     },
-    /// ];
-    ///
-    /// let result = LspServer::spawn_batch(&configs).await;
-    ///
-    /// if result.has_servers() {
-    ///     println!("Successfully spawned {} servers", result.server_count());
-    /// }
-    ///
-    /// if result.partial_success() {
-    ///     eprintln!("Warning: {} servers failed", result.failure_count());
-    /// }
-    /// # }
-    /// ```
-    pub async fn spawn_batch(configs: &[ServerInitConfig]) -> ServerInitResult {
-        let mut result = ServerInitResult::new();
-        let outcomes = futures::future::join_all(configs.iter().map(Self::start_contained)).await;
-        for (config, outcome) in configs.iter().zip(outcomes) {
-            match outcome {
-                ServerStartOutcome::Started(server) => {
-                    result.add_server(config.server_config.id(), *server);
-                }
-                ServerStartOutcome::Failed(failure) => result.add_failure(failure),
-            }
-        }
-        result
-    }
-
     /// Spawns and initializes one server, turning an error or a panic into
     /// that server's [`ServerStartOutcome::Failed`] so it can never affect a
     /// sibling. Logs the outcome with the id and elapsed time.
@@ -1067,7 +906,7 @@ impl LspServer {
     /// Runs on the caller's task: dropping the future drops the child
     /// process it owns.
     pub(crate) async fn start_contained(config: &ServerInitConfig) -> ServerStartOutcome {
-        contain(config, Self::spawn(config.clone())).await
+        Box::pin(contain(config, Self::spawn(config.clone()))).await
     }
 }
 
@@ -1163,6 +1002,21 @@ fn resolve_position_encodings(configured: &[String]) -> Vec<PositionEncodingKind
     } else {
         encodings
     }
+}
+
+/// Sends one handshake notification, mapping a failed write to
+/// [`Error::LspInitFailed`] naming the notification's method.
+async fn notify_handshake<N>(client: &LspClient, params: N::Params) -> Result<()>
+where
+    N: lsp_types::Notification,
+{
+    client
+        .notify_typed::<N>(params)
+        .await
+        .map_err(|e| Error::LspInitFailed {
+            message: format!("{} notification failed: {e}", N::METHOD.as_str()),
+            stderr: None,
+        })
 }
 
 /// Whether `error` means the connection to the server is gone, as opposed to
@@ -1302,6 +1156,7 @@ impl LspServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
+    use std::collections::HashMap;
 
     use super::*;
 
@@ -1475,7 +1330,6 @@ mod tests {
             workspace_roots: vec![PathBuf::from("/tmp/workspace")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-            notification_tx: None,
         };
 
         #[allow(clippy::redundant_clone)]
@@ -1491,7 +1345,6 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-            notification_tx: None,
         };
 
         let debug_str = format!("{config:?}");
@@ -1534,7 +1387,6 @@ mod tests {
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-            notification_tx: None,
         };
 
         assert!(config.initialization_options.is_some());
@@ -1548,7 +1400,6 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-            notification_tx: None,
         };
 
         assert_eq!(config.workspace_roots.len(), 0);
@@ -1565,7 +1416,6 @@ mod tests {
             ],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-            notification_tx: None,
         };
 
         assert_eq!(config.workspace_roots.len(), 3);
@@ -1702,241 +1552,6 @@ mod tests {
     }
 
     #[test]
-    fn test_server_init_result_new_empty() {
-        let result = ServerInitResult::new();
-        assert!(!result.has_servers());
-        assert!(!result.all_failed());
-        assert!(!result.partial_success());
-        assert_eq!(result.server_count(), 0);
-        assert_eq!(result.failure_count(), 0);
-    }
-
-    #[test]
-    fn test_server_init_result_default() {
-        let result = ServerInitResult::default();
-        assert!(!result.has_servers());
-        assert_eq!(result.server_count(), 0);
-        assert_eq!(result.failure_count(), 0);
-    }
-
-    #[test]
-    fn test_server_init_result_all_failures() {
-        let mut result = ServerInitResult::new();
-
-        result.add_failure(ServerSpawnFailure {
-            server_id: ServerId::from("rust"),
-            language_id: "rust".to_string(),
-            command: "rust-analyzer".to_string(),
-            reason: StartupFailure::InitTaskPanicked,
-        });
-
-        result.add_failure(ServerSpawnFailure {
-            server_id: ServerId::from("python"),
-            language_id: "python".to_string(),
-            command: "pyright".to_string(),
-            reason: StartupFailure::InitTaskPanicked,
-        });
-
-        assert!(!result.has_servers());
-        assert!(result.all_failed());
-        assert!(!result.partial_success());
-        assert_eq!(result.server_count(), 0);
-        assert_eq!(result.failure_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_server_init_result_all_success() {
-        let mut result = ServerInitResult::new();
-
-        let transport1 = crate::test_lsp::inert_transport();
-        let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
-        let (_, mock_notification_rx1) = mpsc::channel(1);
-        let (_, mock_lifecycle_rx1) = mpsc::channel(1);
-
-        let server1 = LspServer {
-            client: client1,
-            capabilities: lsp_types::ServerCapabilities::default(),
-            position_encoding: PositionEncodingKind::UTF8,
-            notification_rx: mock_notification_rx1,
-            lifecycle_rx: mock_lifecycle_rx1,
-            child: None,
-            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
-        };
-
-        result.add_server("rust".to_string(), server1);
-
-        assert!(result.has_servers());
-        assert!(!result.all_failed());
-        assert!(!result.partial_success());
-        assert_eq!(result.server_count(), 1);
-        assert_eq!(result.failure_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_server_init_result_partial_success() {
-        let mut result = ServerInitResult::new();
-
-        let transport = crate::test_lsp::inert_transport();
-        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-        let (_, mock_notification_rx) = mpsc::channel(1);
-        let (_, mock_lifecycle_rx) = mpsc::channel(1);
-
-        let server = LspServer {
-            client,
-            capabilities: lsp_types::ServerCapabilities::default(),
-            position_encoding: PositionEncodingKind::UTF8,
-            notification_rx: mock_notification_rx,
-            lifecycle_rx: mock_lifecycle_rx,
-            child: None,
-            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
-        };
-
-        result.add_server("rust".to_string(), server);
-
-        result.add_failure(ServerSpawnFailure {
-            server_id: ServerId::from("python"),
-            language_id: "python".to_string(),
-            command: "pyright".to_string(),
-            reason: StartupFailure::InitTaskPanicked,
-        });
-
-        assert!(result.has_servers());
-        assert!(!result.all_failed());
-        assert!(result.partial_success());
-        assert_eq!(result.server_count(), 1);
-        assert_eq!(result.failure_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_server_init_result_multiple_servers() {
-        let mut result = ServerInitResult::new();
-
-        for i in 0..3 {
-            let transport = crate::test_lsp::inert_transport();
-            let config = if i == 0 {
-                LspServerConfig::rust_analyzer()
-            } else if i == 1 {
-                LspServerConfig::pyright()
-            } else {
-                LspServerConfig::typescript()
-            };
-            let client = LspClient::from_transport(config.clone(), transport);
-            let (_, mock_notification_rx) = mpsc::channel(1);
-            let (_, mock_lifecycle_rx) = mpsc::channel(1);
-
-            let server = LspServer {
-                client,
-                capabilities: lsp_types::ServerCapabilities::default(),
-                position_encoding: PositionEncodingKind::UTF8,
-                notification_rx: mock_notification_rx,
-                lifecycle_rx: mock_lifecycle_rx,
-                child: None,
-                init_config: crate::test_lsp::init_config_for(config.clone()),
-            };
-
-            result.add_server(config.language_id, server);
-        }
-
-        assert!(result.has_servers());
-        assert!(!result.all_failed());
-        assert!(!result.partial_success());
-        assert_eq!(result.server_count(), 3);
-        assert_eq!(result.failure_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_server_init_result_replace_server() {
-        let mut result = ServerInitResult::new();
-
-        let transport1 = crate::test_lsp::inert_transport();
-        let client1 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport1);
-        let (_, mock_notification_rx1) = mpsc::channel(1);
-        let (_, mock_lifecycle_rx1) = mpsc::channel(1);
-
-        let server1 = LspServer {
-            client: client1,
-            capabilities: lsp_types::ServerCapabilities::default(),
-            position_encoding: PositionEncodingKind::UTF8,
-            notification_rx: mock_notification_rx1,
-            lifecycle_rx: mock_lifecycle_rx1,
-            child: None,
-            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
-        };
-
-        result.add_server("rust".to_string(), server1);
-        assert_eq!(result.server_count(), 1);
-
-        let transport2 = crate::test_lsp::inert_transport();
-        let client2 = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport2);
-        let (_, mock_notification_rx2) = mpsc::channel(1);
-        let (_, mock_lifecycle_rx2) = mpsc::channel(1);
-
-        let server2 = LspServer {
-            client: client2,
-            capabilities: lsp_types::ServerCapabilities::default(),
-            position_encoding: PositionEncodingKind::UTF16,
-            notification_rx: mock_notification_rx2,
-            lifecycle_rx: mock_lifecycle_rx2,
-            child: None,
-            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
-        };
-
-        result.add_server("rust".to_string(), server2);
-        assert_eq!(result.server_count(), 1);
-    }
-
-    #[test]
-    fn test_server_init_result_debug() {
-        let mut result = ServerInitResult::new();
-
-        result.add_failure(ServerSpawnFailure {
-            server_id: ServerId::from("rust"),
-            language_id: "rust".to_string(),
-            command: "rust-analyzer".to_string(),
-            reason: StartupFailure::InitTaskPanicked,
-        });
-
-        let debug_str = format!("{result:?}");
-        assert!(debug_str.contains("ServerInitResult"));
-    }
-
-    #[test]
-    fn test_server_init_result_multiple_failures() {
-        let mut result = ServerInitResult::new();
-
-        result.add_failure(ServerSpawnFailure {
-            server_id: ServerId::from("python"),
-            language_id: "python".to_string(),
-            command: "pyright".to_string(),
-            reason: StartupFailure::InitTaskPanicked,
-        });
-
-        result.add_failure(ServerSpawnFailure {
-            server_id: ServerId::from("typescript"),
-            language_id: "typescript".to_string(),
-            command: "tsserver".to_string(),
-            reason: StartupFailure::InitTaskPanicked,
-        });
-
-        assert_eq!(result.failure_count(), 2);
-        assert_eq!(result.server_count(), 0);
-        assert!(result.all_failed());
-        assert!(!result.partial_success());
-    }
-
-    #[tokio::test]
-    async fn test_spawn_batch_empty_configs() {
-        let configs: &[ServerInitConfig] = &[];
-        let result = LspServer::spawn_batch(configs).await;
-
-        assert!(!result.has_servers());
-        assert!(!result.all_failed());
-        assert!(!result.partial_success());
-        assert_eq!(result.server_count(), 0);
-        assert_eq!(result.failure_count(), 0);
-    }
-
-    #[test]
     fn test_spawn_error_classifies_not_found() {
         use std::io::{Error as IoError, ErrorKind};
 
@@ -1955,51 +1570,9 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec![],
-            notification_tx: None,
         };
         let err = LspServer::spawn(config).await.unwrap_err();
         assert_matches!(err, Error::ServerNotFound { .. }, "got {err:?}");
-    }
-
-    #[tokio::test]
-    async fn test_spawn_batch_single_invalid_config() {
-        let configs = vec![ServerInitConfig {
-            server_config: LspServerConfig {
-                language_id: "rust".to_string(),
-                command: "nonexistent-command-12345".to_string(),
-                args: vec![],
-                env: std::collections::HashMap::new(),
-                file_patterns: vec!["**/*.rs".to_string()],
-                initialization_options: None,
-                timeout_seconds: 10,
-                request_timeout_seconds: 10,
-                heuristics: None,
-                name: None,
-                handles: None,
-                indexing: crate::bridge::IndexingPolicy::Auto,
-            },
-            workspace_roots: vec![],
-            initialization_options: None,
-            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-            notification_tx: None,
-        }];
-
-        let result = LspServer::spawn_batch(&configs).await;
-
-        assert!(!result.has_servers());
-        assert!(result.all_failed());
-        assert!(!result.partial_success());
-        assert_eq!(result.server_count(), 0);
-        assert_eq!(result.failure_count(), 1);
-
-        let failure = &result.failures[0];
-        assert_eq!(failure.language_id, "rust");
-        assert_eq!(failure.command, "nonexistent-command-12345");
-        assert_matches!(&failure.reason, StartupFailure::Spawn(e) if matches!(**e, Error::ServerNotFound { .. }),
-            "got {:?}",
-            failure.reason
-        );
-        assert!(failure.to_string().contains("failed to spawn"));
     }
 
     #[test]
@@ -2255,37 +1828,6 @@ echo 'fatal: bad toolchain' >&2
         );
     }
 
-    /// FR-001/FR-019: each server announces itself and waits for its sibling
-    /// before answering `initialize`, so sequential startup would let the
-    /// first one time out.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn spawn_batch_initializes_configs_concurrently() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (a_up, b_up) = (dir.path().join("a_up"), dir.path().join("b_up"));
-        let configs = [
-            crate::test_lsp::named_sh_init_config(
-                dir.path(),
-                "a",
-                "rust",
-                &crate::test_lsp::answer_initialize_script(Some(&a_up), Some(&b_up)),
-            ),
-            crate::test_lsp::named_sh_init_config(
-                dir.path(),
-                "b",
-                "python",
-                &crate::test_lsp::answer_initialize_script(Some(&b_up), Some(&a_up)),
-            ),
-        ];
-
-        let result =
-            tokio::time::timeout(Duration::from_secs(20), LspServer::spawn_batch(&configs))
-                .await
-                .unwrap();
-
-        assert_eq!(result.server_count(), 2, "failures: {:?}", result.failures);
-    }
-
     /// `window/logMessage` and `window/showMessage` text echoing configured
     /// secrets is redacted before it reaches the notification lane (#554).
     #[cfg(unix)]
@@ -2419,145 +1961,6 @@ sleep 5
         assert!(!server.has_exited().unwrap());
     }
 
-    #[tokio::test]
-    async fn test_spawn_batch_all_invalid_configs() {
-        let configs = vec![
-            ServerInitConfig {
-                server_config: LspServerConfig {
-                    language_id: "rust".to_string(),
-                    command: "nonexistent-rust-analyzer".to_string(),
-                    args: vec![],
-                    env: std::collections::HashMap::new(),
-                    file_patterns: vec!["**/*.rs".to_string()],
-                    initialization_options: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
-                    heuristics: None,
-                    name: None,
-                    handles: None,
-                    indexing: crate::bridge::IndexingPolicy::Auto,
-                },
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
-            },
-            ServerInitConfig {
-                server_config: LspServerConfig {
-                    language_id: "python".to_string(),
-                    command: "nonexistent-pyright".to_string(),
-                    args: vec![],
-                    env: std::collections::HashMap::new(),
-                    file_patterns: vec!["**/*.py".to_string()],
-                    initialization_options: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
-                    heuristics: None,
-                    name: None,
-                    handles: None,
-                    indexing: crate::bridge::IndexingPolicy::Auto,
-                },
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
-            },
-            ServerInitConfig {
-                server_config: LspServerConfig {
-                    language_id: "typescript".to_string(),
-                    command: "nonexistent-tsserver".to_string(),
-                    args: vec![],
-                    env: std::collections::HashMap::new(),
-                    file_patterns: vec!["**/*.ts".to_string()],
-                    initialization_options: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
-                    heuristics: None,
-                    name: None,
-                    handles: None,
-                    indexing: crate::bridge::IndexingPolicy::Auto,
-                },
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
-            },
-        ];
-
-        let result = LspServer::spawn_batch(&configs).await;
-
-        assert!(!result.has_servers());
-        assert!(result.all_failed());
-        assert!(!result.partial_success());
-        assert_eq!(result.server_count(), 0);
-        assert_eq!(result.failure_count(), 3);
-
-        let failure_languages: Vec<_> = result
-            .failures
-            .iter()
-            .map(|f| f.language_id.as_str())
-            .collect();
-        assert!(failure_languages.contains(&"rust"));
-        assert!(failure_languages.contains(&"python"));
-        assert!(failure_languages.contains(&"typescript"));
-    }
-
-    #[tokio::test]
-    async fn test_spawn_batch_multiple_invalid_configs_ordering() {
-        let configs = vec![
-            ServerInitConfig {
-                server_config: LspServerConfig {
-                    language_id: "lang1".to_string(),
-                    command: "cmd1-nonexistent".to_string(),
-                    args: vec![],
-                    env: std::collections::HashMap::new(),
-                    file_patterns: vec![],
-                    initialization_options: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
-                    heuristics: None,
-                    name: None,
-                    handles: None,
-                    indexing: crate::bridge::IndexingPolicy::Auto,
-                },
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
-            },
-            ServerInitConfig {
-                server_config: LspServerConfig {
-                    language_id: "lang2".to_string(),
-                    command: "cmd2-nonexistent".to_string(),
-                    args: vec![],
-                    env: std::collections::HashMap::new(),
-                    file_patterns: vec![],
-                    initialization_options: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
-                    heuristics: None,
-                    name: None,
-                    handles: None,
-                    indexing: crate::bridge::IndexingPolicy::Auto,
-                },
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
-            },
-        ];
-
-        let result = LspServer::spawn_batch(&configs).await;
-
-        assert_eq!(result.failure_count(), 2);
-
-        assert_eq!(result.failures[0].language_id, "lang1");
-        assert_eq!(result.failures[0].command, "cmd1-nonexistent");
-
-        assert_eq!(result.failures[1].language_id, "lang2");
-        assert_eq!(result.failures[1].command, "cmd2-nonexistent");
-    }
-
     /// Wire-level regressions for the `initialize` request. The tests
     /// capture the real bytes `LspServer::initialize` writes over an
     /// in-memory duplex pipe standing in for the LSP server. Mirrors the
@@ -2581,7 +1984,6 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: vec!["utf-32".to_string(), "utf-8".to_string()],
-                notification_tx: None,
             };
 
             let init_task =
@@ -2610,6 +2012,35 @@ sleep 5
         }
 
         #[tokio::test]
+        async fn test_initialize_pushes_null_settings_right_after_initialized() {
+            let (client, mut server) = fake_lsp_client();
+            let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+            let init_task =
+                tokio::spawn(async move { LspServer::initialize(&client, &config).await });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            assert_eq!(request["method"], "initialize");
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"].clone(),
+                serde_json::json!({ "capabilities": {} }),
+            )
+            .await;
+
+            let initialized = read_framed_message(&mut reader).await;
+            let configuration = read_framed_message(&mut reader).await;
+            init_task.await.unwrap().unwrap();
+
+            assert_eq!(initialized["method"], "initialized");
+            assert_eq!(configuration["method"], "workspace/didChangeConfiguration");
+            assert_eq!(
+                configuration["params"],
+                serde_json::json!({ "settings": null })
+            );
+        }
+
+        #[tokio::test]
         async fn test_initialize_advertises_stale_request_support() {
             let (client, mut server) = fake_lsp_client();
 
@@ -2618,7 +2049,6 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
             };
 
             let init_task =
@@ -2669,7 +2099,6 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
             };
 
             let init_task =
@@ -2706,7 +2135,6 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
             };
 
             let init_task =
@@ -2763,7 +2191,6 @@ sleep 5
                 workspace_roots,
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
             };
 
             let init_task =
@@ -2786,58 +2213,6 @@ sleep 5
 
             init_task.await.unwrap().unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn test_spawn_batch_logs_each_failure() {
-        let configs = vec![
-            ServerInitConfig {
-                server_config: LspServerConfig {
-                    language_id: "test1".to_string(),
-                    command: "nonexistent-test1".to_string(),
-                    args: vec![],
-                    env: std::collections::HashMap::new(),
-                    file_patterns: vec![],
-                    initialization_options: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
-                    heuristics: None,
-                    name: None,
-                    handles: None,
-                    indexing: crate::bridge::IndexingPolicy::Auto,
-                },
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
-            },
-            ServerInitConfig {
-                server_config: LspServerConfig {
-                    language_id: "test2".to_string(),
-                    command: "nonexistent-test2".to_string(),
-                    args: vec![],
-                    env: std::collections::HashMap::new(),
-                    file_patterns: vec![],
-                    initialization_options: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
-                    heuristics: None,
-                    name: None,
-                    handles: None,
-                    indexing: crate::bridge::IndexingPolicy::Auto,
-                },
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-                notification_tx: None,
-            },
-        ];
-
-        let result = LspServer::spawn_batch(&configs).await;
-
-        assert_eq!(result.failure_count(), 2);
-        assert_eq!(result.failures[0].language_id, "test1");
-        assert_eq!(result.failures[1].language_id, "test2");
     }
 
     /// Minimal [`LspServerConfig`] for `build_command` tests, where only

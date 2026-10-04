@@ -30,6 +30,7 @@ rather than checked against the byte cap.
 | `position_encodings` | array of strings | `["utf-8", "utf-16"]` | Preferred LSP position encodings (`utf-8`, `utf-16`, `utf-32`), offered to each spawned server during the `initialize` handshake in the listed order. A preference, not a restriction — per the LSP spec, UTF-16 is a mandatory fallback a server may still choose even if omitted here. |
 | `language_extensions` | array of `{extensions, language_id}` | `[]` within an explicit `[workspace]` table; 30 built-in mappings only when `[workspace]` is absent entirely | Custom or overriding file-extension → language-ID mappings. Adding a `[workspace]` table for any other field (e.g. just `roots`) silently drops the 30 built-ins unless you list `language_extensions` yourself — list every language you need, not just the new one. |
 | `heuristics_max_depth` | integer | `10` | Recursion depth for `heuristics.project_markers` search (see below). Maximum `64`; larger values are rejected at startup. |
+| `max_concurrent_server_starts` | integer | `8` | Upper bound on LSP servers starting at the same time; the rest start as earlier ones settle. Rejects `0`. |
 
 ## `[[lsp_servers]]` fields
 

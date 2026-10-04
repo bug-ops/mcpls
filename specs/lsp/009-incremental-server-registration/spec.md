@@ -32,7 +32,7 @@ related:
 
 ### Problem Statement
 
-`LspServer::spawn_batch` (`crates/mcpls-core/src/lsp/lifecycle.rs`) spawns and initializes the
+`LspServer::spawn_batch` (`crates/mcpls-core/src/lsp/lifecycle.rs`, since removed, #588) spawned and initialized the
 configured servers strictly one after another. `init_lsp_servers` (`crates/mcpls-core/src/lib.rs`)
 then registers the whole batch with the translator (`register_servers`: client + server inserts and a
 single `rebind_router`) and calls `clear_expected_servers` only after the batch has returned.
@@ -45,7 +45,7 @@ returns the retryable `ServerInitializing` error (-32051), and `get_tool_support
 2. A server that is slow, or hangs until its `timeout_seconds`, blocks every other language for that
    long. This contradicts the graceful-degradation principle of
    [[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001]] (NFR-001: no single server's failure may
-   prevent any other from becoming available), which `spawn_batch` honours for *outcomes* but not for
+   prevent any other from becoming available), which the former `spawn_batch` honoured for *outcomes* but not for
    *timing*.
 3. Config order matters: a slow server listed first delays `rust-analyzer`.
 
@@ -127,15 +127,15 @@ AND the same call at t = 11 s succeeds
 ### US-004: Embedder gets the same behaviour
 
 AS A library embedder of `mcpls-core`
-I WANT `spawn_batch` and the registration path to start servers concurrently with a deterministic result
+I WANT the registration path to start servers concurrently with a deterministic result
 SO THAT library users get the same latency characteristics as the CLI.
 
 **Acceptance criteria:**
 
 ```
 GIVEN a batch of configs where several fail and several succeed
-WHEN spawn_batch returns
-THEN failures are listed in configuration order and the set of servers equals the set that initialized
+WHEN startup has settled
+THEN every failure is recorded against its own server and the set of registered servers equals the set that initialized
 ```
 
 ## 3. Functional Requirements
@@ -160,7 +160,8 @@ THEN failures are listed in configuration order and the set of servers equals th
 | FR-016 | WHEN a server fails THE SYSTEM SHALL publish startup-failure notifications, at settlement time of that server (after its record, rebind and expected-set removal), to subscribers of every file whose route is now failed, including routes attributed to it through the configured router while a catch-all is pending; re-notifying an earlier failure is harmless, and nothing is published once per batch | should |
 | FR-017 | THE SYSTEM SHALL emit per-server `info!`/`error!` lines as today; aggregate messages ("All N configured LSP server(s) failed to initialize", "Partial server initialization", "Proceeding with N LSP server(s)") SHALL be emitted once, when the last server settles | should |
 | FR-018 | WHEN the last server settles and none registered THE SYSTEM SHALL end in the same state as today's all-failed path: router rebound against an empty set, expected set empty, every tool returning a terminal error (`AllServersFailedToInit` / `ServerFailedToStart`) | must |
-| FR-019 | `LspServer::spawn_batch` SHALL run its configs concurrently and return a `ServerInitResult` whose `failures` are in configuration order | must |
+| FR-019 | Server startup SHALL run the configs concurrently on the supervised task, with at most `workspace.max_concurrent_server_starts` (default 8, non-zero, `ServerStartConcurrency`) in flight at once; the rest start as earlier ones settle. `LspServer::spawn_batch` and `ServerInitResult` were removed (#588): production startup never used them | must |
+| FR-021 | WHEN the start stream ends without cancellation THE SYSTEM SHALL log the aggregate outcome once, even when the last server to settle failed and no diagnostics pump is running; cancellation drops the in-flight starts (their children die with `kill_on_drop`) and logs nothing | must |
 | FR-020 | THE doc comment of `ToolRouter::rebind_to_registered` (which stated it is sound only because registration is all-or-nothing) SHALL be replaced by the contract of the mechanism that implements FR-005..FR-007: `ToolRouter::rebind` derives the active table from the immutable configured router and each server's `ServerSettlement` (`Pending`, `Registered`, `Failed`) on every settlement, a pure function of that state, and `rebind_to_registered` is its finished-startup special case | must |
 
 ## 4. Non-Functional Requirements
@@ -174,9 +175,9 @@ THEN failures are listed in configuration order and the set of servers equals th
 | NFR-005 | Determinism | The final routing table, failure set and diagnostics-route count are a pure function of the per-server outcomes, never of completion order or scheduling |
 | NFR-006 | Concurrency safety | No `std::sync::Mutex` guard (translator registries, router) is held across an `.await` or nested with another, as documented for `Translator`; settlement of different servers may interleave at any lock boundary |
 | NFR-007 | Type safety | Per-server outcome is a closed type (registered server or `StartupFailure`), not a stringly or `Option`-pair representation; settlement of an id is representable at most once (no double-settle state) |
-| NFR-008 | Resource usage | Concurrent initialization of N servers must not exceed one initialize-time memory/CPU spike per server already accepted today; whether to cap parallelism is open (see section 9) |
+| NFR-008 | Resource usage | Concurrent initialization is capped by `workspace.max_concurrent_server_starts` (default 8, a fixed value so a generated configuration is machine-independent); an info line is logged when more servers are configured than the cap |
 | NFR-009 | Observability | Each settlement logs the server id and elapsed time since init start, so a slow server is diagnosable from logs alone |
-| NFR-010 | Documentation | Every changed `pub` item (`spawn_batch`, any new settlement API) has an updated `///` doc with `# Examples`; docs build with `-D warnings` |
+| NFR-010 | Documentation | Every changed `pub` item (`ServerStartConcurrency`, any new settlement API) has an updated `///` doc with `# Examples`; docs build with `-D warnings` |
 
 ## 5. Data Model
 
@@ -232,8 +233,8 @@ THEN failures are listed in configuration order and the set of servers equals th
 
 ### Ask First
 
-- Adding a concurrency cap or a new config option for startup parallelism.
-- Changing public signatures of `spawn_batch`, `register_servers`, or adding a streaming startup API.
+- Changing the default of `workspace.max_concurrent_server_starts`.
+- Changing public signatures of `register_servers`, or adding a streaming startup API.
 - Adding any dependency (e.g. `futures` utilities if not already present).
 
 ### Never
@@ -248,10 +249,10 @@ THEN failures are listed in configuration order and the set of servers equals th
 
 > [!question] Open items
 > - [x] Mechanism for FR-005..FR-007: the active table is re-derived from the immutable `configured_router` and the three-state settlement on every settlement (`ToolRouter::rebind`); `rebind_to_registered` remains as the finished-startup wrapper.
-> - [ ] Cap on parallel server initialization: unbounded for now (applicable set is small, project-marker filtered); revisit only if a measurement shows a spike.
+> - [x] Cap on parallel server initialization: `workspace.max_concurrent_server_starts` (#589), implemented with `buffer_unordered` over `start_contained`; the stream sits in an `Option` read through a helper that never completes when absent, because `tokio::select!` still evaluates a disabled branch.
 > - [x] Provisional diagnostics-route count (FR-011): non-failed servers, pending ones included, that are the diagnostics route in the current re-derived router.
 > - [x] Edge case "explicit-route server failed, catch-all pending": the dead tool reports the retryable `ServerInitializing` naming the catch-all (FR-007, section 6).
-> - [x] Public API shape: `spawn_batch` is a concurrent join returning the full `ServerInitResult`; incremental registration lives in `init_lsp_servers` over the crate-private `LspServer::start_contained`.
+> - [x] Public API shape: `spawn_batch` and `ServerInitResult` were removed (#588); incremental registration lives in `init_lsp_servers` over the crate-private `LspServer::start_contained`.
 > - [x] Panic containment: per-future `catch_unwind` on the supervised task (`start_contained`), so aborting the task drops every unregistered child (FR-014).
 > - [x] Concurrent `LspServer::spawn` is safe with `lsp/process.rs` process-wide state: `LIFELINE` is a synchronous mutex never held across an await and `WARNED` is atomic.
 > - [x] `Translator::tool_support_snapshot` still does not read recorded startup failures: a failed server's routes are reported `no_server`, as before; per-route enforcement (`client_for_file`, `diagnostics_route_for_path`) reports the recorded failure, including in the FR-007 window.
@@ -260,7 +261,7 @@ THEN failures are listed in configuration order and the set of servers equals th
 
 - [[constitution]] -- project principles
 - [[MOC-specs]] -- all specifications
-- [[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001]] -- `spawn_batch` graceful degradation (FR-003, NFR-001)
+- [[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001]] -- graceful degradation (FR-003, NFR-001)
 - [[lsp/007-lsp-child-process-lifetime/spec|lsp/007]] -- child-process lifetime binding (FR-014)
 - [[mcp/005-tool-capability-discoverability/spec|mcp/005]] -- `get_tool_support` route classification
-- Code: `crates/mcpls-core/src/lsp/lifecycle.rs` (`spawn_batch`), `crates/mcpls-core/src/lib.rs` (`init_lsp_servers`, `register_servers`, `run_init_supervised`), `crates/mcpls-core/src/bridge/translator/{mod,routing,support}.rs`, `crates/mcpls-core/src/config/routing.rs` (`rebind_to_registered`), `crates/mcpls-core/src/bridge/notifications.rs` (`set_diagnostics_route_count`)
+- Code: `crates/mcpls-core/src/lsp/lifecycle.rs` (`start_contained`), `crates/mcpls-core/src/lib.rs` (`init_lsp_servers`, `register_servers`, `run_init_supervised`), `crates/mcpls-core/src/bridge/translator/{mod,routing,support}.rs`, `crates/mcpls-core/src/config/routing.rs` (`rebind_to_registered`), `crates/mcpls-core/src/bridge/notifications.rs` (`set_diagnostics_route_count`)

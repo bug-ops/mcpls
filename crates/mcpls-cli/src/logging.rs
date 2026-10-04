@@ -1,12 +1,17 @@
 //! Logging initialization and configuration.
 
+use std::borrow::Cow;
+
 use anyhow::{Context, Result};
-use mcpls_core::escape_control;
+use mcpls_core::{escape_control, needs_control_escape};
 use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::field::RecordFields;
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::fmt::format::{FormatFields, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent};
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, fmt};
 
 /// Directives appended after the user's level so rmcp's session-creation
@@ -32,7 +37,7 @@ fn build_filter(level: &str) -> Result<EnvFilter> {
 /// Text-mode field formatter that control-escapes every field value, so
 /// attacker-influenceable text (an LSP server's message or method name, a
 /// client URI, a file name) cannot forge log lines or inject terminal
-/// escapes. JSON mode already escapes control characters.
+/// escapes. JSON mode does the same through [`EscapingJson`].
 struct EscapingFields;
 
 impl<'writer> FormatFields<'writer> for EscapingFields {
@@ -74,6 +79,94 @@ impl Visit for EscapingVisitor<'_> {
     }
 }
 
+/// Line written instead of a JSON log line whose text cannot be escaped.
+const SUPPRESSED_LINE: &str =
+    "{\"level\":\"ERROR\",\"fields\":{\"message\":\"log line suppressed: unescapable field\"}}\n";
+
+/// JSON-mode event formatter that control-escapes every string, so JSON
+/// output is as safe as text mode: serde escapes only C0 controls, leaving
+/// C1 controls, line separators and bidi marks raw.
+struct EscapingJson<F>(F);
+
+impl<S, N, F> FormatEvent<S, N> for EscapingJson<F>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    F: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        let mut line = String::new();
+        self.0.format_event(ctx, Writer::new(&mut line), event)?;
+        let escaped = escape_json_strings(&line);
+        writer.write_str(escaped.as_deref().unwrap_or(SUPPRESSED_LINE))
+    }
+}
+
+/// Rewrites the string literals of one JSON log line that hold a backslash
+/// or a character [`needs_control_escape`] flags: each is decoded, escaped
+/// with [`escape_control`] and re-encoded. Every other byte, including key
+/// order, is copied as is. `None` when a literal cannot be decoded.
+fn escape_json_strings(line: &str) -> Option<Cow<'_, str>> {
+    // The line terminator is the formatter's own, not text a server controls.
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    if !body.contains('\\') && !body.chars().any(needs_control_escape) {
+        return Some(Cow::Borrowed(line));
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find('"') {
+        out.push_str(&rest[..start]);
+        let end = start.checked_add(json_literal_len(&rest[start..])?)?;
+        out.push_str(&escape_json_literal(&rest[start..end])?);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    Some(Cow::Owned(out))
+}
+
+/// Byte length of the string literal at the start of `text`, quotes included.
+fn json_literal_len(text: &str) -> Option<usize> {
+    let mut bytes = text.bytes().enumerate().skip(1);
+    while let Some((index, byte)) = bytes.next() {
+        match byte {
+            b'\\' => {
+                bytes.next();
+            }
+            b'"' => return index.checked_add(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `literal` (quotes included) with its text control-escaped; borrowed when
+/// escaping changes nothing, so the original bytes survive.
+fn escape_json_literal(literal: &str) -> Option<Cow<'_, str>> {
+    let inner = literal.get(1..literal.len().checked_sub(1)?)?;
+    if !inner.contains('\\') && !inner.chars().any(needs_control_escape) {
+        return Some(Cow::Borrowed(literal));
+    }
+    let decoded: String = serde_json::from_str(literal).ok()?;
+    match escape_control(&decoded) {
+        Cow::Borrowed(_) => Some(Cow::Borrowed(literal)),
+        Cow::Owned(escaped) => serde_json::to_string(&escaped).ok().map(Cow::Owned),
+    }
+}
+
+fn json_format() -> fmt::format::Format<fmt::format::Json> {
+    fmt::format()
+        .json()
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+}
+
 /// Initialize the logging subsystem.
 ///
 /// When `log_json` is `true`, log events are emitted as newline-delimited
@@ -100,11 +193,8 @@ pub fn init(level: &str, log_json: bool) -> Result<()> {
             .with(
                 fmt::layer()
                     .with_writer(std::io::stderr)
-                    .with_target(true)
-                    .with_thread_ids(false)
-                    .with_file(false)
-                    .with_line_number(false)
-                    .json(),
+                    .json()
+                    .event_format(EscapingJson(json_format())),
             )
             .try_init()
             .ok(); // Ignore if already initialized
@@ -130,6 +220,7 @@ pub fn init(level: &str, log_json: bool) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -176,6 +267,137 @@ mod tests {
         assert!(
             output.contains("method=file:///a\\nERROR"),
             "got {output:?}"
+        );
+    }
+
+    fn logs_with<F>(format: F, emit: impl FnOnce()) -> String
+    where
+        F: FormatEvent<tracing_subscriber::Registry, fmt::format::JsonFields>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(move || writer.clone())
+                .json()
+                .event_format(format),
+        );
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn json_logs(emit: impl FnOnce()) -> String {
+        logs_with(EscapingJson(json_format()), emit)
+    }
+
+    /// Emits a line holding an invalid JSON escape instead of an event.
+    struct InvalidEscape;
+
+    impl<S, N> FormatEvent<S, N> for InvalidEscape
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+        N: for<'a> FormatFields<'a> + 'static,
+    {
+        fn format_event(
+            &self,
+            _: &FmtContext<'_, S, N>,
+            mut writer: Writer<'_>,
+            _: &Event<'_>,
+        ) -> std::fmt::Result {
+            writer.write_str("{\"a\":\"bad \\q escape\"}\n")
+        }
+    }
+
+    #[test]
+    fn test_json_logs_write_the_fixed_line_when_a_literal_cannot_be_decoded() {
+        let output = logs_with(EscapingJson(InvalidEscape), || tracing::info!("x"));
+
+        assert_eq!(output, SUPPRESSED_LINE);
+        assert!(output.ends_with('\n'));
+        serde_json::from_str::<serde_json::Value>(&output).unwrap();
+    }
+
+    /// Debug fields (`\"`) and Windows paths (`\\`) take the decode path but
+    /// need no escaping, so the line is identical to the unwrapped formatter's.
+    #[test]
+    fn test_json_logs_keep_literals_with_only_quotes_and_backslashes_unchanged() {
+        let emit = || {
+            tracing::info!(path = ?r"C:\Users\dev\x.rs", quoted = %"say \"hi\"", "msg \"q\"");
+        };
+        let plain = logs_with(json_format().without_time(), emit);
+        let wrapped = logs_with(EscapingJson(json_format().without_time()), emit);
+
+        assert_eq!(wrapped, plain);
+        assert!(wrapped.contains(r"\\"), "{wrapped}");
+    }
+
+    #[test]
+    fn test_escape_json_strings_borrows_a_clean_line_with_its_newline() {
+        assert_matches!(
+            escape_json_strings("{\"a\":\"clean\"}\n"),
+            Some(Cow::Borrowed(_))
+        );
+        assert_matches!(
+            escape_json_strings("{\"a\":\"say \\\"hi\\\"\"}\n"),
+            Some(Cow::Owned(_))
+        );
+    }
+
+    #[test]
+    fn test_json_logs_escape_control_characters_in_event_and_span_fields() {
+        let hostile = "a\nb\u{202E}c\u{85}d\u{E0001}e\"q\\p";
+        let output = json_logs(|| {
+            let span = tracing::info_span!("work", file = hostile);
+            let _entered = span.enter();
+            tracing::warn!(method = hostile, "bad {hostile}");
+        });
+
+        assert_eq!(output.lines().count(), 1, "got {output:?}");
+        for raw in ['\u{202E}', '\u{85}', '\u{E0001}'] {
+            assert!(!output.contains(raw), "{raw:?} in {output:?}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let expected = "a\\nb\\u{202e}c\\u{85}d\\u{e0001}e\"q\\p";
+        assert_eq!(value["fields"]["method"], expected);
+        assert_eq!(value["fields"]["message"], format!("bad {expected}"));
+        assert_eq!(value["span"]["file"], expected);
+        assert_eq!(value["spans"][0]["file"], expected);
+    }
+
+    #[test]
+    fn test_json_logs_keep_clean_lines_and_key_order_stable() {
+        let clean = json_logs(|| tracing::info!(method = "plain", "hello"));
+        let escaped = json_logs(|| tracing::info!(method = "pl\nain", "hello"));
+
+        let key_order = |line: &str| {
+            let mut found: Vec<_> = [
+                "timestamp",
+                "level",
+                "fields",
+                "target",
+                "method",
+                "message",
+            ]
+            .into_iter()
+            .filter_map(|key| line.find(&format!("\"{key}\":")).map(|at| (at, key)))
+            .collect();
+            found.sort_unstable();
+            found.into_iter().map(|(_, key)| key).collect::<Vec<_>>()
+        };
+        assert_eq!(key_order(&clean), key_order(&escaped));
+        assert_eq!(key_order(&clean).len(), 6, "got {clean:?}");
+        assert!(clean.contains("\"method\":\"plain\""), "got {clean:?}");
+    }
+
+    #[test]
+    fn test_escape_json_strings_fails_closed_on_unterminated_literal() {
+        assert_eq!(escape_json_strings("{\"a\\\\b"), None);
+        assert_eq!(
+            escape_json_strings("{\"a\":\"x\\ny\"}\n").as_deref(),
+            Some("{\"a\":\"x\\\\ny\"}\n")
         );
     }
 

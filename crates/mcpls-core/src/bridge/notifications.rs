@@ -543,6 +543,7 @@ pub struct LogEntry {
 /// Log severity level.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[schemars(inline)]
 pub enum LogLevel {
     /// Error log level.
     Error,
@@ -552,6 +553,33 @@ pub enum LogLevel {
     Info,
     /// Debug log level.
     Debug,
+}
+
+impl LogLevel {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Error => 0,
+            Self::Warning => 1,
+            Self::Info => 2,
+            Self::Debug => 3,
+        }
+    }
+
+    /// Whether a log of this level is at least as severe as `min`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::LogLevel;
+    ///
+    /// assert!(LogLevel::Error.meets(LogLevel::Warning));
+    /// assert!(!LogLevel::Debug.meets(LogLevel::Info));
+    /// assert!(LogLevel::Debug.meets(LogLevel::Debug));
+    /// ```
+    #[must_use]
+    pub const fn meets(self, min: Self) -> bool {
+        self.rank() <= min.rank()
+    }
 }
 
 impl From<lsp_types::MessageType> for LogLevel {

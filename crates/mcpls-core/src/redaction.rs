@@ -13,6 +13,7 @@
 use std::borrow::Cow;
 
 use crate::config::LspServerConfig;
+use crate::error::Error;
 
 /// Shortest value redacted; shorter ones would match unrelated text.
 const MIN_SECRET_BYTES: usize = 8;
@@ -34,6 +35,34 @@ pub fn is_secret_name(name: &str) -> bool {
     SECRET_NAME_PATTERNS
         .iter()
         .any(|pattern| upper.contains(pattern))
+}
+
+/// Text known to carry no configured secret: it was redacted when built or is
+/// a fixed string.
+///
+/// It has no public constructor, so a value of this type held by
+/// [`Error::LspProtocolError`] cannot be an unredacted `String`; the crate
+/// builds it only through the redaction set of the server it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactedText(String);
+
+impl RedactedText {
+    /// Wraps a literal, which cannot hold a secret.
+    pub(crate) fn fixed(text: &'static str) -> Self {
+        Self(text.to_owned())
+    }
+
+    /// The text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RedactedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +165,81 @@ impl Redactions {
                 }
             })
         })
+    }
+
+    /// Whether there is nothing to hide.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// [`Self::apply`] in place; `text` is written only when a secret occurs.
+    pub(crate) fn redact_in_place(&self, text: &mut String) {
+        if let Cow::Owned(redacted) = self.apply(text) {
+            *text = redacted;
+        }
+    }
+
+    /// Redacts every string leaf of `value`; object keys are left alone.
+    pub(crate) fn redact_json(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => self.redact_in_place(text),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.redact_json(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values_mut() {
+                    self.redact_json(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Redacts the text a server controls in `diagnostic`: message, source,
+    /// string code, related-information messages and `data`.
+    ///
+    /// URIs (`relatedInformation[].location.uri`, `codeDescription.href`) are
+    /// kept: they are cache keys and links, and a secret-valued path would
+    /// make them unusable.
+    pub(crate) fn redact_diagnostic(&self, diagnostic: &mut lsp_types::Diagnostic) {
+        match &mut diagnostic.message {
+            lsp_types::Message::String(text) => self.redact_in_place(text),
+            lsp_types::Message::MarkupContent(content) => self.redact_in_place(&mut content.value),
+        }
+        if let Some(source) = &mut diagnostic.source {
+            self.redact_in_place(source);
+        }
+        if let Some(lsp_types::Code::String(code)) = &mut diagnostic.code {
+            self.redact_in_place(code);
+        }
+        for related in diagnostic.related_information.iter_mut().flatten() {
+            self.redact_in_place(&mut related.message);
+        }
+        if let Some(data) = &mut diagnostic.data {
+            self.redact_json(data);
+        }
+    }
+
+    /// Redacts the `title` and `message` of a `$/progress` payload.
+    pub(crate) fn redact_progress(&self, value: &mut serde_json::Value) {
+        for key in ["title", "message"] {
+            if let Some(serde_json::Value::String(text)) = value.get_mut(key) {
+                self.redact_in_place(text);
+            }
+        }
+    }
+
+    /// [`Self::apply`], wrapped as [`RedactedText`].
+    fn redact(&self, text: &str) -> RedactedText {
+        RedactedText(self.apply(text).into_owned())
+    }
+
+    /// An [`Error::LspProtocolError`] whose text is `message` with the secrets
+    /// replaced: the only way to build one from formatted text.
+    pub(crate) fn protocol_error(&self, message: std::fmt::Arguments<'_>) -> Error {
+        Error::LspProtocolError(self.redact(&message.to_string()))
     }
 
     /// Hides a secret cut by an elision boundary at the end of `head`: the
@@ -270,6 +374,112 @@ mod tests {
             assert!(cleaned.contains("[redacted:API_TOKEN]"), "{cleaned}");
             assert!(!cleaned.contains("word-12345"), "{cleaned}");
         }
+    }
+
+    const SECRET: &str = "SuperSecretValue123";
+
+    fn secret_diagnostic() -> lsp_types::Diagnostic {
+        serde_json::from_value(serde_json::json!({
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "code": "E-SuperSecretValue123",
+            "codeDescription": {"href": "https://example.com/SuperSecretValue123"},
+            "source": "lint-SuperSecretValue123",
+            "message": {"kind": "markdown", "value": "see `SuperSecretValue123`"},
+            "relatedInformation": [{
+                "location": {
+                    "uri": "file:///SuperSecretValue123/a.rs",
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}
+                },
+                "message": "defined with SuperSecretValue123"
+            }],
+            "data": {"SuperSecretValue123": ["x", {"nested": "has SuperSecretValue123"}], "n": 3}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_redact_diagnostic_covers_text_fields_and_data_values() {
+        let set = redactions(&[("API_TOKEN", SECRET)]);
+        let mut diagnostic = secret_diagnostic();
+
+        set.redact_diagnostic(&mut diagnostic);
+
+        let lsp_types::Message::MarkupContent(content) = &diagnostic.message else {
+            panic!("expected markup content");
+        };
+        assert_eq!(content.value, "see `[redacted:API_TOKEN]`");
+        assert_eq!(
+            diagnostic.source.as_deref(),
+            Some("lint-[redacted:API_TOKEN]")
+        );
+        assert_eq!(
+            diagnostic.code,
+            Some(lsp_types::Code::String("E-[redacted:API_TOKEN]".to_owned()))
+        );
+        let related = diagnostic.related_information.as_ref().unwrap();
+        assert_eq!(related[0].message, "defined with [redacted:API_TOKEN]");
+        let data = diagnostic.data.as_ref().unwrap();
+        assert_eq!(data[SECRET][1]["nested"], "has [redacted:API_TOKEN]");
+        assert_eq!(data["n"], 3);
+    }
+
+    #[test]
+    fn test_redact_diagnostic_keeps_uris() {
+        let set = redactions(&[("API_TOKEN", SECRET)]);
+        let mut diagnostic = secret_diagnostic();
+
+        set.redact_diagnostic(&mut diagnostic);
+
+        let related = diagnostic.related_information.as_ref().unwrap();
+        assert_eq!(
+            AsRef::<str>::as_ref(&related[0].location.uri),
+            "file:///SuperSecretValue123/a.rs"
+        );
+        let href = &diagnostic.code_description.as_ref().unwrap().href;
+        assert_eq!(
+            AsRef::<str>::as_ref(href),
+            "https://example.com/SuperSecretValue123"
+        );
+    }
+
+    #[test]
+    fn test_redact_progress_covers_title_and_message() {
+        let set = redactions(&[("API_TOKEN", SECRET)]);
+        let mut value = serde_json::json!({
+            "kind": "begin", "title": "index SuperSecretValue123", "message": "at SuperSecretValue123"
+        });
+
+        set.redact_progress(&mut value);
+
+        assert_eq!(value["title"], "index [redacted:API_TOKEN]");
+        assert_eq!(value["message"], "at [redacted:API_TOKEN]");
+    }
+
+    #[test]
+    fn test_redact_in_place_leaves_clean_text_untouched() {
+        let set = redactions(&[("API_TOKEN", SECRET)]);
+        let mut clean = String::from("nothing here");
+        let mut dirty = format!("x {SECRET}");
+
+        set.redact_in_place(&mut clean);
+        set.redact_in_place(&mut dirty);
+
+        assert_eq!(clean, "nothing here");
+        assert_eq!(dirty, "x [redacted:API_TOKEN]");
+        assert!(!set.is_empty());
+        assert!(Redactions::default().is_empty());
+    }
+
+    #[test]
+    fn test_protocol_error_masks_secrets_and_keeps_other_text() {
+        let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
+
+        let error = set.protocol_error(format_args!("bad value ghp_abcdefgh in {}", "frame"));
+
+        assert_eq!(
+            error.to_string(),
+            "LSP protocol error: bad value [redacted:API_TOKEN] in frame"
+        );
     }
 
     #[test]

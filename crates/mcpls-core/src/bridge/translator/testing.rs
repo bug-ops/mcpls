@@ -254,7 +254,6 @@ mod sh_servers {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-            notification_tx: None,
         }
     }
 

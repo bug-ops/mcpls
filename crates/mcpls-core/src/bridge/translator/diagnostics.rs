@@ -19,12 +19,12 @@ use super::enclosing::{ContextualDiagnostics, ResultContext};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::validate_path_against_roots;
 use crate::bridge::encoding::PositionEncoding;
-use crate::bridge::notifications::message_as_str;
+use crate::bridge::notifications::{LogLevel, message_as_str};
 use crate::bridge::{
     ClientPath, DiagnosticInfo, DocumentTracker, NotificationCache, WorkspaceRoots, path_to_uri,
 };
 use crate::config::ToolKind;
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// Hand-rolled union of `textDocument/diagnostic`'s two possible result
 /// shapes.
@@ -189,7 +189,7 @@ impl Translator {
 
         let merged = match pull_response {
             Ok(response) => {
-                let items = match response {
+                let mut items = match response {
                     DocumentDiagnosticReportResult::Report(report) => match report {
                         lsp_types::DocumentDiagnosticReport::RelatedFullDocumentDiagnosticReport(
                             full,
@@ -200,6 +200,12 @@ impl Translator {
                     },
                     DocumentDiagnosticReportResult::Partial(_) => vec![],
                 };
+                let redactions = client.redactions();
+                if !redactions.is_empty() {
+                    for d in &mut items {
+                        redactions.redact_diagnostic(d);
+                    }
+                }
                 let mut diagnostics = Vec::with_capacity(items.len());
                 for d in &items {
                     diagnostics.push(diagnostic_to_mcp(d, &ctx, uri).await);
@@ -372,50 +378,23 @@ impl Translator {
 
     /// Handle server logs request.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the `min_level` parameter is invalid.
+    /// Logs at least as severe as `min_level` are returned, or all of them
+    /// when it is `None`.
+    #[must_use]
     pub fn handle_server_logs(
         cache: &NotificationCache,
         limit: usize,
-        min_level: Option<String>,
-    ) -> Result<ServerLogsResult> {
-        use crate::bridge::notifications::LogLevel;
-
-        let min_level_filter = if let Some(level_str) = min_level {
-            let level = match level_str.to_lowercase().as_str() {
-                "error" => LogLevel::Error,
-                "warning" => LogLevel::Warning,
-                "info" => LogLevel::Info,
-                "debug" => LogLevel::Debug,
-                _ => {
-                    return Err(Error::InvalidToolParams(format!(
-                        "Invalid min_level: '{level_str}'. Valid values: error, warning, info, debug"
-                    )));
-                }
-            };
-            Some(level)
-        } else {
-            None
-        };
-
-        let all_logs = cache.logs();
-
-        let logs: Vec<_> = all_logs
+        min_level: Option<LogLevel>,
+    ) -> ServerLogsResult {
+        let logs = cache
+            .logs()
             .iter()
-            .filter(|log| {
-                min_level_filter.is_none_or(|min| match min {
-                    LogLevel::Error => matches!(log.level, LogLevel::Error),
-                    LogLevel::Warning => matches!(log.level, LogLevel::Error | LogLevel::Warning),
-                    LogLevel::Info => !matches!(log.level, LogLevel::Debug),
-                    LogLevel::Debug => true,
-                })
-            })
+            .filter(|log| min_level.is_none_or(|min| log.level.meets(min)))
             .take(limit)
             .cloned()
             .collect();
 
-        Ok(ServerLogsResult { logs })
+        ServerLogsResult { logs }
     }
 
     /// Handle server messages request.
@@ -450,6 +429,7 @@ mod tests {
     use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
+    use crate::error::Error;
     use crate::test_lsp::client_path;
 
     /// Pins the upstream `lsp_types::DocumentDiagnosticParams` serde
@@ -498,8 +478,6 @@ mod tests {
 
     #[test]
     fn test_handle_server_logs_with_filter() {
-        use crate::bridge::notifications::LogLevel;
-
         let mut cache = NotificationCache::new();
 
         // Add some logs
@@ -509,33 +487,21 @@ mod tests {
         cache.store_log(LogLevel::Debug, "debug msg".to_string());
 
         // Test with error filter
-        let result = Translator::handle_server_logs(&cache, 10, Some("error".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Error));
         assert_eq!(logs.logs.len(), 1);
         assert_eq!(logs.logs[0].message, "error msg");
 
         // Test with warning filter (includes error and warning)
-        let result = Translator::handle_server_logs(&cache, 10, Some("warning".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Warning));
         assert_eq!(logs.logs.len(), 2);
 
         // Test with info filter (excludes debug)
-        let result = Translator::handle_server_logs(&cache, 10, Some("info".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Info));
         assert_eq!(logs.logs.len(), 3);
 
         // Test with debug filter (includes all)
-        let result = Translator::handle_server_logs(&cache, 10, Some("debug".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Debug));
         assert_eq!(logs.logs.len(), 4);
-
-        // Test with invalid filter
-        let result = Translator::handle_server_logs(&cache, 10, Some("invalid".to_string()));
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[test]
@@ -1167,8 +1133,6 @@ mod tests {
 
     #[test]
     fn test_handle_server_logs_no_filter() {
-        use crate::bridge::notifications::LogLevel;
-
         let mut cache = NotificationCache::new();
 
         cache.store_log(LogLevel::Error, "error msg".to_string());
@@ -1176,65 +1140,49 @@ mod tests {
         cache.store_log(LogLevel::Info, "info msg".to_string());
         cache.store_log(LogLevel::Debug, "debug msg".to_string());
 
-        let result = Translator::handle_server_logs(&cache, 10, None);
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, None);
         assert_eq!(logs.logs.len(), 4);
     }
 
     #[test]
     fn test_handle_server_logs_error_filter_strict() {
-        use crate::bridge::notifications::LogLevel;
-
         let mut cache = NotificationCache::new();
 
         cache.store_log(LogLevel::Error, "error msg".to_string());
         cache.store_log(LogLevel::Warning, "warning msg".to_string());
         cache.store_log(LogLevel::Info, "info msg".to_string());
 
-        let result = Translator::handle_server_logs(&cache, 10, Some("error".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Error));
         assert_eq!(logs.logs.len(), 1);
         assert_eq!(logs.logs[0].message, "error msg");
     }
 
     #[test]
     fn test_handle_server_logs_warning_filter_includes_errors() {
-        use crate::bridge::notifications::LogLevel;
-
         let mut cache = NotificationCache::new();
 
         cache.store_log(LogLevel::Error, "error msg".to_string());
         cache.store_log(LogLevel::Warning, "warning msg".to_string());
         cache.store_log(LogLevel::Info, "info msg".to_string());
 
-        let result = Translator::handle_server_logs(&cache, 10, Some("warning".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Warning));
         assert_eq!(logs.logs.len(), 2);
     }
 
     #[test]
     fn test_handle_server_logs_info_filter_excludes_debug() {
-        use crate::bridge::notifications::LogLevel;
-
         let mut cache = NotificationCache::new();
 
         cache.store_log(LogLevel::Error, "error msg".to_string());
         cache.store_log(LogLevel::Info, "info msg".to_string());
         cache.store_log(LogLevel::Debug, "debug msg".to_string());
 
-        let result = Translator::handle_server_logs(&cache, 10, Some("info".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Info));
         assert_eq!(logs.logs.len(), 2);
     }
 
     #[test]
     fn test_handle_server_logs_debug_filter_includes_all() {
-        use crate::bridge::notifications::LogLevel;
-
         let mut cache = NotificationCache::new();
 
         cache.store_log(LogLevel::Error, "error msg".to_string());
@@ -1242,46 +1190,22 @@ mod tests {
         cache.store_log(LogLevel::Info, "info msg".to_string());
         cache.store_log(LogLevel::Debug, "debug msg".to_string());
 
-        let result = Translator::handle_server_logs(&cache, 10, Some("debug".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Debug));
         assert_eq!(logs.logs.len(), 4);
     }
 
     #[test]
     fn test_handle_server_logs_limit_applies_after_filter() {
-        use crate::bridge::notifications::LogLevel;
-
         let mut cache = NotificationCache::new();
 
         for i in 0..10 {
             cache.store_log(LogLevel::Error, format!("error {i}"));
         }
 
-        let result = Translator::handle_server_logs(&cache, 5, Some("error".to_string()));
-        assert!(result.is_ok());
-        let logs = result.unwrap();
+        let logs = Translator::handle_server_logs(&cache, 5, Some(LogLevel::Error));
         assert_eq!(logs.logs.len(), 5);
         assert_eq!(logs.logs[0].message, "error 0");
         assert_eq!(logs.logs[4].message, "error 4");
-    }
-
-    #[test]
-    fn test_handle_server_logs_case_insensitive_level() {
-        use crate::bridge::notifications::LogLevel;
-
-        let mut cache = NotificationCache::new();
-
-        cache.store_log(LogLevel::Error, "error msg".to_string());
-
-        let result = Translator::handle_server_logs(&cache, 10, Some("ERROR".to_string()));
-        assert!(result.is_ok());
-
-        let result = Translator::handle_server_logs(&cache, 10, Some("Error".to_string()));
-        assert!(result.is_ok());
-
-        let result = Translator::handle_server_logs(&cache, 10, Some("eRrOr".to_string()));
-        assert!(result.is_ok());
     }
 
     #[test]
@@ -1344,6 +1268,99 @@ mod tests {
             &client_path(&test_file),
         );
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
+    }
+
+    /// #583: pulled diagnostics are redacted like pushed ones, before they are
+    /// merged, so a pulled item and its already-redacted cached twin dedupe.
+    #[tokio::test]
+    async fn test_handle_diagnostics_redacts_pull_items_before_merging_with_the_cache() {
+        let dir = TempDir::new().unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(crate::test_lsp::test_extensions())
+            .with_router(ToolRouter::catch_all([(
+                ServerId::from("rust"),
+                "rust".to_string(),
+            )]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
+        let redactions = crate::redaction::Redactions::new([(
+            "API_TOKEN".to_owned(),
+            "SuperSecretValue123".to_owned(),
+        )]);
+        let (client, mut server, _lanes) =
+            crate::test_lsp::fake_lsp_client_with_redactions(redactions);
+        translator.register_client("rust".to_string(), client);
+
+        let path = dir.path().join("lib.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let uri = path_to_uri(&path.canonicalize().unwrap()).unwrap();
+        let notification_cache = Mutex::new(NotificationCache::new());
+        notification_cache.lock().await.store_diagnostics(
+            &ServerId::from("rust"),
+            &uri,
+            Some(1),
+            vec![lsp_diag(
+                0,
+                4,
+                lsp_types::DiagnosticSeverity::Warning,
+                "leaked [redacted:API_TOKEN]",
+                None,
+            )],
+        );
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_diagnostics(
+                        client_path(path_str),
+                        ResultContext::None,
+                        &notification_cache,
+                    )
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/diagnostic");
+        let range = serde_json::json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 4}
+        });
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!({
+                "kind": "full",
+                "items": [
+                    {"range": range, "severity": 2, "message": "leaked SuperSecretValue123"},
+                    {
+                        "range": range,
+                        "severity": 1,
+                        "message": {"kind": "plaintext", "value": "other SuperSecretValue123"},
+                        "data": {"hint": "SuperSecretValue123"}
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let shown = serde_json::to_string(&result.diagnostics).unwrap();
+        assert!(!shown.contains("SuperSecretValue123"), "{shown}");
+        assert_eq!(result.diagnostics.len(), 2, "{shown}");
+        assert!(shown.contains("leaked [redacted:API_TOKEN]"), "{shown}");
     }
 
     /// S1 regression (#244): a push-only server (or one that times out)
