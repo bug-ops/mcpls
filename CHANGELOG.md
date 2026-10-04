@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SECURITY.md` and a documented trust model for workspace-supplied code execution. (#609)
 - User guide section "Verifying an edit" documents the apply, save and poll `get_diagnostics` loop; a speculative-edit preview tool is a documented non-goal. (#609)
 - `--http-allowed-origin` and `HttpConfig::with_allowed_origins` accept extra browser origins as the typed `AllowedOrigin`; a non-loopback `Host` is still rejected. (#610)
+- `--http-allowed-host`, `MCPLS_HTTP_ALLOWED_HOSTS` and `HttpConfig::with_allowed_hosts` extend the loopback `Host` allowlist with the typed `AllowedHost`; the bound IP is allowed automatically, ports 80 and 443 must be omitted. (#597, #614)
+- Per-server `settings` table pushed after `initialized` and served on `workspace/configuration`; new `LspSettings` and `InvalidLspSettings`. (#598, #614)
+- `HttpConfig::write_stall_timeout` and `WriteStallTimeout` (30 s) free the connection permit of a peer that stops reading. (#600, #614)
 
 ### Changed
 
@@ -106,6 +109,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** JSON logs escape control and deceptive characters in every string, so a multi-line value reads as the literal `\n`. (#610)
 - **Breaking:** `get_server_logs` `min_level` is a lowercase enum, anything else is rejected, and `Translator::handle_server_logs` takes `Option<LogLevel>`. (#610)
 - **Breaking:** `HttpConfig::max_request_body` (`RequestBodyLimit`, clamped to 64 MiB) replaces `max_request_body_bytes`, `with_max_request_body_bytes` and `DEFAULT_MAX_REQUEST_BODY_BYTES`. (#610)
+- **Breaking:** `LspServerConfig` gains a public `settings` field, and `HttpConfig` gains `allowed_hosts` and `write_stall_timeout`. (#597, #598, #600, #614)
+- With `settings` set, `workspace.configuration` is advertised and rust-analyzer and jdtls may replace `initialization_options`; mcpls warns when both are set. (#598, #614)
+- HTTP connections close with a bounded linger so early 403 and 413 reach the client; the status is guaranteed only for bodies up to 1 MiB. (#602, #614)
+- Listen replay is paced (burst 32, 320 per second, best effort) and the eviction record is a capped map; use `listen_with_capacity` of at least 2000 for a guarantee. (#593, #614)
+- Tool results redact configured secrets in server display text as `[redacted:NAME]`; edits, URIs, identifiers and command arguments are unchanged, so redaction is partial. (#599, #614)
+- `SECURITY.md` trust model names `settings` and `initialization_options`. (#598, #614)
 
 ### Fixed
 
