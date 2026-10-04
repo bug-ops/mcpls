@@ -438,3 +438,18 @@ fn test_default_logging_is_not_json() {
         .stderr(predicate::str::contains("starting mcpls"))
         .stderr(predicate::str::contains("\"message\":\"starting mcpls\"").not());
 }
+
+#[cfg(feature = "transport-http")]
+#[test]
+fn test_invalid_http_path_exits_with_usage_error_instead_of_panicking() {
+    for bad in ["/", "mcp", ""] {
+        let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+        clear_ambient_env(&mut cmd)
+            .env_remove("MCPLS_HTTP_PATH")
+            .args(["--listen", "127.0.0.1:0", "--http-path", bad])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("panicked").not());
+    }
+}

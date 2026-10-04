@@ -452,6 +452,16 @@ pub enum Error {
     #[error("MCP server error: {0}")]
     McpServer(String),
 
+    /// The HTTP transport could not bind its listener.
+    #[error("failed to bind HTTP listener on {addr}: {source}")]
+    HttpBind {
+        /// Address the listener was asked to bind.
+        addr: std::net::SocketAddr,
+        /// Underlying I/O error, e.g. `AddrInUse`.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Document was not found or could not be opened.
     #[error("document not found: {0}")]
     DocumentNotFound(PathBuf),
@@ -1003,6 +1013,7 @@ impl Error {
             Self::LspInitFailed { .. }
             | Self::LspServerError { .. }
             | Self::McpServer(_)
+            | Self::HttpBind { .. }
             | Self::NoServerForLanguage(_)
             | Self::NoServerForTool { .. }
             | Self::NoServerConfigured

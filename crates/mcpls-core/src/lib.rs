@@ -26,7 +26,7 @@
 //!     // Stdio (default):
 //!     let result = serve(config).await;
 //!     // HTTP (requires `transport-http` feature):
-//!     // let http = mcpls_core::HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp");
+//!     // let http = mcpls_core::HttpConfig::new("127.0.0.1:3000".parse().unwrap());
 //!     // let result = serve_with(config, Transport::Http(http)).await;
 //!
 //!     // See `serve`/`serve_with`'s "Shutdown" docs: process::exit avoids a
@@ -78,7 +78,8 @@ use transport::run_http;
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 pub use transport::{
-    ConnectionLimit, HeaderReadTimeout, HttpConfig, ProbeDeadline, ProbeInterval, StreamLiveness,
+    ConnectionLimit, HeaderReadTimeout, HttpConfig, HttpPath, InvalidHttpPath, ProbeDeadline,
+    ProbeInterval, SessionLimit, StreamLiveness,
 };
 use transport::{ShutdownSignal, run_stdio};
 pub use util::escape_control;

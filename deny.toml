@@ -9,6 +9,7 @@ all-features = true
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = []
+yanked = "deny"
 
 [licenses]
 allow = [

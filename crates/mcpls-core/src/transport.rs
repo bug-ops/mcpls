@@ -61,13 +61,19 @@ pub enum Transport {
 /// clients must send requests with a `Host` that matches the allow-list, or
 /// use a reverse proxy that rewrites the `Host` header.
 ///
+/// A request carrying an `Origin` header is accepted only when it names a
+/// loopback origin (`localhost`, `127.0.0.1`, `[::1]`) on the bound port;
+/// anything else, including `Origin: null`, is answered with `403`. A request
+/// without `Origin` (every non-browser client) is unaffected, so a proxy in
+/// front of browser clients must rewrite or strip `Origin`.
+///
 /// # Examples
 ///
 /// ```rust,ignore
 /// use std::net::SocketAddr;
 /// use mcpls_core::{HttpConfig, Transport};
 ///
-/// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp");
+/// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap());
 /// let transport = Transport::Http(cfg);
 /// ```
 #[cfg(feature = "transport-http")]
@@ -82,7 +88,7 @@ pub struct HttpConfig {
     /// The same service also answers at the root path `/`, regardless of
     /// this value, so a reverse proxy must not rely on `path` alone to
     /// restrict which URLs reach mcpls.
-    pub path: String,
+    pub path: HttpPath,
     /// Maximum size, in bytes, of a single POST request body.
     ///
     /// Enforced by `rmcp`'s `StreamableHttpService` while streaming the body,
@@ -100,10 +106,8 @@ pub struct HttpConfig {
     /// semaphore — never more than this many sessions can be active at once,
     /// regardless of request concurrency.
     /// Requests that would start a new session beyond this limit receive
-    /// `429 Too Many Requests`. Defaults to
-    /// [`HttpConfig::DEFAULT_MAX_CONCURRENT_SESSIONS`]. A value of `0`
-    /// rejects every session.
-    pub max_concurrent_sessions: usize,
+    /// `429 Too Many Requests`. Defaults to [`SessionLimit::DEFAULT`].
+    pub max_concurrent_sessions: SessionLimit,
     /// How long a session may go without client activity before it is closed.
     pub(crate) session_idle_timeout: IdleTimeout,
     /// Longest a client may take to send a complete request header, and
@@ -134,30 +138,47 @@ pub struct HttpConfig {
 impl HttpConfig {
     /// Default request body size cap (4 MiB), matching `rmcp`'s own default.
     pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
-    /// Default concurrent HTTP session cap.
-    pub const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 100;
 
-    /// Create an [`HttpConfig`] with default body-size, session, timeout and
-    /// connection caps.
+    /// Create an [`HttpConfig`] mounted at [`HttpPath::default`] with default
+    /// body-size, session, timeout and connection caps.
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use mcpls_core::HttpConfig;
     ///
-    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp");
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap());
+    /// assert_eq!(cfg.path.as_str(), "/mcp");
     /// ```
-    pub fn new(bind: std::net::SocketAddr, path: impl Into<String>) -> Self {
+    #[must_use]
+    pub fn new(bind: std::net::SocketAddr) -> Self {
         Self {
             bind,
-            path: path.into(),
+            path: HttpPath::default(),
             max_request_body_bytes: Self::DEFAULT_MAX_REQUEST_BODY_BYTES,
-            max_concurrent_sessions: Self::DEFAULT_MAX_CONCURRENT_SESSIONS,
+            max_concurrent_sessions: SessionLimit::DEFAULT,
             session_idle_timeout: IdleTimeout::DEFAULT,
             header_read_timeout: HeaderReadTimeout::DEFAULT,
             max_concurrent_connections: ConnectionLimit::DEFAULT,
             stream_liveness: StreamLiveness::DEFAULT,
         }
+    }
+
+    /// Override the URL path the MCP service is mounted at.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::{HttpConfig, HttpPath};
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap())
+    ///     .with_path("/api/mcp".parse::<HttpPath>().unwrap());
+    /// assert_eq!(cfg.path.as_str(), "/api/mcp");
+    /// ```
+    #[must_use]
+    pub fn with_path(mut self, path: HttpPath) -> Self {
+        self.path = path;
+        self
     }
 
     /// Override the maximum POST request body size in bytes.
@@ -169,7 +190,7 @@ impl HttpConfig {
 
     /// Override the maximum number of concurrent HTTP sessions.
     #[must_use]
-    pub const fn with_max_concurrent_sessions(mut self, max: usize) -> Self {
+    pub const fn with_max_concurrent_sessions(mut self, max: SessionLimit) -> Self {
         self.max_concurrent_sessions = max;
         self
     }
@@ -195,7 +216,7 @@ impl HttpConfig {
     /// ```
     /// use mcpls_core::{HttpConfig, StreamLiveness};
     ///
-    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp")
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap())
     ///     .with_stream_liveness(StreamLiveness::Disabled);
     /// assert_eq!(cfg.stream_liveness, StreamLiveness::Disabled);
     /// ```
@@ -208,19 +229,22 @@ impl HttpConfig {
 
 #[cfg(feature = "transport-http")]
 macro_rules! non_zero_duration {
-    ($(#[$meta:meta])* $name:ident, $default_secs:expr, $default_doc:literal) => {
+    ($(#[$meta:meta])* $vis:vis $name:ident, $default_secs:expr, $default_doc:literal) => {
         $(#[$meta])*
         #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub struct $name(std::time::Duration);
+        $vis struct $name(std::time::Duration);
 
         impl $name {
             #[doc = $default_doc]
-            pub const DEFAULT: Self = Self(std::time::Duration::from_secs($default_secs));
+            $vis const DEFAULT: Self = match Self::new(std::time::Duration::from_secs($default_secs)) {
+                Some(duration) => duration,
+                None => panic!("the default duration must be non-zero"),
+            };
 
             /// `None` for a zero duration.
             #[must_use]
-            pub const fn new(duration: std::time::Duration) -> Option<Self> {
+            $vis const fn new(duration: std::time::Duration) -> Option<Self> {
                 if duration.is_zero() {
                     None
                 } else {
@@ -230,7 +254,34 @@ macro_rules! non_zero_duration {
 
             /// The wrapped duration, never zero.
             #[must_use]
-            pub const fn get(self) -> std::time::Duration {
+            $vis const fn get(self) -> std::time::Duration {
+                self.0
+            }
+        }
+    };
+}
+
+#[cfg(feature = "transport-http")]
+macro_rules! non_zero_limit {
+    ($(#[$meta:meta])* $name:ident, $default:expr, $default_doc:literal) => {
+        $(#[$meta])*
+        #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name(usize);
+
+        impl $name {
+            #[doc = $default_doc]
+            pub const DEFAULT: Self = Self($default);
+
+            /// `None` for zero; larger values are clamped to the semaphore maximum.
+            #[must_use]
+            pub fn new(max: usize) -> Option<Self> {
+                (max > 0).then(|| Self(max.min(tokio::sync::Semaphore::MAX_PERMITS)))
+            }
+
+            /// The wrapped limit, between 1 and the semaphore maximum.
+            #[must_use]
+            pub const fn get(self) -> usize {
                 self.0
             }
         }
@@ -251,7 +302,7 @@ non_zero_duration! {
     /// let interval = ProbeInterval::new(Duration::from_mins(1)).unwrap();
     /// assert_eq!(interval.get(), Duration::from_mins(1));
     /// ```
-    ProbeInterval, 60, "60 seconds."
+    pub ProbeInterval, 60, "60 seconds."
 }
 
 #[cfg(feature = "transport-http")]
@@ -269,7 +320,112 @@ non_zero_duration! {
     /// let deadline = ProbeDeadline::new(Duration::from_secs(30)).unwrap();
     /// assert_eq!(deadline.get(), Duration::from_secs(30));
     /// ```
-    ProbeDeadline, 30, "30 seconds."
+    pub ProbeDeadline, 30, "30 seconds."
+}
+
+/// Why a string is not a valid [`HttpPath`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::{HttpPath, InvalidHttpPath};
+///
+/// assert_eq!("mcp".parse::<HttpPath>(), Err(InvalidHttpPath::MissingLeadingSlash));
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidHttpPath {
+    /// The path is empty or does not start with `/`.
+    #[error("must start with `/`")]
+    MissingLeadingSlash,
+    /// The path is exactly `/`; the service already answers at the root.
+    #[error("must not be `/`: the service already answers at the root path")]
+    Root,
+    /// The path contains `//` or ends with `/`.
+    #[error("must not contain an empty segment (`//` or a trailing `/`)")]
+    EmptySegment,
+    /// The path contains a `.` or `..` segment.
+    #[error("must not contain a `.` or `..` segment")]
+    DotSegment,
+    /// The path contains a character outside `A-Z a-z 0-9 - . _ ~`.
+    #[error("contains `{0}`; only ASCII letters, digits and `-._~` are allowed in a segment")]
+    InvalidCharacter(char),
+}
+
+/// URL path the MCP service is mounted at, validated so mounting it cannot
+/// panic.
+///
+/// Starts with `/`, is not `/` itself, has no empty or dot segments, and each
+/// segment uses only ASCII letters, digits and `-._~`. Wildcard, parameter
+/// and percent-encoded forms are rejected rather than normalized.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::{HttpPath, InvalidHttpPath};
+///
+/// assert_eq!("/api/mcp".parse::<HttpPath>().unwrap().as_str(), "/api/mcp");
+/// assert_eq!(HttpPath::default().as_str(), "/mcp");
+/// assert_eq!("/".parse::<HttpPath>(), Err(InvalidHttpPath::Root));
+/// assert_eq!("/a/{id}".parse::<HttpPath>(), Err(InvalidHttpPath::InvalidCharacter('{')));
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpPath(Box<str>);
+
+#[cfg(feature = "transport-http")]
+impl HttpPath {
+    /// The validated path, starting with `/`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl Default for HttpPath {
+    fn default() -> Self {
+        Self("/mcp".into())
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl std::fmt::Display for HttpPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl std::str::FromStr for HttpPath {
+    type Err = InvalidHttpPath;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let rest = s
+            .strip_prefix('/')
+            .ok_or(InvalidHttpPath::MissingLeadingSlash)?;
+        if rest.is_empty() {
+            return Err(InvalidHttpPath::Root);
+        }
+        for segment in rest.split('/') {
+            if segment.is_empty() {
+                return Err(InvalidHttpPath::EmptySegment);
+            }
+            if matches!(segment, "." | "..") {
+                return Err(InvalidHttpPath::DotSegment);
+            }
+            if let Some(c) = segment
+                .chars()
+                .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')))
+            {
+                return Err(InvalidHttpPath::InvalidCharacter(c));
+            }
+        }
+        Ok(Self(s.into()))
+    }
 }
 
 /// How a session's standalone GET (SSE) stream is checked for a dead peer.
@@ -327,81 +483,64 @@ impl Default for StreamLiveness {
     }
 }
 
-/// Non-zero request read timeout for [`HttpConfig::header_read_timeout`].
-///
-/// A zero duration would drop every connection, so it is unrepresentable.
-///
-/// # Examples
-///
-/// ```
-/// use std::time::Duration;
-/// use mcpls_core::HeaderReadTimeout;
-///
-/// assert!(HeaderReadTimeout::new(Duration::ZERO).is_none());
-/// let timeout = HeaderReadTimeout::new(Duration::from_secs(10)).unwrap();
-/// assert_eq!(timeout.get(), Duration::from_secs(10));
-/// ```
 #[cfg(feature = "transport-http")]
-#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeaderReadTimeout(std::time::Duration);
-
-#[cfg(feature = "transport-http")]
-impl HeaderReadTimeout {
-    /// 30 seconds.
-    pub const DEFAULT: Self = Self(std::time::Duration::from_secs(30));
-
-    /// `None` for a zero duration.
-    #[must_use]
-    pub const fn new(timeout: std::time::Duration) -> Option<Self> {
-        if timeout.is_zero() {
-            None
-        } else {
-            Some(Self(timeout))
-        }
-    }
-
-    /// The wrapped duration, never zero.
-    #[must_use]
-    pub const fn get(self) -> std::time::Duration {
-        self.0
-    }
+non_zero_duration! {
+    /// Non-zero request read timeout for [`HttpConfig::header_read_timeout`].
+    ///
+    /// A zero duration would drop every connection, so it is unrepresentable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::HeaderReadTimeout;
+    ///
+    /// assert!(HeaderReadTimeout::new(Duration::ZERO).is_none());
+    /// let timeout = HeaderReadTimeout::new(Duration::from_secs(10)).unwrap();
+    /// assert_eq!(timeout.get(), Duration::from_secs(10));
+    /// ```
+    pub HeaderReadTimeout, 30, "30 seconds."
 }
 
-/// Non-zero open-connection cap for [`HttpConfig::max_concurrent_connections`],
-/// clamped to what [`tokio::sync::Semaphore`] supports.
-///
-/// # Examples
-///
-/// ```
-/// use mcpls_core::ConnectionLimit;
-///
-/// assert!(ConnectionLimit::new(0).is_none());
-/// assert_eq!(ConnectionLimit::new(8).unwrap().get(), 8);
-/// assert!(ConnectionLimit::new(usize::MAX).is_some());
-/// ```
 #[cfg(feature = "transport-http")]
-#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnectionLimit(usize);
+non_zero_limit! {
+    /// Non-zero open-connection cap for [`HttpConfig::max_concurrent_connections`],
+    /// clamped to what [`tokio::sync::Semaphore`] supports.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::ConnectionLimit;
+    ///
+    /// assert!(ConnectionLimit::new(0).is_none());
+    /// assert_eq!(ConnectionLimit::new(8).unwrap().get(), 8);
+    /// assert!(ConnectionLimit::new(usize::MAX).is_some());
+    /// ```
+    ConnectionLimit,
+    512,
+    "512: room for 100 sessions each holding a GET stream, a `subscriptions/listen` stream and one in-flight POST."
+}
 
 #[cfg(feature = "transport-http")]
-impl ConnectionLimit {
-    /// 512: room for 100 sessions each holding a GET stream, a
-    /// `subscriptions/listen` stream and one in-flight POST.
-    pub const DEFAULT: Self = Self(512);
-
-    /// `None` for zero; larger values are clamped to the semaphore maximum.
-    #[must_use]
-    pub fn new(max: usize) -> Option<Self> {
-        (max > 0).then(|| Self(max.min(tokio::sync::Semaphore::MAX_PERMITS)))
-    }
-
-    /// The wrapped limit, between 1 and the semaphore maximum.
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
-    }
+non_zero_limit! {
+    /// Non-zero cap on concurrent HTTP sessions for
+    /// [`HttpConfig::max_concurrent_sessions`], clamped to what
+    /// [`tokio::sync::Semaphore`] supports.
+    ///
+    /// A zero cap would reject every session, so it is unrepresentable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::SessionLimit;
+    ///
+    /// assert!(SessionLimit::new(0).is_none());
+    /// assert_eq!(SessionLimit::new(5).unwrap().get(), 5);
+    /// assert_eq!(SessionLimit::DEFAULT.get(), 100);
+    /// ```
+    SessionLimit,
+    100,
+    "100 concurrent sessions."
 }
 
 #[cfg(feature = "transport-http")]
@@ -412,7 +551,7 @@ use rmcp::ServiceExt as _;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 #[cfg(feature = "transport-http")]
 use rmcp::transport::streamable_http_server::session::local::{
-    LocalSessionManager, LocalSessionManagerError, SessionConfig,
+    LocalSessionManager, LocalSessionManagerError,
 };
 #[cfg(feature = "transport-http")]
 use rmcp::transport::streamable_http_server::session::{
@@ -759,8 +898,24 @@ pub(crate) async fn run_http(
     // ack a liveness probe; they are bounded only by `MAX_LISTEN_STREAMS`
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
-        .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
+        .map_err(|source| crate::Error::HttpBind {
+            addr: cfg.bind,
+            source,
+        })?;
     serve_http(listener, mcp_server, cfg, shutdown_signal).await
+}
+
+/// Browser origins of a page served by this process's own loopback listener.
+///
+/// rmcp accepts a request without an `Origin` header, so non-browser clients
+/// are unaffected; a browser page on any other origin gets `403`.
+#[cfg(feature = "transport-http")]
+fn loopback_origins(port: u16) -> [String; 3] {
+    [
+        format!("http://localhost:{port}"),
+        format!("http://127.0.0.1:{port}"),
+        format!("http://[::1]:{port}"),
+    ]
 }
 
 /// Serves the MCP HTTP transport on an already-bound `listener`.
@@ -800,8 +955,11 @@ pub(crate) async fn serve_http(
     // new sessions from, rather than a shared instance a caller could
     // accidentally hand to multiple sessions.
     let mcp_for_factory = mcp_server;
+    let local_addr = listener.local_addr()?;
     // StreamableHttpServerConfig is #[non_exhaustive]; construct via Default then mutate.
-    let mut http_cfg = StreamableHttpServerConfig::default();
+    let mut http_cfg = StreamableHttpServerConfig::default()
+        .with_allowed_origins(loopback_origins(local_addr.port()))
+        .enforce_origin_validation();
     http_cfg.cancellation_token = cancel.clone();
     http_cfg.max_request_body_bytes = cfg.max_request_body_bytes;
 
@@ -818,17 +976,13 @@ pub(crate) async fn serve_http(
     );
 
     let app = axum::Router::new()
-        .nest_service(&cfg.path, service.clone())
+        .nest_service(cfg.path.as_str(), service.clone())
         .route_service("/", service)
         .layer(axum::middleware::from_fn(enforce_session_cap))
         .layer(axum::middleware::from_fn_with_state(
             cfg.header_read_timeout,
             enforce_body_inactivity,
         ));
-
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| crate::Error::McpServer(format!("listener local_addr: {e}")))?;
 
     let reaper_cancel = cancel.child_token();
     // Stops the reaper on every return path below, not only on shutdown.
@@ -843,7 +997,9 @@ pub(crate) async fn serve_http(
              any transport — place this endpoint behind a reverse proxy that enforces \
              authentication. mcpls itself enforces only a header-read/idle timeout and a connection \
              cap. The proxy must also rewrite the Host header, since rmcp's Host validation \
-             allows only localhost/127.0.0.1/::1 by default"
+             allows only localhost/127.0.0.1/::1 by default, and rewrite or strip the Origin \
+             header of browser clients, since only loopback origins on the bound port are \
+             allowed"
         );
     }
 
@@ -1192,10 +1348,10 @@ struct CappedSessionManager {
 
 #[cfg(feature = "transport-http")]
 impl CappedSessionManager {
-    fn new(max_sessions: usize, idle: IdleTimeout) -> Self {
+    fn new(max_sessions: SessionLimit, idle: IdleTimeout) -> Self {
         Self {
             inner: std::sync::Arc::new(LocalSessionManager::default()),
-            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_sessions)),
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_sessions.get())),
             slots: StdMutex::new(std::collections::HashMap::new()),
             idle,
             stream_liveness: StreamLiveness::Disabled,
@@ -1324,38 +1480,23 @@ impl CappedSessionManager {
     }
 }
 
-/// Non-zero duration after which a session without inbound client activity
-/// or open response stream is closed by [`run_idle_reaper`].
-///
-/// Deliberately separate from rmcp's own `keep_alive`, which measures any
-/// event on the session -- including outbound notifications -- and so never
-/// fires for an abandoned but subscribed session (#521).
 #[cfg(feature = "transport-http")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct IdleTimeout(std::time::Duration);
+non_zero_duration! {
+    /// Non-zero duration after which a session without inbound client activity
+    /// or open response stream is closed by [`run_idle_reaper`].
+    ///
+    /// Deliberately separate from rmcp's own `keep_alive`, which measures any
+    /// event on the session -- including outbound notifications -- and so never
+    /// fires for an abandoned but subscribed session (#521).
+    pub(crate) IdleTimeout, 300, "5 minutes."
+}
 
 #[cfg(feature = "transport-http")]
 impl IdleTimeout {
-    /// Matches rmcp's default `keep_alive` (5 minutes).
-    pub(crate) const DEFAULT: Self = match Self::new(SessionConfig::DEFAULT_KEEP_ALIVE) {
-        Some(timeout) => timeout,
-        None => panic!("the default idle timeout must be non-zero"),
-    };
-
-    /// `None` for a zero duration, which would make every session instantly
-    /// idle.
-    pub(crate) const fn new(timeout: std::time::Duration) -> Option<Self> {
-        if timeout.is_zero() {
-            None
-        } else {
-            Some(Self(timeout))
-        }
-    }
-
     /// A fifth of the timeout, so an idle session closes within 1.2x of it;
     /// never zero, which `tokio::time::interval` rejects.
     fn sweep_interval(self) -> std::time::Duration {
-        self.0
+        self.get()
             .checked_div(5)
             .unwrap_or_default()
             .max(std::time::Duration::from_millis(1))
@@ -1397,7 +1538,7 @@ impl SessionActivity {
 
     fn is_idle(&self, now: tokio::time::Instant, timeout: IdleTimeout) -> bool {
         let state = lock_std(&self.0);
-        state.open_streams == 0 && now.saturating_duration_since(state.idle_since) >= timeout.0
+        state.open_streams == 0 && now.saturating_duration_since(state.idle_since) >= timeout.get()
     }
 }
 
@@ -1801,14 +1942,68 @@ mod tests {
         #[test]
         fn test_http_config_fields() {
             let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-            let cfg = HttpConfig::new(addr, "/mcp");
+            let cfg = HttpConfig::new(addr);
             assert_eq!(cfg.bind, addr);
-            assert_eq!(cfg.path, "/mcp");
+            assert_eq!(cfg.path, crate::HttpPath::default());
+        }
+
+        #[test]
+        fn test_http_path_accepts_valid_paths() {
+            for ok in [
+                "/mcp",
+                "/a",
+                "/api/v1/mcp",
+                "/a-b_c.d~e",
+                "/A1/2b",
+                "/.well-known",
+            ] {
+                assert_eq!(ok.parse::<crate::HttpPath>().unwrap().as_str(), ok);
+            }
+        }
+
+        #[test]
+        fn test_http_path_rejects_each_invalid_shape() {
+            use crate::InvalidHttpPath as E;
+
+            let cases = [
+                ("", E::MissingLeadingSlash),
+                ("mcp", E::MissingLeadingSlash),
+                ("/", E::Root),
+                ("//", E::EmptySegment),
+                ("/a//b", E::EmptySegment),
+                ("/a/", E::EmptySegment),
+                ("/.", E::DotSegment),
+                ("/a/../b", E::DotSegment),
+                ("/{id}", E::InvalidCharacter('{')),
+                ("/a/*rest", E::InvalidCharacter('*')),
+                ("/:id", E::InvalidCharacter(':')),
+                ("/a?b", E::InvalidCharacter('?')),
+                ("/a#b", E::InvalidCharacter('#')),
+                ("/a%20b", E::InvalidCharacter('%')),
+                ("/a b", E::InvalidCharacter(' ')),
+                ("/\u{e9}", E::InvalidCharacter('\u{e9}')),
+            ];
+            for (input, expected) in cases {
+                assert_eq!(input.parse::<crate::HttpPath>(), Err(expected), "{input:?}");
+            }
+        }
+
+        proptest::proptest! {
+            #[test]
+            fn test_every_valid_http_path_nests_without_panic(
+                raw in "(/[A-Za-z0-9._~-]{1,6}){1,4}|[ -~]{0,12}"
+            ) {
+                if let Ok(path) = raw.parse::<crate::HttpPath>() {
+                    let _ = axum::Router::<()>::new()
+                        .nest_service(path.as_str(), axum::routing::get(|| async {}));
+                }
+            }
         }
 
         #[test]
         fn test_http_config_clone() {
-            let cfg = HttpConfig::new("127.0.0.1:3001".parse().unwrap(), "/test");
+            let cfg = HttpConfig::new("127.0.0.1:3001".parse().unwrap())
+                .with_path("/test".parse().unwrap());
             let cloned = cfg.clone();
             assert_eq!(cloned.bind, cfg.bind);
             assert_eq!(cloned.path, cfg.path);
@@ -1816,40 +2011,34 @@ mod tests {
 
         #[test]
         fn test_transport_http_variant() {
-            let cfg = HttpConfig::new("127.0.0.1:3002".parse().unwrap(), "/mcp");
+            let cfg = HttpConfig::new("127.0.0.1:3002".parse().unwrap());
             let t = Transport::Http(cfg);
             assert!(matches!(t, Transport::Http(_)));
         }
 
         #[test]
         fn test_http_config_new_uses_default_limits() {
-            let cfg = HttpConfig::new("127.0.0.1:3003".parse().unwrap(), "/mcp");
+            let cfg = HttpConfig::new("127.0.0.1:3003".parse().unwrap());
             assert_eq!(
                 cfg.max_request_body_bytes,
                 HttpConfig::DEFAULT_MAX_REQUEST_BODY_BYTES
             );
-            assert_eq!(
-                cfg.max_concurrent_sessions,
-                HttpConfig::DEFAULT_MAX_CONCURRENT_SESSIONS
-            );
+            assert_eq!(cfg.max_concurrent_sessions, crate::SessionLimit::DEFAULT);
         }
 
         #[test]
         fn test_http_config_with_max_request_body_bytes_overrides_default() {
-            let cfg = HttpConfig::new("127.0.0.1:3004".parse().unwrap(), "/mcp")
+            let cfg = HttpConfig::new("127.0.0.1:3004".parse().unwrap())
                 .with_max_request_body_bytes(1024);
             assert_eq!(cfg.max_request_body_bytes, 1024);
-            assert_eq!(
-                cfg.max_concurrent_sessions,
-                HttpConfig::DEFAULT_MAX_CONCURRENT_SESSIONS
-            );
+            assert_eq!(cfg.max_concurrent_sessions, crate::SessionLimit::DEFAULT);
         }
 
         #[test]
         fn test_http_config_with_max_concurrent_sessions_overrides_default() {
-            let cfg = HttpConfig::new("127.0.0.1:3005".parse().unwrap(), "/mcp")
-                .with_max_concurrent_sessions(5);
-            assert_eq!(cfg.max_concurrent_sessions, 5);
+            let cfg = HttpConfig::new("127.0.0.1:3005".parse().unwrap())
+                .with_max_concurrent_sessions(crate::SessionLimit::new(5).unwrap());
+            assert_eq!(cfg.max_concurrent_sessions.get(), 5);
             assert_eq!(
                 cfg.max_request_body_bytes,
                 HttpConfig::DEFAULT_MAX_REQUEST_BODY_BYTES
@@ -1885,7 +2074,7 @@ mod tests {
             let addr = probe.local_addr().unwrap();
             drop(probe);
 
-            let cfg = HttpConfig::new(addr, "/mcp");
+            let cfg = HttpConfig::new(addr);
 
             let server_task = tokio::spawn(super::super::run_http(
                 server,
@@ -1976,13 +2165,17 @@ mod tests {
                 McpConfig::default(),
             );
 
-            let cfg = HttpConfig::new(addr, "/mcp");
+            let cfg = HttpConfig::new(addr);
 
             let result =
                 super::super::run_http(server, cfg, super::super::ShutdownSignal::new()).await;
             assert!(
-                result.is_err(),
-                "run_http should fail when port is occupied"
+                matches!(
+                    &result,
+                    Err(crate::Error::HttpBind { addr: bound, source })
+                        if *bound == addr && source.kind() == std::io::ErrorKind::AddrInUse
+                ),
+                "run_http should fail with HttpBind(AddrInUse) when the port is occupied, got {result:?}"
             );
 
             drop(occupied);
@@ -2023,7 +2216,7 @@ mod tests {
 
             let timeout = std::time::Duration::from_millis(200);
             let (addr, server_task) = spawn_run_http(|addr| {
-                HttpConfig::new(addr, "/mcp")
+                HttpConfig::new(addr)
                     .with_header_read_timeout(HeaderReadTimeout::new(timeout).unwrap())
             })
             .await;
@@ -2052,7 +2245,7 @@ mod tests {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
             let (addr, server_task) = spawn_run_http(|addr| {
-                HttpConfig::new(addr, "/mcp")
+                HttpConfig::new(addr)
                     .with_max_concurrent_connections(ConnectionLimit::new(1).unwrap())
             })
             .await;
@@ -2092,7 +2285,7 @@ mod tests {
 
             let timeout = std::time::Duration::from_millis(200);
             let (addr, server_task) = spawn_run_http(|addr| {
-                HttpConfig::new(addr, "/mcp")
+                HttpConfig::new(addr)
                     .with_header_read_timeout(HeaderReadTimeout::new(timeout).unwrap())
                     .with_max_concurrent_connections(ConnectionLimit::new(1).unwrap())
             })
@@ -2265,7 +2458,7 @@ mod tests {
         ) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let cfg = configure(HttpConfig::new(addr, "/mcp"));
+            let cfg = configure(HttpConfig::new(addr));
             let task = tokio::spawn(super::super::serve_http(
                 listener,
                 server,
@@ -2371,8 +2564,10 @@ mod tests {
         async fn test_capped_session_manager_enforces_hard_bound() {
             use rmcp::transport::streamable_http_server::session::SessionManager as _;
 
-            let manager =
-                super::super::CappedSessionManager::new(1, super::super::IdleTimeout::DEFAULT);
+            let manager = super::super::CappedSessionManager::new(
+                crate::SessionLimit::new(1).unwrap(),
+                super::super::IdleTimeout::DEFAULT,
+            );
 
             let (first_id, _transport) = manager.create_session().await.unwrap();
 
@@ -2406,7 +2601,7 @@ mod tests {
             const CONCURRENT_ATTEMPTS: usize = 25;
 
             let manager = std::sync::Arc::new(super::super::CappedSessionManager::new(
-                MAX_SESSIONS,
+                crate::SessionLimit::new(MAX_SESSIONS).unwrap(),
                 super::super::IdleTimeout::DEFAULT,
             ));
 
@@ -2503,13 +2698,72 @@ mod tests {
             server_task.abort();
         }
 
+        /// #556: a browser request from a foreign origin is rejected with `403`
+        /// on POST and GET; loopback origins on the bound port and requests
+        /// without `Origin` still work.
+        #[tokio::test]
+        async fn test_run_http_enforces_loopback_origin() {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| cfg).await;
+            let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+            let post = |origin: Option<String>| async move {
+                let origin_header = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+                raw_http_post(
+                    addr,
+                    "/mcp",
+                    &format!(
+                        "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n{origin_header}"
+                    ),
+                    initialize_body,
+                )
+                .await
+            };
+
+            for rejected in ["http://evil.example", "null", "http://127.0.0.1:1"] {
+                let response = post(Some(rejected.to_owned())).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 403"),
+                    "Origin {rejected} should be rejected, got: {response}"
+                );
+            }
+            for accepted in [
+                Some(format!("http://127.0.0.1:{}", addr.port())),
+                Some(format!("http://localhost:{}", addr.port())),
+                None,
+            ] {
+                let response = post(accepted.clone()).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 200"),
+                    "Origin {accepted:?} should be accepted, got: {response}"
+                );
+            }
+
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = format!(
+                "GET /mcp HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: text/event-stream\r\nOrigin: http://evil.example\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8_lossy(&response);
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "GET with a foreign Origin should be rejected, got: {response}"
+            );
+
+            server_task.abort();
+        }
+
         /// End-to-end: with `max_concurrent_sessions(1)`, a second concurrent
         /// `initialize` handshake over `run_http` must be rejected with `429`
         /// once the first session is established.
         #[tokio::test]
         async fn test_run_http_rejects_new_session_at_capacity_with_429() {
-            let (addr, server_task) =
-                spawn_http_server(test_server(), |cfg| cfg.with_max_concurrent_sessions(1)).await;
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_max_concurrent_sessions(crate::SessionLimit::new(1).unwrap())
+            })
+            .await;
 
             let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
             let accept_headers =
@@ -2547,8 +2801,10 @@ mod tests {
         /// sniffing for the cap decision (the bug this design replaced).
         #[tokio::test]
         async fn test_run_http_stateless_request_bypasses_session_cap() {
-            let (addr, server_task) =
-                spawn_http_server(test_server(), |cfg| cfg.with_max_concurrent_sessions(1)).await;
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_max_concurrent_sessions(crate::SessionLimit::new(1).unwrap())
+            })
+            .await;
 
             let accept_headers =
                 "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
@@ -3085,7 +3341,8 @@ mod tests {
         #[allow(clippy::significant_drop_tightening)]
         #[tokio::test(start_paused = true)]
         async fn test_reap_idle_frees_permit_and_spares_touched_sessions() {
-            let manager = CappedSessionManager::new(2, idle_secs(10));
+            let manager =
+                CappedSessionManager::new(crate::SessionLimit::new(2).unwrap(), idle_secs(10));
             let (idle_id, _idle_transport) = manager.create_session().await.unwrap();
             let (busy_id, _busy_transport) = manager.create_session().await.unwrap();
             assert!(matches!(
@@ -3108,7 +3365,10 @@ mod tests {
         #[allow(clippy::significant_drop_tightening)]
         #[tokio::test(start_paused = true)]
         async fn test_run_idle_reaper_closes_idle_session_and_stops_on_cancel() {
-            let manager = std::sync::Arc::new(CappedSessionManager::new(1, idle_secs(10)));
+            let manager = std::sync::Arc::new(CappedSessionManager::new(
+                crate::SessionLimit::new(1).unwrap(),
+                idle_secs(10),
+            ));
             let (id, _transport) = manager.create_session().await.unwrap();
             let cancel = tokio_util::sync::CancellationToken::new();
             let reaper = tokio::spawn(run_idle_reaper(
@@ -3178,7 +3438,8 @@ mod tests {
         #[allow(clippy::significant_drop_tightening)]
         #[tokio::test(start_paused = true)]
         async fn test_open_resume_stream_blocks_reaping() {
-            let manager = CappedSessionManager::new(1, idle_secs(10));
+            let manager =
+                CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10));
             let (id, serving) = initialized_session(&manager).await;
             let stream = manager.resume(&id, "0".to_owned()).await.unwrap();
             assert_open_stream_blocks_reaping(&manager, stream).await;
@@ -3189,7 +3450,8 @@ mod tests {
         #[allow(clippy::significant_drop_tightening)]
         #[tokio::test(start_paused = true)]
         async fn test_open_post_stream_blocks_reaping() {
-            let manager = CappedSessionManager::new(1, idle_secs(10));
+            let manager =
+                CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10));
             let (id, serving) = initialized_session(&manager).await;
             let ping: ClientJsonRpcMessage = serde_json::from_value(
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
@@ -3204,7 +3466,8 @@ mod tests {
         #[allow(clippy::significant_drop_tightening)]
         #[tokio::test(start_paused = true)]
         async fn test_open_standalone_stream_blocks_reaping() {
-            let manager = CappedSessionManager::new(1, idle_secs(10));
+            let manager =
+                CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10));
             let (id, serving) = initialized_session(&manager).await;
             let stream = manager.create_standalone_stream(&id).await.unwrap();
             assert_open_stream_blocks_reaping(&manager, stream).await;
@@ -3216,12 +3479,11 @@ mod tests {
             deadline: std::time::Duration,
         ) -> std::sync::Arc<CappedSessionManager> {
             std::sync::Arc::new(
-                CappedSessionManager::new(4, idle_secs(3600)).with_stream_liveness(
-                    StreamLiveness::Probe {
+                CappedSessionManager::new(crate::SessionLimit::new(4).unwrap(), idle_secs(3600))
+                    .with_stream_liveness(StreamLiveness::Probe {
                         interval: ProbeInterval::new(interval).unwrap(),
                         deadline: ProbeDeadline::new(deadline).unwrap(),
-                    },
-                ),
+                    }),
             )
         }
 
@@ -3419,7 +3681,10 @@ mod tests {
         async fn test_disabled_liveness_never_pings_or_ends_stream() {
             use futures::StreamExt as _;
 
-            let manager = std::sync::Arc::new(CappedSessionManager::new(1, idle_secs(3600)));
+            let manager = std::sync::Arc::new(CappedSessionManager::new(
+                crate::SessionLimit::new(1).unwrap(),
+                idle_secs(3600),
+            ));
             let (id, serving) = initialized_session(&manager).await;
             let mut stream = Box::pin(manager.create_standalone_stream(&id).await.unwrap());
 
@@ -3459,7 +3724,7 @@ mod tests {
 
         #[test]
         fn test_http_config_stream_liveness_defaults_to_probe_and_is_overridable() {
-            let cfg = HttpConfig::new("127.0.0.1:3003".parse().unwrap(), "/mcp");
+            let cfg = HttpConfig::new("127.0.0.1:3003".parse().unwrap());
             assert_eq!(cfg.stream_liveness, StreamLiveness::DEFAULT);
             let cfg = cfg.with_stream_liveness(StreamLiveness::Disabled);
             assert_eq!(cfg.stream_liveness, StreamLiveness::Disabled);
@@ -3515,7 +3780,8 @@ mod tests {
             let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = probe.local_addr().unwrap();
             drop(probe);
-            let mut cfg = HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(max_sessions);
+            let mut cfg = HttpConfig::new(addr)
+                .with_max_concurrent_sessions(crate::SessionLimit::new(max_sessions).unwrap());
             cfg.session_idle_timeout = IdleTimeout::new(TEST_IDLE).unwrap();
             let task = tokio::spawn(super::super::run_http(
                 server,
@@ -3876,7 +4142,7 @@ mod tests {
             use tracing_subscriber::layer::SubscriberExt as _;
 
             let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-            let cfg = HttpConfig::new(addr, "/mcp");
+            let cfg = HttpConfig::new(addr);
 
             let captured = CapturedLogs::default();
             let subscriber = tracing_subscriber::registry().with(captured.clone());

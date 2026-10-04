@@ -120,7 +120,8 @@ async fn run(args: Args) -> Result<()> {
         {
             match args.listen {
                 Some(bind) => mcpls_core::Transport::Http(
-                    mcpls_core::HttpConfig::new(bind, args.http_path.clone())
+                    mcpls_core::HttpConfig::new(bind)
+                        .with_path(args.http_path.clone())
                         .with_stream_liveness(args.http_stream_liveness.into()),
                 ),
                 None => mcpls_core::Transport::Stdio,
