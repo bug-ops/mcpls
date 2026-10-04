@@ -300,7 +300,7 @@ impl Translator {
             });
         }
 
-        // TODO(F3): source this from `LspServer::init_config` and drop `server_configs`.
+        // TODO(#529): source this from `LspServer::init_config` and drop `server_configs`.
         let Some(config) = lock_std(&self.server_configs).get(id).cloned() else {
             return Err(Error::ServerUnavailable {
                 server_id: id.clone(),
