@@ -11,7 +11,7 @@ tags:
   - diagnostics
   - competitor-gap
 created: 2026-10-04
-status: draft
+status: decided
 related:
   - "[[constitution]]"
   - "[[mcp/001-mcp-tool-surface-and-routing/spec|mcp-tool-surface-and-routing]]"
@@ -32,6 +32,36 @@ related:
 > **Priority**: P4
 > **Related issues**: #570; the optional blast-radius group (section 3, group C) relates to #565
 > (see [[bridge/007-enclosing-symbol-context/spec|bridge/007]])
+
+## Decision (#570): Option A, documented non-goal
+
+> [!important] Resolved
+> mcpls remains read-only and ships no speculative-preview tool. Option A is adopted: the verify
+> loop is documented in the user guide ("Verifying an edit"). Sections 3 to 9 describe options B to D
+> and stay as reference only if the decision is reopened. Group C (blast-radius composite) is also a
+> non-goal: the pieces compose from existing tools, and enclosing-symbol context (#565) lowers the cost.
+
+Reasons:
+
+- An overlay breaks the `DocumentTracker` invariant that content is derived from disk, and races other
+  calls on the same path (isolation versus exclusive hold has no cheap answer).
+- Diagnostics pushed for speculative content leak into `NotificationCache` and resource
+  subscriptions unless every consumer learns about overlays.
+- rust-analyzer's compiler diagnostics (flycheck) appear only after save, so a preview that reports
+  "no new errors" is untrustworthy exactly where the agent most wants an answer.
+- One competitor offers the capability and the issue is P4.
+
+Recommended agent loop (what the docs state):
+
+1. Obtain the edit from `rename_symbol`, `format_document` or `get_code_actions`, or write it directly.
+2. Apply it with the host's own editor and save the file.
+3. Poll `get_diagnostics`. Servers whose diagnostics depend on a build (rust-analyzer flycheck) need
+   the save before new compiler errors appear, so an empty result right after the write can still be
+   stale; poll again or check indexing status via `get_tool_support`.
+4. Revert with the host's own tools (for example `git checkout -- <file>`) if new errors appear.
+
+Caveats to state: the loop touches the working tree (file watchers, formatters on save, git status),
+and it cannot run in a host that denies writes.
 
 ## 1. Overview
 
