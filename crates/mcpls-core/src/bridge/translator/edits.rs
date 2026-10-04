@@ -262,13 +262,13 @@ async fn resolve_code_action(
     server_id: &ServerId,
     mut action: lsp_types::CodeAction,
 ) -> lsp_types::CodeAction {
-    match client
+    let outcome = client
         .request_typed::<lsp_types::CodeActionResolveRequest>(
             action.clone(),
             client.code_action_resolve_timeout(),
         )
-        .await
-    {
+        .await;
+    match outcome {
         Ok(resolved) => {
             if resolved.edit.is_some() {
                 action.edit = resolved.edit;
@@ -279,7 +279,6 @@ async fn resolve_code_action(
                     "codeAction/resolve succeeded but returned no edit"
                 );
             }
-            action
         }
         Err(err) => {
             tracing::warn!(
@@ -288,9 +287,9 @@ async fn resolve_code_action(
                 error = %err,
                 "codeAction/resolve failed, returning action without edit"
             );
-            action
         }
     }
+    action
 }
 
 /// Resolves up to [`MAX_CODE_ACTION_RESOLVES`] deferred actions in `entries`
