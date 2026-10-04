@@ -24,7 +24,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 005 | [[lsp/005-lsp-content-modified-retry/spec\|lsp-content-modified-retry]] | bug | P2 | implemented (#390) | #382 |
 | 006 | [[lsp/006-server-spawn-install-hint/spec\|server-spawn-install-hint]] | research | P3 | implemented (#530) | #494 |
 | 007 | [[lsp/007-lsp-child-process-lifetime/spec\|lsp-child-process-lifetime]] | enhancement | P2 | implemented (#546) | #526 |
-| 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | draft | #567, #568, #569 |
+| 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | group A implemented (#567); rest draft | #567, #568, #569 |
 | 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | draft | #572 |
 
 ## mcp
@@ -37,8 +37,8 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 004 | [[mcp/004-mcp-tasks-sep2663-adoption/spec\|mcp-tasks-sep2663-adoption]] | research | P4 | draft | #119 |
 | 005 | [[mcp/005-tool-capability-discoverability/spec\|tool-capability-discoverability]] | research | P4 | implemented (#540) | #461 |
 | 006 | [[mcp/006-http-stream-liveness/spec\|http-stream-liveness]] | enhancement | P3 | implemented | #543 |
-| 007 | [[mcp/007-symbol-name-addressing/spec\|symbol-name-addressing]] | research | P2 | draft | #563 |
-| 008 | [[mcp/008-manual-lsp-server-restart/spec\|manual-lsp-server-restart]] | enhancement | P2 | draft | #564 |
+| 007 | [[mcp/007-symbol-name-addressing/spec\|symbol-name-addressing]] | research | P2 | implemented (MVP, signature help deferred) | #563 |
+| 008 | [[mcp/008-manual-lsp-server-restart/spec\|manual-lsp-server-restart]] | enhancement | P2 | implemented | #564 |
 | 009 | [[mcp/009-speculative-edit-diagnostic-preview/spec\|speculative-edit-diagnostic-preview]] | research | P4 | draft | #570 |
 | 010 | [[mcp/010-http-session-keepalive-with-live-stream/spec\|http-session-keepalive-with-live-stream]] | enhancement | P3 | draft | #573 |
 

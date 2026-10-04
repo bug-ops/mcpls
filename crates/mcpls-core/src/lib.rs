@@ -286,6 +286,72 @@ pub(crate) async fn diagnostics_pump(
     }
 }
 
+/// Re-starts diagnostics pumps for manually restarted servers over the same
+/// shared state and shutdown watch the initial pumps use.
+#[derive(Clone)]
+pub(crate) struct PumpWiring {
+    shared: PumpShared,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl std::fmt::Debug for PumpWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PumpWiring").finish_non_exhaustive()
+    }
+}
+
+impl bridge::NotificationWiring for PumpWiring {
+    fn spawn_pump(
+        &self,
+        id: ServerId,
+        receivers: bridge::NotificationReceivers,
+        caches_diagnostics: bool,
+    ) -> tokio::task::AbortHandle {
+        let shared = self.shared.clone();
+        let cancel_rx = self.cancel_rx.clone();
+        let cache = Arc::clone(&shared.notification_cache);
+        tokio::spawn(async move {
+            let pump = diagnostics_pump(
+                id.clone(),
+                receivers.notifications,
+                receivers.lifecycle,
+                cancel_rx,
+                caches_diagnostics,
+                shared,
+            );
+            if let Err(payload) = AssertUnwindSafe(pump).catch_unwind().await {
+                error!(
+                    "Diagnostics pump for LSP server '{id}' panicked: {}",
+                    panic_message(payload.as_ref())
+                );
+                let mut cache = cache.lock().await;
+                cache.mark_push_degraded(&id);
+                cache.reset_indexing_state(&id);
+            }
+        })
+        .abort_handle()
+    }
+
+    fn publish_invalidated<'a>(
+        &'a self,
+        cleared: &'a [String],
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if cleared.is_empty() {
+                return;
+            }
+            let cleared: HashSet<&str> = cleared.iter().map(String::as_str).collect();
+            self.shared
+                .subs
+                .publish_matching(|uri| {
+                    bridge::diagnostics_cache_key(uri)
+                        .is_some_and(|key| cleared.contains(key.as_str()))
+                })
+                .await;
+        })
+    }
+}
+
 /// Result of [`register_servers`]: everything the caller needs to start the
 /// per-server diagnostics pump tasks.
 pub(crate) struct RegisteredServers {
@@ -925,6 +991,7 @@ async fn shutdown(
     translator: &Translator,
     lsp_init_handle: Option<JoinHandle<()>>,
 ) {
+    translator.begin_shutdown();
     let _ = cancel_tx.send(true);
 
     let mut cleanup_signal = ShutdownSignal::new();
@@ -1147,8 +1214,14 @@ async fn init_lsp_servers(
             caches_diagnostics,
             pump_shared.clone(),
         ));
+        translator.set_notification_task(id.clone(), pump.clone());
         pump_servers.insert(pump.id(), id);
     }
+    // Only now can a manual restart replace the pumps registered above.
+    translator.install_wiring(Arc::new(PumpWiring {
+        shared: pump_shared,
+        cancel_rx: cancel_rx.clone(),
+    }));
     drain_pumps(pumps, &pump_servers, &notification_cache).await;
 }
 
@@ -2994,6 +3067,79 @@ mod tests {
             tx.send(publish("y.rs")).await.unwrap();
             assert_eq!(recv_within(&mut rx_b).await, y.as_str());
             assert_eq!(recv_within(&mut rx_a).await, y.as_str());
+        }
+
+        /// A restart tells the subscribers of the diagnostics it cleared to
+        /// re-read them, matching the cache key to the subscription URI even
+        /// for a percent-encoded path, and leaves other subscribers alone.
+        #[tokio::test]
+        async fn test_publish_invalidated_notifies_only_subscribers_of_cleared_files() {
+            use crate::bridge::resources::PublishedDiagnosticsUri;
+            use crate::mcp::{SessionHandle, Target};
+
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let cleared_file = root.join("a b.rs");
+            let other_file = root.join("other.rs");
+            for file in [&cleared_file, &other_file] {
+                std::fs::write(file, "fn main() {}").unwrap();
+            }
+
+            let cache = make_cache();
+            let id = ServerId::from("rust");
+            let roots = WorkspaceRoots::resolve(vec![root]);
+            let published = PublishedDiagnosticsUri::resolve(
+                &bridge::path_to_uri(&cleared_file).unwrap(),
+                roots.canonical(),
+            )
+            .await
+            .unwrap();
+            let error = lsp_types::Diagnostic {
+                message: "boom".to_owned().into(),
+                ..Default::default()
+            };
+            let cleared = {
+                let mut cache = cache.lock().await;
+                cache.store_published_diagnostics(&id, &published, None, vec![error]);
+                cache.clear_server_diagnostics(&id)
+            };
+            assert!(!cleared.is_empty());
+
+            let subs = make_subs();
+            let session = SessionHandle::new(subs.clone());
+            let (tx_cleared, mut rx_cleared) = mpsc::channel(8);
+            let (tx_other, mut rx_other) = mpsc::channel(8);
+            let cleared_uri = bridge::resources::make_uri(&cleared_file).unwrap();
+            let other_uri = bridge::resources::make_uri(&other_file).unwrap();
+            session
+                .subscribe_for_test(
+                    &DiagnosticsResourceUri::for_test(&cleared_uri),
+                    Target::Channel(tx_cleared.clone()),
+                )
+                .await
+                .unwrap();
+            session
+                .subscribe_for_test(
+                    &DiagnosticsResourceUri::for_test(&other_uri),
+                    Target::Channel(tx_other.clone()),
+                )
+                .await
+                .unwrap();
+            let (_cancel, cancel_rx) = watch::channel(false);
+            let wiring = PumpWiring {
+                shared: PumpShared {
+                    notification_cache: cache,
+                    subs,
+                    workspace_roots: roots,
+                },
+                cancel_rx,
+            };
+
+            bridge::NotificationWiring::publish_invalidated(&wiring, &cleared).await;
+
+            assert_eq!(recv_within(&mut rx_cleared).await, cleared_uri);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_matches!(rx_other.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         }
 
         /// #532: diagnostics a server publishes through a symlinked spelling

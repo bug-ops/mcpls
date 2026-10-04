@@ -228,10 +228,10 @@ struct NormalizedLocations {
 /// single `Definition` (`Location` or `Location[]`), or a `DefinitionLink[]`
 /// from clients that opted into `LinkSupport`.
 enum GotoKind {
-    /// A plain `Definition`, as returned to clients without `LinkSupport`.
-    Definition(lsp_types::Definition),
-    /// A `DefinitionLink[]`, as returned to clients with `LinkSupport`.
-    DefinitionLinkList(Vec<lsp_types::DefinitionLink>),
+    /// Plain locations, as returned to clients without `LinkSupport`.
+    Locations(Vec<lsp_types::Location>),
+    /// A `LocationLink[]`, as returned to clients with `LinkSupport`.
+    Links(Vec<lsp_types::LocationLink>),
 }
 
 /// Implemented once per go-to-X response enum so [`goto_response_to_locations`]
@@ -246,8 +246,8 @@ trait GotoResponse {
 impl GotoResponse for lsp_types::DefinitionResponse {
     fn into_kind(self) -> GotoKind {
         match self {
-            Self::Definition(def) => GotoKind::Definition(def),
-            Self::DefinitionLinkList(links) => GotoKind::DefinitionLinkList(links),
+            Self::Definition(def) => GotoKind::Locations(definition_to_locations(def)),
+            Self::DefinitionLinkList(links) => GotoKind::Links(links),
         }
     }
 }
@@ -255,8 +255,8 @@ impl GotoResponse for lsp_types::DefinitionResponse {
 impl GotoResponse for lsp_types::ImplementationResponse {
     fn into_kind(self) -> GotoKind {
         match self {
-            Self::Definition(def) => GotoKind::Definition(def),
-            Self::DefinitionLinkList(links) => GotoKind::DefinitionLinkList(links),
+            Self::Definition(def) => GotoKind::Locations(definition_to_locations(def)),
+            Self::DefinitionLinkList(links) => GotoKind::Links(links),
         }
     }
 }
@@ -264,22 +264,37 @@ impl GotoResponse for lsp_types::ImplementationResponse {
 impl GotoResponse for lsp_types::TypeDefinitionResponse {
     fn into_kind(self) -> GotoKind {
         match self {
-            Self::Definition(def) => GotoKind::Definition(def),
-            Self::DefinitionLinkList(links) => GotoKind::DefinitionLinkList(links),
+            Self::Definition(def) => GotoKind::Locations(definition_to_locations(def)),
+            Self::DefinitionLinkList(links) => GotoKind::Links(links),
+        }
+    }
+}
+
+impl GotoResponse for lsp_types::DeclarationResponse {
+    fn into_kind(self) -> GotoKind {
+        match self {
+            Self::Declaration(lsp_types::Declaration::Location(loc)) => {
+                GotoKind::Locations(vec![loc])
+            }
+            Self::Declaration(lsp_types::Declaration::LocationList(locs)) => {
+                GotoKind::Locations(locs)
+            }
+            Self::DeclarationLinkList(links) => GotoKind::Links(links),
         }
     }
 }
 
 /// Normalize a go-to-X response (`textDocument/definition`,
-/// `textDocument/implementation`, or `textDocument/typeDefinition`) into a
+/// `textDocument/implementation`, `textDocument/typeDefinition`, or
+/// `textDocument/declaration`) into a
 /// flat list of MCP `Location` values.
 async fn goto_response_to_locations<R: GotoResponse>(
     response: Option<R>,
     ctx: &EncodingCtx,
 ) -> NormalizedLocations {
     let lsp_locs = match response.map(GotoResponse::into_kind) {
-        Some(GotoKind::Definition(def)) => definition_to_locations(def),
-        Some(GotoKind::DefinitionLinkList(links)) => {
+        Some(GotoKind::Locations(locs)) => locs,
+        Some(GotoKind::Links(links)) => {
             links.into_iter().map(definition_link_to_location).collect()
         }
         None => vec![],
@@ -317,6 +332,16 @@ impl GotoParams for lsp_types::ImplementationParams {
 }
 
 impl GotoParams for lsp_types::TypeDefinitionParams {
+    fn from_position(text_document_position_params: TextDocumentPositionParams) -> Self {
+        Self {
+            text_document_position_params,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+}
+
+impl GotoParams for lsp_types::DeclarationParams {
     fn from_position(text_document_position_params: TextDocumentPositionParams) -> Self {
         Self {
             text_document_position_params,
@@ -673,6 +698,42 @@ impl Translator {
                 &file_path,
                 position,
                 Capability::TypeDefinition,
+            )
+            .await?;
+
+        Ok(LocationsResult {
+            locations,
+            truncated,
+            positions_degraded,
+        })
+    }
+
+    /// Handle go-to-declaration request (`textDocument/declaration`).
+    ///
+    /// Returns the declaration location of the symbol at position. Differs
+    /// from go-to-definition for languages that separate declaration from
+    /// definition (C/C++ headers, interface members).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// the routed server does not advertise `declarationProvider` support, or
+    /// the server is still indexing the workspace after
+    /// `INDEXING_READY_TIMEOUT`.
+    pub async fn handle_declaration(
+        &self,
+        file_path: String,
+        position: Position,
+    ) -> Result<LocationsResult> {
+        let NormalizedLocations {
+            locations,
+            truncated,
+            positions_degraded,
+        } = self
+            .handle_goto::<lsp_types::DeclarationRequest, _>(
+                &file_path,
+                position,
+                Capability::Declaration,
             )
             .await?;
 
@@ -1717,6 +1778,188 @@ mod tests {
         assert_eq!(result.locations.len(), 2);
         assert_eq!(result.locations[0].uri, first_impl_uri);
         assert_eq!(result.locations[1].uri, second_impl_uri);
+    }
+
+    /// `handle_declaration` flattens a plain `Declaration::LocationList` and
+    /// sends `textDocument/declaration`.
+    #[tokio::test]
+    async fn test_handle_declaration_flattens_location_list() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let decl_path = dir.path().join("decl.rs");
+        fs::write(&decl_path, "fn decl();").unwrap();
+        let decl_uri = Url::from_file_path(&decl_path).unwrap().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_declaration(path, pos(1, 1)).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/declaration");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "uri": decl_uri,
+                "range": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 7}
+                }
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_declaration should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.locations.len(), 1);
+        assert_eq!(result.locations[0].uri, decl_uri);
+    }
+
+    /// `handle_declaration` maps `DeclarationLink[]` through `targetSelectionRange`.
+    #[tokio::test]
+    async fn test_handle_declaration_flattens_link_list() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let target_path = dir.path().join("target.h");
+        fs::write(&target_path, "struct TargetType;").unwrap();
+        let target_uri = Url::from_file_path(&target_path).unwrap().to_string();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_declaration(path, pos(1, 1)).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let _opened = read_framed_message(&mut wire).await;
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "textDocument/declaration");
+
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "targetUri": target_uri,
+                "targetRange": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 18}
+                },
+                "targetSelectionRange": {
+                    "start": {"line": 0, "character": 7},
+                    "end": {"line": 0, "character": 17}
+                }
+            }]),
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_declaration should not hang")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.locations.len(), 1);
+        assert_eq!(result.locations[0].range.start.character, 8);
+    }
+
+    /// An empty declaration answer is an empty result, not an error (FR-003).
+    #[tokio::test]
+    async fn test_handle_declaration_null_response_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            let path = path.to_string_lossy().to_string();
+            tokio::spawn(async move { translator.handle_declaration(path, pos(1, 1)).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let _opened = read_framed_message(&mut wire).await;
+        let request = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_declaration should not hang")
+            .unwrap()
+            .unwrap();
+        assert!(result.locations.is_empty());
+    }
+
+    /// `handle_declaration` is gated by the indexing readiness check like definition.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_declaration_returns_workspace_indexing_error_when_loading() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        let translator = translator.with_notification_cache(cache);
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let err = translator
+            .handle_declaration(path.to_string_lossy().to_string(), pos(1, 1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
+        ));
     }
 
     /// Success-path coverage for `handle_type_definition` through the

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::bridge::indexing::{IndexingPolicy, IndexingState, IndexingTracker};
-use crate::bridge::resources::PublishedDiagnosticsUri;
+use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::config::ServerId;
 use crate::util::{truncate_str, truncate_string};
 
@@ -96,6 +96,15 @@ fn uri_cache_key(uri: &str) -> std::borrow::Cow<'_, str> {
     } else {
         std::borrow::Cow::Borrowed(uri)
     }
+}
+
+/// The cache key under which diagnostics for the file behind `uri` are
+/// stored, for matching [`NotificationCache::clear_server_diagnostics`]
+/// results against a subscription.
+pub fn diagnostics_cache_key(uri: &DiagnosticsResourceUri) -> Option<String> {
+    let path = crate::bridge::resources::parse_uri(uri.as_str()).ok()?;
+    let lsp_uri = crate::bridge::try_path_to_uri(&path)?;
+    Some(uri_cache_key(lsp_uri.as_ref()).into_owned())
 }
 
 /// Maximum number of distinct published URIs (a canonical path and its
@@ -1303,11 +1312,13 @@ impl NotificationCache {
     ///
     /// Used when a server crashes and respawns: its own stale entries must
     /// be invalidated without disturbing any other server's cache entries
-    /// (#266).
-    pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) {
+    /// (#266). Returns the cleared cache keys so a caller can tell
+    /// subscribers which resources changed (see [`diagnostics_cache_key`]).
+    pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) -> Vec<String> {
         let Some(order) = self.diagnostic_order.remove(server_id) else {
-            return;
+            return Vec::new();
         };
+        let mut cleared = Vec::with_capacity(order.len());
         for (_, key) in order {
             if self
                 .diagnostics
@@ -1319,7 +1330,9 @@ impl NotificationCache {
             self.diagnostics_owners.remove(&key);
             self.diagnostic_seq.remove(&key);
             self.unindex_source(&key);
+            cleared.push(key);
         }
+        cleared
     }
 
     /// Marks `server_id`'s push-based diagnostics as no longer live -- see
@@ -1327,6 +1340,12 @@ impl NotificationCache {
     /// of the cache.
     pub(crate) fn mark_push_degraded(&mut self, server_id: &ServerId) {
         self.push_degraded.insert(server_id.clone());
+    }
+
+    /// Marks `server_id`'s push-based diagnostics as live again, after its
+    /// notification pump was re-wired by a manual restart.
+    pub(crate) fn clear_push_degraded(&mut self, server_id: &ServerId) {
+        self.push_degraded.remove(server_id);
     }
 
     /// Whether `server_id`'s push-based diagnostics are known to be

@@ -50,9 +50,24 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 
 /// Upper bound [`LspServer::shutdown`] waits for the child process to exit on
 /// its own after sending the LSP `exit` notification, before falling back to
-/// killing it on drop. Only the leader is awaited; descendants are reaped by
-/// the lifeline binding.
+/// killing its process tree. Only the leader is awaited here.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// How long [`LspServer::terminate`] lets the leader process exit on its own
+/// after the `shutdown` handshake, before the process tree is killed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitGrace {
+    /// Up to the rest of the handshake budget, at most [`CHILD_EXIT_GRACE`]
+    /// (normal shutdown).
+    WithinBudget,
+    /// A server that answered `shutdown` may take this long to exit, since a
+    /// healthy server can be slow to flush; one that did not answer is killed
+    /// at once.
+    IfAnswered(Duration),
+}
+
+/// Upper bound on each step of killing a server's leftover process tree.
+const TREE_KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// How long a failed `initialize` waits for the child to be reaped before
 /// concluding it is still running and keeping the original error.
@@ -581,6 +596,10 @@ impl LspServer {
                     dynamic_registration: Some(false),
                     link_support: Some(true),
                 }),
+                declaration: Some(lsp_types::DeclarationClientCapabilities {
+                    dynamic_registration: Some(false),
+                    link_support: Some(true),
+                }),
                 references: Some(lsp_types::ReferenceClientCapabilities {
                     dynamic_registration: Some(false),
                 }),
@@ -778,33 +797,59 @@ impl LspServer {
     ///
     /// Sends the LSP `shutdown` request, waits for the response, sends the
     /// `exit` notification, stops the message loop, then waits up to a grace
-    /// period (never past the overall deadline) for the child process to exit
-    /// on its own. If it hasn't by then, or if the handshake itself fails or
-    /// times out, the child is simply dropped here — `kill_on_drop`
-    /// terminates it via SIGKILL (a no-op if it has already exited); on Windows
-    /// this also kills its descendants. A test
-    /// fixture with no real backing process (`child` is `None`) skips this
-    /// step entirely -- there is nothing to wait for or kill.
+    /// period (never past the overall deadline) for the leader process to exit
+    /// on its own. Whatever is left in the server's process group is then
+    /// killed (on Unix this includes shared daemons such as Gradle or Bloop
+    /// started by the server). A test fixture with no real backing process
+    /// skips the process steps.
     ///
     /// # Errors
     ///
     /// Returns the first error of the handshake or the message-loop stop,
     /// including [`Error::ShutdownTimeout`] when the deadline elapsed. The
-    /// child process is still torn down (gracefully if it exits in time,
-    /// killed otherwise) regardless of whether this returns `Ok` or `Err`.
+    /// process tree is still torn down regardless of whether this returns
+    /// `Ok` or `Err`.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.terminate(SHUTDOWN_TIMEOUT, ExitGrace::WithinBudget)
+            .await
+    }
+
+    /// Stop the server and its whole process tree, leaving `self` usable as a
+    /// dead server (`is_dead()` is `true` for a real process).
+    ///
+    /// Sends the LSP `shutdown` request, waits for the response, sends the
+    /// `exit` notification and stops the message loop, all within `budget`.
+    /// It then lets the leader process exit on its own for as long as `grace`
+    /// allows, which is the only path that lets the server reap its own
+    /// children. Whatever is left in the server's process group is then killed
+    /// (on Unix this includes shared daemons such as Gradle or Bloop started
+    /// by the server). A test fixture with no real backing process (`child`
+    /// is `None`) skips the process steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error of the handshake or the message-loop stop,
+    /// including [`Error::ShutdownTimeout`] when `budget` elapsed. The
+    /// process tree is still torn down regardless of whether this returns
+    /// `Ok` or `Err`.
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "SHUTDOWN_TIMEOUT and CHILD_EXIT_GRACE are small constants"
     )]
-    pub async fn shutdown(self) -> Result<()> {
+    pub(crate) async fn terminate(&mut self, budget: Duration, grace: ExitGrace) -> Result<()> {
         debug!("Shutting down LSP server");
 
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        let client = self.client;
+        let deadline = Instant::now() + budget;
+        let client = &mut self.client;
+        let shutdown_request_timeout = Duration::from_secs(5).min(budget);
 
         let handshake: Result<()> = timeout_at(deadline, async {
             let _: serde_json::Value = client
-                .request(ShutdownRequest::METHOD.as_str(), (), Duration::from_secs(5))
+                .request(
+                    ShutdownRequest::METHOD.as_str(),
+                    (),
+                    shutdown_request_timeout,
+                )
                 .await?;
             client.notify_typed::<ExitNotification>(()).await
         })
@@ -815,8 +860,12 @@ impl LspServer {
             Err(e) => handshake.and(Err(e)),
         };
 
-        if let Some(mut child) = self.child {
-            let child_deadline = deadline.min(Instant::now() + CHILD_EXIT_GRACE);
+        if let Some(child) = &mut self.child {
+            let child_deadline = match grace {
+                ExitGrace::WithinBudget => deadline.min(Instant::now() + CHILD_EXIT_GRACE),
+                ExitGrace::IfAnswered(grace) if handshake.is_ok() => Instant::now() + grace,
+                ExitGrace::IfAnswered(_) => Instant::now(),
+            };
             match timeout_at(child_deadline, child.wait()).await {
                 Ok(Ok(status)) => {
                     debug!(
@@ -831,8 +880,7 @@ impl LspServer {
                      notification, killing it"
                 ),
             }
-            // `child` drops here: it kills the leader (and on Windows the job) if still
-            // running, and is a no-op if `wait()` above already reaped it.
+            child.terminate_tree(TREE_KILL_GRACE).await;
         }
 
         handshake?;

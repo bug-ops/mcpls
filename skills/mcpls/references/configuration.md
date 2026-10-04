@@ -60,6 +60,7 @@ a few map many-to-one:
 | `hover` | `get_hover` |
 | `definition` | `get_definition` |
 | `type_definition` | `go_to_type_definition` |
+| `declaration` | `go_to_declaration` |
 | `implementation` | `go_to_implementation` |
 | `references` | `get_references` |
 | `diagnostics` | `get_diagnostics` (pull) **and** `get_cached_diagnostics` (same route serves both) |

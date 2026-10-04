@@ -32,19 +32,21 @@ use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
     DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, InlayHintsParams,
-    PositionParams, RangeParams, ReferencesParams, RenameParams, ServerLogsParams,
-    ServerMessagesParams, ToolSupportParams, WorkspaceSymbolParams,
+    PositionParams, RangeParams, ReferencesParams, RenameParams, RestartServerParams,
+    ServerLogsParams, ServerMessagesParams, SymbolTargetParams, ToolSupportParams,
+    WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
 };
 use crate::bridge::{
-    CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
-    DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    IncomingCallsResult, IndexingState, InlayHintsResult, LocationsResult, NotificationCache,
-    OutgoingCallsResult, Position, PositionEncoding, ReferencesResult, RenameResult,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator, WorkspaceRoots,
-    WorkspaceSymbolResult, validate_path_against_roots,
+    AddressableTool, Addressed, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
+    DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult,
+    FormatDocumentResult, HoverResult, IncomingCallsResult, IndexingState, InlayHintsResult,
+    LocationsResult, NotificationCache, OutgoingCallsResult, Position, PositionEncoding,
+    ReferencesResult, RenameResult, RestartServerResult, ServerLogsResult, ServerMessagesResult,
+    SignatureHelpResult, Translator, WorkspaceRoots, WorkspaceSymbolResult,
+    validate_path_against_roots,
 };
 use crate::config::{McpConfig, ToolPrefix};
 
@@ -110,6 +112,13 @@ const _: () = assert!(
 macro_rules! positions_note_request {
     () => {
         "`positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact."
+    };
+}
+
+/// Tool-description sentence for the tools that accept a symbol name.
+macro_rules! name_addressing_note {
+    () => {
+        "Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing."
     };
 }
 
@@ -199,6 +208,9 @@ fn map_bridge_error(e: crate::error::Error) -> McpError {
         crate::error::McpErrorKind::InvalidParams => McpError::invalid_params(message, None),
         crate::error::McpErrorKind::InvalidPosition(raw) => {
             error_with_data(ErrorCode::INVALID_PARAMS, message, &raw)
+        }
+        crate::error::McpErrorKind::SymbolResolution(data) => {
+            error_with_data(ErrorCode::INVALID_PARAMS, message, &data)
         }
         crate::error::McpErrorKind::Internal => McpError::internal_error(message, None),
         crate::error::McpErrorKind::Retryable(data) => {
@@ -479,7 +491,7 @@ impl McplsServer {
     /// Every mcpls tool is a read-only LSP query: `rename_symbol`,
     /// `format_document` and `get_code_actions` return a *proposed*
     /// `WorkspaceEdit` and never write to disk. Applying that once here
-    /// replaces an identical `annotations(...)` block on all 21 `#[tool]`
+    /// replaces an identical `annotations(...)` block on every `#[tool]`
     /// attributes. A tool declaring its own annotations keeps them;
     /// `test_tool_annotation_classifications_match_intent` forces a future
     /// mutating tool to write down an explicit classification rather than
@@ -520,67 +532,71 @@ impl McplsServer {
 
     /// Get hover information at a position in a file.
     #[tool(
-        description = concat!("Type and documentation info at position. Returns signatures, docs, and inferred types for symbols. ", positions_note_request!()),
+        description = concat!("Type and documentation info for a symbol. Returns signatures, docs, and inferred types. ", name_addressing_note!(), " ", positions_note_request!()),
         title = "Hover"
     )]
     async fn get_hover(
         &self,
-        Parameters(PositionParams {
-            file_path,
-            line,
-            character,
-        }): Parameters<PositionParams>,
-    ) -> Result<Json<HoverResult>, McpError> {
+        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+    ) -> Result<Json<Addressed<HoverResult>>, McpError> {
+        let translator = &self.context.translator;
         to_structured_tool_result(
-            self.context
-                .translator
-                .handle_hover(file_path, Position { line, character })
+            translator
+                .with_resolved_target(
+                    file_path,
+                    target,
+                    AddressableTool::Hover,
+                    |file_path, position| translator.handle_hover(file_path, position),
+                )
                 .await,
         )
     }
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = concat!("Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!()),
+        description = concat!("Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
         title = "Go to Definition"
     )]
     async fn get_definition(
         &self,
-        Parameters(PositionParams {
-            file_path,
-            line,
-            character,
-        }): Parameters<PositionParams>,
-    ) -> Result<Json<DefinitionResult>, McpError> {
+        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+    ) -> Result<Json<Addressed<DefinitionResult>>, McpError> {
+        let translator = &self.context.translator;
         to_structured_tool_result(
-            self.context
-                .translator
-                .handle_definition(file_path, Position { line, character })
+            translator
+                .with_resolved_target(
+                    file_path,
+                    target,
+                    AddressableTool::Definition,
+                    |file_path, position| translator.handle_definition(file_path, position),
+                )
                 .await,
         )
     }
 
     /// Find all references to a symbol.
     #[tool(
-        description = concat!("References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", positions_note_request!()),
+        description = concat!("References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
         title = "Find References"
     )]
     async fn get_references(
         &self,
         Parameters(ReferencesParams {
-            position:
-                PositionParams {
-                    file_path,
-                    line,
-                    character,
-                },
+            target: SymbolTargetParams { file_path, target },
             include_declaration,
         }): Parameters<ReferencesParams>,
-    ) -> Result<Json<ReferencesResult>, McpError> {
+    ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
+        let translator = &self.context.translator;
         to_structured_tool_result(
-            self.context
-                .translator
-                .handle_references(file_path, Position { line, character }, include_declaration)
+            translator
+                .with_resolved_target(
+                    file_path,
+                    target,
+                    AddressableTool::References,
+                    |file_path, position| {
+                        translator.handle_references(file_path, position, include_declaration)
+                    },
+                )
                 .await,
         )
     }
@@ -642,25 +658,25 @@ impl McplsServer {
     // read-only: returns a proposed WorkspaceEdit, does not apply it -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = concat!("Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. ", positions_note_request!()),
+        description = concat!("Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. ", name_addressing_note!(), " An ambiguous name never produces an edit. ", positions_note_request!()),
         title = "Rename Symbol"
     )]
     async fn rename_symbol(
         &self,
         Parameters(RenameParams {
-            position:
-                PositionParams {
-                    file_path,
-                    line,
-                    character,
-                },
+            target: SymbolTargetParams { file_path, target },
             new_name,
         }): Parameters<RenameParams>,
-    ) -> Result<Json<RenameResult>, McpError> {
+    ) -> Result<Json<Addressed<RenameResult>>, McpError> {
+        let translator = &self.context.translator;
         to_structured_tool_result(
-            self.context
-                .translator
-                .handle_rename(file_path, Position { line, character }, new_name)
+            translator
+                .with_resolved_target(
+                    file_path,
+                    target,
+                    AddressableTool::Rename,
+                    |file_path, position| translator.handle_rename(file_path, position, new_name),
+                )
                 .await,
         )
     }
@@ -793,21 +809,24 @@ impl McplsServer {
 
     /// Prepare call hierarchy at a position.
     #[tool(
-        description = concat!("Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        description = concat!("Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
         title = "Prepare Call Hierarchy"
     )]
     async fn prepare_call_hierarchy(
         &self,
-        Parameters(PositionParams {
-            file_path,
-            line,
-            character,
-        }): Parameters<PositionParams>,
-    ) -> Result<Json<CallHierarchyPrepareResult>, McpError> {
+        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+    ) -> Result<Json<Addressed<CallHierarchyPrepareResult>>, McpError> {
+        let translator = &self.context.translator;
         to_structured_tool_result(
-            self.context
-                .translator
-                .handle_call_hierarchy_prepare(file_path, Position { line, character })
+            translator
+                .with_resolved_target(
+                    file_path,
+                    target,
+                    AddressableTool::PrepareCallHierarchy,
+                    |file_path, position| {
+                        translator.handle_call_hierarchy_prepare(file_path, position)
+                    },
+                )
                 .await,
         )
     }
@@ -943,31 +962,54 @@ impl McplsServer {
 
     /// Go to implementation locations.
     #[tool(
-        description = concat!("Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. ", positions_note_request!()),
+        description = concat!("Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
         title = "Go to Implementation"
     )]
     async fn go_to_implementation(
         &self,
-        Parameters(PositionParams {
-            file_path,
-            line,
-            character,
-        }): Parameters<PositionParams>,
-    ) -> Result<Json<LocationsResult>, McpError> {
+        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+    ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
+        let translator = &self.context.translator;
         to_structured_tool_result(
-            self.context
-                .translator
-                .handle_implementation(file_path, Position { line, character })
+            translator
+                .with_resolved_target(
+                    file_path,
+                    target,
+                    AddressableTool::Implementation,
+                    |file_path, position| translator.handle_implementation(file_path, position),
+                )
                 .await,
         )
     }
 
     /// Go to type definition location.
     #[tool(
-        description = concat!("Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!()),
+        description = concat!("Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
         title = "Go to Type Definition"
     )]
     async fn go_to_type_definition(
+        &self,
+        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+    ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
+        let translator = &self.context.translator;
+        to_structured_tool_result(
+            translator
+                .with_resolved_target(
+                    file_path,
+                    target,
+                    AddressableTool::TypeDefinition,
+                    |file_path, position| translator.handle_type_definition(file_path, position),
+                )
+                .await,
+        )
+    }
+
+    /// Go to declaration location.
+    #[tool(
+        description = concat!("Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!()),
+        title = "Go to Declaration"
+    )]
+    async fn go_to_declaration(
         &self,
         Parameters(PositionParams {
             file_path,
@@ -978,9 +1020,27 @@ impl McplsServer {
         to_structured_tool_result(
             self.context
                 .translator
-                .handle_type_definition(file_path, Position { line, character })
+                .handle_declaration(file_path, Position { line, character })
                 .await,
         )
+    }
+
+    /// Restart LSP servers.
+    #[tool(
+        description = "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (e.g. after editing `Cargo.toml` or `package.json`). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered and the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
+        title = "Restart Server",
+        annotations(
+            title = "Restart Server",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn restart_server(
+        &self,
+        Parameters(RestartServerParams { target }): Parameters<RestartServerParams>,
+    ) -> Result<Json<RestartServerResult>, McpError> {
+        to_structured_tool_result(self.context.translator.restart_servers(target).await)
     }
 
     /// Report which tools are usable for which languages.
@@ -1536,6 +1596,51 @@ mod tests {
     use crate::bridge::resources::ResourceSubscriptions;
     use crate::mcp::tool_support::ToolBackend;
 
+    #[test]
+    fn test_symbol_resolution_error_maps_to_invalid_params_with_the_outcome_as_data() {
+        let err = map_bridge_error(crate::error::Error::SymbolResolution(Box::new(
+            crate::error::SymbolResolutionData::NotDefinedInFile {
+                name: "Config".to_string(),
+            },
+        )));
+
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            err.data,
+            Some(serde_json::json!({"resolution": "not_defined_in_file", "name": "Config"}))
+        );
+        assert!(err.message.contains("Config"));
+    }
+
+    #[test]
+    fn test_server_restarted_error_is_retryable_with_its_own_code() {
+        let err = map_bridge_error(crate::error::Error::ServerRestarted {
+            server_id: crate::config::ServerId::from("rust"),
+        });
+
+        assert_eq!(
+            err.code,
+            ErrorCode(crate::error::SERVER_RESTARTED_ERROR_CODE)
+        );
+        assert_eq!(err.data, Some(serde_json::json!({"server_id": "rust"})));
+    }
+
+    #[test]
+    fn test_unknown_server_error_is_invalid_params_listing_configured_ids() {
+        let err = map_bridge_error(crate::error::Error::UnknownServers {
+            unknown: vec![crate::config::ServerId::from("nope")],
+            configured: vec![crate::config::ServerId::from("rust")],
+        });
+
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("'nope'") && err.message.contains("'rust'"));
+    }
+
+    /// A position-addressed tool call, from the plain position parameters.
+    fn at(params: Parameters<PositionParams>) -> Parameters<SymbolTargetParams> {
+        Parameters(params.0.into())
+    }
+
     fn create_test_server() -> McplsServer {
         create_test_server_with_ignored_flag(false)
     }
@@ -1893,7 +1998,7 @@ mod tests {
         // No LSP server is registered for any language on this test server,
         // so this fails downstream of the workspace-roots gate with
         // `Error::NoServerForLanguage`/`NoServerConfigured`.
-        let result = server.get_hover(params).await;
+        let result = server.get_hover(at(params)).await;
         assert!(result.is_err());
     }
 
@@ -1913,7 +2018,7 @@ mod tests {
             character: 1,
         });
 
-        let result = server.get_hover(params).await;
+        let result = server.get_hover(at(params)).await;
         let err = result.err().unwrap();
         assert!(
             err.message.contains("no workspace roots configured"),
@@ -1931,7 +2036,7 @@ mod tests {
             character: 5,
         });
 
-        let result = server.get_definition(params).await;
+        let result = server.get_definition(at(params)).await;
         assert!(result.is_err());
     }
 
@@ -1939,11 +2044,12 @@ mod tests {
     async fn test_references_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(ReferencesParams {
-            position: PositionParams {
+            target: PositionParams {
                 file_path: test_file.to_str().unwrap().to_string(),
                 line: 10,
                 character: 5,
-            },
+            }
+            .into(),
             include_declaration: false,
         });
 
@@ -2564,11 +2670,12 @@ mod tests {
     async fn test_rename_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(RenameParams {
-            position: PositionParams {
+            target: PositionParams {
                 file_path: test_file.to_str().unwrap().to_string(),
                 line: 10,
                 character: 5,
-            },
+            }
+            .into(),
             new_name: "new_name".to_string(),
         });
 
@@ -2653,7 +2760,7 @@ mod tests {
             line: 10,
             character: 5,
         });
-        let result = server.prepare_call_hierarchy(params).await;
+        let result = server.prepare_call_hierarchy(at(params)).await;
         assert!(result.is_err());
     }
 
@@ -3529,7 +3636,7 @@ sleep 0.3
             character: 5,
         });
 
-        let result = server.go_to_implementation(params).await;
+        let result = server.go_to_implementation(at(params)).await;
         assert!(result.is_err());
     }
 
@@ -3542,7 +3649,7 @@ sleep 0.3
             character: 5,
         });
 
-        let result = server.go_to_type_definition(params).await;
+        let result = server.go_to_type_definition(at(params)).await;
         assert!(result.is_err());
     }
 
@@ -3658,6 +3765,8 @@ sleep 0.3
             ("go_to_type_definition", true, false, true),
             ("get_inlay_hints", true, false, true),
             ("get_tool_support", true, false, true),
+            ("go_to_declaration", true, false, true),
+            ("restart_server", false, true, false),
         ];
 
         assert_eq!(
@@ -4735,14 +4844,17 @@ sleep 0.3
             }
         };
         match tool {
-            McpTool::GetHover => server.get_hover(Parameters(position())).await.map(|_| ()),
+            McpTool::GetHover => server
+                .get_hover(Parameters(position().into()))
+                .await
+                .map(|_| ()),
             McpTool::GetDefinition => server
-                .get_definition(Parameters(position()))
+                .get_definition(Parameters(position().into()))
                 .await
                 .map(|_| ()),
             McpTool::GetReferences => server
                 .get_references(Parameters(ReferencesParams {
-                    position: position(),
+                    target: position().into(),
                     include_declaration: false,
                 }))
                 .await
@@ -4755,7 +4867,7 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::RenameSymbol => server
                 .rename_symbol(Parameters(RenameParams {
-                    position: position(),
+                    target: position().into(),
                     new_name: "renamed".to_string(),
                 }))
                 .await
@@ -4798,7 +4910,7 @@ sleep 0.3
                 .await
                 .map(|_| ()),
             McpTool::PrepareCallHierarchy => server
-                .prepare_call_hierarchy(Parameters(position()))
+                .prepare_call_hierarchy(Parameters(position().into()))
                 .await
                 .map(|_| ()),
             McpTool::GetIncomingCalls => server
@@ -4831,11 +4943,15 @@ sleep 0.3
                 .await
                 .map(|_| ()),
             McpTool::GoToImplementation => server
-                .go_to_implementation(Parameters(position()))
+                .go_to_implementation(Parameters(position().into()))
+                .await
+                .map(|_| ()),
+            McpTool::GoToDeclaration => server
+                .go_to_declaration(Parameters(position()))
                 .await
                 .map(|_| ()),
             McpTool::GoToTypeDefinition => server
-                .go_to_type_definition(Parameters(position()))
+                .go_to_type_definition(Parameters(position().into()))
                 .await
                 .map(|_| ()),
             McpTool::GetInlayHints => server
@@ -4847,6 +4963,13 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::GetToolSupport => server
                 .get_tool_support(Parameters(ToolSupportParams::default()))
+                .map(|_| ()),
+            McpTool::RestartServer => server
+                .restart_server(Parameters(
+                    serde_json::from_value(serde_json::json!({"servers": ["unconfigured"]}))
+                        .unwrap(),
+                ))
+                .await
                 .map(|_| ()),
         }
     }
@@ -4946,7 +5069,7 @@ sleep 0.3
         let report = report_json(&fixture.server, None);
 
         assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
-        assert_eq!(report["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(report["tools"].as_array().unwrap().len(), 23);
 
         let hover = tool_entry(&report, "get_hover");
         assert_eq!(hover["coverage"], "some");

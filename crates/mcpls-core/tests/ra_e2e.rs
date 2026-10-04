@@ -381,6 +381,50 @@ fn sc_get_definition(client: &mut McpClient, workspace: &Path) -> Result<(), Str
     Ok(())
 }
 
+/// Name addressing: `get_definition` by `symbol_name` reports the symbol and
+/// the position it queried, and an unknown name is a typed `-32602`.
+fn sc_get_definition_by_name(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let resp = client
+        .call_tool(
+            "get_definition",
+            &json!({"file_path": lib.to_string_lossy(), "symbol_name": "add"}),
+        )
+        .map_err(|e| format!("call failed: {e}"))?;
+    let text = assertions::assert_tool_ok(&resp);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+
+    let resolved = &inner["resolved_symbol"];
+    if resolved["name"] != "add" || resolved["position_source"] != "selection_range" {
+        return Err(format!("unexpected resolved_symbol: {resolved}"));
+    }
+    let add_line = find_line(&lib, "pub fn add(");
+    if resolved["position"]["line"] != add_line {
+        return Err(format!(
+            "resolved line {} != {add_line}",
+            resolved["position"]["line"]
+        ));
+    }
+    if inner["locations"].as_array().is_none_or(Vec::is_empty) {
+        return Err(format!("no locations in {inner}"));
+    }
+
+    let missing = client.call_tool(
+        "get_definition",
+        &json!({"file_path": lib.to_string_lossy(), "symbol_name": "no_such_symbol_xyz"}),
+    );
+    match missing {
+        Err(e) => {
+            let message = e.to_string();
+            if !(message.contains("-32602") && message.contains("not_found")) {
+                return Err(format!("expected a not_found -32602, got: {message}"));
+            }
+        }
+        Ok(resp) => return Err(format!("expected an error, got: {resp}")),
+    }
+    Ok(())
+}
+
 /// Tool 3: `get_references` — find references to `add`.
 fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
@@ -1165,6 +1209,37 @@ fn sc_go_to_type_definition(client: &mut McpClient, workspace: &Path) -> Result<
     }
 }
 
+/// `go_to_declaration` — declaration of `add` at its call site in `caller`.
+fn sc_go_to_declaration(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let caller_line = find_line(&lib, "pub fn caller(");
+    let resp = client
+        .call_tool(
+            "go_to_declaration",
+            &json!({
+                "file_path": lib.to_string_lossy(),
+                "line": caller_line + 1,
+                "character": 5,
+            }),
+        )
+        .map_err(|e| format!("call failed: {e}"))?;
+
+    let text = assertions::assert_tool_ok(&resp);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+    let locs = inner["locations"]
+        .as_array()
+        .ok_or_else(|| format!("expected locations array, got {inner}"))?;
+    if let Some(first) = locs.first() {
+        let uri = first["uri"].as_str().unwrap_or("");
+        if !uri.ends_with("/src/lib.rs") {
+            return Err(format!(
+                "declaration URI does not end with '/src/lib.rs': {uri}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Tool 20: `get_inlay_hints` — type hints in `lsp317_target`.
 fn sc_get_inlay_hints(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
@@ -1238,6 +1313,45 @@ fn sc_get_tool_support(client: &mut McpClient, _workspace: &Path) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// `restart_server`: restarts rust-analyzer and then serves a hover again.
+fn sc_restart_server(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let resp = client
+        .call_tool("restart_server", &json!({"all": true}))
+        .map_err(|e| format!("call failed: {e}"))?;
+    let text = assertions::assert_tool_ok(&resp);
+    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+    let status = &inner["servers"][0]["status"];
+    if status != "restarted" {
+        return Err(format!("expected status restarted, got {inner}"));
+    }
+
+    let lib = workspace.join("src/lib.rs");
+    let add_line = find_line(&lib, "pub fn add(");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let hover = client
+            .call_tool(
+                "get_hover",
+                &json!({"file_path": lib.to_string_lossy(), "line": add_line, "character": 8}),
+            )
+            .map_err(|e| format!("call failed: {e}"))?;
+        if hover.get("error").is_none() {
+            let text = assertions::assert_tool_ok(&hover);
+            let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+            if inner["contents"]
+                .as_str()
+                .is_some_and(|v| v.contains("add"))
+            {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("no hover after restart within 60 s; last={hover}"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// Resource sub-case 1: `list_resources` — at least one lib.rs resource exposed.
@@ -1446,6 +1560,41 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
     Ok(())
 }
 
+/// Sub-case registry, in execution order.
+fn sub_cases() -> Vec<SubCase> {
+    vec![
+        sub_case!(sc_get_hover),
+        sub_case!(sc_out_of_range_position_is_invalid_params_with_raw_error),
+        sub_case!(sc_get_definition),
+        sub_case!(sc_get_definition_by_name),
+        sub_case!(sc_get_references),
+        sub_case!(sc_get_diagnostics),
+        sub_case!(sc_rename_symbol),
+        sub_case!(sc_get_completions),
+        sub_case!(sc_get_document_symbols),
+        sub_case!(sc_format_document),
+        sub_case!(sc_workspace_symbol_search),
+        sub_case!(sc_get_code_actions),
+        sub_case!(sc_prepare_call_hierarchy),
+        sub_case!(sc_get_incoming_calls),
+        sub_case!(sc_get_outgoing_calls),
+        sub_case!(sc_get_cached_diagnostics),
+        sub_case!(sc_get_server_logs),
+        sub_case!(sc_get_server_messages),
+        sub_case!(sc_get_signature_help),
+        sub_case!(sc_go_to_implementation),
+        sub_case!(sc_go_to_type_definition),
+        sub_case!(sc_go_to_declaration),
+        sub_case!(sc_get_inlay_hints),
+        sub_case!(sc_get_tool_support),
+        sub_case!(sc_list_resources),
+        sub_case!(sc_read_resource),
+        sub_case!(sc_subscribe_unsubscribe_resource),
+        sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
+        sub_case!(sc_restart_server),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Suite driver
 // ---------------------------------------------------------------------------
@@ -1495,35 +1644,7 @@ fn ra_e2e_suite() {
     let lib_rs = workspace.join("src/lib.rs");
     wait_until_ready(&mut client, &lib_rs);
 
-    // Sub-case registry.
-    let sub_cases: &[SubCase] = &[
-        sub_case!(sc_get_hover),
-        sub_case!(sc_out_of_range_position_is_invalid_params_with_raw_error),
-        sub_case!(sc_get_definition),
-        sub_case!(sc_get_references),
-        sub_case!(sc_get_diagnostics),
-        sub_case!(sc_rename_symbol),
-        sub_case!(sc_get_completions),
-        sub_case!(sc_get_document_symbols),
-        sub_case!(sc_format_document),
-        sub_case!(sc_workspace_symbol_search),
-        sub_case!(sc_get_code_actions),
-        sub_case!(sc_prepare_call_hierarchy),
-        sub_case!(sc_get_incoming_calls),
-        sub_case!(sc_get_outgoing_calls),
-        sub_case!(sc_get_cached_diagnostics),
-        sub_case!(sc_get_server_logs),
-        sub_case!(sc_get_server_messages),
-        sub_case!(sc_get_signature_help),
-        sub_case!(sc_go_to_implementation),
-        sub_case!(sc_go_to_type_definition),
-        sub_case!(sc_get_inlay_hints),
-        sub_case!(sc_get_tool_support),
-        sub_case!(sc_list_resources),
-        sub_case!(sc_read_resource),
-        sub_case!(sc_subscribe_unsubscribe_resource),
-        sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
-    ];
+    let sub_cases = sub_cases();
 
     let filter = std::env::var("MCPLS_RA_FILTER").ok();
 

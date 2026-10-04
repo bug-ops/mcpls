@@ -187,6 +187,8 @@ pub enum Capability {
     DocumentSymbols,
     /// `workspaceSymbolProvider` (`workspace/symbol`).
     WorkspaceSymbols,
+    /// `declarationProvider` (`textDocument/declaration`).
+    Declaration,
 }
 
 #[allow(
@@ -195,7 +197,7 @@ pub enum Capability {
     reason = "compile-time check; the loop condition keeps `i` below `ALL.len()`"
 )]
 const _: () = {
-    assert!(Capability::ALL.len() == Capability::WorkspaceSymbols as usize + 1);
+    assert!(Capability::ALL.len() == Capability::Declaration as usize + 1);
     assert!(Capability::ALL.len() <= u16::BITS as usize);
     let mut i = 0;
     while i < Capability::ALL.len() {
@@ -206,7 +208,7 @@ const _: () = {
 
 impl Capability {
     /// Every capability, in discriminant order.
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::Completions,
         Self::SignatureHelp,
         Self::InlayHints,
@@ -221,6 +223,7 @@ impl Capability {
         Self::CodeActions,
         Self::DocumentSymbols,
         Self::WorkspaceSymbols,
+        Self::Declaration,
     ];
 
     /// The [`ToolKind`] whose route this capability gates -- the single
@@ -241,6 +244,7 @@ impl Capability {
             Self::CodeActions => ToolKind::CodeActions,
             Self::DocumentSymbols => ToolKind::DocumentSymbols,
             Self::WorkspaceSymbols => ToolKind::WorkspaceSymbols,
+            Self::Declaration => ToolKind::Declaration,
         }
     }
 
@@ -294,6 +298,7 @@ impl Capability {
             Self::CodeActions => "codeActionProvider",
             Self::DocumentSymbols => "documentSymbolProvider",
             Self::WorkspaceSymbols => "workspaceSymbolProvider",
+            Self::Declaration => "declarationProvider",
         }
     }
 
@@ -388,6 +393,14 @@ impl Capability {
                 Some(
                     lsp_types::WorkspaceSymbolProvider::Bool(true)
                         | lsp_types::WorkspaceSymbolProvider::WorkspaceSymbolOptions(_)
+                )
+            ),
+            Self::Declaration => matches!(
+                caps.declaration_provider,
+                Some(
+                    lsp_types::DeclarationProvider::Bool(true)
+                        | lsp_types::DeclarationProvider::DeclarationOptions(_)
+                        | lsp_types::DeclarationProvider::DeclarationRegistrationOptions(_)
                 )
             ),
         }
@@ -3228,6 +3241,38 @@ mod tests {
                 ..
             })
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_declaration_blocked_when_capability_not_supported() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, _server) = translator_with_capabilities(
+            &dir,
+            &server_id,
+            lsp_types::ServerCapabilities::default(),
+        );
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let result = translator
+            .handle_declaration(
+                path.to_string_lossy().to_string(),
+                Position {
+                    line: 1,
+                    character: 1,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CapabilityNotSupported {
+                capability: "declarationProvider",
+                ..
+            })
+        ));
     }
 
     /// Explicit `Some(RenameProvider::Bool(false))` -- as distinct from an absent

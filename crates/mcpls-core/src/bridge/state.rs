@@ -155,13 +155,30 @@ impl DocumentText {
     /// no such line. Scans at most `stride - 1` terminators from the nearest
     /// checkpoint plus the target line itself.
     pub(super) fn line(&self, n: u32) -> Option<&str> {
+        let start = self.line_start(n)?;
+        let (end, _) = line_bounds(&self.content, start);
+        Some(&self.content[start..end])
+    }
+
+    fn line_start(&self, n: u32) -> Option<usize> {
         let n = n as usize;
         let mut start = *self.checkpoints.get(n.checked_div(self.stride)?)?;
         for _ in 0..n.checked_rem(self.stride)? {
             start = line_bounds(&self.content, start).1?;
         }
-        let (end, _) = line_bounds(&self.content, start);
-        Some(&self.content[start..end])
+        Some(start)
+    }
+
+    /// The lines from the 0-based `n`'th on, without terminators; empty if
+    /// there is no such line.
+    pub(super) fn lines_from(&self, n: u32) -> impl Iterator<Item = &str> {
+        let mut next = self.line_start(n);
+        std::iter::from_fn(move || {
+            let start = next?;
+            let (end, after) = line_bounds(&self.content, start);
+            next = after;
+            self.content.get(start..end)
+        })
     }
 }
 
@@ -629,6 +646,33 @@ impl DocumentTracker {
     pub fn line_text(&self, path: &Path, line: u32) -> Option<String> {
         let documents = lock_std(&self.documents);
         documents.get(path)?.text.line(line).map(str::to_string)
+    }
+
+    /// Up to `max_lines` of `path`'s tracked lines from the 0-based
+    /// `start_line` on, joined with `\n` (lines carry no terminator, so the
+    /// join is unambiguous); `None` if the document is not open or has no such
+    /// line. Copied out in one lock acquisition so callers scan without
+    /// holding the documents mutex.
+    #[must_use]
+    pub(crate) fn line_window(
+        &self,
+        path: &Path,
+        start_line: u32,
+        max_lines: usize,
+    ) -> Option<String> {
+        let documents = lock_std(&self.documents);
+        let mut lines = documents
+            .get(path)?
+            .text
+            .lines_from(start_line)
+            .take(max_lines);
+        let mut window = lines.next()?.to_string();
+        for line in lines {
+            window.push('\n');
+            window.push_str(line);
+        }
+        drop(documents);
+        Some(window)
     }
 
     /// Get the number of open documents.
@@ -4082,6 +4126,25 @@ mod tests {
                     None,
                     "{content:?} stride {stride} past the last line"
                 );
+            }
+        }
+    }
+
+    /// `lines_from` yields exactly the lines `line` would, from any start.
+    #[test]
+    fn test_document_text_lines_from_matches_line_exhaustively() {
+        for content in all_strings(7) {
+            let expected = naive_lines(&content);
+            for stride in 1..=3 {
+                let text = DocumentText::with_stride(content.clone(), stride);
+                for start in 0..=expected.len() {
+                    let got: Vec<&str> = text.lines_from(u32::try_from(start).unwrap()).collect();
+                    assert_eq!(
+                        got,
+                        expected[start.min(expected.len())..],
+                        "{content:?} {stride} {start}"
+                    );
+                }
             }
         }
     }

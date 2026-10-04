@@ -10,7 +10,7 @@ tags:
   - lsp
   - competitor-gap
 created: 2026-10-04
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001-lsp-server-lifecycle-and-respawn]]"
@@ -32,9 +32,42 @@ related:
 > #359 (push-diagnostics degradation flag)
 
 > [!warning] Status
-> Draft produced non-interactively. Every product decision that the finding left open is recorded
-> as `[NEEDS CLARIFICATION: ...]` with a recommended default. No implementation detail (HOW) is
-> prescribed here; that belongs in the plan.
+> Implemented with #564 (together with #542, #567 and #563). The open product decisions are
+> resolved in "Decisions" below; the `[NEEDS CLARIFICATION]` markers in the body keep the
+> original questions for context.
+
+> [!success] Decisions
+> - **Name and selector (FR-001, FR-002):** `restart_server`, taking `servers` (non-empty list of
+>   server ids) or `all: true`; a bare call, an empty list, a blank id, or both fields are
+>   rejected at deserialization. `language_id` and `file_path` selectors are not offered.
+> - **Process-tree reaping (FR-006):** #542 is fixed in the same change (per-server watchdog
+>   process group, see lsp/007), so a restart kills the server's whole group; `setsid`
+>   descendants (#541) may survive.
+> - **Pump re-wiring (FR-009):** the diagnostics pump is re-wired on restart and the push-degraded
+>   flag is cleared. Automatic crash respawn keeps discarding notifications (a follow-up).
+> - **Cooldown and backoff (FR-008):** a manual restart bypasses the crash-loop backoff; the same
+>   server is throttled for 5 s (`throttled { retry_in_ms }`).
+> - **Annotations (FR-010):** `read_only_hint = false`, `destructive_hint = true`,
+>   `idempotent_hint = false` (each repeat tears down and respawns a process). Destructive
+>   because the group kill also kills shared daemons (Gradle, Bloop) that other clients may be
+>   using, so clients should ask before running it.
+> - **Always on (FR-013):** no configuration flag.
+> - **Startup-failed servers (FR-015):** reported as `not_running`; starting them is a follow-up.
+>   A server still starting reports `initializing`.
+> - **Termination order:** kill-then-respawn: the old server gets 3 s to answer `shutdown`; one
+>   that answered may then take up to 10 s to exit on its own (rust-analyzer and jdtls flush
+>   caches), after which the whole process group is killed; one that did not answer is killed
+>   at once. Terminate errors are not fatal. Worst cases per server: about 3.1 s for a wedged
+>   server, about 13 s for a healthy slow-to-stop one; `All` over N servers takes about
+>   ceil(N/4) times that (four restart concurrently), plus each replacement's `initialize`.
+> - **Failed restart:** the stopped server's cached diagnostics are cleared, it is flagged
+>   push-degraded and subscribers are notified, so stale data is never served as live (SC-006).
+> - **Pending requests:** requests in flight on the old process fail with the retryable
+>   `server_restarted` error, code `-32054`.
+> - **Subscribers:** resource subscribers are told to re-read the diagnostics cleared by the
+>   restart (`resources/updated`).
+> - **Pinned documents:** the tracker has no pinning; "documents tracked as open" are re-sent on
+>   next access.
 
 ## 1. Overview
 
@@ -180,11 +213,11 @@ THEN the restart tool's annotations declare read_only_hint = false and are expli
 | FR-003 | WHEN the selector names a server id that is not configured THE SYSTEM SHALL reject the call with a typed error that lists the configured ids, and SHALL restart nothing | must |
 | FR-004 | WHEN a restart is requested for a live, registered server THE SYSTEM SHALL terminate the old process (graceful `shutdown`/`exit` attempt bounded by the existing LSP shutdown deadline, then forced kill), spawn a replacement from the server's existing spawn configuration, and complete the LSP `initialize` handshake before reporting success | must |
 | FR-005 | WHEN a restart succeeds THE SYSTEM SHALL reset all per-server state that belonged to the old process, exactly as the dead-server path does today: fail requests still pending on the old client with a typed error (not a timeout), clear the document tracker's sync history for that server so documents are re-sent with `didOpen` on next access, clear that server's cached diagnostics, and reset its tracked indexing state to `Unknown` so the readiness gate (bridge/006) applies to the new process | must |
-| FR-006 | WHEN a restart terminates an old process THE SYSTEM SHALL also terminate that process's descendants to the same extent the platform lifetime mechanism allows ([[lsp/007-lsp-child-process-lifetime/spec\|lsp/007]]): the whole tree on Windows; on Unix the leader, with descendants subject to #541 and #542. [NEEDS CLARIFICATION: ship the tool before #542 is fixed (a manual restart of a wedged server would then leak the wedged descendants until mcpls exits), or make #542 a prerequisite. Recommended default: fix #542 first or in the same batch, and document the residual `setsid` case (#541) in the tool description.] | should |
+| FR-006 | WHEN a restart terminates an old process THE SYSTEM SHALL also terminate that process's descendants to the same extent the platform lifetime mechanism allows ([[lsp/007-lsp-child-process-lifetime/spec\|lsp/007]]): the whole tree on Windows; on Unix the server's process group (#542), with `setsid` descendants subject to #541, and shared daemons such as Gradle or Bloop killed too. [NEEDS CLARIFICATION: ship the tool before #542 is fixed (a manual restart of a wedged server would then leak the wedged descendants until mcpls exits), or make #542 a prerequisite. Recommended default: fix #542 first or in the same batch, and document the residual `setsid` case (#541) in the tool description.] | should |
 | FR-007 | WHEN a restart and an automatic respawn (or two restarts) target the same server concurrently THE SYSTEM SHALL serialize them per server so that exactly one new process results and no caller observes a half-replaced server (single-flight, as `respawn_if_dead` provides for respawn) | must |
 | FR-008 | WHEN a server is within a crash-loop backoff window THE SYSTEM SHALL treat an explicit restart as operator intent and attempt it immediately, then record its outcome in the same failure/stability bookkeeping as an automatic respawn, so a restart that fails keeps the backoff honest. [NEEDS CLARIFICATION: confirm bypass-on-manual-restart, and whether to impose a minimum interval between manual restarts of the same server to stop an agent from restart-looping a slow-indexing server. Recommended default: bypass backoff, and apply a short per-server cooldown that returns a typed `Throttled { retry_in }` outcome.] | should |
 | FR-009 | WHEN the restarted server is the diagnostics-route server for its language THE SYSTEM SHALL leave push-diagnostics state truthful: if the replacement's push notifications are not delivered into the cache, the server SHALL be flagged degraded exactly as today (`push_notifications_degraded`, #359) and the restart result SHALL say so; a restart SHALL NOT silently leave resource subscribers believing diagnostics are live. [NEEDS CLARIFICATION: re-wire the diagnostics pump on restart so a restart returns the server to non-degraded, which is the main reason a user would restart a healthy-but-stale rust-analyzer, versus accepting the existing permanent degradation. Recommended default: re-wiring is a prerequisite, because accepting degradation makes restart worse than the stale state for diagnostics users.] | must |
-| FR-010 | THE SYSTEM SHALL annotate the tool with `read_only_hint = false`, `destructive_hint = false` (it discards in-memory server state only; no user data or files), `idempotent_hint = true` (the end state of repeating the call is the same), and an `open_world_hint` consistent with the other tools. [NEEDS CLARIFICATION: confirm `idempotent_hint = true`, since each repeat does tear down and respawn a process.] | must |
+| FR-010 | THE SYSTEM SHALL annotate the tool with `read_only_hint = false`, `destructive_hint = true` (it discards in-memory server state and kills the server's whole process group, including shared daemons other clients may use; no user files are touched), `idempotent_hint = false` (each repeat tears down and respawns a process), and an `open_world_hint` consistent with the other tools. | must |
 | FR-011 | THE SYSTEM SHALL return a structured result (`structuredContent` with `outputSchema`, the existing tool-output convention) containing one entry per targeted server with a closed, typed outcome set: restarted, failed (with typed reason), throttled/backing-off (with `retry_in`), and the server's resulting indexing state; plus the push-degradation flag from FR-009 | must |
 | FR-012 | WHEN some targeted servers restart and others fail THE SYSTEM SHALL complete every requested restart independently (one failure does not stop the rest) and report all outcomes, consistent with the graceful-degradation principle in the constitution | must |
 | FR-013 | THE SYSTEM SHALL decide, as a recorded product decision, whether the tool is enabled by default or opt-in through configuration. [NEEDS CLARIFICATION: the project otherwise exposes a read-only tool surface, but the constitution (VII) prefers one code path over flags. Recommended default: always on, with accurate annotations (FR-010) so MCP clients can prompt, and no config flag. If opt-in is chosen, the disabled tool must be absent from `tools/list` and `get_tool_support`, not present-but-refusing.] | must |
@@ -200,7 +233,7 @@ THEN the restart tool's annotations declare read_only_hint = false and are expli
 | NFR-003 | Bounded latency | Termination of the old process SHALL be bounded by the existing LSP shutdown deadline (`lsp::SHUTDOWN_TIMEOUT` and its child-exit grace); the call SHALL NOT wait for workspace indexing to finish. Total call duration is bounded by termination plus the configured `initialize` timeout |
 | NFR-004 | No orphans | After a successful restart no leader process of the old instance remains; descendants follow FR-006 |
 | NFR-005 | Safety | No `unsafe` code (`unsafe_code = "forbid"` workspace-wide) and no new dependency without CHANGELOG justification |
-| NFR-006 | Protocol compatibility | The tool conforms to the standard MCP `Tool` schema (name, description, `inputSchema`, `outputSchema`, annotations). Adding it is a visible `tools/list` change (21 to 22 tools) and a breaking-surface item for CHANGELOG |
+| NFR-006 | Protocol compatibility | The tool conforms to the standard MCP `Tool` schema (name, description, `inputSchema`, `outputSchema`, annotations). Adding it is a visible `tools/list` change (22 to 23 tools together with `go_to_declaration`) and a breaking-surface item for CHANGELOG |
 | NFR-007 | Non-regression | Automatic crash respawn, its backoff and `get_tool_support` behavior (mcp/005 NFR-002 and NFR-003) SHALL remain unchanged for callers that never use the restart tool |
 | NFR-008 | Observability | Each restart SHALL be logged (`tracing`) with server id, trigger (manual vs automatic) and outcome |
 
@@ -247,7 +280,7 @@ as a bridge-local tool.
 | SC-002 | Isolation test with two servers, restart one | Second server's pid, tracked documents, cached diagnostics and indexing state are byte-for-byte unchanged |
 | SC-003 | Document re-sync test | After restart, the first access to a previously opened document sends `didOpen` (not `didChange`) to the new process |
 | SC-004 | Outcome-typing test for mixed success/failure across two servers | Result has exactly one typed entry per requested server; one failure does not prevent the other restart |
-| SC-005 | Tool-surface guard tests | `test_all_tools_carry_annotations` and the value-level annotation table updated with the new tool's `(false, false, true)` classification; `McpTool::ALL`, `tool_surface.json` and the `get_tool_support` parity matrix updated; count 22 |
+| SC-005 | Tool-surface guard tests | `test_all_tools_carry_annotations` and the value-level annotation table updated with the new tool's `(false, false, false)` classification; `McpTool::ALL`, `tool_surface.json` and the `get_tool_support` parity matrix updated; count 23 |
 | SC-006 | Diagnostics-route test (FR-009) | After restarting the diagnostics-route server, `get_cached_diagnostics` and the diagnostics resource either deliver live push again, or carry the degraded flag; never stale-as-live |
 | SC-007 | Concurrency test: restart racing automatic respawn and a second restart | Exactly one new process; no leaked child |
 | SC-008 | Documentation gate | README tool table, tool description (including the Unix descendant caveat) and CHANGELOG entry present |

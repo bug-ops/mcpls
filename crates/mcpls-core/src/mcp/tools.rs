@@ -3,6 +3,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::{
+    MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position, RestartTarget,
+    ServerIds, SymbolName, SymbolQuery, SymbolTarget, parse_symbol_kind,
+};
+use crate::config::ServerId;
+
 /// Shared position parameters (file path plus 1-based line/character) used by
 /// every tool that operates at a single point in a file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -36,13 +42,138 @@ pub struct RangeParams {
     pub end_character: u32,
 }
 
+/// Wire form of [`SymbolTargetParams`]: a file plus either a position or a
+/// symbol name.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(
+    description = "A file plus the symbol to act on: give either `line` and `character`, or `symbol_name`."
+)]
+struct SymbolTargetWire {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    file_path: String,
+    /// Line number (1-based); give with `character`, instead of `symbol_name`.
+    #[schemars(
+        description = "Line number (1-based). Give with `character`, instead of `symbol_name`."
+    )]
+    #[serde(default)]
+    line: Option<u32>,
+    /// Character/column number (1-based); give with `line`.
+    #[schemars(
+        description = "Character/column number (1-based). Give with `line`, instead of `symbol_name`."
+    )]
+    #[serde(default)]
+    character: Option<u32>,
+    /// Name of a symbol defined in the file, instead of a position.
+    #[schemars(
+        description = "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them."
+    )]
+    #[serde(default)]
+    symbol_name: Option<String>,
+    /// Narrow `symbol_name` to this kind.
+    #[schemars(
+        description = "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value."
+    )]
+    #[serde(default)]
+    symbol_kind: Option<String>,
+    /// Narrow `symbol_name` to symbols inside this container.
+    #[schemars(
+        description = "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name."
+    )]
+    #[serde(default)]
+    container: Option<String>,
+}
+
+/// A file and the symbol in it a tool acts on, addressed by position or by
+/// name. Exactly one addressing form is representable: a request with both,
+/// neither, half a position, or qualifiers without a name fails to
+/// deserialize and is reported as invalid parameters.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(try_from = "SymbolTargetWire")]
+#[schemars(with = "SymbolTargetWire")]
+pub struct SymbolTargetParams {
+    /// Absolute path to the file.
+    pub file_path: String,
+    /// The symbol to act on.
+    pub target: SymbolTarget,
+}
+
+impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
+    type Error = String;
+
+    fn try_from(wire: SymbolTargetWire) -> Result<Self, Self::Error> {
+        let target = match (wire.line, wire.character, wire.symbol_name) {
+            (Some(line), Some(character), None) => {
+                if wire.symbol_kind.is_some() || wire.container.is_some() {
+                    return Err(
+                        "`symbol_kind` and `container` apply only with `symbol_name`".to_string(),
+                    );
+                }
+                SymbolTarget::Position(Position { line, character })
+            }
+            (None, None, Some(name)) => {
+                let kind = wire
+                    .symbol_kind
+                    .as_deref()
+                    .map(|kind| {
+                        if kind.len() > MAX_SYMBOL_NAME_BYTES {
+                            return Err("`symbol_kind` is too long".to_string());
+                        }
+                        parse_symbol_kind(kind)
+                    })
+                    .transpose()?;
+                SymbolTarget::Name(SymbolQuery {
+                    name: SymbolName::try_new(name).map_err(|e| e.to_string())?,
+                    kind,
+                    container: wire
+                        .container
+                        .map(SymbolName::try_new)
+                        .transpose()
+                        .map_err(|e| e.to_string())?,
+                })
+            }
+            (Some(_), Some(_), Some(_)) => {
+                return Err(
+                    "give either `line` and `character`, or `symbol_name`, not both".to_string(),
+                );
+            }
+            (None, None, None) => {
+                return Err("give `line` and `character`, or `symbol_name`".to_string());
+            }
+            _ => {
+                return Err(
+                    "`line` and `character` must be given together and not with `symbol_name`"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(Self {
+            file_path: wire.file_path,
+            target,
+        })
+    }
+}
+
+#[cfg(test)]
+impl From<PositionParams> for SymbolTargetParams {
+    fn from(position: PositionParams) -> Self {
+        Self {
+            file_path: position.file_path,
+            target: SymbolTarget::Position(Position {
+                line: position.line,
+                character: position.character,
+            }),
+        }
+    }
+}
+
 /// Parameters for the `get_references` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for finding all references to a symbol.")]
 pub struct ReferencesParams {
-    /// Position in the file to operate on.
+    /// The symbol to find references to.
     #[serde(flatten)]
-    pub position: PositionParams,
+    pub target: SymbolTargetParams,
     /// Whether to include the declaration in the results.
     #[schemars(description = "Whether to include the declaration in the results.")]
     #[serde(default)]
@@ -59,12 +190,12 @@ pub struct DiagnosticsParams {
 }
 
 /// Parameters for the `rename_symbol` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for renaming a symbol across the workspace.")]
 pub struct RenameParams {
-    /// Position in the file to operate on.
+    /// The symbol to rename.
     #[serde(flatten)]
-    pub position: PositionParams,
+    pub target: SymbolTargetParams,
     /// New name for the symbol.
     #[schemars(description = "New name for the symbol.")]
     pub new_name: String,
@@ -232,6 +363,58 @@ pub struct ToolSupportParams {
     pub file_path: Option<String>,
 }
 
+/// Wire form of [`RestartServerParams`]: exactly one of the two fields selects
+/// the servers.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(
+    description = "Parameters for restarting LSP servers. Give exactly one of `servers` or `all`."
+)]
+struct RestartServerWire {
+    /// Ids of the servers to restart.
+    #[schemars(
+        description = "Ids of the servers to restart; an unknown id is rejected with the list of configured ids. Non-empty."
+    )]
+    #[schemars(length(max = MAX_RESTART_SERVER_IDS), inner(length(max = MAX_SERVER_ID_BYTES)))]
+    #[serde(default)]
+    servers: Option<Vec<String>>,
+    /// Restart every configured server.
+    #[schemars(description = "Set to true to restart every configured server.")]
+    #[serde(default)]
+    all: bool,
+}
+
+/// Parameters for the `restart_server` tool, parsed into a [`RestartTarget`]
+/// at deserialization so a bare call, an empty list, or both selectors are
+/// rejected as invalid parameters.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(try_from = "RestartServerWire")]
+#[schemars(with = "RestartServerWire")]
+pub struct RestartServerParams {
+    /// Which servers to restart.
+    pub target: RestartTarget,
+}
+
+impl TryFrom<RestartServerWire> for RestartServerParams {
+    type Error = String;
+
+    fn try_from(wire: RestartServerWire) -> Result<Self, Self::Error> {
+        let target = match (wire.servers, wire.all) {
+            (Some(_), true) => return Err("give either `servers` or `all`, not both".to_string()),
+            (None, false) => {
+                return Err(
+                    "give `servers` (a non-empty list of server ids) or `all: true`".to_string(),
+                );
+            }
+            (None, true) => RestartTarget::All,
+            (Some(ids), false) => {
+                let ids = ids.into_iter().map(ServerId::from).collect();
+                RestartTarget::Servers(ServerIds::try_new(ids).map_err(|e| e.to_string())?)
+            }
+        };
+        Ok(Self { target })
+    }
+}
+
 /// Parameters for the `get_inlay_hints` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting inlay hints in a range.")]
@@ -254,23 +437,15 @@ mod tests {
     /// objects with no knowledge of the Rust-side nesting.
     #[test]
     fn flattened_params_serialize_to_flat_json() {
-        let references = ReferencesParams {
-            position: PositionParams {
-                file_path: "/a.rs".to_string(),
-                line: 1,
-                character: 2,
-            },
-            include_declaration: true,
+        let position = PositionParams {
+            file_path: "/a.rs".to_string(),
+            line: 1,
+            character: 2,
         };
-        let json = serde_json::to_value(&references).unwrap();
+        let json = serde_json::to_value(&position).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({
-                "file_path": "/a.rs",
-                "line": 1,
-                "character": 2,
-                "include_declaration": true,
-            })
+            serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2})
         );
 
         let inlay = InlayHintsParams {
@@ -295,16 +470,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restart_params_accept_servers_or_all() {
+        let one: RestartServerParams =
+            serde_json::from_value(serde_json::json!({"servers": ["rust", "rust", "py"]})).unwrap();
+        let RestartTarget::Servers(ids) = one.target else {
+            panic!("expected a server list");
+        };
+        assert_eq!(ids.as_slice().len(), 2);
+
+        let all: RestartServerParams =
+            serde_json::from_value(serde_json::json!({"all": true})).unwrap();
+        assert_eq!(all.target, RestartTarget::All);
+    }
+
+    #[test]
+    fn restart_params_reject_ambiguous_or_empty_selectors() {
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"all": false}),
+            serde_json::json!({"servers": []}),
+            serde_json::json!({"servers": [" "]}),
+            serde_json::json!({"servers": ["rust"], "all": true}),
+            serde_json::json!({"servers": (0..=MAX_RESTART_SERVER_IDS).map(|i| format!("s{i}")).collect::<Vec<_>>()}),
+            serde_json::json!({"servers": ["x".repeat(MAX_SERVER_ID_BYTES + 1)]}),
+        ] {
+            assert!(
+                serde_json::from_value::<RestartServerParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_params_schema_exposes_wire_fields() {
+        let schema = schemars::schema_for!(RestartServerParams);
+        let properties = schema
+            .as_object()
+            .unwrap()
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(properties.contains_key("servers"));
+        assert!(properties.contains_key("all"));
+        assert!(!properties.contains_key("target"));
+        let servers = &properties["servers"];
+        assert_eq!(servers["maxItems"], MAX_RESTART_SERVER_IDS);
+        assert_eq!(servers["items"]["maxLength"], MAX_SERVER_ID_BYTES);
+    }
+
     /// A flat JSON object (what an MCP client actually sends) must deserialize
     /// into the nested Rust shape produced by `#[serde(flatten)]`.
     #[test]
     fn flat_json_deserializes_into_flattened_params() {
         let json = serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2});
         let references: ReferencesParams = serde_json::from_value(json).unwrap();
-        assert_eq!(references.position.file_path, "/a.rs");
-        assert_eq!(references.position.line, 1);
-        assert_eq!(references.position.character, 2);
+        assert_eq!(references.target.file_path, "/a.rs");
+        assert_eq!(
+            references.target.target,
+            SymbolTarget::Position(Position {
+                line: 1,
+                character: 2
+            })
+        );
         assert!(!references.include_declaration);
+
+        let json = serde_json::json!({
+            "file_path": "/a.rs",
+            "symbol_name": "parse",
+            "symbol_kind": "function",
+            "container": "Config",
+            "include_declaration": true,
+        });
+        let references: ReferencesParams = serde_json::from_value(json).unwrap();
+        assert!(references.include_declaration);
+        let SymbolTarget::Name(query) = references.target.target else {
+            panic!("expected a name target");
+        };
+        assert_eq!(query.name.as_str(), "parse");
+        assert_eq!(query.kind, Some(lsp_types::SymbolKind::Function));
+        assert_eq!(query.container.unwrap().as_str(), "Config");
+    }
+
+    #[test]
+    fn symbol_target_accepts_exactly_one_addressing_form() {
+        let parse = |json: serde_json::Value| serde_json::from_value::<SymbolTargetParams>(json);
+        assert!(
+            parse(serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 1})).is_ok()
+        );
+        assert!(parse(serde_json::json!({"file_path": "/a.rs", "symbol_name": "f"})).is_ok());
+        for bad in [
+            serde_json::json!({"file_path": "/a.rs"}),
+            serde_json::json!({"file_path": "/a.rs", "line": 1}),
+            serde_json::json!({"file_path": "/a.rs", "character": 1}),
+            serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 1, "symbol_name": "f"}),
+            serde_json::json!({"file_path": "/a.rs", "line": 1, "symbol_name": "f"}),
+            serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 1, "container": "T"}),
+            serde_json::json!({"file_path": "/a.rs", "symbol_name": " "}),
+            serde_json::json!({"file_path": "/a.rs", "symbol_name": "f", "symbol_kind": "nope"}),
+            serde_json::json!({"file_path": "/a.rs", "symbol_name": "f", "container": ""}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn symbol_kind_accepts_names_and_numeric_values() {
+        let kind = |value: &str| {
+            let json =
+                serde_json::json!({"file_path": "/a.rs", "symbol_name": "f", "symbol_kind": value});
+            let params: SymbolTargetParams = serde_json::from_value(json).unwrap();
+            let SymbolTarget::Name(query) = params.target else {
+                panic!("expected a name target");
+            };
+            query.kind
+        };
+        assert_eq!(kind("Method"), Some(lsp_types::SymbolKind::Method));
+        assert_eq!(kind("6"), Some(lsp_types::SymbolKind::Method));
     }
 
     /// The generated JSON schema must expose `PositionParams`/`RangeParams`
@@ -324,8 +607,11 @@ mod tests {
         assert!(properties.contains_key("file_path"));
         assert!(properties.contains_key("line"));
         assert!(properties.contains_key("character"));
+        assert!(properties.contains_key("symbol_name"));
+        assert!(properties.contains_key("symbol_kind"));
+        assert!(properties.contains_key("container"));
         assert!(properties.contains_key("include_declaration"));
-        assert!(!properties.contains_key("position"));
+        assert!(!properties.contains_key("target"));
 
         let schema = schemars::schema_for!(InlayHintsParams);
         let properties = schema

@@ -805,31 +805,61 @@
   {
     "name": "get_definition",
     "title": "Go to Definition",
-    "description": "Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
-          "description": "Character/column number (1-based).",
+          "default": null,
+          "description": "Character/column number (1-based). Give with `line`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "file_path": {
           "description": "Absolute path to the file.",
           "type": "string"
         },
         "line": {
-          "description": "Line number (1-based).",
+          "default": null,
+          "description": "Line number (1-based). Give with `character`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "symbol_kind": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_name": {
+          "default": null,
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "file_path",
-        "line",
-        "character"
+        "file_path"
       ],
       "type": "object"
     },
@@ -894,6 +924,21 @@
             }
           ]
         },
+        "PositionSource": {
+          "description": "Where the queried position of a name-addressed call came from.",
+          "oneOf": [
+            {
+              "const": "selection_range",
+              "description": "The server's `selectionRange` start, verified to spell the name.",
+              "type": "string"
+            },
+            {
+              "const": "inferred",
+              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
+              "type": "string"
+            }
+          ]
+        },
         "Range": {
           "description": "Range in a document (1-based for MCP).",
           "properties": {
@@ -911,6 +956,43 @@
             "end"
           ],
           "type": "object"
+        },
+        "ResolvedSymbol": {
+          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
+          "properties": {
+            "container": {
+              "description": "Enclosing symbol, when the server reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Numeric LSP `SymbolKind`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "The symbol's name as the server reports it.",
+              "type": "string"
+            },
+            "position": {
+              "$ref": "#/$defs/Position2D",
+              "description": "The 1-based position that was queried."
+            },
+            "position_source": {
+              "$ref": "#/$defs/PositionSource",
+              "description": "How `position` was determined."
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "position",
+            "position_source"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -925,6 +1007,17 @@
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "resolved_symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedSymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only for a name-addressed call."
         },
         "truncated": {
           "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
@@ -1253,31 +1346,61 @@
   {
     "name": "get_hover",
     "title": "Hover",
-    "description": "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Type and documentation info for a symbol. Returns signatures, docs, and inferred types. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
-          "description": "Character/column number (1-based).",
+          "default": null,
+          "description": "Character/column number (1-based). Give with `line`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "file_path": {
           "description": "Absolute path to the file.",
           "type": "string"
         },
         "line": {
-          "description": "Line number (1-based).",
+          "default": null,
+          "description": "Line number (1-based). Give with `character`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "symbol_kind": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_name": {
+          "default": null,
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "file_path",
-        "line",
-        "character"
+        "file_path"
       ],
       "type": "object"
     },
@@ -1320,6 +1443,21 @@
             }
           ]
         },
+        "PositionSource": {
+          "description": "Where the queried position of a name-addressed call came from.",
+          "oneOf": [
+            {
+              "const": "selection_range",
+              "description": "The server's `selectionRange` start, verified to spell the name.",
+              "type": "string"
+            },
+            {
+              "const": "inferred",
+              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
+              "type": "string"
+            }
+          ]
+        },
         "Range": {
           "description": "Range in a document (1-based for MCP).",
           "properties": {
@@ -1335,6 +1473,43 @@
           "required": [
             "start",
             "end"
+          ],
+          "type": "object"
+        },
+        "ResolvedSymbol": {
+          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
+          "properties": {
+            "container": {
+              "description": "Enclosing symbol, when the server reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Numeric LSP `SymbolKind`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "The symbol's name as the server reports it.",
+              "type": "string"
+            },
+            "position": {
+              "$ref": "#/$defs/Position2D",
+              "description": "The 1-based position that was queried."
+            },
+            "position_source": {
+              "$ref": "#/$defs/PositionSource",
+              "description": "How `position` was determined."
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "position",
+            "position_source"
           ],
           "type": "object"
         }
@@ -1366,6 +1541,17 @@
             }
           ],
           "description": "Optional range the hover applies to."
+        },
+        "resolved_symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedSymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only for a name-addressed call."
         }
       },
       "required": [
@@ -1915,15 +2101,27 @@
   {
     "name": "get_references",
     "title": "Find References",
-    "description": "References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
-          "description": "Character/column number (1-based).",
+          "default": null,
+          "description": "Character/column number (1-based). Give with `line`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -1935,16 +2133,34 @@
           "type": "boolean"
         },
         "line": {
-          "description": "Line number (1-based).",
+          "default": null,
+          "description": "Line number (1-based). Give with `character`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "symbol_kind": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_name": {
+          "default": null,
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "file_path",
-        "line",
-        "character"
+        "file_path"
       ],
       "type": "object"
     },
@@ -2009,6 +2225,21 @@
             }
           ]
         },
+        "PositionSource": {
+          "description": "Where the queried position of a name-addressed call came from.",
+          "oneOf": [
+            {
+              "const": "selection_range",
+              "description": "The server's `selectionRange` start, verified to spell the name.",
+              "type": "string"
+            },
+            {
+              "const": "inferred",
+              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
+              "type": "string"
+            }
+          ]
+        },
         "Range": {
           "description": "Range in a document (1-based for MCP).",
           "properties": {
@@ -2026,6 +2257,43 @@
             "end"
           ],
           "type": "object"
+        },
+        "ResolvedSymbol": {
+          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
+          "properties": {
+            "container": {
+              "description": "Enclosing symbol, when the server reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Numeric LSP `SymbolKind`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "The symbol's name as the server reports it.",
+              "type": "string"
+            },
+            "position": {
+              "$ref": "#/$defs/Position2D",
+              "description": "The 1-based position that was queried."
+            },
+            "position_source": {
+              "$ref": "#/$defs/PositionSource",
+              "description": "How `position` was determined."
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "position",
+            "position_source"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2040,6 +2308,17 @@
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "resolved_symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedSymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only for a name-addressed call."
         },
         "truncated": {
           "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more references\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
@@ -2598,9 +2877,9 @@
     }
   },
   {
-    "name": "go_to_implementation",
-    "title": "Go to Implementation",
-    "description": "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "name": "go_to_declaration",
+    "title": "Go to Declaration",
+    "description": "Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -2727,6 +3006,247 @@
             }
           ],
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "truncated": {
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "locations"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Go to Declaration",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "go_to_implementation",
+    "title": "Go to Implementation",
+    "description": "Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "default": null,
+          "description": "Character/column number (1-based). Give with `line`, instead of `symbol_name`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "default": null,
+          "description": "Line number (1-based). Give with `character`, instead of `symbol_name`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "symbol_kind": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_name": {
+          "default": null,
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Location": {
+          "description": "Location in a document.",
+          "properties": {
+            "out_of_workspace": {
+              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (see\n`bridge::uri_in_workspace_roots`'s docs for why), so callers that\nwant to apply their own policy toward out-of-workspace locations can\ncheck this flag. The underlying check is purely lexical -- it does\nnot resolve symlinks -- so a location reached through a symlinked\nworkspace root (e.g. macOS's `/var` -> `/private/var`, or a package\nmanager's symlinked dependency store) can read `true` even though it\nis genuinely inside the workspace. Also always `true` when no\nworkspace roots are configured, consistent with\n`bridge::uri_in_workspace_roots`'s fail-closed convention: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range within the document."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "PositionSource": {
+          "description": "Where the queried position of a name-addressed call came from.",
+          "oneOf": [
+            {
+              "const": "selection_range",
+              "description": "The server's `selectionRange` start, verified to spell the name.",
+              "type": "string"
+            },
+            {
+              "const": "inferred",
+              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "ResolvedSymbol": {
+          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
+          "properties": {
+            "container": {
+              "description": "Enclosing symbol, when the server reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Numeric LSP `SymbolKind`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "The symbol's name as the server reports it.",
+              "type": "string"
+            },
+            "position": {
+              "$ref": "#/$defs/Position2D",
+              "description": "The 1-based position that was queried."
+            },
+            "position_source": {
+              "$ref": "#/$defs/PositionSource",
+              "description": "How `position` was determined."
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "position",
+            "position_source"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "locations": {
+          "description": "Locations found.",
+          "items": {
+            "$ref": "#/$defs/Location"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "resolved_symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedSymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only for a name-addressed call."
         },
         "truncated": {
           "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
@@ -2748,31 +3268,61 @@
   {
     "name": "go_to_type_definition",
     "title": "Go to Type Definition",
-    "description": "Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
-          "description": "Character/column number (1-based).",
+          "default": null,
+          "description": "Character/column number (1-based). Give with `line`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "file_path": {
           "description": "Absolute path to the file.",
           "type": "string"
         },
         "line": {
-          "description": "Line number (1-based).",
+          "default": null,
+          "description": "Line number (1-based). Give with `character`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "symbol_kind": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_name": {
+          "default": null,
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "file_path",
-        "line",
-        "character"
+        "file_path"
       ],
       "type": "object"
     },
@@ -2837,6 +3387,21 @@
             }
           ]
         },
+        "PositionSource": {
+          "description": "Where the queried position of a name-addressed call came from.",
+          "oneOf": [
+            {
+              "const": "selection_range",
+              "description": "The server's `selectionRange` start, verified to spell the name.",
+              "type": "string"
+            },
+            {
+              "const": "inferred",
+              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
+              "type": "string"
+            }
+          ]
+        },
         "Range": {
           "description": "Range in a document (1-based for MCP).",
           "properties": {
@@ -2852,6 +3417,43 @@
           "required": [
             "start",
             "end"
+          ],
+          "type": "object"
+        },
+        "ResolvedSymbol": {
+          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
+          "properties": {
+            "container": {
+              "description": "Enclosing symbol, when the server reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Numeric LSP `SymbolKind`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "The symbol's name as the server reports it.",
+              "type": "string"
+            },
+            "position": {
+              "$ref": "#/$defs/Position2D",
+              "description": "The 1-based position that was queried."
+            },
+            "position_source": {
+              "$ref": "#/$defs/PositionSource",
+              "description": "How `position` was determined."
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "position",
+            "position_source"
           ],
           "type": "object"
         }
@@ -2876,6 +3478,17 @@
           ],
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
         },
+        "resolved_symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedSymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only for a name-addressed call."
+        },
         "truncated": {
           "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
           "type": "boolean"
@@ -2896,31 +3509,61 @@
   {
     "name": "prepare_call_hierarchy",
     "title": "Prepare Call Hierarchy",
-    "description": "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
-          "description": "Character/column number (1-based).",
+          "default": null,
+          "description": "Character/column number (1-based). Give with `line`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "file_path": {
           "description": "Absolute path to the file.",
           "type": "string"
         },
         "line": {
-          "description": "Line number (1-based).",
+          "default": null,
+          "description": "Line number (1-based). Give with `character`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "symbol_kind": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_name": {
+          "default": null,
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "file_path",
-        "line",
-        "character"
+        "file_path"
       ],
       "type": "object"
     },
@@ -3012,6 +3655,21 @@
             }
           ]
         },
+        "PositionSource": {
+          "description": "Where the queried position of a name-addressed call came from.",
+          "oneOf": [
+            {
+              "const": "selection_range",
+              "description": "The server's `selectionRange` start, verified to spell the name.",
+              "type": "string"
+            },
+            {
+              "const": "inferred",
+              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
+              "type": "string"
+            }
+          ]
+        },
         "Range": {
           "description": "Range in a document (1-based for MCP).",
           "properties": {
@@ -3027,6 +3685,43 @@
           "required": [
             "start",
             "end"
+          ],
+          "type": "object"
+        },
+        "ResolvedSymbol": {
+          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
+          "properties": {
+            "container": {
+              "description": "Enclosing symbol, when the server reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Numeric LSP `SymbolKind`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "The symbol's name as the server reports it.",
+              "type": "string"
+            },
+            "position": {
+              "$ref": "#/$defs/Position2D",
+              "description": "The 1-based position that was queried."
+            },
+            "position_source": {
+              "$ref": "#/$defs/PositionSource",
+              "description": "How `position` was determined."
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "position",
+            "position_source"
           ],
           "type": "object"
         }
@@ -3051,6 +3746,17 @@
           ],
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
         },
+        "resolved_symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedSymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only for a name-addressed call."
+        },
         "truncated": {
           "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`, #516). Omitted (defaults to `false`) when\nserialized.",
           "type": "boolean"
@@ -3071,35 +3777,65 @@
   {
     "name": "rename_symbol",
     "title": "Rename Symbol",
-    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. An ambiguous name never produces an edit. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
-          "description": "Character/column number (1-based).",
+          "default": null,
+          "description": "Character/column number (1-based). Give with `line`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "container": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "file_path": {
           "description": "Absolute path to the file.",
           "type": "string"
         },
         "line": {
-          "description": "Line number (1-based).",
+          "default": null,
+          "description": "Line number (1-based). Give with `character`, instead of `symbol_name`.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "new_name": {
           "description": "New name for the symbol.",
           "type": "string"
+        },
+        "symbol_kind": {
+          "default": null,
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_name": {
+          "default": null,
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
         "file_path",
-        "line",
-        "character",
         "new_name"
       ],
       "type": "object"
@@ -3200,6 +3936,21 @@
             }
           ]
         },
+        "PositionSource": {
+          "description": "Where the queried position of a name-addressed call came from.",
+          "oneOf": [
+            {
+              "const": "selection_range",
+              "description": "The server's `selectionRange` start, verified to spell the name.",
+              "type": "string"
+            },
+            {
+              "const": "inferred",
+              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
+              "type": "string"
+            }
+          ]
+        },
         "Range": {
           "description": "Range in a document (1-based for MCP).",
           "properties": {
@@ -3215,6 +3966,43 @@
           "required": [
             "start",
             "end"
+          ],
+          "type": "object"
+        },
+        "ResolvedSymbol": {
+          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
+          "properties": {
+            "container": {
+              "description": "Enclosing symbol, when the server reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Numeric LSP `SymbolKind`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "The symbol's name as the server reports it.",
+              "type": "string"
+            },
+            "position": {
+              "$ref": "#/$defs/Position2D",
+              "description": "The 1-based position that was queried."
+            },
+            "position_source": {
+              "$ref": "#/$defs/PositionSource",
+              "description": "How `position` was determined."
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "position",
+            "position_source"
           ],
           "type": "object"
         },
@@ -3260,6 +4048,17 @@
             }
           ],
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "resolved_symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedSymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only for a name-addressed call."
         }
       },
       "required": [
@@ -3272,6 +4071,249 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": true
+    }
+  },
+  {
+    "name": "restart_server",
+    "title": "Restart Server",
+    "description": "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (e.g. after editing `Cargo.toml` or `package.json`). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered and the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "all": {
+          "default": false,
+          "description": "Set to true to restart every configured server.",
+          "type": "boolean"
+        },
+        "servers": {
+          "default": null,
+          "description": "Ids of the servers to restart; an unknown id is rejected with the list of configured ids. Non-empty.",
+          "items": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "IndexingState": {
+          "description": "Workspace-indexing readiness of a routed LSP server.\n\nTracked separately from the `initialize`/`initialized` handshake\ncompletion (`ServerState::is_ready`). A server can finish the handshake\nand still be mid-index for tens of seconds afterward, during which\nwhole-workspace queries (hover, definition, references, completions,\ncode actions) can silently return an empty/`null` result\nindistinguishable from a genuine \"nothing found\".\n\n`Unknown` and `Ready` are treated identically by\n`Translator::wait_for_indexing_ready` (proceed without waiting): a server\nthat never emits a recognized readiness signal must never be penalized\nwith an artificial delay, and the only way to tell \"no signal ever comes\"\napart from \"just hasn't reported yet\" would require guessing at a\nserver's protocol support, so both stay unblocked. Only `Loading` -- a\npositive signal that indexing is actively in progress -- triggers a\nbounded wait.",
+          "oneOf": [
+            {
+              "const": "unknown",
+              "description": "No recognized workspace-readiness signal has been observed for this\nserver yet.",
+              "type": "string"
+            },
+            {
+              "const": "loading",
+              "description": "A recognized signal reported that indexing is still in progress.",
+              "type": "string"
+            },
+            {
+              "const": "ready",
+              "description": "A recognized signal reported that the initial workspace load is\ncomplete.",
+              "type": "string"
+            }
+          ]
+        },
+        "RestartFailure": {
+          "description": "Why a restart failed after the old process was already stopped.\n\nThe server stays registered as dead; the next tool call retries the spawn\nunder the normal crash-loop backoff.",
+          "oneOf": [
+            {
+              "description": "The replacement process could not be started.",
+              "properties": {
+                "kind": {
+                  "const": "spawn_failed",
+                  "type": "string"
+                },
+                "message": {
+                  "description": "Why the spawn failed.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The replacement started but did not complete the `initialize` handshake.",
+              "properties": {
+                "kind": {
+                  "const": "initialize_failed",
+                  "type": "string"
+                },
+                "message": {
+                  "description": "Why initialization failed.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "mcpls is shutting down, so no replacement was started.",
+              "properties": {
+                "kind": {
+                  "const": "shutting_down",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "ServerId": {
+          "description": "Unique identity of a configured LSP server within a workspace.\n\nDerived from [`LspServerConfig::id`]: a server's explicit `name` if set,\notherwise its `language_id`. This is the key used throughout the bridge\nlayer (`Translator::lsp_clients`, `lsp_servers`, notification receivers)\ninstead of a raw language string, so two servers sharing a language no\nlonger silently overwrite each other.",
+          "type": "string"
+        },
+        "ServerRestartEntry": {
+          "description": "One server's entry in a [`RestartServerResult`].",
+          "oneOf": [
+            {
+              "description": "The server runs a freshly initialized process.",
+              "properties": {
+                "coalesced": {
+                  "description": "Another restart of the same server finished while this request\nwaited, so no second restart was performed.",
+                  "type": "boolean"
+                },
+                "indexing_state": {
+                  "$ref": "#/$defs/IndexingState",
+                  "description": "Indexing readiness of the new process."
+                },
+                "push_notifications_degraded": {
+                  "description": "Push diagnostics for this server are still not live. A restart\nclears this; it stays set if a crash respawn raced in afterwards\nand restarting again is needed.",
+                  "type": "boolean"
+                },
+                "status": {
+                  "const": "restarted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "coalesced",
+                "indexing_state",
+                "push_notifications_degraded"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The restart failed; see [`RestartFailure`].",
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/RestartFailure",
+                  "description": "Why it failed."
+                },
+                "status": {
+                  "const": "failed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The server was restarted too recently; retry after `retry_in_ms`.",
+              "properties": {
+                "retry_in_ms": {
+                  "description": "Milliseconds until a restart is allowed again.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "status": {
+                  "const": "throttled",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "retry_in_ms"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The server has not finished its initial startup; retry shortly.",
+              "properties": {
+                "status": {
+                  "const": "initializing",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The server never started (or failed at startup), so there is no\nprocess to restart. Fix the cause and restart mcpls.",
+              "properties": {
+                "message": {
+                  "description": "Why the server is not running.",
+                  "type": "string"
+                },
+                "status": {
+                  "const": "not_running",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "message"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "server_id": {
+              "$ref": "#/$defs/ServerId",
+              "description": "The server this entry reports on."
+            }
+          },
+          "required": [
+            "server_id"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "servers": {
+          "description": "Per-server outcomes.",
+          "items": {
+            "$ref": "#/$defs/ServerRestartEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "servers"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Restart Server",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false
     }
   },
   {

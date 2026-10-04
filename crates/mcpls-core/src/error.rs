@@ -212,6 +212,176 @@ impl fmt::Display for FailureList<'_> {
     }
 }
 
+/// Maximum candidates named in the `Display` text of an ambiguity error;
+/// the structured payload carries all of them.
+const MAX_DISPLAYED_CANDIDATES: usize = 10;
+
+/// One symbol a name resolved to, with enough context to tell it apart from
+/// its namesakes and to address it by position instead.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::SymbolCandidate;
+///
+/// let candidate = SymbolCandidate {
+///     name: "new".to_string(),
+///     kind: 6,
+///     kind_name: "Method".to_string(),
+///     container: Some("Config".to_string()),
+///     line: 12,
+///     character: 8,
+/// };
+/// assert_eq!(candidate.to_string(), "Method `new` in `Config` at 12:8");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SymbolCandidate {
+    /// The symbol's name as the server reports it.
+    pub name: String,
+    /// Numeric LSP `SymbolKind`.
+    pub kind: u32,
+    /// Readable name of [`Self::kind`].
+    pub kind_name: String,
+    /// Enclosing symbol, when the server reports one.
+    pub container: Option<String>,
+    /// 1-based line of the identifier.
+    pub line: u32,
+    /// 1-based character of the identifier.
+    pub character: u32,
+}
+
+impl fmt::Display for SymbolCandidate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} `{}`", self.kind_name, self.name)?;
+        if let Some(container) = &self.container {
+            write!(f, " in `{container}`")?;
+        }
+        write!(f, " at {}:{}", self.line, self.character)
+    }
+}
+
+/// Why a symbol name could not be resolved to exactly one position.
+///
+/// Carried as the structured `data` of the `INVALID_PARAMS` error, tagged by
+/// `resolution`.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::SymbolResolutionData;
+///
+/// let missing = SymbolResolutionData::NotDefinedInFile { name: "Config".to_string() };
+/// assert_eq!(
+///     serde_json::to_value(&missing).unwrap(),
+///     serde_json::json!({"resolution": "not_defined_in_file", "name": "Config"})
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "resolution", rename_all = "snake_case")]
+pub enum SymbolResolutionData {
+    /// The name matches several symbols; nothing was picked.
+    Ambiguous {
+        /// The requested name.
+        name: String,
+        /// The matching symbols, capped.
+        candidates: Vec<SymbolCandidate>,
+        /// More symbols match than `candidates` lists.
+        truncated: bool,
+    },
+    /// No symbol of that name (and kind/container) is defined in the file.
+    NotFound {
+        /// The requested name.
+        name: String,
+        /// Symbols of that name excluded by the kind or container filter.
+        excluded_by_filters: usize,
+    },
+    /// The name occurs in the file but no symbol defines it there (an import
+    /// or a plain reference).
+    NotDefinedInFile {
+        /// The requested name.
+        name: String,
+    },
+    /// A symbol matched but its identifier position could not be verified
+    /// against the document text, so no query was made.
+    PositionUnverified {
+        /// The requested name.
+        name: String,
+        /// The symbol that matched.
+        candidate: SymbolCandidate,
+    },
+}
+
+impl fmt::Display for SymbolResolutionData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ambiguous {
+                name,
+                candidates,
+                truncated,
+            } => {
+                write!(
+                    f,
+                    "symbol `{name}` is ambiguous ({} candidates{}): ",
+                    candidates.len(),
+                    if *truncated { ", more not listed" } else { "" }
+                )?;
+                for (index, candidate) in
+                    candidates.iter().take(MAX_DISPLAYED_CANDIDATES).enumerate()
+                {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    candidate.fmt(f)?;
+                }
+                if candidates.len() > MAX_DISPLAYED_CANDIDATES {
+                    f.write_str("; ...")?;
+                }
+                f.write_str(
+                    ". Narrow it with `symbol_kind` or `container`, or address it by line and character",
+                )
+            }
+            Self::NotFound {
+                name,
+                excluded_by_filters,
+            } => {
+                write!(f, "no symbol named `{name}` is defined in this file")?;
+                if *excluded_by_filters > 0 {
+                    write!(
+                        f,
+                        " ({excluded_by_filters} with that name excluded by `symbol_kind`/`container`)"
+                    )?;
+                }
+                f.write_str("; try `workspace_symbol_search` or address it by line and character")
+            }
+            Self::NotDefinedInFile { name } => write!(
+                f,
+                "`{name}` is not defined in this file (it only occurs as a reference or import); \
+                 find its definition with `workspace_symbol_search` or address it by line and character"
+            ),
+            Self::PositionUnverified { name, candidate } => write!(
+                f,
+                "could not verify where the identifier `{name}` is ({candidate}), so nothing was \
+                 queried; address it by line and character"
+            ),
+        }
+    }
+}
+
+/// `Display` adapter listing server ids, separated by `, `.
+struct IdList<'a>(&'a [ServerId]);
+
+impl fmt::Display for IdList<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, id) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "'{id}'")?;
+        }
+        Ok(())
+    }
+}
+
 /// What a failed server startup wrote to stderr, bounded and sanitized.
 ///
 /// Holds the first and last bytes of the output (or all of it when short), so
@@ -501,6 +671,35 @@ pub enum Error {
     ServerInitializing {
         /// Routing identity of the server that has not yet registered.
         server_id: ServerId,
+    },
+
+    /// The server was restarted on request while this call was in flight or
+    /// being routed; the request never reached the replacement.
+    #[error(
+        "LSP server '{server_id}' was restarted while this request was in flight; retry the request"
+    )]
+    ServerRestarted {
+        /// Routing identity of the restarted server.
+        server_id: ServerId,
+    },
+
+    /// A symbol name could not be resolved to exactly one position.
+    ///
+    /// Boxed to keep [`Error`] small.
+    #[error("{0}")]
+    SymbolResolution(Box<SymbolResolutionData>),
+
+    /// A restart request named servers that are not configured.
+    #[error(
+        "unknown LSP server(s) {}; configured servers: {}",
+        IdList(unknown),
+        IdList(configured)
+    )]
+    UnknownServers {
+        /// The requested ids that matched no configured server.
+        unknown: Vec<ServerId>,
+        /// Every configured server id.
+        configured: Vec<ServerId>,
     },
 
     /// A workspace-wide tool (one with no file to resolve a language from,
@@ -824,6 +1023,21 @@ pub const STATELESS_SUBSCRIPTION_ERROR_CODE: i32 = -32052;
 /// ```
 pub const LISTEN_STREAMS_EXHAUSTED_ERROR_CODE: i32 = -32053;
 
+/// Bespoke JSON-RPC code for [`Error::ServerRestarted`].
+///
+/// Same convention range as [`WORKSPACE_INDEXING_ERROR_CODE`], next unused
+/// slot after [`LISTEN_STREAMS_EXHAUSTED_ERROR_CODE`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::{LISTEN_STREAMS_EXHAUSTED_ERROR_CODE, SERVER_RESTARTED_ERROR_CODE};
+///
+/// assert_eq!(SERVER_RESTARTED_ERROR_CODE, -32054);
+/// assert_ne!(SERVER_RESTARTED_ERROR_CODE, LISTEN_STREAMS_EXHAUSTED_ERROR_CODE);
+/// ```
+pub const SERVER_RESTARTED_ERROR_CODE: i32 = -32054;
+
 /// Structured `data` payload of a retryable JSON-RPC error.
 ///
 /// Each variant pairs a bespoke error code ([`Self::code`]) with its own
@@ -870,6 +1084,11 @@ pub enum RetryableErrorData {
         /// Maximum number of concurrent listen streams.
         max_listen_streams: usize,
     },
+    /// The routed server was restarted while the request was in flight.
+    ServerRestarted {
+        /// Server that was restarted.
+        server_id: ServerId,
+    },
 }
 
 impl RetryableErrorData {
@@ -882,6 +1101,7 @@ impl RetryableErrorData {
                 SERVER_INITIALIZING_ERROR_CODE
             }
             Self::ListenStreamsExhausted { .. } => LISTEN_STREAMS_EXHAUSTED_ERROR_CODE,
+            Self::ServerRestarted { .. } => SERVER_RESTARTED_ERROR_CODE,
         }
     }
 }
@@ -913,6 +1133,9 @@ pub enum McpErrorKind {
     /// raw error was rewritten for display. Maps to `-32602` with the
     /// original error as `data`.
     InvalidPosition(RewrittenServerError),
+    /// Caller-fault: a symbol name did not resolve to exactly one position.
+    /// Maps to `-32602` with the structured resolution outcome as `data`.
+    SymbolResolution(SymbolResolutionData),
     /// A transient, retryable server-side condition, distinct from a crash.
     /// Maps to a bespoke JSON-RPC `code` with a structured `data` payload a
     /// caller can act on mechanically, rather than the generic
@@ -949,6 +1172,7 @@ impl Error {
     pub fn mcp_error_kind(&self) -> McpErrorKind {
         match self {
             Self::InvalidToolParams(_)
+            | Self::UnknownServers { .. }
             | Self::PathOutsideWorkspace(_)
             | Self::NotARegularFile(_)
             | Self::InvalidUri(_)
@@ -989,6 +1213,12 @@ impl Error {
             }),
             Self::ServerInitializing { server_id } => {
                 McpErrorKind::Retryable(RetryableErrorData::ServerInitializing {
+                    server_id: server_id.clone(),
+                })
+            }
+            Self::SymbolResolution(data) => McpErrorKind::SymbolResolution((**data).clone()),
+            Self::ServerRestarted { server_id } => {
+                McpErrorKind::Retryable(RetryableErrorData::ServerRestarted {
                     server_id: server_id.clone(),
                 })
             }
@@ -1058,6 +1288,34 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn test_ambiguity_display_lists_at_most_ten_candidates_and_the_hint() {
+        let candidates: Vec<SymbolCandidate> = (1..=12)
+            .map(|line| SymbolCandidate {
+                name: "new".to_string(),
+                kind: 6,
+                kind_name: "Method".to_string(),
+                container: Some("Foo".to_string()),
+                line,
+                character: 1,
+            })
+            .collect();
+        let text = SymbolResolutionData::Ambiguous {
+            name: "new".to_string(),
+            candidates,
+            truncated: false,
+        }
+        .to_string();
+
+        assert!(text.contains("12 candidates"), "{text}");
+        assert!(
+            text.contains("at 10:1") && !text.contains("at 11:1"),
+            "{text}"
+        );
+        assert!(text.contains("; ..."), "{text}");
+        assert!(text.contains("`symbol_kind` or `container`"), "{text}");
+    }
 
     #[test]
     fn test_error_display_lsp_init_failed() {

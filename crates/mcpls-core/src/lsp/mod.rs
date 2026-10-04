@@ -12,9 +12,9 @@ pub(crate) mod types;
 
 pub(crate) use client::{CONTENT_MODIFIED_RETRY_METHODS, MAX_ERROR_MESSAGE_CALLER_BYTES};
 pub use client::{LspClient, SHUTDOWN_TIMEOUT};
-pub(crate) use lifecycle::SUPPORTED_SYMBOL_KINDS;
 #[cfg(all(test, unix))]
 pub(crate) use lifecycle::fake_lsp_server_with_dead_loop_and_live_child;
+pub(crate) use lifecycle::{ExitGrace, SUPPORTED_SYMBOL_KINDS};
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
 #[cfg(test)]
 pub(crate) use lifecycle::{fake_lsp_server, fake_lsp_server_with_config};

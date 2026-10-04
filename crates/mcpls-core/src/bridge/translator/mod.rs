@@ -8,13 +8,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use tokio::sync::Mutex;
 
 use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
 use self::respawn::RespawnBackoff;
+use self::restart::RestartGeneration;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots, lock_std};
@@ -22,6 +24,7 @@ use crate::config::{ServerId, ToolKind, ToolRouter};
 use crate::error::{ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
+mod addressing;
 mod assist;
 mod call_hierarchy;
 #[cfg(test)]
@@ -33,6 +36,7 @@ mod edits;
 mod encoding_ctx;
 mod navigation;
 mod respawn;
+mod restart;
 mod routing;
 mod support;
 mod symbols;
@@ -40,11 +44,21 @@ mod symbols;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod testing;
 
+pub use addressing::{
+    AddressableTool, Addressed, MAX_SYMBOL_NAME_BYTES, PositionSource, ResolvedSymbol,
+    ResolvedTarget, SymbolName, SymbolNameError, SymbolQuery, SymbolTarget,
+};
 pub use dto::*;
+pub use restart::{
+    MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NotificationReceivers, NotificationWiring,
+    RestartFailure, RestartOutcome, RestartServerResult, RestartTarget, ServerIds, ServerIdsError,
+    ServerRestartEntry,
+};
 #[cfg(test)]
 pub use routing::Capability;
 pub use routing::validate_path_against_roots;
 pub use support::{RouteSupport, ToolSupportSnapshot};
+pub use symbols::parse_symbol_kind;
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 ///
@@ -118,22 +132,26 @@ pub struct Translator {
     /// it to invalidate a respawned server's stale cached diagnostics --
     /// see that method's docs for why that matters.
     notification_cache: Option<Arc<Mutex<NotificationCache>>>,
-    /// `AbortHandle` for the currently-running lifecycle-lane forwarding
-    /// task spawned by the most recent [`Self::respawn_if_dead`] call for
-    /// each server, keyed by routing identity. Under a fast crash loop, an
-    /// earlier respawn's forwarder can still be alive (or have a buffered
-    /// notification in flight) when a later respawn for the same `id`
-    /// resets the cache -- aborting the previous handle before installing a
-    /// new one bounds that stale write instead of letting it run
-    /// indefinitely. See [`Self::respawn_if_dead`].
-    ///
-    /// Scope: this only covers forwarder-vs-forwarder races across
-    /// consecutive respawns. The *original* `diagnostics_pump` task from a
-    /// server's initial spawn (`serve_with`'s scope, not `Translator`'s) has
-    /// the same theoretical backlog risk on the *first* respawn, but fixing
-    /// that is out of scope here -- same accepted trade-off already
-    /// documented at `NotificationCache::push_degraded`'s `#249` reference.
-    lifecycle_forwarders: Arc<StdMutex<HashMap<ServerId, tokio::task::AbortHandle>>>,
+    /// `AbortHandle` of the task currently consuming each server's
+    /// notification lanes: the initial diagnostics pump, or the consumer
+    /// started by the most recent respawn or restart. Aborting the previous
+    /// one before installing a new one bounds a stale write from an earlier
+    /// generation (see [`Self::respawn_locked`]).
+    notification_tasks: Arc<StdMutex<HashMap<ServerId, tokio::task::AbortHandle>>>,
+    /// How to re-start a diagnostics pump for a restarted server. Installed
+    /// once initialization has registered the initial pumps; until then a
+    /// manual restart reports the server as still initializing.
+    wiring: OnceLock<Arc<dyn NotificationWiring>>,
+    /// Count of manual restarts per server, to coalesce requests that queued
+    /// behind another restart of the same server.
+    restart_generations: Arc<StdMutex<HashMap<ServerId, RestartGeneration>>>,
+    /// When each server's last manual restart attempt started.
+    restart_attempts: Arc<StdMutex<HashMap<ServerId, std::time::Instant>>>,
+    /// Set once shutdown has begun; a restart then declines to start a server.
+    shutting_down: AtomicBool,
+    /// Set when the background init task panicked, so a restart that finds no
+    /// notification wiring knows none will ever be installed.
+    init_panicked: AtomicBool,
     /// Time source for respawn-backoff bookkeeping ([`respawn`](self::respawn)).
     /// Always [`SystemClock`] in production; overridden via
     /// [`Self::with_clock`] in tests so backoff-window tests can advance
@@ -175,7 +193,12 @@ impl Translator {
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
-            lifecycle_forwarders: Arc::new(StdMutex::new(HashMap::new())),
+            notification_tasks: Arc::new(StdMutex::new(HashMap::new())),
+            wiring: OnceLock::new(),
+            restart_generations: Arc::new(StdMutex::new(HashMap::new())),
+            restart_attempts: Arc::new(StdMutex::new(HashMap::new())),
+            shutting_down: AtomicBool::new(false),
+            init_panicked: AtomicBool::new(false),
             clock: Arc::new(SystemClock),
             indexing_ready_timeout: navigation::INDEXING_READY_TIMEOUT,
         }
@@ -287,6 +310,8 @@ impl Translator {
     /// pumps of registered servers died with the task, so those servers are
     /// marked push-degraded and their indexing state is reset.
     pub(crate) async fn settle_after_init_panic(&self, configs: &[ServerInitConfig]) {
+        self.init_panicked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let registered: HashSet<ServerId> = lock_std(&self.lsp_clients).keys().cloned().collect();
         {
             let mut failures = lock_std(&self.startup_failures);
@@ -513,6 +538,7 @@ impl Translator {
     /// points at the now-shut-down servers, so in-flight tool calls would
     /// resolve to a client whose server is gone.
     pub(crate) async fn shutdown_servers(&self) {
+        self.begin_shutdown();
         let servers: Vec<(ServerId, LspServer)> = lock_std(&self.lsp_servers).drain().collect();
         if servers.is_empty() {
             return;

@@ -10,7 +10,7 @@ tags:
   - parity
   - ux
 created: 2026-10-04
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/001-mcp-tool-surface-and-routing/spec|mcp-tool-surface-and-routing]]"
@@ -25,6 +25,36 @@ related:
 > **Type**: research (competitor parity gap)
 > **Priority**: P2 (two comparable bridges ship it; see parity rubric)
 > **Related issues**: #563
+
+> [!success] Implemented (MVP, #563)
+> - **Tools (FR-002):** `get_hover`, `get_definition`, `get_references`, `go_to_implementation`,
+>   `go_to_type_definition`, `prepare_call_hierarchy` and `rename_symbol`. `get_signature_help` is
+>   deferred: a definition identifier is not a call site.
+> - **Shape (FR-006):** optional name fields on each existing tool: `symbol_name`, `symbol_kind`
+>   (name or numeric, validated like `workspace_symbol_search`'s `kind_filter`) and `container`.
+>   Exactly one addressing form is representable after deserialization; both, neither, half a
+>   position, or qualifiers without a name are `-32602`.
+> - **Resolution (FR-001, FR-003, FR-004, FR-007):** against `textDocument/documentSymbol` (flat
+>   or hierarchical), exact name first, then the simple name with generic arguments, receivers and
+>   qualifiers (`Type::method`, `(*T).M`) normalized; kind and container narrow before ambiguity.
+>   Outcomes are typed `-32602` errors with `data.resolution`: `ambiguous` (all candidates, capped
+>   at 50, with positions), `not_found`, `not_defined_in_file` (the name occurs as a whole word
+>   in the document but nothing defines it there; no text-occurrence fallback binds to it) and
+>   `position_unverified`.
+> - **Position verification (NFR-002):** the identifier position must be verified against the
+>   tracked document text: `selectionRange.start` must spell the simple name as a whole word
+>   (Unicode-aware), otherwise the name must occur exactly once as a whole word inside the
+>   symbol's range (at most 500 lines), else `position_unverified`. The result's
+>   `resolved_symbol.position_source` says which (`selection_range` or `inferred`; FR-009).
+> - **Gating (FR-010, US-004):** the target tool's capability is checked before the
+>   document-symbol request; the final query uses the position form's own indexing gate and
+>   `positions_degraded`.
+> - **Deferred:** `go_to_declaration` (same shape as `get_definition`) takes a position only.
+> - **Matching:** a trailing parameter list (`bar(int)`, as jdtls names methods) and generic
+>   arguments are stripped; every symbol with the simple name is a candidate, narrowed by kind
+>   and container, so a free function never shadows a same-named method.
+> - **Not done:** nested name paths beyond `Type::method`, cross-file resolution, a name form in
+>   `get_tool_support` (FR-013 is met through `tools/list` descriptions and schemas).
 
 ## 1. Overview
 
@@ -249,7 +279,7 @@ returned by `get_document_symbols`, and `PositionDegradation` from `bridge/trans
 > [!question] Needs a decision before planning
 > - [NEEDS CLARIFICATION: scope of FR-007 for imported/referenced symbols: text-occurrence fallback (broader coverage, risk of binding to the wrong occurrence) vs. refuse and direct the agent to `workspace_symbol_search` or position addressing (safer, narrower).]
 > - [NEEDS CLARIFICATION: nested name paths (for example `Type/method`) vs. simple name + kind + container qualifier. Affects the candidate model and how far ambiguity can be narrowed without a second call.]
-> - [NEEDS CLARIFICATION: tool shape. Options: (a) optional name parameters on each existing tool with a closed either/or choice, (b) separate name-addressed tools, (c) a resolve-only tool returning a position the agent passes on. Pre-v1.0.0, so breaking changes are allowed, but the `tools/list` surface growth (21 tools today) and `get_tool_support` consistency matter.]
+> - [NEEDS CLARIFICATION: tool shape. Options: (a) optional name parameters on each existing tool with a closed either/or choice, (b) separate name-addressed tools, (c) a resolve-only tool returning a position the agent passes on. Pre-v1.0.0, so breaking changes are allowed, but the `tools/list` surface growth (23 tools after #563, #564, #567) and `get_tool_support` consistency matter.]
 > - [NEEDS CLARIFICATION: behavior when `positions_degraded` would be `Request` for the resolved query: refuse vs. flag (see section 6).]
 > - [NEEDS CLARIFICATION: should `workspace_symbol_search` results be directly usable as name-addressing input (cross-file resolution), or is the first release strictly per-file, as in the file-scoped name form used by comparable bridges?]
 > - [NEEDS CLARIFICATION: measurable evidence that agents actually miscount positions in mcpls sessions (error rate, retries). Not required for P2 parity classification, but would inform priority escalation.]

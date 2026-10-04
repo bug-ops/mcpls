@@ -166,3 +166,185 @@ pub(super) fn translator_with_capabilities_and_encoding(
 
     (translator, server)
 }
+
+/// Fake `sh` LSP server fixtures: a hand-written script has no equivalent on
+/// Windows, so everything below is unix-only.
+#[cfg(unix)]
+mod sh_servers {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use crate::config::LspServerConfig;
+    use crate::lsp::ServerInitConfig;
+    use crate::test_lsp::with_read_preamble;
+
+    /// Writes a `sh` script that answers the LSP `initialize` handshake
+    /// with a canned response -- request id `1`, since a freshly spawned
+    /// `LspClient`'s request counter always starts there -- and then
+    /// exits shortly after, so `LspServer::spawn` succeeds but the
+    /// process is already dead moments later. Stands in for "the server
+    /// was alive, then crashed" without needing a real language server
+    /// binary.
+    ///
+    /// The brief sleep before exiting matters: `LspServer::spawn` sends
+    /// the `initialized` notification right after the `initialize`
+    /// response arrives, and without it the process can (racily) have
+    /// already exited by the time that notification is written to its
+    /// stdin, failing the spawn itself instead of the respawn this is
+    /// meant to seed.
+    pub(in crate::bridge::translator) fn write_crash_after_init_script(dir: &Path) -> PathBuf {
+        let script_path = dir.join("crash_after_init.sh");
+        let body = with_read_preamble(
+            r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+    printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+    sleep 0.3
+    "#,
+        );
+        fs::write(&script_path, body).unwrap();
+        script_path
+    }
+
+    /// Like [`write_crash_after_init_script`], but stays alive for
+    /// `sleep_secs` after responding instead of exiting immediately.
+    pub(in crate::bridge::translator) fn write_responder_script(
+        dir: &Path,
+        sleep_secs: u64,
+    ) -> PathBuf {
+        let script_path = dir.join("responder.sh");
+        let template = with_read_preamble(
+            r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+    printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+    sleep __SLEEP__
+    "#,
+        );
+        fs::write(
+            &script_path,
+            template.replace("__SLEEP__", &sleep_secs.to_string()),
+        )
+        .unwrap();
+        script_path
+    }
+
+    pub(in crate::bridge::translator) fn stub_server_config(
+        id: &str,
+        script: &Path,
+    ) -> ServerInitConfig {
+        ServerInitConfig {
+            server_config: LspServerConfig {
+                language_id: id.to_string(),
+                command: "sh".to_string(),
+                args: vec![script.to_string_lossy().to_string()],
+                env: HashMap::new(),
+                file_patterns: vec![],
+                initialization_options: None,
+                // Generous relative to the sub-second fake scripts these
+                // tests spawn, to absorb CI scheduling jitter under
+                // concurrent nextest load (a bare `sh` invocation has no
+                // real work to do, so this never lengthens the happy path).
+                timeout_seconds: 20,
+                request_timeout_seconds: 20,
+                heuristics: None,
+                name: Some(id.to_string()),
+                handles: None,
+                indexing: crate::bridge::IndexingPolicy::Auto,
+            },
+            workspace_roots: vec![],
+            initialization_options: None,
+            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            notification_tx: None,
+        }
+    }
+
+    pub(in crate::bridge::translator) fn pid_is_running(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    const PROTOCOL_SERVER_BODY: &str = r#"LOG='__LOG__'
+echo "started $$" >> "$LOG"
+reply() { printf 'Content-Length: %d\r\n\r\n%s' ${#1} "$1"; }
+read_msg() {
+  content_length=0
+  while IFS= read -r header; do
+    header=$(printf '%s' "$header" | tr -d '\r')
+    [ -z "$header" ] && break
+    case "$header" in
+      Content-Length:*) content_length=$(printf '%s' "$header" | sed 's/^Content-Length: *//') ;;
+    esac
+  done
+  msg=$(dd bs=1 count="$content_length" 2>/dev/null)
+}
+reply '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+__PUBLISH__
+while true; do
+  read_msg
+  [ -z "$msg" ] && exit 0
+  echo "$msg" >> "$LOG"
+  case "$msg" in
+    *'"method":"shutdown"'*)
+      id=$(printf '%s' "$msg" | sed 's/.*"id":\([0-9]*\).*/\1/')
+      reply "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}"
+      ;;
+    *'"method":"exit"'*) sleep __EXIT_DELAY__; echo exiting >> "$LOG"; exit 0 ;;
+  esac
+done
+"#;
+
+    /// A server that completes `initialize` and then answers the LSP
+    /// `shutdown` request, exiting on `exit`. It appends `started <pid>` and
+    /// every message it receives to `log`, and publishes one diagnostic for
+    /// `publish_uri` straight after `initialize` when given. Any other request
+    /// is left unanswered.
+    pub(in crate::bridge::translator) fn write_protocol_server_script(
+        dir: &Path,
+        log: &Path,
+        publish_uri: Option<&str>,
+    ) -> PathBuf {
+        write_protocol_script(dir, log, publish_uri, 0)
+    }
+
+    /// As [`write_protocol_server_script`], but waits `exit_delay_secs` after
+    /// the `exit` notification before logging `exiting` and exiting: a healthy
+    /// server that is slow to stop.
+    pub(in crate::bridge::translator) fn write_slow_exit_server_script(
+        dir: &Path,
+        log: &Path,
+        exit_delay_secs: u32,
+    ) -> PathBuf {
+        write_protocol_script(dir, log, None, exit_delay_secs)
+    }
+
+    fn write_protocol_script(
+        dir: &Path,
+        log: &Path,
+        publish_uri: Option<&str>,
+        exit_delay_secs: u32,
+    ) -> PathBuf {
+        let publish = publish_uri.map_or_else(String::new, |uri| {
+            format!(
+                r#"reply '{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"{uri}","diagnostics":[{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}},"message":"boom"}}]}}}}'"#
+            )
+        });
+        let script_path = dir.join("protocol_server.sh");
+        let body = with_read_preamble(
+            &PROTOCOL_SERVER_BODY
+                .replace("__LOG__", &log.display().to_string())
+                .replace("__PUBLISH__", &publish)
+                .replace("__EXIT_DELAY__", &exit_delay_secs.to_string()),
+        );
+        fs::write(&script_path, body).unwrap();
+        script_path
+    }
+}
+
+#[cfg(unix)]
+pub(super) use sh_servers::{
+    pid_is_running, stub_server_config, write_crash_after_init_script,
+    write_protocol_server_script, write_responder_script, write_slow_exit_server_script,
+};
