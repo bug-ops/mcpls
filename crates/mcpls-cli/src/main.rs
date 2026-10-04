@@ -119,10 +119,10 @@ async fn run(args: Args) -> Result<()> {
         #[cfg(feature = "transport-http")]
         {
             match args.listen {
-                Some(bind) => mcpls_core::Transport::Http(mcpls_core::HttpConfig::new(
-                    bind,
-                    args.http_path.clone(),
-                )),
+                Some(bind) => mcpls_core::Transport::Http(
+                    mcpls_core::HttpConfig::new(bind, args.http_path.clone())
+                        .with_stream_liveness(args.http_stream_liveness.into()),
+                ),
                 None => mcpls_core::Transport::Stdio,
             }
         }

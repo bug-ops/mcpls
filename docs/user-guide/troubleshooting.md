@@ -595,6 +595,15 @@ args = []
 file_patterns = ["**/*.go"]
 ```
 
+### "Server is still initializing" / "Server failed to start" from cached diagnostics
+
+**Cause**: `get_cached_diagnostics` and the diagnostics resource no longer return an empty list while the file's language server is starting or after it failed to start; they return an error instead, so an empty list always means "no diagnostics".
+
+**Fix**:
+- `ServerInitializing` (code `-32051`, retryable): the server is still starting (large projects can take minutes); retry after a short wait
+- `ServerFailedToStart`: the message names the command and the reason; install the server or fix its `command`/`args` in the config, then restart mcpls
+- `resources/subscribe` on such a file fails the same way, except during startup, where it succeeds and you receive one `resources/updated` if startup then fails; re-read the resource to get the error
+
 ### "Position out of bounds"
 
 **Cause**: Line/character position exceeds file content

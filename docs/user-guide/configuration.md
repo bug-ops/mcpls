@@ -689,6 +689,26 @@ export MCPLS_HTTP_PATH=/api/mcp
 mcpls
 ```
 
+### `MCPLS_HTTP_STREAM_LIVENESS` (transport-http feature)
+
+Liveness probing of each session's HTTP GET (SSE) stream: `probe` or `off`.
+Only meaningful when `MCPLS_LISTEN` is set.
+
+With `probe`, mcpls sends an MCP `ping` request on the GET stream every 60 s and
+closes the stream when the client does not answer (by POSTing the JSON-RPC
+response) within 30 s. This frees the stream of a vanished peer and works behind
+a reverse proxy, complementing the kernel-level `TCP_USER_TIMEOUT` mcpls sets on
+accepted sockets on Linux and Android. A client that ignores server `ping` requests would be
+disconnected every 90 s; use `off` for it. The probe interval and deadline are
+configurable only when embedding `mcpls-core` (`StreamLiveness`).
+
+**Default**: `probe`
+
+```bash
+export MCPLS_HTTP_STREAM_LIVENESS=off
+mcpls
+```
+
 ## Complete Examples
 
 ### Rust Project (Zero Config)
@@ -900,6 +920,7 @@ mcpls --log-json
 # HTTP transport (requires transport-http feature)
 mcpls --listen 127.0.0.1:3000
 mcpls --listen 127.0.0.1:3000 --http-path /api/mcp
+mcpls --listen 127.0.0.1:3000 --http-stream-liveness off
 
 # Show version
 mcpls --version

@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::Translator;
+use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
 use crate::bridge::{InFlightGuard, WorkspaceRoots, lexically_normalize, lock_std};
 use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
@@ -494,6 +495,66 @@ pub(super) fn lookup_route<T>(
     RouteLookup::Unrouted
 }
 
+/// Where a file's diagnostics-route server stands, as seen by the cache-only
+/// diagnostics readers.
+///
+/// Resolved by [`Translator::diagnostics_route_for_path`] with the same rules
+/// as [`Translator::client_for_file`], so reading cached diagnostics cannot
+/// disagree with the pull tool about whether a server exists.
+#[derive(Debug)]
+pub enum DiagnosticsRoute {
+    /// The routed server is registered.
+    Live(ServerId),
+    /// The routed server is expected but has not registered yet.
+    Initializing(ServerId),
+    /// The server that would have served the file failed to start.
+    FailedToStart(Box<ServerSpawnFailure>),
+    /// No server is configured for the file's language.
+    Unrouted,
+}
+
+impl DiagnosticsRoute {
+    /// The routed server's id while it is registered or still starting.
+    pub(crate) const fn server_id(&self) -> Option<&ServerId> {
+        match self {
+            Self::Live(id) | Self::Initializing(id) => Some(id),
+            Self::FailedToStart(_) | Self::Unrouted => None,
+        }
+    }
+
+    /// Whether the server failed to start.
+    pub(crate) const fn is_failed(&self) -> bool {
+        matches!(self, Self::FailedToStart(_))
+    }
+
+    /// The startup failure, if the server failed to start.
+    ///
+    /// For subscription paths, where a still-starting server is fine (updates
+    /// will follow) but a failed one never publishes anything.
+    pub(crate) fn into_startup_failure(self) -> Option<Box<ServerSpawnFailure>> {
+        match self {
+            Self::FailedToStart(failure) => Some(failure),
+            Self::Live(_) | Self::Initializing(_) | Self::Unrouted => None,
+        }
+    }
+
+    /// Gates a cache read on the route: the live server's id, or `None` when
+    /// no server is configured (an empty cache is then the honest answer).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ServerInitializing`] while the server is still starting,
+    /// [`Error::ServerFailedToStart`] once it failed to start.
+    pub(crate) fn into_read_result(self) -> Result<Option<ServerId>> {
+        match self {
+            Self::Live(id) => Ok(Some(id)),
+            Self::Unrouted => Ok(None),
+            Self::Initializing(server_id) => Err(Error::ServerInitializing { server_id }),
+            Self::FailedToStart(failure) => Err(Error::ServerFailedToStart(failure)),
+        }
+    }
+}
+
 /// Outcome of resolving a workspace-wide tool route; see [`RouteLookup`].
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum WorkspaceRouteLookup {
@@ -675,45 +736,58 @@ impl Translator {
         })
     }
 
-    /// Resolve the routing identity of the diagnostics-route server for
-    /// `path`'s detected language, without requiring that server to be
-    /// currently registered.
+    /// Classify the diagnostics-route server for `path`'s detected language.
     ///
-    /// Mirrors [`Self::client_for_file`]'s language-candidate order but only
-    /// queries the router: a cache-only caller (`get_cached_diagnostics`) has no LSP
-    /// round trip to gate a resolved server's registration on, and only
-    /// needs the id to check [`crate::bridge::NotificationCache::is_push_degraded`]
-    /// (#359) -- the id itself is stable across a respawn (the routing
-    /// identity doesn't change, only the registered client behind it does),
-    /// unlike `NotificationCache::diagnostics_owner`, which a respawn clears
-    /// along with the crashed server's stale entries.
+    /// Mirrors [`Self::client_for_file`]'s language-candidate order and
+    /// registered/expected/failed classification, so a cache-only caller
+    /// (`get_cached_diagnostics`, the diagnostics resource) can tell an empty
+    /// cache from a server that is still starting or never started.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::ServerFailedToStart`] when no live route exists and
-    /// the server the configured routing would have used failed to start, so
-    /// a cache-only read reports the failure instead of an empty list. A
-    /// surviving catch-all route wins, as in [`Self::client_for_file`].
-    // TODO(#544): `resources/subscribe` still succeeds for a language whose
-    // server failed to start.
-    // TODO(#545): cached reads during initialization return an empty list, not
-    // `ServerInitializing`.
-    pub(crate) fn diagnostics_route_for_path(&self, path: &Path) -> Result<Option<ServerId>> {
+    /// The id of a [`DiagnosticsRoute::Live`] route is stable across a
+    /// respawn (only the registered client behind it changes), unlike
+    /// `NotificationCache::diagnostics_owner`, which a respawn clears -- so it
+    /// is what the push-degraded flag (#359) is keyed on.
+    #[must_use]
+    pub(crate) fn diagnostics_route_for_path(&self, path: &Path) -> DiagnosticsRoute {
         let candidates = self.language_candidates(path);
-
-        let live = {
-            let router = lock_std(&self.router);
-            candidates
-                .iter()
-                .find_map(|lang| router.resolve(lang, ToolKind::Diagnostics).cloned())
-        };
-        if live.is_some() {
-            return Ok(live);
+        let lookup = lookup_route(
+            &candidates,
+            |lang| {
+                lock_std(&self.router)
+                    .resolve(lang, ToolKind::Diagnostics)
+                    .cloned()
+            },
+            |id| lock_std(&self.lsp_clients).contains_key(id).then_some(()),
+            |id| lock_std(&self.expected_servers).contains(id),
+        );
+        match lookup {
+            RouteLookup::Registered(id, ()) => DiagnosticsRoute::Live(id),
+            RouteLookup::Initializing(id) => DiagnosticsRoute::Initializing(id),
+            RouteLookup::Dangling { server_id, .. } => {
+                tracing::error!(
+                    "router diagnostics route names server '{server_id}' that is neither \
+                     registered nor expected"
+                );
+                DiagnosticsRoute::Unrouted
+            }
+            RouteLookup::Unrouted => self
+                .startup_failure_for_candidates(&candidates, ToolKind::Diagnostics)
+                .map_or(DiagnosticsRoute::Unrouted, |failure| {
+                    DiagnosticsRoute::FailedToStart(Box::new(failure))
+                }),
         }
-        self.startup_failure_for_candidates(&candidates, ToolKind::Diagnostics)
-            .map_or(Ok(None), |failure| {
-                Err(Error::ServerFailedToStart(Box::new(failure)))
-            })
+    }
+
+    /// As [`Self::diagnostics_route_for_path`], for a canonical diagnostics
+    /// resource URI; a URI that does not parse is [`DiagnosticsRoute::Unrouted`].
+    #[must_use]
+    pub(crate) fn diagnostics_route_for_uri(
+        &self,
+        uri: &DiagnosticsResourceUri,
+    ) -> DiagnosticsRoute {
+        parse_uri(uri.as_str()).map_or(DiagnosticsRoute::Unrouted, |path| {
+            self.diagnostics_route_for_path(&path)
+        })
     }
 
     /// Validate `file_path`, then resolve its routed client via
@@ -1649,81 +1723,133 @@ mod tests {
         assert_eq!(client.language_id(), "typescriptreact");
     }
 
-    /// #359: `diagnostics_route_for_path` must resolve the same id
-    /// `is_diagnostics_route`/the router would, without requiring a
-    /// registered client -- `get_cached_diagnostics` relies on this to look
-    /// up `NotificationCache::is_push_degraded` even when the file's server
-    /// is currently down (mid-respawn or crash-looping).
+    /// #359: a registered server's route id stays resolvable (it is what the
+    /// push-degraded flag is keyed on) across a respawn, which swaps the
+    /// client behind the id without unregistering it.
     #[test]
-    fn test_diagnostics_route_for_path_resolves_without_registered_client() {
-        let temp_dir = TempDir::new().unwrap();
-        let test_file = temp_dir.path().join("main.rs");
-        fs::write(&test_file, "fn main() {}").unwrap();
-
-        let mut extension_map = HashMap::new();
-        extension_map.insert("rs".to_string(), "rust".to_string());
-        let id = ServerId::from("rust");
-
-        let translator = Translator::new()
-            .with_extensions(extension_map)
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
-        // Deliberately no `register_client`/`register_server`: this must not
-        // require a live registration, unlike `client_for_file`.
-
-        assert_eq!(
-            translator.diagnostics_route_for_path(&test_file).unwrap(),
-            Some(id)
-        );
-    }
-
-    /// #535: with no live route and a recorded startup failure, the
-    /// diagnostics route is an error naming the failed server, not `None`.
-    #[test]
-    fn test_diagnostics_route_for_path_reports_startup_failure() {
+    fn test_diagnostics_route_for_path_live_when_registered() {
         let id = ServerId::from("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
-        translator.record_startup_failures(&[not_found_failure(&id, "rust", "sh")]);
-        translator.rebind_router(&HashSet::new());
-        translator.clear_expected_servers();
+        translator.register_client(
+            id.clone(),
+            LspClient::new(crate::config::LspServerConfig::rust_analyzer()),
+        );
 
-        let err = translator
-            .diagnostics_route_for_path(Path::new("/ws/main.rs"))
-            .unwrap_err();
+        let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
 
         assert!(
-            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
-            "got {err:?}"
+            matches!(&route, DiagnosticsRoute::Live(live) if *live == id),
+            "{route:?}"
+        );
+        assert_eq!(route.server_id(), Some(&id));
+        assert_eq!(route.into_read_result().unwrap(), Some(id));
+    }
+
+    /// A routed server that is expected but not yet registered reads as
+    /// retryable "still starting", not as an empty cache.
+    #[test]
+    fn test_diagnostics_route_for_path_initializing_while_expected() {
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.set_expected_servers(HashSet::from([id.clone()]));
+
+        let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
+
+        assert!(
+            matches!(&route, DiagnosticsRoute::Initializing(i) if *i == id),
+            "{route:?}"
+        );
+        assert_eq!(route.server_id(), Some(&id));
+        let err = route.into_read_result().unwrap_err();
+        assert!(
+            matches!(&err, Error::ServerInitializing { server_id } if *server_id == id),
+            "{err:?}"
         );
     }
 
-    /// A surviving catch-all still serves diagnostics, so a failed explicit
-    /// server never masks it.
+    /// #535: a server that failed to start is reported, not read as empty.
     #[test]
-    fn test_diagnostics_route_for_path_prefers_live_catch_all_over_failure() {
+    fn test_diagnostics_route_for_path_failed_to_start() {
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.record_startup_failures(&[not_found_failure(&id, "rust", "rust-analyzer")]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
+
+        assert!(route.is_failed(), "{route:?}");
+        assert_eq!(route.server_id(), None);
+        let err = route.into_read_result().unwrap_err();
+        assert!(
+            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
+            "{err:?}"
+        );
+    }
+
+    /// A language with no configured route is unrouted, and the failure of an
+    /// unrelated language's server does not leak into it.
+    #[test]
+    fn test_diagnostics_route_for_path_unrouted_reads_empty() {
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.record_startup_failures(&[not_found_failure(&id, "rust", "rust-analyzer")]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        let route = translator.diagnostics_route_for_path(Path::new("/ws/script.py"));
+
+        assert!(matches!(route, DiagnosticsRoute::Unrouted), "{route:?}");
+        assert_eq!(route.into_read_result().unwrap(), None);
+    }
+
+    /// A router entry naming a server that is neither registered nor expected
+    /// is logged and treated as unrouted.
+    #[test]
+    fn test_diagnostics_route_for_path_dangling_is_unrouted() {
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(id, "rust".to_string())]));
+
+        let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
+
+        assert!(matches!(route, DiagnosticsRoute::Unrouted), "{route:?}");
+    }
+
+    /// A live catch-all the router was rebound to beats a failed explicit
+    /// server, as for `client_for_file`.
+    #[tokio::test]
+    async fn test_diagnostics_route_for_path_live_catch_all_wins_over_failed_explicit_server() {
         let configs = [
-            router_config("rust", "explicit", Some(vec![ToolKind::Diagnostics])),
+            router_config("rust", "diag-only", Some(vec![ToolKind::Diagnostics])),
             router_config("rust", "catch-all", None),
         ];
         let router = ToolRouter::from_configs(configs.iter()).unwrap();
+        let failed_id = ServerId::from("diag-only");
         let live_id = ServerId::from("catch-all");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(router);
-        translator.record_startup_failures(&[not_found_failure(
-            &ServerId::from("explicit"),
-            "rust",
-            "sh",
-        )]);
+        let (client, _server) = fake_lsp_client();
+        translator.register_client(live_id.clone(), client);
+        translator.record_startup_failures(&[not_found_failure(&failed_id, "rust", "sh")]);
         translator.rebind_router(&HashSet::from([live_id.clone()]));
         translator.clear_expected_servers();
 
-        assert_eq!(
-            translator
-                .diagnostics_route_for_path(Path::new("/ws/main.rs"))
-                .unwrap(),
-            Some(live_id)
+        let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
+
+        assert!(
+            matches!(&route, DiagnosticsRoute::Live(id) if *id == live_id),
+            "{route:?}"
         );
     }
 
@@ -1745,13 +1871,11 @@ mod tests {
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
 
-        let err = translator
-            .diagnostics_route_for_path(Path::new("/ws/app.tsx"))
-            .unwrap_err();
+        let route = translator.diagnostics_route_for_path(Path::new("/ws/app.tsx"));
 
         assert!(
-            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
-            "got {err:?}"
+            matches!(&route, DiagnosticsRoute::FailedToStart(f) if f.server_id == id),
+            "{route:?}"
         );
     }
 
@@ -1773,12 +1897,9 @@ mod tests {
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
 
-        assert_eq!(
-            translator
-                .diagnostics_route_for_path(Path::new("/ws/main.rs"))
-                .unwrap(),
-            None
-        );
+        let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
+
+        assert!(matches!(route, DiagnosticsRoute::Unrouted), "{route:?}");
     }
 
     /// The live pull path (`get_diagnostics`) also reports the failure.
@@ -1835,22 +1956,6 @@ mod tests {
             alias,
             roots,
         }
-    }
-
-    /// A file whose language has no configured route resolves to `None`
-    /// rather than panicking or falling back to some default server.
-    #[test]
-    fn test_diagnostics_route_for_path_returns_none_for_unrouted_language() {
-        let temp_dir = TempDir::new().unwrap();
-        let test_file = temp_dir.path().join("unknown.xyz");
-        fs::write(&test_file, "content").unwrap();
-
-        let translator = Translator::new();
-
-        assert_eq!(
-            translator.diagnostics_route_for_path(&test_file).unwrap(),
-            None
-        );
     }
 
     #[test]

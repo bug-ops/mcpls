@@ -4,6 +4,7 @@
 //! binary and communicating with it as a real MCP client would.
 
 use anyhow::Result;
+use mcpls_core::error::SERVER_INITIALIZING_ERROR_CODE;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -816,6 +817,72 @@ fn test_e2e_tool_call_returns_structured_content_matching_output_schema() -> Res
         .ok_or_else(|| anyhow::anyhow!("no content[0].text: {result}"))?;
     let from_text: serde_json::Value = serde_json::from_str(text)?;
     assert_eq!(from_text, result["structuredContent"]);
+
+    Ok(())
+}
+
+/// #535/#544/#545: with a language server binary that does not exist, the
+/// cached-diagnostics tool and `resources/subscribe` report the startup failure
+/// (naming the command) once initialization settles, instead of an empty list
+/// or a silently accepted subscription.
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_missing_server_binary_is_reported_by_cached_diagnostics_and_subscribe() -> Result<()> {
+    const MISSING_COMMAND: &str = "mcpls-e2e-no-such-language-server";
+
+    let workspace = TempDir::new()?;
+    let root = workspace.path().canonicalize()?;
+    let file = root.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n")?;
+
+    let config_dir = TempDir::new()?;
+    let config_path = config_dir.path().join("mcpls.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+            [workspace]
+            roots = ["{}"]
+
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "{MISSING_COMMAND}"
+            args = []
+            file_patterns = ["**/*.rs"]
+            "#,
+            root.to_string_lossy().replace('\\', "\\\\")
+        ),
+    )?;
+    let mut client = McpClient::spawn_with_args(&[
+        "--config",
+        config_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?,
+    ])?;
+    client.initialize()?;
+
+    let describe = |response: Result<serde_json::Value>| match response {
+        Ok(value) => value.to_string(),
+        Err(e) => e.to_string(),
+    };
+    let args = json!({ "file_path": file.to_string_lossy() });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let settled = loop {
+        let text = describe(client.call_tool("get_cached_diagnostics", &args));
+        if !text.contains(&SERVER_INITIALIZING_ERROR_CODE.to_string()) {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "initialization never settled: {text}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(settled.contains(MISSING_COMMAND), "{settled}");
+
+    let uri = format!("lsp-diagnostics://{}", file.to_string_lossy());
+    let subscribed = describe(client.subscribe_resource(&uri));
+    assert!(subscribed.contains(MISSING_COMMAND), "{subscribed}");
 
     Ok(())
 }

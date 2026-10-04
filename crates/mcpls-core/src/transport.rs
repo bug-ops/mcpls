@@ -123,6 +123,10 @@ pub struct HttpConfig {
     /// the underlying semaphore supports are clamped by
     /// [`ConnectionLimit::new`].
     pub max_concurrent_connections: ConnectionLimit,
+    /// Liveness probing of each session's standalone GET (SSE) stream.
+    ///
+    /// Defaults to [`StreamLiveness::DEFAULT`].
+    pub stream_liveness: StreamLiveness,
 }
 
 #[cfg(feature = "transport-http")]
@@ -152,6 +156,7 @@ impl HttpConfig {
             session_idle_timeout: IdleTimeout::DEFAULT,
             header_read_timeout: HeaderReadTimeout::DEFAULT,
             max_concurrent_connections: ConnectionLimit::DEFAULT,
+            stream_liveness: StreamLiveness::DEFAULT,
         }
     }
 
@@ -181,6 +186,142 @@ impl HttpConfig {
     pub const fn with_max_concurrent_connections(mut self, max: ConnectionLimit) -> Self {
         self.max_concurrent_connections = max;
         self
+    }
+
+    /// Override how standalone GET streams are probed for liveness.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::{HttpConfig, StreamLiveness};
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp")
+    ///     .with_stream_liveness(StreamLiveness::Disabled);
+    /// assert_eq!(cfg.stream_liveness, StreamLiveness::Disabled);
+    /// ```
+    #[must_use]
+    pub const fn with_stream_liveness(mut self, liveness: StreamLiveness) -> Self {
+        self.stream_liveness = liveness;
+        self
+    }
+}
+
+#[cfg(feature = "transport-http")]
+macro_rules! non_zero_duration {
+    ($(#[$meta:meta])* $name:ident, $default_secs:expr, $default_doc:literal) => {
+        $(#[$meta])*
+        #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name(std::time::Duration);
+
+        impl $name {
+            #[doc = $default_doc]
+            pub const DEFAULT: Self = Self(std::time::Duration::from_secs($default_secs));
+
+            /// `None` for a zero duration.
+            #[must_use]
+            pub const fn new(duration: std::time::Duration) -> Option<Self> {
+                if duration.is_zero() {
+                    None
+                } else {
+                    Some(Self(duration))
+                }
+            }
+
+            /// The wrapped duration, never zero.
+            #[must_use]
+            pub const fn get(self) -> std::time::Duration {
+                self.0
+            }
+        }
+    };
+}
+
+#[cfg(feature = "transport-http")]
+non_zero_duration! {
+    /// Non-zero delay between liveness probes on a GET stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::ProbeInterval;
+    ///
+    /// assert!(ProbeInterval::new(Duration::ZERO).is_none());
+    /// let interval = ProbeInterval::new(Duration::from_secs(60)).unwrap();
+    /// assert_eq!(interval.get(), Duration::from_secs(60));
+    /// ```
+    ProbeInterval, 60, "60 seconds."
+}
+
+#[cfg(feature = "transport-http")]
+non_zero_duration! {
+    /// Non-zero time a client has to answer a liveness probe before its GET
+    /// stream is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::ProbeDeadline;
+    ///
+    /// assert!(ProbeDeadline::new(Duration::ZERO).is_none());
+    /// let deadline = ProbeDeadline::new(Duration::from_secs(30)).unwrap();
+    /// assert_eq!(deadline.get(), Duration::from_secs(30));
+    /// ```
+    ProbeDeadline, 30, "30 seconds."
+}
+
+/// How a session's standalone GET (SSE) stream is checked for a dead peer.
+///
+/// With [`StreamLiveness::Probe`], mcpls sends an MCP `ping` request on the
+/// stream every `interval`. A client that does not answer it (by sending the
+/// JSON-RPC response in a POST) within `deadline` has its stream closed and the
+/// resources behind it released. This is portable, needs no socket options,
+/// and also detects a peer that vanished behind a reverse proxy, which TCP
+/// keepalive cannot.
+///
+/// A client that ignores server `ping` requests is closed and reconnects
+/// every `interval + deadline`; use [`StreamLiveness::Disabled`] for such
+/// clients.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::StreamLiveness;
+///
+/// assert!(matches!(StreamLiveness::default(), StreamLiveness::Probe { .. }));
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamLiveness {
+    /// Never probe; a vanished peer is noticed only when the OS gives up on
+    /// the connection.
+    Disabled,
+    /// Probe every `interval`; close the stream when unanswered for
+    /// `deadline`.
+    Probe {
+        /// Delay between the end of one probe and the start of the next.
+        interval: ProbeInterval,
+        /// Time a client has to answer a probe.
+        deadline: ProbeDeadline,
+    },
+}
+
+#[cfg(feature = "transport-http")]
+impl StreamLiveness {
+    /// Probe every 60 seconds with a 30 second answer deadline.
+    pub const DEFAULT: Self = Self::Probe {
+        interval: ProbeInterval::DEFAULT,
+        deadline: ProbeDeadline::DEFAULT,
+    };
+}
+
+#[cfg(feature = "transport-http")]
+impl Default for StreamLiveness {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -278,6 +419,11 @@ use rmcp::transport::streamable_http_server::session::{
 
 #[cfg(feature = "transport-http")]
 use crate::bridge::lock_std;
+
+#[cfg(feature = "transport-http")]
+mod liveness;
+#[cfg(feature = "transport-http")]
+use liveness::{ProbeId, SessionLiveness, StreamProbe, is_common_channel_event_id};
 
 /// A registered handle for waiting on a shutdown signal: `SIGTERM`/`SIGINT`
 /// on Unix (as sent by containers, systemd, and `Ctrl-C`) or `Ctrl-C` on
@@ -489,7 +635,23 @@ pub(crate) async fn run_stdio(
 /// (`SessionConfig::DEFAULT_CHANNEL_CAPACITY`) and replays them when a GET
 /// opens, including when a dead primary GET is replaced, so a client may see
 /// duplicates. A second GET opened while the first is still considered alive
-/// receives no notifications until the first is detected dead.
+/// is a shadow stream that receives no notifications; once the first ends, a
+/// newly opened GET becomes the primary.
+///
+/// # Stream liveness
+///
+/// With [`StreamLiveness::Probe`] (the default), each session's standalone GET
+/// stream is probed with an MCP `ping` request every
+/// [`ProbeInterval::DEFAULT`] and closed when the client does not answer by
+/// sending the JSON-RPC response in a POST within [`ProbeDeadline::DEFAULT`]. The probe
+/// runs inside mcpls, so it needs no socket options and also catches a peer
+/// that vanished behind a reverse proxy. Probe replies are consumed and never
+/// forwarded to the MCP service. Closing ends only the GET stream, not the
+/// session; the client's reconnect (with `Last-Event-ID`) resumes it. A client
+/// that never answers server `ping` requests would be disconnected every
+/// interval plus deadline, so [`StreamLiveness::Disabled`] switches probing
+/// off. Request-wise resumes and stateless `subscriptions/listen` streams are
+/// not probed.
 ///
 /// A session is closed, freeing its `max_concurrent_sessions` permit, once it
 /// has had no inbound client activity and no open response stream (POST or
@@ -499,20 +661,24 @@ pub(crate) async fn run_stdio(
 /// starts at the later of the last inbound request and the moment the last
 /// stream closed. A client that closes its connections cleanly is noticed on
 /// the next write, at most one SSE keep-alive (15 s) later. A silently vanished
-/// peer (half-open TCP: sleeping laptop, dropped NAT mapping) keeps its stream,
-/// and with it the session, open until the OS gives up retransmitting
-/// (roughly 15-30 minutes on Linux) -- bounded, but not by the idle timeout.
-/// On Linux and Android every accepted socket gets `TCP_USER_TIMEOUT` of
-/// `HALF_OPEN_TIMEOUT` (60 s), so unacknowledged data (the 15 s SSE pings
-/// guarantee some) drops the connection about 75 s after the peer vanishes
-/// (#531). macOS and Windows keep the kernel default. Behind the recommended
-/// reverse proxy the accepted socket faces the proxy, so the proxy's own
-/// timeouts govern instead. A client that stops reading with a full receive
-/// window for longer than the timeout may be dropped too. A client with a GET
-/// stream open is never reaped by mcpls, but rmcp's own 5-minute `keep_alive`
-/// still ends a session that sees no event at all in that time (SSE pings do
-/// not count). Clients should send `DELETE` on shutdown; after an expiry they
-/// must re-initialize and re-subscribe.
+/// peer (half-open TCP: sleeping laptop, dropped NAT mapping) is detected by
+/// the liveness probe above: its stream closes within one probe interval plus
+/// deadline and the session then expires after the idle timeout. The probe
+/// works on every platform and behind a reverse proxy. As a kernel-level
+/// complement, on Linux and Android every accepted socket also gets
+/// `TCP_USER_TIMEOUT` of `HALF_OPEN_TIMEOUT` (60 s), so unacknowledged data
+/// (the 15 s SSE pings guarantee some) drops the connection about 75 s after
+/// the peer vanishes (#552). macOS and Windows keep the kernel default, and
+/// behind the recommended reverse proxy the accepted socket faces the proxy,
+/// so the proxy's own timeouts govern that hop. A client that stops reading
+/// with a full receive window for longer than the timeout may be dropped too.
+/// With probing disabled and no such timeout, a vanished peer holds its stream
+/// until the OS gives up retransmitting (roughly 15-30 minutes on Linux). A
+/// client that answers probes and keeps a GET stream open is never reaped by
+/// mcpls, but rmcp's own 5-minute `keep_alive` still ends a session that sees
+/// no event at all in that time (SSE pings do not count). Clients should send
+/// `DELETE` on shutdown; after an expiry they must re-initialize and
+/// re-subscribe.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
 /// "one instance per request"; `resources/subscribe`/`unsubscribe` detect
@@ -571,6 +737,8 @@ pub(crate) async fn run_http(
     cfg: HttpConfig,
     shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
+    // TODO(#551): stateless `subscriptions/listen` streams have no session to
+    // ack a liveness probe; they are bounded only by `MAX_LISTEN_STREAMS`
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
@@ -602,10 +770,10 @@ pub(crate) async fn serve_http(
     };
     use tokio_util::sync::CancellationToken;
 
-    let session_manager = Arc::new(CappedSessionManager::new(
-        cfg.max_concurrent_sessions,
-        cfg.session_idle_timeout,
-    ));
+    let session_manager = Arc::new(
+        CappedSessionManager::new(cfg.max_concurrent_sessions, cfg.session_idle_timeout)
+            .with_stream_liveness(cfg.stream_liveness),
+    );
     let reaper_manager = Arc::clone(&session_manager);
     let cancel = CancellationToken::new();
 
@@ -790,7 +958,6 @@ async fn serve_http1(
             },
         };
 
-        // TODO(#543): portable half-open detection via MCP ping
         #[cfg(any(target_os = "linux", target_os = "android"))]
         set_half_open_timeout(&stream);
 
@@ -1002,6 +1169,7 @@ struct CappedSessionManager {
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     slots: StdMutex<std::collections::HashMap<SessionId, SessionSlot>>,
     idle: IdleTimeout,
+    stream_liveness: StreamLiveness,
 }
 
 #[cfg(feature = "transport-http")]
@@ -1012,7 +1180,58 @@ impl CappedSessionManager {
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_sessions)),
             slots: StdMutex::new(std::collections::HashMap::new()),
             idle,
+            stream_liveness: StreamLiveness::Disabled,
         }
+    }
+
+    const fn with_stream_liveness(mut self, stream_liveness: StreamLiveness) -> Self {
+        self.stream_liveness = stream_liveness;
+        self
+    }
+
+    fn session_liveness(&self, id: &SessionId) -> Option<std::sync::Arc<SessionLiveness>> {
+        lock_std(&self.slots)
+            .get(id)
+            .map(|slot| std::sync::Arc::clone(&slot.liveness))
+    }
+
+    /// Wraps a standalone-channel `stream` in a probing forwarding task when
+    /// liveness probing is on; otherwise only guards it.
+    ///
+    /// Fails closed when probing is on but the session's slot is gone (the
+    /// reaper removed it ahead of closing the inner session), rather than
+    /// handing out an unprobed stream.
+    fn standalone<S>(
+        &self,
+        id: &SessionId,
+        guard: Option<StreamGuard>,
+        stream: S,
+    ) -> Result<
+        impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static + use<S>,
+        CappedSessionManagerError,
+    >
+    where
+        S: futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static,
+    {
+        use futures::StreamExt as _;
+
+        Ok(match self.stream_liveness {
+            StreamLiveness::Probe { interval, deadline } => {
+                let liveness = self
+                    .session_liveness(id)
+                    .ok_or_else(|| LocalSessionManagerError::SessionNotFound(id.clone()))?;
+                StreamProbe {
+                    liveness,
+                    interval,
+                    deadline,
+                    manager: std::sync::Arc::clone(&self.inner),
+                    session: id.clone(),
+                }
+                .forward(stream, guard)
+                .left_stream()
+            }
+            StreamLiveness::Disabled => Self::guarded(guard, stream).right_stream(),
+        })
     }
 
     fn activity(&self, id: &SessionId) -> Option<std::sync::Arc<SessionActivity>> {
@@ -1183,6 +1402,7 @@ impl Drop for StreamGuard {
 struct SessionSlot {
     _permit: tokio::sync::OwnedSemaphorePermit,
     activity: std::sync::Arc<SessionActivity>,
+    liveness: std::sync::Arc<SessionLiveness>,
 }
 
 /// Periodically closes the sessions of `manager` that are idle, until
@@ -1246,6 +1466,7 @@ impl SessionManager for CappedSessionManager {
             SessionSlot {
                 _permit: permit,
                 activity: SessionActivity::new(),
+                liveness: std::sync::Arc::default(),
             },
         );
         Ok((id, transport))
@@ -1292,6 +1513,12 @@ impl SessionManager for CappedSessionManager {
         message: ClientJsonRpcMessage,
     ) -> Result<(), Self::Error> {
         self.touch(id);
+        if let Some(probe) = ProbeId::answered_by(&message) {
+            if let Some(liveness) = self.session_liveness(id) {
+                liveness.acknowledge(probe);
+            }
+            return Ok(());
+        }
         Ok(self.inner.accept_message(id, message).await?)
     }
 
@@ -1302,7 +1529,7 @@ impl SessionManager for CappedSessionManager {
     {
         let guard = self.open_guard(id);
         let stream = self.inner.create_standalone_stream(id).await?;
-        Ok(Self::guarded(guard, stream))
+        self.standalone(id, guard, stream)
     }
 
     async fn resume(
@@ -1311,9 +1538,16 @@ impl SessionManager for CappedSessionManager {
         last_event_id: String,
     ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>
     {
+        use futures::StreamExt as _;
+
         let guard = self.open_guard(id);
+        let common = is_common_channel_event_id(&last_event_id);
         let stream = self.inner.resume(id, last_event_id).await?;
-        Ok(Self::guarded(guard, stream))
+        Ok(if common {
+            self.standalone(id, guard, stream)?.left_stream()
+        } else {
+            Self::guarded(guard, stream).right_stream()
+        })
     }
 }
 
@@ -1521,8 +1755,8 @@ mod tests {
 
         use super::super::{
             CappedSessionManager, CappedSessionManagerError, ConnectionLimit, HeaderReadTimeout,
-            HttpConfig, IdleTimeout, SessionActivity, SessionManager as _, Transport,
-            run_idle_reaper,
+            HttpConfig, IdleTimeout, ProbeDeadline, ProbeInterval, SessionActivity,
+            SessionManager as _, StreamLiveness, Transport, run_idle_reaper,
         };
         use crate::bridge::WorkspaceRoots;
         use crate::test_lsp::CapturedLogs;
@@ -2623,6 +2857,37 @@ mod tests {
                 .unwrap_or_else(|_| panic!("no message on the stream within 5 s"))
             }
 
+            /// Next liveness `ping` request on the stream.
+            async fn next_ping(&mut self) -> serde_json::Value {
+                loop {
+                    let message = self.next_message().await;
+                    if message["method"] == "ping" {
+                        return message;
+                    }
+                }
+            }
+
+            /// Whether the server ends the stream within `limit`.
+            async fn ends_within(&mut self, limit: std::time::Duration) -> bool {
+                use tokio::io::AsyncReadExt as _;
+
+                tokio::time::timeout(limit, async {
+                    loop {
+                        if self.buf.contains("0\r\n\r\n") {
+                            return;
+                        }
+                        let mut chunk = [0u8; 4096];
+                        let n = self.stream.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        self.buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    }
+                })
+                .await
+                .is_ok()
+            }
+
             /// Next `notifications/resources/updated` message.
             async fn next_resource_update_message(&mut self) -> serde_json::Value {
                 loop {
@@ -2909,6 +3174,299 @@ mod tests {
             let stream = manager.create_standalone_stream(&id).await.unwrap();
             assert_open_stream_blocks_reaping(&manager, stream).await;
             serving.abort();
+        }
+
+        fn probing_manager(
+            interval: std::time::Duration,
+            deadline: std::time::Duration,
+        ) -> std::sync::Arc<CappedSessionManager> {
+            std::sync::Arc::new(
+                CappedSessionManager::new(4, idle_secs(3600)).with_stream_liveness(
+                    StreamLiveness::Probe {
+                        interval: ProbeInterval::new(interval).unwrap(),
+                        deadline: ProbeDeadline::new(deadline).unwrap(),
+                    },
+                ),
+            )
+        }
+
+        fn probe_reply(
+            message: &rmcp::transport::streamable_http_server::session::ServerSseMessage,
+        ) -> Option<ClientJsonRpcMessage> {
+            let json = serde_json::to_value(&**message.message.as_ref()?).ok()?;
+            (json["method"] == "ping").then(|| {
+                serde_json::from_value(
+                    serde_json::json!({"jsonrpc": "2.0", "id": json["id"], "result": {}}),
+                )
+                .unwrap()
+            })
+        }
+
+        /// Drains `stream`, answering every probe in `answer_in` when `answering`;
+        /// finishes when the stream ends.
+        fn spawn_drain<S>(
+            manager: &std::sync::Arc<CappedSessionManager>,
+            answer_in: &rmcp::transport::streamable_http_server::session::SessionId,
+            stream: S,
+            answering: bool,
+        ) -> tokio::task::JoinHandle<()>
+        where
+            S: futures::Stream<
+                    Item = rmcp::transport::streamable_http_server::session::ServerSseMessage,
+                > + Send
+                + 'static,
+        {
+            use futures::StreamExt as _;
+
+            let manager = std::sync::Arc::clone(manager);
+            let answer_in = answer_in.clone();
+            tokio::spawn(async move {
+                let mut stream = Box::pin(stream);
+                while let Some(message) = stream.next().await {
+                    if let Some(reply) = probe_reply(&message).filter(|_| answering) {
+                        manager.accept_message(&answer_in, reply).await.unwrap();
+                    }
+                }
+            })
+        }
+
+        const PROBE_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+        /// A probing manager with one initialized session; `serving` is the
+        /// session worker's task.
+        async fn probed_session() -> (
+            std::sync::Arc<CappedSessionManager>,
+            rmcp::transport::streamable_http_server::session::SessionId,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let manager = probing_manager(PROBE_STEP, PROBE_STEP * 2);
+            let (id, serving) = initialized_session(&manager).await;
+            (manager, id, serving)
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_primary_timeout_closes_standalone_stream_and_clears_shadows() {
+            let (manager, id, serving) = probed_session().await;
+            let primary = manager.create_standalone_stream(&id).await.unwrap();
+            let shadow = manager.create_standalone_stream(&id).await.unwrap();
+            let primary_task = spawn_drain(&manager, &id, primary, false);
+            let shadow_task = spawn_drain(&manager, &id, shadow, true);
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), primary_task)
+                .await
+                .unwrap_or_else(|_| panic!("silent primary must end"))
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), shadow_task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("closing the primary's stream must end the answering shadow too")
+                })
+                .unwrap();
+            serving.abort();
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_shadow_timeout_leaves_primary_stream_open() {
+            let (manager, id, serving) = probed_session().await;
+            let primary = manager.create_standalone_stream(&id).await.unwrap();
+            let shadow = manager.create_standalone_stream(&id).await.unwrap();
+            let primary_task = spawn_drain(&manager, &id, primary, true);
+            let shadow_task = spawn_drain(&manager, &id, shadow, false);
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), shadow_task)
+                .await
+                .unwrap_or_else(|_| panic!("silent shadow must end"))
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert!(
+                !primary_task.is_finished(),
+                "a shadow timeout must not close the primary stream"
+            );
+            primary_task.abort();
+            serving.abort();
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_wedged_session_does_not_block_stream_end() {
+            use futures::StreamExt as _;
+
+            let (manager, id, serving) = probed_session().await;
+            let mut stream = Box::pin(manager.create_standalone_stream(&id).await.unwrap());
+            let wedge = manager.inner.sessions.write().await;
+
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while stream.next().await.is_some() {}
+            })
+            .await;
+            assert!(
+                ended.is_ok(),
+                "the stream must end although close is wedged"
+            );
+
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            drop(wedge);
+            serving.abort();
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_ack_from_another_session_is_ignored_by_manager() {
+            let manager = probing_manager(PROBE_STEP, PROBE_STEP * 2);
+            let (probed, serving_a) = initialized_session(&manager).await;
+            let (other, serving_b) = initialized_session(&manager).await;
+            let stream = manager.create_standalone_stream(&probed).await.unwrap();
+            let task = spawn_drain(&manager, &other, stream, true);
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("a probe answered in another session must still time out")
+                })
+                .unwrap();
+            serving_a.abort();
+            serving_b.abort();
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_probe_replies_are_consumed_and_other_messages_forwarded() {
+            let manager = probing_manager(PROBE_STEP, PROBE_STEP * 2);
+            let (id, _transport) = manager.create_session().await.unwrap();
+            manager.inner.sessions.write().await.remove(&id);
+            let message = |json: serde_json::Value| -> ClientJsonRpcMessage {
+                serde_json::from_value(json).unwrap()
+            };
+
+            let response = message(
+                serde_json::json!({"jsonrpc": "2.0", "id": "mcpls-liveness-99", "result": {}}),
+            );
+            assert!(manager.accept_message(&id, response).await.is_ok());
+
+            let probe_error = message(serde_json::json!({
+                "jsonrpc": "2.0", "id": "mcpls-liveness-99",
+                "error": {"code": -32601, "message": "no ping"},
+            }));
+            assert!(manager.accept_message(&id, probe_error).await.is_ok());
+
+            let anonymous_error = message(serde_json::json!({
+                "jsonrpc": "2.0", "error": {"code": -32700, "message": "parse"},
+            }));
+            assert!(matches!(
+                manager.accept_message(&id, anonymous_error).await,
+                Err(CappedSessionManagerError::Inner(_))
+            ));
+            let foreign = message(serde_json::json!({"jsonrpc": "2.0", "id": 5, "result": {}}));
+            assert!(matches!(
+                manager.accept_message(&id, foreign).await,
+                Err(CappedSessionManagerError::Inner(_))
+            ));
+        }
+
+        #[test]
+        fn test_probe_settings_reject_zero() {
+            assert_eq!(ProbeInterval::new(std::time::Duration::ZERO), None);
+            assert_eq!(ProbeDeadline::new(std::time::Duration::ZERO), None);
+            assert!(ProbeInterval::new(std::time::Duration::from_nanos(1)).is_some());
+            assert!(ProbeDeadline::new(std::time::Duration::from_nanos(1)).is_some());
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_disabled_liveness_never_pings_or_ends_stream() {
+            use futures::StreamExt as _;
+
+            let manager = std::sync::Arc::new(CappedSessionManager::new(1, idle_secs(3600)));
+            let (id, serving) = initialized_session(&manager).await;
+            let mut stream = Box::pin(manager.create_standalone_stream(&id).await.unwrap());
+
+            let next =
+                tokio::time::timeout(std::time::Duration::from_secs(120), stream.next()).await;
+            assert!(next.is_err(), "a disabled stream must stay silent and open");
+            serving.abort();
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_request_wise_resume_is_not_tracked_as_standalone_stream() {
+            let (manager, id, serving) = probed_session().await;
+            let liveness = manager.session_liveness(&id).unwrap();
+
+            manager.resume(&id, "3/2".to_owned()).await.err();
+            assert!(!liveness.has_primary());
+
+            let _common = manager.resume(&id, "0".to_owned()).await.unwrap();
+            assert!(liveness.has_primary());
+            serving.abort();
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_probing_fails_closed_when_session_slot_is_gone() {
+            let (manager, id, serving) = probed_session().await;
+            crate::bridge::lock_std(&manager.slots).remove(&id);
+
+            assert!(matches!(
+                manager.create_standalone_stream(&id).await,
+                Err(CappedSessionManagerError::Inner(_))
+            ));
+            serving.abort();
+        }
+
+        #[test]
+        fn test_http_config_stream_liveness_defaults_to_probe_and_is_overridable() {
+            let cfg = HttpConfig::new("127.0.0.1:3003".parse().unwrap(), "/mcp");
+            assert_eq!(cfg.stream_liveness, StreamLiveness::DEFAULT);
+            let cfg = cfg.with_stream_liveness(StreamLiveness::Disabled);
+            assert_eq!(cfg.stream_liveness, StreamLiveness::Disabled);
+        }
+
+        /// A probe reaches the GET stream, a reply sent by POST keeps it open, and a
+        /// client that goes silent has the stream closed. Real time with
+        /// sub-second settings.
+        #[tokio::test]
+        async fn test_http_probe_pings_get_stream_keeps_answering_client_and_closes_silent_one() {
+            let interval = std::time::Duration::from_millis(200);
+            let deadline = std::time::Duration::from_secs(2);
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_stream_liveness(StreamLiveness::Probe {
+                    interval: ProbeInterval::new(interval).unwrap(),
+                    deadline: ProbeDeadline::new(deadline).unwrap(),
+                })
+            })
+            .await;
+            let (session, mut stream) = establish_session(addr).await;
+
+            let mut previous = None;
+            for _ in 0..2 {
+                let ping = stream.next_ping().await;
+                assert_ne!(previous.as_ref(), Some(&ping["id"]));
+                let reply = serde_json::json!({"jsonrpc": "2.0", "id": ping["id"], "result": {}});
+                let response = post_in_session(addr, &session, &reply.to_string()).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 202"),
+                    "a probe reply must be accepted, got: {response}"
+                );
+                previous = Some(ping["id"].clone());
+            }
+
+            assert!(
+                stream
+                    .ends_within(interval + deadline + std::time::Duration::from_secs(2))
+                    .await,
+                "a client that stops answering must have its GET stream closed"
+            );
+            server_task.abort();
         }
 
         /// Starts `run_http` with the e2e idle timeout and a session cap of
