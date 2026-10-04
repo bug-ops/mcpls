@@ -7,6 +7,8 @@
 pub mod pin;
 pub mod prepare;
 pub mod probe;
+pub mod process_tree;
 pub mod report;
 pub mod run;
 pub mod scenario;
+pub mod signals;

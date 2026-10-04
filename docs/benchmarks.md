@@ -45,8 +45,29 @@ probe per run), `--ready-timeout-secs` (300), `--call-timeout-secs` (60),
 ## Methodology
 
 - **Fresh process per run.** Each run spawns mcpls, which spawns the language
-  server, and shuts both down afterwards. Shutdown is bounded (10 s) and
-  recorded as `clean` or `killed`.
+  server, and shuts both down afterwards. mcpls leads its own process group.
+  Shutdown is bounded (10 s for mcpls to exit, then up to 1 s, polled every
+  50 ms, for the rest of the group to follow) and recorded as `clean`,
+  `killed` (mcpls had to be killed, or the session did not close cleanly) or
+  `orphans_killed` (mcpls exited but members of its group, such as cargo or
+  proc-macro servers, outlived it and were killed). `orphans_killed` takes
+  precedence over `killed`: it does not say whether the session had closed cleanly.
+- **Interruption.** During `run`, `Ctrl-C` or `SIGTERM` kills the whole process
+  group of the active run before exiting with 130 or 143, so no cargo or rustc
+  of the run is left running to skew the next one. During `prepare` only the
+  direct child (git, a setup command) is killed, so a `SIGTERM` can leave
+  grandchildren of a setup step running; an interrupted clone leaves at most a
+  `repos/.<name>.partial` directory, which the next `prepare` wipes.
+- **Process-tree limits.** Descendants that detach with `setsid` escape the
+  group kill and the RSS sum. A zombie member whose parent is still alive counts
+  as a live member until it is reaped, which can report `orphans_killed` for a
+  harmless leftover. Windows has no process group here, so only mcpls itself is
+  killed. Two concurrent `prepare` runs of one scenario are not supported (they
+  share the `.partial` staging directory).
+- **mcpls stderr** goes to
+  `<work-dir>/logs/<scenario>/<invocation unix millis>/run-<index>.log`; the
+  path is recorded per run as `stderr_log`, and later invocations never
+  overwrite it. The files are not size-limited.
 - **Timed vs untimed.** Cloning, `cargo fetch`, `cargo check` (warms `target/`
   and proc macros) and `pnpm install` happen in `prepare` and are never timed.
 - **Regions.**
@@ -56,7 +77,7 @@ probe per run), `--ready-timeout-secs` (300), `--call-timeout-secs` (60),
     latency of one tool call, repeated `--iterations` times per run.
 - **Readiness is semantic.** `ready_probe` is a normal probe with an expected
   answer (for example hover text containing a symbol name). It is retried every
-  250 ms until it passes; the attempt count is recorded. If it never passes
+  50 ms until it passes (`params.ready_retry_interval_ms`); the attempt count is recorded. If it never passes
   within `--ready-timeout-secs` the `ready` sample is `timed_out`, the last failing
   attempt is kept in `ready.last_failure`, and the run's remaining probes are
   skipped.
@@ -77,11 +98,23 @@ probe per run), `--ready-timeout-secs` (300), `--call-timeout-secs` (60),
 - **Timeouts.** After a call times out, mcpls is still serving it, so later
   calls would queue behind it and be inflated. The remaining probes of that run
   are skipped and the run is marked `truncated_after_timeout`.
-- **Summary** is min / lower median / max over successful samples of the
+- **Summary** is min / lower median / p95 / max over successful samples of the
   measured runs; failed, incorrect and timed-out samples are counted separately.
-  No p95 is reported at these sample sizes.
-- **Process memory (RSS) is not measured yet** (process-tree sampling of mcpls
-  and its language-server children is future work).
+  `p95_us` is the nearest-rank observed value and is `null` (printed as `-`)
+  below 20 samples, where it would equal the maximum. With the defaults a probe
+  has 12 steady samples, so p95 appears only with more `--runs` or `--iterations`.
+- **Process memory (RSS)** is sampled with `ps` at two checkpoints, `ready`
+  (right after the ready probe passed) and `after_probes`, never during a call.
+  The `ready` reading adds one `ps` call (tens of milliseconds of idle time)
+  between the ready probe and the first probe, during which the server may keep
+  indexing, so `first` latencies are slightly flattered compared with no
+  sampling. `after_probes` is skipped for a run truncated by a timeout.
+  Each reading lists every member of the mcpls process group and their sum
+  (`memory` per run, `memory_summary` min / median / max of the sums). Limits:
+  the sum is per process group, so pages shared between processes are counted
+  more than once, and descendants that detach with `setsid` (for example
+  rust-analyzer flycheck, which mcpls does not trigger because it sends no
+  `didSave`) are missed. RSS is `unavailable` where `ps` is not usable.
 
 ## Pinning and reproducibility
 
@@ -106,8 +139,24 @@ opts in with `expected_version`; none of the bundled scenarios does.
   report's pin record then shows the mismatch (`version_output` does not contain
   `expected_version`).
 - The work directory (default `<cache dir>/mcpls-bench`) must not be inside a
-  Cargo workspace: cargo would treat a clone below an ancestor `Cargo.toml` as a
-  workspace member and rust-analyzer would fail to load it.
+  project: an ancestor `Cargo.toml` makes cargo treat the clone as a workspace
+  member (rust-analyzer would fail to load it), and an ancestor
+  `pnpm-workspace.yaml` or `node_modules` changes how pnpm and TypeScript
+  resolve it. The ancestors are checked before anything is created, so a
+  refused path leaves no directory behind.
+- Clones are staged in `repos/.<name>.partial` and renamed into place after
+  HEAD verifies, so an interrupted clone never looks complete. A leftover
+  incomplete checkout from an older version (a `.git` without a resolvable HEAD)
+  is removed and cloned again; a checkout at a wrong commit still aborts.
+- Git is hardened: scenario URLs must be `https://github.com/<owner>/<repo>`
+  in canonical form (no credentials, port, query, fragment, whitespace,
+  backslash, `..` or upper-case host, so git and the URL parser read it the
+  same way). Every git call removes every inherited `GIT_*` environment
+  variable, ignores user and system configuration
+  (`GIT_CONFIG_GLOBAL` is the null device, so `insteadOf` rewrites and a global
+  `http.proxy` do not apply; proxies set through environment variables still
+  do), allows only the https protocol, and puts `--` before positional
+  arguments of `remote add` and `fetch`.
 - `RepoSource::Local` (used only by the smoke scenario) is unpinned and reported
   as such.
 
@@ -176,8 +225,9 @@ Expectations per kind: `hover.contains`, `definition.uri_suffix`,
 The JSON report is `mcpls_bench::report::RunReport`: `scenario`, `source`
 (`pinned` commit or `unpinned` path), `mcpls`/`server`/`runtime` pin records,
 `mcpls_binary`, `params`, `runs` (each with `warmup`, `ready`,
-`truncated_after_timeout`, `samples`, `shutdown`), `aborted` and `summary`
-(per region: `ok`, `not_ok`, `first` and `steady` min/median/max). A sample is
+`truncated_after_timeout`, `samples`, `memory`, `stderr_log`, `shutdown`),
+`aborted`, `summary` (per region: `ok`, `not_ok`, `first` and `steady`
+min/median/p95/max) and `memory_summary`. A sample is
 `{ region, outcome, elapsed_us, iteration }` where `outcome` is `ok`,
 `incorrect { detail }`, `failed { error }` or `timed_out`.
 

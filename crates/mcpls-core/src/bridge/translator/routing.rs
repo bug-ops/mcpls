@@ -176,9 +176,23 @@ pub enum Capability {
     WorkspaceSymbols,
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "compile-time check; the loop condition keeps `i` below `ALL.len()`"
+)]
+const _: () = {
+    assert!(Capability::ALL.len() == Capability::WorkspaceSymbols as usize + 1);
+    assert!(Capability::ALL.len() <= u16::BITS as usize);
+    let mut i = 0;
+    while i < Capability::ALL.len() {
+        assert!(Capability::ALL[i] as usize == i);
+        i += 1;
+    }
+};
+
 impl Capability {
-    /// Every capability, in a fixed order.
-    #[cfg(test)]
+    /// Every capability, in discriminant order.
     pub(crate) const ALL: [Self; 14] = [
         Self::Completions,
         Self::SignatureHelp,
@@ -218,24 +232,23 @@ impl Capability {
     }
 
     /// The capability gating `tool`, or `None` for a tool dispatched without
-    /// a capability check (`Diagnostics`).
+    /// a capability check (`Diagnostics`). Derived from [`Self::tool_kind`]
+    /// over [`Self::ALL`], so the pairing has a single source.
     pub(crate) const fn for_tool(tool: ToolKind) -> Option<Self> {
-        match tool {
-            ToolKind::Completions => Some(Self::Completions),
-            ToolKind::SignatureHelp => Some(Self::SignatureHelp),
-            ToolKind::InlayHints => Some(Self::InlayHints),
-            ToolKind::Hover => Some(Self::Hover),
-            ToolKind::Definition => Some(Self::Definition),
-            ToolKind::References => Some(Self::References),
-            ToolKind::Implementation => Some(Self::Implementation),
-            ToolKind::TypeDefinition => Some(Self::TypeDefinition),
-            ToolKind::CallHierarchy => Some(Self::CallHierarchy),
-            ToolKind::Rename => Some(Self::Rename),
-            ToolKind::FormatDocument => Some(Self::FormatDocument),
-            ToolKind::CodeActions => Some(Self::CodeActions),
-            ToolKind::DocumentSymbols => Some(Self::DocumentSymbols),
-            ToolKind::WorkspaceSymbols => Some(Self::WorkspaceSymbols),
-            ToolKind::Diagnostics => None,
+        Self::find_gating(&Self::ALL, tool)
+    }
+
+    const fn find_gating(candidates: &[Self], tool: ToolKind) -> Option<Self> {
+        match candidates {
+            // `PartialEq` is not const, so compare discriminants.
+            [first, rest @ ..] => {
+                if first.tool_kind() as u8 == tool as u8 {
+                    Some(*first)
+                } else {
+                    Self::find_gating(rest, tool)
+                }
+            }
+            [] => None,
         }
     }
 

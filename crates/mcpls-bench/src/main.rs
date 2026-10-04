@@ -1,14 +1,16 @@
 //! `mcpls-bench` command-line entry point.
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mcpls_bench::prepare::{WorkDir, prepare};
-use mcpls_bench::report::{Micros, RunReport};
+use mcpls_bench::report::{Kib, Micros, RunReport};
 use mcpls_bench::run::{RunOptions, run};
 use mcpls_bench::scenario::Scenario;
+use mcpls_bench::signals::ShutdownSignals;
 
 #[derive(Debug, Parser)]
 #[command(name = "mcpls-bench", version, about)]
@@ -86,19 +88,39 @@ fn scenario_dir(path: &Path) -> Result<PathBuf> {
 fn print_summary(report: &RunReport) {
     let cell = |us: Option<Micros>| us.map_or_else(|| "-".to_owned(), |m| m.0.to_string());
     eprintln!(
-        "{:<16} {:>4} {:>6} {:>11} {:>10} {:>10} {:>10}",
-        "region", "ok", "not_ok", "first_med", "steady_min", "steady_med", "steady_max"
+        "{:<16} {:>4} {:>6} {:>11} {:>10} {:>10} {:>10} {:>10}",
+        "region",
+        "ok",
+        "not_ok",
+        "first_med",
+        "steady_min",
+        "steady_med",
+        "steady_p95",
+        "steady_max"
     );
     for row in &report.summary {
         eprintln!(
-            "{:<16} {:>4} {:>6} {:>11} {:>10} {:>10} {:>10}",
+            "{:<16} {:>4} {:>6} {:>11} {:>10} {:>10} {:>10} {:>10}",
             row.region,
             row.ok,
             row.not_ok,
             cell(row.first.as_ref().map(|s| s.median_us)),
             cell(row.steady.as_ref().map(|s| s.min_us)),
             cell(row.steady.as_ref().map(|s| s.median_us)),
+            cell(row.steady.as_ref().and_then(|s| s.p95_us)),
             cell(row.steady.as_ref().map(|s| s.max_us)),
+        );
+    }
+    for row in &report.memory_summary {
+        let total = |kib: Option<Kib>| kib.map_or_else(|| "-".to_owned(), |k| k.0.to_string());
+        eprintln!(
+            "rss {}: measured {} unavailable {} min_kib {} median_kib {} max_kib {}",
+            row.checkpoint,
+            row.measured,
+            row.unavailable,
+            total(row.total.as_ref().map(|t| t.min_kib)),
+            total(row.total.as_ref().map(|t| t.median_kib)),
+            total(row.total.as_ref().map(|t| t.max_kib)),
         );
     }
     if report.aborted {
@@ -107,8 +129,33 @@ fn print_summary(report: &RunReport) {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    match Cli::parse().command {
+async fn main() -> ExitCode {
+    let command = Cli::parse().command;
+    let mut signals = match ShutdownSignals::install() {
+        Ok(signals) => signals,
+        Err(error) => {
+            eprintln!("Error: failed to install signal handlers: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Dropping `execute` on a signal drops the active process-group guard, which kills mcpls and its tree.
+    tokio::select! {
+        result = execute(command) => match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Error: {error:?}");
+                ExitCode::FAILURE
+            }
+        },
+        signal = signals.recv() => {
+            eprintln!("received {signal}; stopped the benchmark and its process tree");
+            ExitCode::from(signal.exit_code())
+        }
+    }
+}
+
+async fn execute(command: Command) -> Result<()> {
+    match command {
         Command::Prepare(args) => {
             let scenario = Scenario::load(&args.scenario)?;
             let work_dir = args.work_dir.map_or_else(WorkDir::default_path, Ok)?;

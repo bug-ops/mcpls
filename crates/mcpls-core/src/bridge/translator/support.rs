@@ -2,13 +2,15 @@
 //!
 //! The snapshot answers "would a call to this tool be dispatched to a server
 //! that advertises its capability?" through the same pure decision functions
-//! enforcement uses ([`lookup_route`], [`lookup_workspace_route`],
-//! [`Capability::is_available`]), so the report and the per-call
+//! enforcement uses ([`lookup_route`], [`lookup_workspace_route`]) and the
+//! same per-capability predicate ([`Capability::is_supported`], folded into a
+//! [`CapabilitySet`] per server), so the report and the per-call
 //! `require_capability` gate cannot drift apart. `require_capability` stays
 //! the authoritative enforcement point.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use lsp_types::ServerCapabilities;
 use schemars::JsonSchema;
@@ -49,6 +51,30 @@ pub enum RouteSupport {
     NoServer,
 }
 
+/// The set of [`Capability`] values one server advertises, one bit each.
+///
+/// Computed once per snapshot through [`Capability::is_supported`], so the
+/// snapshot never clones a server's full `ServerCapabilities`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CapabilitySet(u16);
+
+impl CapabilitySet {
+    /// The capabilities `caps` advertises.
+    pub fn of(caps: &ServerCapabilities) -> Self {
+        Capability::ALL
+            .into_iter()
+            .filter(|capability| capability.is_supported(caps))
+            .fold(Self::default(), |set, capability| {
+                Self(set.0 | 1 << capability as u8)
+            })
+    }
+
+    /// Whether `capability` is in the set.
+    pub const fn contains(self, capability: Capability) -> bool {
+        self.0 & (1 << capability as u8) != 0
+    }
+}
+
 /// A point-in-time copy of the registries needed to answer
 /// [`RouteSupport`] queries without holding any `Translator` lock.
 ///
@@ -56,9 +82,9 @@ pub enum RouteSupport {
 /// `require_capability`; see `Translator::require_capability`.
 #[derive(Debug)]
 pub struct ToolSupportSnapshot {
-    router: ToolRouter,
+    router: Arc<ToolRouter>,
     expected: HashSet<ServerId>,
-    capabilities: HashMap<ServerId, ServerCapabilities>,
+    capabilities: HashMap<ServerId, CapabilitySet>,
     registered: HashSet<ServerId>,
 }
 
@@ -107,7 +133,7 @@ impl ToolSupportSnapshot {
             return RouteSupport::Initializing;
         };
         match Capability::for_tool(tool) {
-            Some(capability) if !capability.is_available(Some(caps)) => {
+            Some(capability) if !caps.contains(capability) => {
                 RouteSupport::CapabilityNotAdvertised { server, capability }
             }
             _ => RouteSupport::Supported { server },
@@ -115,30 +141,66 @@ impl ToolSupportSnapshot {
     }
 }
 
-impl Translator {
-    /// Copy the registries `get_tool_support` reads, taking each lock once,
-    /// sequentially, and never nested.
-    ///
-    /// Read order is `expected_servers`, then `lsp_servers`, then
-    /// `lsp_clients`, then the router -- the reverse of the order
-    /// registration mutates them (insert clients/servers, rebind router,
-    /// clear expected). A healthy server mid-registration is therefore seen
-    /// as registered or still expected, never as neither (which would be
-    /// misreported as `no_server`).
-    pub(crate) fn tool_support_snapshot(&self) -> ToolSupportSnapshot {
-        let expected = lock_std(&self.expected_servers).clone();
-        let capabilities = lock_std(&self.lsp_servers)
+/// A boundary in [`Translator::tool_support_snapshot`]'s sequential reads.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotStage {
+    Start,
+    ExpectedRead,
+    ServersRead,
+    ClientsRead,
+    RouterRead,
+}
+
+/// The snapshot's sequential reads, in the one order both the production
+/// path and the observed test path use. The optional observer is invoked at
+/// each boundary and expands to nothing when absent.
+macro_rules! snapshot_reads {
+    ($translator:expr $(, $observe:ident)?) => {{
+        let translator = $translator;
+        $($observe(SnapshotStage::Start);)?
+        let expected = lock_std(&translator.expected_servers).clone();
+        $($observe(SnapshotStage::ExpectedRead);)?
+        let capabilities = lock_std(&translator.lsp_servers)
             .iter()
-            .map(|(id, server)| (id.clone(), server.capabilities().clone()))
+            .map(|(id, server)| (id.clone(), CapabilitySet::of(server.capabilities())))
             .collect();
-        let registered = lock_std(&self.lsp_clients).keys().cloned().collect();
-        let router = lock_std(&self.router).clone();
+        $($observe(SnapshotStage::ServersRead);)?
+        let registered = lock_std(&translator.lsp_clients).keys().cloned().collect();
+        $($observe(SnapshotStage::ClientsRead);)?
+        let router = Arc::clone(&lock_std(&translator.router));
+        $($observe(SnapshotStage::RouterRead);)?
         ToolSupportSnapshot {
             router,
             expected,
             capabilities,
             registered,
         }
+    }};
+}
+
+impl Translator {
+    /// Copy the registries `get_tool_support` reads, taking each lock once,
+    /// sequentially, and never nested.
+    ///
+    /// Read order is `expected_servers`, then `lsp_servers`, then
+    /// `lsp_clients`, then the router. Registration writes the client, the
+    /// server, rebinds the router, then clears `expected_servers`. Reading
+    /// `expected_servers` first means a healthy server mid-registration is
+    /// seen as registered or still expected, never as neither (which would
+    /// be misreported as `no_server`).
+    pub(crate) fn tool_support_snapshot(&self) -> ToolSupportSnapshot {
+        snapshot_reads!(self)
+    }
+
+    /// [`Self::tool_support_snapshot`] with `observe` called at every
+    /// boundary between reads, so a test can interleave registration writes.
+    #[cfg(test)]
+    fn tool_support_snapshot_observed(
+        &self,
+        mut observe: impl FnMut(SnapshotStage),
+    ) -> ToolSupportSnapshot {
+        snapshot_reads!(self, observe)
     }
 
     /// The language of the file at `path`, after workspace-root validation.
@@ -174,11 +236,14 @@ mod tests {
     ) -> ToolSupportSnapshot {
         let ids = |names: &[&str]| names.iter().map(|n| ServerId::from(*n)).collect();
         ToolSupportSnapshot {
-            router: ToolRouter::catch_all([(ServerId::from("rust"), "rust".to_string())]),
+            router: Arc::new(ToolRouter::catch_all([(
+                ServerId::from("rust"),
+                "rust".to_string(),
+            )])),
             expected: ids(expected),
             capabilities: caps
                 .iter()
-                .map(|(id, caps)| (ServerId::from(*id), caps.clone()))
+                .map(|(id, caps)| (ServerId::from(*id), CapabilitySet::of(caps)))
                 .collect(),
             registered: ids(registered),
         }
@@ -257,27 +322,81 @@ mod tests {
         );
     }
 
-    /// Registration order is insert (t1), rebind (t2), clear expected (t3).
-    /// A snapshot reading `expected` first and clients after sees the server
-    /// in at least one of the two sets for every interleaving; the opposite
-    /// read order can see neither, which reads as `no_server`.
     #[test]
-    fn expected_read_first_never_misreports_healthy_server() {
-        let before_registration = snapshot(&[], &["rust"], &[]);
-        let after_registration = snapshot(&["rust"], &[], &[("rust", rust_caps(true))]);
-        let expected_read_after_clear_clients_read_before_insert = snapshot(&[], &[], &[]);
-
-        for snap in [&before_registration, &after_registration] {
-            assert_ne!(
-                snap.document_support("rust", ToolKind::Hover),
-                RouteSupport::NoServer
+    fn capability_set_holds_exactly_the_advertised_capabilities() {
+        let set = CapabilitySet::of(&rust_caps(true));
+        for capability in Capability::ALL {
+            assert_eq!(
+                set.contains(capability),
+                capability == Capability::Hover,
+                "{capability:?}"
             );
         }
         assert_eq!(
-            expected_read_after_clear_clients_read_before_insert
-                .document_support("rust", ToolKind::Hover),
-            RouteSupport::NoServer
+            CapabilitySet::of(&ServerCapabilities::default()),
+            CapabilitySet::default()
         );
+    }
+
+    /// Applies the four registration writes in the order production performs
+    /// them (`Translator::register_server_complete`: client then server;
+    /// then `register_servers`' `rebind_router`; then
+    /// `clear_expected_servers`) at every boundary between the snapshot's
+    /// reads, over all 70 monotone placements. A healthy server must never
+    /// read as `no_server`.
+    #[tokio::test]
+    async fn healthy_server_never_misreported_for_any_write_read_interleaving() {
+        use crate::lsp::LspServer;
+        use crate::test_lsp::fake_lsp_client;
+
+        const STAGES: usize = 5;
+        let id = ServerId::from("rust");
+        let mut schedules = 0;
+        for g0 in 0..STAGES {
+            for g1 in g0..STAGES {
+                for g2 in g1..STAGES {
+                    for g3 in g2..STAGES {
+                        schedules += 1;
+                        let gaps = [g0, g1, g2, g3];
+                        let translator = Translator::new()
+                            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+                        translator.set_expected_servers(HashSet::from([id.clone()]));
+                        let (client, _fake) = fake_lsp_client();
+                        let mut client = Some(client);
+
+                        let snap = translator.tool_support_snapshot_observed(|stage| {
+                            for (step, gap) in gaps.iter().enumerate() {
+                                if *gap != stage as usize {
+                                    continue;
+                                }
+                                match step {
+                                    0 => translator
+                                        .register_client(id.clone(), client.take().unwrap()),
+                                    1 => translator.register_server(
+                                        id.clone(),
+                                        LspServer::new_for_test(rust_caps(true)),
+                                    ),
+                                    2 => translator.rebind_router(&HashSet::from([id.clone()])),
+                                    _ => translator.clear_expected_servers(),
+                                }
+                            }
+                        });
+
+                        assert_ne!(
+                            snap.document_support("rust", ToolKind::Hover),
+                            RouteSupport::NoServer,
+                            "document route, gaps {gaps:?}"
+                        );
+                        assert_ne!(
+                            snap.workspace_support(ToolKind::WorkspaceSymbols),
+                            RouteSupport::NoServer,
+                            "workspace route, gaps {gaps:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(schedules, 70);
     }
 
     #[test]
@@ -285,7 +404,7 @@ mod tests {
         let mut router = ToolRouter::catch_all([(ServerId::from("rust"), "rust".to_string())]);
         router.rebind_to_registered(&HashSet::new());
         let snap = ToolSupportSnapshot {
-            router,
+            router: Arc::new(router),
             expected: HashSet::new(),
             capabilities: HashMap::new(),
             registered: HashSet::new(),
@@ -300,7 +419,7 @@ mod tests {
     #[test]
     fn nothing_configured_workspace_support_is_no_server() {
         let snap = ToolSupportSnapshot {
-            router: ToolRouter::default(),
+            router: Arc::new(ToolRouter::default()),
             expected: HashSet::new(),
             capabilities: HashMap::new(),
             registered: HashSet::new(),

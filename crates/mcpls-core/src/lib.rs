@@ -999,6 +999,9 @@ async fn init_lsp_servers(
     // initializing" (especially for servers that failed to spawn on
     // partial success, which would otherwise return ServerInitializing
     // forever instead of the recorded startup failure).
+    //
+    // This must stay after `register_servers`: `Translator::tool_support_snapshot`'s
+    // read order relies on it (`healthy_server_never_misreported_for_any_write_read_interleaving`).
     translator.clear_expected_servers();
     info!("Proceeding with {} LSP server(s)", server_count);
 

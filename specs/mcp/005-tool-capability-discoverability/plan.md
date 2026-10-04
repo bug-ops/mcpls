@@ -44,11 +44,18 @@ approved this mechanism (spec section 8, "Ask First", satisfied; SC-001).
   `require_capability`) and by the report, so the two cannot disagree (NFR-002: enforcement is
   unchanged and stays authoritative).
 - **Snapshot.** `Translator::tool_support_snapshot` copies `expected_servers`, `lsp_servers`,
-  `lsp_clients`, then the router, one lock at a time, in the reverse of registration order, so a
-  server mid-registration is never seen as neither expected nor registered.
-- **Report.** `McpTool` (21 variants) declares each tool's backend (`Document`, `Workspace`,
-  `Local`). `coverage` is `all`, `some`, `none`, `unknown` or `always`; routes carry
-  `supported`, `capability_not_advertised`, `initializing` or `no_server` (NFR-003).
+  `lsp_clients`, then the router, one lock at a time. Registration writes the client, the server,
+  the router rebind, then clears `expected_servers`; reading `expected_servers` first means a
+  server mid-registration is never seen as neither expected nor registered. The unit test
+  `healthy_server_never_misreported_for_any_write_read_interleaving` checks all 70 interleavings
+  of those four writes with the four reads. The snapshot holds the
+  router as an `Arc` (copy-on-write on rebind) and each server's advertised `Capability` set, not
+  a clone of its `ServerCapabilities`.
+- **Report.** `McpTool` (21 variants) declares each tool's name and backend (`Document`,
+  `Workspace`, `Local`) in one `spec`. `coverage` is `all`, `some`, `none`, `unknown` or `always`;
+  routes carry `supported`, `capability_not_advertised`, `initializing` or `no_server` (NFR-003).
+  Document routes group the languages sharing an identical status (`languages` array, first-seen
+  order); a workspace route has no `languages`.
 - **Staleness.** Computed per query from live registries, so respawns are reflected (NFR-004, FR-003).
 
 ## 4. Edge cases (spec section 6)
