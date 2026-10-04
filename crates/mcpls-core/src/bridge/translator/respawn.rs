@@ -957,17 +957,17 @@ fi
 
             let guard = cache.lock().await;
             assert!(
-                guard.diagnostics(synced_uri.as_ref()).is_none(),
+                guard.diagnostics(&synced_uri).is_none(),
                 "diagnostics attributed to the crashed connection must be \
                  invalidated on respawn, not served as current"
             );
             assert!(
-                guard.diagnostics(never_opened_uri.as_ref()).is_none(),
+                guard.diagnostics(&never_opened_uri).is_none(),
                 "workspace-wide diagnostics for a file mcpls never opened \
                  must also be invalidated, not just synced documents"
             );
             assert!(
-                guard.diagnostics(other_language_uri.as_ref()).is_some(),
+                guard.diagnostics(&other_language_uri).is_some(),
                 "a different diagnostics-route server's entries must survive \
                  an unrelated server's respawn-triggered cache clear"
             );
@@ -1243,7 +1243,7 @@ sleep 1
                 cache
                     .lock()
                     .await
-                    .diagnostics(owned_by_healthy_server.as_ref())
+                    .diagnostics(&owned_by_healthy_server)
                     .is_some(),
                 "respawning a non-diagnostics-route server must not clear \
                  the diagnostics-route server's cache entries"

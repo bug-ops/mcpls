@@ -744,7 +744,7 @@ mod tests {
             link.to_str().unwrap(),
         )
         .unwrap();
-        assert_eq!(published.canonical().as_ref(), client_side);
+        assert_eq!(published.canonical(), &client_side);
     }
 
     #[cfg(unix)]

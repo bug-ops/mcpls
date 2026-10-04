@@ -1074,7 +1074,7 @@ impl McplsServer {
         let (sources, signals) = {
             let cache = self.context.notification_cache.lock().await;
             (
-                cache.diagnostic_sources(lsp_uri.as_ref()),
+                cache.diagnostic_sources(&lsp_uri),
                 DiagnosticsRouteSignals::sample(&cache, route_id.as_ref()),
             )
         };
@@ -1352,7 +1352,7 @@ impl ServerHandler for McplsServer {
                     crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
                 let has_cached_diagnostics = {
                     let cache = self.context.notification_cache.lock().await;
-                    cache.has_diagnostics(lsp_uri.as_ref())
+                    cache.has_diagnostics(&lsp_uri)
                 };
 
                 if has_cached_diagnostics
@@ -1464,7 +1464,7 @@ impl ServerHandler for McplsServer {
         let cached: Vec<&DiagnosticsResourceUri> = {
             let cache = self.context.notification_cache.lock().await;
             uris.canonical()
-                .filter(|(_, lsp_uri)| cache.has_diagnostics(lsp_uri.as_ref()))
+                .filter(|(_, lsp_uri)| cache.has_diagnostics(lsp_uri))
                 .map(|(uri, _)| uri)
                 .collect()
         };

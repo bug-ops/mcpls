@@ -2520,7 +2520,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     let found = {
                         let guard = cache.lock().await;
-                        guard.diagnostics(uri.as_ref()).is_some()
+                        guard.diagnostics(&uri).is_some()
                     };
                     if found {
                         return true;
@@ -2604,7 +2604,7 @@ mod tests {
                 loop {
                     {
                         let guard = cache.lock().await;
-                        if guard.diagnostics(inside_uri.as_ref()).is_some() {
+                        if guard.diagnostics(&inside_uri).is_some() {
                             return;
                         }
                     }
@@ -2614,11 +2614,7 @@ mod tests {
             .await
             .expect("pump did not cache in-workspace diagnostics within 5 s");
 
-            let found_outside = cache
-                .lock()
-                .await
-                .diagnostics(outside_uri.as_ref())
-                .is_some();
+            let found_outside = cache.lock().await.diagnostics(&outside_uri).is_some();
             assert!(
                 !found_outside,
                 "diagnostics for a URI outside workspace roots must not be cached"
@@ -2740,7 +2736,7 @@ mod tests {
                 loop {
                     {
                         let guard = cache.lock().await;
-                        if guard.diagnostics(uri.as_ref()).is_some() {
+                        if guard.diagnostics(&uri).is_some() {
                             return;
                         }
                     }
@@ -3055,8 +3051,8 @@ mod tests {
             let (info, escaped) = {
                 let guard = cache.lock().await;
                 (
-                    guard.diagnostic_sources(canonical_lsp.as_ref()),
-                    guard.has_diagnostics(bridge::path_to_uri(&escape).unwrap().as_ref()),
+                    guard.diagnostic_sources(&canonical_lsp),
+                    guard.has_diagnostics(&bridge::path_to_uri(&escape).unwrap()),
                 )
             };
             assert_eq!(info.merge().unwrap().diagnostics.len(), 1);
@@ -3102,10 +3098,7 @@ mod tests {
             let canonical_uri = bridge::path_to_uri(&real.join("main.rs")).unwrap();
             let info = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    let sources = cache
-                        .lock()
-                        .await
-                        .diagnostic_sources(canonical_uri.as_ref());
+                    let sources = cache.lock().await.diagnostic_sources(&canonical_uri);
                     if let Some(info) = sources.merge() {
                         return info;
                     }
@@ -3170,7 +3163,7 @@ mod tests {
             let info = cache
                 .lock()
                 .await
-                .diagnostic_sources(canonical_lsp.as_ref())
+                .diagnostic_sources(&canonical_lsp)
                 .merge()
                 .unwrap();
             assert!(info.diagnostics.is_empty(), "the alias's clear must apply");
