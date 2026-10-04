@@ -27,8 +27,8 @@ pub(crate) use indexing::{
 };
 pub use indexing::{IndexingPolicy, IndexingState};
 pub use notifications::{
-    DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
-    apply_lifecycle_notification,
+    DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
+    ServerMessage, apply_lifecycle_notification,
 };
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, ResourceLimits, path_to_uri,

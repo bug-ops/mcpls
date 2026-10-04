@@ -179,10 +179,11 @@ impl Translator {
             .request("textDocument/diagnostic", params, client.request_timeout())
             .await;
 
-        let diag_info = {
+        let sources = {
             let cache = notification_cache.lock().await;
-            cache.diagnostics(uri.as_ref()).cloned()
+            cache.diagnostic_sources(uri.as_ref())
         };
+        let diag_info = sources.merge();
 
         match pull_response {
             Ok(response) => {

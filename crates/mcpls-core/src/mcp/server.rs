@@ -860,12 +860,13 @@ impl McplsServer {
                 // Lock only long enough for the map lookup + clone: no
                 // canonicalize() or Vec mapping while `notification_cache`
                 // is held, since `diagnostics_pump` needs the same lock.
-                let (diag_info, owner, signals) = {
+                let (sources, owner, signals) = {
                     let cache = self.context.notification_cache.lock().await;
                     let owner = cache.diagnostics_owner(&uri).cloned();
                     let signals = DiagnosticsRouteSignals::sample(&cache, route_id.as_ref());
-                    (cache.diagnostics(&uri).cloned(), owner, signals)
+                    (cache.diagnostic_sources(&uri), owner, signals)
                 };
+                let diag_info = sources.merge();
                 let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
                     self.context.translator.position_encoding_for(&server_id)
                 });
@@ -1059,15 +1060,21 @@ impl McplsServer {
             .translator
             .diagnostics_route_id_for_path(&validated_path);
 
-        // Built from a borrow of the cache entry rather than `.cloned()`-ing the
-        // whole `DiagnosticInfo` first: `build_resource_diagnostics_response`
-        // only ever needs `version` (Copy) and its own clone of `diagnostics`,
-        // so cloning the entry up front would clone `diagnostics` twice.
-        let cache = self.context.notification_cache.lock().await;
+        // Only the snapshot is taken under the cache lock: merging the sources
+        // (dedupe, sort, size cap) runs after it is released, since
+        // `diagnostics_pump` needs the same lock.
+        let (sources, signals) = {
+            let cache = self.context.notification_cache.lock().await;
+            (
+                cache.diagnostic_sources(lsp_uri.as_ref()),
+                DiagnosticsRouteSignals::sample(&cache, route_id.as_ref()),
+            )
+        };
+        let diag_info = sources.merge();
         Ok(build_resource_diagnostics_response(
             self.context.translator.is_document_open(&validated_path),
-            cache.diagnostics(lsp_uri.as_ref()),
-            DiagnosticsRouteSignals::sample(&cache, route_id.as_ref()),
+            diag_info.as_ref(),
+            signals,
         ))
     }
 
@@ -1279,7 +1286,7 @@ impl ServerHandler for McplsServer {
                     crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
                 let has_cached_diagnostics = {
                     let cache = self.context.notification_cache.lock().await;
-                    cache.diagnostics(lsp_uri.as_ref()).is_some()
+                    cache.has_diagnostics(lsp_uri.as_ref())
                 };
 
                 if has_cached_diagnostics
@@ -1387,7 +1394,7 @@ impl ServerHandler for McplsServer {
         let cached: Vec<&DiagnosticsResourceUri> = {
             let cache = self.context.notification_cache.lock().await;
             uris.canonical()
-                .filter(|(_, lsp_uri)| cache.diagnostics(lsp_uri.as_ref()).is_some())
+                .filter(|(_, lsp_uri)| cache.has_diagnostics(lsp_uri.as_ref()))
                 .map(|(uri, _)| uri)
                 .collect()
         };

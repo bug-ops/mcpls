@@ -59,7 +59,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bridge::resources::DiagnosticsResourceUri;
+use bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use bridge::{NotificationCache, Translator};
 pub use config::{ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
@@ -202,9 +202,23 @@ pub(crate) async fn diagnostics_pump(
                             );
                             continue;
                         }
+                        let Some(published) =
+                            PublishedDiagnosticsUri::resolve(&p.uri, &workspace_roots).await
+                        else {
+                            debug!(
+                                "dropping diagnostics for URI resolving outside the workspace: {}",
+                                p.uri.as_ref()
+                            );
+                            continue;
+                        };
                         {
                             let mut cache = notification_cache.lock().await;
-                            cache.store_diagnostics(&server_id, &p.uri, p.version, p.diagnostics);
+                            cache.store_published_diagnostics(
+                                &server_id,
+                                &published,
+                                p.version,
+                                p.diagnostics,
+                            );
                         }
 
                         let sessions = subs.live_sessions();
@@ -221,7 +235,7 @@ pub(crate) async fn diagnostics_pump(
                             continue;
                         }
 
-                        let Some(mcp_uri) = DiagnosticsResourceUri::for_published(&p.uri) else {
+                        let Some(mcp_uri) = DiagnosticsResourceUri::for_published(&published) else {
                             continue;
                         };
 
@@ -2787,7 +2801,11 @@ mod tests {
         use crate::test_lsp::spawn_test_pump;
 
         fn test_mcp_uri(file: &str) -> DiagnosticsResourceUri {
-            DiagnosticsResourceUri::for_published(&test_uri(file)).unwrap()
+            DiagnosticsResourceUri::for_published(&PublishedDiagnosticsUri::for_test(
+                test_uri(file),
+                test_uri(file),
+            ))
+            .unwrap()
         }
 
         fn publish(file: &str) -> LspNotification {
@@ -2842,6 +2860,85 @@ mod tests {
             tx.send(publish("y.rs")).await.unwrap();
             assert_eq!(recv_within(&mut rx_b).await, y.as_str());
             assert_eq!(recv_within(&mut rx_a).await, y.as_str());
+        }
+
+        /// #532: diagnostics a server publishes through a symlinked spelling
+        /// notify the subscriber of the canonical URI and read back under the
+        /// canonical key; a link pointing outside the workspace is dropped.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_pump_keys_symlinked_publish_by_canonical_path() {
+            use crate::mcp::{SessionHandle, Target};
+
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let file = root.join("main.rs");
+            std::fs::write(&file, "fn main() {}").unwrap();
+            let link = root.join("link.rs");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            let outside = tempfile::TempDir::new().unwrap();
+            std::fs::write(outside.path().join("x.rs"), "").unwrap();
+            let escape = root.join("escape.rs");
+            std::os::unix::fs::symlink(outside.path().join("x.rs"), &escape).unwrap();
+
+            let cache = make_cache();
+            let subs = make_subs();
+            let session = SessionHandle::new(subs.clone());
+            let (tx_session, mut rx_session) = mpsc::channel(8);
+            let canonical = bridge::resources::make_uri(&file).unwrap();
+            session
+                .subscribe_for_test(
+                    &DiagnosticsResourceUri::for_test(&canonical),
+                    Target::Channel(tx_session),
+                )
+                .await
+                .unwrap();
+
+            let (tx, rx) = mpsc::channel(8);
+            let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            tokio::spawn(diagnostics_pump(
+                ServerId::from("rust"),
+                rx,
+                lifecycle_rx,
+                cancel_rx,
+                true,
+                PumpShared {
+                    notification_cache: Arc::clone(&cache),
+                    subs,
+                    workspace_roots: Arc::from(vec![root]),
+                },
+            ));
+            let error = lsp_types::Diagnostic {
+                message: "boom".to_owned().into(),
+                ..Default::default()
+            };
+            for (path, diagnostics) in [(&escape, vec![error.clone()]), (&link, vec![error])] {
+                tx.send(LspNotification::PublishDiagnostics(
+                    PublishDiagnosticsParams {
+                        uri: bridge::path_to_uri(path).unwrap(),
+                        diagnostics,
+                        version: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            }
+
+            assert_eq!(recv_within(&mut rx_session).await, canonical);
+            let canonical_lsp = bridge::path_to_uri(&file).unwrap();
+            let (info, escaped) = {
+                let guard = cache.lock().await;
+                (
+                    guard.diagnostic_sources(canonical_lsp.as_ref()),
+                    guard.has_diagnostics(bridge::path_to_uri(&escape).unwrap().as_ref()),
+                )
+            };
+            assert_eq!(info.merge().unwrap().diagnostics.len(), 1);
+            assert!(
+                !escaped,
+                "a symlink pointing outside the workspace must be dropped"
+            );
         }
 
         /// #468: a session whose peer stopped reading neither blocks the pump
