@@ -2592,6 +2592,13 @@ mod tests {
                 {
                     Ok(Ok(0)) | Err(_) => break,
                     Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+                    // Server closes after the early 403 with the body unread, which surfaces as RST.
+                    Ok(Err(e))
+                        if e.kind() == std::io::ErrorKind::ConnectionReset
+                            && !response.is_empty() =>
+                    {
+                        break;
+                    }
                     Ok(Err(e)) => panic!("read error: {e}"),
                 }
             }

@@ -92,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `test_run_http_enforces_loopback_origin` no longer fails intermittently on a connection reset after the `403` response. (#601)
 - Language servers start concurrently and each is usable as soon as its own `initialize` completes. (#590)
 - An invalid `--http-path` is rejected at argument parsing instead of panicking. (#590)
 - A client answering liveness probes on an open GET stream is no longer dropped after 5 minutes. (#590)
