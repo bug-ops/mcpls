@@ -12,6 +12,7 @@ use tokio::time::Duration;
 
 use super::Translator;
 use super::restart::{NotificationReceivers, NotificationRouting};
+use crate::DiagnosticsRole;
 use crate::bridge::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
@@ -74,7 +75,7 @@ impl Translator {
     /// Two concurrent callers racing to respawn the same server both get a
     /// clone of the *same* underlying `Mutex`, so awaiting it actually
     /// serializes them instead of letting both proceed independently.
-    pub(super) fn respawn_lock(&self, id: &ServerId) -> Arc<Mutex<()>> {
+    pub(crate) fn respawn_lock(&self, id: &ServerId) -> Arc<Mutex<()>> {
         Arc::clone(
             lock_std(&self.respawn_locks)
                 .entry(id.clone())
@@ -347,9 +348,11 @@ impl Translator {
         }
 
         let consumer = match routing {
-            NotificationRouting::Pump(wiring) => {
-                wiring.spawn_pump(id.clone(), receivers, diagnostics_route)
-            }
+            NotificationRouting::Pump(wiring) => wiring.spawn_pump(
+                id.clone(),
+                receivers,
+                DiagnosticsRole::from_route(diagnostics_route),
+            ),
             NotificationRouting::Discard => self.spawn_discard_consumer(id, receivers),
         };
         lock_std(&self.notification_tasks).insert(id.clone(), consumer);
@@ -946,17 +949,17 @@ fi
 
             let guard = cache.lock().await;
             assert!(
-                guard.diagnostics(synced_uri.as_ref()).is_none(),
+                guard.diagnostics(&synced_uri).is_none(),
                 "diagnostics attributed to the crashed connection must be \
                  invalidated on respawn, not served as current"
             );
             assert!(
-                guard.diagnostics(never_opened_uri.as_ref()).is_none(),
+                guard.diagnostics(&never_opened_uri).is_none(),
                 "workspace-wide diagnostics for a file mcpls never opened \
                  must also be invalidated, not just synced documents"
             );
             assert!(
-                guard.diagnostics(other_language_uri.as_ref()).is_some(),
+                guard.diagnostics(&other_language_uri).is_some(),
                 "a different diagnostics-route server's entries must survive \
                  an unrelated server's respawn-triggered cache clear"
             );
@@ -1232,7 +1235,7 @@ sleep 1
                 cache
                     .lock()
                     .await
-                    .diagnostics(owned_by_healthy_server.as_ref())
+                    .diagnostics(&owned_by_healthy_server)
                     .is_some(),
                 "respawning a non-diagnostics-route server must not clear \
                  the diagnostics-route server's cache entries"

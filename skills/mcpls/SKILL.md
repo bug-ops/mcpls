@@ -95,7 +95,7 @@ no environment variable equivalent.
 | `--log-level <LEVEL>` | `-l` | `MCPLS_LOG` | `info` | Any `tracing-subscriber` `EnvFilter` directive works, e.g. `mcpls=debug,info`. An invalid value does **not** error — it silently falls back to `info`. |
 | `--log-json` | — | `MCPLS_LOG_JSON` | `false` | Output logs in JSON format for structured logging. The env var accepts `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive). |
 | `--listen <ADDR>` | — | `MCPLS_LISTEN` | unset | HTTP transport bind address (e.g. `127.0.0.1:3000`). Only exists when built with `--features transport-http` — see [HTTP transport caveats](#registering-with-an-mcp-client). |
-| `--http-path <PATH>` | — | `MCPLS_HTTP_PATH` | `/mcp` | URL path the MCP service mounts at. Only meaningful with `--listen`; same `transport-http` feature gate. |
+| `--http-path <PATH>` | — | `MCPLS_HTTP_PATH` | `/mcp` | URL path the MCP service mounts at. Must start with `/`, must not be `/`, and may use only ASCII letters, digits and `-._~` per segment; an invalid value exits with code 2 before any server starts, even without `--listen`. Only used with `--listen`; same `transport-http` feature gate. HTTP requests carrying an `Origin` other than a loopback origin on the bound port get `403`. |
 
 Plus standard `--version` / `--help`. No subcommands.
 

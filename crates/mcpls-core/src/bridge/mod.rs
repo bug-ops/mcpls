@@ -26,11 +26,11 @@ pub(crate) use indexing::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_SETTLE,
 };
 pub use indexing::{IndexingPolicy, IndexingState};
-pub(crate) use notifications::diagnostics_cache_key;
 pub use notifications::{
     DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
     ServerMessage, apply_lifecycle_notification,
 };
+pub(crate) use notifications::{DiagnosticsKey, diagnostics_cache_key};
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, ResourceLimits, path_to_uri,
     uri_to_path,

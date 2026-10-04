@@ -83,28 +83,66 @@ const MAX_DIAGNOSTICS_ENTRY_BYTES: usize = 1024 * 1024;
 /// emptiness -- see the private `entry_to_evict` (#284).
 const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 
-/// Normalize a URI string to a stable cache key.
+/// A `file:` URI normalized for cache lookup; only built by [`Self::of`], so a
+/// raw URI string can never be mistaken for a key.
 ///
 /// On Windows, URI comparisons must be case-insensitive: the filesystem is
 /// case-insensitive and different tools (e.g. rust-analyzer vs std) may
 /// produce drive letters in different cases (`C:` vs `c:`).
 /// Lowercasing the entire URI is safe for `file://` URIs because they have
 /// no case-sensitive query or fragment components.
-fn uri_cache_key(uri: &str) -> std::borrow::Cow<'_, str> {
-    if cfg!(windows) {
-        std::borrow::Cow::Owned(uri.to_ascii_lowercase())
-    } else {
-        std::borrow::Cow::Borrowed(uri)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DiagnosticsKey(String);
+
+impl DiagnosticsKey {
+    fn of(uri: &Uri) -> Self {
+        let text: &str = uri.as_ref();
+        if cfg!(windows) {
+            Self(text.to_ascii_lowercase())
+        } else {
+            Self(text.to_owned())
+        }
+    }
+}
+
+/// How a cached entry's URI relates to the canonical path of its file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Spelling {
+    /// The server published under the canonical spelling of the path.
+    Canonical,
+    /// The server published under a symlink alias of the file at this key.
+    Alias(DiagnosticsKey),
+}
+
+/// One cached diagnostics entry with all of its bookkeeping, so the indices
+/// derived from it are only ever touched by `insert_entry`/`take_entry`.
+#[derive(Debug)]
+struct CachedEntry {
+    info: DiagnosticInfo,
+    /// Server that published the entry.
+    owner: ServerId,
+    /// Position in `owner`'s write order.
+    seq: u64,
+    spelling: Spelling,
+}
+
+impl CachedEntry {
+    /// Key of the file this entry belongs to, given the entry's own `key`.
+    const fn file<'a>(&'a self, key: &'a DiagnosticsKey) -> &'a DiagnosticsKey {
+        match &self.spelling {
+            Spelling::Canonical => key,
+            Spelling::Alias(canonical) => canonical,
+        }
     }
 }
 
 /// The cache key under which diagnostics for the file behind `uri` are
 /// stored, for matching [`NotificationCache::clear_server_diagnostics`]
 /// results against a subscription.
-pub fn diagnostics_cache_key(uri: &DiagnosticsResourceUri) -> Option<String> {
+pub fn diagnostics_cache_key(uri: &DiagnosticsResourceUri) -> Option<DiagnosticsKey> {
     let path = crate::bridge::resources::parse_uri(uri.as_str()).ok()?;
     let lsp_uri = crate::bridge::try_path_to_uri(&path)?;
-    Some(uri_cache_key(lsp_uri.as_ref()).into_owned())
+    Some(DiagnosticsKey::of(&lsp_uri))
 }
 
 /// Maximum number of distinct published URIs (a canonical path and its
@@ -402,19 +440,12 @@ pub struct DiagnosticInfo {
     pub diagnostics: Vec<LspDiagnostic>,
 }
 
-/// Where a published URI's entry is indexed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SourceIndex {
-    canonical_key: String,
-    is_canonical: bool,
-}
-
 /// One cached entry of a [`DiagnosticSources`] snapshot.
 #[derive(Debug, Clone)]
 struct SourceEntry {
     info: DiagnosticInfo,
     /// Whether the server published under the canonical spelling of the path.
-    is_canonical: bool,
+    spelling: Spelling,
 }
 
 /// Owned snapshot of the diagnostics cached for one file, possibly spread
@@ -445,10 +476,12 @@ impl DiagnosticSources {
     /// # Examples
     ///
     /// ```
+    /// use lsp_types::Uri;
     /// use mcpls_core::bridge::NotificationCache;
     ///
     /// let cache = NotificationCache::new();
-    /// let sources = cache.diagnostic_sources("file:///workspace/main.rs");
+    /// let uri = Uri::from("file:///workspace/main.rs".to_owned());
+    /// let sources = cache.diagnostic_sources(&uri);
     /// assert!(sources.merge().is_none());
     /// ```
     #[must_use]
@@ -459,7 +492,7 @@ impl DiagnosticSources {
         }
         let version = entries
             .iter()
-            .find(|entry| entry.is_canonical)
+            .find(|entry| entry.spelling == Spelling::Canonical)
             .and_then(|entry| entry.info.version);
 
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
@@ -567,47 +600,34 @@ impl From<lsp_types::MessageType> for MessageType {
 /// Cache for LSP server notifications.
 #[derive(Debug)]
 pub struct NotificationCache {
-    /// Diagnostics indexed by document URI.
-    diagnostics: HashMap<String, DiagnosticInfo>,
-    /// Server that currently owns each cached URI, so an entry's order map
-    /// can be found without scanning every server's.
-    diagnostics_owners: HashMap<String, ServerId>,
-    /// Per-server `diagnostics` keys ordered oldest-write-first, keyed by a
+    /// Diagnostics entries by published URI.
+    entries: HashMap<DiagnosticsKey, CachedEntry>,
+    /// Per-server entry keys ordered oldest-write-first, keyed by a
     /// monotonic sequence number rather than position: a re-publish removes
-    /// its old entry by key in `O(log n)` (via `diagnostic_seq`) instead of
-    /// scanning for it, which a plain `VecDeque` would require. Not
-    /// independently capped per server -- only the aggregate across all
-    /// servers is bounded, by `MAX_DIAGNOSTIC_ENTRIES` -- but each server's
-    /// own map length is what eviction compares against its fair share (see
+    /// its old entry by key in `O(log n)` instead of scanning for it, which a
+    /// plain `VecDeque` would require. Not independently capped per server --
+    /// only the aggregate across all servers is bounded, by
+    /// `MAX_DIAGNOSTIC_ENTRIES` -- but each server's own map length is what
+    /// eviction compares against its fair share (see
     /// [`NotificationCache::server_to_evict_from`]) to decide which server
     /// loses an entry once the aggregate is full, so one server's write
     /// volume can never evict another's entries while it still has room
-    /// left in the global budget (#266, #276). Kept in sync with
-    /// `diagnostics` by every method that adds or removes an entry.
-    diagnostic_order: HashMap<ServerId, BTreeMap<u64, String>>,
-    /// Maps each cached URI to its current sequence number in its owner's
-    /// `diagnostic_order` map, so a re-publish or clear can find and remove
-    /// its old order entry without scanning.
-    diagnostic_seq: HashMap<String, u64>,
-    /// Canonical file key -> keys of the published URIs (the canonical path
-    /// and its symlink aliases) whose entries are unioned on read. Entries
-    /// themselves stay keyed by published URI, so caps, eviction and owner
-    /// bookkeeping are unchanged; pruned wherever an entry is removed.
-    diagnostics_sources: HashMap<String, BTreeSet<String>>,
-    /// Reverse of `diagnostics_sources`: published-URI key -> where it is
-    /// indexed and whether it is the canonical spelling.
-    source_canonical: HashMap<String, SourceIndex>,
-    /// Next sequence number to assign in `diagnostic_order`. Shared across
-    /// every server's order map and monotonically increasing for the
-    /// cache's lifetime; never reused, so it never collides with an older
-    /// entry still pending eviction.
+    /// left in the global budget (#266, #276).
+    order: HashMap<ServerId, BTreeMap<u64, DiagnosticsKey>>,
+    /// Canonical file key -> keys of the entries (the canonical path and its
+    /// symlink aliases) whose diagnostics are unioned on read.
+    files: HashMap<DiagnosticsKey, BTreeSet<DiagnosticsKey>>,
+    /// Next sequence number to assign in `order`. Shared across every
+    /// server's order map and monotonically increasing for the cache's
+    /// lifetime; never reused, so it never collides with an older entry
+    /// still pending eviction.
     next_diagnostic_seq: u64,
     /// Number of registered diagnostics-route servers currently sharing the
     /// `MAX_DIAGNOSTIC_ENTRIES` budget, explicitly configured via
     /// [`NotificationCache::set_diagnostics_route_count`].
     ///
     /// `None` until that setter is called -- `per_server_budget` then falls
-    /// back to the number of servers whose `diagnostic_order` entry is
+    /// back to the number of servers whose `order` entry is
     /// non-empty (i.e. currently holds at least one entry) rather than
     /// treating an unset count as `1`, which used to hand a single early
     /// publisher the entire budget with no fair-share partitioning at all
@@ -615,18 +635,18 @@ pub struct NotificationCache {
     /// caller knows it up front: it pre-accounts for servers that are
     /// registered but have not published anything yet, avoiding a window
     /// where an early publisher is temporarily over-allocated before a
-    /// slower server's first write grows `diagnostic_order`.
+    /// slower server's first write grows `order`.
     diagnostics_route_count: Option<usize>,
 
-    /// Count of entries in `diagnostics` whose diagnostics list is currently
+    /// Count of entries in `entries` whose diagnostics list is currently
     /// empty (`[]`), i.e. an LSP server reporting a previously-tracked file
     /// as now clean. A plain counter, not a duplicated key set, so `0` is an
     /// `O(1)` signal that lets `entry_to_evict` skip its empty-entry search
     /// entirely in the common steady state of a codebase full of real
     /// diagnostics (#284) -- which entry is empty is still answered by
-    /// looking the key up in `diagnostics` itself (see the private
-    /// `is_empty_entry`), not by mirroring membership here. Kept in sync by
-    /// every method that adds or removes a `diagnostics` entry.
+    /// looking the key up in `entries` itself (see the private
+    /// `is_empty_entry`), not by mirroring membership here. Maintained only
+    /// by `insert_entry`/`take_entry`.
     empty_diagnostics_count: usize,
     /// Recent log entries (FIFO queue with max size).
     logs: VecDeque<LogEntry>,
@@ -662,12 +682,9 @@ impl NotificationCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            diagnostics: HashMap::with_capacity(32),
-            diagnostics_owners: HashMap::with_capacity(32),
-            diagnostic_order: HashMap::new(),
-            diagnostic_seq: HashMap::with_capacity(32),
-            diagnostics_sources: HashMap::new(),
-            source_canonical: HashMap::new(),
+            entries: HashMap::with_capacity(32),
+            order: HashMap::new(),
+            files: HashMap::new(),
             next_diagnostic_seq: 0,
             diagnostics_route_count: None,
             empty_diagnostics_count: 0,
@@ -698,13 +715,18 @@ impl NotificationCache {
         self.diagnostics_route_count = Some(count.max(1));
     }
 
+    #[cfg(test)]
+    pub(crate) const fn configured_route_count(&self) -> Option<usize> {
+        self.diagnostics_route_count
+    }
+
     /// Current per-server fair share of `MAX_DIAGNOSTIC_ENTRIES`, divided
     /// evenly across the configured server count and floored at 1 so a
     /// large server count can never reduce a server's share to zero.
     ///
     /// Uses the explicit count from [`Self::set_diagnostics_route_count`]
     /// when set; otherwise falls back to the number of servers whose
-    /// `diagnostic_order` entry is non-empty (#283) -- matching
+    /// `order` entry is non-empty (#283) -- matching
     /// `server_to_evict_from`'s own `!order.is_empty()` filter, so a server
     /// that has been fully evicted or reassigned away from (an empty but
     /// still-present order map) is not double-counted in the denominator.
@@ -720,7 +742,7 @@ impl NotificationCache {
         let count = self
             .diagnostics_route_count
             .unwrap_or_else(|| {
-                self.diagnostic_order
+                self.order
                     .values()
                     .filter(|order| !order.is_empty())
                     .count()
@@ -751,13 +773,13 @@ impl NotificationCache {
     /// *last* equally-maximal element it sees, and a `HashMap`'s iteration
     /// order is randomized per process, so an `order.len()`-only key would
     /// make the eviction target for a genuine tie vary from run to run.
-    /// Every candidate here is a distinct `diagnostic_order` key, so pairing
+    /// Every candidate here is a distinct `order` key, so pairing
     /// the count with `id.as_str()` makes the sort key unique per server --
     /// no two entries can ever tie on the full key, which eliminates the
     /// non-determinism outright rather than just picking a fixed side of it.
     fn server_to_evict_from(&self, writer: &ServerId) -> Option<ServerId> {
         let largest = self
-            .diagnostic_order
+            .order
             .iter()
             .filter(|(_, order)| !order.is_empty())
             .max_by_key(|(id, order)| (order.len(), id.as_str()));
@@ -770,7 +792,7 @@ impl NotificationCache {
         }
 
         if self
-            .diagnostic_order
+            .order
             .get(writer)
             .is_some_and(|order| !order.is_empty())
         {
@@ -782,19 +804,19 @@ impl NotificationCache {
 
     /// Whether the cached entry for `key` currently has an empty (`[]`)
     /// diagnostics list, i.e. an LSP server reporting a previously-tracked
-    /// file as now clean. Derived directly from `diagnostics` rather than
+    /// file as now clean. Derived directly from `entries` rather than
     /// from a separately maintained key set, so there is nothing else to
     /// keep in sync (#284).
-    fn is_empty_entry(&self, key: &str) -> bool {
-        self.diagnostics
+    fn is_empty_entry(&self, key: &DiagnosticsKey) -> bool {
+        self.entries
             .get(key)
-            .is_some_and(|info| info.diagnostics.is_empty())
+            .is_some_and(|entry| entry.info.diagnostics.is_empty())
     }
 
     /// Oldest entry in `server`'s own order map whose diagnostics list is
     /// empty, if it has one.
-    fn oldest_empty_entry_in(&self, server: &ServerId) -> Option<(u64, String)> {
-        let order = self.diagnostic_order.get(server)?;
+    fn oldest_empty_entry_in(&self, server: &ServerId) -> Option<(u64, DiagnosticsKey)> {
+        let order = self.order.get(server)?;
         order
             .iter()
             .find(|(_, key)| self.is_empty_entry(key))
@@ -831,7 +853,7 @@ impl NotificationCache {
     /// is `0`, so the common steady state (a codebase full of real
     /// diagnostics, no clean-file churn) pays no extra cost over a plain
     /// oldest-first lookup (#284).
-    fn entry_to_evict(&self, writer: &ServerId) -> Option<(ServerId, u64, String)> {
+    fn entry_to_evict(&self, writer: &ServerId) -> Option<(ServerId, u64, DiagnosticsKey)> {
         let evict_from = self.server_to_evict_from(writer)?;
 
         if self.empty_diagnostics_count > 0 {
@@ -841,7 +863,7 @@ impl NotificationCache {
 
             let budget = self.per_server_budget();
             let cross_server_pick = self
-                .diagnostic_order
+                .order
                 .iter()
                 .filter(|(id, order)| order.len() > budget && *id != &evict_from)
                 .filter_map(|(id, order)| {
@@ -855,12 +877,14 @@ impl NotificationCache {
             }
         }
 
-        let order = self.diagnostic_order.get(&evict_from)?;
+        let order = self.order.get(&evict_from)?;
         let (&seq, key) = order.iter().next()?;
         Some((evict_from, seq, key.clone()))
     }
 
-    /// Store diagnostics for a document published by `server_id`.
+    /// Store diagnostics for a document published by `server_id`, indexed
+    /// under its canonical file so every spelling of one file is read back as
+    /// the union of what each published.
     ///
     /// Each diagnostic's `message` is truncated to `MAX_ENTRY_TEXT_BYTES`,
     /// and the whole list is bounded to `MAX_DIAGNOSTICS_ENTRY_BYTES`
@@ -888,93 +912,6 @@ impl NotificationCache {
     /// being capped at a static equal split regardless of how much of it
     /// they actually use. Which exact entry is removed is further refined by
     /// emptiness -- see the private `entry_to_evict` (#284).
-    pub(crate) fn store_diagnostics(
-        &mut self,
-        server_id: &ServerId,
-        uri: &Uri,
-        version: Option<i32>,
-        mut diagnostics: Vec<LspDiagnostic>,
-    ) {
-        // Bound each diagnostic's free-form message text (#311); see
-        // `MAX_ENTRY_TEXT_BYTES`. `mem::take` + `truncate_string` avoids an
-        // extra clone on the common (already-under-limit) path, since
-        // `message` is already an owned `String` here.
-        for diagnostic in &mut diagnostics {
-            let placeholder = lsp_types::Message::String(String::new());
-            diagnostic.message = truncate_message(
-                std::mem::replace(&mut diagnostic.message, placeholder),
-                MAX_ENTRY_TEXT_BYTES,
-            );
-        }
-        // Bound the whole list's serialized size (#311 C1); see
-        // `MAX_DIAGNOSTICS_ENTRY_BYTES`.
-        cap_diagnostics_entry_size(uri, &mut diagnostics);
-
-        let key = uri_cache_key(uri.as_ref()).into_owned();
-        let info = DiagnosticInfo {
-            uri: uri.clone(),
-            version,
-            diagnostics,
-        };
-
-        // Remove the URI's existing order entry, if any -- from its
-        // previous owner's order map, whether that's this same server (a
-        // republish, repositioned to the back below) or a different one
-        // (the diagnostics route changed, e.g. on respawn). Also tells us
-        // whether this store adds a new entry to the aggregate (and so may
-        // need to evict to stay within budget) or merely replaces one.
-        let mut is_new_entry = true;
-        if let Some(old_seq) = self.diagnostic_seq.remove(&key) {
-            is_new_entry = false;
-            if let Some(previous_owner) = self.diagnostics_owners.get(&key)
-                && let Some(order) = self.diagnostic_order.get_mut(previous_owner)
-            {
-                order.remove(&old_seq);
-            }
-        }
-
-        if is_new_entry {
-            while self.diagnostics.len() >= MAX_DIAGNOSTIC_ENTRIES
-                && let Some((owner, seq, evict_key)) = self.entry_to_evict(server_id)
-            {
-                debug_assert_eq!(self.diagnostic_seq.get(&evict_key), Some(&seq));
-                debug_assert_eq!(self.diagnostics_owners.get(&evict_key), Some(&owner));
-                self.remove_entry(&evict_key);
-            }
-        }
-
-        self.diagnostics_owners
-            .insert(key.clone(), server_id.clone());
-        let seq = self.next_diagnostic_seq;
-        self.next_diagnostic_seq = self.next_diagnostic_seq.saturating_add(1);
-        self.diagnostic_order
-            .entry(server_id.clone())
-            .or_default()
-            .insert(seq, key.clone());
-        self.diagnostic_seq.insert(key.clone(), seq);
-
-        // Track the emptiness transition, if any, of the entry this store
-        // replaces (or creates) -- `self.diagnostics` still holds the old
-        // value at this point, since the `insert` below hasn't run yet
-        // (#284: derived from `diagnostics` itself, not a duplicated key
-        // set).
-        let was_empty = self.is_empty_entry(&key);
-        let is_empty_now = info.diagnostics.is_empty();
-        match (was_empty, is_empty_now) {
-            (false, true) => {
-                self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_add(1);
-            }
-            (true, false) => {
-                self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
-            }
-            _ => {}
-        }
-        self.diagnostics.insert(key, info);
-    }
-
-    /// Store diagnostics a server published for `published`, indexed under
-    /// its canonical file so every spelling of one file is read back as the
-    /// union of what each published.
     ///
     /// An empty publish replaces only its own source's entry. At most
     /// `MAX_SOURCES_PER_FILE` spellings are kept per file: a further alias is
@@ -986,17 +923,17 @@ impl NotificationCache {
         server_id: &ServerId,
         published: &PublishedDiagnosticsUri,
         version: Option<i32>,
-        diagnostics: Vec<LspDiagnostic>,
+        mut diagnostics: Vec<LspDiagnostic>,
     ) {
-        let source_key = uri_cache_key(published.source().as_ref()).into_owned();
-        let canonical_key = uri_cache_key(published.canonical().as_ref()).into_owned();
+        let source_key = DiagnosticsKey::of(published.source());
+        let canonical_key = DiagnosticsKey::of(published.canonical());
 
         let already_indexed = self
-            .source_canonical
+            .entries
             .get(&source_key)
-            .is_some_and(|index| index.canonical_key == canonical_key);
+            .is_some_and(|entry| entry.file(&source_key) == &canonical_key);
         let at_capacity = self
-            .diagnostics_sources
+            .files
             .get(&canonical_key)
             .is_some_and(|sources| sources.len() >= MAX_SOURCES_PER_FILE);
         if !already_indexed && at_capacity {
@@ -1012,82 +949,170 @@ impl NotificationCache {
                 );
                 return;
             };
-            self.remove_entry(&oldest_alias);
+            self.take_entry(&oldest_alias);
         }
 
-        self.store_diagnostics(server_id, published.source(), version, diagnostics);
+        // Bound each diagnostic's free-form message text (#311); see
+        // `MAX_ENTRY_TEXT_BYTES`. `mem::take` + `truncate_string` avoids an
+        // extra clone on the common (already-under-limit) path, since
+        // `message` is already an owned `String` here.
+        for diagnostic in &mut diagnostics {
+            let placeholder = lsp_types::Message::String(String::new());
+            diagnostic.message = truncate_message(
+                std::mem::replace(&mut diagnostic.message, placeholder),
+                MAX_ENTRY_TEXT_BYTES,
+            );
+        }
+        // Bound the whole list's serialized size (#311 C1); see
+        // `MAX_DIAGNOSTICS_ENTRY_BYTES`.
+        cap_diagnostics_entry_size(published.source(), &mut diagnostics);
 
-        self.unindex_source(&source_key);
-        self.diagnostics_sources
-            .entry(canonical_key.clone())
-            .or_default()
-            .insert(source_key.clone());
-        self.source_canonical.insert(
+        let info = DiagnosticInfo {
+            uri: published.source().clone(),
+            version,
+            diagnostics,
+        };
+
+        // A replacement leaves its previous owner's order map (the owner may
+        // differ when the diagnostics route changed, e.g. on respawn) and
+        // never needs room; only a genuinely new URI can trigger eviction.
+        let is_new_entry = self.take_entry(&source_key).is_none();
+        if is_new_entry {
+            while self.entries.len() >= MAX_DIAGNOSTIC_ENTRIES
+                && let Some((_, _, evict_key)) = self.entry_to_evict(server_id)
+            {
+                self.take_entry(&evict_key);
+            }
+        }
+
+        let seq = self.next_diagnostic_seq;
+        self.next_diagnostic_seq = self.next_diagnostic_seq.saturating_add(1);
+        let spelling = if published.is_canonical() {
+            Spelling::Canonical
+        } else {
+            Spelling::Alias(canonical_key)
+        };
+        self.insert_entry(
             source_key,
-            SourceIndex {
-                canonical_key,
-                is_canonical: published.is_canonical(),
+            CachedEntry {
+                info,
+                owner: server_id.clone(),
+                seq,
+                spelling,
             },
         );
     }
 
-    /// The least recently written non-canonical source indexed under
-    /// `canonical_key`.
-    fn oldest_alias_source(&self, canonical_key: &str) -> Option<String> {
-        self.diagnostics_sources
-            .get(canonical_key)?
-            .iter()
-            .filter(|source| {
-                self.source_canonical
-                    .get(*source)
-                    .is_some_and(|index| !index.is_canonical)
-            })
-            .min_by_key(|source| self.diagnostic_seq.get(*source))
-            .cloned()
+    /// Stores `uri`'s diagnostics as the canonical spelling of its own file.
+    #[cfg(test)]
+    pub(crate) fn store_diagnostics(
+        &mut self,
+        server_id: &ServerId,
+        uri: &Uri,
+        version: Option<i32>,
+        diagnostics: Vec<LspDiagnostic>,
+    ) {
+        let published = PublishedDiagnosticsUri::for_test(uri.clone(), uri.clone());
+        self.store_published_diagnostics(server_id, &published, version, diagnostics);
     }
 
-    /// Removes one cached entry and every piece of bookkeeping for it.
-    fn remove_entry(&mut self, key: &str) {
-        if let Some(seq) = self.diagnostic_seq.remove(key)
-            && let Some(owner) = self.diagnostics_owners.get(key)
-            && let Some(order) = self.diagnostic_order.get_mut(owner)
-        {
-            order.remove(&seq);
+    /// Adds `entry` under `key`, which must not be cached yet, to every
+    /// index. Together with [`Self::take_entry`] the only code that touches
+    /// `order`, `files` and `empty_diagnostics_count`.
+    fn insert_entry(&mut self, key: DiagnosticsKey, entry: CachedEntry) {
+        debug_assert!(!self.entries.contains_key(&key));
+        self.order
+            .entry(entry.owner.clone())
+            .or_default()
+            .insert(entry.seq, key.clone());
+        self.files
+            .entry(entry.file(&key).clone())
+            .or_default()
+            .insert(key.clone());
+        if entry.info.diagnostics.is_empty() {
+            self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_add(1);
         }
-        self.diagnostics_owners.remove(key);
-        if self
-            .diagnostics
-            .remove(key)
-            .is_some_and(|removed| removed.diagnostics.is_empty())
-        {
-            self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
-        }
-        self.unindex_source(key);
+        self.entries.insert(key, entry);
     }
 
-    fn unindex_source(&mut self, source_key: &str) {
-        let Some(index) = self.source_canonical.remove(source_key) else {
-            return;
-        };
-        if let Some(sources) = self.diagnostics_sources.get_mut(&index.canonical_key) {
-            sources.remove(source_key);
-            if sources.is_empty() {
-                self.diagnostics_sources.remove(&index.canonical_key);
+    /// Removes the entry cached under `key` from every index and returns it.
+    fn take_entry(&mut self, key: &DiagnosticsKey) -> Option<CachedEntry> {
+        let entry = self.entries.remove(key)?;
+        if let Some(order) = self.order.get_mut(&entry.owner) {
+            order.remove(&entry.seq);
+        }
+        let file = entry.file(key);
+        if let Some(members) = self.files.get_mut(file) {
+            members.remove(key);
+            if members.is_empty() {
+                self.files.remove(file);
             }
         }
+        if entry.info.diagnostics.is_empty() {
+            self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
+        }
+        Some(entry)
+    }
+
+    /// Panics unless `order`, `files` and `empty_diagnostics_count` describe
+    /// exactly the cached entries.
+    #[cfg(test)]
+    fn assert_consistent(&self) {
+        let mut ordered = 0;
+        for (server, order) in &self.order {
+            for (seq, key) in order {
+                let entry = self
+                    .entries
+                    .get(key)
+                    .unwrap_or_else(|| panic!("ordered key has no entry"));
+                assert_eq!((&entry.owner, entry.seq), (server, *seq));
+                ordered += 1;
+            }
+        }
+        assert_eq!(ordered, self.entries.len(), "order and entries diverge");
+
+        let mut filed = 0;
+        for (file, members) in &self.files {
+            assert!(!members.is_empty(), "empty file set kept");
+            for key in members {
+                let entry = self
+                    .entries
+                    .get(key)
+                    .unwrap_or_else(|| panic!("filed key has no entry"));
+                assert_eq!(entry.file(key), file);
+                filed += 1;
+            }
+        }
+        assert_eq!(filed, self.entries.len(), "files and entries diverge");
+
+        let empty = self
+            .entries
+            .values()
+            .filter(|entry| entry.info.diagnostics.is_empty())
+            .count();
+        assert_eq!(empty, self.empty_diagnostics_count);
+    }
+
+    /// The least recently written non-canonical source indexed under
+    /// `canonical_key`.
+    fn oldest_alias_source(&self, canonical_key: &DiagnosticsKey) -> Option<DiagnosticsKey> {
+        self.files
+            .get(canonical_key)?
+            .iter()
+            .filter_map(|source| {
+                let entry = self.entries.get(source)?;
+                matches!(entry.spelling, Spelling::Alias(_)).then_some((entry.seq, source))
+            })
+            .min_by_key(|(seq, _)| *seq)
+            .map(|(_, source)| source.clone())
     }
 
     /// Keys of every entry cached for the file `key` names: its indexed
     /// published URIs plus an entry stored directly under `key` itself.
-    fn source_keys<'a>(&'a self, key: &'a str) -> BTreeSet<&'a str> {
-        let mut keys: BTreeSet<&str> = self
-            .diagnostics_sources
-            .get(key)
-            .into_iter()
-            .flatten()
-            .map(String::as_str)
-            .collect();
-        if self.diagnostics.contains_key(key) {
+    fn source_keys<'a>(&'a self, key: &'a DiagnosticsKey) -> BTreeSet<&'a DiagnosticsKey> {
+        let mut keys: BTreeSet<&DiagnosticsKey> =
+            self.files.get(key).into_iter().flatten().collect();
+        if self.entries.contains_key(key) {
             keys.insert(key);
         }
         keys
@@ -1208,7 +1233,7 @@ impl NotificationCache {
 
     /// Get diagnostics for a document URI.
     ///
-    /// If the stored list was ever truncated by `store_diagnostics`'s
+    /// If the stored list was ever truncated by `store_published_diagnostics`'s
     /// `MAX_DIAGNOSTICS_ENTRY_BYTES` cap (#311), the diagnostics here are in
     /// severity order (`ERROR` first), not the original publish/file-position
     /// order -- callers that assume file-position order should not rely on
@@ -1219,8 +1244,10 @@ impl NotificationCache {
     /// published URIs; use [`Self::diagnostic_sources`] to read the union.
     #[inline]
     #[must_use]
-    pub fn diagnostics(&self, uri: &str) -> Option<&DiagnosticInfo> {
-        self.diagnostics.get(uri_cache_key(uri).as_ref())
+    pub fn diagnostics(&self, uri: &Uri) -> Option<&DiagnosticInfo> {
+        self.entries
+            .get(&DiagnosticsKey::of(uri))
+            .map(|entry| &entry.info)
     }
 
     /// Snapshot of every entry cached for the file `uri` names, to be
@@ -1232,30 +1259,31 @@ impl NotificationCache {
     /// # Examples
     ///
     /// ```
+    /// use lsp_types::Uri;
     /// use mcpls_core::bridge::NotificationCache;
     ///
     /// let cache = NotificationCache::new();
-    /// let snapshot = cache.diagnostic_sources("file:///workspace/main.rs");
+    /// let uri = Uri::from("file:///workspace/main.rs".to_owned());
+    /// let snapshot = cache.diagnostic_sources(&uri);
     /// // Merge once the cache lock has been released.
     /// assert!(snapshot.merge().is_none());
     /// ```
     #[must_use]
-    pub fn diagnostic_sources(&self, uri: &str) -> DiagnosticSources {
-        let key = uri_cache_key(uri);
+    pub fn diagnostic_sources(&self, uri: &Uri) -> DiagnosticSources {
+        let key = DiagnosticsKey::of(uri);
         let entries = self
             .source_keys(&key)
             .into_iter()
             .filter_map(|source| {
-                let info = self.diagnostics.get(source)?.clone();
-                let is_canonical = self
-                    .source_canonical
-                    .get(source)
-                    .map_or_else(|| source == key.as_ref(), |index| index.is_canonical);
-                Some(SourceEntry { info, is_canonical })
+                let entry = self.entries.get(source)?;
+                Some(SourceEntry {
+                    info: entry.info.clone(),
+                    spelling: entry.spelling.clone(),
+                })
             })
             .collect();
         DiagnosticSources {
-            requested: Uri::from(uri.to_owned()),
+            requested: uri.clone(),
             entries,
         }
     }
@@ -1266,16 +1294,17 @@ impl NotificationCache {
     /// # Examples
     ///
     /// ```
+    /// use lsp_types::Uri;
     /// use mcpls_core::bridge::NotificationCache;
     ///
     /// let cache = NotificationCache::new();
-    /// assert!(!cache.has_diagnostics("file:///workspace/main.rs"));
+    /// let uri = Uri::from("file:///workspace/main.rs".to_owned());
+    /// assert!(!cache.has_diagnostics(&uri));
     /// ```
     #[must_use]
-    pub fn has_diagnostics(&self, uri: &str) -> bool {
-        let key = uri_cache_key(uri);
-        self.diagnostics.contains_key(key.as_ref())
-            || self.diagnostics_sources.contains_key(key.as_ref())
+    pub fn has_diagnostics(&self, uri: &Uri) -> bool {
+        let key = DiagnosticsKey::of(uri);
+        self.entries.contains_key(&key) || self.files.contains_key(&key)
     }
 
     /// Server that published the currently cached diagnostics for `uri`, if
@@ -1284,14 +1313,17 @@ impl NotificationCache {
     /// one from.
     #[inline]
     #[must_use]
-    pub fn diagnostics_owner(&self, uri: &str) -> Option<&ServerId> {
-        let key = uri_cache_key(uri);
-        self.diagnostics_owners.get(key.as_ref()).or_else(|| {
-            self.diagnostics_sources
-                .get(key.as_ref())?
-                .iter()
-                .find_map(|source| self.diagnostics_owners.get(source))
-        })
+    pub fn diagnostics_owner(&self, uri: &Uri) -> Option<&ServerId> {
+        let key = DiagnosticsKey::of(uri);
+        self.entries
+            .get(&key)
+            .or_else(|| {
+                self.files
+                    .get(&key)?
+                    .iter()
+                    .find_map(|source| self.entries.get(source))
+            })
+            .map(|entry| &entry.owner)
     }
 
     /// All stored log entries.
@@ -1314,22 +1346,13 @@ impl NotificationCache {
     /// be invalidated without disturbing any other server's cache entries
     /// (#266). Returns the cleared cache keys so a caller can tell
     /// subscribers which resources changed (see [`diagnostics_cache_key`]).
-    pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) -> Vec<String> {
-        let Some(order) = self.diagnostic_order.remove(server_id) else {
+    pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) -> Vec<DiagnosticsKey> {
+        let Some(order) = self.order.remove(server_id) else {
             return Vec::new();
         };
         let mut cleared = Vec::with_capacity(order.len());
-        for (_, key) in order {
-            if self
-                .diagnostics
-                .remove(&key)
-                .is_some_and(|info| info.diagnostics.is_empty())
-            {
-                self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
-            }
-            self.diagnostics_owners.remove(&key);
-            self.diagnostic_seq.remove(&key);
-            self.unindex_source(&key);
+        for key in order.into_values() {
+            self.take_entry(&key);
             cleared.push(key);
         }
         cleared
@@ -1364,7 +1387,7 @@ impl NotificationCache {
     #[must_use]
     #[cfg(test)]
     pub(crate) fn diagnostics_count(&self) -> usize {
-        self.diagnostics.len()
+        self.entries.len()
     }
 
     /// Get the number of stored log entries.
@@ -1489,7 +1512,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = cache.diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(&uri).unwrap();
         assert_eq!(stored.uri, uri);
         assert_eq!(stored.version, Some(1));
         assert_eq!(stored.diagnostics.len(), 1);
@@ -1530,7 +1553,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = cache.diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(&uri).unwrap();
         let stored = message_as_str(&stored.diagnostics[0].message);
         assert!(stored.len() < oversized.len());
         assert!(stored.ends_with("... (truncated)"));
@@ -1584,7 +1607,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(&uri).unwrap().diagnostics;
         assert!(
             stored.len() < original_count,
             "aggregate cap must trim the list, kept {} of {original_count}",
@@ -1615,7 +1638,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(&uri).unwrap().diagnostics;
         assert!(
             stored.len() > 2600,
             "largest-fitting-prefix search must keep far more than half, kept {}",
@@ -1658,7 +1681,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(&uri).unwrap().diagnostics;
         assert!(
             stored
                 .iter()
@@ -1738,7 +1761,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(&uri).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         assert_eq!(
             stored[0].message,
@@ -1769,7 +1792,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(&uri).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         assert_eq!(
             stored[0].message,
@@ -1817,7 +1840,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(&uri).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         let serialized_len = serde_json::to_vec(stored).unwrap().len();
         assert!(
@@ -1871,7 +1894,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
 
-        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(&uri).unwrap().diagnostics;
         assert_eq!(stored.len(), 1);
         assert_eq!(
             stored[0].message,
@@ -1901,7 +1924,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = &cache.diagnostics(uri.as_ref()).unwrap().diagnostics;
+        let stored = &cache.diagnostics(&uri).unwrap().diagnostics;
         let serialized_len = serde_json::to_vec(stored).unwrap().len();
         assert!(
             serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
@@ -1921,7 +1944,7 @@ mod tests {
         cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
 
-        let stored = cache.diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(&uri).unwrap();
         assert_eq!(stored.version, Some(2));
     }
 
@@ -2104,13 +2127,10 @@ mod tests {
         };
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
-        assert_eq!(
-            cache.diagnostics(uri.as_ref()).unwrap().diagnostics.len(),
-            1
-        );
+        assert_eq!(cache.diagnostics(&uri).unwrap().diagnostics.len(), 1);
 
         cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
-        let stored = cache.diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(&uri).unwrap();
         assert_eq!(stored.diagnostics.len(), 0);
         assert_eq!(stored.version, Some(2));
     }
@@ -2145,7 +2165,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
 
-        let stored = cache.diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(&uri).unwrap();
         assert_eq!(stored.diagnostics.len(), 100);
     }
 
@@ -2190,9 +2210,9 @@ mod tests {
 
         // Oldest entries should be evicted (FIFO).
         let evicted: Uri = Uri::from("file:///test0.rs");
-        assert!(cache.diagnostics(evicted.as_ref()).is_none());
+        assert!(cache.diagnostics(&evicted).is_none());
         let newest: Uri = Uri::from(format!("file:///test{}.rs", MAX_DIAGNOSTIC_ENTRIES + 9));
-        assert!(cache.diagnostics(newest.as_ref()).is_some());
+        assert!(cache.diagnostics(&newest).is_some());
     }
 
     #[test]
@@ -2209,7 +2229,7 @@ mod tests {
             );
         }
         assert_eq!(cache.diagnostics_count(), 1);
-        assert!(cache.diagnostics(uri.as_ref()).is_some());
+        assert!(cache.diagnostics(&uri).is_some());
     }
 
     #[test]
@@ -2239,15 +2259,15 @@ mod tests {
         cache.store_diagnostics(&test_server(), &overflow, Some(1), vec![]);
 
         assert!(
-            cache.diagnostics(actively_edited.as_ref()).is_some(),
+            cache.diagnostics(&actively_edited).is_some(),
             "republished entry must survive eviction after being refreshed"
         );
         let oldest_untouched: Uri = Uri::from("file:///untouched0.rs");
         assert!(
-            cache.diagnostics(oldest_untouched.as_ref()).is_none(),
+            cache.diagnostics(&oldest_untouched).is_none(),
             "the oldest never-republished entry must be evicted instead"
         );
-        assert!(cache.diagnostics(overflow.as_ref()).is_some());
+        assert!(cache.diagnostics(&overflow).is_some());
     }
 
     #[test]
@@ -2256,7 +2276,7 @@ mod tests {
         let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&test_server(), &uri, None, vec![]);
-        let stored = cache.diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(&uri).unwrap();
         assert_eq!(stored.version, None);
     }
 
@@ -2286,13 +2306,13 @@ mod tests {
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
         assert!(
-            cache.diagnostics(quiet_uri.as_ref()).is_some(),
+            cache.diagnostics(&quiet_uri).is_some(),
             "quiet server's only entry must survive the noisy server's overflow"
         );
 
         let noisy_first: Uri = Uri::from("file:///noisy/file0.rs");
         assert!(
-            cache.diagnostics(noisy_first.as_ref()).is_none(),
+            cache.diagnostics(&noisy_first).is_none(),
             "noisy server's own oldest entries must be evicted once the aggregate cache is full"
         );
     }
@@ -2400,18 +2420,20 @@ mod tests {
             MAX_DIAGNOSTIC_ENTRIES,
             "the aggregate cap must still be enforced even when every existing server is within share"
         );
-        assert!(cache.diagnostics(new_uri.as_ref()).is_some());
+        assert!(cache.diagnostics(&new_uri).is_some());
 
         // `a` and `b` are tied at 500 entries each; the deterministic
         // tie-break in `server_to_evict_from` picks `b`, so `b`'s oldest
         // entry is the one evicted, not `a`'s.
         let b_oldest: Uri = Uri::from("file:///b/file0.rs");
         assert!(
-            cache.diagnostics(b_oldest.as_ref()).is_none(),
+            cache.diagnostics(&b_oldest).is_none(),
             "the largest in-share server (tie-broken to b) must lose its oldest entry"
         );
         assert!(
-            cache.diagnostics("file:///a/file0.rs").is_some(),
+            cache
+                .diagnostics(&Uri::from("file:///a/file0.rs".to_owned()))
+                .is_some(),
             "the other in-share server must be untouched"
         );
     }
@@ -2430,7 +2452,7 @@ mod tests {
         }
 
         assert_eq!(cache.diagnostics_count(), 1);
-        let stored = cache.diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(&uri).unwrap();
         assert_eq!(stored.version, Some(max_version - 1));
     }
 
@@ -2448,7 +2470,7 @@ mod tests {
         cache.store_diagnostics(&new_owner, &uri, Some(2), vec![]);
 
         assert_eq!(cache.diagnostics_count(), 1);
-        let stored = cache.diagnostics(uri.as_ref()).unwrap();
+        let stored = cache.diagnostics(&uri).unwrap();
         assert_eq!(stored.version, Some(2));
 
         // The old owner's order map must no longer reference this URI:
@@ -2458,7 +2480,7 @@ mod tests {
             let other: Uri = Uri::from(format!("file:///old/file{i}.rs"));
             cache.store_diagnostics(&old_owner, &other, Some(1), vec![]);
         }
-        assert!(cache.diagnostics(uri.as_ref()).is_some());
+        assert!(cache.diagnostics(&uri).is_some());
     }
 
     /// #290: `diagnostics_owner` is what a cache-only read (e.g.
@@ -2473,7 +2495,7 @@ mod tests {
 
         cache.store_diagnostics(&server, &uri, Some(1), vec![]);
 
-        assert_eq!(cache.diagnostics_owner(uri.as_ref()), Some(&server));
+        assert_eq!(cache.diagnostics_owner(&uri), Some(&server));
     }
 
     #[test]
@@ -2481,7 +2503,7 @@ mod tests {
         let cache = NotificationCache::new();
         let uri: Uri = Uri::from("file:///never-seen.rs");
 
-        assert_eq!(cache.diagnostics_owner(uri.as_ref()), None);
+        assert_eq!(cache.diagnostics_owner(&uri), None);
     }
 
     /// Reassigning ownership (see `test_store_diagnostics_reassigns_ownership`
@@ -2496,10 +2518,10 @@ mod tests {
         let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&old_owner, &uri, Some(1), vec![]);
-        assert_eq!(cache.diagnostics_owner(uri.as_ref()), Some(&old_owner));
+        assert_eq!(cache.diagnostics_owner(&uri), Some(&old_owner));
 
         cache.store_diagnostics(&new_owner, &uri, Some(2), vec![]);
-        assert_eq!(cache.diagnostics_owner(uri.as_ref()), Some(&new_owner));
+        assert_eq!(cache.diagnostics_owner(&uri), Some(&new_owner));
     }
 
     /// #266 S2: clearing one server's diagnostics must not disturb another
@@ -2517,8 +2539,8 @@ mod tests {
 
         cache.clear_server_diagnostics(&crashed);
 
-        assert!(cache.diagnostics(crashed_uri.as_ref()).is_none());
-        assert!(cache.diagnostics(healthy_uri.as_ref()).is_some());
+        assert!(cache.diagnostics(&crashed_uri).is_none());
+        assert!(cache.diagnostics(&healthy_uri).is_some());
         assert_eq!(cache.diagnostics_count(), 1);
 
         // Idempotent / no-op for a server with no (or no longer any) entries.
@@ -2583,10 +2605,10 @@ mod tests {
         cache.store_diagnostics(&other, &new_uri, Some(1), vec![]);
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
-        assert!(cache.diagnostics(new_uri.as_ref()).is_some());
+        assert!(cache.diagnostics(&new_uri).is_some());
         let server_oldest: Uri = Uri::from("file:///file0.rs");
         assert!(
-            cache.diagnostics(server_oldest.as_ref()).is_none(),
+            cache.diagnostics(&server_oldest).is_none(),
             "the pre-existing server's oldest entry, now far over its shrunk share, must be evicted"
         );
     }
@@ -2613,20 +2635,20 @@ mod tests {
 
         assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
         assert!(
-            cache.diagnostics(quiet_uri.as_ref()).is_some(),
+            cache.diagnostics(&quiet_uri).is_some(),
             "quiet server's only entry must survive even without ever calling \
              set_diagnostics_route_count"
         );
         let noisy_first: Uri = Uri::from("file:///noisy/file0.rs");
         assert!(
-            cache.diagnostics(noisy_first.as_ref()).is_none(),
+            cache.diagnostics(&noisy_first).is_none(),
             "the noisy server, now auto-derived as one of two servers sharing the budget, \
              must still lose its own oldest entries once over its fair share"
         );
     }
 
     /// #283: with only one server ever writing, the auto-derived fair-share
-    /// count (from `diagnostic_order.len()`) must stay `1`, letting that
+    /// count (from `order.len()`) must stay `1`, letting that
     /// server use the whole aggregate budget -- the same as the old default
     /// of `1` when the setter went uncalled, not a regression for the
     /// common single-server case.
@@ -2676,15 +2698,15 @@ mod tests {
         cache.store_diagnostics(&server, &overflow, Some(1), vec![]);
 
         assert!(
-            cache.diagnostics(important.as_ref()).is_some(),
+            cache.diagnostics(&important).is_some(),
             "a non-empty entry must survive eviction over empty entries, even though it is older"
         );
         let oldest_clean: Uri = Uri::from("file:///clean0.rs");
         assert!(
-            cache.diagnostics(oldest_clean.as_ref()).is_none(),
+            cache.diagnostics(&oldest_clean).is_none(),
             "the oldest empty entry must be evicted instead of the older non-empty one"
         );
-        assert!(cache.diagnostics(overflow.as_ref()).is_some());
+        assert!(cache.diagnostics(&overflow).is_some());
     }
 
     /// #284: storing an empty diagnostics list must still create a fully
@@ -2701,7 +2723,7 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
 
-        let stored = cache.diagnostics(uri.as_ref());
+        let stored = cache.diagnostics(&uri);
         assert!(
             stored.is_some(),
             "an empty-diagnostics entry must still be tracked"
@@ -2756,17 +2778,17 @@ mod tests {
         for i in 0..500 {
             let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
             assert!(
-                cache.diagnostics(uri.as_ref()).is_some(),
+                cache.diagnostics(&uri).is_some(),
                 "server a's real diagnostics must all survive; b has an empty entry to lose \
                  instead"
             );
         }
         let b_oldest: Uri = Uri::from("file:///b/file0.rs");
         assert!(
-            cache.diagnostics(b_oldest.as_ref()).is_none(),
+            cache.diagnostics(&b_oldest).is_none(),
             "b's oldest empty entry must be evicted instead of a's real diagnostics"
         );
-        assert!(cache.diagnostics(overflow.as_ref()).is_some());
+        assert!(cache.diagnostics(&overflow).is_some());
     }
 
     /// #284: a URI that transitions non-empty -> empty -> non-empty must not
@@ -2805,7 +2827,7 @@ mod tests {
         let overflow: Uri = Uri::from("file:///overflow.rs");
         cache.store_diagnostics(&server, &overflow, Some(1), vec![]);
 
-        let stored = cache.diagnostics(uri.as_ref());
+        let stored = cache.diagnostics(&uri);
         assert!(
             stored.is_some_and(|info| info.diagnostics.len() == 1),
             "the re-dirtied entry must survive and keep its real diagnostic, not be mistaken \
@@ -2877,9 +2899,7 @@ mod tests {
     }
 
     fn merged(cache: &NotificationCache) -> Option<DiagnosticInfo> {
-        cache
-            .diagnostic_sources(file_uri("main.rs").as_ref())
-            .merge()
+        cache.diagnostic_sources(&file_uri("main.rs")).merge()
     }
 
     fn messages(info: &DiagnosticInfo) -> Vec<String> {
@@ -3048,7 +3068,7 @@ mod tests {
         );
 
         assert_eq!(cache.diagnostics_count(), MAX_SOURCES_PER_FILE);
-        assert!(cache.diagnostics(file_uri("extra.rs").as_ref()).is_none());
+        assert!(cache.diagnostics(&file_uri("extra.rs")).is_none());
         assert!(!messages(&merged(&cache).unwrap()).contains(&"extra".to_owned()));
     }
 
@@ -3088,9 +3108,9 @@ mod tests {
 
         cache.clear_server_diagnostics(&server);
 
-        assert!(cache.diagnostics_sources.is_empty());
-        assert!(cache.source_canonical.is_empty());
-        assert!(!cache.has_diagnostics(file_uri("main.rs").as_ref()));
+        cache.assert_consistent();
+        assert!(cache.files.is_empty());
+        assert!(!cache.has_diagnostics(&file_uri("main.rs")));
         assert!(merged(&cache).is_none());
     }
 
@@ -3104,9 +3124,13 @@ mod tests {
             cache.store_diagnostics(&server, &uri, None, vec![]);
         }
 
-        assert!(cache.diagnostics(file_uri("a1.rs").as_ref()).is_none());
-        assert!(cache.diagnostics_sources.is_empty());
-        assert!(cache.source_canonical.is_empty());
+        assert!(cache.diagnostics(&file_uri("a1.rs")).is_none());
+        cache.assert_consistent();
+        assert!(
+            !cache
+                .files
+                .contains_key(&DiagnosticsKey::of(&file_uri("main.rs")))
+        );
     }
 
     #[test]
@@ -3115,10 +3139,7 @@ mod tests {
         let server = test_server();
         cache.store_published_diagnostics(&server, &published("alias.rs"), None, vec![]);
 
-        assert_eq!(
-            cache.diagnostics_owner(file_uri("main.rs").as_ref()),
-            Some(&server)
-        );
+        assert_eq!(cache.diagnostics_owner(&file_uri("main.rs")), Some(&server));
     }
 
     /// S5: a server fanning one file out over many spellings must not be able
@@ -3179,8 +3200,8 @@ mod tests {
             vec![diagnostic_at(1, "x")],
         );
 
-        assert!(cache.diagnostics(file_uri("extra.rs").as_ref()).is_none());
-        assert!(cache.diagnostics(file_uri("main.rs").as_ref()).is_some());
+        assert!(cache.diagnostics(&file_uri("extra.rs")).is_none());
+        assert!(cache.diagnostics(&file_uri("main.rs")).is_some());
     }
 
     /// The merge must not compare every diagnostic against every other one
@@ -3220,5 +3241,80 @@ mod tests {
         cache.store_published_diagnostics(&server, &published("a2.rs"), None, vec![coded]);
 
         assert_eq!(merged(&cache).unwrap().diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn test_clear_server_diagnostics_leaves_no_dangling_file_index() {
+        let mut cache = NotificationCache::new();
+        let (a, b) = (ServerId::from("a"), ServerId::from("b"));
+        cache.store_published_diagnostics(&a, &published("a1.rs"), None, vec![]);
+        cache.store_published_diagnostics(
+            &b,
+            &published("main.rs"),
+            None,
+            vec![diagnostic_at(1, "e")],
+        );
+
+        cache.clear_server_diagnostics(&a);
+
+        cache.assert_consistent();
+        assert_eq!(cache.files.len(), 1);
+        assert!(cache.diagnostics(&file_uri("main.rs")).is_some());
+        assert!(cache.diagnostics(&file_uri("a1.rs")).is_none());
+    }
+
+    #[derive(Debug, Clone)]
+    enum CacheOp {
+        Publish {
+            server: u8,
+            file: u8,
+            alias: Option<u8>,
+            empty: bool,
+        },
+        Clear {
+            server: u8,
+        },
+    }
+
+    fn cache_op() -> impl proptest::strategy::Strategy<Value = CacheOp> {
+        use proptest::prelude::*;
+
+        prop_oneof![
+            4 => (0..3u8, 0..3u8, proptest::option::of(0..3u8), any::<bool>()).prop_map(
+                |(server, file, alias, empty)| CacheOp::Publish { server, file, alias, empty }
+            ),
+            1 => (0..3u8).prop_map(|server| CacheOp::Clear { server }),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn cache_indices_stay_consistent_under_random_operations(
+            ops in proptest::collection::vec(cache_op(), 0..60)
+        ) {
+            let mut cache = NotificationCache::new();
+            for op in ops {
+                match op {
+                    CacheOp::Publish { server, file, alias, empty } => {
+                        let canonical = file_uri(&format!("f{file}.rs"));
+                        let source = alias.map_or_else(
+                            || canonical.clone(),
+                            |n| file_uri(&format!("alias{n}.rs")),
+                        );
+                        let diagnostics = if empty { vec![] } else { vec![diagnostic_at(1, "e")] };
+                        cache.store_published_diagnostics(
+                            &ServerId::from(format!("s{server}")),
+                            &PublishedDiagnosticsUri::for_test(source, canonical),
+                            None,
+                            diagnostics,
+                        );
+                    }
+                    CacheOp::Clear { server } => {
+                        cache.clear_server_diagnostics(&ServerId::from(format!("s{server}")));
+                    }
+                }
+                cache.assert_consistent();
+            }
+        }
     }
 }

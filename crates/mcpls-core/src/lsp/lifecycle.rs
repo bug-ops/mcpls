@@ -8,10 +8,12 @@
 //! 5. Graceful shutdown sequence
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
+use futures::FutureExt as _;
 use lsp_types::{
     ClientCapabilities, ClientInfo, ExitNotification, GeneralClientCapabilities, InitializeParams,
     InitializeRequest, InitializeResult, InitializedNotification, InitializedParams,
@@ -29,7 +31,7 @@ use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 use crate::lsp::process::ServerProcess;
-use crate::lsp::stderr::StderrCapture;
+use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 use crate::redaction::Redactions;
@@ -208,6 +210,18 @@ pub struct ServerInitConfig {
     /// The caller is responsible for draining the corresponding receiver and
     /// storing entries in [`crate::bridge::NotificationCache`].
     pub notification_tx: Option<mpsc::Sender<LspNotification>>,
+}
+
+/// The terminal outcome of starting one configured server.
+///
+/// A closed type so a settled server is either running or has a recorded
+/// failure, never both and never neither.
+#[derive(Debug)]
+pub enum ServerStartOutcome {
+    /// The server initialized and is ready to register.
+    Started(Box<LspServer>),
+    /// The server failed to start.
+    Failed(ServerSpawnFailure),
 }
 
 /// Result of attempting to spawn multiple LSP servers.
@@ -404,10 +418,13 @@ impl LspServer {
     /// - Initialize request fails or times out
     /// - Server returns error during initialization
     pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
-        info!(
-            "Spawning LSP server: {} {:?}",
-            config.server_config.command, config.server_config.args
-        );
+        let redactions = Arc::new(Redactions::for_server(
+            &config.server_config,
+            std::env::vars_os().filter_map(|(name, value)| {
+                Some((name.into_string().ok()?, value.into_string().ok()?))
+            }),
+        ));
+        Self::log_spawn(&config.server_config, &redactions);
 
         let command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
 
@@ -450,7 +467,7 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stderr".to_string()))?;
         let stderr_capture = StderrCapture::start(stderr);
 
-        let transport = LspTransport::new(stdin, stdout);
+        let transport = LspTransport::with_redactions(stdin, stdout, Arc::clone(&redactions));
         let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
         let client = LspClient::from_transport_with_notifications(
@@ -458,25 +475,18 @@ impl LspServer {
             transport,
             notification_tx,
             lifecycle_tx,
+            Arc::clone(&redactions),
         );
-
-        // Only needed on the failure paths below, so the environment scan is
-        // not paid for by a successful start.
-        let redactions = || {
-            Redactions::for_server(
-                &config.server_config,
-                std::env::vars_os().filter_map(|(name, value)| {
-                    Some((name.into_string().ok()?, value.into_string().ok()?))
-                }),
-            )
-        };
         let (capabilities, position_encoding) = match Self::initialize(&client, &config).await {
             Ok(negotiated) => negotiated,
             Err(init_error) if is_connection_loss(&init_error) => {
                 let exit_status = early_exit_status(&mut child).await;
-                let stderr = stderr_capture
-                    .finish(exit_status.is_some(), &redactions())
-                    .await;
+                let eof_wait = if exit_status.is_some() {
+                    EofWait::Grace
+                } else {
+                    EofWait::Skip
+                };
+                let stderr = stderr_capture.finish(eof_wait, &redactions).await;
                 return Err(match exit_status {
                     Some(status) => Error::ServerExitedDuringInit {
                         command: config.server_config.command.clone(),
@@ -484,7 +494,9 @@ impl LspServer {
                         stderr,
                     },
                     None => Error::LspInitFailed {
-                        message: format!("Initialize request failed: {init_error}"),
+                        message: redactions
+                            .apply(&format!("Initialize request failed: {init_error}"))
+                            .into_owned(),
                         stderr,
                     },
                 });
@@ -493,7 +505,8 @@ impl LspServer {
                 // The server may be about to exit after printing its reason,
                 // so wait the (bounded) end-of-file grace whether or not it
                 // has exited yet.
-                let stderr = stderr_capture.finish(true, &redactions()).await;
+                let stderr = stderr_capture.finish(EofWait::Grace, &redactions).await;
+                let message = redactions.apply(&message).into_owned();
                 return Err(Error::LspInitFailed { message, stderr });
             }
             Err(init_error) => return Err(init_error),
@@ -510,6 +523,24 @@ impl LspServer {
             child: Some(child),
             init_config: config,
         })
+    }
+
+    /// Logs the command and argument count at `info`, and the argument values
+    /// (redacted) only at `debug`.
+    fn log_spawn(server_config: &LspServerConfig, redactions: &Redactions) {
+        info!(
+            "Spawning LSP server: {} ({} arg(s))",
+            server_config.command,
+            server_config.args.len()
+        );
+        debug!(
+            "LSP server args: {:?}",
+            server_config
+                .args
+                .iter()
+                .map(|arg| redactions.apply(arg))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Build the child `Command` for a spawned LSP server, without spawning it.
@@ -888,19 +919,24 @@ impl LspServer {
         Ok(())
     }
 
-    /// Spawn multiple LSP servers in batch mode with graceful degradation.
+    /// Spawn multiple LSP servers concurrently with graceful degradation.
     ///
-    /// Attempts to spawn and initialize all configured servers. If some servers
-    /// fail to spawn, the successful servers are still returned. This enables
-    /// graceful degradation where the system can continue to operate with
-    /// partial functionality.
+    /// Attempts to spawn and initialize all configured servers at once, each
+    /// bounded by its own `timeout_seconds`, so the wall clock is the slowest
+    /// single server rather than the sum. If some servers fail to spawn, the
+    /// successful servers are still returned. This enables graceful
+    /// degradation where the system can continue to operate with partial
+    /// functionality.
     ///
     /// # Behavior
     ///
-    /// - Attempts to spawn each server sequentially
+    /// - Spawns every server concurrently on the calling task, so dropping
+    ///   the returned future drops every not-yet-registered child process
     /// - Logs success (info) and failure (error) for each server
-    /// - Accumulates successful servers and failures
-    /// - Never panics or returns early - attempts all servers
+    /// - Accumulates successful servers and failures; failures are listed in
+    ///   configuration order
+    /// - Never panics or returns early - attempts all servers; a panic while
+    ///   starting one server is recorded as that server's failure
     ///
     /// # Examples
     ///
@@ -940,39 +976,77 @@ impl LspServer {
     /// ```
     pub async fn spawn_batch(configs: &[ServerInitConfig]) -> ServerInitResult {
         let mut result = ServerInitResult::new();
-
-        for config in configs {
-            let server_id = config.server_config.id();
-            let language_id = config.server_config.language_id.clone();
-            let command = config.server_config.command.clone();
-
-            match Self::spawn(config.clone()).await {
-                Ok(server) => {
-                    info!(
-                        "Successfully spawned LSP server: {} ({})",
-                        server_id, command
-                    );
-                    result.add_server(server_id, server);
+        let outcomes = futures::future::join_all(configs.iter().map(Self::start_contained)).await;
+        for (config, outcome) in configs.iter().zip(outcomes) {
+            match outcome {
+                ServerStartOutcome::Started(server) => {
+                    result.add_server(config.server_config.id(), *server);
                 }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to spawn LSP server: {} ({}): {}",
-                        server_id,
-                        command,
-                        e
-                    );
-                    result.add_failure(ServerSpawnFailure {
-                        server_id,
-                        language_id,
-                        command,
-                        reason: StartupFailure::Spawn(Arc::new(e)),
-                    });
-                }
+                ServerStartOutcome::Failed(failure) => result.add_failure(failure),
             }
         }
-
         result
     }
+
+    /// Spawns and initializes one server, turning an error or a panic into
+    /// that server's [`ServerStartOutcome::Failed`] so it can never affect a
+    /// sibling. Logs the outcome with the id and elapsed time.
+    ///
+    /// Runs on the caller's task: dropping the future drops the child
+    /// process it owns.
+    pub(crate) async fn start_contained(config: &ServerInitConfig) -> ServerStartOutcome {
+        contain(config, Self::spawn(config.clone())).await
+    }
+}
+
+/// Drives `start` (one server's spawn and handshake) and classifies how it
+/// ended; see [`LspServer::start_contained`].
+async fn contain(
+    config: &ServerInitConfig,
+    start: impl std::future::Future<Output = Result<LspServer>>,
+) -> ServerStartOutcome {
+    let server_id = config.server_config.id();
+    let language_id = config.server_config.language_id.clone();
+    let command = config.server_config.command.clone();
+    let started = Instant::now();
+
+    let reason = match AssertUnwindSafe(start).catch_unwind().await {
+        Ok(Ok(server)) => {
+            info!(
+                "Successfully spawned LSP server: {} ({}) in {:?}",
+                server_id,
+                command,
+                started.elapsed()
+            );
+            return ServerStartOutcome::Started(Box::new(server));
+        }
+        Ok(Err(e)) => {
+            tracing::error!(
+                "Failed to spawn LSP server: {} ({}) after {:?}: {}",
+                server_id,
+                command,
+                started.elapsed(),
+                e
+            );
+            StartupFailure::Spawn(Arc::new(e))
+        }
+        Err(payload) => {
+            tracing::error!(
+                "Starting LSP server {} ({}) panicked after {:?}: {}",
+                server_id,
+                command,
+                started.elapsed(),
+                crate::panic_message(payload.as_ref())
+            );
+            StartupFailure::InitTaskPanicked
+        }
+    };
+    ServerStartOutcome::Failed(ServerSpawnFailure {
+        server_id,
+        language_id,
+        command,
+        reason,
+    })
 }
 
 /// Convert configured position-encoding strings into the ordered
@@ -1993,6 +2067,182 @@ echo 'fatal: bad toolchain' >&2
         assert!(!text.contains("s3cr3t-value"), "{text}");
     }
 
+    #[test]
+    fn test_log_spawn_hides_argument_values() {
+        use tracing_subscriber::prelude::*;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let mut config = LspServerConfig::rust_analyzer();
+        config.args = vec!["--api-key=SuperSecretArg456".to_string()];
+        let redactions = Redactions::for_server(&config, std::iter::empty());
+        let logs = CapturedLogs::default();
+        let info_only = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            .with(logs.clone());
+
+        tracing::subscriber::with_default(info_only, || {
+            LspServer::log_spawn(&config, &redactions);
+        });
+
+        let output = logs.messages().join("\n");
+        assert!(output.contains("(1 arg(s))"), "{output}");
+        assert!(!output.contains("SuperSecretArg456"), "{output}");
+    }
+
+    /// FR-012: a panic while starting one server is that server's failure.
+    #[tokio::test]
+    async fn contain_attributes_a_panic_to_its_own_server() {
+        let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+
+        let outcome = contain(&config, async { panic!("start boom") }).await;
+
+        assert_matches!(
+            outcome,
+            ServerStartOutcome::Failed(failure)
+                if failure.server_id == config.server_config.id()
+                    && matches!(failure.reason, StartupFailure::InitTaskPanicked)
+        );
+    }
+
+    #[tokio::test]
+    async fn contain_reports_a_spawn_error_as_that_servers_failure() {
+        let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+
+        let outcome = contain(&config, async { Err(Error::ServerTerminated) }).await;
+
+        assert_matches!(
+            outcome,
+            ServerStartOutcome::Failed(failure) if matches!(failure.reason, StartupFailure::Spawn(_))
+        );
+    }
+
+    /// FR-001/FR-019: each server announces itself and waits for its sibling
+    /// before answering `initialize`, so sequential startup would let the
+    /// first one time out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_batch_initializes_configs_concurrently() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (a_up, b_up) = (dir.path().join("a_up"), dir.path().join("b_up"));
+        let configs = [
+            crate::test_lsp::named_sh_init_config(
+                dir.path(),
+                "a",
+                "rust",
+                &crate::test_lsp::answer_initialize_script(Some(&a_up), Some(&b_up)),
+            ),
+            crate::test_lsp::named_sh_init_config(
+                dir.path(),
+                "b",
+                "python",
+                &crate::test_lsp::answer_initialize_script(Some(&b_up), Some(&a_up)),
+            ),
+        ];
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(20), LspServer::spawn_batch(&configs))
+                .await
+                .unwrap();
+
+        assert_eq!(result.server_count(), 2, "failures: {:?}", result.failures);
+    }
+
+    /// `window/logMessage` and `window/showMessage` text echoing configured
+    /// secrets is redacted before it reaches the notification lane (#554).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_redacts_secrets_in_server_log_and_show_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+body="{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":3,\"message\":\"env=$API_TOKEN arg=$1\"}}"
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+body="{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":3,\"message\":\"env=$API_TOKEN\"}}"
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 5
+"#;
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(script),
+        );
+        config
+            .server_config
+            .args
+            .push("--api-key=SuperSecretArg456".to_string());
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+
+        let mut server = LspServer::spawn(config).await.unwrap();
+        let mut rx = server.take_notification_rx();
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let notification = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            texts.push(format!("{notification:?}"));
+        }
+
+        let joined = texts.join("\n");
+        assert!(!joined.contains("SuperSecretValue123"), "{joined}");
+        assert!(!joined.contains("SuperSecretArg456"), "{joined}");
+        assert!(joined.contains("[redacted:API_TOKEN]"), "{joined}");
+        assert!(joined.contains("[redacted:api-key]"), "{joined}");
+    }
+
+    /// A secret echoed into a mistyped `initialize` result reaches the serde
+    /// error text, which is redacted too (#554).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_redacts_secrets_in_initialize_decode_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":"SuperSecretValue123"}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 5
+"#;
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(script),
+        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let text = err.to_string();
+        assert!(!text.contains("SuperSecretValue123"), "{text}");
+    }
+
+    /// The server's own `initialize` error text is redacted (#554).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_redacts_secrets_in_initialize_error_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = r#"body="{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"bad token $API_TOKEN\"}}"
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 5
+"#;
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(script),
+        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("[redacted:API_TOKEN]"), "{text}");
+        assert!(!text.contains("SuperSecretValue123"), "{text}");
+    }
+
     /// Regression guard for the drain: a server flooding stderr both before
     /// and after it answers `initialize` must never block or lose its pipe
     /// (`EPIPE`/`SIGPIPE`) once `spawn` has returned.
@@ -2572,17 +2822,14 @@ sleep 5
         );
     }
 
-    /// #174 §8/S2 regression: `register_servers`'s diagnostics-cache flags
-    /// must be computed from the *rebound* router, not the pre-rebind view.
-    /// Sets up a `python` config where a narrow "diagnostics-only" server
-    /// (`pyright-diag`) is configured but never actually registers (as if
-    /// it failed to spawn), leaving only a catch-all (`pylsp`) live. Before
-    /// the fix, computing the flags from the pre-rebind router would resolve
-    /// `Diagnostics` to the dead `pyright-diag` for every survivor, so
-    /// `pylsp` would be flagged `false` and the diagnostics cache would go
-    /// silently dark for `python` despite a live server being available.
+    /// #174 section 8 regression: the diagnostics route must be read from the
+    /// router as re-derived after the explicit diagnostics server failed, not
+    /// from the configured one. A narrow "diagnostics-only" server
+    /// (`pyright-diag`) fails to start, leaving only a catch-all (`pylsp`);
+    /// resolving `Diagnostics` against the configured router would name the
+    /// dead `pyright-diag` and silence diagnostics for `python`.
     #[tokio::test]
-    async fn test_register_servers_computes_diagnostics_flags_from_rebound_router() {
+    async fn test_settling_dead_diagnostics_server_hands_the_route_to_the_catch_all() {
         use crate::bridge::Translator;
         use crate::config::{ServerId, ToolKind, ToolRouter};
 
@@ -2619,41 +2866,23 @@ sleep 5
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);
-
-        // Only pylsp actually registers; pyright-diag never spawned.
-        let mut result = ServerInitResult::new();
-        result.add_server(
-            pylsp_id.clone(),
-            fake_lsp_server_with_config(configs[1].clone()),
+        translator.set_expected_servers(
+            [ServerId::from("pyright-diag"), pylsp_id.clone()]
+                .into_iter()
+                .collect(),
         );
 
-        let registered = crate::register_servers(result, &translator);
+        translator.settle_failed(&ServerSpawnFailure {
+            server_id: ServerId::from("pyright-diag"),
+            language_id: "python".to_string(),
+            command: "pyright-langserver".to_string(),
+            reason: StartupFailure::InitTaskPanicked,
+        });
+        translator.settle_started(fake_lsp_server_with_config(configs[1].clone()));
 
-        assert_eq!(
-            registered.diagnostics_flags.get(&pylsp_id),
-            Some(&true),
-            "pylsp must inherit the diagnostics route once pyright-diag is \
-             known dead, and the flag must reflect that post-rebind state"
-        );
-    }
-
-    /// The indexing policy comes from the server's own `init_config`.
-    #[tokio::test]
-    async fn test_register_servers_reports_indexing_policy_from_init_config() {
-        use crate::bridge::{IndexingPolicy, Translator};
-
-        let mut config = LspServerConfig::rust_analyzer();
-        config.indexing = IndexingPolicy::Disabled;
-        let id = config.id();
-
-        let mut result = ServerInitResult::new();
-        result.add_server(id.clone(), fake_lsp_server_with_config(config));
-
-        let registered = crate::register_servers(result, &Translator::new());
-
-        assert_eq!(
-            registered.indexing_policies.get(&id),
-            Some(&IndexingPolicy::Disabled)
+        assert!(
+            translator.is_diagnostics_route("python", &pylsp_id),
+            "pylsp must inherit the diagnostics route once pyright-diag is known dead"
         );
     }
 }

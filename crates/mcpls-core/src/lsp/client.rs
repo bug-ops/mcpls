@@ -20,6 +20,7 @@ use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     LspNotification, RequestId,
 };
+use crate::redaction::Redactions;
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -313,6 +314,7 @@ impl LspClient {
             Arc::clone(&pending_failure),
             None,
             None,
+            Arc::default(),
         ));
 
         Self {
@@ -339,6 +341,7 @@ impl LspClient {
         transport: (LspTransport, LspTransportReader),
         notification_tx: mpsc::Sender<LspNotification>,
         lifecycle_tx: mpsc::Sender<LspNotification>,
+        redactions: Arc<Redactions>,
     ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
@@ -354,6 +357,7 @@ impl LspClient {
             Arc::clone(&pending_failure),
             Some(notification_tx),
             Some(lifecycle_tx),
+            redactions,
         ));
 
         Self {
@@ -592,7 +596,7 @@ impl LspClient {
                     // read it again -- drop the now-orphaned entry instead of
                     // leaking it in `pending_requests` forever.
                     self.pending_requests.lock().await.remove(&id);
-                    return Err(Error::Timeout(timeout_duration.as_secs()));
+                    return Err(Error::Timeout(timeout_duration));
                 }
             };
 
@@ -858,6 +862,7 @@ impl LspClient {
         pending_failure: Arc<StdMutex<PendingFailure>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<mpsc::Sender<LspNotification>>,
+        redactions: Arc<Redactions>,
     ) -> Result<()> {
         debug!("Message loop started");
         let (mut transport, reader) = transport;
@@ -872,6 +877,7 @@ impl LspClient {
                 &pending_requests,
                 notification_tx.as_ref(),
                 lifecycle_tx.as_ref(),
+                &redactions,
             )
             .await
         };
@@ -966,6 +972,7 @@ impl LspClient {
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
+        redactions: &Redactions,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -997,6 +1004,7 @@ impl LspClient {
                                             pending_requests,
                                             notification_tx,
                                             lifecycle_tx,
+                                            redactions,
                                         )
                                         .await?;
                                     }
@@ -1031,6 +1039,7 @@ impl LspClient {
                         pending_requests,
                         notification_tx,
                         lifecycle_tx,
+                        redactions,
                     )
                     .await?;
                 }
@@ -1051,6 +1060,7 @@ impl LspClient {
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
+        redactions: &Redactions,
     ) -> Result<()> {
         match message {
             InboundMessage::Response(response) => {
@@ -1070,9 +1080,10 @@ impl LspClient {
                         // `error!` once the error is actually surfaced to the
                         // caller (retry exhaustion or a non-retryable error);
                         // the response id is already traced above.
+                        let message = redactions.apply(&error.message);
                         trace!(
                             "LSP error response: {} (code {})",
-                            Self::truncate_error_message_for_log(&error.message),
+                            Self::truncate_error_message_for_log(&message),
                             error.code
                         );
                         // Truncated separately from the log line, to the larger
@@ -1080,10 +1091,8 @@ impl LspClient {
                         // unbounded and attacker-influenceable (#313), but a
                         // log-line-sized cut would also clip legitimate long
                         // errors before the model ever sees them (S2).
-                        let caller_message = crate::util::truncate_str(
-                            &error.message,
-                            MAX_ERROR_MESSAGE_CALLER_BYTES,
-                        );
+                        let caller_message =
+                            crate::util::truncate_str(&message, MAX_ERROR_MESSAGE_CALLER_BYTES);
                         let _ = sender.send(Err(Error::LspServerError {
                             code: error.code,
                             message: caller_message,
@@ -1117,7 +1126,8 @@ impl LspClient {
                 debug!("Received notification: {}", notification.method);
 
                 // Parse notification into typed variant
-                let typed = LspNotification::parse(&notification.method, notification.params);
+                let mut typed = LspNotification::parse(&notification.method, notification.params);
+                Self::redact_notification(&mut typed, redactions);
 
                 let destination = Self::notification_lane(&typed, notification_tx, lifecycle_tx);
 
@@ -1129,8 +1139,11 @@ impl LspClient {
                             params.uri.as_ref(),
                             params.diagnostics.len()
                         );
-                    } else {
-                        trace!("Forwarding notification: {:?}", typed);
+                    } else if tracing::enabled!(tracing::Level::TRACE) {
+                        trace!(
+                            "Forwarding notification: {}",
+                            redactions.apply(&format!("{typed:?}"))
+                        );
                     }
 
                     // Names lane and method -- the only diagnostic for a dropped frame.
@@ -1146,6 +1159,20 @@ impl LspClient {
         }
 
         Ok(())
+    }
+
+    /// Redacts the human-readable text a server controls before it reaches
+    /// the notification cache, from where MCP tools return it.
+    fn redact_notification(notification: &mut LspNotification, redactions: &Redactions) {
+        match notification {
+            LspNotification::LogMessage(params) => {
+                params.message = redactions.apply(&params.message).into_owned();
+            }
+            LspNotification::ShowMessage(params) => {
+                params.message = redactions.apply(&params.message).into_owned();
+            }
+            _ => {}
+        }
     }
 
     fn server_request_response(request: JsonRpcRequest) -> JsonRpcResponse {
@@ -1205,6 +1232,48 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+
+    /// The `trace!` of a forwarded notification must not print a configured
+    /// secret that the server echoed into an unrecognized notification.
+    #[tokio::test]
+    async fn test_forwarded_notification_trace_is_redacted() {
+        use tracing_subscriber::prelude::*;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let redactions =
+            Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]);
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with(logs.clone()),
+        );
+        let (mut transport, _reader) = LspTransport::new(tokio::io::sink(), tokio::io::empty());
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let notification = InboundMessage::Notification(JsonRpcNotification {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "custom/echo".to_string(),
+            params: Some(serde_json::json!({"env": "SuperSecretValue123"})),
+        });
+
+        LspClient::handle_inbound_message(
+            &mut transport,
+            notification,
+            &pending,
+            None,
+            Some(&lifecycle_tx),
+            &redactions,
+        )
+        .await
+        .unwrap();
+
+        assert!(lifecycle_rx.recv().await.is_some());
+        let output = logs.messages().join("\n");
+        assert!(output.contains("Forwarding notification"), "{output}");
+        assert!(!output.contains("SuperSecretValue123"), "{output}");
+    }
 
     #[test]
     fn test_request_id_generation() {
@@ -1750,7 +1819,7 @@ mod tests {
             tokio::time::advance(TIMEOUT + Duration::from_secs(1)).await;
             assert_matches!(
                 first.await.unwrap(),
-                Err(Error::Timeout(5)),
+                Err(Error::Timeout(limit)) if limit == TIMEOUT,
                 "request awaiting its reply must time out"
             );
             assert!(
@@ -2561,6 +2630,7 @@ mod tests {
                 &pending_requests,
                 None,
                 None,
+                &Redactions::default(),
             )
             .await;
 
@@ -2601,6 +2671,7 @@ mod tests {
                 &pending_requests,
                 None,
                 None,
+                &Redactions::default(),
             )
             .await;
             assert_matches!(result, Err(Error::ServerTerminated), "got {result:?}");
@@ -2653,6 +2724,7 @@ mod tests {
                 &pending_requests,
                 None,
                 None,
+                &Redactions::default(),
             )
             .await;
 
@@ -2694,6 +2766,7 @@ mod tests {
                 Arc::default(),
                 None,
                 None,
+                Arc::default(),
             )
             .await;
 
@@ -2752,6 +2825,7 @@ mod tests {
                 &pending_requests,
                 None,
                 None,
+                &Redactions::default(),
             )
             .await;
             assert!(inner_result.is_ok(), "got {inner_result:?}");

@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use lsp_types::{
-    DocumentDiagnosticParams, PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
+    DocumentDiagnosticParams, PartialResultParams, TextDocumentIdentifier, Uri,
+    WorkDoneProgressParams,
 };
 use tokio::sync::Mutex;
 
@@ -79,7 +80,7 @@ pub(super) async fn diagnostic_to_mcp(
 }
 
 impl Translator {
-    /// Resolve the LSP-side cache key (URI string) for a cached-diagnostics lookup.
+    /// Resolve the LSP-side cache key (URI) for a cached-diagnostics lookup.
     ///
     /// Split out from the cache read itself so callers (e.g. the
     /// `get_cached_diagnostics` MCP tool) can do the path `canonicalize()` and
@@ -94,7 +95,7 @@ impl Translator {
     pub fn cached_diagnostics_uri(
         workspace_roots: &WorkspaceRoots,
         file_path: &str,
-    ) -> Result<String> {
+    ) -> Result<Uri> {
         Self::cached_diagnostics_path_and_uri(workspace_roots, file_path).map(|(_, uri)| uri)
     }
 
@@ -111,13 +112,13 @@ impl Translator {
     pub(crate) fn cached_diagnostics_path_and_uri(
         workspace_roots: &WorkspaceRoots,
         file_path: &str,
-    ) -> Result<(PathBuf, String)> {
+    ) -> Result<(PathBuf, Uri)> {
         let path = PathBuf::from(file_path);
         let validated_path = validate_path_against_roots(&path, workspace_roots)?;
 
         // Use path_to_uri (strips \\?\ on Windows) so the key matches what
         // rust-analyzer stores in publishDiagnostics notifications.
-        let uri = path_to_uri(&validated_path)?.to_string();
+        let uri = path_to_uri(&validated_path)?;
         Ok((validated_path, uri))
     }
 
@@ -181,7 +182,7 @@ impl Translator {
 
         let sources = {
             let cache = notification_cache.lock().await;
-            cache.diagnostic_sources(uri.as_ref())
+            cache.diagnostic_sources(uri)
         };
         let diag_info = sources.merge();
 

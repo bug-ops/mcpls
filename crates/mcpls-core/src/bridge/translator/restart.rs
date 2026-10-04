@@ -21,7 +21,8 @@ use tokio::task::AbortHandle;
 
 use super::Translator;
 use super::respawn::BackoffPolicy;
-use crate::bridge::{IndexingState, lock_std};
+use crate::DiagnosticsRole;
+use crate::bridge::{DiagnosticsKey, IndexingState, lock_std};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::{ExitGrace, LspClient, LspNotification, LspServer, ServerInitConfig};
@@ -177,6 +178,7 @@ impl RestartFailure {
             // Spawning a replacement never yields the variants below; they are
             // reported as an initialization failure rather than a new reason.
             | Error::McpServer(_)
+            | Error::HttpBind { .. }
             | Error::DocumentNotFound(_)
             | Error::NoServerForLanguage(_)
             | Error::NoServerForTool { .. }
@@ -312,12 +314,12 @@ pub trait NotificationWiring: std::fmt::Debug + Send + Sync {
         &self,
         id: ServerId,
         receivers: NotificationReceivers,
-        caches_diagnostics: bool,
+        role: DiagnosticsRole,
     ) -> AbortHandle;
 
     /// Tell subscribers of the resources behind the `cleared` cache keys to
     /// re-read them.
-    fn publish_invalidated<'a>(&'a self, cleared: &'a [String]) -> BoxFuture<'a, ()>;
+    fn publish_invalidated<'a>(&'a self, cleared: &'a [DiagnosticsKey]) -> BoxFuture<'a, ()>;
 }
 
 /// A server taken out of the registries for termination, restored on every
@@ -546,14 +548,13 @@ impl Translator {
                 },
             });
         }
-        if self.wiring.get().is_none() {
-            return Some(if self.init_panicked.load(Ordering::SeqCst) {
-                RestartOutcome::NotRunning {
-                    message: "startup was interrupted by a panic, so servers cannot be restarted; restart mcpls".to_string(),
-                }
-            } else {
-                RestartOutcome::Initializing
+        if self.init_panicked.load(Ordering::SeqCst) {
+            return Some(RestartOutcome::NotRunning {
+                message: "startup was interrupted by a panic, so servers cannot be restarted; restart mcpls".to_string(),
             });
+        }
+        if self.wiring.get().is_none() {
+            return Some(RestartOutcome::Initializing);
         }
         self.restart_cooldown_remaining(id)
             .map(|remaining| RestartOutcome::Throttled {
@@ -736,7 +737,7 @@ mod tests {
             RestartFailure::SpawnFailed { .. }
         );
         assert_matches!(
-            RestartFailure::from_error(&Error::Timeout(5)),
+            RestartFailure::from_error(&Error::Timeout(Duration::from_secs(5))),
             RestartFailure::InitializeFailed { .. }
         );
     }
@@ -804,7 +805,7 @@ mod tests {
                 },
                 cancel_rx,
             };
-            let pump = wiring.spawn_pump(id.clone(), receivers, true);
+            let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Authoritative);
             translator.set_notification_task(id.clone(), pump);
             if wired {
                 translator.install_wiring(Arc::new(wiring));
@@ -1093,7 +1094,7 @@ mod tests {
                 "{result:?}"
             );
             tokio::time::timeout(Duration::from_secs(5), async {
-                while !fx.cache.lock().await.has_diagnostics(uri.as_ref()) {
+                while !fx.cache.lock().await.has_diagnostics(&uri) {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             })
@@ -1265,8 +1266,10 @@ mod tests {
                 };
                 translator.register_server_complete(server);
                 let id = ServerId::from(name.as_str());
-                translator
-                    .set_notification_task(id.clone(), wiring.spawn_pump(id, receivers, false));
+                translator.set_notification_task(
+                    id.clone(),
+                    wiring.spawn_pump(id, receivers, DiagnosticsRole::Secondary),
+                );
                 logs.push(log);
             }
             translator.install_wiring(Arc::new(wiring));
@@ -1381,6 +1384,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_restart_after_an_init_panic_with_wiring_installed_reports_not_running() {
+            let dir = TempDir::new().unwrap();
+            let log = dir.path().join("server.log");
+            let script = write_protocol_server_script(dir.path(), &log, None);
+            let fx = fixture(dir, &script, true).await;
+            fx.translator.settle_after_init_panic(&[]).await;
+
+            let result = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+
+            assert_matches!(
+                only_outcome(&result),
+                RestartOutcome::NotRunning { .. },
+                "{result:?}"
+            );
+        }
+
+        #[tokio::test]
         async fn test_a_failed_restart_invalidates_the_stopped_servers_cached_diagnostics() {
             let dir = TempDir::new().unwrap();
             let file = dunce::canonicalize(dir.path()).unwrap().join("main.rs");
@@ -1390,7 +1414,7 @@ mod tests {
             let script = write_protocol_server_script(dir.path(), &log, Some(uri.as_ref()));
             let fx = fixture(dir, &script, true).await;
             tokio::time::timeout(Duration::from_secs(5), async {
-                while !fx.cache.lock().await.has_diagnostics(uri.as_ref()) {
+                while !fx.cache.lock().await.has_diagnostics(&uri) {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             })
@@ -1412,10 +1436,7 @@ mod tests {
             assert_matches!(only_outcome(&result), RestartOutcome::Failed { .. });
             let (stale, degraded) = {
                 let cache = fx.cache.lock().await;
-                (
-                    cache.has_diagnostics(uri.as_ref()),
-                    cache.is_push_degraded(&fx.id),
-                )
+                (cache.has_diagnostics(&uri), cache.is_push_degraded(&fx.id))
             };
             assert!(!stale, "stale diagnostics must go");
             assert!(degraded);

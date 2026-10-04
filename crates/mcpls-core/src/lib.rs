@@ -26,7 +26,7 @@
 //!     // Stdio (default):
 //!     let result = serve(config).await;
 //!     // HTTP (requires `transport-http` feature):
-//!     // let http = mcpls_core::HttpConfig::new("127.0.0.1:3000".parse().unwrap(), "/mcp");
+//!     // let http = mcpls_core::HttpConfig::new("127.0.0.1:3000".parse().unwrap());
 //!     // let result = serve_with(config, Transport::Http(http)).await;
 //!
 //!     // See `serve`/`serve_with`'s "Shutdown" docs: process::exit avoids a
@@ -62,11 +62,13 @@ use std::time::Duration;
 
 use bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use bridge::{NotificationCache, Translator, WorkspaceRoots};
-pub use config::{ProjectConfigTrust, ServerConfig};
+pub use config::{ProjectConfigStatus, ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
-use futures::FutureExt as _;
-use lsp::{LspNotification, LspServer, ServerInitConfig};
+use error::ServerSpawnFailure;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt as _, StreamExt as _};
+use lsp::{LspNotification, LspServer, ServerInitConfig, ServerStartOutcome};
 use lsp_types::Uri;
 use mcp::SubscriptionRegistry;
 use tokio::sync::Mutex;
@@ -78,7 +80,8 @@ use transport::run_http;
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 pub use transport::{
-    ConnectionLimit, HeaderReadTimeout, HttpConfig, ProbeDeadline, ProbeInterval, StreamLiveness,
+    ConnectionLimit, HeaderReadTimeout, HttpConfig, HttpPath, InvalidHttpPath, ProbeDeadline,
+    ProbeInterval, SessionLimit, StreamLiveness,
 };
 use transport::{ShutdownSignal, run_stdio};
 pub use util::escape_control;
@@ -129,6 +132,37 @@ pub(crate) struct PumpShared {
     pub(crate) workspace_roots: WorkspaceRoots,
 }
 
+/// Whether a server's `publishDiagnostics` pushes are the ones the cache
+/// keeps for its language -- see #174 section 8.
+///
+/// The role is re-evaluated whenever a server settles: a catch-all that
+/// registered as `Secondary` becomes `Authoritative` when the explicit
+/// diagnostics server for its language fails afterwards. Pushes the catch-all
+/// made while it was `Secondary` are not replayed; the cache fills with its
+/// next publish for each file (the next `didOpen`/`didChange`). A file nobody
+/// opens may never get one, since mcpls sends no `didSave`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiagnosticsRole {
+    /// The server is the language's diagnostics route: its pushes are cached
+    /// and subscribers are notified.
+    Authoritative,
+    /// Another server owns the language's diagnostics (or none does): pushes
+    /// are skipped so they cannot overwrite or spuriously notify about the
+    /// owner's entries.
+    Secondary,
+}
+
+impl DiagnosticsRole {
+    /// The role of a server that is, or is not, the language's diagnostics route.
+    pub(crate) const fn from_route(is_diagnostics_route: bool) -> Self {
+        if is_diagnostics_route {
+            Self::Authoritative
+        } else {
+            Self::Secondary
+        }
+    }
+}
+
 /// Background task that drains LSP notifications, writes them to the cache,
 /// and queues `resources/updated` for each MCP session subscribed to the URI.
 ///
@@ -171,7 +205,7 @@ pub(crate) async fn diagnostics_pump(
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut lifecycle_rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-    caches_diagnostics: bool,
+    role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
     shared: PumpShared,
 ) {
     let PumpShared {
@@ -208,7 +242,7 @@ pub(crate) async fn diagnostics_pump(
                         // for this language's diagnostics; skip publishing so it
                         // doesn't overwrite (or spuriously notify about) another
                         // server's cache entry.
-                        if !caches_diagnostics {
+                        if *role_rx.borrow() == DiagnosticsRole::Secondary {
                             continue;
                         }
                         if !diagnostic_path_in_workspace(&p.uri, &workspace_roots) {
@@ -305,10 +339,11 @@ impl bridge::NotificationWiring for PumpWiring {
         &self,
         id: ServerId,
         receivers: bridge::NotificationReceivers,
-        caches_diagnostics: bool,
+        role: DiagnosticsRole,
     ) -> tokio::task::AbortHandle {
         let shared = self.shared.clone();
         let cancel_rx = self.cancel_rx.clone();
+        let (_role_tx, role_rx) = tokio::sync::watch::channel(role);
         let cache = Arc::clone(&shared.notification_cache);
         tokio::spawn(async move {
             let pump = diagnostics_pump(
@@ -316,7 +351,7 @@ impl bridge::NotificationWiring for PumpWiring {
                 receivers.notifications,
                 receivers.lifecycle,
                 cancel_rx,
-                caches_diagnostics,
+                role_rx,
                 shared,
             );
             if let Err(payload) = AssertUnwindSafe(pump).catch_unwind().await {
@@ -334,97 +369,20 @@ impl bridge::NotificationWiring for PumpWiring {
 
     fn publish_invalidated<'a>(
         &'a self,
-        cleared: &'a [String],
+        cleared: &'a [bridge::DiagnosticsKey],
     ) -> futures::future::BoxFuture<'a, ()> {
         Box::pin(async move {
             if cleared.is_empty() {
                 return;
             }
-            let cleared: HashSet<&str> = cleared.iter().map(String::as_str).collect();
+            let cleared: HashSet<&bridge::DiagnosticsKey> = cleared.iter().collect();
             self.shared
                 .subs
                 .publish_matching(|uri| {
-                    bridge::diagnostics_cache_key(uri)
-                        .is_some_and(|key| cleared.contains(key.as_str()))
+                    bridge::diagnostics_cache_key(uri).is_some_and(|key| cleared.contains(&key))
                 })
                 .await;
         })
-    }
-}
-
-/// Result of [`register_servers`]: everything the caller needs to start the
-/// per-server diagnostics pump tasks.
-pub(crate) struct RegisteredServers {
-    /// Notification and lifecycle-lane (P3) receivers extracted from each
-    /// server before registration, paired per server rather than kept in
-    /// two separate maps: both are always extracted together in
-    /// [`register_servers`]'s single population loop, so there is no
-    /// "notification receiver without a matching lifecycle receiver" state
-    /// to represent or handle at the call site (Fix 4 -- a `HashMap<_,
-    /// (Receiver, Receiver)>` makes that case unrepresentable instead of
-    /// needing an `unwrap`/`expect` to rule it out).
-    pub(crate) receivers: HashMap<
-        ServerId,
-        (
-            tokio::sync::mpsc::Receiver<lsp::LspNotification>,
-            tokio::sync::mpsc::Receiver<lsp::LspNotification>,
-        ),
-    >,
-    /// Whether each server is the one the (rebound) router resolves
-    /// `ToolKind::Diagnostics` to for its language -- see #174 §8. Computed
-    /// here, right after the rebind, so it always reflects the post-rebind
-    /// router rather than a stale pre-rebind view.
-    pub(crate) diagnostics_flags: HashMap<ServerId, bool>,
-    /// Workspace-indexing policy each server was configured with, taken from
-    /// the config it was spawned from.
-    pub(crate) indexing_policies: HashMap<ServerId, bridge::IndexingPolicy>,
-}
-
-/// Register initialized LSP servers with the translator, rebind the router to
-/// the set that actually registered, and extract notification receivers.
-///
-/// Takes ownership of the `ServerInitResult`, extracts `notification_rx` from
-/// each server before registration. Registration itself is a sequence of
-/// short, independently-locked map inserts (see `Translator`'s field docs),
-/// so no external synchronization is required here; the rebind that follows
-/// relies only on all of *this* function's inserts having completed, which
-/// the sequential code below guarantees.
-pub(crate) fn register_servers(
-    mut result: lsp::ServerInitResult,
-    translator: &bridge::Translator,
-) -> RegisteredServers {
-    let mut receivers = HashMap::new();
-    for (id, server) in &mut result.servers {
-        receivers.insert(
-            id.clone(),
-            (server.take_notification_rx(), server.take_lifecycle_rx()),
-        );
-    }
-
-    let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
-
-    let mut language_by_id = HashMap::new();
-    let mut indexing_policies = HashMap::new();
-    for (id, server) in result.servers {
-        language_by_id.insert(id.clone(), server.client().language_id().to_string());
-        indexing_policies.insert(id, server.init_config().server_config.indexing);
-        translator.register_server_complete(server);
-    }
-
-    translator.rebind_router(&registered);
-
-    let diagnostics_flags = language_by_id
-        .into_iter()
-        .map(|(id, language)| {
-            let is_diagnostics_server = translator.is_diagnostics_route(&language, &id);
-            (id, is_diagnostics_server)
-        })
-        .collect();
-
-    RegisteredServers {
-        receivers,
-        diagnostics_flags,
-        indexing_policies,
     }
 }
 
@@ -787,7 +745,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             config.workspace.indexing_ready_timeout_seconds,
         ));
     // moved, not cloned -- `config`'s last use is above
-    let (project_config_ignored, mcp) = (config.project_config_ignored, config.mcp);
+    let (project_config_status, mcp) = (config.project_config_status, config.mcp);
     translator.set_workspace_roots(workspace_roots.clone());
 
     // Mark applicable servers as "expected" so a tool call that arrives while
@@ -842,7 +800,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Arc::clone(&notification_cache),
         workspace_roots,
         subscription_registry,
-        project_config_ignored,
+        project_config_status,
         mcp,
     );
     info!("MCPLS server initialized successfully");
@@ -1052,7 +1010,7 @@ fn spawn_lsp_servers_background(
             cancel_rx,
             workspace_roots,
         );
-        if run_init_supervised(&translator, &applicable_configs, body).await
+        if Box::pin(run_init_supervised(&translator, &applicable_configs, body)).await
             == InitOutcome::Panicked
         {
             publish_startup_failures(&translator, &settle_registry).await;
@@ -1118,8 +1076,12 @@ async fn run_init_supervised(
     }
 }
 
-/// Spawns `configs`, registers the servers that came up, and runs their
-/// diagnostics pumps until shutdown.
+/// Spawns `configs` concurrently, registers each server the moment its own
+/// `initialize` settles, and runs their diagnostics pumps until shutdown.
+///
+/// The start futures are polled on this (the supervised) task, so aborting it
+/// drops every not-yet-registered `Child`. Cancellation abandons whatever is
+/// still starting and registers nothing further.
 async fn init_lsp_servers(
     configs: &[ServerInitConfig],
     translator: &Translator,
@@ -1128,124 +1090,224 @@ async fn init_lsp_servers(
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     workspace_roots: WorkspaceRoots,
 ) {
-    let result = LspServer::spawn_batch(configs).await;
-    translator.record_startup_failures(&result.failures);
-
-    if result.all_failed() {
-        error!(
-            "All {} configured LSP server(s) failed to initialize",
-            result.failure_count()
-        );
-        for failure in &result.failures {
-            error!("Server initialization failed: {}", failure);
-        }
-        // No server will register: rebind against an empty registered
-        // set so every route drops (one rule, no special case -- see
-        // `ToolRouter::rebind_to_registered`), then stop reporting
-        // "still initializing". This path returns before
-        // `register_servers` ever runs, so it needs its own rebind call;
-        // skipping it would leave every route pointed at a dead server.
-        translator.rebind_router(&HashSet::new());
-        translator.clear_expected_servers();
-        publish_startup_failures(translator, &subscription_registry).await;
+    if configs.is_empty() {
         return;
     }
-
-    if result.partial_success() {
-        warn!(
-            "Partial server initialization: {} succeeded, {} failed",
-            result.server_count(),
-            result.failure_count()
-        );
-        for failure in &result.failures {
-            error!("Server initialization failed: {}", failure);
-        }
-    }
-
-    let server_count = result.server_count();
-    let registered = register_servers(result, translator);
-    // Background initialization has completed; stop reporting "still
-    // initializing" (especially for servers that failed to spawn on
-    // partial success, which would otherwise return ServerInitializing
-    // forever instead of the recorded startup failure).
-    //
-    // This must stay after `register_servers`: `Translator::tool_support_snapshot`'s
-    // read order relies on it (`healthy_server_never_misreported_for_any_write_read_interleaving`).
-    translator.clear_expected_servers();
-    publish_startup_failures(translator, &subscription_registry).await;
-    info!("Proceeding with {} LSP server(s)", server_count);
-
-    // Give each diagnostics-route server a fair share of the shared
-    // diagnostics cache budget now that the full set is known -- see
-    // `NotificationCache::set_diagnostics_route_count` (#266).
-    let diagnostics_route_count = registered
-        .diagnostics_flags
-        .values()
-        .filter(|&&is_route| is_route)
-        .count();
-    {
-        let mut cache = notification_cache.lock().await;
-        cache.set_diagnostics_route_count(diagnostics_route_count);
-        // Apply each server's IndexingPolicy (P4) before any pump starts, pinning Disabled to Unknown.
-        for (id, policy) in &registered.indexing_policies {
-            cache.set_indexing_policy(id.clone(), *policy);
-        }
-    }
-
-    // Start diagnostics pump tasks now that servers are registered.
+    let mut pending: FuturesUnordered<_> = configs.iter().map(LspServer::start_contained).collect();
     let pump_shared = PumpShared {
         notification_cache: Arc::clone(&notification_cache),
         subs: subscription_registry,
         workspace_roots,
     };
-    let mut pumps: JoinSet<()> = JoinSet::new();
-    let mut pump_servers = HashMap::new();
-    for (id, (rx, lifecycle_rx)) in registered.receivers {
-        let caches_diagnostics = registered
-            .diagnostics_flags
-            .get(&id)
-            .copied()
-            .unwrap_or(false);
-        let pump = pumps.spawn(diagnostics_pump(
-            id.clone(),
-            rx,
-            lifecycle_rx,
-            cancel_rx.clone(),
-            caches_diagnostics,
-            pump_shared.clone(),
-        ));
-        translator.set_notification_task(id.clone(), pump.clone());
-        pump_servers.insert(pump.id(), id);
-    }
-    // Only now can a manual restart replace the pumps registered above.
+    // Installed before the first server settles, so every settled server can
+    // be restarted and no init path leaves a registered server unwired.
     translator.install_wiring(Arc::new(PumpWiring {
-        shared: pump_shared,
+        shared: pump_shared.clone(),
         cancel_rx: cancel_rx.clone(),
     }));
-    drain_pumps(pumps, &pump_servers, &notification_cache).await;
+    let mut settler = StartupSettler {
+        translator,
+        notification_cache,
+        pump_shared,
+        cancel_rx: cancel_rx.clone(),
+        configured: configs
+            .iter()
+            .map(|config| {
+                (
+                    config.server_config.id(),
+                    config.server_config.language_id.clone(),
+                )
+            })
+            .collect(),
+        roles: HashMap::new(),
+        pumps: JoinSet::new(),
+        pump_servers: HashMap::new(),
+        tally: StartupTally::default(),
+    };
+
+    let mut cancel_rx = cancel_rx;
+    let mut cancelled = *cancel_rx.borrow();
+    if cancelled {
+        pending = FuturesUnordered::new();
+    }
+    loop {
+        if pending.is_empty() && settler.pumps.is_empty() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = cancel_rx.changed(), if !cancelled => {
+                cancelled = true;
+                pending = FuturesUnordered::new();
+            }
+            Some(outcome) = pending.next(), if !pending.is_empty() => {
+                settler.settle(outcome).await;
+                if pending.is_empty() && !cancelled {
+                    settler.tally.log_summary();
+                }
+            }
+            Some(joined) = settler.pumps.join_next_with_id(), if !settler.pumps.is_empty() => {
+                handle_pump_exit(joined, &settler.pump_servers, &settler.notification_cache).await;
+            }
+        }
+    }
 }
 
-/// Awaits every pump in `pumps`. A pump that panicked has stopped caching
-/// pushes for its server, so that server is marked push-degraded and its
-/// indexing state is reset instead of freezing at its last value.
-async fn drain_pumps(
-    mut pumps: JoinSet<()>,
+/// How many servers have registered and failed so far.
+#[derive(Debug, Default, Clone, Copy)]
+struct StartupTally {
+    registered: usize,
+    failed: usize,
+}
+
+impl StartupTally {
+    /// Logs the aggregate outcome; called once, when the last server settles.
+    fn log_summary(self) {
+        let Self { registered, failed } = self;
+        if registered == 0 {
+            error!("All {failed} configured LSP server(s) failed to initialize");
+            return;
+        }
+        if failed > 0 {
+            warn!("Partial server initialization: {registered} succeeded, {failed} failed");
+        }
+        info!("Proceeding with {registered} LSP server(s)");
+    }
+}
+
+/// Settles servers one at a time for [`init_lsp_servers`].
+struct StartupSettler<'a> {
+    translator: &'a Translator,
+    notification_cache: Arc<Mutex<NotificationCache>>,
+    pump_shared: PumpShared,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    /// `(id, language)` of every configured server, settled or not.
+    configured: Vec<(ServerId, String)>,
+    roles: HashMap<ServerId, (String, tokio::sync::watch::Sender<DiagnosticsRole>)>,
+    pumps: JoinSet<()>,
+    pump_servers: HashMap<tokio::task::Id, ServerId>,
+    tally: StartupTally,
+}
+
+impl StartupSettler<'_> {
+    async fn settle(&mut self, outcome: ServerStartOutcome) {
+        match outcome {
+            ServerStartOutcome::Started(server) => self.settle_started(*server).await,
+            ServerStartOutcome::Failed(failure) => self.settle_failed(failure).await,
+        }
+    }
+
+    /// Receivers and indexing policy are taken before the server is visible;
+    /// cancel is re-checked right before registering.
+    async fn settle_started(&mut self, mut server: LspServer) {
+        if *self.cancel_rx.borrow() {
+            return;
+        }
+        let notification_rx = server.take_notification_rx();
+        let lifecycle_rx = server.take_lifecycle_rx();
+        let policy = server.init_config().server_config.indexing;
+        let config_id = server.init_config().server_config.id();
+        self.notification_cache
+            .lock()
+            .await
+            .set_indexing_policy(config_id, policy);
+        if *self.cancel_rx.borrow() {
+            return;
+        }
+
+        // A restart waits on this lock, so it never runs between the server
+        // becoming visible and its initial pump being registered.
+        let respawn_lock = self
+            .translator
+            .respawn_lock(&server.init_config().server_config.id());
+        let serialized = respawn_lock.lock().await;
+        let (id, language) = self.translator.settle_started(server);
+        let (role_tx, role_rx) = tokio::sync::watch::channel(self.diagnostics_role(&language, &id));
+        self.roles.insert(id.clone(), (language, role_tx));
+        self.recompute_roles().await;
+        let pump = self.pumps.spawn(diagnostics_pump(
+            id.clone(),
+            notification_rx,
+            lifecycle_rx,
+            self.cancel_rx.clone(),
+            role_rx,
+            self.pump_shared.clone(),
+        ));
+        self.translator
+            .set_notification_task(id.clone(), pump.clone());
+        drop(serialized);
+        self.pump_servers.insert(pump.id(), id.clone());
+        self.tally.registered = self.tally.registered.saturating_add(1);
+        self.publish_routes_served_by(&id).await;
+    }
+
+    /// Notifies subscribers of files now served by `id`, which may have been
+    /// told "starting" while the route was unbound.
+    async fn publish_routes_served_by(&self, id: &ServerId) {
+        self.pump_shared
+            .subs
+            .publish_matching(|uri| {
+                self.translator.diagnostics_route_for_uri(uri).server_id() == Some(id)
+            })
+            .await;
+    }
+
+    /// Records the failure, re-evaluates roles, notifies failed routes.
+    async fn settle_failed(&mut self, failure: ServerSpawnFailure) {
+        error!("Server initialization failed: {failure}");
+        self.translator.settle_failed(&failure);
+        self.tally.failed = self.tally.failed.saturating_add(1);
+        self.recompute_roles().await;
+        publish_startup_failures(self.translator, &self.pump_shared.subs).await;
+    }
+
+    fn diagnostics_role(&self, language: &str, id: &ServerId) -> DiagnosticsRole {
+        DiagnosticsRole::from_route(self.translator.is_diagnostics_route(language, id))
+    }
+
+    /// Pending servers count toward the route count, so it equals the batch
+    /// value once every server has settled.
+    async fn recompute_roles(&self) {
+        for (id, (language, role_tx)) in &self.roles {
+            let role = self.diagnostics_role(language, id);
+            role_tx.send_if_modified(|current| {
+                let changed = *current != role;
+                *current = role;
+                changed
+            });
+        }
+        let route_count = self
+            .configured
+            .iter()
+            .filter(|(id, language)| {
+                self.translator.startup_failure(id).is_none()
+                    && self.translator.is_diagnostics_route(language, id)
+            })
+            .count();
+        self.notification_cache
+            .lock()
+            .await
+            .set_diagnostics_route_count(route_count);
+    }
+}
+
+/// A panicked pump stops caching its server's pushes: mark it push-degraded.
+async fn handle_pump_exit(
+    joined: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
     pump_servers: &HashMap<tokio::task::Id, ServerId>,
     notification_cache: &Mutex<NotificationCache>,
 ) {
-    while let Some(joined) = pumps.join_next_with_id().await {
-        let Err(join_error) = joined else { continue };
-        if !join_error.is_panic() {
-            continue;
-        }
-        let Some(server_id) = pump_servers.get(&join_error.id()) else {
-            continue;
-        };
-        error!("Diagnostics pump for LSP server '{server_id}' panicked: {join_error}");
-        let mut cache = notification_cache.lock().await;
-        cache.mark_push_degraded(server_id);
-        cache.reset_indexing_state(server_id);
+    let Err(join_error) = joined else { return };
+    if !join_error.is_panic() {
+        return;
     }
+    let Some(server_id) = pump_servers.get(&join_error.id()) else {
+        return;
+    };
+    error!("Diagnostics pump for LSP server '{server_id}' panicked: {join_error}");
+    let mut cache = notification_cache.lock().await;
+    cache.mark_push_degraded(server_id);
+    cache.reset_indexing_state(server_id);
 }
 
 /// Shared by any `#[cfg(test)]` module in this crate that needs to mutate
@@ -1981,7 +2043,7 @@ mod tests {
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
                 }],
-                project_config_ignored: false,
+                project_config_status: ProjectConfigStatus::NotIgnored,
             };
 
             // serve() proceeds to run the MCP server and blocks on the stdio
@@ -2023,7 +2085,7 @@ mod tests {
                     indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
                 },
                 lsp_servers: vec![],
-                project_config_ignored: false,
+                project_config_status: ProjectConfigStatus::NotIgnored,
             };
 
             let result = serve(config).await;
@@ -2081,7 +2143,7 @@ mod tests {
                     indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
                 },
                 lsp_servers: vec![],
-                project_config_ignored: false,
+                project_config_status: ProjectConfigStatus::NotIgnored,
             };
 
             // serve() with no LSP servers configured blocks on the stdio
@@ -2146,7 +2208,7 @@ mod tests {
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
                 }],
-                project_config_ignored: false,
+                project_config_status: ProjectConfigStatus::NotIgnored,
             };
 
             // `validate()` runs before any spawn/transport work and should
@@ -2324,6 +2386,418 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod settler_tests {
+        use super::*;
+        use crate::bridge::WorkspaceRoots;
+        use crate::config::{LspServerConfig, ToolKind};
+        use crate::error::StartupFailure;
+
+        fn settler_for<'a>(
+            translator: &'a Translator,
+            cache: &Arc<Mutex<NotificationCache>>,
+            subs: SubscriptionRegistry,
+            configs: &[&LspServerConfig],
+        ) -> StartupSettler<'a> {
+            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            StartupSettler {
+                translator,
+                notification_cache: Arc::clone(cache),
+                pump_shared: PumpShared {
+                    notification_cache: Arc::clone(cache),
+                    subs,
+                    workspace_roots: WorkspaceRoots::default(),
+                },
+                cancel_rx,
+                configured: configs
+                    .iter()
+                    .map(|c| (c.id(), c.language_id.clone()))
+                    .collect(),
+                roles: HashMap::new(),
+                pumps: JoinSet::new(),
+                pump_servers: HashMap::new(),
+                tally: StartupTally::default(),
+            }
+        }
+
+        fn failure_of(config: &LspServerConfig) -> ServerStartOutcome {
+            ServerStartOutcome::Failed(ServerSpawnFailure {
+                server_id: config.id(),
+                language_id: config.language_id.clone(),
+                command: config.command.clone(),
+                reason: StartupFailure::InitTaskPanicked,
+            })
+        }
+
+        fn explicit_and_catch_all_translator() -> (Translator, LspServerConfig, LspServerConfig) {
+            let mut explicit = LspServerConfig::rust_analyzer();
+            explicit.name = Some("explicit".to_string());
+            explicit.handles = Some(vec![ToolKind::Diagnostics]);
+            let mut catch_all = LspServerConfig::rust_analyzer();
+            catch_all.name = Some("catch-all".to_string());
+            let translator = Translator::new()
+                .with_extensions(crate::test_lsp::test_extensions())
+                .with_router(ToolRouter::from_configs([&explicit, &catch_all]).unwrap());
+            translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
+            (translator, explicit, catch_all)
+        }
+
+        async fn subscribe_to_main_rs(
+            registry: &SubscriptionRegistry,
+        ) -> (
+            crate::mcp::SessionHandle,
+            tokio::sync::mpsc::Receiver<String>,
+            crate::bridge::resources::DiagnosticsResourceUri,
+        ) {
+            use crate::bridge::resources::make_uri;
+            use crate::mcp::{SessionHandle, Target};
+
+            let session = SessionHandle::new(registry.clone());
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let uri = crate::test_lsp::diagnostics_uri(
+                &make_uri(&crate::test_lsp::absolute_path("main.rs")).unwrap(),
+            );
+            session
+                .subscribe_for_test(&uri, Target::Channel(tx))
+                .await
+                .unwrap();
+            (session, rx, uri)
+        }
+
+        /// FR-016: while the explicit diagnostics server is failed and the
+        /// catch-all still starting, subscribers hear nothing (the route is
+        /// merely starting); they are told once the catch-all fails too.
+        #[tokio::test]
+        async fn startup_failure_publish_reaches_routes_attributed_via_configured_router() {
+            let (translator, explicit, catch_all) = explicit_and_catch_all_translator();
+            let registry = SubscriptionRegistry::new();
+            let (_session, mut rx, uri) = subscribe_to_main_rs(&registry).await;
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let mut settler = settler_for(&translator, &cache, registry, &[&explicit, &catch_all]);
+
+            settler.settle(failure_of(&explicit)).await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err(),
+                "the route is only starting while the catch-all is pending"
+            );
+
+            settler.settle(failure_of(&catch_all)).await;
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("notified once the catch-all failed")
+                .unwrap();
+            assert_eq!(got, uri.as_str());
+        }
+
+        /// A subscriber of a file whose explicit server failed is told to
+        /// re-read once the catch-all registers and serves the route.
+        #[tokio::test]
+        async fn catch_all_registration_notifies_subscribers_of_recovered_routes() {
+            let (translator, explicit, catch_all) = explicit_and_catch_all_translator();
+            let registry = SubscriptionRegistry::new();
+            let (_session, mut rx, uri) = subscribe_to_main_rs(&registry).await;
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let mut settler = settler_for(&translator, &cache, registry, &[&explicit, &catch_all]);
+
+            settler.settle(failure_of(&explicit)).await;
+            settler
+                .settle(ServerStartOutcome::Started(Box::new(
+                    crate::lsp::fake_lsp_server_with_config(catch_all.clone()),
+                )))
+                .await;
+
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("notified when the catch-all registered")
+                .unwrap();
+            assert_eq!(got, uri.as_str());
+        }
+
+        /// Cancellation that lands while the cache lock is awaited also drops it.
+        #[tokio::test]
+        async fn settle_started_cancelled_during_cache_wait_does_not_register() {
+            let config = LspServerConfig::rust_analyzer();
+            let translator = Translator::new();
+            translator.set_expected_servers(std::iter::once(config.id()).collect());
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut settler =
+                settler_for(&translator, &cache, SubscriptionRegistry::new(), &[&config]);
+            settler.cancel_rx = cancel_rx;
+            let guard = cache.lock().await;
+
+            let settle = settler.settle(ServerStartOutcome::Started(Box::new(
+                crate::lsp::fake_lsp_server_with_config(config.clone()),
+            )));
+            let release = async {
+                tokio::task::yield_now().await;
+                cancel_tx.send(true).unwrap();
+                drop(guard);
+            };
+            tokio::join!(settle, release);
+
+            assert_eq!(translator.registered_server_count(), 0);
+        }
+
+        /// Cancellation that lands while a server finishes starting drops it
+        /// instead of registering it after shutdown drained the registry.
+        #[tokio::test]
+        async fn settle_started_after_cancel_does_not_register() {
+            let config = LspServerConfig::rust_analyzer();
+            let translator = Translator::new();
+            translator.set_expected_servers(std::iter::once(config.id()).collect());
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut settler =
+                settler_for(&translator, &cache, SubscriptionRegistry::new(), &[&config]);
+            settler.cancel_rx = cancel_rx;
+            cancel_tx.send(true).unwrap();
+
+            settler
+                .settle(ServerStartOutcome::Started(Box::new(
+                    crate::lsp::fake_lsp_server_with_config(config.clone()),
+                )))
+                .await;
+
+            assert_eq!(translator.registered_server_count(), 0);
+        }
+
+        /// M4/M6: the catch-all registers as `Secondary` while the explicit
+        /// diagnostics server is pending, becomes `Authoritative` once that
+        /// server fails, and the route count equals the batch value.
+        #[tokio::test]
+        async fn catch_all_role_flips_when_explicit_diagnostics_server_fails() {
+            let mut explicit = LspServerConfig::rust_analyzer();
+            explicit.name = Some("explicit".to_string());
+            explicit.handles = Some(vec![ToolKind::Diagnostics]);
+            let mut catch_all = LspServerConfig::rust_analyzer();
+            catch_all.name = Some("catch-all".to_string());
+            let router = ToolRouter::from_configs([&explicit, &catch_all]).unwrap();
+            let translator = Translator::new().with_router(router);
+            translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let mut settler = settler_for(
+                &translator,
+                &cache,
+                SubscriptionRegistry::new(),
+                &[&explicit, &catch_all],
+            );
+
+            settler
+                .settle(ServerStartOutcome::Started(Box::new(
+                    crate::lsp::fake_lsp_server_with_config(catch_all.clone()),
+                )))
+                .await;
+            let role = |settler: &StartupSettler<'_>| *settler.roles[&catch_all.id()].1.borrow();
+            assert_eq!(role(&settler), DiagnosticsRole::Secondary);
+            assert_eq!(cache.lock().await.configured_route_count(), Some(1));
+
+            settler
+                .settle(ServerStartOutcome::Failed(ServerSpawnFailure {
+                    server_id: explicit.id(),
+                    language_id: "rust".to_string(),
+                    command: explicit.command.clone(),
+                    reason: StartupFailure::InitTaskPanicked,
+                }))
+                .await;
+
+            assert_eq!(role(&settler), DiagnosticsRole::Authoritative);
+            assert_eq!(cache.lock().await.configured_route_count(), Some(1));
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod startup_tests {
+        use std::path::Path;
+
+        use super::*;
+        use crate::bridge::{RouteSupport, WorkspaceRoots};
+        use crate::config::ToolKind;
+        use crate::error::StartupFailure;
+        use crate::test_lsp::{answer_initialize_script, named_sh_init_config};
+
+        struct Startup {
+            translator: Arc<Translator>,
+            task: JoinHandle<()>,
+            cancel_tx: tokio::sync::watch::Sender<bool>,
+        }
+
+        fn start(configs: Vec<ServerInitConfig>) -> Startup {
+            let router =
+                ToolRouter::from_configs(configs.iter().map(|c| &c.server_config)).unwrap();
+            let translator = Arc::new(
+                Translator::new()
+                    .with_extensions(crate::test_lsp::test_extensions())
+                    .with_router(router),
+            );
+            translator.set_expected_servers(configs.iter().map(|c| c.server_config.id()).collect());
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let task = spawn_lsp_servers_background(
+                configs,
+                Arc::clone(&translator),
+                cache,
+                SubscriptionRegistry::new(),
+                cancel_rx,
+                WorkspaceRoots::default(),
+            );
+            Startup {
+                translator,
+                task,
+                cancel_tx,
+            }
+        }
+
+        fn support(translator: &Translator, language: &str) -> RouteSupport {
+            translator
+                .tool_support_snapshot()
+                .document_support(language, ToolKind::Hover)
+        }
+
+        async fn wait_until(what: &str, condition: impl Fn() -> bool + Send + Sync) {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while !condition() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        }
+
+        /// US-001/US-002: the fast server is usable while the slow one is still
+        /// initializing, whichever is listed first.
+        #[tokio::test]
+        async fn fast_server_registers_while_slow_sibling_initializes() {
+            for slow_first in [true, false] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let gate = dir.path().join("gate");
+                let fast = named_sh_init_config(
+                    dir.path(),
+                    "fast",
+                    "rust",
+                    &answer_initialize_script(None, None),
+                );
+                let slow = named_sh_init_config(
+                    dir.path(),
+                    "slow",
+                    "typescriptreact",
+                    &answer_initialize_script(None, Some(&gate)),
+                );
+                let configs = if slow_first {
+                    vec![slow, fast]
+                } else {
+                    vec![fast, slow]
+                };
+                let startup = start(configs);
+
+                wait_until("the fast server to register", || {
+                    !matches!(
+                        support(&startup.translator, "rust"),
+                        RouteSupport::Initializing
+                    )
+                })
+                .await;
+                assert_eq!(
+                    support(&startup.translator, "typescriptreact"),
+                    RouteSupport::Initializing,
+                    "slow_first: {slow_first}"
+                );
+
+                std::fs::write(&gate, "").unwrap();
+                wait_until("the slow server to register", || {
+                    !matches!(
+                        support(&startup.translator, "typescriptreact"),
+                        RouteSupport::Initializing
+                    )
+                })
+                .await;
+                startup.cancel_tx.send(true).unwrap();
+                startup.task.await.unwrap();
+            }
+        }
+
+        /// US-003: a failed server reports its failure at once while its sibling
+        /// still initializes.
+        #[tokio::test]
+        async fn failed_server_reports_failure_while_sibling_initializes() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let gate = dir.path().join("gate");
+            let mut broken = named_sh_init_config(dir.path(), "broken", "rust", "exit 1\n");
+            broken.server_config.command = "mcpls-no-such-language-server".to_string();
+            let slow = named_sh_init_config(
+                dir.path(),
+                "slow",
+                "typescriptreact",
+                &answer_initialize_script(None, Some(&gate)),
+            );
+            let startup = start(vec![broken, slow]);
+
+            wait_until("the broken server to settle", || {
+                startup
+                    .translator
+                    .diagnostics_route_for_path(Path::new("/ws/main.rs"))
+                    .is_failed()
+            })
+            .await;
+            assert_eq!(
+                support(&startup.translator, "typescriptreact"),
+                RouteSupport::Initializing
+            );
+            let failure = startup
+                .translator
+                .startup_failure(&ServerId::from("broken"))
+                .unwrap();
+            std::assert_matches!(failure.reason, StartupFailure::Spawn(_));
+
+            startup.cancel_tx.send(true).unwrap();
+            startup.task.await.unwrap();
+        }
+
+        /// FR-014/FR-015 and review N5: cancellation abandons servers that are
+        /// still starting without registering them, recording a failure for
+        /// them or logging an aggregate outcome.
+        #[tokio::test]
+        async fn cancel_during_startup_stops_registering_pending_servers() {
+            use tracing_subscriber::prelude::*;
+
+            use crate::test_lsp::CapturedLogs;
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let never = dir.path().join("never");
+            let up = dir.path().join("up");
+            let stuck = named_sh_init_config(
+                dir.path(),
+                "stuck",
+                "rust",
+                &answer_initialize_script(Some(&up), Some(&never)),
+            );
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::registry().with(logs.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+            let startup = start(vec![stuck]);
+
+            wait_until("the stuck server to start", || up.exists()).await;
+            startup.cancel_tx.send(true).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), startup.task)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(guard);
+
+            assert_eq!(startup.translator.registered_server_count(), 0);
+            assert!(startup.translator.startup_failures().is_empty());
+            let aggregate: Vec<String> = logs
+                .messages()
+                .into_iter()
+                .filter(|m| m.contains("Proceeding with") || m.contains("failed to initialize"))
+                .collect();
+            assert!(aggregate.is_empty(), "{aggregate:?}");
+        }
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     mod init_supervision_tests {
         use super::*;
         use crate::bridge::IndexingState;
@@ -2488,7 +2962,9 @@ mod tests {
             });
             let pump_servers = HashMap::from([(pump.id(), id.clone())]);
 
-            drain_pumps(pumps, &pump_servers, &cache).await;
+            while let Some(joined) = pumps.join_next_with_id().await {
+                handle_pump_exit(joined, &pump_servers, &cache).await;
+            }
 
             let guard = cache.lock().await;
             assert!(guard.is_push_degraded(&id));
@@ -2504,7 +2980,9 @@ mod tests {
             let pump = pumps.spawn(async {});
             let pump_servers = HashMap::from([(pump.id(), id.clone())]);
 
-            drain_pumps(pumps, &pump_servers, &cache).await;
+            while let Some(joined) = pumps.join_next_with_id().await {
+                handle_pump_exit(joined, &pump_servers, &cache).await;
+            }
 
             assert!(!cache.lock().await.is_push_degraded(&id));
         }
@@ -2566,7 +3044,7 @@ mod tests {
                 rx,
                 lifecycle_rx,
                 cancel_rx,
-                true,
+                tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
                 PumpShared {
                     notification_cache: c,
                     subs: subs.clone(),
@@ -2592,7 +3070,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     let found = {
                         let guard = cache.lock().await;
-                        guard.diagnostics(uri.as_ref()).is_some()
+                        guard.diagnostics(&uri).is_some()
                     };
                     if found {
                         return true;
@@ -2638,7 +3116,7 @@ mod tests {
                 rx,
                 lifecycle_rx,
                 cancel_rx,
-                true,
+                tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: subs.clone(),
@@ -2676,7 +3154,7 @@ mod tests {
                 loop {
                     {
                         let guard = cache.lock().await;
-                        if guard.diagnostics(inside_uri.as_ref()).is_some() {
+                        if guard.diagnostics(&inside_uri).is_some() {
                             return;
                         }
                     }
@@ -2686,11 +3164,7 @@ mod tests {
             .await
             .expect("pump did not cache in-workspace diagnostics within 5 s");
 
-            let found_outside = cache
-                .lock()
-                .await
-                .diagnostics(outside_uri.as_ref())
-                .is_some();
+            let found_outside = cache.lock().await.diagnostics(&outside_uri).is_some();
             assert!(
                 !found_outside,
                 "diagnostics for a URI outside workspace roots must not be cached"
@@ -2711,7 +3185,7 @@ mod tests {
                 rx,
                 lifecycle_rx,
                 cancel_rx,
-                true,
+                tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -2741,7 +3215,7 @@ mod tests {
                 rx,
                 lifecycle_rx,
                 cancel_rx,
-                true,
+                tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -2786,7 +3260,7 @@ mod tests {
                 rx,
                 lifecycle_rx,
                 cancel_rx,
-                true,
+                tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -2812,7 +3286,7 @@ mod tests {
                 loop {
                     {
                         let guard = cache.lock().await;
-                        if guard.diagnostics(uri.as_ref()).is_some() {
+                        if guard.diagnostics(&uri).is_some() {
                             return;
                         }
                     }
@@ -2846,7 +3320,7 @@ mod tests {
                 rx,
                 lifecycle_rx,
                 cancel_rx,
-                true,
+                tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -2903,7 +3377,7 @@ mod tests {
                 rx,
                 lifecycle_rx,
                 cancel_rx,
-                true,
+                tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -2969,7 +3443,7 @@ mod tests {
                 rx,
                 lifecycle_rx,
                 cancel_rx,
-                true,
+                tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3200,8 +3674,8 @@ mod tests {
             let (info, escaped) = {
                 let guard = cache.lock().await;
                 (
-                    guard.diagnostic_sources(canonical_lsp.as_ref()),
-                    guard.has_diagnostics(bridge::path_to_uri(&escape).unwrap().as_ref()),
+                    guard.diagnostic_sources(&canonical_lsp),
+                    guard.has_diagnostics(&bridge::path_to_uri(&escape).unwrap()),
                 )
             };
             assert_eq!(info.merge().unwrap().diagnostics.len(), 1);
@@ -3247,10 +3721,7 @@ mod tests {
             let canonical_uri = bridge::path_to_uri(&real.join("main.rs")).unwrap();
             let info = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    let sources = cache
-                        .lock()
-                        .await
-                        .diagnostic_sources(canonical_uri.as_ref());
+                    let sources = cache.lock().await.diagnostic_sources(&canonical_uri);
                     if let Some(info) = sources.merge() {
                         return info;
                     }
@@ -3315,7 +3786,7 @@ mod tests {
             let info = cache
                 .lock()
                 .await
-                .diagnostic_sources(canonical_lsp.as_ref())
+                .diagnostic_sources(&canonical_lsp)
                 .merge()
                 .unwrap();
             assert!(info.diagnostics.is_empty(), "the alias's clear must apply");
@@ -3414,7 +3885,7 @@ mod tests {
                 make_cache(),
                 WorkspaceRoots::resolve(vec![root.clone()]),
                 subs.clone(),
-                false,
+                ProjectConfigStatus::NotIgnored,
                 config::McpConfig::default(),
             );
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -3507,7 +3978,7 @@ mod tests {
                     make_cache(),
                     WorkspaceRoots::resolve(vec![root]),
                     subs.clone(),
-                    false,
+                    ProjectConfigStatus::NotIgnored,
                     config::McpConfig::default(),
                 );
                 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
