@@ -740,6 +740,23 @@ export MCPLS_HTTP_STREAM_LIVENESS=off
 mcpls
 ```
 
+## Secret Redaction
+
+mcpls hides the values of secret-named environment variables, secret-named
+`--flag=value` / `--flag value` arguments and secret-keyed
+`initialization_options` strings (names containing `TOKEN`, `KEY`, `SECRET`,
+`PASSW`, `CRED` or `AUTH`, case-insensitive; values under 8 bytes are not
+redacted) from everything that reaches logs or MCP clients: server log and
+show messages, startup and request errors, trace-level wire logs, and the
+spawn argument list (only the count is logged at `info`; values appear
+redacted at `debug`). Replacements read `[redacted:NAME]`.
+
+Matching is by exact value, plus its JSON-escaped and `Debug`-escaped
+spellings. A server that re-encodes a secret, for example as a `\uXXXX`
+escape for non-ASCII text, as `\/` for a `/`, or as URL or base64 text, can
+slip past the redaction in trace-level wire logs; typical ASCII tokens without
+a `/` are unaffected.
+
 ## Complete Examples
 
 ### Rust Project (Zero Config)

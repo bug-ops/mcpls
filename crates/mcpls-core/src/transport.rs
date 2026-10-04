@@ -819,8 +819,9 @@ pub(crate) async fn run_stdio(
 /// that. This reaper is the only expiry owner: rmcp's own `keep_alive` timer is
 /// switched off, so neither outbound `resources/updated` notifications (#521)
 /// nor SSE pings affect expiry. The idle clock starts at the later of the last
-/// inbound request and the moment the last stream closed. A client that closes its connections cleanly is noticed on
-/// the next write, at most one SSE keep-alive (15 s) later. A silently vanished
+/// inbound request and the moment the last stream closed. A client that closes
+/// its connections cleanly is noticed on the next write, at most one SSE
+/// keep-alive (15 s) later. A silently vanished
 /// peer (half-open TCP: sleeping laptop, dropped NAT mapping) is detected by
 /// the liveness probe above: its stream closes within one probe interval plus
 /// deadline and the session then expires after the idle timeout. The probe
