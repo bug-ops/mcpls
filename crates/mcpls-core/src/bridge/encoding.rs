@@ -40,40 +40,72 @@ impl PositionEncoding {
     }
 }
 
+/// Whether a column conversion preserved the exact character the caller named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnFidelity {
+    /// The column is correct in the target encoding.
+    Exact,
+    /// The column could not be converted and was passed through as-is.
+    PassedThrough,
+}
+
+/// A converted value together with whether its column conversion was exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub struct Converted<T> {
+    /// The converted value.
+    pub value: T,
+    /// Whether the column inside `value` is exact in the target encoding.
+    pub fidelity: ColumnFidelity,
+}
+
+impl<T> Converted<T> {
+    const fn exact(value: T) -> Self {
+        Self {
+            value,
+            fidelity: ColumnFidelity::Exact,
+        }
+    }
+
+    const fn passed_through(value: T) -> Self {
+        Self {
+            value,
+            fidelity: ColumnFidelity::PassedThrough,
+        }
+    }
+}
+
 /// Convert MCP position (1-based) to LSP position (0-based), translating the
 /// character column into `encoding`'s units.
 ///
 /// MCP character columns are defined in UTF-16 code units -- the LSP default
 /// and what nearly every server negotiates -- so `PositionEncoding::Utf16`
-/// is a pure line/column offset with no further work, byte-for-byte
-/// identical to the fixed-encoding behavior this replaces. For any other
-/// negotiated encoding, `line_text` (the exact text of the target 0-based
-/// LSP line, without a line terminator) is used to re-derive the column in
-/// `encoding`'s units. If `line_text` is unavailable (e.g. the file could
-/// not be read) or the character offset is out of bounds for that line, the
-/// raw MCP character is used unconverted rather than failing the request.
-#[must_use]
+/// is a pure line/column offset with no further work, and column 0 is
+/// identical in every encoding. Otherwise `line_text` (the exact text of the
+/// target 0-based LSP line, without a line terminator) is used to re-derive
+/// the column in `encoding`'s units; a column past the end of the line clamps
+/// to the line length, per LSP 3.17. If `line_text` is unavailable (e.g. the
+/// file could not be read) or the column lands inside a multi-unit
+/// character, the raw MCP character is used unconverted rather than failing
+/// the request, and the result's [`Converted::fidelity`] is
+/// [`ColumnFidelity::PassedThrough`].
 pub fn mcp_to_lsp_position(
     position: Position,
     line_text: Option<&str>,
     encoding: PositionEncoding,
-) -> lsp_types::Position {
-    let lsp_line = position.line.saturating_sub(1);
-    let mcp_character = position.character.saturating_sub(1);
-
-    let lsp_character = match (encoding, line_text) {
-        (PositionEncoding::Utf16, _) | (_, None) => mcp_character,
-        (_, Some(text)) => {
-            let target = EncodingConverter::new(encoding);
-            exact_byte_offset(text, mcp_character, PositionEncoding::Utf16)
-                .and_then(|byte_offset| target.byte_offset_to_character(text, byte_offset).ok())
-                .unwrap_or(mcp_character)
-        }
-    };
-
-    lsp_types::Position {
-        line: lsp_line,
-        character: lsp_character,
+) -> Converted<lsp_types::Position> {
+    let column = convert_column(
+        position.character.saturating_sub(1),
+        line_text,
+        PositionEncoding::Utf16,
+        encoding,
+    );
+    Converted {
+        value: lsp_types::Position {
+            line: position.line.saturating_sub(1),
+            character: column.value,
+        },
+        fidelity: column.fidelity,
     }
 }
 
@@ -81,27 +113,77 @@ pub fn mcp_to_lsp_position(
 /// (1-based, UTF-16 code units).
 ///
 /// The inverse of [`mcp_to_lsp_position`]; see its docs for the fast path
-/// and fallback behavior.
-#[must_use]
+/// and fallback behavior. `character == u32::MAX`, the LSP "end of line"
+/// idiom, is always [`ColumnFidelity::Exact`] and returned unchanged.
 pub fn lsp_to_mcp_position(
     pos: lsp_types::Position,
     line_text: Option<&str>,
     encoding: PositionEncoding,
-) -> Position2D {
-    let mcp_character = match (encoding, line_text) {
-        (PositionEncoding::Utf16, _) | (_, None) => pos.character,
-        (_, Some(text)) => {
-            let utf16 = EncodingConverter::new(PositionEncoding::Utf16);
-            exact_byte_offset(text, pos.character, encoding)
-                .and_then(|byte_offset| utf16.byte_offset_to_character(text, byte_offset).ok())
-                .unwrap_or(pos.character)
-        }
+) -> Converted<Position2D> {
+    let column = if pos.character == u32::MAX {
+        Converted::exact(u32::MAX)
+    } else {
+        convert_column(pos.character, line_text, encoding, PositionEncoding::Utf16)
     };
 
-    Position2D {
-        line: pos.line.saturating_add(1),
-        character: mcp_character.saturating_add(1),
+    Converted {
+        value: Position2D {
+            line: pos.line.saturating_add(1),
+            character: column.value.saturating_add(1),
+        },
+        fidelity: column.fidelity,
     }
+}
+
+/// Re-derive a 0-based `column` from `from` units into `to` units, deciding
+/// fidelity in one place for both conversion directions.
+fn convert_column(
+    column: u32,
+    line_text: Option<&str>,
+    from: PositionEncoding,
+    to: PositionEncoding,
+) -> Converted<u32> {
+    if from == to || column == 0 {
+        return Converted::exact(column);
+    }
+    let Some(text) = line_text else {
+        return Converted::passed_through(column);
+    };
+
+    let line_len_in = |encoding| {
+        EncodingConverter::new(encoding)
+            .byte_offset_to_character(text, text.len())
+            .ok()
+    };
+    // Code units never outnumber bytes, so `column > text.len()` is past the end in any encoding.
+    let past_end =
+        || column as usize > text.len() || line_len_in(from).is_some_and(|len| column > len);
+
+    let exact = (column as usize <= text.len())
+        .then(|| exact_byte_offset(text, column, from))
+        .flatten()
+        .and_then(|byte_offset| {
+            EncodingConverter::new(to)
+                .byte_offset_to_character(text, byte_offset)
+                .ok()
+        });
+    if let Some(converted) = exact {
+        return Converted::exact(converted);
+    }
+    if past_end()
+        && let Some(clamped) = line_len_in(to)
+    {
+        // A server column past its own line end means its text differs from ours.
+        return if from == PositionEncoding::Utf16 {
+            Converted::exact(clamped)
+        } else {
+            Converted {
+                value: clamped,
+                fidelity: ColumnFidelity::PassedThrough,
+            }
+        };
+    }
+    Converted::passed_through(column)
 }
 
 /// Resolve `character_offset` (in `encoding`'s units) to a byte offset in
@@ -259,58 +341,47 @@ impl EncodingConverter {
 mod tests {
     use super::*;
 
+    fn lsp_at(
+        line: u32,
+        character: u32,
+        line_text: Option<&str>,
+        encoding: PositionEncoding,
+    ) -> Converted<lsp_types::Position> {
+        mcp_to_lsp_position(Position { line, character }, line_text, encoding)
+    }
+
+    fn mcp_at(
+        line: u32,
+        character: u32,
+        line_text: Option<&str>,
+        encoding: PositionEncoding,
+    ) -> Converted<(u32, u32)> {
+        let converted =
+            lsp_to_mcp_position(lsp_types::Position { line, character }, line_text, encoding);
+        Converted {
+            value: (converted.value.line, converted.value.character),
+            fidelity: converted.fidelity,
+        }
+    }
+
     #[test]
     fn test_mcp_to_lsp_position() {
-        let lsp_pos = mcp_to_lsp_position(
-            Position {
-                line: 1,
-                character: 1,
-            },
-            None,
-            PositionEncoding::Utf16,
-        );
+        let lsp_pos = lsp_at(1, 1, None, PositionEncoding::Utf16).value;
         assert_eq!(lsp_pos.line, 0);
         assert_eq!(lsp_pos.character, 0);
 
-        let lsp_pos = mcp_to_lsp_position(
-            Position {
-                line: 10,
-                character: 5,
-            },
-            None,
-            PositionEncoding::Utf16,
-        );
+        let lsp_pos = lsp_at(10, 5, None, PositionEncoding::Utf16).value;
         assert_eq!(lsp_pos.line, 9);
         assert_eq!(lsp_pos.character, 4);
     }
 
     #[test]
     fn test_lsp_to_mcp_position() {
-        let Position2D {
-            line,
-            character: char,
-        } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: 0,
-                character: 0,
-            },
-            None,
-            PositionEncoding::Utf16,
-        );
+        let (line, char) = mcp_at(0, 0, None, PositionEncoding::Utf16).value;
         assert_eq!(line, 1);
         assert_eq!(char, 1);
 
-        let Position2D {
-            line,
-            character: char,
-        } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: 9,
-                character: 4,
-            },
-            None,
-            PositionEncoding::Utf16,
-        );
+        let (line, char) = mcp_at(9, 4, None, PositionEncoding::Utf16).value;
         assert_eq!(line, 10);
         assert_eq!(char, 5);
     }
@@ -319,18 +390,11 @@ mod tests {
     fn test_roundtrip() {
         for line in 1..100 {
             for char in 1..100 {
-                let lsp_pos = mcp_to_lsp_position(
-                    Position {
-                        line,
-                        character: char,
-                    },
-                    None,
-                    PositionEncoding::Utf16,
-                );
+                let lsp_pos = lsp_at(line, char, None, PositionEncoding::Utf16).value;
                 let Position2D {
                     line: mcp_line,
                     character: mcp_char,
-                } = lsp_to_mcp_position(lsp_pos, None, PositionEncoding::Utf16);
+                } = lsp_to_mcp_position(lsp_pos, None, PositionEncoding::Utf16).value;
                 assert_eq!(line, mcp_line);
                 assert_eq!(char, mcp_char);
             }
@@ -340,14 +404,7 @@ mod tests {
     #[test]
     fn test_saturating_sub_zero() {
         // Edge case: MCP position 0 should not underflow
-        let lsp_pos = mcp_to_lsp_position(
-            Position {
-                line: 0,
-                character: 0,
-            },
-            None,
-            PositionEncoding::Utf16,
-        );
+        let lsp_pos = lsp_at(0, 0, None, PositionEncoding::Utf16).value;
         assert_eq!(lsp_pos.line, 0);
         assert_eq!(lsp_pos.character, 0);
     }
@@ -359,27 +416,10 @@ mod tests {
     #[test]
     fn test_utf16_negotiated_ignores_line_text() {
         let line_text = "let 😀 = \"héllo\";";
-        let lsp_pos = mcp_to_lsp_position(
-            Position {
-                line: 1,
-                character: 6,
-            },
-            Some(line_text),
-            PositionEncoding::Utf16,
-        );
+        let lsp_pos = lsp_at(1, 6, Some(line_text), PositionEncoding::Utf16).value;
         assert_eq!(lsp_pos.character, 5);
 
-        let Position2D {
-            character: mcp_char,
-            ..
-        } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: 0,
-                character: 5,
-            },
-            Some(line_text),
-            PositionEncoding::Utf16,
-        );
+        let (_, mcp_char) = mcp_at(0, 5, Some(line_text), PositionEncoding::Utf16).value;
         assert_eq!(mcp_char, 6);
     }
 
@@ -391,14 +431,7 @@ mod tests {
     fn test_mcp_to_lsp_position_utf8_negotiated_multibyte() {
         let line_text = "héllo";
         // 1-based MCP column 3 sits right after "hé" (2 UTF-16 units).
-        let lsp_pos = mcp_to_lsp_position(
-            Position {
-                line: 1,
-                character: 3,
-            },
-            Some(line_text),
-            PositionEncoding::Utf8,
-        );
+        let lsp_pos = lsp_at(1, 3, Some(line_text), PositionEncoding::Utf8).value;
         // In UTF-8 bytes, "hé" is 3 bytes (h=1, é=2).
         assert_eq!(lsp_pos.character, 3);
     }
@@ -407,17 +440,7 @@ mod tests {
     fn test_lsp_to_mcp_position_utf8_negotiated_multibyte() {
         let line_text = "héllo";
         // LSP (UTF-8 byte) position 3 = right after "hé".
-        let Position2D {
-            character: mcp_char,
-            ..
-        } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: 0,
-                character: 3,
-            },
-            Some(line_text),
-            PositionEncoding::Utf8,
-        );
+        let (_, mcp_char) = mcp_at(0, 3, Some(line_text), PositionEncoding::Utf8).value;
         // In UTF-16 units, "hé" is 2 units (h=1, é=1).
         assert_eq!(mcp_char, 3);
     }
@@ -430,14 +453,7 @@ mod tests {
             PositionEncoding::Utf16,
             PositionEncoding::Utf32,
         ] {
-            let pos = mcp_to_lsp_position(
-                Position {
-                    line: 1,
-                    character: 5,
-                },
-                Some(line_text),
-                encoding,
-            );
+            let pos = lsp_at(1, 5, Some(line_text), encoding).value;
             assert_eq!(
                 pos.character, 4,
                 "encoding {encoding:?} must agree on ASCII"
@@ -446,32 +462,55 @@ mod tests {
     }
 
     /// An out-of-bounds MCP character (e.g. stale client-side coordinates)
-    /// must fall back to the raw value rather than erroring the request.
+    /// clamps to the line length in the *target* encoding's units (LSP 3.17)
+    /// rather than erroring or passing through: `"éééé"` is 4 UTF-16 units
+    /// but 8 bytes.
     #[test]
-    fn test_mcp_to_lsp_position_out_of_bounds_falls_back() {
-        let line_text = "short";
-        let pos = mcp_to_lsp_position(
-            Position {
-                line: 1,
-                character: 1000,
-            },
-            Some(line_text),
-            PositionEncoding::Utf8,
-        );
-        assert_eq!(pos.character, 999);
+    fn test_mcp_to_lsp_position_past_end_of_line_clamps_exactly() {
+        for (text, column, expected) in [("short", 1000, 5), ("éééé", 6, 8)] {
+            let pos = lsp_at(1, column, Some(text), PositionEncoding::Utf8);
+            assert_eq!(pos.value.character, expected, "{text}");
+            assert_eq!(pos.fidelity, ColumnFidelity::Exact, "{text}");
+        }
     }
 
     #[test]
-    fn test_mcp_to_lsp_position_missing_line_text_falls_back() {
-        let pos = mcp_to_lsp_position(
-            Position {
-                line: 1,
-                character: 4,
-            },
-            None,
-            PositionEncoding::Utf8,
-        );
-        assert_eq!(pos.character, 3);
+    fn test_lsp_to_mcp_position_past_end_of_line_clamps_but_is_flagged_as_stale_text() {
+        let pos = mcp_at(0, 100, Some("éééé"), PositionEncoding::Utf8);
+        assert_eq!(pos.value, (1, 5));
+        assert_eq!(pos.fidelity, ColumnFidelity::PassedThrough);
+    }
+
+    #[test]
+    fn test_mcp_to_lsp_position_missing_line_text_passes_through_flagged() {
+        let pos = lsp_at(1, 4, None, PositionEncoding::Utf8);
+        assert_eq!(pos.value.character, 3);
+        assert_eq!(pos.fidelity, ColumnFidelity::PassedThrough);
+    }
+
+    #[test]
+    fn test_column_zero_is_exact_without_line_text_in_both_directions() {
+        let to_lsp = lsp_at(3, 1, None, PositionEncoding::Utf8);
+        assert_eq!(to_lsp.value.character, 0);
+        assert_eq!(to_lsp.fidelity, ColumnFidelity::Exact);
+
+        let to_mcp = mcp_at(2, 0, None, PositionEncoding::Utf32);
+        assert_eq!(to_mcp.value, (3, 1));
+        assert_eq!(to_mcp.fidelity, ColumnFidelity::Exact);
+    }
+
+    #[test]
+    fn test_lsp_to_mcp_position_missing_line_text_passes_through_flagged() {
+        let pos = mcp_at(0, 4, None, PositionEncoding::Utf8);
+        assert_eq!(pos.value, (1, 5));
+        assert_eq!(pos.fidelity, ColumnFidelity::PassedThrough);
+    }
+
+    #[test]
+    fn test_utf16_is_always_exact() {
+        let pos = lsp_at(1, 500, Some("x"), PositionEncoding::Utf16);
+        assert_eq!(pos.value.character, 499);
+        assert_eq!(pos.fidelity, ColumnFidelity::Exact);
     }
 
     #[test]
@@ -588,23 +627,14 @@ mod tests {
 
     /// C1 regression, `mcp_to_lsp_position`/`lsp_to_mcp_position` level: a
     /// UTF-8-negotiated conversion whose intermediate byte offset lands
-    /// mid-character must fall back to the raw value (existing `unwrap_or`
-    /// behavior) rather than propagate a panic.
+    /// mid-character must fall back to the raw value, flagged, rather than
+    /// propagate a panic.
     #[test]
     fn test_lsp_to_mcp_position_utf8_mid_char_lsp_offset_falls_back() {
         let line_text = "héllo";
-        let Position2D {
-            character: mcp_char,
-            ..
-        } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: 0,
-                character: 2, // inside 'é' in UTF-8 byte terms
-            },
-            Some(line_text),
-            PositionEncoding::Utf8,
-        );
-        assert_eq!(mcp_char, 3); // pos.character + 1, the raw fallback
+        let converted = mcp_at(0, 2, Some(line_text), PositionEncoding::Utf8);
+        assert_eq!(converted.value.1, 3); // pos.character + 1, the raw fallback
+        assert_eq!(converted.fidelity, ColumnFidelity::PassedThrough);
     }
 
     /// Astral (non-BMP) characters on the UTF-8 negotiated path: `𝄞` (U+1D11E,
@@ -615,27 +645,10 @@ mod tests {
         let line_text = "𝄞x";
         // 1-based MCP column 3 sits right after the surrogate pair (2 UTF-16
         // units) + 1 for 1-based indexing.
-        let lsp_pos = mcp_to_lsp_position(
-            Position {
-                line: 1,
-                character: 3,
-            },
-            Some(line_text),
-            PositionEncoding::Utf8,
-        );
+        let lsp_pos = lsp_at(1, 3, Some(line_text), PositionEncoding::Utf8).value;
         assert_eq!(lsp_pos.character, 4); // 4 UTF-8 bytes for the astral char
 
-        let Position2D {
-            character: mcp_char,
-            ..
-        } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: 0,
-                character: 4,
-            },
-            Some(line_text),
-            PositionEncoding::Utf8,
-        );
+        let (_, mcp_char) = mcp_at(0, 4, Some(line_text), PositionEncoding::Utf8).value;
         assert_eq!(mcp_char, 3);
     }
 
@@ -647,17 +660,11 @@ mod tests {
     #[test]
     fn test_mcp_to_lsp_position_mid_surrogate_falls_back() {
         let line_text = "𝄞x";
-        let lsp_pos = mcp_to_lsp_position(
-            Position {
-                line: 1,
-                character: 2,
-            },
-            Some(line_text),
-            PositionEncoding::Utf8,
-        );
+        let lsp_pos = lsp_at(1, 2, Some(line_text), PositionEncoding::Utf8);
         // Falls back to the raw (unconverted) MCP character rather than
         // rounding forward to byte offset 4 (right after the astral char).
-        assert_eq!(lsp_pos.character, 1);
+        assert_eq!(lsp_pos.value.character, 1);
+        assert_eq!(lsp_pos.fidelity, ColumnFidelity::PassedThrough);
     }
 
     /// CRLF line endings: `line_text` (as sourced by callers via `str::lines`)
@@ -666,14 +673,7 @@ mod tests {
     #[test]
     fn test_mcp_to_lsp_position_utf8_negotiated_crlf_line_text() {
         let line_text = "héllo"; // as it would be yielded by "héllo\r\n".lines()
-        let lsp_pos = mcp_to_lsp_position(
-            Position {
-                line: 1,
-                character: 3,
-            },
-            Some(line_text),
-            PositionEncoding::Utf8,
-        );
+        let lsp_pos = lsp_at(1, 3, Some(line_text), PositionEncoding::Utf8).value;
         assert_eq!(lsp_pos.character, 3);
     }
 
@@ -682,49 +682,33 @@ mod tests {
     /// must clamp to `u32::MAX` instead of panicking or wrapping to 0.
     #[test]
     fn test_lsp_to_mcp_position_character_max_does_not_overflow() {
-        let Position2D {
-            character: mcp_char,
-            ..
-        } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: 0,
-                character: u32::MAX,
-            },
-            None,
-            PositionEncoding::Utf16,
-        );
+        let (_, mcp_char) = mcp_at(0, u32::MAX, None, PositionEncoding::Utf16).value;
         assert_eq!(mcp_char, u32::MAX);
+    }
+
+    /// The `u32::MAX` end-of-line sentinel is exact in every encoding, with
+    /// or without line text.
+    #[test]
+    fn test_lsp_to_mcp_position_character_max_is_exact_for_non_utf16() {
+        for line_text in [None, Some("héllo")] {
+            let converted = mcp_at(0, u32::MAX, line_text, PositionEncoding::Utf8);
+            assert_eq!(converted.value.1, u32::MAX);
+            assert_eq!(converted.fidelity, ColumnFidelity::Exact);
+        }
     }
 
     /// Issue #413: same overflow hazard on `pos.line`, since it also comes
     /// directly from the untrusted LSP server.
     #[test]
     fn test_lsp_to_mcp_position_line_max_does_not_overflow() {
-        let Position2D { line: mcp_line, .. } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: u32::MAX,
-                character: 0,
-            },
-            None,
-            PositionEncoding::Utf16,
-        );
+        let (mcp_line, _) = mcp_at(u32::MAX, 0, None, PositionEncoding::Utf16).value;
         assert_eq!(mcp_line, u32::MAX);
     }
 
     /// Issue #413: both components at `u32::MAX` simultaneously.
     #[test]
     fn test_lsp_to_mcp_position_both_max_does_not_overflow() {
-        let Position2D {
-            line: mcp_line,
-            character: mcp_char,
-        } = lsp_to_mcp_position(
-            lsp_types::Position {
-                line: u32::MAX,
-                character: u32::MAX,
-            },
-            None,
-            PositionEncoding::Utf16,
-        );
+        let (mcp_line, mcp_char) = mcp_at(u32::MAX, u32::MAX, None, PositionEncoding::Utf16).value;
         assert_eq!(mcp_line, u32::MAX);
         assert_eq!(mcp_char, u32::MAX);
     }

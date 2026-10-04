@@ -15,7 +15,7 @@ pub mod resources;
 mod state;
 mod translator;
 
-pub use encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
+pub use encoding::PositionEncoding;
 // Not part of the crate's public API surface (unlike `IndexingPolicy`/`IndexingState`
 // above, both referenced from public signatures) -- these three exist only
 // for `config`'s default-value/validation wiring, so `pub(crate)` avoids
@@ -39,8 +39,8 @@ pub(crate) use translator::validate_path_against_roots;
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, DroppedEdits, FormatDocumentResult,
-    HoverResult, Location, Position, Position2D, Range, ReferencesResult, RenameResult, Symbol,
-    TextEdit, Translator,
+    HoverResult, Location, Position, Position2D, PositionDegradation, Range, ReferencesResult,
+    RenameResult, Symbol, TextEdit, Translator,
 };
 
 /// Whether `uri` resolves to a path within one of `workspace_roots`.

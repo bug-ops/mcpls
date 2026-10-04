@@ -45,6 +45,16 @@ const DISK_CHECK_DEBOUNCE: Duration = Duration::from_millis(250);
 /// instead of by stat alone -- this is what closes the racy-rewrite gap.
 const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
 
+/// The 0-based `line`'th line of `content` under the one line rule shared by
+/// [`DocumentTracker::line_text`] and `DocumentTracker::read_line_checked`:
+/// lines are separated by `\n`, at most one trailing `\r` is stripped from
+/// each, and the empty line after a final `\n` (or line 0 of empty content)
+/// exists. A lone `\r` is not a line separator here.
+fn split_line(content: &str, line: u32) -> Option<&str> {
+    let text = content.split('\n').nth(line as usize)?;
+    Some(text.strip_suffix('\r').unwrap_or(text))
+}
+
 /// Returns whether `mtime` is old enough, relative to `read_at`, that a write
 /// landing after `read_at` could not have preserved it.
 ///
@@ -458,12 +468,8 @@ impl DocumentTracker {
     /// state have diverged (e.g. an edit not yet flushed to disk).
     #[must_use]
     pub fn line_text(&self, path: &Path, line: u32) -> Option<String> {
-        lock_std(&self.documents)
-            .get(path)?
-            .content
-            .lines()
-            .nth(line as usize)
-            .map(str::to_string)
+        let documents = lock_std(&self.documents);
+        split_line(&documents.get(path)?.content, line).map(str::to_string)
     }
 
     /// Get the number of open documents.
@@ -1005,12 +1011,11 @@ impl DocumentTracker {
     /// not valid UTF-8, or if `budget` (or `max_file_size`) was exhausted
     /// before a complete line could be read -- [`LineRead::bytes_read`] is
     /// populated in every one of these cases (see below), never silently
-    /// dropped via an `Err` with no byte count. The line's trailing line
-    /// ending is stripped to match `str::lines`'s convention exactly: a
-    /// trailing `\n` is removed, and only then is one further trailing `\r`
-    /// also removed (a real `\r\n` terminator) -- a final line with no
-    /// trailing `\n` at all keeps any trailing `\r` verbatim, since it was
-    /// never followed by a real line terminator, same as `str::lines`.
+    /// dropped via an `Err` with no byte count. Lines follow the same rule
+    /// as [`Self::line_text`] (see [`split_line`]): they are separated by
+    /// `\n`, at most one trailing `\r` is stripped from each, and the empty
+    /// line right after a final `\n` (or line 0 of an empty file) is
+    /// `Some("")`.
     ///
     /// `budget` bounds this call's own read on top of
     /// [`crate::util::bounded_read_cap`] of `max_file_size`: the actual cap
@@ -1077,18 +1082,21 @@ impl DocumentTracker {
         let mut buf = Vec::new();
         let mut bytes_read: u64 = 0;
         let mut current_line = 0u32;
+        let mut at_line_start = true;
         loop {
             buf.clear();
             let n = reader.read_until(b'\n', &mut buf).await.map_err(io_err)?;
             bytes_read += n as u64;
             if n == 0 {
-                // No complete line left to return either way; bytes scanned
-                // are still reported so the caller can charge them.
+                // A clean EOF (not the cap running out) right at a line start
+                // is the empty trailing line `split_line` also reports.
+                let trailing_empty_line = current_line == line && at_line_start && bytes_read < cap;
                 return Ok(LineRead {
-                    text: None,
+                    text: trailing_empty_line.then(String::new),
                     bytes_read,
                 });
             }
+            at_line_start = buf.last() == Some(&b'\n');
             if current_line == line {
                 let truncated_by_cap = bytes_read >= cap && buf.last() != Some(&b'\n');
                 if truncated_by_cap {
@@ -1099,9 +1107,9 @@ impl DocumentTracker {
                 }
                 if buf.last() == Some(&b'\n') {
                     buf.pop();
-                    if buf.last() == Some(&b'\r') {
-                        buf.pop();
-                    }
+                }
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
                 }
                 return Ok(LineRead {
                     text: String::from_utf8(buf).ok(),
@@ -3252,7 +3260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_line_checked_empty_file_returns_none() {
+    async fn test_read_line_checked_empty_file_line_zero_is_empty_line() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("empty.rs");
         std::fs::write(&path, "").unwrap();
@@ -3263,7 +3271,42 @@ mod tests {
                 .read_line_checked(&path, 0, u64::MAX)
                 .await
                 .unwrap()
+                .text
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            tracker
+                .read_line_checked(&path, 1, u64::MAX)
+                .await
+                .unwrap()
                 .text,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_line_checked_trailing_empty_line_after_final_newline() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("trailing.rs");
+        std::fs::write(&path, "a\n").unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let read = |line| tracker.read_line_checked(&path, line, u64::MAX);
+        assert_eq!(read(1).await.unwrap().text.as_deref(), Some(""));
+        assert_eq!(read(2).await.unwrap().text, None);
+    }
+
+    #[tokio::test]
+    async fn test_read_line_checked_cap_at_line_boundary_is_not_empty_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("capped.rs");
+        std::fs::write(&path, "abc\nrest\n").unwrap();
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        // budget 3 -> cap 4: the read stops right after "abc\n", mid-file.
+        assert_eq!(
+            tracker.read_line_checked(&path, 1, 3).await.unwrap().text,
             None
         );
     }
@@ -3299,42 +3342,61 @@ mod tests {
         );
     }
 
-    /// Regression for M2: `str::lines` strips at most one trailing `\r` per
-    /// line, not every trailing `\r`, and only when it precedes an actual
-    /// `\n` terminator -- a final, untermined line keeps a trailing `\r`
-    /// verbatim. Uses `str::lines` itself as the oracle on the exact inputs
-    /// that distinguish these from a naive "strip every trailing `\r`/`\n`"
-    /// implementation.
+    /// The tracker and disk readers must agree on every line, including the
+    /// CR-stripping and trailing-empty-line edge cases -- `to_lsp` falls back
+    /// to disk whenever the tracker misses, so a divergence would
+    /// reintroduce a false degradation signal.
     #[tokio::test]
-    async fn test_read_line_checked_matches_str_lines_crlf_semantics() {
+    async fn test_line_text_and_read_line_checked_agree_on_line_rule() {
         let dir = TempDir::new().unwrap();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
-        let double_cr = "abc\r\r\n";
-        let path_a = dir.path().join("double_cr.rs");
-        std::fs::write(&path_a, double_cr).unwrap();
-        assert_eq!(
-            tracker
-                .read_line_checked(&path_a, 0, u64::MAX)
-                .await
-                .unwrap()
-                .text
-                .as_deref(),
-            double_cr.lines().next()
-        );
+        let contents = [
+            "",
+            "abc",
+            "abc\n",
+            "abc\r\n",
+            "abc\r\r\n",
+            "abc\r",
+            "a\n\nb",
+            "a\r\nb\r\n",
+        ];
+        for (i, content) in contents.iter().enumerate() {
+            let path = dir.path().join(format!("parity_{i}.rs"));
+            std::fs::write(&path, content).unwrap();
+            tracker.open(path.clone(), (*content).to_string()).unwrap();
+            for line in 0..5 {
+                let disk = tracker
+                    .read_line_checked(&path, line, u64::MAX)
+                    .await
+                    .unwrap()
+                    .text;
+                assert_eq!(
+                    tracker.line_text(&path, line),
+                    disk,
+                    "content {content:?}, line {line}"
+                );
+            }
+        }
+    }
 
-        let trailing_cr_no_newline = "abc\r";
-        let path_b = dir.path().join("trailing_cr_no_newline.rs");
-        std::fs::write(&path_b, trailing_cr_no_newline).unwrap();
-        assert_eq!(
-            tracker
-                .read_line_checked(&path_b, 0, u64::MAX)
-                .await
-                .unwrap()
-                .text
-                .as_deref(),
-            trailing_cr_no_newline.lines().next()
-        );
+    #[test]
+    fn test_line_text_trailing_empty_line_and_cr_stripping() {
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/test/lines.rs");
+        tracker
+            .open(path.clone(), "ab\r\ncd\r\r\n".to_string())
+            .unwrap();
+
+        assert_eq!(tracker.line_text(&path, 0).as_deref(), Some("ab"));
+        assert_eq!(tracker.line_text(&path, 1).as_deref(), Some("cd\r"));
+        assert_eq!(tracker.line_text(&path, 2).as_deref(), Some(""));
+        assert_eq!(tracker.line_text(&path, 3), None);
+
+        let empty = PathBuf::from("/test/empty.rs");
+        tracker.open(empty.clone(), String::new()).unwrap();
+        assert_eq!(tracker.line_text(&empty, 0).as_deref(), Some(""));
+        assert_eq!(tracker.line_text(&empty, 1), None);
     }
 
     /// Regression for the `bounded_read_cap` off-by-one: a file whose size

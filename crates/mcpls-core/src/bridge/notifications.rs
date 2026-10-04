@@ -1031,7 +1031,7 @@ impl NotificationCache {
     /// Whether `server_id`'s push-based diagnostics are known to be
     /// degraded (see [`Self::mark_push_degraded`]) -- callers such as
     /// `get_cached_diagnostics` and `read_resource` use this to flag a
-    /// cache-only result as potentially stale rather than presenting it as
+    /// cache-only result as potentially incomplete rather than presenting it as
     /// current.
     #[inline]
     #[must_use]
