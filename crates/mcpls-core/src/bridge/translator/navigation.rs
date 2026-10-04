@@ -935,6 +935,68 @@ mod tests {
         assert_eq!(result.contents, "hover text");
     }
 
+    /// #518: a hover that times out while awaiting the server's reply must
+    /// leave the bridge usable -- the document stays tracked, so the next
+    /// hover goes straight to the request without a second `didOpen`.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_hover_timeout_keeps_document_open_for_next_request() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        cache.lock().await.observe_indexing_signal(
+            &server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let path = path.to_string_lossy().to_string();
+
+        let spawn_hover = || {
+            let translator = Arc::clone(&translator);
+            let path = path.clone();
+            tokio::spawn(async move { translator.handle_hover(path, pos(1, 1)).await })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+
+        let first = spawn_hover();
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let first_request = read_framed_message(&mut wire).await;
+        assert_eq!(first_request["method"], "textDocument/hover");
+
+        let timeout_secs = crate::config::LspServerConfig::rust_analyzer().request_timeout_seconds;
+        tokio::time::advance(Duration::from_secs(timeout_secs + 1)).await;
+        assert!(matches!(
+            first.await.unwrap().unwrap_err(),
+            Error::Timeout(_)
+        ));
+
+        let second = spawn_hover();
+        let second_request = read_framed_message(&mut wire).await;
+        assert_eq!(
+            second_request["method"], "textDocument/hover",
+            "a timed-out hover must not cause the document to be re-opened"
+        );
+        write_response(
+            &mut server.read_half_stdin,
+            &second_request["id"],
+            serde_json::json!({"contents": {"kind": "markdown", "value": "after timeout"}}),
+        )
+        .await;
+
+        assert_eq!(second.await.unwrap().unwrap().contents, "after timeout");
+    }
+
     /// End-to-end: `handle_definition` must surface `Error::WorkspaceIndexing`
     /// while the routed server is still `Loading`, without reaching the fake
     /// LSP server.

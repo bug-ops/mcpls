@@ -482,6 +482,11 @@ pub struct CallHierarchyItemResult {
 pub struct CallHierarchyPrepareResult {
     /// List of callable items at the position.
     pub items: Vec<CallHierarchyItemResult>,
+    /// Whether `items` was capped below the LSP server's full response (see
+    /// `MAX_NORMALIZED_LOCATIONS`, #516). Omitted (defaults to `false`) when
+    /// serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// Set only when some `character` offsets in this result are inexact (non-UTF-16
     /// servers only); omitted when all are exact. Tells whether the queried position
     /// or only the returned offsets are affected.
@@ -558,8 +563,11 @@ pub struct ServerMessagesResult {
 /// A single parameter in a signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureParameter {
-    /// Label of the parameter.
-    pub label: String,
+    /// Label of the parameter, or `None` when the server gave an offset pair
+    /// into the signature label that does not resolve to a substring of it
+    /// (out of range, inside a character, or reversed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Optional documentation for the parameter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation: Option<String>,

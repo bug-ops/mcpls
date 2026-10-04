@@ -444,12 +444,32 @@ pub(crate) async fn run_stdio(
 /// unwinding and forfeit `kill_on_drop` cleanup of any still-running LSP
 /// child processes, which is worse than requiring one more signal.
 #[cfg(feature = "transport-http")]
+pub(crate) async fn run_http(
+    mcp_server: crate::mcp::McplsServer,
+    cfg: HttpConfig,
+    shutdown_signal: ShutdownSignal,
+) -> Result<(), crate::Error> {
+    // TODO(#531): bound half-open GET/listen streams via TCP_USER_TIMEOUT
+    let listener = tokio::net::TcpListener::bind(cfg.bind)
+        .await
+        .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
+    serve_http(listener, mcp_server, cfg, shutdown_signal).await
+}
+
+/// Serves the MCP HTTP transport on an already-bound `listener`.
+///
+/// Split out of [`run_http`] so callers (tests in particular) can bind the
+/// listener themselves and know the exact address before serving starts.
+/// `cfg.bind` is ignored; the listener's local address is authoritative.
+/// Shutdown behavior is documented on [`run_http`].
+#[cfg(feature = "transport-http")]
 // `session_manager` and `service` are moved into `app`, which is served until
 // shutdown — clippy's drop-tightening heuristic misreads that as an
 // early-droppable temporary because both types embed `tokio::sync` lock types
 // (`CappedSessionManager`'s `Mutex`, `StreamableHttpService`'s `RwLock`s).
 #[allow(clippy::significant_drop_tightening)]
-pub(crate) async fn run_http(
+pub(crate) async fn serve_http(
+    listener: tokio::net::TcpListener,
     mcp_server: crate::mcp::McplsServer,
     cfg: HttpConfig,
     mut shutdown_signal: ShutdownSignal,
@@ -495,20 +515,19 @@ pub(crate) async fn run_http(
         .route_service("/", service)
         .layer(axum::middleware::from_fn(enforce_session_cap));
 
-    // TODO(#531): bound half-open GET/listen streams via TCP_USER_TIMEOUT
-    let listener = tokio::net::TcpListener::bind(cfg.bind)
-        .await
-        .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| crate::Error::McpServer(format!("listener local_addr: {e}")))?;
 
     let reaper_cancel = cancel.child_token();
     // Stops the reaper on every return path below, not only on shutdown.
     let _reaper_guard = reaper_cancel.clone().drop_guard();
     tokio::spawn(run_idle_reaper(reaper_manager, reaper_cancel));
 
-    tracing::info!(addr = %cfg.bind, path = %cfg.path, "MCP HTTP transport listening");
-    if !cfg.bind.ip().is_loopback() {
+    tracing::info!(addr = %local_addr, path = %cfg.path, "MCP HTTP transport listening");
+    if !local_addr.ip().is_loopback() {
         tracing::warn!(
-            addr = %cfg.bind,
+            addr = %local_addr,
             "binding to a non-loopback address: mcpls performs no authentication of its own on \
              any transport — place this endpoint behind a reverse proxy that enforces \
              authentication. The proxy must also rewrite the Host header, since rmcp's Host \
@@ -1220,12 +1239,10 @@ mod tests {
                 cfg,
                 super::super::ShutdownSignal::new(),
             ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             // A successful TCP connect proves the listener is up.
-            let connected = tokio::net::TcpStream::connect(addr).await;
             assert!(
-                connected.is_ok(),
+                connect_with_retry(addr).await.is_some(),
                 "HTTP listener should accept TCP connections"
             );
 
@@ -1250,16 +1267,7 @@ mod tests {
         /// must still be running.
         #[tokio::test(start_paused = true)]
         async fn test_run_http_does_not_self_terminate_without_signal() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp");
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
+            let (_addr, server_task) = spawn_http_server(test_server(), |cfg| cfg).await;
 
             // Let the spawned task make initial progress (bind the
             // listener, enter its `select!`) without depending on any real
@@ -1360,6 +1368,43 @@ mod tests {
             test_server_with_roots(std::sync::Arc::from(Vec::new()))
         }
 
+        /// Polls a TCP connect until it succeeds or the 5s budget runs out;
+        /// for tests that go through `run_http`, which binds internally.
+        async fn connect_with_retry(addr: SocketAddr) -> Option<tokio::net::TcpStream> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                    return Some(stream);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        /// Binds an ephemeral loopback listener and serves `server` on it via
+        /// `serve_http`. The listener is bound before this returns, so the
+        /// kernel queues connections immediately and no readiness wait is needed.
+        async fn spawn_http_server(
+            server: crate::mcp::McplsServer,
+            configure: impl FnOnce(HttpConfig) -> HttpConfig,
+        ) -> (
+            SocketAddr,
+            tokio::task::JoinHandle<Result<(), crate::Error>>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cfg = configure(HttpConfig::new(addr, "/mcp"));
+            let task = tokio::spawn(super::super::serve_http(
+                listener,
+                server,
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
+            (addr, task)
+        }
+
         /// Sends a raw HTTP/1.1 POST request over TCP and returns the raw response
         /// text (status line, headers, and body). Used because neither `reqwest`
         /// nor `tower`/`http-body-util` are available as dev-dependencies here.
@@ -1398,17 +1443,8 @@ mod tests {
         /// `StreamableHttpServerConfig::max_request_body_bytes`.
         #[tokio::test]
         async fn test_run_http_rejects_oversized_body_with_413() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64);
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) =
+                spawn_http_server(test_server(), |cfg| cfg.with_max_request_body_bytes(64)).await;
 
             let oversized_body = vec![b'a'; 65];
             let response = raw_http_post(
@@ -1433,17 +1469,8 @@ mod tests {
         /// "passed the size check" from "was a valid request").
         #[tokio::test]
         async fn test_run_http_accepts_body_within_limit() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp").with_max_request_body_bytes(64);
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) =
+                spawn_http_server(test_server(), |cfg| cfg.with_max_request_body_bytes(64)).await;
 
             let small_body = vec![b'a'; 32];
             let response = raw_http_post(
@@ -1561,7 +1588,6 @@ mod tests {
             let server_task = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let response = raw_http_post(addr, "/", "", b"{}").await;
             assert!(
@@ -1599,7 +1625,6 @@ mod tests {
             let server_task = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let response = raw_http_post(addr, "/", "", b"{}").await;
             assert!(
@@ -1615,17 +1640,8 @@ mod tests {
         /// once the first session is established.
         #[tokio::test]
         async fn test_run_http_rejects_new_session_at_capacity_with_429() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1);
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) =
+                spawn_http_server(test_server(), |cfg| cfg.with_max_concurrent_sessions(1)).await;
 
             let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
             let accept_headers =
@@ -1663,17 +1679,8 @@ mod tests {
         /// sniffing for the cap decision (the bug this design replaced).
         #[tokio::test]
         async fn test_run_http_stateless_request_bypasses_session_cap() {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
-            let cfg = HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(1);
-            let server_task = tokio::spawn(super::super::run_http(
-                test_server(),
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) =
+                spawn_http_server(test_server(), |cfg| cfg.with_max_concurrent_sessions(1)).await;
 
             let accept_headers =
                 "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
@@ -1715,20 +1722,10 @@ mod tests {
         async fn test_stateless_requests_never_register_with_subscription_registry() {
             const REQUEST_COUNT: u32 = 20;
 
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
             let server = test_server();
             let registry = server.subscription_registry();
 
-            let cfg = HttpConfig::new(addr, "/mcp");
-            let server_task = tokio::spawn(super::super::run_http(
-                server,
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
 
             let stateless_headers = "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: resources/list\r\n";
 
@@ -1771,21 +1768,11 @@ mod tests {
             std::fs::write(&file_path, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file_path).unwrap();
 
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-
             let server =
                 test_server_with_roots(std::sync::Arc::from(vec![workspace.path().to_path_buf()]));
             let registry = server.subscription_registry();
 
-            let cfg = HttpConfig::new(addr, "/mcp");
-            let server_task = tokio::spawn(super::super::run_http(
-                server,
-                cfg,
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
 
             SubscribeTestServer {
                 addr,
@@ -2109,15 +2096,7 @@ mod tests {
 
             let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
             let registry = server.subscription_registry();
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = probe.local_addr().unwrap();
-            drop(probe);
-            let server_task = tokio::spawn(super::super::run_http(
-                server,
-                HttpConfig::new(addr, "/mcp"),
-                super::super::ShutdownSignal::new(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
 
             let (session_a, mut stream_a) = establish_session(addr).await;
             let (session_b, mut stream_b) = establish_session(addr).await;

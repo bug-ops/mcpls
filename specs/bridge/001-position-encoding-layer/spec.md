@@ -130,6 +130,9 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | FR-008 | WHEN `line.saturating_sub(1)` or `character.saturating_sub(1)` would underflow (an MCP position of `0`) THE SYSTEM SHALL clamp to `0` rather than wrapping or panicking | must |
 | FR-009 | WHEN a column is past the end of the line text THE SYSTEM SHALL clamp it to the line length in the target units; the result is `Exact` for an MCP column and `PassedThrough` for a server column (the server's text differs from ours) | must |
 | FR-010 | THE SYSTEM SHALL treat column 0, the UTF-16 fast path, and the LSP `u32::MAX` end-of-line sentinel (server to MCP) as `Exact` without consulting `line_text` | must |
+| FR-011 | THE SYSTEM SHALL split `line_text` and disk reads into lines per the LSP 3.17 line model (`\n`, `\r\n` and a lone `\r` end a line, the terminator is excluded, the empty line after a final terminator exists); servers that split only on `\n`/`\r\n` disagree on files containing a lone `\r` | must |
+| FR-012 | THE SYSTEM SHALL bound a tracked-document line lookup by line checkpoints (`DocumentText`), not a whole-document scan | must |
+| FR-013 | THE SYSTEM SHALL cap one response's disk-read I/O for position conversion at 4 times `workspace.max_file_size` (4 times the default when the limit is `0`) and at most 256 MiB, and reject `workspace.max_file_size` above 1 GiB | must |
 
 ## 4. Non-Functional Requirements
 

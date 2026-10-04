@@ -140,6 +140,7 @@ THEN server B receives didOpen (not didChange), independent of server A's sync h
 | FR-008 | THE SYSTEM SHALL provide `forget_server(server_id)` to clear one server's entire sync history across all tracked documents, without affecting any other server's sync history for the same documents | must |
 | FR-009 | THE SYSTEM SHALL provide `line_text(path, line)`, reading from in-memory tracked content (not disk), for range/position conversion consumers ([[bridge/001-position-encoding-layer/spec|spec bridge/001]]) that need a document's current line text without an extra disk read | must |
 | FR-010 | WHEN `DocumentTracker::open` is called for an already-tracked path THE SYSTEM SHALL unconditionally replace the entry, resetting version to 1 and clearing all servers' sync history for that path | must |
+| FR-011 | WHEN LRU eviction removes a document THE SYSTEM SHALL owe a `didClose` per (path, server) that had it open; a server re-opening the path settles its own debt first (`didClose` then `didOpen`), and the others stay pending until claimed without ever waiting on a busy path lock | must |
 
 ## 4. Non-Functional Requirements
 

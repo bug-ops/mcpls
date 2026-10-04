@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexS
 use tokio::time::Duration;
 
 use crate::config::LspServerConfig;
-use crate::lsp::{LspClient, LspTransport, LspTransportReader};
+use crate::lsp::{LspClient, LspTransport, LspTransportReader, ServerInitConfig};
 
 /// Duplex buffer capacity for the mock pipes below. Framed JSON-RPC
 /// messages exchanged in these tests run from a few dozen bytes to a
@@ -227,6 +227,37 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
             .unwrap()
             .push((*event.metadata().level(), visitor.0));
     }
+}
+
+/// Minimal [`ServerInitConfig`] around `server_config` for test fixtures.
+pub const fn init_config_for(server_config: LspServerConfig) -> ServerInitConfig {
+    ServerInitConfig {
+        server_config,
+        workspace_roots: vec![],
+        initialization_options: None,
+        position_encodings: vec![],
+        notification_tx: None,
+    }
+}
+
+/// Extension map shared by routing tests: `.rs` and `.tsx`.
+pub fn test_extensions() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("rs".to_string(), "rust".to_string()),
+        ("tsx".to_string(), "typescriptreact".to_string()),
+    ])
+}
+
+/// Writes `script_body` to `dir/server.sh` and returns a config that runs it
+/// under `sh` as an LSP server.
+#[cfg(unix)]
+pub fn sh_script_init_config(dir: &std::path::Path, script_body: &str) -> ServerInitConfig {
+    let script = dir.join("server.sh");
+    std::fs::write(&script, script_body).unwrap();
+    let mut server_config = LspServerConfig::rust_analyzer();
+    server_config.command = "sh".to_string();
+    server_config.args = vec![script.to_string_lossy().to_string()];
+    init_config_for(server_config)
 }
 
 /// Reads and discards a full LSP-framed request from stdin, so a fixture

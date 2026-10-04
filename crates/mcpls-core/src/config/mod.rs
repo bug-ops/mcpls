@@ -334,7 +334,9 @@ pub struct WorkspaceConfig {
 
     /// Maximum size, in bytes, of a single file `DocumentTracker` will open.
     /// A file larger than this fails with `FileSizeLimitExceeded`. `0`
-    /// disables the limit.
+    /// disables the limit. Values above [`MAX_FILE_SIZE_LIMIT`] are rejected
+    /// by [`ServerConfig::validate`]. The per-response disk-read budget for
+    /// position conversion scales with this value.
     /// Default: 10485760 (10MB)
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
@@ -367,6 +369,13 @@ impl Default for WorkspaceConfig {
         }
     }
 }
+
+/// Upper bound for `workspace.max_file_size` (1 GiB).
+///
+/// Keeps the derived per-response disk-read budget (a multiple of it) far from
+/// overflow, and a misconfiguration from making every response a
+/// gigabyte-scale scan.
+pub const MAX_FILE_SIZE_LIMIT: u64 = 1 << 30;
 
 const fn default_heuristics_max_depth() -> usize {
     DEFAULT_HEURISTICS_MAX_DEPTH
@@ -1125,7 +1134,21 @@ impl ServerConfig {
     /// threshold.
     fn validate_workspace_bounds(&self) -> Result<()> {
         self.validate_indexing_ready_timeout()?;
-        self.validate_heuristics_max_depth()
+        self.validate_heuristics_max_depth()?;
+        self.validate_max_file_size()
+    }
+
+    /// Rejects `workspace.max_file_size` above [`MAX_FILE_SIZE_LIMIT`]; `0`
+    /// (unlimited) stays valid.
+    fn validate_max_file_size(&self) -> Result<()> {
+        let size = self.workspace.max_file_size;
+        if size > MAX_FILE_SIZE_LIMIT {
+            return Err(Error::InvalidConfig(format!(
+                "workspace.max_file_size ({size}) exceeds the hard cap of {MAX_FILE_SIZE_LIMIT} \
+                 bytes; use a lower value, or 0 to disable the per-file limit"
+            )));
+        }
+        Ok(())
     }
 
     /// Rejects `workspace.heuristics_max_depth` above [`MAX_HEURISTICS_DEPTH`].
@@ -1499,6 +1522,23 @@ mod tests {
             let mut config = ServerConfig::default();
             config.workspace.heuristics_max_depth = depth;
             assert!(config.validate().is_ok(), "depth {depth} must be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_max_file_size_bound() {
+        for (size, ok) in [
+            (0, true),
+            (MAX_FILE_SIZE_LIMIT, true),
+            (MAX_FILE_SIZE_LIMIT + 1, false),
+        ] {
+            let mut config = ServerConfig::default();
+            config.workspace.max_file_size = size;
+            let result = config.validate();
+            assert_eq!(result.is_ok(), ok, "max_file_size {size}: {result:?}");
+            if let Err(Error::InvalidConfig(msg)) = result {
+                assert!(msg.contains("max_file_size"));
+            }
         }
     }
 

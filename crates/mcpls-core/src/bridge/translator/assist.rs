@@ -13,6 +13,7 @@ use super::dto::{
 };
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
+use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
@@ -23,6 +24,84 @@ fn extract_documentation(doc: lsp_types::Documentation) -> String {
         lsp_types::Documentation::String(s) => s,
         lsp_types::Documentation::MarkupContent(m) => m.value,
     }
+}
+
+/// Most parameters kept per signature; the rest are dropped (logged).
+const MAX_SIGNATURE_PARAMETERS: usize = 256;
+
+/// Total resolved tuple-label bytes allowed per signature, as a multiple of
+/// the signature label's length: generous enough for overlapping or repeated
+/// spans (variadic or default-value ranges), bounded against amplification.
+const RESOLVED_LABEL_BUDGET_MULTIPLE: usize = 4;
+
+/// Converts a signature's LSP parameters to their MCP form, resolving
+/// offset-pair labels against `signature_label` in `encoding`'s code units.
+///
+/// An offset pair that cannot be resolved exactly yields `label: None`
+/// (logged) rather than a wrong or raw `[start,end]` label (#511). The
+/// requested offsets are resolved in one pass per signature, the parameter
+/// count is capped at [`MAX_SIGNATURE_PARAMETERS`], and the resolved bytes in
+/// total are capped at [`RESOLVED_LABEL_BUDGET_MULTIPLE`] times the label's
+/// length, so many overlapping pairs cannot amplify one response.
+fn signature_parameters(
+    params: Vec<lsp_types::ParameterInformation>,
+    signature_label: &str,
+    encoding: PositionEncoding,
+) -> Vec<SignatureParameter> {
+    if params.len() > MAX_SIGNATURE_PARAMETERS {
+        tracing::warn!(
+            reported = params.len(),
+            cap = MAX_SIGNATURE_PARAMETERS,
+            "signature parameter count exceeds the cap; truncating"
+        );
+    }
+    let offsets = LabelOffsets::new(
+        signature_label,
+        params
+            .iter()
+            .take(MAX_SIGNATURE_PARAMETERS)
+            .filter_map(|p| match p.label {
+                lsp_types::ParameterInformationLabel::Tuple((start, end)) => {
+                    Some(<[u32; 2]>::from((start, end)))
+                }
+                lsp_types::ParameterInformationLabel::String(_) => None,
+            })
+            .flatten(),
+        encoding,
+    );
+    let mut resolved_budget = signature_label
+        .len()
+        .saturating_mul(RESOLVED_LABEL_BUDGET_MULTIPLE);
+    params
+        .into_iter()
+        .take(MAX_SIGNATURE_PARAMETERS)
+        .map(|param| {
+            let label = match param.label {
+                lsp_types::ParameterInformationLabel::String(s) => Some(s),
+                lsp_types::ParameterInformationLabel::Tuple((start, end)) => {
+                    let resolved = offsets
+                        .substring(start, end)
+                        .filter(|text| text.len() <= resolved_budget);
+                    if let Some(text) = resolved {
+                        resolved_budget -= text.len();
+                    } else {
+                        tracing::warn!(
+                            start,
+                            end,
+                            encoding = encoding.to_lsp(),
+                            "signature parameter label offsets do not resolve within the \
+                             signature label; omitting the label"
+                        );
+                    }
+                    resolved.map(str::to_string)
+                }
+            };
+            SignatureParameter {
+                label,
+                documentation: param.documentation.map(extract_documentation),
+            }
+        })
+        .collect()
 }
 
 /// Maximum length, in bytes, of a `get_completions` `trigger` parameter.
@@ -167,23 +246,13 @@ impl Translator {
                     .signatures
                     .into_iter()
                     .map(|sig| SignatureInfo {
-                        label: sig.label,
+                        parameters: signature_parameters(
+                            sig.parameters.unwrap_or_default(),
+                            &sig.label,
+                            ctx.encoding,
+                        ),
                         documentation: sig.documentation.map(extract_documentation),
-                        parameters: sig
-                            .parameters
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|p| SignatureParameter {
-                                label: match p.label {
-                                    lsp_types::ParameterInformationLabel::String(s) => s,
-                                    lsp_types::ParameterInformationLabel::Tuple((start, end)) => {
-                                        // TODO(#511): offsets are in the server's encoding, not label text
-                                        format!("[{start},{end}]")
-                                    }
-                                },
-                                documentation: p.documentation.map(extract_documentation),
-                            })
-                            .collect(),
+                        label: sig.label,
                     })
                     .collect(),
                 active_signature: sig_help.active_signature,
@@ -646,5 +715,113 @@ mod tests {
     async fn test_handle_signature_help_in_range_position_is_not_degraded() {
         let wire = utf8_degradation("fn main() {}", 1, 4, "textDocument/signatureHelp").await;
         assert!(wire.get("positions_degraded").is_none());
+    }
+
+    fn tuple_param(start: u32, end: u32) -> lsp_types::ParameterInformation {
+        lsp_types::ParameterInformation {
+            label: lsp_types::ParameterInformationLabel::Tuple((start, end)),
+            documentation: None,
+        }
+    }
+
+    fn one_param(
+        param: lsp_types::ParameterInformation,
+        label: &str,
+        encoding: PositionEncoding,
+    ) -> SignatureParameter {
+        signature_parameters(vec![param], label, encoding)
+            .pop()
+            .unwrap()
+    }
+
+    /// #511: tuple offsets are in the negotiated encoding's units, so the
+    /// same parameter resolves to the same substring under each of them.
+    #[test]
+    fn test_signature_parameter_tuple_label_resolves_per_encoding() {
+        let label = "é𝄞(a: u8)";
+        for (encoding, start, end) in [
+            (PositionEncoding::Utf8, 7, 12),
+            (PositionEncoding::Utf16, 4, 9),
+            (PositionEncoding::Utf32, 3, 8),
+        ] {
+            let param = one_param(tuple_param(start, end), label, encoding);
+            assert_eq!(param.label.as_deref(), Some("a: u8"), "{encoding:?}");
+        }
+    }
+
+    /// #511: offsets that do not resolve exactly yield no label rather than a
+    /// wrong substring or the raw pair.
+    #[test]
+    fn test_signature_parameter_invalid_tuple_offsets_yield_no_label() {
+        let label = "é𝄞(a: u8)";
+        for (encoding, start, end) in [
+            (PositionEncoding::Utf16, 0, 99),
+            (PositionEncoding::Utf16, 9, 4),
+            (PositionEncoding::Utf16, 2, 4),
+            (PositionEncoding::Utf8, 1, 3),
+            (PositionEncoding::Utf32, 3, 99),
+        ] {
+            let param = one_param(tuple_param(start, end), label, encoding);
+            assert_eq!(param.label, None, "{encoding:?} {start}..{end}");
+        }
+    }
+
+    #[test]
+    fn test_signature_parameter_string_label_passes_through() {
+        let param = one_param(
+            lsp_types::ParameterInformation {
+                label: lsp_types::ParameterInformationLabel::String("a: u8".to_string()),
+                documentation: None,
+            },
+            "f(a: u8)",
+            PositionEncoding::Utf16,
+        );
+        assert_eq!(param.label.as_deref(), Some("a: u8"));
+    }
+
+    #[test]
+    fn test_signature_parameter_unresolved_label_is_omitted_when_serialized() {
+        let param = one_param(tuple_param(5, 1), "abcdef", PositionEncoding::Utf16);
+        let wire = serde_json::to_value(param).unwrap();
+        assert!(wire.get("label").is_none());
+    }
+
+    /// Security L1: many parameters all spanning the whole label are capped in
+    /// count and in total resolved bytes.
+    #[test]
+    fn test_signature_parameters_whole_label_pairs_are_bounded() {
+        let label = "x".repeat(1000);
+        let params = vec![tuple_param(0, 1000); MAX_SIGNATURE_PARAMETERS * 4];
+        let out = signature_parameters(params, &label, PositionEncoding::Utf16);
+        assert_eq!(out.len(), MAX_SIGNATURE_PARAMETERS);
+        let resolved: usize = out
+            .iter()
+            .filter_map(|p| p.label.as_ref())
+            .map(String::len)
+            .sum();
+        assert!(
+            resolved <= label.len() * RESOLVED_LABEL_BUDGET_MULTIPLE,
+            "resolved {resolved} bytes"
+        );
+        assert_eq!(out[0].label.as_deref(), Some(label.as_str()));
+        assert!(out[RESOLVED_LABEL_BUDGET_MULTIPLE].label.is_none());
+    }
+
+    /// Overlapping and repeated spans within the budget all resolve.
+    #[test]
+    fn test_signature_parameters_overlapping_ranges_resolve() {
+        let label = "f(a, b, ...rest)";
+        let params = vec![
+            tuple_param(2, 3),
+            tuple_param(2, 3),
+            tuple_param(2, 15),
+            tuple_param(8, 15),
+        ];
+        let out = signature_parameters(params, label, PositionEncoding::Utf16);
+        let labels: Vec<_> = out.iter().map(|p| p.label.as_deref()).collect();
+        assert_eq!(
+            labels,
+            [Some("a"), Some("a"), Some("a, b, ...rest"), Some("...rest")]
+        );
     }
 }

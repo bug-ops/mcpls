@@ -139,8 +139,8 @@ SO THAT a crash-looping server doesn't make every tool call for that language sl
 ```
 GIVEN a server that has failed 3 consecutive respawn attempts
 WHEN a 4th tool call arrives for that server within the current backoff window
-THEN respawn_if_dead returns Error::ServerUnavailable immediately (naming the remaining backoff
-     duration) rather than attempting another spawn and waiting for it to fail/timeout
+THEN respawn_if_dead returns Error::ServerUnavailable immediately (carrying the remaining backoff
+     duration as `retry_in`) rather than attempting another spawn and waiting for it to fail/timeout
 ```
 
 ### US-004: No orphaned LSP child processes after mcpls exits
@@ -196,6 +196,7 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | `LspServer` | One managed, initialized LSP server instance | `client: LspClient`, `capabilities: ServerCapabilities`, `position_encoding: PositionEncodingKind`, `notification_rx`, `child: tokio::process::Child`, `init_config: ServerInitConfig` |
 | `ServerInitConfig` | Everything needed to spawn+initialize one server | `server_config`, `workspace_roots`, `initialization_options`, `position_encodings`, `notification_tx` |
 | `ServerInitResult` | Outcome of `spawn_batch` across all configured servers | `servers: HashMap<ServerId, LspServer>`, `failures: Vec<ServerSpawnFailure>` |
+| `ServerSpawnFailure` | Why one configured server never registered | `server_id`, `language_id`, `command`, `reason: StartupFailure` (`Spawn(Arc<Error>)` or `InitTaskPanicked`) |
 | `ServerState` | Coarse lifecycle state of a server connection | `Uninitialized`, `Initializing`, `Ready`, `ShuttingDown`, `Shutdown` |
 | `RespawnBackoff` (translator-internal) | Per-server respawn-attempt bookkeeping | `consecutive_failures: u32`, `last_attempt: Instant`, `last_attempt_succeeded: bool` |
 
@@ -204,6 +205,11 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | Scenario | Expected Behavior |
 |----------|--------------------|
 | A server's command is not on `PATH` | `spawn` returns `Error::ServerNotFound` (other spawn errors stay `Error::ServerSpawnFailed`); `spawn_batch` records it as a failure and continues with the rest |
+| A configured server failed its initial spawn | The failure is recorded per server; tool calls that would route to it return `Error::ServerFailedToStart` (a live catch-all for the same language still wins), and workspace-wide tools return `Error::ServerFailedToStart` when the failed server would have claimed the tool, or `Error::AllServersFailedToInit` only when no server registered at all. Startup failures are never retried until mcpls restarts (#527) |
+| A server exits before answering `initialize` | `spawn` returns `Error::ServerExitedDuringInit` with the exit code (and a rustup-proxy hint for rust-analyzer) |
+| The background init task panics | The panic is caught on the init task itself; every unregistered config is recorded as `StartupFailure::InitTaskPanicked`, the router is rebound to what registered, and servers that did register are marked push-degraded with their indexing state reset. A panicking diagnostics pump degrades its own server the same way (#528) |
+| An MCP tool call or `read_resource` handler panics | The panic is contained and returned to the client as an internal error instead of leaving the request unanswered (#528) |
+| The respawn path needs a server's config | It is read from the registered `LspServer`'s own `init_config`; there is no separate config map (#529) |
 | A large workspace makes `initialize` slow | Bounded by the server's configured `timeout_seconds` (clamped to `MAX_TIMEOUT_SECONDS`), not a hardcoded 30s |
 | Server crashes between two tool calls | First call after the crash detects it via `is_dead` (child exited or message loop stopped), respawns, and proceeds; the crash is otherwise invisible to the caller beyond added latency |
 | Two tool calls race a dead-server detection simultaneously | Single-flighted via `respawn_lock`; the loser waits for the winner's attempt and rechecks rather than double-spawning |

@@ -2,15 +2,16 @@
 //!
 //! Tracks open documents and their versions for LSP synchronization.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 
 use lsp_types::{
     DidChangeTextDocumentNotification, DidChangeTextDocumentParams,
-    DidOpenTextDocumentNotification, DidOpenTextDocumentParams, TextDocumentContentChangeEvent,
-    TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
+    DidCloseTextDocumentNotification, DidCloseTextDocumentParams, DidOpenTextDocumentNotification,
+    DidOpenTextDocumentParams, TextDocumentContentChangeEvent, TextDocumentItem, Uri,
+    VersionedTextDocumentIdentifier,
 };
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -45,15 +46,128 @@ const DISK_CHECK_DEBOUNCE: Duration = Duration::from_millis(250);
 /// instead of by stat alone -- this is what closes the racy-rewrite gap.
 const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
 
-/// The 0-based `line`'th line of `content` under the one line rule shared by
-/// [`DocumentTracker::line_text`] and `DocumentTracker::read_line_checked`:
-/// lines are separated by `\n`, at most one trailing `\r` is stripped from
-/// each, and the empty line after a final `\n` (or line 0 of empty content)
-/// exists. A lone `\r` is not a line separator here.
-fn split_line(content: &str, line: u32) -> Option<&str> {
-    let text = content.split('\n').nth(line as usize)?;
-    Some(text.strip_suffix('\r').unwrap_or(text))
+/// Content up to this size is indexed inline; larger content goes to the
+/// blocking pool.
+const INLINE_INDEX_MAX_BYTES: usize = 1024 * 1024;
+
+/// Lines between two consecutive [`DocumentText`] checkpoints.
+const LINE_CHECKPOINT_STRIDE: usize = 64;
+
+/// Whether `byte` ends a line under the LSP 3.17 line model.
+const fn is_line_terminator(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r')
 }
+
+/// Byte offset where the line starting at `start` ends (its terminator, or
+/// `content.len()` for the last line), and where the next line starts, or
+/// `None` for the last line. `\r\n` is one terminator.
+fn line_bounds(content: &str, start: usize) -> (usize, Option<usize>) {
+    let bytes = content.as_bytes();
+    let Some(offset) = bytes[start..].iter().position(|&b| is_line_terminator(b)) else {
+        return (content.len(), None);
+    };
+    let end = start + offset;
+    let crlf = bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n');
+    (end, Some(end + 1 + usize::from(crlf)))
+}
+
+/// A document's text together with sparse line checkpoints, so a line lookup
+/// scans at most one checkpoint stride rather than the whole document (#488).
+///
+/// Lines follow the LSP 3.17 line model, the same one
+/// [`DocumentTracker::read_line_checked`] applies to disk reads: a line ends
+/// at `\n`, `\r\n` or a lone `\r`, the terminator is not part of the line,
+/// and the empty line after a final terminator (or line 0 of empty content)
+/// exists. Servers that split only on `\n`/`\r\n` (reportedly rust-analyzer,
+/// gopls and clangd) disagree with this on files containing a lone `\r`;
+/// positions after such a `\r` are then converted against the wrong line
+/// text.
+///
+/// Content and checkpoints are built together and never mutated, so the index
+/// cannot go stale. Memory overhead is one `usize` per stride lines, at most
+/// `len / 8` bytes at the default stride even for content made only of empty
+/// lines.
+#[derive(Clone)]
+pub(super) struct DocumentText {
+    content: String,
+    stride: usize,
+    /// `checkpoints[k]` is the byte offset where line `k * stride` starts.
+    checkpoints: Box<[usize]>,
+}
+
+impl std::fmt::Debug for DocumentText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocumentText")
+            .field("len", &self.content.len())
+            .field("checkpoints", &self.checkpoints.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DocumentText {
+    /// Indexes `content` at the default stride.
+    pub(super) fn new(content: String) -> Self {
+        Self::with_stride(content, LINE_CHECKPOINT_STRIDE)
+    }
+
+    /// Indexes `content`, with a checkpoint every `stride` lines (`stride`
+    /// is clamped to at least 1).
+    fn with_stride(content: String, stride: usize) -> Self {
+        let stride = stride.max(1);
+        let mut checkpoints = vec![0];
+        let mut start = 0;
+        let mut line = 0usize;
+        while let (_, Some(next)) = line_bounds(&content, start) {
+            start = next;
+            line += 1;
+            if line.is_multiple_of(stride) {
+                checkpoints.push(start);
+            }
+        }
+        Self {
+            content,
+            stride,
+            checkpoints: checkpoints.into_boxed_slice(),
+        }
+    }
+
+    /// As [`Self::new`], but indexes content above [`INLINE_INDEX_MAX_BYTES`]
+    /// on the blocking pool so a large file does not stall the runtime.
+    async fn build(content: String) -> Result<Self> {
+        if content.len() <= INLINE_INDEX_MAX_BYTES {
+            return Ok(Self::new(content));
+        }
+        tokio::task::spawn_blocking(move || Self::new(content))
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))
+    }
+
+    /// The full text.
+    pub(super) fn as_str(&self) -> &str {
+        &self.content
+    }
+
+    /// The 0-based `n`'th line without its terminator, or `None` if there is
+    /// no such line. Scans at most `stride - 1` terminators from the nearest
+    /// checkpoint plus the target line itself.
+    pub(super) fn line(&self, n: u32) -> Option<&str> {
+        let n = n as usize;
+        let mut start = *self.checkpoints.get(n / self.stride)?;
+        for _ in 0..n % self.stride {
+            start = line_bounds(&self.content, start).1?;
+        }
+        let (end, _) = line_bounds(&self.content, start);
+        Some(&self.content[start..end])
+    }
+}
+
+impl PartialEq for DocumentText {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content
+    }
+}
+
+impl Eq for DocumentText {}
 
 /// Returns whether `mtime` is old enough, relative to `read_at`, that a write
 /// landing after `read_at` could not have preserved it.
@@ -160,7 +274,7 @@ pub(super) struct DocumentState {
     uri: Uri,
     language_id: String,
     version: i32,
-    content: String,
+    text: DocumentText,
     disk: Option<DiskSync>,
     synced: HashMap<ServerId, i32>,
     /// When this document was last accessed via `ensure_open`
@@ -180,7 +294,7 @@ impl PartialEq for DocumentState {
             uri,
             language_id,
             version,
-            content,
+            text,
             disk,
             synced,
             last_accessed: _,
@@ -188,7 +302,7 @@ impl PartialEq for DocumentState {
         *uri == other.uri
             && *language_id == other.language_id
             && *version == other.version
-            && *content == other.content
+            && *text == other.text
             && *disk == other.disk
             && *synced == other.synced
     }
@@ -199,12 +313,12 @@ impl Eq for DocumentState {}
 impl DocumentState {
     /// Creates a new document state at version 1, with unknown disk
     /// provenance and no server yet recorded as synced.
-    fn new(uri: Uri, language_id: String, content: String) -> Self {
+    fn new(uri: Uri, language_id: String, text: DocumentText) -> Self {
         Self {
             uri,
             language_id,
             version: 1,
-            content,
+            text,
             disk: None,
             synced: HashMap::new(),
             last_accessed: Instant::now(),
@@ -244,7 +358,7 @@ impl DocumentState {
     #[must_use]
     #[cfg(test)]
     pub(crate) fn content(&self) -> &str {
-        &self.content
+        self.text.as_str()
     }
 
     /// Filesystem snapshot as of the last time `content` was read from disk.
@@ -276,13 +390,13 @@ impl DocumentState {
     /// preserving the monotonicity invariant. (Not strictly greater: the
     /// caller computes `version` via `saturating_add`, which can legitimately
     /// clamp to the current value at `i32::MAX`.)
-    fn commit_reload(&mut self, version: i32, content: String, snap: Option<DiskSync>) {
+    fn commit_reload(&mut self, version: i32, text: DocumentText, snap: Option<DiskSync>) {
         debug_assert!(
             version >= self.version,
             "document version must be monotonically increasing"
         );
         self.version = version;
-        self.content = content;
+        self.text = text;
         self.disk = snap;
     }
 
@@ -361,26 +475,38 @@ pub struct LineRead {
     pub(crate) bytes_read: u64,
 }
 
-/// A document evicted by `DocumentTracker::open`'s LRU eviction (#495).
+/// A `textDocument/didClose` still owed after `DocumentTracker::open`'s LRU
+/// eviction removed a document (#495): the servers that had it open and the
+/// URI to close.
 ///
-/// Carries the servers whose `textDocument/didOpen`/`didChange` it had
-/// received. `DocumentTracker` itself has no access to any server's
-/// [`LspClient`] --
-/// that registry lives one layer up, in `Translator` -- so it cannot send
-/// `textDocument/didClose` itself. Instead, [`DocumentTracker::take_evicted`]
-/// hands these back to a caller that does have that access, which must send
-/// each of `synced_servers` a `textDocument/didClose` for `uri`, or that
-/// server's own open-document set keeps growing even though mcpls's own
-/// tracking evicted the entry.
-#[derive(Debug, Clone)]
-pub struct EvictedDocument {
+/// `DocumentTracker` has no access to any server's [`LspClient`] -- that
+/// registry lives one layer up, in `Translator` -- so it cannot send the
+/// close itself. Debts are kept per `(path, server)`: a server that later
+/// re-opens the path settles its own debt first (close, then open, see
+/// `DocumentTracker::sync_phase`), while the remaining servers' debts stay
+/// pending for [`DocumentTracker::try_claim_pending_close`].
+#[derive(Debug)]
+struct PendingClose {
+    uri: Uri,
+    servers: HashSet<ServerId>,
+}
+
+/// Exclusive claim on one path's owed `didClose` notifications, returned by
+/// [`DocumentTracker::try_claim_pending_close`].
+///
+/// Holds the path's lock for as long as it lives, so any later `didOpen` for
+/// the path through [`DocumentTracker::ensure_open`] is ordered after the
+/// closes. Drop it as soon as the notifications are sent.
+#[derive(Debug)]
+#[must_use = "dropping the claim releases the path lock; send the closes first"]
+pub struct PendingCloseClaim<'a> {
     /// Filesystem path of the evicted document.
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     /// URI of the evicted document, as sent to any server that had it open.
-    pub uri: Uri,
-    /// Servers that had this document open, each needing a
-    /// `textDocument/didClose` now that mcpls itself has evicted it.
-    pub synced_servers: Vec<ServerId>,
+    pub(crate) uri: Uri,
+    /// Servers that still need a `textDocument/didClose` for `uri`.
+    pub(crate) servers: Vec<ServerId>,
+    _path_guard: PathLockGuard<'a>,
 }
 
 /// Tracks document state across the workspace.
@@ -419,10 +545,13 @@ pub struct DocumentTracker {
     limits: ResourceLimits,
     /// Custom file extension to language ID mappings.
     extension_map: HashMap<String, String>,
-    /// Documents evicted by `Self::open`'s LRU eviction, queued for
-    /// [`Self::take_evicted`] to hand to a caller that can notify their
-    /// servers (#495). See [`EvictedDocument`].
-    evicted: StdMutex<Vec<EvictedDocument>>,
+    /// `didClose` notifications owed after `Self::open`'s LRU eviction (#495),
+    /// per path and server. See [`PendingClose`].
+    ///
+    /// Lock order: `documents` before `pending_closes`, never the reverse.
+    /// Under a path's lock, the servers pending for that path and the
+    /// servers synced to it never overlap.
+    pending_closes: StdMutex<HashMap<PathBuf, PendingClose>>,
 }
 
 impl DocumentTracker {
@@ -436,18 +565,14 @@ impl DocumentTracker {
             generations: StdMutex::new(HashMap::new()),
             limits,
             extension_map,
-            evicted: StdMutex::new(Vec::new()),
+            pending_closes: StdMutex::new(HashMap::new()),
         }
     }
 
-    /// Drains and returns documents evicted by `Self::open`'s LRU eviction
-    /// since the last call (#495) -- see [`EvictedDocument`]. A caller with
-    /// access to each server's `LspClient` (i.e. `Translator`) should call
-    /// this after every `ensure_open` that could have triggered eviction and
-    /// send `textDocument/didClose` for each evicted document to each of its
-    /// `synced_servers`.
-    pub fn take_evicted(&self) -> Vec<EvictedDocument> {
-        std::mem::take(&mut lock_std(&self.evicted))
+    /// The configured resource limits.
+    #[must_use]
+    pub(crate) const fn limits(&self) -> ResourceLimits {
+        self.limits
     }
 
     /// Marks `path` as in use by a handler until the returned guard drops, so
@@ -495,7 +620,7 @@ impl DocumentTracker {
     #[must_use]
     pub fn line_text(&self, path: &Path, line: u32) -> Option<String> {
         let documents = lock_std(&self.documents);
-        split_line(&documents.get(path)?.content, line).map(str::to_string)
+        documents.get(path)?.text.line(line).map(str::to_string)
     }
 
     /// Get the number of open documents.
@@ -520,14 +645,15 @@ impl DocumentTracker {
     /// least-recently-used tracked document that both has no
     /// `ensure_open` call currently in flight against it and is
     /// disk-verified (see `evict_lru`) to make room, rather than failing
-    /// outright (#495) -- the evicted document is queued for
-    /// [`Self::take_evicted`]. Only falls back to
-    /// [`Error::DocumentLimitExceeded`] when no tracked document meets both
-    /// conditions, so none is safe to evict.
+    /// outright (#495) -- the servers that had the evicted document open are
+    /// recorded as owed a `didClose` (see [`PendingClose`]). Only falls back
+    /// to [`Error::DocumentLimitExceeded`] when no tracked document meets
+    /// both conditions, so none is safe to evict.
     ///
-    /// `take_evicted`'s queue is an unbounded `Vec` that only ever grows
-    /// until drained -- `Translator` drains it after every `ensure_open`
-    /// that could have triggered eviction.
+    /// The owed closes are bounded by `max_documents` times the number of
+    /// servers: evicting the same path again merges into its existing entry.
+    /// `Translator` flushes them after every `ensure_open` that could have
+    /// triggered eviction.
     ///
     /// The caller must hold `lock_path` for `path` (as `ensure_open` does):
     /// without it, a concurrent `ensure_open` for the same path could
@@ -542,13 +668,20 @@ impl DocumentTracker {
     /// Returns an error if:
     /// - Document limit is exceeded and no document is evictable
     /// - File size limit is exceeded
+    #[cfg(test)]
     pub(crate) fn open(&self, path: PathBuf, content: String) -> Result<Uri> {
-        self.check_file_size(content.len() as u64)?;
+        self.open_text(path, DocumentText::new(content))
+    }
+
+    /// As [`Self::open`], for content already indexed -- lets async callers
+    /// build the [`DocumentText`] off the runtime thread.
+    fn open_text(&self, path: PathBuf, text: DocumentText) -> Result<Uri> {
+        self.check_file_size(text.as_str().len() as u64)?;
 
         let uri = path_to_uri(&path)?;
         let language_id = detect_language(&path, &self.extension_map);
 
-        let state = DocumentState::new(uri.clone(), language_id, content);
+        let state = DocumentState::new(uri.clone(), language_id, text);
 
         // Check document limit and insert under a single lock acquisition so
         // two concurrent `open` calls for different new paths can't both
@@ -574,15 +707,27 @@ impl DocumentTracker {
                     max: self.limits.max_documents,
                 });
             };
-            lock_std(&self.evicted).push(EvictedDocument {
-                path: evicted_path,
-                uri: evicted_state.uri,
-                synced_servers: evicted_state.synced.into_keys().collect(),
-            });
+            self.record_pending_close(evicted_path, evicted_state);
         }
         documents.insert(path, state);
         drop(documents);
         Ok(uri)
+    }
+
+    /// Records that every server `evicted` had synced is owed a `didClose`,
+    /// merging with any debts already pending for `path`.
+    fn record_pending_close(&self, path: PathBuf, evicted: DocumentState) {
+        if evicted.synced.is_empty() {
+            return;
+        }
+        lock_std(&self.pending_closes)
+            .entry(path)
+            .or_insert_with(|| PendingClose {
+                uri: evicted.uri,
+                servers: HashSet::new(),
+            })
+            .servers
+            .extend(evicted.synced.into_keys());
     }
 
     /// Removes and returns the least-recently-used entry in `documents` that
@@ -679,6 +824,11 @@ impl DocumentTracker {
         for state in lock_std(&self.documents).values_mut() {
             state.forget_server(server);
         }
+        // The respawned process never had these documents open, so owes no close.
+        lock_std(&self.pending_closes).retain(|_, pending| {
+            pending.servers.remove(server);
+            !pending.servers.is_empty()
+        });
     }
 
     /// Current sync generation for `server` (see [`Self::forget_server`]).
@@ -720,6 +870,107 @@ impl DocumentTracker {
         }
     }
 
+    /// As [`Self::lock_path`], but returns `None` instead of waiting when
+    /// another caller holds `path`'s lock.
+    fn try_lock_path(&self, path: &Path) -> Option<PathLockGuard<'_>> {
+        let arc = {
+            let mut locks = lock_std(&self.path_locks);
+            locks
+                .entry(path.to_path_buf())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        if let Ok(guard) = Arc::clone(&arc).try_lock_owned() {
+            return Some(PathLockGuard {
+                path_locks: &self.path_locks,
+                path: path.to_path_buf(),
+                arc,
+                guard: Some(guard),
+            });
+        }
+        // Mirrors `PathLockGuard`'s eviction rule: our `arc` and the map's
+        // entry are the only references left when nobody holds or awaits it.
+        let mut locks = lock_std(&self.path_locks);
+        if Arc::strong_count(&arc) <= 2 {
+            locks.remove(path);
+        }
+        None
+    }
+
+    /// Paths with a `didClose` still owed after LRU eviction, as a snapshot
+    /// for [`Self::try_claim_pending_close`].
+    pub(crate) fn pending_close_paths(&self) -> Vec<PathBuf> {
+        lock_std(&self.pending_closes).keys().cloned().collect()
+    }
+
+    /// Claims `path`'s owed `didClose` notifications, or `None` if there are
+    /// none for it or another caller currently holds the path's lock.
+    ///
+    /// Never waits on a path lock: a busy path is left pending for a later
+    /// call, and its own `ensure_open` settles the debt of the server it syncs
+    /// anyway. The returned claim holds the path lock, so a concurrent
+    /// `ensure_open` for the path waits until the closes have been sent --
+    /// claim, notify and drop one path at a time so a wedged server cannot
+    /// stall unrelated paths.
+    ///
+    /// Servers that have meanwhile synced the path are filtered out: a close
+    /// for them would undo a live open.
+    pub(crate) fn try_claim_pending_close(&self, path: &Path) -> Option<PendingCloseClaim<'_>> {
+        let path_guard = self.try_lock_path(path)?;
+        let synced: HashSet<ServerId> = lock_std(&self.documents)
+            .get(path)
+            .map(|st| st.synced.keys().cloned().collect())
+            .unwrap_or_default();
+        let pending = lock_std(&self.pending_closes).remove(path)?;
+        let servers: Vec<ServerId> = pending.servers.difference(&synced).cloned().collect();
+        if servers.is_empty() {
+            return None;
+        }
+        Some(PendingCloseClaim {
+            path: path.to_path_buf(),
+            uri: pending.uri,
+            servers,
+            _path_guard: path_guard,
+        })
+    }
+
+    /// Removes `server`'s owed close for `path`, returning whether there was
+    /// one. Must be called under `path`'s lock.
+    fn take_pending_close(&self, path: &Path, server: &ServerId) -> bool {
+        let mut pending_closes = lock_std(&self.pending_closes);
+        let Some(pending) = pending_closes.get_mut(path) else {
+            return false;
+        };
+        let owed = pending.servers.remove(server);
+        if pending.servers.is_empty() {
+            pending_closes.remove(path);
+        }
+        owed
+    }
+
+    /// Re-records `server`'s owed close for `path` after its `didClose`
+    /// failed to send. Must be called under `path`'s lock.
+    ///
+    /// Skipped when `server` was forgotten since `generation` was observed: a
+    /// respawned process never had the path open, so it owes no close. The
+    /// check runs under the `pending_closes` lock, which `forget_server`'s
+    /// purge also takes after bumping the generation, so one of the two
+    /// always wins.
+    fn restore_pending_close(&self, path: &Path, uri: &Uri, server: &ServerId, generation: u64) {
+        let mut pending_closes = lock_std(&self.pending_closes);
+        if self.generation(server) != generation {
+            return;
+        }
+        pending_closes
+            .entry(path.to_path_buf())
+            .or_insert_with(|| PendingClose {
+                uri: uri.clone(),
+                servers: HashSet::new(),
+            })
+            .servers
+            .insert(server.clone());
+    }
+
     /// Ensure a document is open *for `server`*, opening it lazily if
     /// necessary, and resynchronize it with disk and with `server` if either
     /// has fallen behind.
@@ -755,7 +1006,7 @@ impl DocumentTracker {
     /// so `get_cached_diagnostics` keeps serving the last-known diagnostics
     /// until the server re-publishes -- there is no transient empty window.
     ///
-    /// `st.version`/`st.content`/`st.disk`/`synced[server]` are all committed
+    /// `st.version`/`st.text`/`st.disk`/`synced[server]` are all committed
     /// only after the notification succeeds. A server that is never asked
     /// again never catches up to a later edit -- which is correct, since a
     /// server that is never asked never needs the content.
@@ -859,7 +1110,7 @@ impl DocumentTracker {
 
         let Some(unchanged) = lock_std(&self.documents)
             .get(path)
-            .map(|st| fresh == st.content)
+            .map(|st| fresh == st.text.as_str())
         else {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
@@ -872,7 +1123,7 @@ impl DocumentTracker {
         Ok(Decision {
             uri,
             target_version: current_version.saturating_add(1),
-            fresh_content: Some(fresh),
+            fresh_content: Some(DocumentText::build(fresh).await?),
             snap: Some(snap),
         })
     }
@@ -884,7 +1135,7 @@ impl DocumentTracker {
         let read_at = SystemTime::now();
         let (content, mtime, size) = self.read_to_string_checked(path).await?;
 
-        let uri = self.open(path.to_path_buf(), content)?;
+        let uri = self.open_text(path.to_path_buf(), DocumentText::build(content).await?)?;
         self.set_disk(
             path,
             DiskSync {
@@ -1033,10 +1284,9 @@ impl DocumentTracker {
     /// before a complete line could be read -- [`LineRead::bytes_read`] is
     /// populated in every one of these cases (see below), never silently
     /// dropped via an `Err` with no byte count. Lines follow the same rule
-    /// as [`Self::line_text`] (see [`split_line`]): they are separated by
-    /// `\n`, at most one trailing `\r` is stripped from each, and the empty
-    /// line right after a final `\n` (or line 0 of an empty file) is
-    /// `Some("")`.
+    /// as [`Self::line_text`] (see [`DocumentText`]): they end at `\n`,
+    /// `\r\n` or a lone `\r`, and the empty line right after a final
+    /// terminator (or line 0 of an empty file) is `Some("")`.
     ///
     /// `budget` bounds this call's own read on top of
     /// [`crate::util::bounded_read_cap`] of `max_file_size`: the actual cap
@@ -1100,45 +1350,7 @@ impl DocumentTracker {
             source: e,
         };
 
-        let mut buf = Vec::new();
-        let mut bytes_read: u64 = 0;
-        let mut current_line = 0u32;
-        let mut at_line_start = true;
-        loop {
-            buf.clear();
-            let n = reader.read_until(b'\n', &mut buf).await.map_err(io_err)?;
-            bytes_read += n as u64;
-            if n == 0 {
-                // A clean EOF (not the cap running out) right at a line start
-                // is the empty trailing line `split_line` also reports.
-                let trailing_empty_line = current_line == line && at_line_start && bytes_read < cap;
-                return Ok(LineRead {
-                    text: trailing_empty_line.then(String::new),
-                    bytes_read,
-                });
-            }
-            at_line_start = buf.last() == Some(&b'\n');
-            if current_line == line {
-                let truncated_by_cap = bytes_read >= cap && buf.last() != Some(&b'\n');
-                if truncated_by_cap {
-                    return Ok(LineRead {
-                        text: None,
-                        bytes_read,
-                    });
-                }
-                if buf.last() == Some(&b'\n') {
-                    buf.pop();
-                }
-                if buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-                return Ok(LineRead {
-                    text: String::from_utf8(buf).ok(),
-                    bytes_read,
-                });
-            }
-            current_line += 1;
-        }
+        read_nth_line(&mut reader, line, cap).await.map_err(io_err)
     }
 
     /// Per-server sync phase of `ensure_open`: sends `didOpen`, `didChange`,
@@ -1186,23 +1398,44 @@ impl DocumentTracker {
         }
 
         let Some((language_id, text)) = lock_std(&self.documents).get(path).map(|st| {
-            let text = fresh_content.clone().unwrap_or_else(|| st.content.clone());
+            let text = fresh_content
+                .as_ref()
+                .unwrap_or(&st.text)
+                .as_str()
+                .to_owned();
             (st.language_id.clone(), text)
         }) else {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
 
         let notify_result = if is_first_open {
-            lsp_client
-                .notify_typed::<DidOpenTextDocumentNotification>(DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem {
-                        uri: uri.clone(),
-                        language_id: language_id.into(),
-                        version: target_version,
-                        text,
-                    },
-                })
-                .await
+            let closed = if self.take_pending_close(path, server) {
+                lsp_client
+                    .notify_typed::<DidCloseTextDocumentNotification>(DidCloseTextDocumentParams {
+                        text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                    })
+                    .await
+                    .inspect_err(|_| self.restore_pending_close(path, &uri, server, generation))
+            } else {
+                Ok(())
+            };
+            match closed {
+                Ok(()) => {
+                    lsp_client
+                        .notify_typed::<DidOpenTextDocumentNotification>(
+                            DidOpenTextDocumentParams {
+                                text_document: TextDocumentItem {
+                                    uri: uri.clone(),
+                                    language_id: language_id.into(),
+                                    version: target_version,
+                                    text,
+                                },
+                            },
+                        )
+                        .await
+                }
+                Err(err) => Err(err),
+            }
         } else {
             lsp_client
                 .notify_typed::<DidChangeTextDocumentNotification>(DidChangeTextDocumentParams {
@@ -1270,6 +1503,74 @@ impl DocumentTracker {
     }
 }
 
+/// Reads the 0-based `line`'th line from `reader` under the [`DocumentText`]
+/// line model, scanning the buffered chunks directly so skipped lines are never
+/// copied.
+///
+/// `cap` is the byte limit the caller imposed on `reader` (a `take` adapter):
+/// a read that consumed `cap` bytes without finishing is reported as `None`
+/// rather than returning a line the cap may have cut. A `\r` ending a skipped
+/// line at a chunk boundary is remembered, so a `\n` opening the next chunk
+/// still counts as part of the same `\r\n` terminator.
+async fn read_nth_line<R>(reader: &mut R, line: u32, cap: u64) -> std::io::Result<LineRead>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut bytes_read: u64 = 0;
+    let mut current_line = 0u32;
+    let mut after_cr = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            let reached_line = current_line == line && bytes_read < cap;
+            return Ok(LineRead {
+                text: reached_line.then(|| String::from_utf8(buf).ok()).flatten(),
+                bytes_read,
+            });
+        }
+
+        let mut i = usize::from(after_cr && chunk[0] == b'\n');
+        after_cr = false;
+        let mut finished = false;
+        while i < chunk.len() {
+            let rest = &chunk[i..];
+            let Some(offset) = rest.iter().position(|&b| is_line_terminator(b)) else {
+                if current_line == line {
+                    buf.extend_from_slice(rest);
+                }
+                i = chunk.len();
+                break;
+            };
+            let terminator = i + offset;
+            if current_line == line {
+                buf.extend_from_slice(&chunk[i..terminator]);
+                i = terminator + 1;
+                finished = true;
+                break;
+            }
+            current_line += 1;
+            i = terminator + 1;
+            if chunk[terminator] == b'\r' {
+                match chunk.get(i) {
+                    Some(b'\n') => i += 1,
+                    Some(_) => {}
+                    None => after_cr = true,
+                }
+            }
+        }
+
+        bytes_read += i as u64;
+        reader.consume(i);
+        if finished {
+            return Ok(LineRead {
+                text: String::from_utf8(buf).ok(),
+                bytes_read,
+            });
+        }
+    }
+}
+
 /// Per-path count of live [`InFlightGuard`]s.
 type InFlightMap = Arc<StdMutex<HashMap<PathBuf, usize>>>;
 
@@ -1306,6 +1607,7 @@ impl Drop for InFlightGuard {
 /// path. On drop, evicts the `path_locks` map entry if (and only if) no
 /// other caller holds a clone of the same `Arc` -- see the `Drop` impl for
 /// why that check is race-free.
+#[derive(Debug)]
 struct PathLockGuard<'a> {
     path_locks: &'a StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
     path: PathBuf,
@@ -1344,7 +1646,7 @@ impl Drop for PathLockGuard<'_> {
 struct Decision {
     uri: Uri,
     target_version: i32,
-    fresh_content: Option<String>,
+    fresh_content: Option<DocumentText>,
     snap: Option<DiskSync>,
 }
 
@@ -1629,8 +1931,8 @@ mod tests {
 
     /// #495: at capacity with every existing document unlocked and
     /// disk-verified, `open` must evict the least-recently-used one to make
-    /// room rather than fail -- the evicted document is queued for
-    /// `take_evicted`.
+    /// room rather than fail -- its servers are recorded as owed a
+    /// `didClose`.
     #[test]
     fn test_document_limit_evicts_lru_instead_of_failing() {
         let limits = ResourceLimits {
@@ -1660,11 +1962,8 @@ mod tests {
         assert!(tracker.is_open(Path::new("/test/file2.rs")));
         assert!(tracker.is_open(Path::new("/test/file3.rs")));
 
-        let evicted = tracker.take_evicted();
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].path, PathBuf::from("/test/file1.rs"));
         assert!(
-            evicted[0].synced_servers.is_empty(),
+            tracker.pending_close_paths().is_empty(),
             "opened directly via `open`, never synced to any server"
         );
     }
@@ -1694,7 +1993,15 @@ mod tests {
             tracker.is_open(&locked_path),
             "the locked document must not be evicted"
         );
-        assert!(tracker.take_evicted().is_empty());
+        assert!(tracker.pending_close_paths().is_empty());
+    }
+
+    /// Servers currently owed a `didClose` for `path`.
+    fn pending_servers(tracker: &DocumentTracker, path: &Path) -> HashSet<ServerId> {
+        lock_std(&tracker.pending_closes)
+            .get(path)
+            .map(|pending| pending.servers.clone())
+            .unwrap_or_default()
     }
 
     /// Opens `name` through `ensure_open` so it is disk-verified (the only
@@ -1735,15 +2042,17 @@ mod tests {
         let result = tracker.open(path_b.clone(), "BBBB".to_string());
         assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
         assert!(tracker.is_open(&path_a));
-        assert!(tracker.take_evicted().is_empty());
+        assert!(tracker.pending_close_paths().is_empty());
 
         drop(guard);
         tracker.open(path_b.clone(), "BBBB".to_string()).unwrap();
         assert!(!tracker.is_open(&path_a));
         assert!(tracker.is_open(&path_b));
-        let evicted = tracker.take_evicted();
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].path, path_a);
+        assert_eq!(tracker.pending_close_paths(), vec![path_a.clone()]);
+        assert_eq!(
+            pending_servers(&tracker, &path_a),
+            HashSet::from([ServerId::from("rust")])
+        );
     }
 
     /// #503: guards for one path stack -- dropping one leaves the path
@@ -1815,7 +2124,7 @@ mod tests {
             tracker.is_open(&first),
             "the not-disk-verified document must not be evicted"
         );
-        assert!(tracker.take_evicted().is_empty());
+        assert!(tracker.pending_close_paths().is_empty());
     }
 
     /// #495: `ensure_open` must bump a document's LRU recency (via
@@ -1874,10 +2183,11 @@ mod tests {
         );
         assert!(tracker.is_open(&path_c));
 
-        let evicted = tracker.take_evicted();
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].path, path_b);
-        assert_eq!(evicted[0].synced_servers, vec![server_id]);
+        assert_eq!(tracker.pending_close_paths(), vec![path_b.clone()]);
+        assert_eq!(
+            pending_servers(&tracker, &path_b),
+            HashSet::from([server_id])
+        );
     }
 
     #[test]
@@ -1954,7 +2264,7 @@ mod tests {
             uri: Uri::from("file:///test.rs"),
             language_id: "rust".to_string(),
             version: 5,
-            content: "fn main() {}".to_string(),
+            text: DocumentText::new("fn main() {}".to_string()),
             disk: None,
             synced: HashMap::new(),
             last_accessed: Instant::now(),
@@ -3455,10 +3765,7 @@ mod tests {
         );
     }
 
-    /// `read_until(b'\n', ..)` splits lines on `\n` alone, so a `\r` ahead of
-    /// it is left in `buf` until the trailing-separator strip loop removes
-    /// it -- pins that CRLF-terminated lines come out identical to LF-only
-    /// ones.
+    /// Pins that CRLF-terminated lines come out identical to LF-only ones.
     #[tokio::test]
     async fn test_read_line_checked_strips_crlf_line_ending() {
         let dir = TempDir::new().unwrap();
@@ -3504,12 +3811,16 @@ mod tests {
             "abc\r",
             "a\n\nb",
             "a\r\nb\r\n",
+            "a\rb",
+            "a\r\r\nb",
+            "\n\r",
+            "\r\n\r\n",
         ];
         for (i, content) in contents.iter().enumerate() {
             let path = dir.path().join(format!("parity_{i}.rs"));
             std::fs::write(&path, content).unwrap();
             tracker.open(path.clone(), (*content).to_string()).unwrap();
-            for line in 0..5 {
+            for line in 0..6 {
                 let disk = tracker
                     .read_line_checked(&path, line, u64::MAX)
                     .await
@@ -3525,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn test_line_text_trailing_empty_line_and_cr_stripping() {
+    fn test_line_text_trailing_empty_line_and_lone_cr_terminator() {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let path = PathBuf::from("/test/lines.rs");
         tracker
@@ -3533,9 +3844,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(tracker.line_text(&path, 0).as_deref(), Some("ab"));
-        assert_eq!(tracker.line_text(&path, 1).as_deref(), Some("cd\r"));
+        assert_eq!(tracker.line_text(&path, 1).as_deref(), Some("cd"));
         assert_eq!(tracker.line_text(&path, 2).as_deref(), Some(""));
-        assert_eq!(tracker.line_text(&path, 3), None);
+        assert_eq!(tracker.line_text(&path, 3).as_deref(), Some(""));
+        assert_eq!(tracker.line_text(&path, 4), None);
 
         let empty = PathBuf::from("/test/empty.rs");
         tracker.open(empty.clone(), String::new()).unwrap();
@@ -3681,5 +3993,399 @@ mod tests {
         let read = tracker.read_line_checked(&path, 0, u64::MAX).await.unwrap();
         assert_eq!(read.text, None);
         assert_eq!(read.bytes_read, OPEN_FAILURE_CHARGE_BYTES);
+    }
+
+    /// Independent line splitter for the oracle tests: a single left-to-right
+    /// pass over the bytes, unlike the checkpointed lookup under test.
+    fn naive_lines(content: &str) -> Vec<&str> {
+        let bytes = content.as_bytes();
+        let mut lines = Vec::new();
+        let (mut start, mut i) = (0, 0);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\n' => {
+                    lines.push(&content[start..i]);
+                    i += 1;
+                    start = i;
+                }
+                b'\r' => {
+                    lines.push(&content[start..i]);
+                    i += 1;
+                    if bytes.get(i) == Some(&b'\n') {
+                        i += 1;
+                    }
+                    start = i;
+                }
+                _ => i += 1,
+            }
+        }
+        lines.push(&content[start..]);
+        lines
+    }
+
+    /// Every string up to `max_len` characters over `{a, e-acute, CR, LF}`.
+    fn all_strings(max_len: usize) -> Vec<String> {
+        let alphabet = ['a', 'é', '\r', '\n'];
+        let mut all = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..max_len {
+            frontier = frontier
+                .iter()
+                .flat_map(|s| {
+                    alphabet.iter().map(move |c| {
+                        let mut next = s.clone();
+                        next.push(*c);
+                        next
+                    })
+                })
+                .collect();
+            all.extend(frontier.iter().cloned());
+        }
+        all
+    }
+
+    /// #513/#488: `DocumentText::line` agrees with an independent splitter on
+    /// every short string, at strides small enough that checkpoints land on
+    /// every CR/LF pair and on the EOF boundary.
+    #[test]
+    fn test_document_text_line_matches_naive_splitter_exhaustively() {
+        for content in all_strings(8) {
+            let expected = naive_lines(&content);
+            for stride in 1..=3 {
+                let text = DocumentText::with_stride(content.clone(), stride);
+                for (n, want) in expected.iter().enumerate() {
+                    assert_eq!(
+                        text.line(u32::try_from(n).unwrap()),
+                        Some(*want),
+                        "{content:?} stride {stride} line {n}"
+                    );
+                }
+                assert_eq!(
+                    text.line(u32::try_from(expected.len()).unwrap()),
+                    None,
+                    "{content:?} stride {stride} past the last line"
+                );
+            }
+        }
+    }
+
+    /// #513: the disk reader agrees with the same oracle, including with a
+    /// one-byte buffer that splits every CRLF across two fills.
+    #[tokio::test]
+    async fn test_read_nth_line_matches_naive_splitter_exhaustively() {
+        for content in all_strings(7) {
+            let expected = naive_lines(&content);
+            for capacity in [1, 2, 8 * 1024] {
+                for n in 0..=expected.len() {
+                    let mut reader =
+                        tokio::io::BufReader::with_capacity(capacity, content.as_bytes());
+                    let read = read_nth_line(&mut reader, u32::try_from(n).unwrap(), u64::MAX)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        read.text.as_deref(),
+                        expected.get(n).copied(),
+                        "{content:?} capacity {capacity} line {n}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #488 M3(a): exactly one stride of lines plus a final terminator leaves
+    /// an empty line starting at EOF, which must still be reachable.
+    #[test]
+    fn test_document_text_checkpoint_at_eof_after_full_stride() {
+        for terminator in ["\n", "\r\n", "\r"] {
+            let content = format!("x{terminator}").repeat(LINE_CHECKPOINT_STRIDE);
+            let text = DocumentText::new(content);
+            let stride = u32::try_from(LINE_CHECKPOINT_STRIDE).unwrap();
+            assert_eq!(text.line(stride - 1), Some("x"));
+            assert_eq!(text.line(stride), Some(""), "terminator {terminator:?}");
+            assert_eq!(text.line(stride + 1), None);
+        }
+    }
+
+    /// #488: a document spanning several checkpoint strides resolves lines on
+    /// both sides of each checkpoint, with CRLF straddling none of them wrong.
+    #[test]
+    fn test_document_text_lines_across_default_stride_boundaries() {
+        let content: String = (0..200)
+            .map(|i| format!("line{i}\r\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let text = DocumentText::new(content);
+        for i in [0u32, 1, 63, 64, 65, 127, 128, 199] {
+            assert_eq!(text.line(i), Some(format!("line{i}").as_str()), "line {i}");
+        }
+        assert_eq!(text.line(200), Some(""));
+        assert_eq!(text.line(201), None);
+    }
+
+    /// Content above the inline threshold is indexed on the blocking pool and
+    /// yields the same lines.
+    #[tokio::test]
+    async fn test_document_text_build_above_inline_threshold_matches_inline() {
+        let content = "ab\r\n".repeat(INLINE_INDEX_MAX_BYTES / 4 + 10);
+        assert!(content.len() > INLINE_INDEX_MAX_BYTES);
+        let built = DocumentText::build(content.clone()).await.unwrap();
+        let inline = DocumentText::new(content);
+        assert_eq!(built.checkpoints, inline.checkpoints);
+        assert_eq!(built.line(1000), Some("ab"));
+    }
+
+    #[test]
+    fn test_document_text_checkpoint_memory_is_sparse() {
+        let text = DocumentText::new("\n".repeat(6400));
+        assert_eq!(text.checkpoints.len(), 6400 / LINE_CHECKPOINT_STRIDE + 1);
+    }
+
+    /// #513: a chunk boundary between `\r` and `\n` must not count the pair as
+    /// two terminators.
+    #[tokio::test]
+    async fn test_read_nth_line_crlf_split_across_fills_is_one_terminator() {
+        let mut reader = tokio::io::BufReader::with_capacity(1, b"a\r\nb".as_slice());
+        let read = read_nth_line(&mut reader, 1, u64::MAX).await.unwrap();
+        assert_eq!(read.text.as_deref(), Some("b"));
+    }
+
+    /// #513: the cap running out mid-line is reported as `None`, not a
+    /// truncated line.
+    #[tokio::test]
+    async fn test_read_nth_line_cap_exhausted_mid_line_is_none() {
+        let mut reader =
+            tokio::io::BufReader::new(tokio::io::AsyncReadExt::take(b"abcdef\n".as_slice(), 3));
+        let read = read_nth_line(&mut reader, 0, 3).await.unwrap();
+        assert_eq!(read.text, None);
+        assert_eq!(read.bytes_read, 3);
+    }
+
+    /// Opens `name` for `servers` in turn through `ensure_open`, returning the
+    /// path and one `(client, fake server)` pair per server.
+    async fn open_for_servers(
+        tracker: &DocumentTracker,
+        dir: &TempDir,
+        name: &str,
+        servers: &[&str],
+    ) -> (
+        PathBuf,
+        Vec<(ServerId, LspClient, crate::test_lsp::FakeServer)>,
+    ) {
+        let path = dir.path().join(name);
+        std::fs::write(&path, name).unwrap();
+        set_mtime(&path, settled_past());
+        let mut out = Vec::new();
+        for server in servers {
+            let (client, fake) = fake_lsp_client();
+            let id = ServerId::from(*server);
+            tracker.ensure_open(&path, &id, &client).await.unwrap();
+            out.push((id, client, fake));
+        }
+        (path, out)
+    }
+
+    /// Evicts the tracker's only document by opening `other`.
+    async fn evict_by_opening(tracker: &DocumentTracker, dir: &TempDir, other: &str) {
+        let path = dir.path().join(other);
+        std::fs::write(&path, other).unwrap();
+        set_mtime(&path, settled_past());
+        let (client, _fake) = fake_lsp_client();
+        tracker
+            .ensure_open(&path, &ServerId::from("other"), &client)
+            .await
+            .unwrap();
+    }
+
+    fn one_document_tracker() -> DocumentTracker {
+        DocumentTracker::new(
+            ResourceLimits {
+                max_documents: 1,
+                max_file_size: 0,
+            },
+            HashMap::new(),
+        )
+    }
+
+    /// #515: a path evicted while synced to A and D, then re-opened through A
+    /// alone, sends A a close before its open, and still owes D its close.
+    #[tokio::test]
+    async fn test_reopen_through_one_server_settles_only_that_servers_close() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, mut servers) = open_for_servers(&tracker, &dir, "p.rs", &["a", "d"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+        assert_eq!(
+            pending_servers(&tracker, &path),
+            HashSet::from([ServerId::from("a"), ServerId::from("d")])
+        );
+
+        let (id_a, client_a, mut fake_a) = servers.remove(0);
+        tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
+
+        let mut wire = BufReader::new(&mut fake_a.write_stdout);
+        assert_eq!(
+            read_framed_message(&mut wire).await["method"],
+            "textDocument/didOpen"
+        );
+        assert_eq!(
+            read_framed_message(&mut wire).await["method"],
+            "textDocument/didClose"
+        );
+        assert_eq!(
+            read_framed_message(&mut wire).await["method"],
+            "textDocument/didOpen"
+        );
+
+        assert_eq!(
+            pending_servers(&tracker, &path),
+            HashSet::from([ServerId::from("d")])
+        );
+        let claim = tracker.try_claim_pending_close(&path).unwrap();
+        assert_eq!(claim.servers, vec![ServerId::from("d")]);
+    }
+
+    /// #515: evict then flush hands out every owed close exactly once.
+    #[tokio::test]
+    async fn test_claim_returns_every_owed_server_once() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a", "d"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+
+        assert_eq!(tracker.pending_close_paths(), vec![path.clone()]);
+        let claim = tracker.try_claim_pending_close(&path).unwrap();
+        assert_eq!(claim.path, path);
+        let mut claimed = claim.servers.clone();
+        claimed.sort_by_key(ToString::to_string);
+        assert_eq!(claimed, vec![ServerId::from("a"), ServerId::from("d")]);
+        drop(claim);
+
+        assert!(tracker.pending_close_paths().is_empty());
+        assert!(tracker.try_claim_pending_close(&path).is_none());
+    }
+
+    /// #515 S2: a busy path is deferred, not awaited, and its debt survives.
+    #[tokio::test]
+    async fn test_claim_defers_busy_path_without_waiting() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+
+        let busy = tracker.lock_path(&path).await;
+        assert!(tracker.try_claim_pending_close(&path).is_none());
+        assert_eq!(
+            pending_servers(&tracker, &path),
+            HashSet::from([ServerId::from("a")]),
+            "a deferred claim must leave the debt pending"
+        );
+        drop(busy);
+        assert!(tracker.try_claim_pending_close(&path).is_some());
+        assert!(
+            lock_std(&tracker.path_locks).is_empty(),
+            "failed and successful claims must not leak path-lock entries"
+        );
+    }
+
+    /// #515: while a claim is alive, `ensure_open` for the path waits for it,
+    /// so a later `didOpen` is ordered after the claimed closes.
+    #[tokio::test]
+    async fn test_claim_holds_path_lock_until_dropped() {
+        let dir = TempDir::new().unwrap();
+        let tracker = Arc::new(one_document_tracker());
+        let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+
+        let claim = tracker.try_claim_pending_close(&path).unwrap();
+        let (client, _fake) = fake_lsp_client();
+        let reopen = {
+            let tracker = Arc::clone(&tracker);
+            let path = path.clone();
+            tokio::spawn(async move {
+                tracker
+                    .ensure_open(&path, &ServerId::from("b"), &client)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!reopen.is_finished(), "ensure_open must wait for the claim");
+        drop(claim);
+        reopen.await.unwrap().unwrap();
+    }
+
+    /// #515: evict, re-open and evict again merges into one entry per server.
+    #[tokio::test]
+    async fn test_repeated_eviction_merges_pending_closes() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, mut servers) = open_for_servers(&tracker, &dir, "p.rs", &["a", "d"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+
+        let (id_d, client_d, _fake_d) = servers.remove(1);
+        tracker.ensure_open(&path, &id_d, &client_d).await.unwrap();
+        evict_by_opening(&tracker, &dir, "r.rs").await;
+
+        assert_eq!(
+            pending_servers(&tracker, &path),
+            HashSet::from([ServerId::from("a"), ServerId::from("d")])
+        );
+        assert_eq!(tracker.pending_close_paths().len(), 2);
+    }
+
+    /// #515: a close that fails after `forget_server` ran (respawn) must not
+    /// re-add the forgotten server's debt.
+    #[tokio::test]
+    async fn test_restore_pending_close_skips_forgotten_server() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+        let server = ServerId::from("a");
+        let uri = path_to_uri(&path).unwrap();
+
+        let generation = tracker.generation(&server);
+        assert!(tracker.take_pending_close(&path, &server));
+        tracker.forget_server(&server);
+        tracker.restore_pending_close(&path, &uri, &server, generation);
+        assert!(pending_servers(&tracker, &path).is_empty());
+
+        tracker.restore_pending_close(&path, &uri, &server, tracker.generation(&server));
+        assert_eq!(pending_servers(&tracker, &path), HashSet::from([server]));
+    }
+
+    /// #515: a respawned server never had the documents open, so it owes no
+    /// close; other servers' debts stay.
+    #[tokio::test]
+    async fn test_forget_server_purges_its_pending_closes() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a", "d"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+
+        tracker.forget_server(&ServerId::from("a"));
+        assert_eq!(
+            pending_servers(&tracker, &path),
+            HashSet::from([ServerId::from("d")])
+        );
+        tracker.forget_server(&ServerId::from("d"));
+        assert!(!lock_std(&tracker.pending_closes).contains_key(&path));
+    }
+
+    /// #515: a failed `didClose` keeps the server's debt and surfaces the error.
+    #[tokio::test]
+    async fn test_failed_close_before_reopen_restores_the_debt() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, mut servers) = open_for_servers(&tracker, &dir, "p.rs", &["a"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+
+        let (id_a, client_a, _fake_a) = servers.remove(0);
+        let will_fail = client_a.clone();
+        client_a.shutdown().await.unwrap();
+        assert!(tracker.ensure_open(&path, &id_a, &will_fail).await.is_err());
+        assert_eq!(
+            pending_servers(&tracker, &path),
+            HashSet::from([ServerId::from("a")])
+        );
     }
 }

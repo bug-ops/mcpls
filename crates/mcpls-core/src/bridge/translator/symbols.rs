@@ -213,15 +213,29 @@ impl Translator {
                 // `ToolRouter` itself) to tell the two apart, mirroring
                 // `client_for_file`'s `ServerInitializing` check below.
                 NoServerReason::NothingRegistered => {
-                    if lock_std(&self.expected_servers).is_empty() {
+                    if !lock_std(&self.expected_servers).is_empty() {
+                        return Error::WorkspaceServersInitializing;
+                    }
+                    let failures = self.startup_failures();
+                    if failures.is_empty() {
                         Error::NoServerConfigured
                     } else {
-                        Error::WorkspaceServersInitializing
+                        Error::AllServersFailedToInit { failures }
                     }
                 }
-                NoServerReason::NoClaimant => Error::NoServerForWorkspaceTool {
-                    tool: ToolKind::WorkspaceSymbols,
-                },
+                // A claimant that failed to start was rebound away, so the live
+                // router sees no claimant for it -- report the failure instead.
+                NoServerReason::NoClaimant => self
+                    .configured_router
+                    .resolve_any(ToolKind::WorkspaceSymbols)
+                    .ok()
+                    .and_then(|id| self.startup_failure(id))
+                    .map_or(
+                        Error::NoServerForWorkspaceTool {
+                            tool: ToolKind::WorkspaceSymbols,
+                        },
+                        |failure| Error::ServerFailedToStart(Box::new(failure)),
+                    ),
             })?;
         self.respawn_if_dead(&server_id).await?;
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
@@ -460,6 +474,81 @@ mod tests {
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
+        assert!(matches!(result, Err(Error::WorkspaceServersInitializing)));
+    }
+
+    /// #527: workspace search with every server failed to start reports the
+    /// failures instead of "no server configured".
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_reports_startup_failures() {
+        let translator = Translator::new();
+        translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
+            server_id: ServerId::from("pyright"),
+            language_id: "python".to_string(),
+            command: "pyright-langserver".to_string(),
+            reason: crate::error::StartupFailure::InitTaskPanicked,
+        }]);
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await;
+
+        let Err(Error::AllServersFailedToInit { failures }) = result else {
+            panic!("expected AllServersFailedToInit, got {result:?}");
+        };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].server_id, ServerId::from("pyright"));
+    }
+
+    /// A failed server that would have claimed workspace search is reported
+    /// instead of "no server handles this tool" while another server lives.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_reports_failed_claimant() {
+        let mut live = crate::config::LspServerConfig::pyright();
+        live.name = Some("live".to_string());
+        live.handles = Some(vec![ToolKind::Hover]);
+        let mut failing = crate::config::LspServerConfig::rust_analyzer();
+        failing.name = Some("failing".to_string());
+        failing.handles = Some(vec![ToolKind::WorkspaceSymbols]);
+        let router = ToolRouter::from_configs([&live, &failing]).unwrap();
+        let failing_id = ServerId::from("failing");
+
+        let translator = Translator::new().with_router(router);
+        translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
+            server_id: failing_id.clone(),
+            language_id: "rust".to_string(),
+            command: "rust-analyzer".to_string(),
+            reason: crate::error::StartupFailure::InitTaskPanicked,
+        }]);
+        translator.rebind_router(&HashSet::from([ServerId::from("live")]));
+        translator.clear_expected_servers();
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await;
+
+        assert!(
+            matches!(&result, Err(Error::ServerFailedToStart(f)) if f.server_id == failing_id),
+            "got {result:?}"
+        );
+    }
+
+    /// A server still expected to register wins over a recorded failure.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_initializing_wins_over_recorded_failure() {
+        let translator = Translator::new();
+        translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
+        translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
+            server_id: ServerId::from("other"),
+            language_id: "go".to_string(),
+            command: "gopls".to_string(),
+            reason: crate::error::StartupFailure::InitTaskPanicked,
+        }]);
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await;
+
         assert!(matches!(result, Err(Error::WorkspaceServersInitializing)));
     }
 

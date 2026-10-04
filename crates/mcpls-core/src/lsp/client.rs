@@ -1658,6 +1658,101 @@ mod tests {
         assert!(matches!(rx2.await.unwrap(), Err(Error::ServerTerminated)));
     }
 
+    /// Pins where a request is cancelled (#518): once the request is on the
+    /// wire, a timeout or a dropped caller must leave the client able to
+    /// serve the next request, with no stale reply crossing over to it. The
+    /// paused clock makes the timeout deterministic.
+    mod timeout_cancellation {
+        use tokio::io::BufReader;
+        use tokio::task::JoinHandle;
+
+        use super::*;
+        use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn spawn_hover(client: &LspClient) -> JoinHandle<Result<Value>> {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .request("textDocument/hover", serde_json::json!({}), TIMEOUT)
+                    .await
+            })
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_timeout_while_awaiting_reply_clears_pending_and_discards_late_reply() {
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let first = spawn_hover(&client);
+            let first_request = read_framed_message(&mut reader).await;
+
+            tokio::time::advance(TIMEOUT + Duration::from_secs(1)).await;
+            assert!(
+                matches!(first.await.unwrap(), Err(Error::Timeout(5))),
+                "request awaiting its reply must time out"
+            );
+            assert!(
+                client.pending_requests.lock().await.is_empty(),
+                "timed-out request must not remain in pending_requests"
+            );
+
+            write_response(
+                &mut server.read_half_stdin,
+                &first_request["id"],
+                serde_json::json!("stale"),
+            )
+            .await;
+
+            let second = spawn_hover(&client);
+            let second_request = read_framed_message(&mut reader).await;
+            assert_ne!(second_request["id"], first_request["id"]);
+            write_response(
+                &mut server.read_half_stdin,
+                &second_request["id"],
+                serde_json::json!("fresh"),
+            )
+            .await;
+
+            assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("fresh"));
+            assert!(client.pending_requests.lock().await.is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_dropped_caller_after_send_is_cleared_by_late_reply() {
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let first = spawn_hover(&client);
+            let first_request = read_framed_message(&mut reader).await;
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+
+            write_response(
+                &mut server.read_half_stdin,
+                &first_request["id"],
+                serde_json::json!("orphaned"),
+            )
+            .await;
+
+            let second = spawn_hover(&client);
+            let second_request = read_framed_message(&mut reader).await;
+            write_response(
+                &mut server.read_half_stdin,
+                &second_request["id"],
+                serde_json::json!("fresh"),
+            )
+            .await;
+
+            assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("fresh"));
+            assert!(
+                client.pending_requests.lock().await.is_empty(),
+                "the orphaned reply must clear the abandoned entry"
+            );
+        }
+    }
+
     #[test]
     fn test_should_retrigger_defaults_to_true_when_data_absent() {
         assert!(LspClient::should_retrigger(None));

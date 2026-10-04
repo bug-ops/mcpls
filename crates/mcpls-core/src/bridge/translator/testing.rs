@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 use super::Translator;
 use super::dto::Position;
-use super::encoding_ctx::{EncodingCtx, new_line_cache};
+use super::encoding_ctx::EncodingCtx;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DiagnosticInfo, DocumentTracker};
@@ -44,15 +44,14 @@ pub(super) fn test_ctx_with_roots(
     encoding: PositionEncoding,
     workspace_roots: Vec<PathBuf>,
 ) -> EncodingCtx {
-    EncodingCtx {
+    EncodingCtx::new(
         encoding,
-        tracker: Arc::new(DocumentTracker::new(
+        Arc::new(DocumentTracker::new(
             ResourceLimits::default(),
             HashMap::new(),
         )),
-        workspace_roots: Arc::new(workspace_roots),
-        line_cache: new_line_cache(),
-    }
+        Arc::new(workspace_roots),
+    )
 }
 
 pub(super) fn test_uri() -> lsp_types::Uri {
