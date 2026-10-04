@@ -644,6 +644,8 @@ impl StatefulSession<'_> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     /// A request with no `http::request::Parts` extension at all (e.g. served
@@ -1090,10 +1092,7 @@ mod tests {
         registration
             .publish(&u("lsp-diagnostics:///unwatched.rs"))
             .await;
-        assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert_matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
 
         let held: Vec<_> = (1..MAX_LISTEN_STREAMS)
             .map(|_| registry.try_reserve_listen().unwrap())

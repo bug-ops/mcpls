@@ -346,7 +346,7 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::fs;
+    use std::{assert_matches, fs};
 
     use super::*;
     use crate::bridge::translator::testing::*;
@@ -357,7 +357,7 @@ mod tests {
     fn test_validate_completions_params_rejects_oversized_trigger() {
         let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
         let result = validate_completions_params(Some(&trigger));
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[test]
@@ -414,10 +414,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// Companion: when the cache reports `Ready`, `handle_completions` must

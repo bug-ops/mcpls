@@ -45,7 +45,7 @@ Cross-cutting concerns (CLI argument parsing, signal handling, transport-level s
 
 ## II. Technology Stack
 
-- **Language**: Rust 1.88+ (MSRV enforced in `Cargo.toml` as `rust-version = "1.88"`)
+- **Language**: Rust 1.99+ (MSRV enforced in `Cargo.toml` as `rust-version = "1.99"`)
 - **Edition**: 2024 edition
 - **Primary dependencies**:
   - `tokio` 1.53+ — async runtime

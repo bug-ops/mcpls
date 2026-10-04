@@ -1150,6 +1150,8 @@ impl LspClient {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -1620,7 +1622,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(Error::Timeout(_))), "got {result:?}");
+        assert_matches!(result, Err(Error::Timeout(_)), "got {result:?}");
         assert!(
             client.pending_requests.lock().await.is_empty(),
             "timed-out request must not remain in pending_requests"
@@ -1658,8 +1660,8 @@ mod tests {
         client.fail_pending_requests().await;
 
         assert!(pending_requests.lock().await.is_empty());
-        assert!(matches!(rx1.await.unwrap(), Err(Error::ServerTerminated)));
-        assert!(matches!(rx2.await.unwrap(), Err(Error::ServerTerminated)));
+        assert_matches!(rx1.await.unwrap(), Err(Error::ServerTerminated));
+        assert_matches!(rx2.await.unwrap(), Err(Error::ServerTerminated));
     }
 
     /// Pins where a request is cancelled (#518): once the request is on the
@@ -1693,8 +1695,9 @@ mod tests {
             let first_request = read_framed_message(&mut reader).await;
 
             tokio::time::advance(TIMEOUT + Duration::from_secs(1)).await;
-            assert!(
-                matches!(first.await.unwrap(), Err(Error::Timeout(5))),
+            assert_matches!(
+                first.await.unwrap(),
+                Err(Error::Timeout(5)),
                 "request awaiting its reply must time out"
             );
             assert!(
@@ -2508,10 +2511,7 @@ mod tests {
             )
             .await;
 
-            assert!(
-                matches!(result, Err(Error::ServerTerminated)),
-                "got {result:?}"
-            );
+            assert_matches!(result, Err(Error::ServerTerminated), "got {result:?}");
         }
 
         /// As above, with a real pending request parked at the time the
@@ -2550,18 +2550,12 @@ mod tests {
                 None,
             )
             .await;
-            assert!(
-                matches!(result, Err(Error::ServerTerminated)),
-                "got {result:?}"
-            );
+            assert_matches!(result, Err(Error::ServerTerminated), "got {result:?}");
 
             LspClient::drain_and_fail_pending(&pending_requests).await;
 
             let received = response_rx.await.unwrap();
-            assert!(
-                matches!(received, Err(Error::ServerTerminated)),
-                "got {received:?}"
-            );
+            assert_matches!(received, Err(Error::ServerTerminated), "got {received:?}");
             assert!(pending_requests.lock().await.is_empty());
         }
 
@@ -2651,10 +2645,7 @@ mod tests {
 
             assert!(result.is_err(), "got {result:?}");
             let received = response_rx.await.unwrap();
-            assert!(
-                matches!(received, Err(Error::ServerTerminated)),
-                "got {received:?}"
-            );
+            assert_matches!(received, Err(Error::ServerTerminated), "got {received:?}");
             assert!(pending_requests.lock().await.is_empty());
         }
 
@@ -2719,8 +2710,9 @@ mod tests {
             assert_eq!(answered.unwrap(), serde_json::json!({ "ok": true }));
 
             let unanswered = unanswered_rx.await.unwrap();
-            assert!(
-                matches!(unanswered, Err(Error::ServerTerminated)),
+            assert_matches!(
+                unanswered,
+                Err(Error::ServerTerminated),
                 "got {unanswered:?}"
             );
             assert!(pending_requests.lock().await.is_empty());
@@ -2790,8 +2782,9 @@ mod tests {
                     )
                 })
                 .unwrap();
-            assert!(
-                matches!(unanswered, Err(Error::ServerTerminated)),
+            assert_matches!(
+                unanswered,
+                Err(Error::ServerTerminated),
                 "got {unanswered:?}"
             );
         }
@@ -2874,10 +2867,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("request on a stopped loop must fail fast"));
-            assert!(
-                matches!(request, Err(Error::ServerTerminated)),
-                "got {request:?}"
-            );
+            assert_matches!(request, Err(Error::ServerTerminated), "got {request:?}");
 
             client.shutdown().await.unwrap();
         }
@@ -2893,14 +2883,8 @@ mod tests {
                 .shutdown_until(Instant::now() - Duration::from_millis(50))
                 .await;
 
-            assert!(
-                matches!(result, Err(Error::ShutdownTimeout)),
-                "got {result:?}"
-            );
-            assert!(matches!(
-                probe.state().await,
-                crate::lsp::ServerState::Shutdown
-            ));
+            assert_matches!(result, Err(Error::ShutdownTimeout), "got {result:?}");
+            assert_matches!(probe.state().await, crate::lsp::ServerState::Shutdown);
         }
 
         /// A message loop wedged writing to a server that never reads must not
@@ -2933,19 +2917,13 @@ mod tests {
             let result = timeout(Duration::from_secs(5), client.shutdown_until(deadline))
                 .await
                 .unwrap_or_else(|_| panic!("shutdown_until must honor its deadline"));
-            assert!(
-                matches!(result, Err(Error::ShutdownTimeout)),
-                "got {result:?}"
-            );
+            assert_matches!(result, Err(Error::ShutdownTimeout), "got {result:?}");
 
             let in_flight = timeout(Duration::from_secs(1), in_flight)
                 .await
                 .unwrap_or_else(|_| panic!("in-flight request must be failed by the drain"))
                 .unwrap();
-            assert!(
-                matches!(in_flight, Err(Error::ServerTerminated)),
-                "got {in_flight:?}"
-            );
+            assert_matches!(in_flight, Err(Error::ServerTerminated), "got {in_flight:?}");
         }
 
         /// #458: a request issued after the client has already shut down
@@ -2976,10 +2954,7 @@ mod tests {
                 )
             });
 
-            assert!(
-                matches!(result, Err(Error::ServerTerminated)),
-                "got {result:?}"
-            );
+            assert_matches!(result, Err(Error::ServerTerminated), "got {result:?}");
         }
     }
 }

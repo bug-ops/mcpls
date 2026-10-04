@@ -239,7 +239,7 @@ jobs:
         run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test)'
 
   msrv:
-    name: MSRV check (1.88)
+    name: MSRV check (1.99)
     needs: detect-changes
     if: needs.detect-changes.outputs.run-full-ci == 'true'
     runs-on: ubuntu-latest
@@ -250,7 +250,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
         with:
-          toolchain: "1.88"
+          toolchain: "1.99"
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           shared-key: "msrv"

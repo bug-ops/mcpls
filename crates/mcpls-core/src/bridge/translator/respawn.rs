@@ -407,6 +407,8 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::bridge::translator::clock::{Clock, FakeClock};
     use crate::config::ServerId;
@@ -682,7 +684,7 @@ sleep __SLEEP__
             set_respawn_config(&translator, &id, broken);
 
             let err = translator.respawn_if_dead(&id).await.unwrap_err();
-            assert!(matches!(err, Error::ServerNotFound { .. }), "got {err:?}");
+            assert_matches!(err, Error::ServerNotFound { .. }, "got {err:?}");
         }
 
         /// #249: two concurrent tool calls that both observe the same dead
@@ -778,14 +780,16 @@ fi
             set_respawn_config(&translator, &id, broken);
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
-            assert!(
-                matches!(err1, Error::ServerNotFound { .. }),
+            assert_matches!(
+                err1,
+                Error::ServerNotFound { .. },
                 "first attempt should be a real (failed) spawn, got {err1:?}"
             );
 
             let err2 = translator.respawn_if_dead(&id).await.unwrap_err();
-            assert!(
-                matches!(err2, Error::ServerUnavailable { .. }),
+            assert_matches!(
+                err2,
+                Error::ServerUnavailable { .. },
                 "second call within the backoff window must fail fast \
                  without attempting another real spawn, got {err2:?}"
             );
@@ -815,14 +819,16 @@ fi
             set_respawn_config(&translator, &id, broken);
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
-            assert!(
-                matches!(err1, Error::ServerNotFound { .. }),
+            assert_matches!(
+                err1,
+                Error::ServerNotFound { .. },
                 "first attempt should be a real (failed) spawn, got {err1:?}"
             );
 
             let err2 = translator.respawn_if_dead(&id).await.unwrap_err();
-            assert!(
-                matches!(err2, Error::ServerUnavailable { .. }),
+            assert_matches!(
+                err2,
+                Error::ServerUnavailable { .. },
                 "second call within the backoff window must still fail fast, got {err2:?}"
             );
 
@@ -877,8 +883,9 @@ fi
             wait_until_dead(&translator, &id).await;
 
             let err = translator.respawn_if_dead(&id).await.unwrap_err();
-            assert!(
-                matches!(err, Error::ServerUnavailable { .. }),
+            assert_matches!(
+                err,
+                Error::ServerUnavailable { .. },
                 "a respawn that dies again within the stability window must \
                  back off instead of being treated as a fresh attempt, got {err:?}"
             );

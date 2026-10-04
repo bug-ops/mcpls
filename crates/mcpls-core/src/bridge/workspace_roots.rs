@@ -131,7 +131,7 @@ impl WorkspaceRoots {
                 continue;
             }
             let alias = lexically_normalize(dunce::simplified(&alias));
-            if alias.as_os_str().is_empty() || canonical.contains(&alias) || kept.contains(&alias) {
+            if alias.is_empty() || canonical.contains(&alias) || kept.contains(&alias) {
                 continue;
             }
             kept.push(alias);

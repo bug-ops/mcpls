@@ -302,6 +302,7 @@ fn parse_inbound_message(value: Value) -> Result<InboundMessage> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
     use std::fmt::Write as _;
 
     use super::*;
@@ -432,7 +433,7 @@ mod tests {
         });
 
         let error = parse_inbound_message(value).unwrap_err();
-        assert!(matches!(error, Error::LspProtocolError(_)));
+        assert_matches!(error, Error::LspProtocolError(_));
         assert!(
             error
                 .to_string()
@@ -498,10 +499,7 @@ mod tests {
         peer.write_all(&oversized_line).await.unwrap();
 
         let result = reader.receive().await;
-        assert!(
-            matches!(result, Err(Error::LspProtocolError(_))),
-            "got {result:?}"
-        );
+        assert_matches!(result, Err(Error::LspProtocolError(_)), "got {result:?}");
     }
 
     /// #457: a spawned server writing endlessly many distinct header lines
@@ -520,10 +518,7 @@ mod tests {
         peer.write_all(body.as_bytes()).await.unwrap();
 
         let result = reader.receive().await;
-        assert!(
-            matches!(result, Err(Error::LspProtocolError(_))),
-            "got {result:?}"
-        );
+        assert_matches!(result, Err(Error::LspProtocolError(_)), "got {result:?}");
     }
 
     /// #457 boundary: a header line whose length lands exactly at

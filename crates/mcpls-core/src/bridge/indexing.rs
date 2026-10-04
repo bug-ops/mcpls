@@ -209,7 +209,7 @@ const QUIESCENT_FIELD: &str = "quiescent";
 /// caller's deadline, only the age of the last real signal does. See
 /// `navigation.rs`'s const-asserts for the cross-checked ordering between
 /// this, `INDEXING_READY_TIMEOUT`, and the two constants below.
-pub const INDEXING_STALENESS_BOUND: Duration = Duration::from_secs(60);
+pub const INDEXING_STALENESS_BOUND: Duration = Duration::from_mins(1);
 
 /// Default maximum time, in seconds, `Translator::wait_for_indexing_ready`
 /// waits for a routed LSP server to report indexing readiness.

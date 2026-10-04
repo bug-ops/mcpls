@@ -1,8 +1,8 @@
 # Multi-stage build for mcpls
-# Build stage uses rust:1.88-slim, runtime uses debian:bookworm-slim
+# Build stage uses rust:1.99-slim-bookworm, runtime uses debian:bookworm-slim
 
 # Build stage
-FROM rust:1.88-slim AS builder
+FROM rust:1.99-slim-bookworm AS builder
 
 WORKDIR /app
 

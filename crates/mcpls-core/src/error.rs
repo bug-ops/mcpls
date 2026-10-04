@@ -36,10 +36,7 @@ struct NotFoundGuidance<'a>(&'a str, Platform);
 impl fmt::Display for NotFoundGuidance<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self(command, platform) = *self;
-        if Path::new(command)
-            .parent()
-            .is_some_and(|p| !p.as_os_str().is_empty())
-        {
+        if Path::new(command).parent().is_some_and(|p| !p.is_empty()) {
             return f.write_str("; check that the configured path exists");
         }
         write!(
@@ -1058,6 +1055,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -1344,7 +1343,7 @@ mod tests {
     fn test_error_from_io() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err: Error = io_err.into();
-        assert!(matches!(err, Error::Io(_)));
+        assert_matches!(err, Error::Io(_));
     }
 
     #[test]
@@ -1353,7 +1352,7 @@ mod tests {
         let json_str = "{invalid json}";
         let json_err = serde_json::from_str::<serde_json::Value>(json_str).unwrap_err();
         let err: Error = json_err.into();
-        assert!(matches!(err, Error::Json(_)));
+        assert_matches!(err, Error::Json(_));
     }
 
     #[test]
@@ -1362,7 +1361,7 @@ mod tests {
         let toml_str = "[invalid toml";
         let toml_err = toml::from_str::<toml::Value>(toml_str).unwrap_err();
         let err: Error = toml_err.into();
-        assert!(matches!(err, Error::TomlDe(_)));
+        assert_matches!(err, Error::TomlDe(_));
     }
 
     #[test]

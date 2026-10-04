@@ -10,7 +10,7 @@ This project follows the [Rust Code of Conduct](https://www.rust-lang.org/polici
 
 ### Prerequisites
 
-- Rust 1.85+ (Edition 2024)
+- Rust 1.99+ (Edition 2024)
 - [cargo-nextest](https://nexte.st/) for running tests: `cargo install cargo-nextest`
 - A language server for testing (e.g., rust-analyzer)
 

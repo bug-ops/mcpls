@@ -369,9 +369,9 @@ struct RawWorkspaceSymbol {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
+    use std::{assert_matches, fs};
 
     use tempfile::TempDir;
     use tokio::io::BufReader;
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn test_resolve_kind_filter_rejects_unknown_name() {
         let result = resolve_kind_filter("NotAKind");
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -465,7 +465,7 @@ mod tests {
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
-        assert!(matches!(result, Err(Error::NoServerConfigured)));
+        assert_matches!(result, Err(Error::NoServerConfigured));
     }
 
     /// #242/S4 regression: a server is configured and still spawning (large
@@ -481,7 +481,7 @@ mod tests {
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
-        assert!(matches!(result, Err(Error::WorkspaceServersInitializing)));
+        assert_matches!(result, Err(Error::WorkspaceServersInitializing));
     }
 
     /// #527: workspace search with every server failed to start reports the
@@ -534,8 +534,7 @@ mod tests {
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
 
-        assert!(
-            matches!(&result, Err(Error::ServerFailedToStart(f)) if f.server_id == failing_id),
+        assert_matches!(&result, Err(Error::ServerFailedToStart(f)) if f.server_id == failing_id,
             "got {result:?}"
         );
     }
@@ -556,7 +555,7 @@ mod tests {
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
 
-        assert!(matches!(result, Err(Error::WorkspaceServersInitializing)));
+        assert_matches!(result, Err(Error::WorkspaceServersInitializing));
     }
 
     /// #242 regression: a server *is* configured and running, it just
@@ -586,12 +585,12 @@ mod tests {
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::NoServerForWorkspaceTool {
                 tool: ToolKind::WorkspaceSymbols
             })
-        ));
+        );
     }
 
     /// #361 regression: a `Flat` (`SymbolInformation`) document-symbol

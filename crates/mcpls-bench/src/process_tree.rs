@@ -321,12 +321,14 @@ async fn run_ps() -> Result<String> {
     if !output.status.success() {
         bail!("ps exited with {}", output.status);
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy_owned(output.stdout))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     const GROUP: ProcessGroupId = ProcessGroupId::new(500);
@@ -360,10 +362,10 @@ mod tests {
         for line in ["500 501 notanumber cmd", "500 501", "500 501 10"] {
             assert!(parse_ps(line, GROUP).is_err(), "{line}");
         }
-        assert!(matches!(
+        assert_matches!(
             rss_reading("500 501 oops\n", GROUP),
             RssReading::Unavailable { .. }
-        ));
+        );
     }
 
     #[test]
@@ -376,10 +378,10 @@ mod tests {
 
     #[test]
     fn empty_group_has_no_reading() {
-        assert!(matches!(
+        assert_matches!(
             rss_reading("1 1 10 init\n", GROUP),
             RssReading::Unavailable { .. }
-        ));
+        );
     }
 
     #[cfg(unix)]

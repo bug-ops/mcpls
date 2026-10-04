@@ -323,9 +323,9 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
+    use std::{assert_matches, fs};
 
     use tempfile::TempDir;
     use tokio::io::BufReader;
@@ -351,7 +351,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
 
         let result = translator
             .handle_call_hierarchy_prepare(
@@ -362,7 +362,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -377,7 +377,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
 
         let result = translator
             .handle_call_hierarchy_prepare(
@@ -388,7 +388,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -396,7 +396,7 @@ mod tests {
         let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator.handle_incoming_calls(invalid_item).await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -404,7 +404,7 @@ mod tests {
         let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator.handle_outgoing_calls(invalid_item).await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     /// Builds a `CallHierarchyItemResult` JSON value pointing at `path`, for
@@ -473,10 +473,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// #423 regression: companion for `handle_outgoing_calls` -- see
@@ -508,10 +508,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// S4 lock-in for the documented `Uri`-validation-loss behavior change
@@ -564,8 +564,9 @@ mod tests {
 
         let result = translator.handle_incoming_calls(item).await;
 
-        assert!(
-            matches!(result, Err(Error::FileIo { .. })),
+        assert_matches!(
+            result,
+            Err(Error::FileIo { .. }),
             "expected Error::FileIo from the canonicalize() failure now that Uri construction \
              cannot itself reject a malformed uri, got {result:?}"
         );
@@ -606,8 +607,9 @@ mod tests {
 
         let result = translator.handle_outgoing_calls(item).await;
 
-        assert!(
-            matches!(result, Err(Error::FileIo { .. })),
+        assert_matches!(
+            result,
+            Err(Error::FileIo { .. }),
             "expected Error::FileIo from the canonicalize() failure now that Uri construction \
              cannot itself reject a malformed uri, got {result:?}"
         );

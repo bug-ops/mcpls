@@ -1786,6 +1786,8 @@ pub fn detect_language(path: &Path, extension_map: &HashMap<String, String>) -> 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -2002,7 +2004,7 @@ mod tests {
         lock_std(&tracker.path_locks).insert(locked_path.clone(), Arc::new(AsyncMutex::new(())));
 
         let result = tracker.open(PathBuf::from("/test/other.rs"), "fn other() {}".to_string());
-        assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+        assert_matches!(result, Err(Error::DocumentLimitExceeded { .. }));
         assert!(
             tracker.is_open(&locked_path),
             "the locked document must not be evicted"
@@ -2054,7 +2056,7 @@ mod tests {
         std::fs::write(&path_b, "BBBB").unwrap();
 
         let result = tracker.open(path_b.clone(), "BBBB".to_string());
-        assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+        assert_matches!(result, Err(Error::DocumentLimitExceeded { .. }));
         assert!(tracker.is_open(&path_a));
         assert!(tracker.pending_close_paths().is_empty());
 
@@ -2087,8 +2089,9 @@ mod tests {
 
         let path_b = dir.path().join("b.rs");
         let result = tracker.open(path_b.clone(), "BBBB".to_string());
-        assert!(
-            matches!(result, Err(Error::DocumentLimitExceeded { .. })),
+        assert_matches!(
+            result,
+            Err(Error::DocumentLimitExceeded { .. }),
             "one guard still outstanding"
         );
 
@@ -2133,7 +2136,7 @@ mod tests {
             PathBuf::from("/test/second.rs"),
             "fn second() {}".to_string(),
         );
-        assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+        assert_matches!(result, Err(Error::DocumentLimitExceeded { .. }));
         assert!(
             tracker.is_open(&first),
             "the not-disk-verified document must not be evicted"
@@ -2223,7 +2226,7 @@ mod tests {
         // Large file should fail
         let large_content = "x".repeat(100);
         let result = tracker.open(PathBuf::from("/test/large.rs"), large_content);
-        assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
+        assert_matches!(result, Err(Error::FileSizeLimitExceeded { .. }));
     }
 
     #[test]
@@ -2491,7 +2494,7 @@ mod tests {
     #[test]
     fn test_path_to_uri_returns_err_for_relative_path() {
         let err = path_to_uri(Path::new("relative/file.ts")).unwrap_err();
-        assert!(matches!(err, Error::InvalidUri(_)));
+        assert_matches!(err, Error::InvalidUri(_));
     }
 
     #[cfg(windows)]
@@ -2672,7 +2675,7 @@ mod tests {
 
         let over_size_content = "x".repeat(101);
         let result = tracker.open(PathBuf::from("/test/over.rs"), over_size_content);
-        assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
+        assert_matches!(result, Err(Error::FileSizeLimitExceeded { .. }));
     }
 
     #[test]
@@ -3080,7 +3083,7 @@ mod tests {
         let result = tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await;
-        assert!(matches!(result, Err(Error::FileIo { .. })));
+        assert_matches!(result, Err(Error::FileIo { .. }));
         assert!(tracker.is_open(&path));
         assert_eq!(tracker.get(&path).unwrap().version(), 1);
         assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
@@ -3109,7 +3112,7 @@ mod tests {
         let result = tracker
             .ensure_open(&path, &ServerId::from("rust"), &client)
             .await;
-        assert!(matches!(result, Err(Error::FileSizeLimitExceeded { .. })));
+        assert_matches!(result, Err(Error::FileSizeLimitExceeded { .. }));
         assert_eq!(tracker.get(&path).unwrap().content(), "small");
         assert_eq!(tracker.get(&path).unwrap().version(), 1);
     }
@@ -3566,7 +3569,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(result, Err(Error::NotARegularFile(_))));
+        assert_matches!(result, Err(Error::NotARegularFile(_)));
     }
 
     /// Direct regression for #442: `check_disk_file_type` itself, isolated
@@ -3587,10 +3590,10 @@ mod tests {
 
         let nul_path = PathBuf::from("NUL");
         let nul = fs::File::open(&nul_path).await.unwrap();
-        assert!(matches!(
+        assert_matches!(
             check_disk_file_type(&nul, &nul_path).await,
             Err(Error::NotARegularFile(_))
-        ));
+        );
     }
 
     /// Regression for #442: `read_to_string_checked` must reject the `NUL`
@@ -3613,7 +3616,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(result, Err(Error::NotARegularFile(_))));
+        assert_matches!(result, Err(Error::NotARegularFile(_)));
     }
 
     /// Boundary regression for #427/#418's shared size gate: a file of
@@ -3639,10 +3642,10 @@ mod tests {
 
         std::fs::write(&path, "a".repeat(11)).unwrap();
         let result = tracker.read_to_string_checked(&path).await;
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::FileSizeLimitExceeded { size: 11, max: 10 })
-        ));
+        );
     }
 
     /// Regression for #474: `read_line_checked` must stop reading (and

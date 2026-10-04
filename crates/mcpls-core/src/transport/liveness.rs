@@ -35,7 +35,7 @@ use crate::bridge::lock_std;
 const PROBE_ID_PREFIX: &str = "mcpls-liveness-";
 const OUTBOUND_CAPACITY: usize = 16;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const FAR_FUTURE: Duration = Duration::from_secs(946_080_000);
+const FAR_FUTURE: Duration = Duration::from_hours(262_800);
 
 /// `delay` from now, saturating at [`FAR_FUTURE`] so an absurd configured
 /// duration cannot overflow `Instant`.
@@ -517,7 +517,7 @@ mod tests {
             std::future::pending::<()>().await;
             Some((ServerSseMessage::default(), flag))
         });
-        let (probe, liveness) = probe(Duration::from_secs(60), Duration::from_secs(30));
+        let (probe, liveness) = probe(Duration::from_mins(1), Duration::from_secs(30));
         let outer = probe.forward(inner, Some(activity.open_stream()));
 
         drop(outer);
@@ -531,7 +531,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_inner_messages_are_forwarded_in_order_and_end_closes_outer() {
-        let (probe, _liveness) = probe(Duration::from_secs(60), Duration::from_secs(30));
+        let (probe, _liveness) = probe(Duration::from_mins(1), Duration::from_secs(30));
         let messages = (0..3).map(|n| {
             let mut message = ServerSseMessage::default();
             message.event_id = Some(n.to_string());
