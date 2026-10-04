@@ -203,7 +203,7 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 
 | Scenario | Expected Behavior |
 |----------|--------------------|
-| A server's command is not on `PATH` | `spawn` returns `Error::ServerSpawnFailed`; `spawn_batch` records it as a failure and continues with the rest |
+| A server's command is not on `PATH` | `spawn` returns `Error::ServerNotFound` (other spawn errors stay `Error::ServerSpawnFailed`); `spawn_batch` records it as a failure and continues with the rest |
 | A large workspace makes `initialize` slow | Bounded by the server's configured `timeout_seconds` (clamped to `MAX_TIMEOUT_SECONDS`), not a hardcoded 30s |
 | Server crashes between two tool calls | First call after the crash detects it via `has_exited`, respawns, and proceeds; the crash is otherwise invisible to the caller beyond added latency |
 | Two tool calls race a dead-server detection simultaneously | Single-flighted via `respawn_lock`; the loser waits for the winner's attempt and rechecks rather than double-spawning |

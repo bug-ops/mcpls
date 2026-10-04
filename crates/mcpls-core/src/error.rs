@@ -10,34 +10,56 @@ use serde::Serialize;
 
 use crate::config::{BuiltinServer, ServerId, ToolKind};
 
+/// Host platform, as far as [`NotFoundGuidance`] cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    Windows,
+    Other,
+}
+
+impl Platform {
+    const CURRENT: Self = if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Other
+    };
+}
+
 /// Display suffix explaining how to fix a missing LSP server executable.
 struct NotFoundGuidance<'a>(&'a str);
 
 impl fmt::Display for NotFoundGuidance<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let command = self.0;
-        if Path::new(command)
-            .parent()
-            .is_some_and(|p| !p.as_os_str().is_empty())
-        {
-            return f.write_str("; check that the configured path exists");
-        }
+        write_not_found_guidance(f, self.0, Platform::CURRENT)
+    }
+}
+
+fn write_not_found_guidance(
+    f: &mut fmt::Formatter<'_>,
+    command: &str,
+    platform: Platform,
+) -> fmt::Result {
+    if Path::new(command)
+        .parent()
+        .is_some_and(|p| !p.as_os_str().is_empty())
+    {
+        return f.write_str("; check that the configured path exists");
+    }
+    write!(
+        f,
+        "; '{command}' is not on the PATH mcpls runs with -- if it is installed, add its \
+         directory to the MCP client's PATH or set `command` to an absolute path"
+    )?;
+    let Some(builtin) = BuiltinServer::from_command(command) else {
+        return Ok(());
+    };
+    if platform == Platform::Windows && builtin.is_npm_package() {
         write!(
             f,
-            "; '{command}' is not on the PATH mcpls runs with -- if it is installed, add its \
-             directory to the MCP client's PATH or set `command` to an absolute path"
+            " (npm-installed servers need the `.cmd` name, e.g. `{command}.cmd`)"
         )?;
-        let Some(builtin) = BuiltinServer::from_command(command) else {
-            return Ok(());
-        };
-        if cfg!(windows) && builtin.is_npm_package() {
-            write!(
-                f,
-                " (npm-installed servers need the `.cmd` name, e.g. `{command}.cmd`)"
-            )?;
-        }
-        write!(f, "; otherwise install it: {}", builtin.install_hint())
     }
+    write!(f, "; otherwise install it: {}", builtin.install_hint())
 }
 
 /// Substring rust-analyzer's raw error text carries when a position-based
@@ -851,16 +873,38 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_timeout_maps_to_internal() {
-        assert_eq!(
-            Error::ShutdownTimeout.mcp_error_kind(),
-            McpErrorKind::Internal
-        );
+    fn test_lifecycle_errors_map_to_internal() {
+        for err in [Error::ShutdownTimeout, not_found("x")] {
+            assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal, "{err:?}");
+        }
+    }
+
+    struct Guidance<'a>(&'a str, Platform);
+
+    impl fmt::Display for Guidance<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_not_found_guidance(f, self.0, self.1)
+        }
     }
 
     #[test]
-    fn test_server_not_found_maps_to_internal() {
-        assert_eq!(not_found("x").mcp_error_kind(), McpErrorKind::Internal);
+    fn test_not_found_guidance_cmd_note_only_for_npm_builtins_on_windows() {
+        let cases = [
+            ("pyright-langserver", Platform::Windows, true),
+            ("typescript-language-server", Platform::Windows, true),
+            ("pyright-langserver", Platform::Other, false),
+            ("rust-analyzer", Platform::Windows, false),
+            ("gopls", Platform::Windows, false),
+            ("my-custom-lsp", Platform::Windows, false),
+        ];
+        for (command, platform, expects_cmd_note) in cases {
+            let msg = Guidance(command, platform).to_string();
+            assert_eq!(
+                msg.contains(".cmd"),
+                expects_cmd_note,
+                "{command} {platform:?}: {msg}"
+            );
+        }
     }
 
     #[test]

@@ -849,9 +849,8 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// does *not* reopen a window where a repeat signal could hit the OS's
 /// default disposition. What it does instead: with no live [`ShutdownSignal`]
 /// subscribed, a signal delivered during `shutdown_servers`/
-/// `await_lsp_init_handle` (bounded by [`Translator::shutdown_servers`]'s own
-/// per-server timeout and [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst
-/// case) is recorded and then silently discarded — there is no receiver to
+/// `await_lsp_init_handle` (bounded by [`lsp::SHUTDOWN_TIMEOUT`] and
+/// [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst case) is recorded and then silently discarded — there is no receiver to
 /// broadcast it to. Before this fix, that made cleanup **uninterruptible**:
 /// an operator's repeat `Ctrl-C`/`SIGTERM` during that window was a no-op
 /// short of `SIGKILL`.
@@ -871,11 +870,10 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// in the re-registration gap above is silently dropped rather than
 /// counted, requiring a second repeat before acting would let an unlucky
 /// operator's second press go unnoticed too. `exit(1)` skips unwinding, so
-/// it forfeits `Drop` (`kill_on_drop` on any still-running LSP child)
-/// exactly like the pre-existing panic/abort gap documented on
-/// [`Translator::shutdown_servers`]'s "Limitations" section — an explicit
-/// trade the operator is asking for, not a case this fix silently
-/// regresses.
+/// it forfeits `Drop` (`kill_on_drop` on any still-running LSP child), one of
+/// the gaps documented on [`Translator::shutdown_servers`]'s "Limitations"
+/// section — an explicit trade the operator is asking for, not a case this
+/// fix silently regresses.
 async fn shutdown(
     cancel_tx: &tokio::sync::watch::Sender<bool>,
     translator: &Translator,

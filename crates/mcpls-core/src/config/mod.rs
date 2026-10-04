@@ -1250,16 +1250,29 @@ mod tests {
 
     #[test]
     fn test_default_commands_match_builtin_servers() {
-        let defaults: HashSet<&str> = ServerConfig::default()
+        let config = ServerConfig::default();
+        let defaults: HashSet<&str> = config
             .lsp_servers
             .iter()
-            .map(|s| s.command.clone())
-            .collect::<Vec<_>>()
-            .iter()
-            .map(|c| BuiltinServer::from_command(c).unwrap().command())
+            .map(|s| s.command.as_str())
             .collect();
         let builtins: HashSet<&str> = BuiltinServer::ALL.iter().map(|b| b.command()).collect();
         assert_eq!(defaults, builtins);
+    }
+
+    #[test]
+    fn test_builtin_server_npm_table() {
+        let npm: Vec<_> = BuiltinServer::ALL
+            .into_iter()
+            .filter(|b| b.is_npm_package())
+            .collect();
+        assert_eq!(
+            npm,
+            [
+                BuiltinServer::Pyright,
+                BuiltinServer::TypescriptLanguageServer
+            ]
+        );
     }
 
     #[test]

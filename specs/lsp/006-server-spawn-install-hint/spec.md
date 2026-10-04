@@ -26,9 +26,8 @@ related:
 mcpls auto-discovers LSP servers via project-marker heuristics
 (`crates/mcpls-core/src/config/`, e.g. `Cargo.toml` → `rust-analyzer`,
 `package.json` → `typescript-language-server`) and auto-generates a default
-config with roughly 30 language → server mappings (the builtin server table
-in `crates/mcpls-core/src/config/server.rs`, ~line 545 comment: "~30 builtin
-server entries") on first run. But mcpls never checks whether the resulting
+config with 6 language → server mappings (the `BuiltinServer` table in
+`crates/mcpls-core/src/config/server.rs`) on first run. But mcpls never checks whether the resulting
 server binary is actually present on `PATH` before trying to spawn it, and it
 does not maintain any "how to install this server" hint table.
 
@@ -62,7 +61,7 @@ server configuration. A bare OS errno at the point of first use undercuts
 that promise: the user has done everything right (opened a project mcpls
 correctly recognized), but the failure message gives them no path forward
 other than researching, outside of mcpls, which package manager or installer
-provides `rust-analyzer` (or any of the other ~30 mapped servers).
+provides `rust-analyzer` (or any of the other 5 builtin servers).
 
 ### Goal
 
@@ -190,7 +189,6 @@ table and enriches an existing error path.
 - Keep `Error::ServerSpawnFailed` for non-`NotFound` spawn errors (FR-005)
 
 ### Ask First
-- Introducing a new `Error` variant vs. enriching `ServerSpawnFailed`'s existing `Display`/fields (FR-006) — this changes a public-ish error surface
 - Adding a new CLI subcommand (e.g. a "doctor" command) as the delivery surface for hints, if the plan phase concludes that's preferable to error-message enrichment alone
 
 ### Never
@@ -211,9 +209,9 @@ table and enriches an existing error path.
 - [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001-lsp-server-lifecycle-and-respawn]] — existing spawn/respawn lifecycle this feature extends, not replaces
-- [[config/001-config-discovery-and-heuristics/spec|config/001-config-discovery-and-heuristics]] — the project-marker heuristics and auto-generated default config that produce the ~30 language → server mappings referenced here
+- [[config/001-config-discovery-and-heuristics/spec|config/001-config-discovery-and-heuristics]] — the project-marker heuristics and auto-generated default config that produce the 6 language → server mappings referenced here
 - `crates/mcpls-core/src/lsp/lifecycle.rs:398` — `LspServer::spawn`, where `Command::spawn()` is called and `Error::ServerSpawnFailed` is constructed
 - `crates/mcpls-core/src/error.rs:181-189` — `Error::ServerSpawnFailed { command, source }` variant and its `Display` impl
-- `crates/mcpls-core/src/config/server.rs` (~line 545) — builtin default-server table (~30 entries) that this feature's install-hint table should stay in sync with
+- `crates/mcpls-core/src/config/server.rs` — `BuiltinServer`, the single source of the 6 builtin commands and their install hints
 - `crates/mcpls-core/src/config/language.rs` — related config-module code (React-variant language-id mapping); cited in the originating finding as part of the `config/` marker/mapping surface this feature sits alongside
 - [`carldaws/squiggles`](https://github.com/carldaws/squiggles) — reference project; release 1.1.0 (2026-09-21) added a `squiggles init` command that detects project languages via marker heuristics, writes a config, and prints the install command for every LSP server binary its presets reference; commits `79a1080` and `b83f056`

@@ -712,7 +712,7 @@ impl LspServer {
         Ok(self.child.is_some() && self.client.is_message_loop_finished())
     }
 
-    /// Shutdown server gracefully, bounded in total by [`SHUTDOWN_TIMEOUT`].
+    /// Shutdown server gracefully, with an overall deadline of [`SHUTDOWN_TIMEOUT`].
     ///
     /// Sends the LSP `shutdown` request, waits for the response, sends the
     /// `exit` notification, stops the message loop, then waits up to a grace
@@ -964,7 +964,7 @@ pub fn fake_lsp_server_with_dead_loop_and_live_child() -> LspServer {
         .arg("30")
         .kill_on_drop(true)
         .spawn()
-        .unwrap();
+        .unwrap_or_else(|e| panic!("failed to spawn sleep: {e}"));
     let mut server = fake_lsp_server();
     server.child = Some(child);
     server
@@ -1344,6 +1344,33 @@ mod tests {
 
         assert!(!server.has_exited().unwrap());
         assert!(server.is_dead().unwrap());
+    }
+
+    /// A server that never answers `shutdown` fails the handshake with the
+    /// request timeout, well inside `SHUTDOWN_TIMEOUT`, and still stops its
+    /// message loop.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_reports_handshake_timeout_within_deadline() {
+        let (client, _fake_server) = crate::test_lsp::fake_lsp_client();
+        let probe = client.clone();
+        let (_, notification_rx) = mpsc::channel(1);
+        let (_, lifecycle_rx) = mpsc::channel(1);
+        let server = LspServer {
+            client,
+            capabilities: lsp_types::ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            notification_rx,
+            lifecycle_rx,
+            child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+        };
+
+        let started = Instant::now();
+        let result = server.shutdown().await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))), "got {result:?}");
+        assert!(started.elapsed() <= SHUTDOWN_TIMEOUT);
+        assert!(matches!(probe.state().await, ServerState::Shutdown));
     }
 
     #[tokio::test]

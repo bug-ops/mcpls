@@ -55,8 +55,9 @@ const READER_CHANNEL_CAPACITY: usize = 100;
 /// `.await` (aborts promptly) or has nothing left to do.
 const READER_TASK_ABORT_GRACE: Duration = Duration::from_secs(1);
 
-/// Upper bound on a full LSP server shutdown (`shutdown` request, `exit`
-/// notification, message-loop stop and child exit).
+/// Deadline for a full LSP server shutdown (`shutdown` request, `exit`
+/// notification, message-loop stop and child exit). Cleanup after an abort
+/// may overrun it by a 50 ms settle.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long [`LspClient::shutdown_until`] waits for an aborted message loop
@@ -739,7 +740,7 @@ impl LspClient {
         self.notify(N::METHOD.as_str(), params).await
     }
 
-    /// Shutdown client gracefully, bounded by [`SHUTDOWN_TIMEOUT`].
+    /// Shutdown client gracefully, with a deadline of [`SHUTDOWN_TIMEOUT`].
     ///
     /// This sends a shutdown command to the background task and waits for it to complete.
     /// Only the client that owns the message loop (the one held by
@@ -2758,6 +2759,49 @@ mod tests {
                     "response for request {i} carried the wrong payload -- id/response mismatch"
                 );
             }
+        }
+
+        /// Shutting down a clone stops the loop for every clone but cannot
+        /// abort it, and the owner can still shut down afterwards.
+        #[tokio::test]
+        async fn test_shutdown_on_clone_stops_shared_loop_then_owner_shutdown_succeeds() {
+            let (client, _server) = fake_lsp_client();
+
+            client.clone().shutdown().await.unwrap();
+
+            let request = timeout(
+                Duration::from_secs(2),
+                client.request::<_, Value>("x/y", serde_json::json!({}), Duration::from_secs(30)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request on a stopped loop must fail fast"));
+            assert!(
+                matches!(request, Err(Error::ServerTerminated)),
+                "got {request:?}"
+            );
+
+            client.shutdown().await.unwrap();
+        }
+
+        /// A deadline that has already passed still aborts the loop, reports
+        /// `ShutdownTimeout`, and leaves the client in the `Shutdown` state.
+        #[tokio::test]
+        async fn test_shutdown_until_expired_deadline_reports_timeout() {
+            let (client, _server) = fake_lsp_client();
+            let probe = client.clone();
+
+            let result = client
+                .shutdown_until(Instant::now() - Duration::from_millis(50))
+                .await;
+
+            assert!(
+                matches!(result, Err(Error::ShutdownTimeout)),
+                "got {result:?}"
+            );
+            assert!(matches!(
+                probe.state().await,
+                crate::lsp::ServerState::Shutdown
+            ));
         }
 
         /// A message loop wedged writing to a server that never reads must not
