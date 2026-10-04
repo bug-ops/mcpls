@@ -238,6 +238,7 @@ fn collect_secret_json(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
     use std::collections::HashMap;
 
     use super::*;
@@ -275,7 +276,7 @@ mod tests {
     fn test_apply_borrows_text_without_secrets() {
         let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
 
-        assert!(matches!(set.apply("nothing here"), Cow::Borrowed(_)));
+        assert_matches!(set.apply("nothing here"), Cow::Borrowed(_));
     }
 
     #[test]

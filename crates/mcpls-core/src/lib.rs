@@ -2505,7 +2505,7 @@ mod tests {
                 .translator
                 .startup_failure(&ServerId::from("broken"))
                 .unwrap();
-            assert!(matches!(failure.reason, StartupFailure::Spawn(_)));
+            std::assert_matches!(failure.reason, StartupFailure::Spawn(_));
 
             startup.cancel_tx.send(true).unwrap();
             startup.task.await.unwrap();

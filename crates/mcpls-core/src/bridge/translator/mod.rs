@@ -870,14 +870,14 @@ mod tests {
         translator.settle_after_init_panic(&init_configs).await;
 
         assert!(translator.startup_failure(&configs[0].id()).is_none());
-        assert!(matches!(
+        std::assert_matches!(
             translator.startup_failure(&configs[1].id()).unwrap().reason,
             StartupFailure::Spawn(_)
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             translator.startup_failure(&configs[2].id()).unwrap().reason,
             StartupFailure::InitTaskPanicked
-        ));
+        );
     }
 
     /// #528: after an init-task panic, a configured server that never
