@@ -407,8 +407,6 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::assert_matches;
-
     use super::*;
     use crate::bridge::translator::clock::{Clock, FakeClock};
     use crate::config::ServerId;
@@ -503,8 +501,8 @@ mod tests {
     #[cfg(unix)]
     mod respawn_tests {
         use std::collections::HashMap;
-        use std::fs;
         use std::path::{Path, PathBuf};
+        use std::{assert_matches, fs};
 
         use tempfile::TempDir;
         use tokio::time::Duration;

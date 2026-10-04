@@ -255,6 +255,8 @@ jobs:
         with:
           shared-key: "msrv"
       - name: cargo check (MSRV)
+        env:
+          RUSTUP_TOOLCHAIN: "1.99"
         run: cargo check --workspace --all-targets --all-features --locked
 
   docs:
