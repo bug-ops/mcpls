@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 use crate::config::{ServerId, ToolKind};
 
 /// Substring rust-analyzer's raw error text carries when a position-based
@@ -387,6 +389,62 @@ pub const SERVER_INITIALIZING_ERROR_CODE: i32 = -32051;
 /// ```
 pub const STATELESS_SUBSCRIPTION_ERROR_CODE: i32 = -32052;
 
+/// Structured `data` payload of a retryable JSON-RPC error.
+///
+/// Each variant pairs a bespoke error code ([`Self::code`]) with its own
+/// payload, so a code can never be sent with another variant's data. Keys
+/// are `snake_case`; the wire form is the variant's fields as a bare object.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::ServerId;
+/// use mcpls_core::error::{RetryableErrorData, WORKSPACE_INDEXING_ERROR_CODE};
+///
+/// let data = RetryableErrorData::WorkspaceIndexing {
+///     server_id: ServerId::from("rust"),
+///     elapsed_secs: 30,
+/// };
+/// assert_eq!(data.code(), WORKSPACE_INDEXING_ERROR_CODE);
+/// assert_eq!(
+///     serde_json::to_value(&data).unwrap(),
+///     serde_json::json!({"server_id": "rust", "elapsed_secs": 30})
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum RetryableErrorData {
+    /// The routed server is still indexing the workspace.
+    WorkspaceIndexing {
+        /// Server that is indexing.
+        server_id: ServerId,
+        /// Seconds spent waiting for indexing to finish before giving up.
+        elapsed_secs: u64,
+    },
+    /// The routed server has not finished initializing.
+    ServerInitializing {
+        /// Server that is initializing.
+        server_id: ServerId,
+    },
+    /// An expected server has not registered yet and no single candidate
+    /// could be narrowed down, so there is no server to name. The braces
+    /// keep the wire value an empty object rather than `null`.
+    WorkspaceServersInitializing {},
+}
+
+impl RetryableErrorData {
+    /// The bespoke JSON-RPC error code for this retryable condition.
+    #[must_use]
+    pub const fn code(&self) -> i32 {
+        match self {
+            Self::WorkspaceIndexing { .. } => WORKSPACE_INDEXING_ERROR_CODE,
+            Self::ServerInitializing { .. } | Self::WorkspaceServersInitializing {} => {
+                SERVER_INITIALIZING_ERROR_CODE
+            }
+        }
+    }
+}
+
 /// JSON-RPC error-code classification for an [`Error`], returned by
 /// [`Error::mcp_error_kind`].
 ///
@@ -411,12 +469,7 @@ pub enum McpErrorKind {
     /// Maps to a bespoke JSON-RPC `code` with a structured `data` payload a
     /// caller can act on mechanically, rather than the generic
     /// `INTERNAL_ERROR`.
-    Retryable {
-        /// Bespoke JSON-RPC error code.
-        code: i32,
-        /// Structured details about the retryable condition.
-        data: serde_json::Value,
-    },
+    Retryable(RetryableErrorData),
     /// An unexpected server-side failure. Maps to JSON-RPC `-32603`
     /// (`INTERNAL_ERROR`).
     Internal,
@@ -439,10 +492,10 @@ impl Error {
     ///     server_id: ServerId::from("rust"),
     ///     elapsed_secs: 30,
     /// };
-    /// let McpErrorKind::Retryable { code, data } = err.mcp_error_kind() else {
+    /// let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
     ///     panic!("expected a retryable classification");
     /// };
-    /// assert_eq!(data["serverId"], "rust");
+    /// assert_eq!(data.code(), mcpls_core::error::WORKSPACE_INDEXING_ERROR_CODE);
     /// ```
     #[must_use]
     pub fn mcp_error_kind(&self) -> McpErrorKind {
@@ -474,27 +527,22 @@ impl Error {
             Self::WorkspaceIndexing {
                 server_id,
                 elapsed_secs,
-            } => McpErrorKind::Retryable {
-                code: WORKSPACE_INDEXING_ERROR_CODE,
-                data: serde_json::json!({
-                    "serverId": server_id.as_str(),
-                    "elapsedSecs": elapsed_secs,
-                }),
-            },
-            Self::ServerInitializing { server_id } => McpErrorKind::Retryable {
-                code: SERVER_INITIALIZING_ERROR_CODE,
-                data: serde_json::json!({
-                    "serverId": server_id.as_str(),
-                }),
-            },
+            } => McpErrorKind::Retryable(RetryableErrorData::WorkspaceIndexing {
+                server_id: server_id.clone(),
+                elapsed_secs: *elapsed_secs,
+            }),
+            Self::ServerInitializing { server_id } => {
+                McpErrorKind::Retryable(RetryableErrorData::ServerInitializing {
+                    server_id: server_id.clone(),
+                })
+            }
             // Same condition as `ServerInitializing` -- an expected LSP
             // server hasn't registered yet, retry -- just without a single
             // candidate server narrowed down (see the variant's doc), so
-            // there's no `serverId` to report.
-            Self::WorkspaceServersInitializing => McpErrorKind::Retryable {
-                code: SERVER_INITIALIZING_ERROR_CODE,
-                data: serde_json::json!({}),
-            },
+            // there's no `server_id` to report.
+            Self::WorkspaceServersInitializing => {
+                McpErrorKind::Retryable(RetryableErrorData::WorkspaceServersInitializing {})
+            }
 
             // Same recognized shape `sanitize_lsp_server_message` rewrites
             // for display: rust-analyzer reports this when a position-based
@@ -544,6 +592,7 @@ impl Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -879,12 +928,14 @@ mod tests {
             server_id: ServerId::from("rust"),
             elapsed_secs: 30,
         };
-        let McpErrorKind::Retryable { code, data } = err.mcp_error_kind() else {
+        let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
             panic!("expected WorkspaceIndexing to classify as Retryable");
         };
-        assert_eq!(code, WORKSPACE_INDEXING_ERROR_CODE);
-        assert_eq!(data["serverId"], "rust");
-        assert_eq!(data["elapsedSecs"], 30);
+        assert_eq!(data.code(), WORKSPACE_INDEXING_ERROR_CODE);
+        assert_eq!(
+            serde_json::to_value(&data).unwrap(),
+            serde_json::json!({"server_id": "rust", "elapsed_secs": 30})
+        );
     }
 
     #[test]
@@ -892,13 +943,17 @@ mod tests {
         let err = Error::ServerInitializing {
             server_id: ServerId::from("python"),
         };
-        let McpErrorKind::Retryable { code, data } = err.mcp_error_kind() else {
+        let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
             panic!("expected ServerInitializing to classify as Retryable");
         };
-        assert_eq!(code, SERVER_INITIALIZING_ERROR_CODE);
-        assert_eq!(data["serverId"], "python");
+        assert_eq!(data.code(), SERVER_INITIALIZING_ERROR_CODE);
+        assert_eq!(
+            serde_json::to_value(&data).unwrap(),
+            serde_json::json!({"server_id": "python"})
+        );
         assert_ne!(
-            code, WORKSPACE_INDEXING_ERROR_CODE,
+            data.code(),
+            WORKSPACE_INDEXING_ERROR_CODE,
             "ServerInitializing must be distinguishable on the wire from WorkspaceIndexing"
         );
     }
@@ -911,10 +966,45 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_workspace_servers_initializing_is_retryable() {
         let err = Error::WorkspaceServersInitializing;
-        let McpErrorKind::Retryable { code, .. } = err.mcp_error_kind() else {
+        let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
             panic!("expected WorkspaceServersInitializing to classify as Retryable");
         };
-        assert_eq!(code, SERVER_INITIALIZING_ERROR_CODE);
+        assert_eq!(data.code(), SERVER_INITIALIZING_ERROR_CODE);
+        assert_eq!(
+            serde_json::to_value(&data).unwrap(),
+            serde_json::json!({}),
+            "the empty struct variant must serialize as `{{}}`, not `null`"
+        );
+    }
+
+    #[test]
+    fn test_retryable_error_data_codes_and_snake_case_keys() {
+        let cases = [
+            (
+                RetryableErrorData::WorkspaceIndexing {
+                    server_id: ServerId::from("rust"),
+                    elapsed_secs: 7,
+                },
+                WORKSPACE_INDEXING_ERROR_CODE,
+                serde_json::json!({"server_id": "rust", "elapsed_secs": 7}),
+            ),
+            (
+                RetryableErrorData::ServerInitializing {
+                    server_id: ServerId::from("python"),
+                },
+                SERVER_INITIALIZING_ERROR_CODE,
+                serde_json::json!({"server_id": "python"}),
+            ),
+            (
+                RetryableErrorData::WorkspaceServersInitializing {},
+                SERVER_INITIALIZING_ERROR_CODE,
+                serde_json::json!({}),
+            ),
+        ];
+        for (data, code, wire) in cases {
+            assert_eq!(data.code(), code);
+            assert_eq!(serde_json::to_value(&data).unwrap(), wire);
+        }
     }
 
     #[test]

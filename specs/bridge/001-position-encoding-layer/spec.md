@@ -112,21 +112,24 @@ THEN the function returns an Err, never panics
 
 GIVEN an MCP character column past the end of the target line's text
 WHEN mcp_to_lsp_position converts it
-THEN the raw (unconverted) value is used as a fallback rather than erroring the whole request
+THEN the column is clamped to the line's length in the target encoding (LSP 3.17) and reported exact
+     rather than erroring the whole request
 ```
 
 ## 3. Functional Requirements
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE SYSTEM SHALL convert an MCP position (1-based line/character) to an LSP position (0-based) via `mcp_to_lsp_position` (taking the typed `Position`), and the inverse via `lsp_to_mcp_position` (returning `Position2D`) | must |
+| FR-001 | THE SYSTEM SHALL convert an MCP position (1-based line/character) to an LSP position (0-based) via `mcp_to_lsp_position` (taking the typed `Position`), and the inverse via `lsp_to_mcp_position`; both are crate-private and return `Converted<lsp_types::Position>` / `Converted<Position2D>`, pairing the value with a `ColumnFidelity` (`Exact` or `PassedThrough`) | must |
 | FR-002 | WHEN the negotiated encoding is `Utf16` THE SYSTEM SHALL perform a pure line/column offset with no `line_text` lookup — byte-for-byte identical to fixed-encoding (pre-negotiation) behavior, since MCP's own columns are already UTF-16 | must |
 | FR-003 | WHEN the negotiated encoding is `Utf8` or `Utf32` AND `line_text` is available THE SYSTEM SHALL re-derive the column in the target encoding's units from the line's actual text, not a fixed arithmetic offset | must |
-| FR-004 | WHEN `line_text` is unavailable (e.g. the file could not be read) THE SYSTEM SHALL fall back to the raw, unconverted MCP/LSP character rather than failing the request | must |
-| FR-005 | WHEN a re-derived character offset does not round-trip exactly (lands inside a multi-unit character, e.g. a UTF-16 surrogate pair or a multi-byte UTF-8 sequence) THE SYSTEM SHALL fall back to the raw value rather than silently rounding forward to the next character boundary | must |
+| FR-004 | WHEN `line_text` is unavailable (e.g. the file could not be read) THE SYSTEM SHALL fall back to the raw, unconverted MCP/LSP character, reported as `PassedThrough`, rather than failing the request (except column 0, which is always `Exact`) | must |
+| FR-005 | WHEN a re-derived character offset does not round-trip exactly (lands inside a multi-unit character, e.g. a UTF-16 surrogate pair or a multi-byte UTF-8 sequence) THE SYSTEM SHALL fall back to the raw value, reported as `PassedThrough`, rather than silently rounding forward to the next character boundary | must |
 | FR-006 | WHEN `byte_offset_to_character`/`character_to_byte_offset` is given a byte offset that is not on a UTF-8 character boundary THE SYSTEM SHALL return an `Err`, never panic | must |
 | FR-007 | THE SYSTEM SHALL support parsing (`PositionEncoding::from_lsp`) and serializing (`PositionEncoding::to_lsp`) the three LSP-defined encoding kind strings: `"utf-8"`, `"utf-16"`, `"utf-32"` | must |
 | FR-008 | WHEN `line.saturating_sub(1)` or `character.saturating_sub(1)` would underflow (an MCP position of `0`) THE SYSTEM SHALL clamp to `0` rather than wrapping or panicking | must |
+| FR-009 | WHEN a column is past the end of the line text THE SYSTEM SHALL clamp it to the line length in the target units; the result is `Exact` for an MCP column and `PassedThrough` for a server column (the server's text differs from ours) | must |
+| FR-010 | THE SYSTEM SHALL treat column 0, the UTF-16 fast path, and the LSP `u32::MAX` end-of-line sentinel (server to MCP) as `Exact` without consulting `line_text` | must |
 
 ## 4. Non-Functional Requirements
 
@@ -154,10 +157,14 @@ THEN the raw (unconverted) value is used as a fallback rather than erroring the 
 | Negotiated encoding is `Utf8`/`Utf32`, ASCII-only line | All three encodings agree (`test_mcp_to_lsp_position_ascii_identical_across_encodings`) |
 | Negotiated encoding is `Utf8`, line contains a 2-byte character (e.g. `é`) before the target column | Column re-derived in bytes, one further than a naive UTF-16-based offset (`test_mcp_to_lsp_position_utf8_negotiated_multibyte`) |
 | Negotiated encoding is `Utf8`, line contains an astral character (e.g. `𝄞`, 4 UTF-8 bytes / 2 UTF-16 units) | Column correctly re-derived across the surrogate pair (`test_mcp_to_lsp_position_utf8_negotiated_astral_char`) |
-| MCP character offset lands mid-surrogate-pair (client miscounted an astral character) | Falls back to the raw offset rather than rounding forward past the whole character (`test_mcp_to_lsp_position_mid_surrogate_falls_back`) |
+| MCP character offset lands mid-surrogate-pair (client miscounted an astral character) | Falls back to the raw offset, flagged `PassedThrough`, rather than rounding forward past the whole character (`test_mcp_to_lsp_position_mid_surrogate_falls_back`) |
 | Byte offset lands mid-character (not a char boundary) | `Err`, not a panic (`test_byte_offset_to_character_mid_char_boundary_does_not_panic`) — a documented regression fix, since `text[..byte_offset]` would otherwise panic and, under `panic = "abort"`, kill the whole process |
-| MCP character far past the end of a short line | Falls back to the raw (unconverted) value (`test_mcp_to_lsp_position_out_of_bounds_falls_back`) |
-| `line_text` is `None` (file unreadable) | Falls back to the raw value (`test_mcp_to_lsp_position_missing_line_text_falls_back`) |
+| MCP character far past the end of a short line | Clamped to the line length in target units, `Exact` (`test_mcp_to_lsp_position_past_end_of_line_clamps_exactly`) |
+| Server character past the end of its line text | Clamped but `PassedThrough` (`test_lsp_to_mcp_position_past_end_of_line_clamps_but_is_flagged_as_stale_text`) |
+| `line_text` is `None` (file unreadable) | Falls back to the raw value, `PassedThrough` (`test_mcp_to_lsp_position_missing_line_text_passes_through_flagged`) |
+| Column 0, either direction, no `line_text` | `Exact` (`test_column_zero_is_exact_without_line_text_in_both_directions`) |
+| Server `character == u32::MAX` | `Exact`, returned unchanged (`test_lsp_to_mcp_position_character_max_is_exact_for_non_utf16`) |
+| Negotiated encoding is `Utf16`, any column | Always `Exact` (`test_utf16_is_always_exact`) |
 | MCP position `(0, 0)` | Clamped to `(0, 0)` via `saturating_sub`, no underflow (`test_saturating_sub_zero`) |
 | CRLF-terminated source line | No column shift — `line_text` never includes the terminator (`test_mcp_to_lsp_position_utf8_negotiated_crlf_line_text`) |
 | rust-analyzer itself rejects a position as out-of-range (its own internal `"Invalid offset LineCol { .. }"` error, distinct from this module's own conversion fallbacks) | Sanitized to a clean `"position out of range for this document"` message by `Error::LspServerError`'s `Display` impl (`crates/mcpls-core/src/error.rs`, #399) before reaching the MCP caller — out of this module's scope (it never sees LSP server-reported errors), but worth cross-referencing since both concern "position out of range" |

@@ -110,7 +110,7 @@ pub fn validate_path_against_roots(path: &Path, workspace_roots: &[PathBuf]) -> 
 ///   signal the cache itself doesn't need). Instead, the `get_diagnostics`
 ///   MCP tool (`mcp::server::get_diagnostics`) independently resolves the
 ///   file's diagnostics-route server and reports its indexing state as an
-///   explicit `indexingInProgress` flag on the response
+///   explicit `indexing_in_progress` flag on the response
 ///   (`mcp::server::DiagnosticsResponse`), so a mid-index pull (which can
 ///   read as "no errors" while rust-analyzer is still loading) is flagged
 ///   rather than silently trusted. The missing capability check was not

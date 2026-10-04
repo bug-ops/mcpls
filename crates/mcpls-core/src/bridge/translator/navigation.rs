@@ -11,7 +11,8 @@ use tokio::time::Instant;
 
 use super::Translator;
 use super::dto::{
-    DefinitionResult, HoverResult, Location, LocationsResult, Position, ReferencesResult,
+    DefinitionResult, HoverResult, Location, LocationsResult, Position, PositionDegradation,
+    ReferencesResult,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
@@ -219,7 +220,7 @@ async fn lsp_locations_to_mcp(
 struct NormalizedLocations {
     locations: Vec<Location>,
     truncated: bool,
-    positions_degraded: bool,
+    positions_degraded: Option<PositionDegradation>,
 }
 
 /// The two response shapes shared by `textDocument/definition`,

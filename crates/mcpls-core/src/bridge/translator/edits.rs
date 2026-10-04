@@ -2089,7 +2089,7 @@ mod tests {
         let clean = RenameResult {
             changes: vec![],
             dropped: DroppedEdits::default(),
-            positions_degraded: false,
+            positions_degraded: None,
         };
         let clean_json = serde_json::to_value(&clean).unwrap();
         assert!(
@@ -2105,7 +2105,7 @@ mod tests {
                 unsupported_snippet_edit: 0,
                 ..DroppedEdits::default()
             },
-            positions_degraded: false,
+            positions_degraded: None,
         };
         let incomplete_json = serde_json::to_value(&incomplete).unwrap();
         let dropped_json = incomplete_json

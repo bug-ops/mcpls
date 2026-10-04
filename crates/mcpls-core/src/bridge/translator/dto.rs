@@ -94,6 +94,22 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// How a non-UTF-16 server's `character` offsets became inexact in a result.
+// Variant order matters: derived `Ord` makes `Request` > `Response`, so `Option::max` keeps the worse.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionDegradation {
+    /// Only offsets in the returned data may be inexact. The result still
+    /// describes the symbol that was asked about; keep it and treat the
+    /// returned `character` values as approximate.
+    Response,
+    /// The queried position was sent to the server unconverted, so the result
+    /// may describe a different symbol. Do not trust it.
+    Request,
+}
+
 /// Result of a hover request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HoverResult {
@@ -101,14 +117,11 @@ pub struct HoverResult {
     pub contents: String,
     /// Optional range the hover applies to.
     pub range: Option<Range>,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning `range`'s `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// Result of a definition request.
@@ -122,14 +135,12 @@ pub struct DefinitionResult {
     /// serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `locations` entries' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// Result of a references request.
@@ -143,14 +154,12 @@ pub struct ReferencesResult {
     /// serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `locations` entries' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// Diagnostic severity.
@@ -185,14 +194,12 @@ pub struct Diagnostic {
 pub struct DiagnosticsResult {
     /// List of diagnostics for the document.
     pub diagnostics: Vec<Diagnostic>,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `diagnostics` ranges' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// A text edit operation.
@@ -223,14 +230,11 @@ pub struct RenameResult {
     /// and callers must not treat this result as the full rename otherwise.
     #[serde(default, skip_serializing_if = "DroppedEdits::is_empty")]
     pub dropped: DroppedEdits,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `changes` edit ranges' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// Counts of `WorkspaceEdit` entries withheld during conversion to MCP DTOs,
@@ -298,6 +302,11 @@ pub struct Completion {
 pub struct CompletionsResult {
     /// List of completion items.
     pub items: Vec<Completion>,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// A document symbol.
@@ -321,14 +330,12 @@ pub struct Symbol {
 pub struct DocumentSymbolsResult {
     /// List of symbols in the document.
     pub symbols: Vec<Symbol>,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `symbols` ranges' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// Result of a format document request.
@@ -336,14 +343,11 @@ pub struct DocumentSymbolsResult {
 pub struct FormatDocumentResult {
     /// List of edits to format the document.
     pub edits: Vec<TextEdit>,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `edits` ranges' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// A workspace symbol.
@@ -372,14 +376,11 @@ pub struct WorkspaceSymbolResult {
     /// the two caused it. Omitted (defaults to `false`) when serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `symbols` locations' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// A single code action.
@@ -437,14 +438,11 @@ pub struct CodeActionsResult {
     /// Omitted (defaults to `false`) when serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `actions` diagnostic/edit ranges'
-    /// `character` values may be wrong for a non-UTF-16 LSP server (#497).
-    /// Omitted (defaults to `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// A call hierarchy item.
@@ -484,14 +482,11 @@ pub struct CallHierarchyItemResult {
 pub struct CallHierarchyPrepareResult {
     /// List of callable items at the position.
     pub items: Vec<CallHierarchyItemResult>,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `items` ranges' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// An incoming call (caller of the current item).
@@ -513,14 +508,11 @@ pub struct IncomingCallsResult {
     /// Omitted (defaults to `false`) when serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `calls` ranges' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// An outgoing call (callee from the current item).
@@ -542,14 +534,11 @@ pub struct OutgoingCallsResult {
     /// Omitted (defaults to `false`) when serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `calls` ranges' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// Result of server logs request.
@@ -599,6 +588,11 @@ pub struct SignatureHelpResult {
     /// Index of the active parameter within the active signature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_parameter: Option<u32>,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// Result of a go-to-implementation or go-to-type-definition request.
@@ -612,14 +606,11 @@ pub struct LocationsResult {
     /// serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `locations` entries' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 /// A single inlay hint entry.
@@ -654,20 +645,59 @@ pub struct InlayHintsResult {
     /// serialized.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
-    /// Whether a position in this response could not be resolved for
-    /// encoding conversion -- disk-read budget exhaustion, an unresolvable
-    /// server-supplied path, a line past EOF, or invalid UTF-8 content can
-    /// each cause this -- meaning some `hints` positions' `character` values may be
-    /// wrong for a non-UTF-16 LSP server (#497). Omitted (defaults to
-    /// `false`) when serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub positions_degraded: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::lsp_kind_to_u32;
+    use super::{PositionDegradation, lsp_kind_to_u32};
+
+    #[test]
+    fn test_position_degradation_request_outranks_response() {
+        assert!(PositionDegradation::Request > PositionDegradation::Response);
+        assert_eq!(
+            Some(PositionDegradation::Response).max(Some(PositionDegradation::Request)),
+            Some(PositionDegradation::Request)
+        );
+        assert_eq!(
+            None.max(Some(PositionDegradation::Response)),
+            Some(PositionDegradation::Response)
+        );
+    }
+
+    #[test]
+    fn test_position_degradation_serializes_as_snake_case_string() {
+        assert_eq!(
+            serde_json::to_value(PositionDegradation::Request).unwrap(),
+            "request"
+        );
+        assert_eq!(
+            serde_json::to_value(PositionDegradation::Response).unwrap(),
+            "response"
+        );
+    }
+
+    #[test]
+    fn test_positions_degraded_key_omitted_when_none() {
+        let result = super::DocumentSymbolsResult {
+            symbols: Vec::new(),
+            positions_degraded: None,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert!(value.get("positions_degraded").is_none());
+
+        let result = super::DocumentSymbolsResult {
+            positions_degraded: Some(PositionDegradation::Response),
+            ..result
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["positions_degraded"], "response");
+    }
 
     /// #467 regression: the old `Option<u8>` narrowing silently dropped any
     /// `InlayHintKind::Custom(n)` with `n > 255` to `None`, indistinguishable
