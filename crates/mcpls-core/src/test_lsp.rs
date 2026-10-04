@@ -415,8 +415,33 @@ pub fn spawn_test_pump_with_cache(
         subs,
         workspace_roots,
         notification_cache,
+        None,
     );
     (tx, cancel_tx)
+}
+
+/// A pump for a server configured with `tsserver.path = pinned`, plus the
+/// sender of its lifecycle lane and the cancel sender (keep it alive).
+pub fn spawn_test_pump_with_tsserver_pin(
+    pinned: std::path::PathBuf,
+) -> (
+    tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let (notification_tx, rx) = tokio::sync::mpsc::channel(32);
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
+    let (_cache, cancel_tx) = spawn_pump(
+        rx,
+        lifecycle_rx,
+        notification_tx,
+        crate::mcp::SubscriptionRegistry::default(),
+        WorkspaceRoots::default(),
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::bridge::NotificationCache::new(),
+        )),
+        Some(pinned),
+    );
+    (lifecycle_tx, cancel_tx)
 }
 
 /// As [`spawn_test_pump`], but over a client's own [`FakeLanes`]; returns the
@@ -437,6 +462,7 @@ pub fn spawn_test_pump_over_lanes(
         std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::bridge::NotificationCache::new(),
         )),
+        None,
     )
 }
 
@@ -447,6 +473,7 @@ fn spawn_pump<K: Send + 'static>(
     subs: crate::mcp::SubscriptionRegistry,
     workspace_roots: WorkspaceRoots,
     notification_cache: std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
+    pinned_tsserver: Option<std::path::PathBuf>,
 ) -> (
     std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
     tokio::sync::watch::Sender<bool>,
@@ -465,6 +492,7 @@ fn spawn_pump<K: Send + 'static>(
             lifecycle_rx,
             cancel_rx,
             tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+            pinned_tsserver,
             shared,
         )
         .await;

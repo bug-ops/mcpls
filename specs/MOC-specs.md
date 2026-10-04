@@ -24,7 +24,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 005 | [[lsp/005-lsp-content-modified-retry/spec\|lsp-content-modified-retry]] | bug | P2 | implemented (#390) | #382 |
 | 006 | [[lsp/006-server-spawn-install-hint/spec\|server-spawn-install-hint]] | research | P3 | implemented (#530) | #494 |
 | 007 | [[lsp/007-lsp-child-process-lifetime/spec\|lsp-child-process-lifetime]] | enhancement | P2 | implemented (#546) | #526 |
-| 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | group A implemented (#567); rest draft | #567, #568, #569 |
+| 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | implemented (declaration #567, type hierarchy, prepare rename, highlights, range formatting); semanticTokens and others non-goals | #567, #568, #569 |
 | 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | implemented | #572 |
 
 ## mcp
@@ -39,7 +39,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 006 | [[mcp/006-http-stream-liveness/spec\|http-stream-liveness]] | enhancement | P3 | implemented | #543 |
 | 007 | [[mcp/007-symbol-name-addressing/spec\|symbol-name-addressing]] | research | P2 | implemented (MVP, signature help deferred) | #563 |
 | 008 | [[mcp/008-manual-lsp-server-restart/spec\|manual-lsp-server-restart]] | enhancement | P2 | implemented | #564 |
-| 009 | [[mcp/009-speculative-edit-diagnostic-preview/spec\|speculative-edit-diagnostic-preview]] | research | P4 | draft | #570 |
+| 009 | [[mcp/009-speculative-edit-diagnostic-preview/spec\|speculative-edit-diagnostic-preview]] | research | P4 | decided (non-goal, verify loop documented) | #570 |
 | 010 | [[mcp/010-http-session-keepalive-with-live-stream/spec\|http-session-keepalive-with-live-stream]] | enhancement | P3 | implemented | #573 |
 | 011 | [[mcp/011-client-path-boundary-parsing/spec\|client-path-boundary-parsing]] | bug | P2 | implemented (#580) | #575 |
 
@@ -53,8 +53,8 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 004 | [[bridge/004-get-diagnostics-flycheck-gap/spec\|get-diagnostics-flycheck-gap]] | bug | P1 | draft | — |
 | 005 | [[bridge/005-expose-document-tracker-limits/spec\|expose-document-tracker-limits]] | enhancement | P2 | implemented (#324) | — |
 | 006 | [[bridge/006-lsp-indexing-readiness-gate/spec\|lsp-indexing-readiness-gate]] | bug | P1 | implemented (#421) | #420 |
-| 007 | [[bridge/007-enclosing-symbol-context/spec\|enclosing-symbol-context]] | research | P4 | draft | #565 |
-| 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | implemented (#580) | #571 |
+| 007 | [[bridge/007-enclosing-symbol-context/spec\|enclosing-symbol-context]] | research | P4 | implemented | #565 |
+| 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | implemented (#580); root-level system symlink aliases (#579) | #571, #579 |
 | 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | draft | #574 |
 | 010 | [[bridge/010-workspace-containment-single-predicate/spec\|workspace-containment-single-predicate]] | refactor | P2 | implemented (#580) | #558 |
 
@@ -67,7 +67,7 @@ neither belongs to a single `config`/`lsp`/`mcp`/`bridge` module.
 |---|------|------|----------|--------|-------|
 | 001 | [[runtime/001-log-json-bool-env-parsing/spec\|log-json-bool-env-parsing]] | bug | P2 | implemented (#314) | — |
 | 002 | [[runtime/002-sigterm-stdin-blocking-pool-hang/spec\|sigterm-stdin-blocking-pool-hang]] | bug | P1 | implemented (#321, #328) | — |
-| 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | draft | #566 |
+| 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | implemented (tsserver pin, docs, SECURITY.md); untrusted-workspace mode deferred | #566 |
 
 ## testing
 

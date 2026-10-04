@@ -23,7 +23,7 @@ related:
 > **Type**: bug (regression)
 > **Priority**: P1
 > **Source**: continuous-improvement live-testing finding (cycle 037), reproduced on the release binary at `ad90190`
-> **Related issues**: #571. Regresses #533 and #552 (`WorkspaceRoots`, commits `4f06dfc` and `ad90190`); last good release `47bbcda`.
+> **Related issues**: #571, #579 (section 12). Regresses #533 and #552 (`WorkspaceRoots`, commits `4f06dfc` and `ad90190`); last good release `47bbcda`.
 
 ## 1. Overview
 
@@ -305,11 +305,33 @@ between A, B and C. B is the recommendation of this spec but changes a public co
 > [!warning] Known limitation
 > Zero-config roots (empty `workspace.roots`) admit only the physical working directory and the validated `$PWD`. A client naming the directory through another symlinked spelling is not admitted; this follows the documented contract and is tracked in #579.
 
-## 12. See Also
+## 12. Amendment: Root-Level System Symlink Aliases (#579)
+
+Split out of #571: a client that spawns mcpls with a cwd option (so `$PWD` is unset or differs) and
+names files through `/tmp/...` on macOS was rejected, because `/tmp` is a symlink to `/private/tmp`
+and no configured or logical spelling covers it. Status: implemented.
+
+| ID | Requirement | Priority |
+|----|------------|----------|
+| FR-018 | THE SYSTEM SHALL, once at startup, admit aliases of each canonical root that differ from it only through a symlink located directly under the filesystem root (`/tmp`, `/var`), in addition to the spellings of FR-001 through FR-003 (`WorkspaceRoots::from_configured_with` adds them after the configured and logical aliases) | must |
+| FR-019 | Each such alias SHALL be admitted only if `canonicalize(alias)` equals the root it was derived from. A forged or retargeted link therefore admits nothing | must |
+| FR-020 | Discovery SHALL list `/` without following links (`DirEntry::file_type`, `read_link`) and SHALL resolve each target lexically against `/`. A link is a candidate for a root only when its target is a component prefix of that root; chained links are skipped. Only the constructed alias is canonicalized, so unrelated links (automounts, network mounts) are never touched | must |
+| FR-021 | Any `read_dir("/")` or `read_link` failure SHALL yield no aliases, be logged at debug level, and SHALL NOT fail startup (#348) | must |
+| FR-022 | THE SYSTEM SHALL keep the lexical pre-check and the canonical containment check unchanged. Edit URIs from servers stay behind `contains_canonical` | must |
+
+Non-goals: links not located directly under `/` (`~/link`) stay unadmitted unless configured, and
+`Location.out_of_workspace` stays canonical-only, so a `/tmp`-spelled server location may still read
+`out_of_workspace: true`. Non-Unix platforms add no system aliases.
+
+Tests: a unix symlink-table test over a tempdir standing in for `/`, a forged-alias test
+(`p/a/../b` lexically vs physically), an unreadable-directory test, `..`/sibling rejection without
+a stat, and a macOS test over a real `/tmp` directory.
+
+## 13. See Also
 
 - [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [[config/001-config-discovery-and-heuristics/spec|config-discovery-and-heuristics]] — how `workspace.roots` is loaded and resolved (#345, #348)
 - [[mcp/002-mcp-resources-diagnostics/spec|mcp-resources-diagnostics]] — `resources/subscribe` and the diagnostics URI also depend on `WorkspaceRoots`
-- Code: `crates/mcpls-core/src/bridge/workspace_roots.rs`, `crates/mcpls-core/src/bridge/translator/routing.rs` (`validate_path_against_roots`), `crates/mcpls-core/src/lib.rs` (`build_workspace_roots`), `crates/mcpls-core/src/config/mod.rs` (`load_from_with_root_base`)
+- Code: `crates/mcpls-core/src/bridge/workspace_roots.rs`, `crates/mcpls-core/src/bridge/translator/routing.rs` (`validate_path_against_roots`), `crates/mcpls-core/src/config/mod.rs` (`load_from_with_root_base`)
 - Docs: `docs/user-guide/tools-reference.md` ("file_path"), CHANGELOG entries for #533 and #552

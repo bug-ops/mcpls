@@ -163,8 +163,8 @@ Position-based tools (`get_hover`, `get_definition`, `get_references`, `go_to_im
 | Tool | What it does |
 |------|--------------|
 | `get_hover` | Type signatures, documentation, inferred types at any position |
-| `get_definition` | Jump to where a symbol is defined — across files, across crates |
-| `get_references` | Every usage of a symbol in your workspace |
+| `get_definition` | Jump to where a symbol is defined — across files, across crates (also accepts `context: "enclosing_symbol"`, like `go_to_implementation`, `go_to_type_definition` and `get_diagnostics`) |
+| `get_references` | Every usage of a symbol in your workspace; opt in to the enclosing symbol of each hit with `context: "enclosing_symbol"` |
 | `get_completions` | Context-aware suggestions that respect types and scope |
 | `get_document_symbols` | Structured outline — functions, types, constants, imports |
 | `workspace_symbol_search` | Find symbols by name across the entire workspace |
@@ -173,6 +173,7 @@ Position-based tools (`get_hover`, `get_definition`, `get_references`, `go_to_im
 | `go_to_type_definition` | Jump to the type definition of an expression, distinct from `get_definition` for variable bindings |
 | `go_to_declaration` | Jump to the declaration of a symbol (C/C++ headers, interface members) |
 | `get_inlay_hints` | Inferred type/parameter annotations an editor would render inline |
+| `get_document_highlights` | Read, write and text occurrences of the symbol at a position within one file |
 
 </details>
 
@@ -193,10 +194,15 @@ Position-based tools (`get_hover`, `get_definition`, `get_references`, `go_to_im
 | Tool | What it does |
 |------|--------------|
 | `rename_symbol` | Workspace-wide rename with full reference tracking |
+| `prepare_rename` | Check whether a position can be renamed, and the range and placeholder, before `rename_symbol` |
 | `format_document` | Apply language-specific formatting rules |
+| `format_range` | Format only a range of a document |
 | `prepare_call_hierarchy` | Get callable items at a position for call hierarchy |
 | `get_incoming_calls` | Find all callers of a function (who calls this?) |
 | `get_outgoing_calls` | Find all callees of a function (what does this call?) |
+| `prepare_type_hierarchy` | Get type hierarchy items at a position |
+| `get_supertypes` | Supertypes of a type hierarchy item |
+| `get_subtypes` | Subtypes of a type hierarchy item |
 
 </details>
 
@@ -271,6 +277,14 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 > against an untrusted checkout must not execute commands from that checkout
 > without explicit consent. Pass `--trust-project-config` (or set
 > `MCPLS_TRUST_PROJECT_CONFIG=true`) only for repositories you trust.
+
+> [!WARNING]
+> That flag does not make analyzing a workspace safe: language servers run
+> workspace code (build scripts, procedural macros, tsserver plugins). By
+> default mcpls pins the TypeScript server's `tsserver` to the one bundled with
+> `typescript-language-server`, for `npm -g` style symlink installs (verified
+> with Homebrew's node) with a global `typescript`. Windows `.cmd` shims, pnpm,
+> Volta, asdf, mise and `npx`/`bunx` launchers are not covered. See [SECURITY.md](SECURITY.md) for the trust model.
 
 </details>
 

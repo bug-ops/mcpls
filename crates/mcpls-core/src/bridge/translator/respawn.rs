@@ -16,6 +16,7 @@ use crate::DiagnosticsRole;
 use crate::bridge::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
+use crate::lsp::tsserver_pin::{configured_tsserver_path, warn_if_pin_ignored};
 use crate::lsp::{LspServer, ServerInitConfig};
 
 /// Tracks respawn attempts for one server, so [`Translator::respawn_if_dead`]
@@ -300,6 +301,7 @@ impl Translator {
         }
 
         let language_id = config.server_config.language_id.clone();
+        let pinned_tsserver = configured_tsserver_path(config.initialization_options.as_ref());
 
         let mut new_server = match LspServer::spawn(config).await {
             Ok(server) => {
@@ -315,6 +317,7 @@ impl Translator {
         let receivers = NotificationReceivers {
             notifications: new_server.take_notification_rx(),
             lifecycle: new_server.take_lifecycle_rx(),
+            pinned_tsserver,
         };
 
         let stale_task = lock_std(&self.notification_tasks).remove(id);
@@ -388,23 +391,23 @@ impl Translator {
         let NotificationReceivers {
             mut notifications,
             mut lifecycle,
+            pinned_tsserver,
         } = receivers;
         tokio::spawn(async move { while notifications.recv().await.is_some() {} });
-        let forwarder = match self.notification_cache.clone() {
-            Some(cache) => {
-                let lifecycle_id = id.clone();
-                tokio::spawn(async move {
-                    while let Some(notif) = lifecycle.recv().await {
-                        crate::bridge::apply_lifecycle_notification(
-                            &mut *cache.lock().await,
-                            &lifecycle_id,
-                            notif,
-                        );
-                    }
-                })
+        let cache = self.notification_cache.clone();
+        let lifecycle_id = id.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(notif) = lifecycle.recv().await {
+                warn_if_pin_ignored(pinned_tsserver.as_deref(), &notif, lifecycle_id.as_str());
+                if let Some(cache) = &cache {
+                    crate::bridge::apply_lifecycle_notification(
+                        &mut *cache.lock().await,
+                        &lifecycle_id,
+                        notif,
+                    );
+                }
             }
-            None => tokio::spawn(async move { while lifecycle.recv().await.is_some() {} }),
-        };
+        });
         forwarder.abort_handle()
     }
 }
@@ -656,6 +659,63 @@ sleep 0.3
             assert_eq!(dead.server_config.args, config.server_config.args);
 
             translator.respawn_if_dead(&id).await.unwrap();
+        }
+
+        /// #566: a respawned server that falls through to the workspace
+        /// tsserver despite a configured pin is warned about by the respawn
+        /// lifecycle forwarder, not only by the startup pump.
+        #[tokio::test]
+        async fn test_respawn_warns_when_pinned_tsserver_is_ignored() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            use crate::test_lsp::{CapturedLogs, with_read_preamble};
+
+            let dir = TempDir::new().unwrap();
+            let crash = write_crash_after_init_script(dir.path());
+            let id = ServerId::from("rust");
+            let server = LspServer::spawn(stub_server_config("rust", &crash))
+                .await
+                .unwrap();
+            let translator = Translator::new();
+            translator.register_client(id.clone(), server.client().clone());
+            translator.register_server(id.clone(), server);
+            wait_until_dead(&translator, &id).await;
+
+            let reporter = dir.path().join("reporter.sh");
+            fs::write(
+                &reporter,
+                with_read_preamble(
+                    r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+note='{"jsonrpc":"2.0","method":"$/typescriptVersion","params":{"version":"5.0","source":"workspace"}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#note} "$note"
+sleep 5
+"#,
+                ),
+            )
+            .unwrap();
+            let mut pinned = stub_server_config("rust", &reporter);
+            pinned.initialization_options =
+                Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}));
+            set_respawn_config(&translator, &id, pinned);
+
+            let captured = CapturedLogs::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(captured.clone()),
+            );
+            translator.respawn_if_dead(&id).await.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !captured
+                    .messages()
+                    .iter()
+                    .any(|m| m.contains("ignored the configured tsserver.path"))
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("respawned server's ignored pin was never warned about");
         }
 
         #[tokio::test]

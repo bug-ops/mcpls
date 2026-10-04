@@ -121,6 +121,75 @@ fn convert_document_symbol<'a>(
     })
 }
 
+/// A `textDocument/documentSymbol` answer normalized into MCP coordinates.
+#[derive(Debug)]
+pub(super) enum DocumentSymbolTree {
+    /// Hierarchical `DocumentSymbol[]`: ancestry is the `children` nesting.
+    Hierarchical(Vec<Symbol>),
+    /// Legacy flat `SymbolInformation[]`: ancestry is at most `containerName`.
+    Flat(Vec<FlatSymbol>),
+}
+
+impl DocumentSymbolTree {
+    /// The symbols as `get_document_symbols` reports them.
+    fn into_symbols(self) -> Vec<Symbol> {
+        match self {
+            Self::Hierarchical(symbols) => symbols,
+            Self::Flat(symbols) => symbols.into_iter().map(|flat| flat.symbol).collect(),
+        }
+    }
+}
+
+/// One entry of a flat `SymbolInformation[]` answer.
+#[derive(Debug)]
+pub(super) struct FlatSymbol {
+    pub(super) symbol: Symbol,
+    pub(super) container_name: Option<String>,
+}
+
+/// Normalizes a `textDocument/documentSymbol` answer into MCP coordinates,
+/// keeping the flat `SymbolInformation` shape distinct so callers can tell
+/// how much ancestry the server reported.
+///
+/// `uri` is the queried document: a flat entry carries its own
+/// `location.uri`, which is not trusted (it feeds `normalize_range` into a
+/// file read), so every entry is normalized against `uri`, the already
+/// resolved document the request was made for.
+pub(super) async fn symbol_tree(
+    response: Option<lsp_types::DocumentSymbolResponse>,
+    ctx: &EncodingCtx,
+    uri: &lsp_types::Uri,
+) -> DocumentSymbolTree {
+    match response {
+        Some(lsp_types::DocumentSymbolResponse::SymbolInformationList(symbols)) => {
+            let mut result = Vec::with_capacity(symbols.len());
+            for sym in symbols {
+                let range = ctx.normalize_range(uri, sym.location.range).await;
+                let selection_range = range.clone();
+                result.push(FlatSymbol {
+                    symbol: Symbol {
+                        name: sym.base_symbol_information.name,
+                        kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
+                        range,
+                        selection_range,
+                        children: None,
+                    },
+                    container_name: sym.base_symbol_information.container_name,
+                });
+            }
+            DocumentSymbolTree::Flat(result)
+        }
+        Some(lsp_types::DocumentSymbolResponse::DocumentSymbolList(symbols)) => {
+            let mut result = Vec::with_capacity(symbols.len());
+            for sym in symbols {
+                result.push(convert_document_symbol(sym, ctx, uri).await);
+            }
+            DocumentSymbolTree::Hierarchical(result)
+        }
+        None => DocumentSymbolTree::Hierarchical(vec![]),
+    }
+}
+
 impl Translator {
     /// Handle document symbols request.
     ///
@@ -134,46 +203,10 @@ impl Translator {
     ) -> Result<DocumentSymbolsResult> {
         let FetchedSymbols { doc, ctx, response } =
             self.request_document_symbols(&file_path).await?;
-        let response_uri = doc.uri().clone();
-
-        let symbols = match response {
-            Some(lsp_types::DocumentSymbolResponse::SymbolInformationList(symbols)) => {
-                // Unlike `DocumentSymbol` (below), the legacy flat
-                // `SymbolInformation` shape carries its own per-entry
-                // `location.uri`. `document_symbols` is a single-document
-                // request by construction (unlike `workspace/symbol`), so
-                // rather than trust a server-supplied URI here -- which
-                // feeds `normalize_range` into a file read -- every entry is
-                // normalized against `response_uri`, the already-resolved,
-                // trusted document this request was made for. A
-                // conformant server always reports the queried document's
-                // own URI here anyway, so this is a no-op in practice.
-                let mut result = Vec::with_capacity(symbols.len());
-                for sym in symbols {
-                    let range = ctx.normalize_range(&response_uri, sym.location.range).await;
-                    let selection_range = range.clone();
-                    result.push(Symbol {
-                        name: sym.base_symbol_information.name,
-                        kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
-                        range,
-                        selection_range,
-                        children: None,
-                    });
-                }
-                result
-            }
-            Some(lsp_types::DocumentSymbolResponse::DocumentSymbolList(symbols)) => {
-                let mut result = Vec::with_capacity(symbols.len());
-                for sym in symbols {
-                    result.push(convert_document_symbol(sym, &ctx, &response_uri).await);
-                }
-                result
-            }
-            None => vec![],
-        };
+        let tree = symbol_tree(response, &ctx, doc.uri()).await;
 
         Ok(DocumentSymbolsResult {
-            symbols,
+            symbols: tree.into_symbols(),
             positions_degraded: ctx.positions_degraded(),
         })
     }
@@ -196,6 +229,19 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
+        self.fetch_document_symbols(doc).await
+    }
+
+    /// Requests `textDocument/documentSymbol` for an already prepared
+    /// document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails.
+    pub(super) async fn fetch_document_symbols(
+        &self,
+        doc: PreparedDocument,
+    ) -> Result<FetchedSymbols> {
         let ctx = self.encoding_ctx(doc.server_id());
         let params = DocumentSymbolParams {
             text_document: TextDocumentIdentifier {

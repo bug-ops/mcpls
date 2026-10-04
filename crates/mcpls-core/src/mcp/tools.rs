@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
     MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position, RestartTarget,
-    ServerIds, SymbolName, SymbolQuery, SymbolTarget, parse_symbol_kind,
+    ResultContext, ServerIds, SymbolName, SymbolQuery, SymbolTarget, TypeHierarchyItemResult,
+    parse_symbol_kind,
 };
 use crate::config::ServerId;
 
@@ -180,6 +181,38 @@ pub struct ReferencesParams {
     #[schemars(description = "Whether to include the declaration in the results.")]
     #[serde(default)]
     pub include_declaration: bool,
+    /// Optional extra context for each returned item.
+    #[schemars(
+        description = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
+    )]
+    #[serde(default)]
+    pub context: ResultContext,
+}
+
+/// Parameters for the `get_definition`, `go_to_implementation` and
+/// `go_to_type_definition` tools.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for navigating from a symbol to related locations.")]
+pub struct NavigationParams {
+    /// The symbol to navigate from.
+    #[serde(flatten)]
+    pub target: SymbolTargetParams,
+    /// Optional extra context for each returned item.
+    #[schemars(
+        description = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
+    )]
+    #[serde(default)]
+    pub context: ResultContext,
+}
+
+#[cfg(test)]
+impl From<PositionParams> for NavigationParams {
+    fn from(position: PositionParams) -> Self {
+        Self {
+            target: position.into(),
+            context: ResultContext::None,
+        }
+    }
 }
 
 /// Parameters for the `get_diagnostics` tool.
@@ -189,6 +222,12 @@ pub struct DiagnosticsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: PathBuf,
+    /// Optional extra context for each returned item.
+    #[schemars(
+        description = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
+    )]
+    #[serde(default)]
+    pub context: ResultContext,
 }
 
 /// Parameters for the `rename_symbol` tool.
@@ -308,6 +347,39 @@ pub struct CallHierarchyCallsParams {
     /// The call hierarchy item to get calls for (from prepare response).
     #[schemars(description = "The call hierarchy item to get calls for (from prepare response).")]
     pub item: serde_json::Value,
+}
+
+/// Parameters for the `get_supertypes` and `get_subtypes` tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(
+    description = "Parameters for getting the supertypes or subtypes of a type hierarchy item."
+)]
+pub struct TypeHierarchyWalkParams {
+    /// The type hierarchy item to walk from (from a prepare, supertypes or subtypes response).
+    #[schemars(
+        description = "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
+    )]
+    pub item: TypeHierarchyItemResult,
+}
+
+/// Parameters for the `format_range` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for formatting a range of a document.")]
+pub struct FormatRangeParams {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    pub file_path: PathBuf,
+    /// Range in the file to format.
+    #[serde(flatten)]
+    pub range: RangeParams,
+    /// Tab size for formatting (default: 4).
+    #[schemars(description = "Tab size for formatting (default: 4).")]
+    #[serde(default = "default_tab_size")]
+    pub tab_size: u32,
+    /// Whether to use spaces instead of tabs (default: true).
+    #[schemars(description = "Whether to use spaces instead of tabs (default: true).")]
+    #[serde(default = "default_insert_spaces")]
+    pub insert_spaces: bool,
 }
 
 /// Parameters for the `get_cached_diagnostics` tool.
@@ -592,6 +664,31 @@ mod tests {
         };
         assert_eq!(kind("Method"), Some(lsp_types::SymbolKind::Method));
         assert_eq!(kind("6"), Some(lsp_types::SymbolKind::Method));
+    }
+
+    #[test]
+    fn format_range_params_are_flat_and_default_options() {
+        let json = serde_json::json!({
+            "file_path": "/a.rs",
+            "start_line": 1,
+            "start_character": 1,
+            "end_line": 2,
+            "end_character": 3,
+        });
+        let params: FormatRangeParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.range.end_line, 2);
+        assert_eq!(params.tab_size, 4);
+        assert!(params.insert_spaces);
+    }
+
+    #[test]
+    fn type_hierarchy_walk_params_require_a_typed_item() {
+        let untyped = serde_json::json!({"item": {"invalid": "structure"}});
+        assert!(serde_json::from_value::<TypeHierarchyWalkParams>(untyped).is_err());
+
+        let schema = schemars::schema_for!(TypeHierarchyWalkParams);
+        let item = &schema.as_object().unwrap()["properties"]["item"];
+        assert!(item.get("$ref").is_some());
     }
 
     /// The generated JSON schema must expose `PositionParams`/`RangeParams`

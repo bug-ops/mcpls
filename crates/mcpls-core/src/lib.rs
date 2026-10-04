@@ -56,6 +56,7 @@ mod test_lsp;
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +71,7 @@ pub use error::Error;
 use error::ServerSpawnFailure;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _};
+use lsp::tsserver_pin::warn_if_pin_ignored;
 use lsp::{LspNotification, LspServer, ServerInitConfig, ServerStartOutcome};
 use mcp::SubscriptionRegistry;
 use tokio::sync::Mutex;
@@ -179,6 +181,7 @@ pub(crate) async fn diagnostics_pump(
     lifecycle_rx: tokio::sync::mpsc::Receiver<LspNotification>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
+    pinned_tsserver: Option<PathBuf>,
     shared: PumpShared,
 ) {
     diagnostics_pump_with_resolver(
@@ -187,6 +190,7 @@ pub(crate) async fn diagnostics_pump(
         lifecycle_rx,
         cancel_rx,
         role_rx,
+        pinned_tsserver,
         shared,
         PublishedPathResolver::new(),
     )
@@ -195,12 +199,17 @@ pub(crate) async fn diagnostics_pump(
 
 /// [`diagnostics_pump`] over a caller-supplied path resolver, so tests can
 /// inject a slow or hanging canonicalizer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal test seam; each parameter is a distinct per-server input"
+)]
 async fn diagnostics_pump_with_resolver(
     server_id: ServerId,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut lifecycle_rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
+    pinned_tsserver: Option<PathBuf>,
     shared: PumpShared,
     mut resolver: PublishedPathResolver,
 ) {
@@ -298,6 +307,7 @@ async fn diagnostics_pump_with_resolver(
                     lifecycle_closed = true;
                     continue;
                 };
+                warn_if_pin_ignored(pinned_tsserver.as_deref(), &notif, server_id.as_str());
                 bridge::apply_lifecycle_notification(
                     &mut *notification_cache.lock().await,
                     &server_id,
@@ -431,6 +441,7 @@ impl bridge::NotificationWiring for PumpWiring {
                 receivers.lifecycle,
                 cancel_rx,
                 role_rx,
+                receivers.pinned_tsserver,
                 shared,
             );
             if let Err(payload) = AssertUnwindSafe(pump).catch_unwind().await {
@@ -604,7 +615,11 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             Some(ServerInitConfig {
                 server_config: lsp_config.clone(),
                 workspace_roots: workspace_roots.canonical().to_vec(),
-                initialization_options: lsp_config.initialization_options.clone(),
+                initialization_options: lsp::tsserver_pin::pinned_initialization_options(
+                    lsp_config,
+                    workspace_roots.canonical(),
+                    |key| std::env::var_os(key),
+                ),
                 position_encodings: config.workspace.position_encodings.clone(),
                 notification_tx: None,
             })
@@ -1104,6 +1119,9 @@ impl StartupSettler<'_> {
         }
         let notification_rx = server.take_notification_rx();
         let lifecycle_rx = server.take_lifecycle_rx();
+        let pinned_tsserver = lsp::tsserver_pin::configured_tsserver_path(
+            server.init_config().initialization_options.as_ref(),
+        );
         let policy = server.init_config().server_config.indexing;
         let config_id = server.init_config().server_config.id();
         self.notification_cache
@@ -1130,6 +1148,7 @@ impl StartupSettler<'_> {
             lifecycle_rx,
             self.cancel_rx.clone(),
             role_rx,
+            pinned_tsserver,
             self.pump_shared.clone(),
         ));
         self.translator
@@ -2457,6 +2476,45 @@ mod tests {
             Uri::from(format!("file:///test/{file}").as_str())
         }
 
+        /// #566: a pinned server that reports another tsserver source is
+        /// warned about; a report of the pinned source is not.
+        #[tokio::test]
+        async fn test_pump_warns_only_when_pinned_tsserver_is_ignored() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            use crate::test_lsp::{CapturedLogs, spawn_test_pump_with_tsserver_pin};
+
+            let captured = CapturedLogs::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(captured.clone()),
+            );
+            let (lifecycle_tx, _cancel_tx) =
+                spawn_test_pump_with_tsserver_pin(PathBuf::from("/pin/tsserver.js"));
+            let report = |source: &str| LspNotification::Other {
+                method: "$/typescriptVersion".into(),
+                params: Some(serde_json::json!({"version": "5.0", "source": source})),
+            };
+            let ignored = || {
+                captured
+                    .messages()
+                    .iter()
+                    .filter(|m| m.contains("ignored the configured tsserver.path"))
+                    .count()
+            };
+
+            lifecycle_tx.send(report("user-setting")).await.unwrap();
+            lifecycle_tx.send(report("workspace")).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while ignored() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("mismatching source was never warned about");
+
+            assert_eq!(ignored(), 1, "{:?}", captured.messages());
+        }
+
         /// `PublishDiagnostics` is cached even when the peer is not yet connected.
         #[tokio::test]
         async fn test_pump_caches_before_peer_set() {
@@ -2475,6 +2533,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: c,
                     subs: subs.clone(),
@@ -2547,6 +2606,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: subs.clone(),
@@ -2616,6 +2676,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -2646,6 +2707,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: cache,
                     subs,
@@ -2691,6 +2753,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -2751,6 +2814,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -2808,6 +2872,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -2874,6 +2939,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
@@ -3129,6 +3195,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: make_subs(),
@@ -3180,6 +3247,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: make_subs(),
@@ -3240,6 +3308,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 role_rx,
+                None,
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: make_subs(),
@@ -3304,6 +3373,7 @@ mod tests {
                 lifecycle_rx,
                 cancel_rx,
                 tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+                None,
                 PumpShared {
                     notification_cache: make_cache(),
                     subs: make_subs(),

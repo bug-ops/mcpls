@@ -1,11 +1,11 @@
-//! Rename, format-document, and code-actions handlers.
+//! Rename, prepare-rename, format-document, format-range, and code-actions handlers.
 
 use std::collections::{HashMap, HashSet};
 
 use lsp_types::{
-    DocumentFormattingParams, FormattingOptions, PartialResultParams,
-    RenameParams as LspRenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
-    WorkDoneProgressParams,
+    DocumentFormattingParams, DocumentRangeFormattingParams, FormattingOptions,
+    PartialResultParams, PrepareRenameParams, RenameParams as LspRenameParams,
+    TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
 };
 use tokio::task::JoinSet;
 
@@ -13,17 +13,18 @@ use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
     CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, DroppedEdits,
-    FormatDocumentResult, Position, RenameResult, TextEdit, WorkspaceEditDescription,
+    FormatDocumentResult, Position, PrepareRenameOutcome, PrepareRenameResult, RenameResult,
+    TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
+use super::routing::{Capability, IndexingGate, validate_position, validate_range};
 use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
-use crate::error::{Error, Result};
+use crate::error::{Error, McpErrorKind, Result};
+use crate::escape_control;
 use crate::lsp::LspClient;
 
-/// Convert LSP range to MCP range (0-based to 1-based).
 /// Validate parameters for `handle_code_actions`.
 fn validate_code_action_params(
     start: Position,
@@ -40,15 +41,6 @@ fn validate_code_action_params(
         "source.organizeImports",
     ];
 
-    let Position {
-        line: start_line,
-        character: start_character,
-    } = start;
-    let Position {
-        line: end_line,
-        character: end_character,
-    } = end;
-
     if let Some(kind) = kind_filter
         && !VALID_ACTION_KINDS
             .iter()
@@ -59,35 +51,7 @@ fn validate_code_action_params(
         )));
     }
 
-    if start_line < 1 || start_character < 1 || end_line < 1 || end_character < 1 {
-        return Err(Error::InvalidToolParams(
-            "Line and character positions must be >= 1".to_string(),
-        ));
-    }
-
-    if start_line > MAX_POSITION_VALUE
-        || start_character > MAX_POSITION_VALUE
-        || end_line > MAX_POSITION_VALUE
-        || end_character > MAX_POSITION_VALUE
-    {
-        return Err(Error::InvalidToolParams(format!(
-            "Position values must be <= {MAX_POSITION_VALUE}"
-        )));
-    }
-
-    if end_line.saturating_sub(start_line) > MAX_RANGE_LINES {
-        return Err(Error::InvalidToolParams(format!(
-            "Range size must be <= {MAX_RANGE_LINES} lines"
-        )));
-    }
-
-    if start_line > end_line || (start_line == end_line && start_character > end_character) {
-        return Err(Error::InvalidToolParams(
-            "Start position must be before or equal to end position".to_string(),
-        ));
-    }
-
-    Ok(())
+    validate_range(start, end)
 }
 
 /// Maximum length, in bytes, of a `rename_symbol` `new_name` parameter.
@@ -526,6 +490,50 @@ async fn convert_code_action(
     }
 }
 
+/// Convert LSP formatting edits into MCP edits in 1-based coordinates.
+async fn convert_text_edits(
+    edits: Vec<lsp_types::TextEdit>,
+    ctx: &EncodingCtx,
+    uri: &lsp_types::Uri,
+) -> Vec<TextEdit> {
+    let mut converted = Vec::with_capacity(edits.len());
+    for edit in edits {
+        converted.push(TextEdit {
+            range: ctx.normalize_range(uri, edit.range).await,
+            new_text: edit.new_text,
+        });
+    }
+    converted
+}
+
+/// JSON-RPC `InvalidParams`, the code servers use to reject a
+/// `textDocument/prepareRename` position that holds no renameable symbol.
+const JSONRPC_INVALID_PARAMS: i32 = -32602;
+
+/// Classify a failed `prepareRename` request.
+///
+/// rust-analyzer rejects a position with no renameable symbol with `-32602`.
+/// clangd uses `-32001` for that and for an out-of-range line, so its answer
+/// stays a server error (pinned by a test). rust-analyzer reports an
+/// out-of-range position as `-32602` with its "Invalid offset" text, so
+/// `mcp_error_kind` is consulted first: a caller-fault position stays an
+/// error and is never read as "not renameable".
+fn prepare_rename_rejection(err: Error) -> Result<PrepareRenameOutcome> {
+    let message = match &err {
+        Error::LspServerError {
+            code: JSONRPC_INVALID_PARAMS,
+            message,
+            ..
+        } if !matches!(err.mcp_error_kind(), McpErrorKind::InvalidPosition(_)) => {
+            escape_control(message).into_owned()
+        }
+        _ => return Err(err),
+    };
+    Ok(PrepareRenameOutcome::NotRenameable {
+        server_message: Some(message),
+    })
+}
+
 impl Translator {
     /// Handle rename request.
     ///
@@ -586,6 +594,83 @@ impl Translator {
         })
     }
 
+    /// Handle a prepare rename request: whether the symbol at `position` can
+    /// be renamed, and the range a rename would replace.
+    ///
+    /// Routes with `rename_symbol` (the `Rename` route), so
+    /// the verdict comes from the server that would perform the rename. A
+    /// `null` answer, or `defaultBehavior: false`, carries no range and no
+    /// permission to rename, so both read as not renameable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position is invalid, the LSP request fails
+    /// for a reason other than rejecting the position, the file cannot be
+    /// opened, the routed server does not advertise rename preparation
+    /// support (`renameProvider.prepareProvider`), or the server is still
+    /// indexing the workspace.
+    pub async fn handle_prepare_rename(
+        &self,
+        file_path: ClientPath,
+        position: Position,
+    ) -> Result<PrepareRenameResult> {
+        validate_position(position)?;
+
+        let doc = self
+            .prepare_gated_document(
+                &file_path,
+                Capability::PrepareRename,
+                IndexingGate::Required,
+            )
+            .await?;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
+        let response_uri = uri.clone();
+        let lsp_position = ctx.to_lsp(uri, position).await;
+
+        let params = PrepareRenameParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: lsp_position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let response = client
+            .request_typed::<lsp_types::PrepareRenameRequest>(params, client.request_timeout())
+            .await;
+        let outcome = match response {
+            Ok(Some(lsp_types::PrepareRenameResult::Range(range))) => {
+                PrepareRenameOutcome::Renameable {
+                    range: ctx.normalize_range(&response_uri, range).await,
+                    placeholder: None,
+                }
+            }
+            Ok(Some(lsp_types::PrepareRenameResult::PrepareRenamePlaceholder(p))) => {
+                PrepareRenameOutcome::Renameable {
+                    range: ctx.normalize_range(&response_uri, p.range).await,
+                    placeholder: Some(p.placeholder),
+                }
+            }
+            Ok(Some(lsp_types::PrepareRenameResult::PrepareRenameDefaultBehavior(d)))
+                if d.default_behavior =>
+            {
+                PrepareRenameOutcome::DefaultBehavior
+            }
+            Ok(Some(lsp_types::PrepareRenameResult::PrepareRenameDefaultBehavior(_)) | None) => {
+                PrepareRenameOutcome::NotRenameable {
+                    server_message: None,
+                }
+            }
+            Err(err) => prepare_rename_rejection(err)?,
+        };
+
+        Ok(PrepareRenameResult {
+            outcome,
+            positions_degraded: ctx.positions_degraded(),
+        })
+    }
+
     /// Handle format document request.
     ///
     /// # Errors
@@ -623,21 +708,66 @@ impl Translator {
             .request_typed::<lsp_types::DocumentFormattingRequest>(params, client.request_timeout())
             .await?;
 
-        let edits = response.unwrap_or_default();
-
-        let mut result_edits = Vec::with_capacity(edits.len());
-        for edit in edits {
-            result_edits.push(TextEdit {
-                range: ctx.normalize_range(&response_uri, edit.range).await,
-                new_text: edit.new_text,
-            });
-        }
-        let result = FormatDocumentResult {
-            edits: result_edits,
+        Ok(FormatDocumentResult {
+            edits: convert_text_edits(response.unwrap_or_default(), &ctx, &response_uri).await,
             positions_degraded: ctx.positions_degraded(),
+        })
+    }
+
+    /// Handle format range request: formatting edits for only `start..end`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the range is invalid (zero or oversized
+    /// positions, start after end), the LSP request fails, the file cannot be
+    /// opened, or the routed server does not advertise
+    /// `documentRangeFormattingProvider` support.
+    pub async fn handle_format_range(
+        &self,
+        file_path: ClientPath,
+        start: Position,
+        end: Position,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<FormatDocumentResult> {
+        validate_range(start, end)?;
+
+        let doc = self
+            .prepare_gated_document(
+                &file_path,
+                Capability::FormatRange,
+                IndexingGate::NotRequired,
+            )
+            .await?;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
+        let response_uri = uri.clone();
+
+        let params = DocumentRangeFormattingParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: lsp_types::Range {
+                start: ctx.to_lsp(uri, start).await,
+                end: ctx.to_lsp(uri, end).await,
+            },
+            options: FormattingOptions {
+                tab_size,
+                insert_spaces,
+                ..Default::default()
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        Ok(result)
+        let response = client
+            .request_typed::<lsp_types::DocumentRangeFormattingRequest>(
+                params,
+                client.request_timeout(),
+            )
+            .await?;
+
+        Ok(FormatDocumentResult {
+            edits: convert_text_edits(response.unwrap_or_default(), &ctx, &response_uri).await,
+            positions_degraded: ctx.positions_degraded(),
+        })
     }
 
     /// Handle code actions request.

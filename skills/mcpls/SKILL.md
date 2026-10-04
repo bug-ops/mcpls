@@ -23,13 +23,14 @@ metadata:
 mcpls is a single Rust binary that bridges the Model Context Protocol (MCP) to the
 Language Server Protocol (LSP). It spawns and speaks LSP to real language servers
 (rust-analyzer, pyright, gopls, clangd, …) and exposes their capabilities to an AI
-agent as 23 MCP tools — hover, go-to-definition, references, diagnostics, rename,
-completions, symbols, formatting, call hierarchy, a `get_tool_support` report of which
-tools work for which languages, and more.
+agent as 29 MCP tools — hover, go-to-definition, references, diagnostics, rename (with
+`prepare_rename`), completions, symbols, formatting (document and range), call and type
+hierarchy, document highlights, a `get_tool_support` report of which tools work for which
+languages, and more.
 
 This skill covers operating the **binary**: installing it, choosing CLI flags and
 environment variables, registering it with an MCP client, and writing `mcpls.toml`.
-It does not enumerate the 23 MCP tools themselves or their parameters — for that, see
+It does not enumerate the 29 MCP tools themselves or their parameters — for that, see
 [Tools Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/tools-reference.md).
 If the bridge is configured with `mcp.tool_prefix`, every tool name listed there gains
 that prefix (`{tool_prefix}_{tool}`).
@@ -185,6 +186,14 @@ Pass `--trust-project-config` (or `MCPLS_TRUST_PROJECT_CONFIG=true`) only for
 repositories you trust. Note that the env var grants trust process-wide, not
 per-project — setting it in a shell profile trusts every `mcpls` invocation that
 shell ever launches, not just the one project you meant to trust.
+
+Trusting the config is not trusting the workspace: language servers run workspace code
+(build scripts, procedural macros, tsconfig plugins) and mcpls does not sandbox them, so
+analyze an untrusted checkout only inside a container or disposable VM. For the TypeScript
+server, mcpls pins `tsserver` to the one bundled with `typescript-language-server` on symlink
+installs (`npm -g` style, verified with Homebrew's node) with a global `typescript`; Windows
+`.cmd`, pnpm, Volta, asdf, mise and `npx`/`bunx` launchers are not covered, and `initialization_options.tsserver.path` overrides
+the pin. See [SECURITY.md](https://github.com/bug-ops/mcpls/blob/main/SECURITY.md).
 
 When a project config is found but ignored, mcpls does not just log a `tracing::warn!`
 to stderr (which a stdio-based agent typically can't see) — it also appends a NOTE to

@@ -604,6 +604,38 @@ file_patterns = ["**/*.go"]
 - `ServerFailedToStart`: the message names the command and the reason; install the server or fix its `command`/`args` in the config, then restart mcpls
 - `resources/subscribe` on such a file fails the same way, except during startup, where it succeeds and you receive one `resources/updated` if startup then fails; re-read the resource to get the error
 
+### "tsserver pin" warnings for TypeScript
+
+**Cause**: mcpls pins the TypeScript server's `tsserver` to the one bundled with `typescript-language-server` so a workspace's own `node_modules` tsserver does not run. When it cannot, it logs a warning naming the reason.
+
+**Reasons and fixes**:
+- Server not found on `PATH` (resolved from the server's own `env` override, else the mcpls environment): install `typescript-language-server` or fix `command`
+- Windows `.cmd` shim or script launcher (pnpm, Volta, asdf, mise): not covered, so the workspace's tsserver can be selected; point `initialization_options.tsserver.path` at a trusted `tsserver.js` yourself
+- `npx`, `bunx`, `node cli.mjs` or another wrapper that only names the server in `args`: not covered; use the `typescript-language-server` executable as `command`, or set `initialization_options.tsserver.path` yourself
+- No valid `typescript` package (with a `package.json` `version`) next to the server: install it globally (`npm install -g typescript`)
+- You set `initialization_options` for the server without `tsserver.path`: the pin is skipped; add `tsserver.path` to keep it
+- A warning after startup that the server reports a version source other than `user-setting`: the pin did not take effect, for example after a restart with a stale pin
+
+To opt back in to the workspace's TypeScript, set `tsserver.path` to a workspace path yourself. See [Trust model](configuration.md#trust-model).
+
+### "enclosing_symbol" is `not_computed` or `unavailable`
+
+**Cause**: with `context: "enclosing_symbol"`, an item's symbol was not looked up or the lookup failed; the primary result is unaffected.
+
+**Fix by `reason`**:
+- `capability_absent`: the routed server does not advertise `documentSymbolProvider`
+- `request_failed` / `timed_out`: the `documentSymbol` request failed or ran past the call's 30 second budget; retry, or check `get_server_logs`
+- `file_cap`: the call enriched the maximum number of distinct files (16, or `workspace.max_documents / 4`); `enrichment.cut_short` is `true`. Split the query or raise `workspace.max_documents`
+- `tracker_limit`: the document tracker could not open the file; raise `workspace.max_documents`
+- `out_of_workspace`: the file lies outside every workspace root (standard library, dependency) and is never opened. A location a server reports under a `/tmp` spelling can still read `out_of_workspace: true` in the result even though that spelling is accepted as input
+- `deadline`: the time budget was spent before the file was reached
+
+### `capability_not_advertised` for newer tools
+
+**Cause**: `prepare_type_hierarchy`, `get_supertypes`, `get_subtypes`, `format_range`, `prepare_rename` and `get_document_highlights` depend on the routed server advertising the LSP capability. rust-analyzer advertises neither type hierarchy nor range formatting; typescript-language-server does not advertise type hierarchy. Call `get_tool_support` to see per-language coverage.
+
+If every server for a language lists `handles` explicitly (no catch-all), add `type_hierarchy`, `document_highlights` or `format_range` to a server's list; see [`handles`](configuration.md#handles).
+
 ### "Position out of bounds"
 
 **Cause**: Line/character position exceeds file content

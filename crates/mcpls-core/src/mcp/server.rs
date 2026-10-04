@@ -31,22 +31,23 @@ use super::session::{ListenPermit, ListenRegistration, ListenUris, SubscriptionR
 use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
-    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, InlayHintsParams,
-    PositionParams, RangeParams, ReferencesParams, RenameParams, RestartServerParams,
-    ServerLogsParams, ServerMessagesParams, SymbolTargetParams, ToolSupportParams,
-    WorkspaceSymbolParams,
+    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, FormatRangeParams,
+    InlayHintsParams, NavigationParams, PositionParams, RangeParams, ReferencesParams,
+    RenameParams, RestartServerParams, ServerLogsParams, ServerMessagesParams, SymbolTargetParams,
+    ToolSupportParams, TypeHierarchyWalkParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
 };
 use crate::bridge::{
     AddressableTool, Addressed, CallHierarchyPrepareResult, ClientPath, CodeActionsResult,
-    CompletionsResult, DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult,
+    CompletionsResult, DefinitionResult, DiagnosticInfo, DiagnosticsResult,
+    DocumentDiagnosticsResult, DocumentHighlightsResult, DocumentSymbolsResult,
     FormatDocumentResult, HoverResult, IncomingCallsResult, IndexingState, InlayHintsResult,
     LocationsResult, NotificationCache, OutgoingCallsResult, Position, PositionEncoding,
-    ReferencesResult, RenameResult, RestartServerResult, ServerLogsResult, ServerMessagesResult,
-    SignatureHelpResult, Translator, WorkspaceRoots, WorkspaceSymbolResult,
-    validate_path_against_roots,
+    PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult, ServerLogsResult,
+    ServerMessagesResult, SignatureHelpResult, Translator, TypeHierarchyResult, WorkspaceRoots,
+    WorkspaceSymbolResult, validate_path_against_roots,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 
@@ -119,6 +120,13 @@ macro_rules! positions_note_request {
 macro_rules! name_addressing_note {
     () => {
         "Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing."
+    };
+}
+
+/// Tool-description sentence for tools accepting `context: \"enclosing_symbol\"`.
+macro_rules! enclosing_symbol_note {
+    () => {
+        "Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`."
     };
 }
 
@@ -326,7 +334,7 @@ fn paginate_resource_paths<'a>(
 #[derive(serde::Serialize, JsonSchema)]
 struct DiagnosticsResponse {
     #[serde(flatten)]
-    result: DiagnosticsResult,
+    result: DocumentDiagnosticsResult,
     #[serde(flatten)]
     signals: DiagnosticsRouteSignals,
 }
@@ -563,12 +571,15 @@ impl McplsServer {
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = concat!("Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
+        description = concat!("Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!()),
         title = "Go to Definition"
     )]
     async fn get_definition(
         &self,
-        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+        Parameters(NavigationParams {
+            target: SymbolTargetParams { file_path, target },
+            context,
+        }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<DefinitionResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
@@ -578,7 +589,9 @@ impl McplsServer {
                     file_path,
                     target,
                     AddressableTool::Definition,
-                    |file_path, position| translator.handle_definition(file_path, position),
+                    |file_path, position| {
+                        translator.handle_definition(file_path, position, context)
+                    },
                 )
                 .await,
         )
@@ -586,7 +599,7 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = concat!("References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
+        description = concat!("References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!()),
         title = "Find References"
     )]
     async fn get_references(
@@ -594,6 +607,7 @@ impl McplsServer {
         Parameters(ReferencesParams {
             target: SymbolTargetParams { file_path, target },
             include_declaration,
+            context,
         }): Parameters<ReferencesParams>,
     ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
@@ -605,7 +619,12 @@ impl McplsServer {
                     target,
                     AddressableTool::References,
                     |file_path, position| {
-                        translator.handle_references(file_path, position, include_declaration)
+                        translator.handle_references(
+                            file_path,
+                            position,
+                            include_declaration,
+                            context,
+                        )
                     },
                 )
                 .await,
@@ -614,12 +633,12 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!()),
+        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!(), " ", enclosing_symbol_note!()),
         title = "Diagnostics"
     )]
     async fn get_diagnostics(
         &self,
-        Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
+        Parameters(DiagnosticsParams { file_path, context }): Parameters<DiagnosticsParams>,
     ) -> Result<Json<DiagnosticsResponse>, McpError> {
         let file_path = parse_client_path(file_path)?;
         // Resolved from the validated/canonicalized path (mirrors
@@ -653,7 +672,7 @@ impl McplsServer {
         let result = self
             .context
             .translator
-            .handle_diagnostics(file_path, &self.context.notification_cache)
+            .handle_diagnostics(file_path, context, &self.context.notification_cache)
             .await;
 
         let after = {
@@ -872,6 +891,139 @@ impl McplsServer {
         to_structured_tool_result(self.context.translator.handle_outgoing_calls(item).await)
     }
 
+    /// Prepare type hierarchy at a position.
+    #[tool(
+        description = concat!("Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        title = "Prepare Type Hierarchy"
+    )]
+    async fn prepare_type_hierarchy(
+        &self,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
+    ) -> Result<Json<TypeHierarchyResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
+        to_structured_tool_result(
+            self.context
+                .translator
+                .handle_type_hierarchy_prepare(file_path, Position { line, character })
+                .await,
+        )
+    }
+
+    /// Get the supertypes (bases) of a type hierarchy item.
+    #[tool(
+        description = concat!("Supertypes (base classes, implemented interfaces) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        title = "Supertypes"
+    )]
+    async fn get_supertypes(
+        &self,
+        Parameters(TypeHierarchyWalkParams { item }): Parameters<TypeHierarchyWalkParams>,
+    ) -> Result<Json<TypeHierarchyResult>, McpError> {
+        to_structured_tool_result(self.context.translator.handle_supertypes(item).await)
+    }
+
+    /// Get the subtypes (derived types) of a type hierarchy item.
+    #[tool(
+        description = concat!("Subtypes (derived classes, implementors) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        title = "Subtypes"
+    )]
+    async fn get_subtypes(
+        &self,
+        Parameters(TypeHierarchyWalkParams { item }): Parameters<TypeHierarchyWalkParams>,
+    ) -> Result<Json<TypeHierarchyResult>, McpError> {
+        to_structured_tool_result(self.context.translator.handle_subtypes(item).await)
+    }
+
+    /// Check whether the symbol at a position can be renamed.
+    #[tool(
+        description = concat!("Whether the symbol at position can be renamed, before proposing a rename. `status` is `renameable` (with the identifier `range` and, when the server gives it, `placeholder`), `default_behavior` (rename is accepted but the server gives no range) or `not_renameable` (optionally with the server's `server_message`). Unsupported servers are refused with a capability error instead. ", positions_note_request!()),
+        title = "Prepare Rename"
+    )]
+    async fn prepare_rename(
+        &self,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
+    ) -> Result<Json<PrepareRenameResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
+        to_structured_tool_result(
+            self.context
+                .translator
+                .handle_prepare_rename(file_path, Position { line, character })
+                .await,
+        )
+    }
+
+    /// Get all occurrences of the symbol at a position within one file.
+    #[tool(
+        description = concat!("Occurrences of the symbol at position within the same file, each marked `read`, `write` or `text`. A file-local subset of get_references. Capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        title = "Document Highlights"
+    )]
+    async fn get_document_highlights(
+        &self,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
+    ) -> Result<Json<DocumentHighlightsResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
+        to_structured_tool_result(
+            self.context
+                .translator
+                .handle_document_highlights(file_path, Position { line, character })
+                .await,
+        )
+    }
+
+    /// Format only a range of a document according to language server rules.
+    // read-only: returns proposed text edits, does not apply them -- mcpls
+    // has no write-back path today; revisit if that changes.
+    #[tool(
+        description = concat!("Format only a range with language-specific rules. Returns text edits the server reports for that range; edits are not filtered or applied. Keep the range end inside the file. ", positions_note_request!()),
+        title = "Format Range"
+    )]
+    async fn format_range(
+        &self,
+        Parameters(FormatRangeParams {
+            file_path,
+            range:
+                RangeParams {
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                },
+            tab_size,
+            insert_spaces,
+        }): Parameters<FormatRangeParams>,
+    ) -> Result<Json<FormatDocumentResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
+        to_structured_tool_result(
+            self.context
+                .translator
+                .handle_format_range(
+                    file_path,
+                    Position {
+                        line: start_line,
+                        character: start_character,
+                    },
+                    Position {
+                        line: end_line,
+                        character: end_character,
+                    },
+                    tab_size,
+                    insert_spaces,
+                )
+                .await,
+        )
+    }
+
     /// Get cached diagnostics for a file.
     #[tool(
         description = concat!("Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. Errors with a retryable `ServerInitializing` while the file's server is still starting, and with `ServerFailedToStart` if it failed to start, instead of returning an empty list. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!()),
@@ -981,12 +1133,15 @@ impl McplsServer {
 
     /// Go to implementation locations.
     #[tool(
-        description = concat!("Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
+        description = concat!("Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!()),
         title = "Go to Implementation"
     )]
     async fn go_to_implementation(
         &self,
-        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+        Parameters(NavigationParams {
+            target: SymbolTargetParams { file_path, target },
+            context,
+        }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
@@ -996,7 +1151,9 @@ impl McplsServer {
                     file_path,
                     target,
                     AddressableTool::Implementation,
-                    |file_path, position| translator.handle_implementation(file_path, position),
+                    |file_path, position| {
+                        translator.handle_implementation(file_path, position, context)
+                    },
                 )
                 .await,
         )
@@ -1004,12 +1161,15 @@ impl McplsServer {
 
     /// Go to type definition location.
     #[tool(
-        description = concat!("Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
+        description = concat!("Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!()),
         title = "Go to Type Definition"
     )]
     async fn go_to_type_definition(
         &self,
-        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+        Parameters(NavigationParams {
+            target: SymbolTargetParams { file_path, target },
+            context,
+        }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
@@ -1019,7 +1179,9 @@ impl McplsServer {
                     file_path,
                     target,
                     AddressableTool::TypeDefinition,
-                    |file_path, position| translator.handle_type_definition(file_path, position),
+                    |file_path, position| {
+                        translator.handle_type_definition(file_path, position, context)
+                    },
                 )
                 .await,
         )
@@ -1643,8 +1805,8 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::bridge::Capability;
     use crate::bridge::resources::ResourceSubscriptions;
+    use crate::bridge::{Capability, ResultContext};
     use crate::mcp::tool_support::ToolBackend;
     use crate::test_lsp::client_path;
 
@@ -1690,6 +1852,11 @@ mod tests {
 
     /// A position-addressed tool call, from the plain position parameters.
     fn at(params: Parameters<PositionParams>) -> Parameters<SymbolTargetParams> {
+        Parameters(params.0.into())
+    }
+
+    /// As [`at`], for the tools that also take a `context`.
+    fn nav(params: Parameters<PositionParams>) -> Parameters<NavigationParams> {
         Parameters(params.0.into())
     }
 
@@ -2093,7 +2260,7 @@ mod tests {
             character: 5,
         });
 
-        let result = server.get_definition(at(params)).await;
+        let result = server.get_definition(nav(params)).await;
         assert!(result.is_err());
     }
 
@@ -2108,6 +2275,7 @@ mod tests {
             }
             .into(),
             include_declaration: false,
+            context: ResultContext::None,
         });
 
         let result = server.get_references(params).await;
@@ -2119,6 +2287,7 @@ mod tests {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(DiagnosticsParams {
             file_path: PathBuf::from(test_file.to_str().unwrap()),
+            context: ResultContext::None,
         });
 
         let result = server.get_diagnostics(params).await;
@@ -2179,6 +2348,7 @@ mod tests {
         let call = {
             let params = Parameters(DiagnosticsParams {
                 file_path: PathBuf::from(path_str),
+                context: ResultContext::None,
             });
             tokio::spawn(async move { mcp_server.get_diagnostics(params).await })
         };
@@ -2246,6 +2416,7 @@ mod tests {
         let call = {
             let params = Parameters(DiagnosticsParams {
                 file_path: PathBuf::from(path_str),
+                context: ResultContext::None,
             });
             tokio::spawn(async move { mcp_server.get_diagnostics(params).await })
         };
@@ -2321,6 +2492,7 @@ mod tests {
         let call = {
             let params = Parameters(DiagnosticsParams {
                 file_path: PathBuf::from(path_str),
+                context: ResultContext::None,
             });
             tokio::spawn(async move { mcp_server.get_diagnostics(params).await })
         };
@@ -2441,6 +2613,7 @@ mod tests {
             let server = Arc::clone(&fx.server);
             let params = Parameters(DiagnosticsParams {
                 file_path: PathBuf::from(fx.path.to_string_lossy().into_owned()),
+                context: ResultContext::None,
             });
             tokio::spawn(async move { server.get_diagnostics(params).await })
         };
@@ -2468,6 +2641,7 @@ mod tests {
             let server = Arc::clone(&fx.server);
             let params = Parameters(DiagnosticsParams {
                 file_path: file_path.clone(),
+                context: ResultContext::None,
             });
             tokio::spawn(async move { server.get_diagnostics(params).await })
         };
@@ -2614,17 +2788,21 @@ mod tests {
             push_notifications_degraded: true,
             indexing_in_progress: true,
         };
-        let result = || DiagnosticsResult {
-            diagnostics: Vec::new(),
-            positions_degraded: Some(crate::bridge::PositionDegradation::Request),
-        };
+        let degraded = Some(crate::bridge::PositionDegradation::Request);
         let pulled = serde_json::to_value(DiagnosticsResponse {
-            result: result(),
+            result: DocumentDiagnosticsResult {
+                diagnostics: Vec::new(),
+                positions_degraded: degraded,
+                enrichment: None,
+            },
             signals,
         })
         .unwrap();
         let cached = serde_json::to_value(CachedDiagnosticsResponse {
-            result: result(),
+            result: DiagnosticsResult {
+                diagnostics: Vec::new(),
+                positions_degraded: degraded,
+            },
             signals,
         })
         .unwrap();
@@ -2709,6 +2887,7 @@ mod tests {
         let call = {
             let params = Parameters(DiagnosticsParams {
                 file_path: PathBuf::from(path_str),
+                context: ResultContext::None,
             });
             tokio::spawn(async move { mcp_server.get_diagnostics(params).await })
         };
@@ -3748,7 +3927,7 @@ sleep 0.3
             character: 5,
         });
 
-        let result = server.go_to_implementation(at(params)).await;
+        let result = server.go_to_implementation(nav(params)).await;
         assert!(result.is_err());
     }
 
@@ -3761,7 +3940,7 @@ sleep 0.3
             character: 5,
         });
 
-        let result = server.go_to_type_definition(at(params)).await;
+        let result = server.go_to_type_definition(nav(params)).await;
         assert!(result.is_err());
     }
 
@@ -3869,6 +4048,12 @@ sleep 0.3
             ("prepare_call_hierarchy", true, false, true),
             ("get_incoming_calls", true, false, true),
             ("get_outgoing_calls", true, false, true),
+            ("prepare_type_hierarchy", true, false, true),
+            ("get_supertypes", true, false, true),
+            ("get_subtypes", true, false, true),
+            ("prepare_rename", true, false, true),
+            ("get_document_highlights", true, false, true),
+            ("format_range", true, false, true),
             ("get_cached_diagnostics", true, false, true),
             ("get_server_logs", true, false, true),
             ("get_server_messages", true, false, true),
@@ -4943,6 +5128,70 @@ sleep 0.3
         );
     }
 
+    /// Only the five enrichment tools declare `context`, with exactly the
+    /// two closed values; `get_cached_diagnostics` must not.
+    #[test]
+    fn test_context_param_is_declared_only_on_enrichment_tools() {
+        let tools = McplsServer::build_tool_router(None).list_all();
+        let with_context: std::collections::BTreeSet<&str> = tools
+            .iter()
+            .filter(|tool| {
+                tool.input_schema
+                    .get("properties")
+                    .is_some_and(|p| p.get("context").is_some())
+            })
+            .map(|tool| tool.name.as_ref())
+            .collect();
+        assert_eq!(
+            with_context,
+            std::collections::BTreeSet::from([
+                "get_definition",
+                "get_diagnostics",
+                "get_references",
+                "go_to_implementation",
+                "go_to_type_definition",
+            ])
+        );
+        let schema = serde_json::to_string(
+            &tools
+                .iter()
+                .find(|tool| tool.name == "get_references")
+                .unwrap()
+                .input_schema,
+        )
+        .unwrap();
+        assert!(schema.contains("enclosing_symbol") && schema.contains("\"none\""));
+    }
+
+    /// `context` accepts the two closed values, defaults to `none`, and
+    /// rejects anything else before a handler runs.
+    #[test]
+    fn test_context_param_deserialization() {
+        let base = |context: Option<&str>| {
+            let mut value = serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 1});
+            if let Some(context) = context {
+                value["context"] = context.into();
+            }
+            value
+        };
+        let parse = |value| serde_json::from_value::<NavigationParams>(value);
+
+        assert_eq!(parse(base(None)).unwrap().context, ResultContext::None);
+        assert_eq!(
+            parse(base(Some("enclosing_symbol"))).unwrap().context,
+            ResultContext::EnclosingSymbol
+        );
+        assert!(parse(base(Some("bogus"))).is_err());
+        assert!(serde_json::from_value::<ReferencesParams>(base(Some("bogus"))).is_err());
+        assert!(
+            serde_json::from_value::<DiagnosticsParams>(serde_json::json!({
+                "file_path": "/a.rs",
+                "context": "bogus",
+            }))
+            .is_err()
+        );
+    }
+
     /// Every tool advertises an `outputSchema`, i.e. every handler returns
     /// `Result<Json<T>, McpError>`.
     #[test]
@@ -4987,11 +5236,16 @@ sleep 0.3
     /// LSP has no boolean form, `true` otherwise), built from the LSP field
     /// name so it cross-checks `Capability::name` against `is_supported`.
     fn capabilities_advertising(capability: Capability) -> lsp_types::ServerCapabilities {
-        let value = match capability {
-            Capability::Completions | Capability::SignatureHelp => serde_json::json!({}),
-            _ => serde_json::json!(true),
+        let json = match capability {
+            Capability::Completions | Capability::SignatureHelp => {
+                serde_json::json!({ capability.name(): {} })
+            }
+            Capability::PrepareRename => {
+                serde_json::json!({ "renameProvider": { "prepareProvider": true } })
+            }
+            _ => serde_json::json!({ capability.name(): true }),
         };
-        serde_json::from_value(serde_json::json!({ capability.name(): value })).unwrap()
+        serde_json::from_value(json).unwrap()
     }
 
     struct SupportFixture {
@@ -5079,6 +5333,28 @@ sleep 0.3
                 }),
             }
         };
+        let type_item = || {
+            let uri = url::Url::from_file_path(file).unwrap().to_string();
+            let at = |character| crate::bridge::Position2D { line: 1, character };
+            TypeHierarchyWalkParams {
+                item: crate::bridge::TypeHierarchyItemResult {
+                    name: "T".to_string(),
+                    kind: 5,
+                    detail: None,
+                    uri,
+                    range: crate::bridge::Range {
+                        start: at(1),
+                        end: at(11),
+                    },
+                    selection_range: crate::bridge::Range {
+                        start: at(1),
+                        end: at(2),
+                    },
+                    data: None,
+                    out_of_workspace: false,
+                },
+            }
+        };
         match tool {
             McpTool::GetHover => server
                 .get_hover(Parameters(position().into()))
@@ -5092,12 +5368,14 @@ sleep 0.3
                 .get_references(Parameters(ReferencesParams {
                     target: position().into(),
                     include_declaration: false,
+                    context: ResultContext::None,
                 }))
                 .await
                 .map(|_| ()),
             McpTool::GetDiagnostics => server
                 .get_diagnostics(Parameters(DiagnosticsParams {
                     file_path: PathBuf::from(file_path.clone()),
+                    context: ResultContext::None,
                 }))
                 .await
                 .map(|_| ()),
@@ -5155,6 +5433,35 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::GetOutgoingCalls => server
                 .get_outgoing_calls(Parameters(item()))
+                .await
+                .map(|_| ()),
+            McpTool::PrepareTypeHierarchy => server
+                .prepare_type_hierarchy(Parameters(position()))
+                .await
+                .map(|_| ()),
+            McpTool::GetSupertypes => server
+                .get_supertypes(Parameters(type_item()))
+                .await
+                .map(|_| ()),
+            McpTool::GetSubtypes => server
+                .get_subtypes(Parameters(type_item()))
+                .await
+                .map(|_| ()),
+            McpTool::PrepareRename => server
+                .prepare_rename(Parameters(position()))
+                .await
+                .map(|_| ()),
+            McpTool::GetDocumentHighlights => server
+                .get_document_highlights(Parameters(position()))
+                .await
+                .map(|_| ()),
+            McpTool::FormatRange => server
+                .format_range(Parameters(FormatRangeParams {
+                    file_path: PathBuf::from(file_path.clone()),
+                    range: range(),
+                    tab_size: 4,
+                    insert_spaces: true,
+                }))
                 .await
                 .map(|_| ()),
             McpTool::GetCachedDiagnostics => server
@@ -5228,7 +5535,8 @@ sleep 0.3
                 lsp_types::ServerCapabilities::default,
                 capabilities_advertising,
             );
-            let fixture = support_fixture(vec![("rust", "rust", caps)], McpConfig::default());
+            let fixture =
+                support_fixture(vec![("rust", "rust", caps.clone())], McpConfig::default());
             let snapshot = fixture.server.context.translator.tool_support_snapshot();
 
             for tool in McpTool::ALL {
@@ -5238,12 +5546,14 @@ sleep 0.3
                 let (reported, expected_refusal) = match tool.spec().backend {
                     ToolBackend::Local => (None, false),
                     ToolBackend::Document(kind) => (
-                        Some(snapshot.document_support("rust", kind)),
-                        Capability::for_tool(kind).is_some_and(|cap| Some(cap) != advertised),
+                        Some(snapshot.document_support_gated("rust", kind, tool.capability())),
+                        tool.capability()
+                            .is_some_and(|cap| !cap.is_supported(&caps)),
                     ),
                     ToolBackend::Workspace(kind) => (
                         Some(snapshot.workspace_support(kind)),
-                        Capability::for_tool(kind).is_some_and(|cap| Some(cap) != advertised),
+                        tool.capability()
+                            .is_some_and(|cap| !cap.is_supported(&caps)),
                     ),
                 };
                 let report_says_refused =
@@ -5305,7 +5615,7 @@ sleep 0.3
         let report = report_json(&fixture.server, None);
 
         assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
-        assert_eq!(report["tools"].as_array().unwrap().len(), 23);
+        assert_eq!(report["tools"].as_array().unwrap().len(), 29);
 
         let hover = tool_entry(&report, "get_hover");
         assert_eq!(hover["coverage"], "some");
@@ -5460,7 +5770,9 @@ sleep 0.3
                     .is_err_and(|e| e.message.contains(CAPABILITY_REFUSAL));
                 let reported = match tool.spec().backend {
                     ToolBackend::Local => continue,
-                    ToolBackend::Document(kind) => snapshot.document_support("rust", kind),
+                    ToolBackend::Document(kind) => {
+                        snapshot.document_support_gated("rust", kind, tool.capability())
+                    }
                     ToolBackend::Workspace(kind) => snapshot.workspace_support(kind),
                 };
                 assert_eq!(
@@ -5470,9 +5782,11 @@ sleep 0.3
                     tool.name()
                 );
                 match tool.spec().backend {
-                    ToolBackend::Document(kind) => assert_eq!(
+                    ToolBackend::Document(_) => assert_eq!(
                         refused,
-                        Capability::for_tool(kind).is_some_and(|cap| cap != advertised),
+                        tool.capability().is_some_and(
+                            |cap| !cap.is_supported(&capabilities_advertising(advertised))
+                        ),
                         "{} with only {advertised:?} on rust",
                         tool.name()
                     ),
