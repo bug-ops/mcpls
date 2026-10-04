@@ -86,6 +86,15 @@ pub(super) struct StderrCapture {
     eof: watch::Receiver<bool>,
 }
 
+/// Whether [`StderrCapture::finish`] waits for end-of-file before snapshotting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EofWait {
+    /// Wait up to `EOF_GRACE`: the server is gone or about to exit.
+    Grace,
+    /// Snapshot immediately: the server is still running.
+    Skip,
+}
+
 impl StderrCapture {
     /// Starts draining `stderr` on a detached task.
     pub(super) fn start(stderr: ChildStderr) -> Self {
@@ -97,15 +106,15 @@ impl StderrCapture {
 
     /// Snapshot of what the server has written so far.
     ///
-    /// When `child_exited`, waits briefly for end-of-file first so output
+    /// With [`EofWait::Grace`], waits briefly for end-of-file first so output
     /// still in flight is included. Secrets in `redactions` are hidden from
     /// the excerpt.
     pub(super) async fn finish(
         &self,
-        child_exited: bool,
+        eof_wait: EofWait,
         redactions: &Redactions,
     ) -> Option<StderrExcerpt> {
-        if child_exited {
+        if eof_wait == EofWait::Grace {
             let mut eof = self.eof.clone();
             if timeout(EOF_GRACE, eof.wait_for(|done| *done))
                 .await

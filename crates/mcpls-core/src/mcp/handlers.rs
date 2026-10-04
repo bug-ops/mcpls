@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use super::session::{SessionHandle, SubscriptionRegistry};
 use crate::bridge::{NotificationCache, Translator, WorkspaceRoots};
-use crate::config::McpConfig;
+use crate::config::{McpConfig, ProjectConfigStatus};
 
 /// Shared context for all tool handlers.
 ///
@@ -51,7 +51,7 @@ pub struct BridgeContext {
     /// Surfaced in-band via `McplsServer::get_info`'s `RmcpServerConfig.instructions`
     /// (stderr's `tracing::warn!` at load time is typically invisible to an
     /// MCP client).
-    pub project_config_ignored: bool,
+    pub project_config_status: ProjectConfigStatus,
     /// Configured `serverInfo`/`instructions` presentation overrides, read by
     /// `McplsServer::get_info`.
     pub mcp: McpConfig,
@@ -66,7 +66,7 @@ impl BridgeContext {
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: WorkspaceRoots,
         subscription_registry: SubscriptionRegistry,
-        project_config_ignored: bool,
+        project_config_status: ProjectConfigStatus,
         mcp: McpConfig,
     ) -> Self {
         Self {
@@ -74,7 +74,7 @@ impl BridgeContext {
             notification_cache,
             workspace_roots,
             session: SessionHandle::new(subscription_registry),
-            project_config_ignored,
+            project_config_status,
             mcp,
         }
     }
@@ -96,7 +96,7 @@ mod tests {
             notification_cache,
             workspace_roots,
             subscription_registry,
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
         assert_eq!(Arc::strong_count(&context.translator), 1);

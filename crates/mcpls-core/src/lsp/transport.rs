@@ -10,13 +10,15 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tracing::{debug, trace, warn};
+use tracing::{Level, debug, trace, warn};
 
 use crate::error::{Error, Result};
 use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use crate::redaction::Redactions;
 
 /// Maximum allowed Content-Length (10 MB)
 const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
@@ -50,6 +52,7 @@ const MAX_HEADERS: usize = 100;
 /// [`LspTransportReader`] for why.
 pub struct LspTransport {
     stdin: Box<dyn AsyncWrite + Unpin + Send>,
+    redactions: Arc<Redactions>,
 }
 
 impl fmt::Debug for LspTransport {
@@ -89,6 +92,7 @@ impl fmt::Debug for LspTransport {
 /// ```
 pub struct LspTransportReader {
     stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    redactions: Arc<Redactions>,
 }
 
 impl fmt::Debug for LspTransportReader {
@@ -112,12 +116,24 @@ impl LspTransport {
         stdin: impl AsyncWrite + Unpin + Send + 'static,
         stdout: impl AsyncRead + Unpin + Send + 'static,
     ) -> (Self, LspTransportReader) {
+        Self::with_redactions(stdin, stdout, Arc::default())
+    }
+
+    /// As [`Self::new`], redacting `redactions` from the wire frames both
+    /// halves log at `trace` level.
+    pub(crate) fn with_redactions(
+        stdin: impl AsyncWrite + Unpin + Send + 'static,
+        stdout: impl AsyncRead + Unpin + Send + 'static,
+        redactions: Arc<Redactions>,
+    ) -> (Self, LspTransportReader) {
         (
             Self {
                 stdin: Box::new(stdin),
+                redactions: Arc::clone(&redactions),
             },
             LspTransportReader {
                 stdout: BufReader::new(Box::new(stdout)),
+                redactions,
             },
         )
     }
@@ -137,7 +153,9 @@ impl LspTransport {
         let content = serde_json::to_string(message)?;
         let header = format!("Content-Length: {}\r\n\r\n", content.len());
 
-        trace!("Sending LSP message: {}", content);
+        if tracing::enabled!(Level::TRACE) {
+            trace!("Sending LSP message: {}", self.redactions.apply(&content));
+        }
 
         self.stdin.write_all(header.as_bytes()).await?;
         self.stdin.write_all(content.as_bytes()).await?;
@@ -181,7 +199,9 @@ impl LspTransportReader {
 
             let content = self.read_content(content_length).await?;
 
-            trace!("Received LSP message: {}", content);
+            if tracing::enabled!(Level::TRACE) {
+                trace!("Received LSP message: {}", self.redactions.apply(&content));
+            }
 
             let value: Value = serde_json::from_str(&content)?;
 
@@ -192,7 +212,10 @@ impl LspTransportReader {
                 // Some servers (notably OmniSharp) emit a burst of these during
                 // startup; log at debug to avoid flooding the logs for what is a
                 // recoverable, expected condition.
-                debug!("Skipping non-object LSP message: {}", value);
+                debug!(
+                    "Skipping non-object LSP message: {}",
+                    self.redactions.apply(&value.to_string())
+                );
                 continue;
             }
 
@@ -307,6 +330,81 @@ mod tests {
 
     use super::*;
     use crate::lsp::types::RequestId;
+
+    #[tokio::test]
+    async fn test_trace_wire_logs_redact_secrets_in_both_directions() {
+        use tracing_subscriber::prelude::*;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let secret = "pa\"ss\\word-12345";
+        let redactions = Arc::new(Redactions::new([(
+            "API_TOKEN".to_owned(),
+            secret.to_owned(),
+        )]));
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with(logs.clone()),
+        );
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {"initializationOptions": {"token": secret}},
+        });
+        let body = frame.to_string();
+        let inbound = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+        let (mut writer_half, mut reader_half) = LspTransport::with_redactions(
+            tokio::io::sink(),
+            std::io::Cursor::new(inbound.into_bytes()),
+            redactions,
+        );
+
+        writer_half.send(&frame).await.unwrap();
+        reader_half.receive().await.unwrap();
+
+        let output = logs.messages().join("\n");
+        assert!(output.contains("Sending LSP message"), "{output}");
+        assert!(output.contains("Received LSP message"), "{output}");
+        assert!(!output.contains("word-12345"), "{output}");
+        assert_eq!(
+            output.matches("[redacted:API_TOKEN]").count(),
+            2,
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skipped_non_object_frame_log_redacts_secrets() {
+        use tracing_subscriber::prelude::*;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let redactions = Arc::new(Redactions::new([(
+            "API_TOKEN".to_owned(),
+            "SuperSecretValue123".to_owned(),
+        )]));
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with(logs.clone()),
+        );
+        let body = "\"echo SuperSecretValue123\"";
+        let inbound = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+        let (_, mut reader) = LspTransport::with_redactions(
+            tokio::io::sink(),
+            std::io::Cursor::new(inbound.into_bytes()),
+            redactions,
+        );
+
+        assert!(reader.receive().await.is_err());
+
+        let output = logs.messages().join("\n");
+        assert!(output.contains("Skipping non-object"), "{output}");
+        assert!(!output.contains("SuperSecretValue123"), "{output}");
+    }
 
     #[test]
     fn test_header_parsing() {

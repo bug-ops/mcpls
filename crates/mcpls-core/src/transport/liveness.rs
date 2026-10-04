@@ -293,7 +293,7 @@ impl StreamProbe {
         let was_primary = self.liveness.release(token);
         drop(inner);
         drop(guard);
-        tracing::debug!(session = %self.session, ?exit, was_primary, "standalone stream ended");
+        tracing::debug!(session = %super::SessionFingerprint(&self.session), ?exit, was_primary, "standalone stream ended");
         if exit == Exit::Unresponsive && was_primary {
             self.close_standalone_stream();
         }
@@ -321,10 +321,10 @@ impl StreamProbe {
             match closed {
                 Ok(None) => {}
                 Ok(Some(e)) => {
-                    tracing::debug!(session = %self.session, "closing standalone stream failed: {e}");
+                    tracing::debug!(session = %super::SessionFingerprint(&self.session), "closing standalone stream failed: {e}");
                 }
                 Err(_) => {
-                    tracing::debug!(session = %self.session, "closing standalone stream timed out");
+                    tracing::debug!(session = %super::SessionFingerprint(&self.session), "closing standalone stream timed out");
                 }
             }
         });

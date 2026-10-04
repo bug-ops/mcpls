@@ -453,13 +453,18 @@ impl LanguageCandidates {
 /// Outcome of resolving a per-document tool route against the registries,
 /// shared by enforcement ([`Translator::client_for_file`]) and the
 /// `get_tool_support` snapshot so the two cannot disagree.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) enum RouteLookup<T> {
     /// The routed server is registered; `T` is whatever the registry lookup returned.
     Registered(ServerId, T),
     /// The routed server is expected but has not registered yet.
     Initializing(ServerId),
-    /// The router names a server that is neither registered nor expected.
+    /// The routed server failed to start and no catch-all is left to wait
+    /// for. Only seen while a router read races a settlement, since a settled
+    /// router drops such a route.
+    Failed(Box<ServerSpawnFailure>),
+    /// The router names a server that is neither registered, expected nor
+    /// recorded as failed.
     Dangling {
         language: String,
         server_id: ServerId,
@@ -469,13 +474,20 @@ pub(super) enum RouteLookup<T> {
 }
 
 /// Resolve the first candidate language with a route, then classify that
-/// route's server. `resolve`, `registered` and `is_expected` are separate
-/// closures so a caller backed by independent locks never holds two at once.
+/// route's server. `resolve`, `registered`, `is_expected`,
+/// `pending_catch_all` and `startup_failure` are separate closures so a caller
+/// backed by independent locks never holds two at once.
+///
+/// A route naming a failed server whose language's catch-all is still
+/// initializing (FR-007: the route is not bound to it yet) is `Initializing`
+/// naming that catch-all, the retryable state, rather than a terminal failure.
 pub(super) fn lookup_route<T>(
     candidates: &LanguageCandidates,
     resolve: impl Fn(&str) -> Option<ServerId>,
     registered: impl Fn(&ServerId) -> Option<T>,
     is_expected: impl Fn(&ServerId) -> bool,
+    pending_catch_all: impl Fn(&str) -> Option<ServerId>,
+    startup_failure: impl Fn(&ServerId) -> Option<ServerSpawnFailure>,
 ) -> RouteLookup<T> {
     for language in candidates.iter() {
         let Some(server_id) = resolve(language) else {
@@ -485,6 +497,10 @@ pub(super) fn lookup_route<T>(
             RouteLookup::Registered(server_id, found)
         } else if is_expected(&server_id) {
             RouteLookup::Initializing(server_id)
+        } else if let Some(catch_all) = pending_catch_all(language) {
+            RouteLookup::Initializing(catch_all)
+        } else if let Some(failure) = startup_failure(&server_id) {
+            RouteLookup::Failed(Box::new(failure))
         } else {
             RouteLookup::Dangling {
                 language: language.to_string(),
@@ -668,6 +684,8 @@ impl Translator {
             |lang| lock_std(&self.router).resolve(lang, tool).cloned(),
             |id| lock_std(&self.lsp_clients).get(id).cloned(),
             |id| lock_std(&self.expected_servers).contains(id),
+            |lang| self.pending_catch_all(lang),
+            |id| self.startup_failure(id),
         );
         match lookup {
             RouteLookup::Registered(id, client) => Ok((id, client)),
@@ -675,9 +693,10 @@ impl Translator {
             // large Unity solution loading via OmniSharp) -- tell the caller
             // to wait and retry rather than implying no server is configured.
             RouteLookup::Initializing(server_id) => Err(Error::ServerInitializing { server_id }),
-            // Unreachable once registration has rebound the router
-            // (`Translator::rebind_router`) -- a route can only name a
-            // registered server after that point. Logged rather than
+            RouteLookup::Failed(failure) => Err(Error::ServerFailedToStart(failure)),
+            // Unreachable once every server has settled and the router was
+            // re-derived (`Translator::rebind_router_to_settled`) -- a route
+            // can only name a registered, pending or failed server. Logged rather than
             // `debug_assert!`-panicked: this method is reachable by any
             // library consumer calling `with_router` without registering
             // matching clients, not just internal misuse.
@@ -713,6 +732,14 @@ impl Translator {
                 }
             }
         }
+    }
+
+    /// The catch-all of `language` if it is still expected to register.
+    fn pending_catch_all(&self, language: &str) -> Option<ServerId> {
+        let catch_all = lock_std(&self.router).catch_all_for(language).cloned()?;
+        lock_std(&self.expected_servers)
+            .contains(&catch_all)
+            .then_some(catch_all)
     }
 
     /// The detected language of `path` plus its React base-language fallback.
@@ -759,10 +786,13 @@ impl Translator {
             },
             |id| lock_std(&self.lsp_clients).contains_key(id).then_some(()),
             |id| lock_std(&self.expected_servers).contains(id),
+            |lang| self.pending_catch_all(lang),
+            |id| self.startup_failure(id),
         );
         match lookup {
             RouteLookup::Registered(id, ()) => DiagnosticsRoute::Live(id),
             RouteLookup::Initializing(id) => DiagnosticsRoute::Initializing(id),
+            RouteLookup::Failed(failure) => DiagnosticsRoute::FailedToStart(failure),
             RouteLookup::Dangling { server_id, .. } => {
                 tracing::error!(
                     "router diagnostics route names server '{server_id}' that is neither \
@@ -1029,7 +1059,7 @@ impl Translator {
     /// dispatching a capability-gated LSP request.
     ///
     /// Production always registers an [`LspServer`] alongside its
-    /// [`LspClient`] in the same `register_servers` step (see `lib.rs`), so in
+    /// [`LspClient`] in the same `Translator::settle_started` step, so in
     /// practice a registered client always has known capabilities. If no
     /// `LspServer` is registered for `server_id` regardless -- a client
     /// registered without its server, which only happens in tests, or a
@@ -2015,7 +2045,7 @@ mod tests {
                 indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
             },
             lsp_servers: vec![],
-            project_config_ignored: false,
+            project_config_status: crate::ProjectConfigStatus::NotIgnored,
         };
 
         let extension_map = config.build_effective_extension_map();

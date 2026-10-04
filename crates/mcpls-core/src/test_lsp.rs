@@ -88,6 +88,7 @@ pub fn fake_lsp_client_with_lanes() -> (LspClient, FakeServer, FakeLanes) {
         transport,
         notification_tx,
         lifecycle_tx,
+        std::sync::Arc::default(),
     );
     (
         client,
@@ -320,6 +321,44 @@ pub fn sh_script_init_config(dir: &std::path::Path, script_body: &str) -> Server
     init_config_for(server_config)
 }
 
+/// Script of an `sh` fake server that answers `initialize` with empty
+/// capabilities: it first creates `announce` and waits until `wait_for`
+/// exists (when given), so tests can order servers without wall-clock sleeps.
+#[cfg(unix)]
+pub fn answer_initialize_script(
+    announce: Option<&std::path::Path>,
+    wait_for: Option<&std::path::Path>,
+) -> String {
+    let announce =
+        announce.map_or_else(String::new, |path| format!("touch '{}'\n", path.display()));
+    let wait = wait_for.map_or_else(String::new, |path| {
+        format!("while [ ! -f '{}' ]; do sleep 0.05; done\n", path.display())
+    });
+    let answer = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 60
+"#;
+    format!("{announce}{wait}{}", with_read_preamble(answer))
+}
+
+/// An `sh` fake server named `name` for `language`, living in its own
+/// subdirectory of `dir` and bounded by a 10 s initialize timeout.
+#[cfg(unix)]
+pub fn named_sh_init_config(
+    dir: &std::path::Path,
+    name: &str,
+    language: &str,
+    script_body: &str,
+) -> ServerInitConfig {
+    let sub = dir.join(name);
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut config = sh_script_init_config(&sub, script_body);
+    config.server_config.name = Some(name.to_string());
+    config.server_config.language_id = language.to_string();
+    config.server_config.timeout_seconds = 10;
+    config
+}
+
 /// Reads and discards a full LSP-framed request from stdin, so a fixture
 /// replying after it can't answer before the request is even sent (#447).
 #[cfg(unix)]
@@ -425,7 +464,7 @@ fn spawn_pump<K: Send + 'static>(
             rx,
             lifecycle_rx,
             cancel_rx,
-            true,
+            tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
             shared,
         )
         .await;

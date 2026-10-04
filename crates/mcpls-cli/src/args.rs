@@ -104,7 +104,9 @@ pub struct Args {
 
     /// URL path the MCP service is mounted at (default `/mcp`).
     ///
-    /// Only meaningful when `--listen` is set.
+    /// Must start with `/`, must not be `/`, and may contain only ASCII
+    /// letters, digits and `-._~` in each segment. Validated at startup even
+    /// without `--listen`. Only used when `--listen` is set.
     #[cfg(feature = "transport-http")]
     #[arg(
         long,
@@ -112,7 +114,7 @@ pub struct Args {
         default_value = "/mcp",
         env = "MCPLS_HTTP_PATH"
     )]
-    pub http_path: String,
+    pub http_path: mcpls_core::HttpPath,
 
     /// Liveness probing of HTTP GET streams: `probe` or `off`.
     ///
@@ -327,13 +329,27 @@ mod tests {
         #[test]
         fn test_http_path_default() {
             let args = Args::parse_from(["mcpls"]);
-            assert_eq!(args.http_path, "/mcp");
+            assert_eq!(args.http_path.as_str(), "/mcp");
         }
 
         #[test]
         fn test_http_path_custom() {
             let args = Args::parse_from(["mcpls", "--http-path", "/api/mcp"]);
-            assert_eq!(args.http_path, "/api/mcp");
+            assert_eq!(args.http_path.as_str(), "/api/mcp");
+        }
+
+        #[test]
+        fn test_http_path_rejected_by_clap() {
+            for bad in [
+                "/", "mcp", "", "/a//b", "/a/", "/a/../b", "/{id}", "/a*", "/a b",
+            ] {
+                let err = Args::try_parse_from(["mcpls", "--http-path", bad]).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{bad:?}"
+                );
+            }
         }
 
         #[test]

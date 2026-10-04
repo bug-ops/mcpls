@@ -101,11 +101,20 @@ impl ToolSupportSnapshot {
             |lang| self.router.resolve(lang, tool).cloned(),
             |id| self.registered.contains(id).then_some(()),
             |id| self.expected.contains(id),
+            |lang| {
+                self.router
+                    .catch_all_for(lang)
+                    .filter(|id| self.expected.contains(*id))
+                    .cloned()
+            },
+            |_| None,
         );
         match lookup {
             RouteLookup::Registered(server, ()) => self.registered_support(server, tool),
             RouteLookup::Initializing(_) => RouteSupport::Initializing,
-            RouteLookup::Dangling { .. } | RouteLookup::Unrouted => RouteSupport::NoServer,
+            RouteLookup::Failed(_) | RouteLookup::Dangling { .. } | RouteLookup::Unrouted => {
+                RouteSupport::NoServer
+            }
         }
     }
 
@@ -339,8 +348,8 @@ mod tests {
     }
 
     /// Applies the four registration writes in the order production performs
-    /// them (`Translator::register_server_complete`: client then server;
-    /// then `register_servers`' `rebind_router`; then
+    /// them (`Translator::settle_started`: client then server; then
+    /// `rebind_router`; then the expected-set removal, here
     /// `clear_expected_servers`) at every boundary between the snapshot's
     /// reads, over all 70 monotone placements. A healthy server must never
     /// read as `no_server`.

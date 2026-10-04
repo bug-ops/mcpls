@@ -41,7 +41,7 @@ time, without ending the session.
 
 - Stateless `subscriptions/listen` streams: no session exists to acknowledge a probe (#551).
 - Request-wise (POST response) streams and their resumes.
-- Closing the session itself; the idle reaper bounds vanished clients (mcp/002, #521).
+- Closing the session itself; the idle reaper bounds vanished clients (mcp/002, #521) and is the only expiry owner: rmcp's own `keep_alive` is off, so a client that answers probes on an open GET stream keeps its session (mcp/010, #573). With probing switched off (FR-009) an open GET stream no longer holds its session.
 
 ## 2. Functional Requirements
 

@@ -607,7 +607,14 @@ starts normally.
 **If the server a tool is routed to fails to spawn**, that tool's requests
 move to the language's catch-all server, if one is running; otherwise they
 report no server available for that tool rather than silently falling back
-to a server that explicitly declined it via `handles`.
+to a server that explicitly declined it via `handles`. While the catch-all is
+still starting, the tool reports the failed server's startup failure; it is
+served by the catch-all once that registers.
+
+Servers start concurrently, and each one is registered, and its languages are
+usable, as soon as its own `initialize` completes. A slow or failing server
+delays only its own languages, and the order of `[[lsp_servers]]` entries does
+not affect when a server becomes usable.
 
 **Exception: `workspace_symbol_search`.** This tool has no document, so it
 has no language to route on. It resolves, across all configured servers, to
@@ -636,6 +643,13 @@ Log level for mcpls output.
 
 **Values**: `trace`, `debug`, `info`, `warn`, `error`
 **Default**: `info`
+
+The HTTP session id is a bearer secret, so mcpls caps the rmcp log targets that
+print it (`rmcp::transport::streamable_http_server::session` at `warn`,
+`rmcp::transport::worker` at `debug`) regardless of this level, and logs only a
+short hash of the id itself. A more specific directive (for example
+`MCPLS_LOG=info,rmcp::transport::streamable_http_server::session::local=info`)
+overrides the cap and puts session ids back into the logs.
 
 ```bash
 export MCPLS_LOG=debug
@@ -669,6 +683,8 @@ mcpls
 >
 > The reverse proxy should also rewrite the `Host` header, as rmcp's host validation only allows `localhost`, `127.0.0.1`, or `::1` by default.
 >
+> A request carrying an `Origin` header is accepted only when it names `localhost`, `127.0.0.1` or `[::1]` on the bound port; anything else, including `Origin: null`, is answered with `403`. Requests without `Origin` (every non-browser client) are unaffected, so a proxy in front of browser clients must rewrite or strip `Origin`.
+>
 > **Example (nginx):**
 > ```nginx
 > location /mcp/ {
@@ -681,6 +697,12 @@ mcpls
 ### `MCPLS_HTTP_PATH` (transport-http feature)
 
 URL prefix the MCP service is mounted at.
+
+The value must start with `/`, must not be `/` (the service already answers at
+the root path), must not contain an empty segment (`//` or a trailing `/`) or a
+`.`/`..` segment, and may use only ASCII letters, digits and `-._~` in each
+segment. An invalid value is rejected with a usage error (exit code 2) before
+any language server starts, even when `MCPLS_LISTEN` is not set.
 
 **Default**: `/mcp`
 
@@ -702,12 +724,38 @@ accepted sockets on Linux and Android. A client that ignores server `ping` reque
 disconnected every 90 s; use `off` for it. The probe interval and deadline are
 configurable only when embedding `mcpls-core` (`StreamLiveness`).
 
+A session whose client answers probes on an open GET stream stays alive until
+the client closes the stream or sends `DELETE`. With `off` there is no proof of
+life, so an open GET stream does not hold its session: the session expires
+after 5 minutes without an inbound request, even while the stream receives
+notifications. Clients using `off` must send a request (for example `ping`)
+more often than that. A POST response stream whose peer vanished mid-write
+keeps its session until the connection fails (`TCP_USER_TIMEOUT` on Linux and
+Android, the OS default elsewhere, or the reverse proxy timeout).
+
 **Default**: `probe`
 
 ```bash
 export MCPLS_HTTP_STREAM_LIVENESS=off
 mcpls
 ```
+
+## Secret Redaction
+
+mcpls hides the values of secret-named environment variables, secret-named
+`--flag=value` / `--flag value` arguments and secret-keyed
+`initialization_options` strings (names containing `TOKEN`, `KEY`, `SECRET`,
+`PASSW`, `CRED` or `AUTH`, case-insensitive; values under 8 bytes are not
+redacted) from everything that reaches logs or MCP clients: server log and
+show messages, startup and request errors, trace-level wire logs, and the
+spawn argument list (only the count is logged at `info`; values appear
+redacted at `debug`). Replacements read `[redacted:NAME]`.
+
+Matching is by exact value, plus its JSON-escaped and `Debug`-escaped
+spellings. A server that re-encodes a secret, for example as a `\uXXXX`
+escape for non-ASCII text, as `\/` for a `/`, or as URL or base64 text, can
+slip past the redaction in trace-level wire logs; typical ASCII tokens without
+a `/` are unaffected.
 
 ## Complete Examples
 
@@ -919,7 +967,7 @@ mcpls --log-json
 
 # HTTP transport (requires transport-http feature)
 mcpls --listen 127.0.0.1:3000
-mcpls --listen 127.0.0.1:3000 --http-path /api/mcp
+mcpls --listen 127.0.0.1:3000 --http-path /api/mcp   # must start with "/", not "/" itself
 mcpls --listen 127.0.0.1:3000 --http-stream-liveness off
 
 # Show version

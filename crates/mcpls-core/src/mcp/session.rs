@@ -378,7 +378,7 @@ struct RegistryInner {
 /// use std::sync::Arc;
 ///
 /// use mcpls_core::bridge::{NotificationCache, Translator, WorkspaceRoots};
-/// use mcpls_core::config::McpConfig;
+/// use mcpls_core::config::{McpConfig, ProjectConfigStatus};
 /// use mcpls_core::mcp::{McplsServer, SubscriptionRegistry};
 /// use tokio::sync::Mutex;
 ///
@@ -390,7 +390,7 @@ struct RegistryInner {
 ///     Arc::new(Mutex::new(NotificationCache::new())),
 ///     WorkspaceRoots::default(),
 ///     registry.clone(),
-///     false,
+///     ProjectConfigStatus::NotIgnored,
 ///     McpConfig::default(),
 /// );
 /// let _session = server.for_new_session();

@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub use language::{base_language_id, react_variant_language_id};
-pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
+pub use routing::{NoServerReason, ServerId, ServerSettlement, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
     BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_HEURISTICS_DEPTH,
@@ -64,7 +64,7 @@ pub struct ServerConfig {
     /// `tracing::warn!` emitted at load time (which is stderr-only and
     /// typically invisible to an MCP client).
     #[serde(skip)]
-    pub project_config_ignored: bool,
+    pub project_config_status: ProjectConfigStatus,
 }
 
 /// Optional overrides for the text mcpls reports about itself over MCP.
@@ -81,7 +81,7 @@ pub struct ServerConfig {
 /// appending to it -- an agent that reads `instructions` at connection time
 /// (see `skills/mcpls/SKILL.md`) sees only the configured text, plus the
 /// unrelated untrusted-project-config NOTE (see
-/// [`ServerConfig::project_config_ignored`]), which is always appended
+/// [`ServerConfig::project_config_status`]), which is always appended
 /// afterward regardless of this field.
 ///
 /// Every field reaches an MCP client verbatim on every `initialize`
@@ -117,7 +117,7 @@ pub struct McpConfig {
 
     /// Replaces the built-in `RmcpServerConfig.instructions` capability blurb.
     /// Omit to keep the built-in text. The untrusted-project-config NOTE
-    /// (see [`ServerConfig::project_config_ignored`]) is still appended
+    /// (see [`ServerConfig::project_config_status`]) is still appended
     /// after this value when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -671,6 +671,27 @@ pub enum ProjectConfigTrust {
     Trusted,
 }
 
+/// Whether a CWD-discovered `./mcpls.toml` took part in a config load.
+///
+/// Load-time metadata carried on [`ServerConfig::project_config_status`] and
+/// surfaced to MCP clients in-band by `McplsServer::get_info`.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::ProjectConfigStatus;
+///
+/// assert_eq!(ProjectConfigStatus::default(), ProjectConfigStatus::NotIgnored);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProjectConfigStatus {
+    /// No project-local config was skipped.
+    #[default]
+    NotIgnored,
+    /// A CWD-discovered `./mcpls.toml` was skipped because it is untrusted.
+    IgnoredUntrusted,
+}
+
 /// Maximum size, in bytes, of a config file `load_from` will read.
 ///
 /// A config file is trusted TOML on a normal setup, but nothing stops a
@@ -771,8 +792,8 @@ impl ServerConfig {
     /// logged naming the ignored path; discovery falls through to the
     /// global config tier or built-in defaults, so project-marker
     /// heuristics (e.g. `Cargo.toml` → rust-analyzer) still apply normally.
-    /// The returned config's [`project_config_ignored`](Self::project_config_ignored)
-    /// is set to `true` in that case, so callers with access to the loaded
+    /// The returned config's [`project_config_status`](Self::project_config_status)
+    /// is [`ProjectConfigStatus::IgnoredUntrusted`] in that case, so callers with access to the loaded
     /// config (e.g. `McplsServer::get_info`) can surface the ignore decision
     /// in-band, not just via the stderr-only warning.
     ///
@@ -803,14 +824,14 @@ impl ServerConfig {
             return Self::load_from(Path::new(&path));
         }
 
-        let mut project_config_ignored = false;
+        let mut project_config_status = ProjectConfigStatus::NotIgnored;
 
         let local_config = PathBuf::from("mcpls.toml");
         if local_config.exists() {
             match trust {
                 ProjectConfigTrust::Trusted => return Self::load_from(&local_config),
                 ProjectConfigTrust::Untrusted => {
-                    project_config_ignored = true;
+                    project_config_status = ProjectConfigStatus::IgnoredUntrusted;
                     let display_path = local_config.canonicalize().unwrap_or_else(|_| {
                         std::env::current_dir()
                             .map_or_else(|_| local_config.clone(), |cwd| cwd.join(&local_config))
@@ -838,7 +859,7 @@ impl ServerConfig {
                 // unchanged for project-local `mcpls.toml` and `$MCPLS_CONFIG`.
                 let mut config =
                     Self::load_from_with_root_base(&user_config, RelativeRootBase::Cwd)?;
-                config.project_config_ignored = project_config_ignored;
+                config.project_config_status = project_config_status;
                 return Ok(config);
             }
 
@@ -856,7 +877,7 @@ impl ServerConfig {
 
         // Return default configuration
         Ok(Self {
-            project_config_ignored,
+            project_config_status,
             ..Self::default()
         })
     }
@@ -1248,7 +1269,7 @@ impl Default for ServerConfig {
                 LspServerConfig::clangd(),
                 LspServerConfig::zls(),
             ],
-            project_config_ignored: false,
+            project_config_status: ProjectConfigStatus::NotIgnored,
         }
     }
 }
@@ -2224,7 +2245,7 @@ mod tests {
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
             }],
-            project_config_ignored: false,
+            project_config_status: ProjectConfigStatus::NotIgnored,
         };
 
         let map = config.build_effective_extension_map();
@@ -2251,7 +2272,7 @@ mod tests {
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
             }],
-            project_config_ignored: false,
+            project_config_status: ProjectConfigStatus::NotIgnored,
         };
 
         let map = config.build_effective_extension_map();
@@ -2278,7 +2299,7 @@ mod tests {
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
             }],
-            project_config_ignored: false,
+            project_config_status: ProjectConfigStatus::NotIgnored,
         };
 
         let map = config.build_effective_extension_map();
@@ -2305,7 +2326,7 @@ mod tests {
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
             }],
-            project_config_ignored: false,
+            project_config_status: ProjectConfigStatus::NotIgnored,
         };
 
         let map = config.build_effective_extension_map();
@@ -2537,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_with_trust_sets_project_config_ignored_flag() {
+    fn test_load_with_trust_sets_project_config_status() {
         assert_mcpls_config_env_unset();
 
         let tmp_dir = TempDir::new().unwrap();
@@ -2548,7 +2569,10 @@ mod tests {
             let _guard = CwdGuard::enter(tmp_dir.path());
             ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap()
         };
-        assert!(config.project_config_ignored);
+        assert_eq!(
+            config.project_config_status,
+            ProjectConfigStatus::IgnoredUntrusted
+        );
 
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("mcpls.toml");
@@ -2558,7 +2582,10 @@ mod tests {
             let _guard = CwdGuard::enter(tmp_dir.path());
             ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap()
         };
-        assert!(!config.project_config_ignored);
+        assert_eq!(
+            config.project_config_status,
+            ProjectConfigStatus::NotIgnored
+        );
     }
 
     #[test]
@@ -2571,7 +2598,10 @@ mod tests {
             let _guard = CwdGuard::enter(tmp_dir.path());
             ServerConfig::load_with_trust(ProjectConfigTrust::Untrusted).unwrap()
         };
-        assert!(!config.project_config_ignored);
+        assert_eq!(
+            config.project_config_status,
+            ProjectConfigStatus::NotIgnored
+        );
     }
 
     #[test]
