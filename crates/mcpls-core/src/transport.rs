@@ -2930,9 +2930,9 @@ mod tests {
             std::fs::write(&file_path, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file_path).unwrap();
 
-            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![
-                workspace.path().to_path_buf(),
-            ]));
+            let server = test_server_with_roots(
+                WorkspaceRoots::from_configured(&[workspace.path().to_path_buf()]).unwrap(),
+            );
             let registry = server.subscription_registry();
 
             let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
@@ -3288,7 +3288,9 @@ mod tests {
             let uri_x = crate::bridge::resources::make_uri(&file_x).unwrap();
             let uri_y = crate::bridge::resources::make_uri(&file_y).unwrap();
 
-            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
+            let server = test_server_with_roots(
+                WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+            );
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
 
@@ -3298,8 +3300,10 @@ mod tests {
             subscribe_in_session(addr, &session_a, &uri_y).await;
             subscribe_in_session(addr, &session_b, &uri_y).await;
 
-            let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
+            let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
+                registry,
+                WorkspaceRoots::from_configured(&[root]).unwrap(),
+            );
             let publish = |file: &std::path::Path| {
                 let notification = crate::lsp::LspNotification::PublishDiagnostics(
                     lsp_types::PublishDiagnosticsParams {
@@ -3894,7 +3898,9 @@ mod tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
+            let server = test_server_with_roots(
+                WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+            );
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
@@ -3902,8 +3908,10 @@ mod tests {
             subscribe_in_session(addr, &session, &uri).await;
             drop(stream);
 
-            let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
+            let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
+                registry,
+                WorkspaceRoots::from_configured(&[root]).unwrap(),
+            );
             let accept_headers =
                 "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
             let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
@@ -3938,14 +3946,18 @@ mod tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
+            let server = test_server_with_roots(
+                WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+            );
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
             let (session, mut stream) = establish_session(addr).await;
             subscribe_in_session(addr, &session, &uri).await;
-            let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
+            let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
+                registry,
+                WorkspaceRoots::from_configured(&[root]).unwrap(),
+            );
 
             let started = tokio::time::Instant::now();
             while started.elapsed() < TEST_IDLE * 3 {
@@ -3988,7 +4000,9 @@ mod tests {
             let file = root.join("main.rs");
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
-            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
+            let server = test_server_with_roots(
+                WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+            );
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
             ListenFixture {
@@ -4062,7 +4076,7 @@ mod tests {
             }
             let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
                 fx.registry.clone(),
-                WorkspaceRoots::resolve(vec![fx.root.clone()]),
+                WorkspaceRoots::from_configured(std::slice::from_ref(&fx.root)).unwrap(),
             );
             tx.send(publish_notification(&fx.file)).await.unwrap();
 
@@ -4137,7 +4151,7 @@ mod tests {
             let server = crate::mcp::McplsServer::new(
                 std::sync::Arc::new(crate::bridge::Translator::new()),
                 cache,
-                WorkspaceRoots::resolve(vec![root]),
+                WorkspaceRoots::from_configured(&[root]).unwrap(),
                 crate::mcp::SubscriptionRegistry::new(),
                 crate::ProjectConfigStatus::NotIgnored,
                 crate::config::McpConfig::default(),

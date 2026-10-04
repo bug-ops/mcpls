@@ -2563,7 +2563,12 @@ sleep 5
             let temp_dir = TempDir::new().unwrap();
             let base = dunce::canonicalize(temp_dir.path()).unwrap();
             let workspace_roots =
-                crate::resolve_workspace_roots(&[PathBuf::from(".")], &base).unwrap();
+                crate::bridge::WorkspaceRoots::from_configured_with(&[PathBuf::from(".")], || {
+                    Ok(crate::bridge::ProcessCwd::new(base.clone(), None))
+                })
+                .unwrap()
+                .canonical()
+                .to_vec();
             assert_eq!(workspace_roots, vec![base.clone()]);
 
             let (client, mut server) = fake_lsp_client();

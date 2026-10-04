@@ -1,5 +1,7 @@
 //! MCP tool parameter definitions.
 
+use std::path::PathBuf;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct PositionParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
+    pub file_path: PathBuf,
     /// Line number (1-based).
     #[schemars(description = "Line number (1-based).")]
     pub line: u32,
@@ -55,7 +57,7 @@ pub struct ReferencesParams {
 pub struct DiagnosticsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
+    pub file_path: PathBuf,
 }
 
 /// Parameters for the `rename_symbol` tool.
@@ -88,7 +90,7 @@ pub struct CompletionsParams {
 pub struct DocumentSymbolsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
+    pub file_path: PathBuf,
 }
 
 /// Parameters for the `format_document` tool.
@@ -97,7 +99,7 @@ pub struct DocumentSymbolsParams {
 pub struct FormatDocumentParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
+    pub file_path: PathBuf,
     /// Tab size for formatting (default: 4).
     #[schemars(description = "Tab size for formatting (default: 4).")]
     #[serde(default = "default_tab_size")]
@@ -156,7 +158,7 @@ const fn default_max_results() -> u32 {
 pub struct CodeActionsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
+    pub file_path: PathBuf,
     /// Range in the file to operate on.
     #[serde(flatten)]
     pub range: RangeParams,
@@ -185,7 +187,7 @@ pub struct CallHierarchyCallsParams {
 pub struct CachedDiagnosticsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
+    pub file_path: PathBuf,
 }
 
 /// Parameters for the `get_server_logs` tool.
@@ -229,7 +231,7 @@ pub struct ToolSupportParams {
     /// Restrict the report to the language of this file.
     #[schemars(description = "Absolute path to a file; restricts the report to its language.")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_path: Option<String>,
+    pub file_path: Option<PathBuf>,
 }
 
 /// Parameters for the `get_inlay_hints` tool.
@@ -238,7 +240,7 @@ pub struct ToolSupportParams {
 pub struct InlayHintsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
-    pub file_path: String,
+    pub file_path: PathBuf,
     /// Range in the file to operate on.
     #[serde(flatten)]
     pub range: RangeParams,
@@ -247,6 +249,8 @@ pub struct InlayHintsParams {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     /// `#[serde(flatten)]` must keep `PositionParams`/`RangeParams` fields at
@@ -256,7 +260,7 @@ mod tests {
     fn flattened_params_serialize_to_flat_json() {
         let references = ReferencesParams {
             position: PositionParams {
-                file_path: "/a.rs".to_string(),
+                file_path: PathBuf::from("/a.rs"),
                 line: 1,
                 character: 2,
             },
@@ -274,7 +278,7 @@ mod tests {
         );
 
         let inlay = InlayHintsParams {
-            file_path: "/b.rs".to_string(),
+            file_path: PathBuf::from("/b.rs"),
             range: RangeParams {
                 start_line: 1,
                 start_character: 2,
@@ -301,7 +305,7 @@ mod tests {
     fn flat_json_deserializes_into_flattened_params() {
         let json = serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2});
         let references: ReferencesParams = serde_json::from_value(json).unwrap();
-        assert_eq!(references.position.file_path, "/a.rs");
+        assert_eq!(references.position.file_path.as_path(), Path::new("/a.rs"));
         assert_eq!(references.position.line, 1);
         assert_eq!(references.position.character, 2);
         assert!(!references.include_declaration);

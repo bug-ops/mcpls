@@ -1,5 +1,4 @@
 use std::assert_matches;
-use std::path::PathBuf;
 
 use mcpls_core::bridge::{Translator, WorkspaceRoots};
 use mcpls_core::config::{ServerConfig, ServerId, ToolKind, ToolRouter};
@@ -59,11 +58,14 @@ fn test_rust_workspace_fixture_exists() {
 }
 
 #[test]
+#[allow(clippy::expect_used)]
 fn test_workspace_roots_configuration() {
     let mut translator = Translator::new();
-    let roots = vec![PathBuf::from("/tmp/test1"), PathBuf::from("/tmp/test2")];
+    let first = tempfile::tempdir().expect("tempdir");
+    let second = tempfile::tempdir().expect("tempdir");
+    let roots = [first.path().to_path_buf(), second.path().to_path_buf()];
 
-    translator.set_workspace_roots(WorkspaceRoots::resolve(roots));
+    translator.set_workspace_roots(WorkspaceRoots::from_configured(&roots).expect("roots resolve"));
 }
 
 #[test]

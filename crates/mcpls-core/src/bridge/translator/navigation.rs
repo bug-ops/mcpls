@@ -16,11 +16,11 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
-use crate::bridge::IndexingState;
 use crate::bridge::indexing::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE,
     PROGRESS_SETTLE,
 };
+use crate::bridge::{ClientPath, IndexingState};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 
@@ -444,7 +444,11 @@ impl Translator {
     /// the routed server does not advertise `hoverProvider` support, or the
     /// server is still indexing the workspace after
     /// `INDEXING_READY_TIMEOUT`.
-    pub async fn handle_hover(&self, file_path: String, position: Position) -> Result<HoverResult> {
+    pub async fn handle_hover(
+        &self,
+        file_path: ClientPath,
+        position: Position,
+    ) -> Result<HoverResult> {
         let doc = self
             .prepare_gated_document(&file_path, Capability::Hover, IndexingGate::Required)
             .await?;
@@ -503,7 +507,7 @@ impl Translator {
     /// server is still indexing the workspace after `INDEXING_READY_TIMEOUT`.
     async fn handle_goto<R, T>(
         &self,
-        file_path: &str,
+        file_path: &ClientPath,
         position: Position,
         capability: Capability,
     ) -> Result<NormalizedLocations>
@@ -541,7 +545,7 @@ impl Translator {
     /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_definition(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         position: Position,
     ) -> Result<DefinitionResult> {
         let NormalizedLocations {
@@ -573,7 +577,7 @@ impl Translator {
     /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_references(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         position: Position,
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
@@ -626,7 +630,7 @@ impl Translator {
     /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_implementation(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         position: Position,
     ) -> Result<LocationsResult> {
         let NormalizedLocations {
@@ -661,7 +665,7 @@ impl Translator {
     /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_type_definition(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         position: Position,
     ) -> Result<LocationsResult> {
         let NormalizedLocations {
@@ -702,6 +706,7 @@ mod tests {
     use crate::bridge::translator::testing::*;
     use crate::bridge::{NotificationCache, lock_std, path_to_uri};
     use crate::config::ServerId;
+    use crate::test_lsp::client_path;
 
     // -----------------------------------------------------------------
     // Indexing readiness gate (`Translator::wait_for_indexing_ready`)
@@ -867,7 +872,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_hover(path.to_string_lossy().to_string(), pos(1, 1))
+            .handle_hover(client_path(path.to_string_lossy().into_owned()), pos(1, 1))
             .await
             .unwrap_err();
 
@@ -903,7 +908,7 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = path.to_string_lossy().to_string();
-            tokio::spawn(async move { translator.handle_hover(path, pos(1, 1)).await })
+            tokio::spawn(async move { translator.handle_hover(client_path(path), pos(1, 1)).await })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -953,7 +958,7 @@ mod tests {
         let spawn_hover = || {
             let translator = Arc::clone(&translator);
             let path = path.clone();
-            tokio::spawn(async move { translator.handle_hover(path, pos(1, 1)).await })
+            tokio::spawn(async move { translator.handle_hover(client_path(path), pos(1, 1)).await })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1009,7 +1014,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_definition(path.to_string_lossy().to_string(), pos(1, 1))
+            .handle_definition(client_path(path.to_string_lossy().into_owned()), pos(1, 1))
             .await
             .unwrap_err();
 
@@ -1045,7 +1050,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = path.to_string_lossy().to_string();
-            tokio::spawn(async move { translator.handle_definition(path, pos(1, 1)).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_definition(client_path(path), pos(1, 1))
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1090,7 +1099,11 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_references(path.to_string_lossy().to_string(), pos(1, 1), true)
+            .handle_references(
+                client_path(path.to_string_lossy().into_owned()),
+                pos(1, 1),
+                true,
+            )
             .await
             .unwrap_err();
 
@@ -1126,7 +1139,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = path.to_string_lossy().to_string();
-            tokio::spawn(async move { translator.handle_references(path, pos(1, 1), true).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_references(client_path(path), pos(1, 1), true)
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1172,7 +1189,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_implementation(path.to_string_lossy().to_string(), pos(1, 1))
+            .handle_implementation(client_path(path.to_string_lossy().into_owned()), pos(1, 1))
             .await
             .unwrap_err();
 
@@ -1205,7 +1222,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_type_definition(path.to_string_lossy().to_string(), pos(1, 1))
+            .handle_type_definition(client_path(path.to_string_lossy().into_owned()), pos(1, 1))
             .await
             .unwrap_err();
 
@@ -1371,7 +1388,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_definition(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -1442,7 +1459,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_definition(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -1514,7 +1531,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = path.to_string_lossy().to_string();
-            tokio::spawn(async move { translator.handle_references(path, pos(1, 1), true).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_references(client_path(path), pos(1, 1), true)
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1601,7 +1622,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = path.to_string_lossy().to_string();
-            tokio::spawn(async move { translator.handle_references(path, pos(1, 1), true).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_references(client_path(path), pos(1, 1), true)
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1670,7 +1695,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_implementation(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -1747,7 +1772,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_type_definition(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
