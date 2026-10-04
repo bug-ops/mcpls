@@ -344,7 +344,7 @@ impl LspServer {
     }
 
     /// Replace the config a respawn of this server would use.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_init_config(&mut self, config: ServerInitConfig) {
         self.init_config = config;
     }
