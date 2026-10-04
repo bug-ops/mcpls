@@ -1,0 +1,25 @@
+name = "lsmcp"
+pinned = "@mizchi/lsmcp@0.10.0"
+cleanup = [".lsmcp"]
+args = ["-y", "@mizchi/lsmcp@0.10.0", "-p", "typescript"]
+
+[launcher]
+command = "npx"
+version_args = ["--version"]
+
+[tools.hover]
+tool = "lsp_get_hover"
+arguments = { root = "{repo}", relativePath = "{relative_file}", line = "{line1}", character = "{character0}" }
+
+[tools.definition]
+tool = "lsp_get_definitions"
+arguments = { root = "{repo}", relativePath = "{relative_file}", line = "{line1}", column = "{character0}", symbolName = "{symbol}" }
+
+[tools.references]
+tool = "lsp_find_references"
+arguments = { root = "{repo}", relativePath = "{relative_file}", line = "{line1}", column = "{character0}", symbolName = "{symbol}" }
+count_marker = ".ts:"
+
+[tools.document_symbols]
+tool = "lsp_get_document_symbols"
+arguments = { root = "{repo}", relativePath = "{relative_file}" }

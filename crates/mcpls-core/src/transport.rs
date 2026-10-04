@@ -131,6 +131,12 @@ pub struct HttpConfig {
     ///
     /// Defaults to [`StreamLiveness::DEFAULT`].
     pub stream_liveness: StreamLiveness,
+    /// Lifetime of stateless `subscriptions/listen` streams.
+    ///
+    /// `None` (the default) follows [`HttpConfig::stream_liveness`]: the
+    /// default lease while probing, none when it is
+    /// [`StreamLiveness::Disabled`].
+    pub listen_lease: Option<ListenLease>,
 }
 
 #[cfg(feature = "transport-http")]
@@ -161,6 +167,7 @@ impl HttpConfig {
             header_read_timeout: HeaderReadTimeout::DEFAULT,
             max_concurrent_connections: ConnectionLimit::DEFAULT,
             stream_liveness: StreamLiveness::DEFAULT,
+            listen_lease: None,
         }
     }
 
@@ -224,6 +231,48 @@ impl HttpConfig {
     pub const fn with_stream_liveness(mut self, liveness: StreamLiveness) -> Self {
         self.stream_liveness = liveness;
         self
+    }
+
+    /// Override the lifetime of stateless `subscriptions/listen` streams
+    /// instead of deriving it from [`HttpConfig::stream_liveness`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::HttpConfig;
+    /// use mcpls_core::transport::ListenLease;
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap())
+    ///     .with_listen_lease(ListenLease::Unbounded);
+    /// assert_eq!(cfg.effective_listen_lease(), ListenLease::Unbounded);
+    /// ```
+    #[must_use]
+    pub const fn with_listen_lease(mut self, lease: ListenLease) -> Self {
+        self.listen_lease = Some(lease);
+        self
+    }
+
+    /// The listen lease in force: the explicit override, else the default
+    /// lease while stream liveness probing is on and none when it is off.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::{HttpConfig, StreamLiveness};
+    /// use mcpls_core::transport::ListenLease;
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap());
+    /// assert_eq!(cfg.effective_listen_lease(), ListenLease::default());
+    /// let off = cfg.with_stream_liveness(StreamLiveness::Disabled);
+    /// assert_eq!(off.effective_listen_lease(), ListenLease::Unbounded);
+    /// ```
+    #[must_use]
+    pub const fn effective_listen_lease(&self) -> ListenLease {
+        match (self.listen_lease, self.stream_liveness) {
+            (Some(lease), _) => lease,
+            (None, StreamLiveness::Probe { .. }) => ListenLease::Renew(LeaseWindow::DEFAULT),
+            (None, StreamLiveness::Disabled) => ListenLease::Unbounded,
+        }
     }
 }
 
@@ -565,7 +614,14 @@ use rmcp::transport::streamable_http_server::session::{
 use crate::bridge::lock_std;
 
 #[cfg(feature = "transport-http")]
+mod lease;
+#[cfg(feature = "transport-http")]
 mod liveness;
+#[cfg(feature = "transport-http")]
+pub(crate) use lease::ListenLeaseSlot;
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+pub use lease::{LeaseWindow, ListenLease};
 #[cfg(feature = "transport-http")]
 use liveness::{ProbeId, SessionLiveness, StreamProbe, is_common_channel_event_id};
 
@@ -810,8 +866,17 @@ pub(crate) async fn run_stdio(
 /// session; the client's reconnect (with `Last-Event-ID`) resumes it. A client
 /// that never answers server `ping` requests would be disconnected every
 /// interval plus deadline, so [`StreamLiveness::Disabled`] switches probing
-/// off. Request-wise resumes and stateless `subscriptions/listen` streams are
-/// not probed.
+/// off. Request-wise resumes are not probed.
+///
+/// Stateless `subscriptions/listen` streams cannot be probed (no session, and
+/// a client cannot answer a server `ping`), so they get a lease instead
+/// ([`ListenLease`], default 15 to 30 minutes with random jitter): the HTTP
+/// body then ends abruptly, without a final result, which a client reads as a
+/// transport close and answers by listening again. The replay on listen covers
+/// the gap. A client that never re-listens stops receiving push updates after
+/// one lease but can still read resources. The lease is off together with
+/// [`StreamLiveness::Disabled`] unless [`HttpConfig::with_listen_lease`] says
+/// otherwise.
 ///
 /// A session is closed, freeing its `max_concurrent_sessions` permit, once it
 /// has had no inbound client activity and no open response stream (POST or
@@ -902,8 +967,6 @@ pub(crate) async fn run_http(
     cfg: HttpConfig,
     shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
-    // TODO(#551): stateless `subscriptions/listen` streams have no session to
-    // ack a liveness probe; they are bounded only by `MAX_LISTEN_STREAMS`
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .map_err(|source| crate::Error::HttpBind {
@@ -986,6 +1049,10 @@ pub(crate) async fn serve_http(
     let app = axum::Router::new()
         .nest_service(cfg.path.as_str(), service.clone())
         .route_service("/", service)
+        .layer(axum::middleware::from_fn_with_state(
+            cfg.effective_listen_lease(),
+            lease::attach_listen_lease,
+        ))
         .layer(axum::middleware::from_fn(enforce_session_cap))
         .layer(axum::middleware::from_fn_with_state(
             cfg.header_read_timeout,
@@ -4227,6 +4294,198 @@ mod tests {
             assert!(acknowledged);
             assert_eq!(error["code"], -32602);
             fx.server_task.abort();
+        }
+
+        fn short_lease(ms: u64) -> super::super::ListenLease {
+            let d = std::time::Duration::from_millis(ms);
+            super::super::ListenLease::Renew(super::super::LeaseWindow::new(d, d).unwrap())
+        }
+
+        #[test]
+        fn test_listen_lease_follows_stream_liveness_unless_overridden() {
+            use super::super::{LeaseWindow, ListenLease};
+
+            let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap());
+            assert_eq!(
+                cfg.effective_listen_lease(),
+                ListenLease::Renew(LeaseWindow::DEFAULT)
+            );
+            let off = cfg.with_stream_liveness(StreamLiveness::Disabled);
+            assert_eq!(off.effective_listen_lease(), ListenLease::Unbounded);
+            let forced = off.with_listen_lease(short_lease(5));
+            assert_eq!(forced.effective_listen_lease(), short_lease(5));
+        }
+
+        /// #551: a listen stream ends abruptly after its lease -- no final
+        /// result and no SSE event id, so a client reads it as a transport
+        /// close and listens again -- freeing its slot, and a re-listen works.
+        #[tokio::test]
+        async fn test_http_listen_lease_ends_stream_abruptly_and_frees_slot() {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+            let uri = crate::bridge::resources::make_uri(&root.join("main.rs")).unwrap();
+            let server = test_server_with_roots(WorkspaceRoots::from_configured(&[root]).unwrap());
+            let registry = server.subscription_registry();
+            let (addr, server_task) =
+                spawn_http_server(server, |cfg| cfg.with_listen_lease(short_lease(300))).await;
+            let notifications = serde_json::json!({"resourceSubscriptions": [uri]});
+
+            let mut stream = SseStream::open_listen(addr, &notifications).await;
+            assert!(
+                stream.ends_within(std::time::Duration::from_secs(10)).await,
+                "the lease must end the stream"
+            );
+            assert!(
+                !stream.buf.contains("\"result\""),
+                "a lease end must not carry a final result: {}",
+                stream.buf
+            );
+            assert!(
+                !stream.buf.lines().any(|line| line.starts_with("id:")),
+                "stateless SSE must not emit event ids: {}",
+                stream.buf
+            );
+            assert_registry_empties(&registry).await;
+
+            let mut again = SseStream::open_listen(addr, &notifications).await;
+            assert!(
+                again.ends_within(std::time::Duration::from_secs(10)).await,
+                "a re-listen gets a fresh lease"
+            );
+            server_task.abort();
+        }
+
+        /// #551: with the lease off (`--http-stream-liveness off` resolves to
+        /// this) a listen stream is not ended on a timer.
+        #[tokio::test]
+        async fn test_http_listen_without_lease_is_not_ended() {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+            let uri = crate::bridge::resources::make_uri(&root.join("main.rs")).unwrap();
+            let server = test_server_with_roots(WorkspaceRoots::from_configured(&[root]).unwrap());
+            let (addr, server_task) = spawn_http_server(server, |cfg| {
+                cfg.with_stream_liveness(StreamLiveness::Disabled)
+            })
+            .await;
+            let mut stream =
+                SseStream::open_listen(addr, &serde_json::json!({"resourceSubscriptions": [uri]}))
+                    .await;
+            assert!(
+                !stream
+                    .ends_within(std::time::Duration::from_millis(1500))
+                    .await
+            );
+            server_task.abort();
+        }
+
+        /// #551 with a real rmcp client at its default 64-slot subscription
+        /// buffer: 200 subscribed URIs of which 10 are cached and one had its
+        /// clear evicted. Each listen replays only those 11 (never all 200, which
+        /// would overflow the buffer), ends abruptly at the lease, and the
+        /// re-listen replays them again.
+        #[tokio::test]
+        async fn test_http_listen_lease_with_real_client_replays_cache_and_evictions() {
+            use rmcp::ClientServiceExt as _;
+            use rmcp::model::{
+                ClientConfig, ProtocolVersion, ServerNotification, SubscriptionFilter,
+            };
+            use rmcp::service::SubscriptionEnd;
+            use rmcp::transport::StreamableHttpClientTransport;
+            use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+            const REQUESTED: usize = 200;
+            const CACHED: usize = 10;
+            let server_id = crate::config::ServerId::from("rust");
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let make = |name: &str| {
+                let path = root.join(name);
+                std::fs::write(&path, "").unwrap();
+                (
+                    crate::bridge::path_to_uri(&path).unwrap(),
+                    crate::bridge::resources::make_uri(&path).unwrap(),
+                )
+            };
+            let mut cache = crate::bridge::NotificationCache::new();
+            let (evicted_lsp, evicted_uri) = make("evicted.rs");
+            cache.store_diagnostics(&server_id, &evicted_lsp, None, vec![]);
+            let mut expected = std::collections::BTreeSet::from([evicted_uri.clone()]);
+            let mut requested = vec![evicted_uri];
+            for i in 0..REQUESTED - 1 {
+                let (lsp, uri) = make(&format!("f{i}.rs"));
+                if i < CACHED {
+                    let diagnostic = lsp_types::Diagnostic {
+                        message: "broken".to_owned().into(),
+                        ..lsp_types::Diagnostic::default()
+                    };
+                    cache.store_diagnostics(&server_id, &lsp, None, vec![diagnostic]);
+                    expected.insert(uri.clone());
+                }
+                requested.push(uri);
+            }
+            let padding = lsp_types::Diagnostic {
+                message: "filler".to_owned().into(),
+                ..lsp_types::Diagnostic::default()
+            };
+            let mut fillers = 0;
+            while cache.has_diagnostics(&evicted_lsp) {
+                let uri = lsp_types::Uri::from(format!("file:///filler{fillers}.rs"));
+                cache.store_diagnostics(&server_id, &uri, None, vec![padding.clone()]);
+                fillers += 1;
+            }
+            assert_eq!(expected.len(), CACHED + 1);
+
+            let server = crate::mcp::McplsServer::new(
+                std::sync::Arc::new(crate::bridge::Translator::new()),
+                std::sync::Arc::new(tokio::sync::Mutex::new(cache)),
+                WorkspaceRoots::from_configured(&[root]).unwrap(),
+                crate::mcp::SubscriptionRegistry::new(),
+                crate::ProjectConfigStatus::NotIgnored,
+                crate::config::McpConfig::default(),
+            );
+            let (addr, server_task) =
+                spawn_http_server(server, |cfg| cfg.with_listen_lease(short_lease(500))).await;
+
+            let transport = StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
+            );
+            let client = ClientConfig::default()
+                .serve_with_lifecycle(
+                    transport,
+                    rmcp::ClientLifecycleMode::Discover {
+                        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    },
+                )
+                .await
+                .unwrap();
+            let mut filter = SubscriptionFilter::new();
+            filter.resource_subscriptions = Some(requested);
+
+            for round in 0..2 {
+                let mut subscription = client.listen(filter.clone()).await.unwrap();
+                let mut seen = std::collections::BTreeSet::new();
+                while let Some(notification) =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), subscription.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                {
+                    if let ServerNotification::ResourceUpdatedNotification(update) = notification {
+                        seen.insert(update.params.uri);
+                    }
+                }
+                assert_eq!(seen, expected, "round {round} replay");
+                assert!(
+                    matches!(subscription.end(), Some(SubscriptionEnd::Abrupt)),
+                    "round {round} must end abruptly, got {:?}",
+                    subscription.end()
+                );
+            }
+
+            client.cancel().await.unwrap();
+            server_task.abort();
         }
 
         /// #233: binding to a non-loopback address must log a warning that

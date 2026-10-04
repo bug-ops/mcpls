@@ -11,6 +11,8 @@ use mcpls_bench::report::{Kib, Micros, RunReport};
 use mcpls_bench::run::{RunOptions, run};
 use mcpls_bench::scenario::Scenario;
 use mcpls_bench::signals::ShutdownSignals;
+use mcpls_bench::stderr_log::{DEFAULT_CAP_MIB, StderrLogCap};
+use mcpls_bench::target::{ExternalTarget, Target};
 
 #[derive(Debug, Parser)]
 #[command(name = "mcpls-bench", version, about)]
@@ -37,8 +39,14 @@ enum Command {
         #[command(flatten)]
         scenario: ScenarioArgs,
         /// The mcpls binary; defaults to the `mcpls` next to this executable (never one from PATH).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "target")]
         mcpls: Option<PathBuf>,
+        /// Measure a comparison MCP server from this target definition instead of mcpls.
+        #[arg(long)]
+        target: Option<PathBuf>,
+        /// Largest stderr log kept per run, in MiB; the rest is drained and dropped.
+        #[arg(long, default_value_t = DEFAULT_CAP_MIB, value_parser = clap::value_parser!(u32).range(1..=4096))]
+        stderr_log_max_mib: u32,
         /// Measured runs, each a fresh mcpls process.
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(..=1000))]
         runs: u32,
@@ -88,10 +96,11 @@ fn scenario_dir(path: &Path) -> Result<PathBuf> {
 fn print_summary(report: &RunReport) {
     let cell = |us: Option<Micros>| us.map_or_else(|| "-".to_owned(), |m| m.0.to_string());
     eprintln!(
-        "{:<16} {:>4} {:>6} {:>11} {:>10} {:>10} {:>10} {:>10}",
+        "{:<16} {:>4} {:>6} {:>6} {:>11} {:>10} {:>10} {:>10} {:>10}",
         "region",
         "ok",
         "not_ok",
+        "unsupp",
         "first_med",
         "steady_min",
         "steady_med",
@@ -100,10 +109,11 @@ fn print_summary(report: &RunReport) {
     );
     for row in &report.summary {
         eprintln!(
-            "{:<16} {:>4} {:>6} {:>11} {:>10} {:>10} {:>10} {:>10}",
+            "{:<16} {:>4} {:>6} {:>6} {:>11} {:>10} {:>10} {:>10} {:>10}",
             row.region,
             row.ok,
             row.not_ok,
+            row.unsupported,
             cell(row.first.as_ref().map(|s| s.median_us)),
             cell(row.steady.as_ref().map(|s| s.min_us)),
             cell(row.steady.as_ref().map(|s| s.median_us)),
@@ -165,6 +175,8 @@ async fn execute(command: Command) -> Result<()> {
         Command::Run {
             scenario: args,
             mcpls,
+            target,
+            stderr_log_max_mib,
             runs,
             warmup_runs,
             iterations,
@@ -176,7 +188,13 @@ async fn execute(command: Command) -> Result<()> {
             let scenario = Scenario::load(&args.scenario)?;
             let work_dir = args.work_dir.map_or_else(WorkDir::default_path, Ok)?;
             let options = RunOptions {
-                mcpls: mcpls.map_or_else(default_mcpls, Ok)?,
+                target: match target {
+                    Some(path) => Target::External(Box::new(ExternalTarget::load(&path)?)),
+                    None => Target::Mcpls {
+                        binary: mcpls.map_or_else(default_mcpls, Ok)?,
+                    },
+                },
+                stderr_log_cap: StderrLogCap::from_mib(stderr_log_max_mib),
                 runs,
                 warmup_runs,
                 iterations,

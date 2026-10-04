@@ -2,12 +2,15 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::lock::WorkDirLock;
 use crate::pin::resolve_in_path;
+use crate::process_tree::ProcessGroup;
 use crate::scenario::{CommitSha, GitUrl, RepoSource, Scenario, SetupStep};
 
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -205,12 +208,14 @@ pub fn repo_dir(scenario: &Scenario, scenario_dir: &Path, work_dir: &Path) -> Re
 pub async fn prepare(scenario: &Scenario, scenario_dir: &Path, work_dir: &Path) -> Result<PathBuf> {
     let work_dir = absolute(work_dir)?;
     let work_dir = work_dir.as_path();
+    let work = WorkDir::new(work_dir)?;
+    let _lock = WorkDirLock::acquire(&work.0, &scenario.name).await?;
     let marker = marker_path(scenario, work_dir);
     if marker.exists() {
         std::fs::remove_file(&marker)
             .with_context(|| format!("failed to remove {}", marker.display()))?;
     }
-    let dir = source_dir(scenario, scenario_dir, || WorkDir::new(work_dir))?;
+    let dir = source_dir(scenario, scenario_dir, || Ok(work))?;
     if let RepoSource::Git { url, commit } = &scenario.source {
         checkout(url, commit, &dir).await?;
     }
@@ -454,12 +459,19 @@ fn git_command(dir: &Path) -> Result<Command> {
     Ok(command)
 }
 
+/// Runs `command` as the leader of its own process group, without a stdin.
+///
+/// A future dropped midway (a signal during `prepare`) kills the group, so no
+/// grandchild of a setup step outlives the interruption.
+async fn run_grouped(mut command: Command) -> Result<ExitStatus> {
+    command.stdin(Stdio::null());
+    ProcessGroup::spawn(command)?.wait_status().await
+}
+
 async fn git(dir: &Path, args: &[&str]) -> Result<()> {
-    let status = git_command(dir)?
-        .args(args)
-        .status()
-        .await
-        .context("failed to run git")?;
+    let mut command = git_command(dir)?;
+    command.args(args);
+    let status = run_grouped(command).await.context("failed to run git")?;
     if !status.success() {
         bail!("git {} exited with {status}", args.join(" "));
     }
@@ -467,11 +479,9 @@ async fn git(dir: &Path, args: &[&str]) -> Result<()> {
 }
 
 async fn run_checked<S: AsRef<OsStr> + Sync>(command: &str, args: &[S], dir: &Path) -> Result<()> {
-    let status = Command::new(resolve_in_path(command)?)
-        .args(args)
-        .current_dir(dir)
-        .kill_on_drop(true)
-        .status()
+    let mut process = Command::new(resolve_in_path(command)?);
+    process.args(args).current_dir(dir);
+    let status = run_grouped(process)
         .await
         .with_context(|| format!("failed to run `{command}`"))?;
     if !status.success() {
@@ -702,6 +712,42 @@ mod tests {
         std::fs::create_dir(&foreign).unwrap();
         std::fs::write(foreign.join("notes.txt"), "keep").unwrap();
         assert!(inspect(&foreign, &sha).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_setup_step_leaves_no_grandchildren() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "sleep 30 & echo $! > grandchild.pid; wait";
+        let interrupted = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_checked("sh", &["-c", script], tmp.path()),
+        )
+        .await;
+        assert!(interrupted.is_err());
+        let text = std::fs::read_to_string(tmp.path().join("grandchild.pid")).unwrap();
+        let pid = rustix::process::Pid::from_raw(text.trim().parse().unwrap()).unwrap();
+        for _ in 0..60 {
+            if rustix::process::test_kill_process(pid).is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the grandchild survived the interruption");
+    }
+
+    #[tokio::test]
+    async fn concurrent_prepares_of_one_scenario_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scenario: Scenario =
+            toml::from_str(include_str!("../scenarios/smoke-fixture.toml")).unwrap();
+        let _held = WorkDirLock::acquire(tmp.path(), &scenario.name)
+            .await
+            .unwrap();
+        let error = prepare(&scenario, Path::new("."), tmp.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("in use"), "{error:#}");
     }
 
     #[cfg(unix)]

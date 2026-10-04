@@ -1,0 +1,59 @@
+name = "vscode-tsls"
+setup = [
+    { command = "npm", args = ["ci", "--ignore-scripts"] },
+]
+
+[source]
+kind = "git"
+url = "https://github.com/microsoft/vscode"
+commit = "07f806f999227108933c2e30515b26eecc1fda74" # 1.140.0
+
+[server]
+language_id = "typescript"
+file_patterns = ["**/*.ts"]
+args = ["--stdio"]
+
+[server.executable]
+command = "typescript-language-server"
+version_args = ["--version"]
+
+[[runtime]]
+command = "node"
+version_args = ["--version"]
+
+[[runtime]]
+command = "npm"
+version_args = ["--version"]
+
+[ready_probe]
+kind = "hover"
+file = "src/vs/base/common/lifecycle.ts"
+position = { line = 12, character = 32 }
+contains = "onUnexpectedError"
+symbol = "onUnexpectedError"
+
+[[probes]]
+kind = "hover"
+file = "src/vs/base/common/lifecycle.ts"
+position = { line = 12, character = 32 }
+contains = "onUnexpectedError"
+symbol = "onUnexpectedError"
+
+[[probes]]
+kind = "definition"
+file = "src/vs/base/common/lifecycle.ts"
+position = { line = 12, character = 32 }
+uri_suffix = "src/vs/base/common/errors.ts"
+symbol = "onUnexpectedError"
+
+[[probes]]
+kind = "references"
+file = "src/vs/base/common/lifecycle.ts"
+position = { line = 312, character = 20 }
+min_count = 2
+symbol = "IDisposable"
+
+[[probes]]
+kind = "document_symbols"
+file = "src/vs/base/common/lifecycle.ts"
+symbol = "DisposableStore"

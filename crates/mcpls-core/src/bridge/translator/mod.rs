@@ -599,10 +599,12 @@ impl Translator {
     ///
     /// Drains the registered LSP servers and, for each one concurrently,
     /// sends the LSP `shutdown` request and `exit` notification via
-    /// [`LspServer::shutdown`], which is bounded by [`crate::lsp::SHUTDOWN_TIMEOUT`].
-    /// A server that errors or fails to respond in time is simply dropped
-    /// instead: its child process handle is `kill_on_drop(true)`, so the
-    /// process is killed rather than left running. Call this once, from the
+    /// [`LspServer::shutdown`], whose handshake is bounded by
+    /// [`crate::lsp::SHUTDOWN_TIMEOUT`] and which then sweeps the server's
+    /// whole process tree, for up to [`crate::lsp::LIFELINE_SWEEP_BUDGET`]
+    /// more. A server that errors or fails to respond in time has its tree
+    /// killed instead. No outer timeout is applied, so when this returns every
+    /// tree is gone. Call this once, from the
     /// top-level shutdown path, after the MCP transport has stopped
     /// accepting new requests.
     ///
@@ -616,8 +618,8 @@ impl Translator {
     /// OOM killer, the forced `exit(1)` on a second signal during shutdown,
     /// or a panic inside a `Drop` during unwinding) the children are still
     /// killed by the lifeline watchdog (Unix) or Job Object (Windows), see
-    /// `specs/lsp/007-lsp-child-process-lifetime`; only descendants that
-    /// leave the process group (`setsid`/`setpgid`) can survive.
+    /// `specs/lsp/007-lsp-child-process-lifetime`, which also sweeps
+    /// descendants that left the process group (`setsid`/`setpgid`).
     ///
     /// `pub(crate)` rather than `pub`: this is meant for exactly one call
     /// site (`serve_with`'s post-transport shutdown sequence), after the MCP

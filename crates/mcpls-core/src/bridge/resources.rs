@@ -180,9 +180,9 @@ pub(crate) struct DiagnosticsResourceUri(String);
 /// A server may publish through a symlinked spelling of a path (rust-analyzer
 /// does, for cargo-metadata paths); keying by that raw spelling would never
 /// match a subscription or read made through the canonical path. The only
-/// constructor is [`Self::resolve`], so a published URI cannot reach the
-/// cache index or a subscription key without being canonicalized and
-/// workspace-checked.
+/// constructor is [`Self::from_canonical_path`], fed by the pump's resolver,
+/// so a published URI cannot reach the cache index or a subscription key
+/// without being canonicalized and workspace-checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublishedDiagnosticsUri {
     source: lsp_types::Uri,
@@ -193,29 +193,39 @@ pub(crate) struct PublishedDiagnosticsUri {
     is_canonical: bool,
 }
 
+/// How trustworthy the canonical path handed to
+/// [`PublishedDiagnosticsUri::from_canonical_path`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalForm {
+    /// Produced by canonicalizing the filesystem (now or earlier).
+    Resolved,
+    /// The filesystem could not be asked; the published spelling stood in.
+    /// Never reported as canonical, so a stand-in cannot pass for the real
+    /// key in the alias index.
+    Fallback,
+}
+
 impl PublishedDiagnosticsUri {
-    /// Canonicalizes `published` (also when the file or some of its
-    /// directories no longer exist) and checks the result against
-    /// `roots`.
+    /// Pairs `published` with its already-resolved `canonical_path`, checking
+    /// the result against `roots`.
     ///
-    /// Returns `None` for a non-`file:` URI, an uncanonicalizable path, or a
-    /// canonical path outside every root (for example a symlink pointing out
-    /// of the workspace). Canonicalization runs on the blocking pool.
-    pub(crate) async fn resolve(
+    /// Returns `None` for a canonical path that cannot be encoded as a URI or
+    /// that lies outside every root (for example a symlink pointing out of
+    /// the workspace). Resolving the path is
+    /// [`PublishedPathResolver`](super::PublishedPathResolver)'s job.
+    pub(super) fn from_canonical_path(
         published: &lsp_types::Uri,
+        published_path: &Path,
+        canonical_path: &Path,
+        form: CanonicalForm,
         roots: &WorkspaceRoots,
     ) -> Option<Self> {
-        let path = uri_to_path(published)?;
-        let published_path = path.clone();
-        let canonical_path =
-            tokio::task::spawn_blocking(move || super::canonicalize_existing_prefix(&path))
-                .await
-                .ok()??;
-        let canonical = super::try_path_to_uri(&canonical_path)?;
-        roots.contains_canonical(&canonical_path).then(|| Self {
+        let canonical = super::try_path_to_uri(canonical_path)?;
+        roots.contains_canonical(canonical_path).then(|| Self {
             source: published.clone(),
             canonical,
-            is_canonical: same_path(&published_path, &canonical_path),
+            is_canonical: form == CanonicalForm::Resolved
+                && same_path(published_path, canonical_path),
         })
     }
 
@@ -617,6 +627,7 @@ mod tests {
     // DiagnosticsResourceUri
     // ------------------------------------------------------------------
 
+    use crate::bridge::resolve_one;
     use crate::test_lsp::{diagnostics_uri as u, workspace_with_main_rs as workspace};
 
     #[test]
@@ -734,9 +745,7 @@ mod tests {
         let roots = WorkspaceRoots::from_configured(&[root]).unwrap();
         let resolved = DiagnosticsResourceUri::resolve(&make_uri(&file).unwrap(), &roots).unwrap();
         let published = crate::bridge::path_to_uri(&file).unwrap();
-        let published = PublishedDiagnosticsUri::resolve(&published, &roots)
-            .await
-            .unwrap();
+        let published = resolve_one(&published, &roots).await.unwrap();
         assert_eq!(
             DiagnosticsResourceUri::for_published(&published),
             Some(resolved.uri)
@@ -747,10 +756,7 @@ mod tests {
     async fn test_published_resolve_rejects_non_file_uri() {
         let (_dir, root, _file) = workspace();
         let uri = lsp_types::Uri::from("untitled:Untitled-1");
-        assert_eq!(
-            PublishedDiagnosticsUri::resolve(&uri, &roots_of(&root)).await,
-            None
-        );
+        assert_eq!(resolve_one(&uri, &roots_of(&root)).await, None);
     }
 
     /// Percent-encoding the path must not make a canonical spelling look like
@@ -762,9 +768,7 @@ mod tests {
         let encoded = lsp_types::Uri::from(canonical.as_ref().replace("main.rs", "main%2Ers"));
         assert_ne!(encoded, canonical);
 
-        let published = PublishedDiagnosticsUri::resolve(&encoded, &roots_of(&root))
-            .await
-            .unwrap();
+        let published = resolve_one(&encoded, &roots_of(&root)).await.unwrap();
 
         assert!(published.is_canonical());
         assert_eq!(published.canonical(), &canonical);
@@ -776,9 +780,7 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         let uri = crate::bridge::path_to_uri(&file).unwrap();
 
-        let published = PublishedDiagnosticsUri::resolve(&uri, &roots_of(&root))
-            .await
-            .unwrap();
+        let published = resolve_one(&uri, &roots_of(&root)).await.unwrap();
 
         assert_eq!(published.canonical(), &uri);
     }
@@ -791,9 +793,7 @@ mod tests {
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let link_uri = crate::bridge::path_to_uri(&link).unwrap();
 
-        let published = PublishedDiagnosticsUri::resolve(&link_uri, &roots_of(&root))
-            .await
-            .unwrap();
+        let published = resolve_one(&link_uri, &roots_of(&root)).await.unwrap();
 
         assert_eq!(published.source(), &link_uri);
         assert_eq!(
@@ -818,10 +818,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("x.rs"), &link).unwrap();
         let link_uri = crate::bridge::path_to_uri(&link).unwrap();
 
-        assert_eq!(
-            PublishedDiagnosticsUri::resolve(&link_uri, &roots_of(&root)).await,
-            None
-        );
+        assert_eq!(resolve_one(&link_uri, &roots_of(&root)).await, None);
     }
 
     // ------------------------------------------------------------------

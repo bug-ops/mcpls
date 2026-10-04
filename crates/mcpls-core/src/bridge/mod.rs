@@ -9,6 +9,7 @@ mod client_path;
 mod encoding;
 mod indexing;
 mod notifications;
+mod published_uri;
 pub mod resources;
 mod state;
 mod translator;
@@ -30,6 +31,9 @@ pub use notifications::{
     ServerMessage, apply_lifecycle_notification,
 };
 pub(crate) use notifications::{DiagnosticsKey, diagnostics_cache_key};
+#[cfg(test)]
+pub(crate) use published_uri::{CanonicalizeFn, resolve_one};
+pub(crate) use published_uri::{Publication, PublicationKind, PublishedPathResolver};
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, ResourceLimits, path_to_uri,
     uri_to_path,
@@ -56,9 +60,7 @@ pub(crate) use translator::{
 #[cfg(test)]
 pub(crate) use workspace_roots::ProcessCwd;
 pub use workspace_roots::WorkspaceRoots;
-pub(crate) use workspace_roots::{
-    canonicalize_existing_prefix, join_relative_root, lexically_normalize, probe_root,
-};
+pub(crate) use workspace_roots::{join_relative_root, lexically_normalize, probe_root};
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder
 /// panicked while holding it.

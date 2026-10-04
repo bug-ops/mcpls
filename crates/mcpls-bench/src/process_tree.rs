@@ -1,26 +1,44 @@
 //! Lifetime and memory accounting of the mcpls process tree.
 //!
-//! mcpls runs as the leader of its own process group so that the language
-//! server and its helpers (cargo, proc-macro servers) can be measured and
-//! reaped together.
+//! mcpls leads its own process group (a Job Object on Windows), but since the
+//! language servers sit in a per-server watchdog group, and helpers such as
+//! rust-analyzer's flycheck call `setsid`, group membership alone no longer
+//! covers the tree. Memory is therefore summed over the parent-pid closure of
+//! mcpls, and survivors are found and killed by pid plus start time.
 
-#[cfg(unix)]
-use std::process::Stdio;
+use std::collections::BTreeSet;
+use std::process::ExitStatus;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use mcpls_core::lsp::LIFELINE_SWEEP_BUDGET;
+#[cfg(unix)]
+use tokio::process::Child;
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
+use crate::process_table::{ParentLink, ProcessIdentity, ProcessRow, ProcessTable};
 use crate::report::{Kib, ProcessRss, RssReading, ShutdownOutcome};
 
 /// How long mcpls gets to exit on its own once its session is closed.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-/// How long members of the group may outlive the leader before they are killed.
-pub const ORPHAN_GRACE: Duration = Duration::from_secs(1);
-#[cfg(unix)]
-const ORPHAN_POLL_INTERVAL: Duration = Duration::from_millis(50);
-#[cfg(unix)]
-const PS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the tree may outlive the leader: the per-server watchdogs get
+/// [`LIFELINE_SWEEP_BUDGET`] to sweep, plus a second for the final poll.
+pub const ORPHAN_GRACE: Duration = LIFELINE_SWEEP_BUDGET.saturating_add(Duration::from_secs(1));
+const ORPHAN_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const CAPTURE_TIMEOUT: Duration = if cfg!(windows) {
+    Duration::from_secs(30)
+} else {
+    Duration::from_secs(5)
+};
+
+/// How the MCP session with the process under test ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// The client closed the session and the server acknowledged within the grace period.
+    Closed,
+    /// The handshake failed, or closing timed out or errored.
+    Abandoned,
+}
 
 /// The id of a process group, equal to the pid of its leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,26 +61,29 @@ impl ProcessGroupId {
     /// the caller's own group or, via `kill(-1, ..)`, every process.
     #[cfg(unix)]
     fn to_pid(self) -> Option<rustix::process::Pid> {
-        if self.0 <= 1 {
-            return None;
-        }
-        rustix::process::Pid::from_raw(i32::try_from(self.0).ok()?)
+        rustix::process::Pid::from_raw(crate::process_table::signalable_pid(self.0)?)
     }
 }
 
-/// Owns the mcpls child and the process group it leads.
+#[cfg(unix)]
+type Leader = Child;
+#[cfg(windows)]
+type Leader = Box<dyn process_wrap::tokio::ChildWrapper>;
+
+/// Owns a spawned child and the process group (Unix) or Job Object (Windows) it leads.
 ///
 /// The group id is captured at spawn, because it is unobtainable once the
 /// leader is reaped. While the leader is unreaped or any member lives, the
 /// kernel keeps the id reserved, so a sweep cannot hit a recycled group.
-/// [`finish`](Self::finish) consumes the guard and disarms it afterwards, so
-/// `Drop` never sweeps a finished group. One race remains and is accepted: the
-/// last member exits between the emptiness probe and the kill, and the id is
-/// reused as a new group within that window.
+/// [`finish`](Self::finish) and [`wait_status`](Self::wait_status) consume the
+/// guard and disarm it afterwards, so `Drop` never sweeps a finished group. One
+/// race remains and is accepted: the last member exits between the emptiness
+/// probe and the kill, and the id is reused as a new group within that window.
+/// Dropping an armed guard (a cancelled future, a signal) kills the group.
 #[derive(Debug)]
 pub struct ProcessGroup {
-    child: Child,
-    pgid: ProcessGroupId,
+    leader: Leader,
+    pid: u32,
     armed: bool,
 }
 
@@ -72,25 +93,42 @@ impl ProcessGroup {
     /// # Errors
     ///
     /// Returns an error when the process cannot be spawned.
-    pub fn spawn(command: &mut Command) -> Result<Self> {
+    pub fn spawn(mut command: Command) -> Result<Self> {
         command.kill_on_drop(true);
         #[cfg(unix)]
-        command.process_group(0);
-        let child = command.spawn().context("failed to spawn the process")?;
-        let pid = child
+        let leader = {
+            command.process_group(0);
+            command.spawn().context("failed to spawn the process")?
+        };
+        #[cfg(windows)]
+        let leader = {
+            use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
+
+            let mut wrapped = CommandWrap::from(command);
+            wrapped.wrap(JobObject).wrap(KillOnDrop);
+            wrapped.spawn().context("failed to spawn the process")?
+        };
+        let pid = leader
             .id()
             .context("the process exited before its id was read")?;
         Ok(Self {
-            child,
-            pgid: ProcessGroupId::new(pid),
+            leader,
+            pid,
             armed: true,
         })
     }
 
-    /// The id of the group this guard leads.
+    /// The pid of the leader.
+    #[must_use]
+    pub const fn leader_pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// The id of the Unix process group this guard leads.
+    #[cfg(unix)]
     #[must_use]
     pub const fn pgid(&self) -> ProcessGroupId {
-        self.pgid
+        ProcessGroupId::new(self.pid)
     }
 
     /// Takes the piped stdout and stdin of the child.
@@ -99,34 +137,129 @@ impl ProcessGroup {
     ///
     /// Returns an error when either stream was not piped or was already taken.
     pub fn take_stdio(&mut self) -> Result<(ChildStdout, ChildStdin)> {
-        let stdout = self
-            .child
-            .stdout
-            .take()
-            .context("stdout was not captured")?;
-        let stdin = self.child.stdin.take().context("stdin was not captured")?;
-        Ok((stdout, stdin))
+        #[cfg(unix)]
+        let (stdout, stdin) = (self.leader.stdout.take(), self.leader.stdin.take());
+        #[cfg(windows)]
+        let (stdout, stdin) = (self.leader.stdout().take(), self.leader.stdin().take());
+        Ok((
+            stdout.context("stdout was not captured")?,
+            stdin.context("stdin was not captured")?,
+        ))
     }
 
-    /// Waits for the leader, then for the rest of the group, killing whatever outlives its grace.
+    /// Takes the piped stderr of the child.
     ///
-    /// `closed` tells whether the MCP session shut down cleanly. A leader that
+    /// # Errors
+    ///
+    /// Returns an error when stderr was not piped or was already taken.
+    pub fn take_stderr(&mut self) -> Result<ChildStderr> {
+        #[cfg(unix)]
+        let stderr = self.leader.stderr.take();
+        #[cfg(windows)]
+        let stderr = self.leader.stderr().take();
+        stderr.context("stderr was not captured")
+    }
+
+    /// Waits for the leader only, not for its descendants.
+    async fn wait_leader(&mut self) -> std::io::Result<ExitStatus> {
+        #[cfg(unix)]
+        return self.leader.wait().await;
+        #[cfg(windows)]
+        return self.leader.inner_mut().wait().await;
+    }
+
+    /// Kills every member of the group.
+    #[cfg(unix)]
+    fn sweep(&self) {
+        if let Err(error) = kill_group(self.pgid()) {
+            eprintln!(
+                "warning: failed to kill process group {}: {error}",
+                self.pid
+            );
+        }
+    }
+
+    /// Kills every member of the job.
+    #[cfg(windows)]
+    fn sweep(&mut self) {
+        if let Err(error) = self.leader.start_kill() {
+            eprintln!(
+                "warning: failed to kill the job of pid {}: {error}",
+                self.pid
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn kill_leader(&mut self) {
+        if let Err(error) = self.leader.kill().await {
+            eprintln!("warning: failed to kill pid {}: {error}", self.pid);
+        }
+    }
+
+    #[cfg(windows)]
+    fn kill_leader(&mut self) -> std::future::Ready<()> {
+        if let Err(error) = self.leader.start_kill() {
+            eprintln!("warning: failed to kill pid {}: {error}", self.pid);
+        }
+        std::future::ready(())
+    }
+
+    /// Waits for a short-lived command, then kills whatever its group still holds.
+    ///
+    /// Dropping the future before it completes kills the whole group, so an
+    /// interrupted setup step leaves no grandchildren behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when waiting for the leader fails.
+    pub async fn wait_status(mut self) -> Result<ExitStatus> {
+        let status = self
+            .wait_leader()
+            .await
+            .with_context(|| format!("failed to wait for pid {}", self.pid))?;
+        self.sweep();
+        self.armed = false;
+        Ok(status)
+    }
+
+    /// Waits for the leader, then for the rest of its tree, killing whatever outlives its grace.
+    ///
+    /// `session` tells whether the MCP session shut down cleanly. A leader that
     /// does not exit within [`SHUTDOWN_GRACE`] is killed together with its group.
-    pub async fn finish(mut self, closed: bool) -> ShutdownOutcome {
+    /// `watch` supplies the processes seen during the run: any that still live
+    /// (same pid and start time) after [`ORPHAN_GRACE`] are reported as
+    /// [`ShutdownOutcome::OrphansKilled`] and killed.
+    pub async fn finish(self, session: SessionEnd, watch: &TreeWatch) -> ShutdownOutcome {
+        self.finish_within(session, watch, SHUTDOWN_GRACE, ORPHAN_GRACE)
+            .await
+    }
+
+    async fn finish_within(
+        mut self,
+        session: SessionEnd,
+        watch: &TreeWatch,
+        shutdown_grace: Duration,
+        orphan_grace: Duration,
+    ) -> ShutdownOutcome {
         let exited = matches!(
-            tokio::time::timeout(SHUTDOWN_GRACE, self.child.wait()).await,
+            tokio::time::timeout(shutdown_grace, self.wait_leader()).await,
             Ok(Ok(_))
         );
         let outcome = if !exited {
             self.sweep();
-            if let Err(error) = self.child.kill().await {
-                eprintln!("warning: failed to kill mcpls: {error}");
+            self.kill_leader().await;
+            if let Some(survivors) = self.leftovers(watch, orphan_grace).await {
+                kill_identified(&survivors).await;
+                ShutdownOutcome::OrphansKilled
+            } else {
+                ShutdownOutcome::Killed
             }
-            ShutdownOutcome::Killed
-        } else if self.orphans_outlive_leader().await {
+        } else if let Some(survivors) = self.leftovers(watch, orphan_grace).await {
             self.sweep();
+            kill_identified(&survivors).await;
             ShutdownOutcome::OrphansKilled
-        } else if closed {
+        } else if session == SessionEnd::Closed {
             ShutdownOutcome::Clean
         } else {
             ShutdownOutcome::Killed
@@ -135,41 +268,44 @@ impl ProcessGroup {
         outcome
     }
 
-    #[cfg(unix)]
-    async fn orphans_outlive_leader(&self) -> bool {
-        let deadline = tokio::time::Instant::now() + ORPHAN_GRACE;
+    /// Polls until the tree is gone; `Some(identities)` when something outlives `grace`.
+    ///
+    /// The identities may be empty when only the group probe, used if the process
+    /// table cannot be read, saw a member.
+    async fn leftovers(&self, watch: &TreeWatch, grace: Duration) -> Option<Vec<ProcessIdentity>> {
+        let deadline = tokio::time::Instant::now() + grace;
         loop {
-            if group_is_empty(self.pgid) {
-                return false;
+            let alive = match capture_table().await {
+                Ok(table) => watch.survivors(&table, cfg!(unix).then_some(self.pid)),
+                Err(error) => {
+                    eprintln!("warning: cannot read the process table: {error:#}");
+                    if group_is_empty_for(self.pid) {
+                        Vec::new()
+                    } else {
+                        return Some(Vec::new());
+                    }
+                }
+            };
+            if alive.is_empty() {
+                return None;
             }
             if tokio::time::Instant::now() >= deadline {
-                return true;
+                return Some(alive);
             }
             tokio::time::sleep(ORPHAN_POLL_INTERVAL).await;
         }
     }
+}
 
-    #[cfg(not(unix))]
-    async fn orphans_outlive_leader(&self) -> bool {
-        false
-    }
+/// Whether the group led by `leader` is gone; Windows has no groups, so nothing can be left in one.
+#[cfg(unix)]
+fn group_is_empty_for(leader: u32) -> bool {
+    group_is_empty(ProcessGroupId::new(leader))
+}
 
-    #[cfg(unix)]
-    fn sweep(&self) {
-        if let Err(error) = kill_group(self.pgid) {
-            eprintln!(
-                "warning: failed to kill process group {}: {error}",
-                self.pgid.get()
-            );
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn sweep(&mut self) {
-        if let Err(error) = self.child.start_kill() {
-            eprintln!("warning: failed to kill mcpls: {error}");
-        }
-    }
+#[cfg(not(unix))]
+const fn group_is_empty_for(_leader: u32) -> bool {
+    true
 }
 
 impl Drop for ProcessGroup {
@@ -213,115 +349,181 @@ fn kill_group(group: ProcessGroupId) -> std::io::Result<()> {
     }
 }
 
-/// Parses `ps -A -o pgid=,pid=,rss=,comm=` output into the members of `group`.
+#[cfg(unix)]
+/// Pids in `table` that still hold exactly one of `targets` and may be signalled.
+fn killable(table: &ProcessTable, targets: &[ProcessIdentity]) -> Vec<i32> {
+    targets
+        .iter()
+        .filter(|target| table.find(target).is_some())
+        .filter_map(|target| crate::process_table::signalable_pid(target.pid()))
+        .collect()
+}
+
+/// Kills the processes of `targets` that are still alive with the same start time.
 ///
-/// `comm` is the last column because it may contain spaces on macOS.
+/// The check runs against a table captured immediately before, so a recycled pid
+/// is skipped; the window between that snapshot and the signal is one `ps` call.
+/// Nothing is killed by bare pid on Windows: the Job Object covers the tree there.
+#[cfg(unix)]
+async fn kill_identified(targets: &[ProcessIdentity]) {
+    {
+        use rustix::io::Errno;
+        use rustix::process::{Pid, Signal, kill_process};
+
+        let table = match capture_table().await {
+            Ok(table) => table,
+            Err(error) => {
+                eprintln!("warning: cannot verify survivors before killing them: {error:#}");
+                return;
+            }
+        };
+        for raw in killable(&table, targets) {
+            let Some(pid) = Pid::from_raw(raw) else {
+                continue;
+            };
+            match kill_process(pid, Signal::KILL) {
+                Ok(()) | Err(Errno::SRCH) => {}
+                Err(error) => eprintln!("warning: failed to kill pid {raw}: {error}"),
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_identified(_targets: &[ProcessIdentity]) -> std::future::Ready<()> {
+    std::future::ready(())
+}
+
+/// Reads the system process table.
 ///
 /// # Errors
 ///
-/// Returns an error for a line of `group` that does not start with three
-/// integers followed by a command name. Lines of other groups are not inspected,
-/// so an unrelated malformed line cannot hide the reading.
-///
-/// # Examples
-///
-/// ```
-/// use mcpls_bench::process_tree::{parse_ps, ProcessGroupId};
-///
-/// let output = "  10   10  2048 mcpls\n  10   11  4096 rust-analyzer\n  99   99   100 sh\n";
-/// let members = parse_ps(output, ProcessGroupId::new(10)).unwrap();
-/// assert_eq!(members.len(), 2);
-/// assert_eq!(members[1].command, "rust-analyzer");
-/// ```
-pub fn parse_ps(output: &str, group: ProcessGroupId) -> Result<Vec<ProcessRss>> {
-    let mut members = Vec::new();
-    for line in output.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let belongs_to_group = fields
-            .clone()
-            .next()
-            .and_then(|first| first.parse::<u32>().ok())
-            == Some(group.get());
-        if !belongs_to_group {
-            continue;
-        }
-        let mut number = |name: &str| -> Result<u32> {
-            fields
-                .next()
-                .with_context(|| format!("ps line `{line}` has no {name}"))?
-                .parse()
-                .with_context(|| format!("ps line `{line}` has a malformed {name}"))
-        };
-        number("pgid")?;
-        let pid = number("pid")?;
-        let rss = number("rss")?;
-        let command = fields.collect::<Vec<_>>().join(" ");
-        if command.is_empty() {
-            bail!("ps line `{line}` has no command");
-        }
-        members.push(ProcessRss {
-            pid,
-            rss: Kib(u64::from(rss)),
-            command,
-        });
+/// Returns an error when the platform tool cannot be run, times out or prints
+/// something unrecognisable.
+pub async fn capture_table() -> Result<ProcessTable> {
+    #[cfg(unix)]
+    {
+        let ps = crate::pin::resolve_in_path("ps")?;
+        let output = run_to_string(
+            Command::new(ps)
+                .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,rss=,lstart=,comm="])
+                .env("LC_ALL", "C"),
+        )
+        .await?;
+        ProcessTable::parse_unix(&output)
     }
-    Ok(members)
-}
-
-/// Turns `ps` output into the reading for `group`.
-#[must_use]
-pub fn rss_reading(output: &str, group: ProcessGroupId) -> RssReading {
-    match parse_ps(output, group) {
-        Err(error) => RssReading::Unavailable {
-            reason: format!("{error:#}"),
-        },
-        Ok(processes) if processes.is_empty() => RssReading::Unavailable {
-            reason: format!("process group {} has no members", group.get()),
-        },
-        Ok(processes) => RssReading::Measured {
-            total: Kib(processes.iter().map(|p| p.rss.0).sum()),
-            processes,
-        },
+    #[cfg(windows)]
+    {
+        const SCRIPT: &str = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,@{n='Created';e={if ($_.CreationDate) { $_.CreationDate.ToString('o') } else { '' }}},Name | ConvertTo-Csv -NoTypeInformation";
+        let shell = crate::pin::resolve_in_path("powershell")?;
+        let output = run_to_string(Command::new(shell).args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ]))
+        .await?;
+        ProcessTable::parse_windows(&output)
     }
 }
 
-/// Sums the resident memory of every member of `group` via `ps`.
-#[cfg(unix)]
-pub async fn sample_rss(group: ProcessGroupId) -> RssReading {
-    match run_ps().await {
-        Ok(output) => rss_reading(&output, group),
-        Err(error) => RssReading::Unavailable {
-            reason: format!("{error:#}"),
-        },
-    }
-}
-
-/// Sums the resident memory of every member of `group` via `ps`.
-#[cfg(not(unix))]
-pub async fn sample_rss(_group: ProcessGroupId) -> RssReading {
-    RssReading::Unavailable {
-        reason: "process-group memory is sampled on unix only".to_owned(),
-    }
-}
-
-#[cfg(unix)]
-async fn run_ps() -> Result<String> {
-    let ps = crate::pin::resolve_in_path("ps")?;
+async fn run_to_string(command: &mut Command) -> Result<String> {
     let output = tokio::time::timeout(
-        PS_TIMEOUT,
-        Command::new(ps)
-            .args(["-A", "-o", "pgid=,pid=,rss=,comm="])
-            .stdin(Stdio::null())
+        CAPTURE_TIMEOUT,
+        command
+            .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output(),
     )
     .await
-    .context("ps timed out")?
-    .context("failed to run ps")?;
+    .context("the process listing timed out")?
+    .context("failed to run the process listing")?;
     if !output.status.success() {
-        bail!("ps exited with {}", output.status);
+        bail!("the process listing exited with {}", output.status);
     }
     Ok(String::from_utf8_lossy_owned(output.stdout))
+}
+
+/// Tracks the mcpls process tree across a run.
+///
+/// Every observation sums the resident memory of the parent-pid closure of
+/// mcpls and remembers each member's identity, so that survivors can be told
+/// from recycled pids after shutdown.
+#[derive(Debug)]
+pub struct TreeWatch {
+    leader_pid: u32,
+    leader: Option<ProcessIdentity>,
+    seen: BTreeSet<ProcessIdentity>,
+}
+
+impl TreeWatch {
+    /// Starts watching the tree rooted at `leader_pid`.
+    #[must_use]
+    pub const fn new(leader_pid: u32) -> Self {
+        Self {
+            leader_pid,
+            leader: None,
+            seen: BTreeSet::new(),
+        }
+    }
+
+    /// Records the tree found in `table` and returns its memory.
+    pub fn observe(&mut self, table: &ProcessTable, link: ParentLink) -> RssReading {
+        if self.leader.is_none() {
+            self.leader = table.identity_of(self.leader_pid).cloned();
+        }
+        let tree = self
+            .leader
+            .as_ref()
+            .map(|leader| table.tree_of(leader, link))
+            .unwrap_or_default();
+        if tree.is_empty() {
+            return RssReading::Unavailable {
+                reason: format!(
+                    "mcpls (pid {}) is not in the process table",
+                    self.leader_pid
+                ),
+            };
+        }
+        self.seen
+            .extend(tree.iter().map(|row| row.identity.clone()));
+        RssReading::Measured {
+            total: Kib(tree.iter().map(|row| row.rss.0).sum()),
+            processes: tree.into_iter().map(process_rss).collect(),
+        }
+    }
+
+    /// Reads the process table and observes the tree.
+    pub async fn sample(&mut self) -> RssReading {
+        match capture_table().await {
+            Ok(table) => self.observe(&table, ParentLink::PLATFORM),
+            Err(error) => RssReading::Unavailable {
+                reason: format!("{error:#}"),
+            },
+        }
+    }
+
+    /// Identities of the observed processes that are alive in `table`, plus live members of `group`.
+    #[must_use]
+    pub fn survivors(&self, table: &ProcessTable, group: Option<u32>) -> Vec<ProcessIdentity> {
+        table
+            .rows()
+            .iter()
+            .filter(|row| !row.zombie)
+            .filter(|row| {
+                self.seen.contains(&row.identity) || (group.is_some() && row.pgid == group)
+            })
+            .map(|row| row.identity.clone())
+            .collect()
+    }
+}
+
+fn process_rss(row: &ProcessRow) -> ProcessRss {
+    ProcessRss {
+        pid: row.identity.pid(),
+        rss: row.rss,
+        command: row.command.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -330,62 +532,110 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::process_table::StartTime;
 
-    const GROUP: ProcessGroupId = ProcessGroupId::new(500);
+    const T0: &str = "Sun Oct  4 16:00:00 2026";
+    const T1: &str = "Sun Oct  4 16:00:09 2026";
 
-    #[test]
-    fn parses_members_of_the_group_only() {
-        let output =
-            "  500   500  2048 mcpls\n  500   501 40960 rust-analyzer\n    1     1   900 launchd\n";
-        let members = parse_ps(output, GROUP).unwrap();
-        assert_eq!(
-            members.iter().map(|m| (m.pid, m.rss)).collect::<Vec<_>>(),
-            [(500, Kib(2048)), (501, Kib(40_960))]
-        );
-        assert_eq!(
-            rss_reading(output, GROUP),
-            RssReading::Measured {
-                total: Kib(43_008),
-                processes: members
-            }
-        );
-    }
-
-    #[test]
-    fn command_names_may_contain_spaces() {
-        let members = parse_ps("500 502 1024 Google Chrome Helper\n", GROUP).unwrap();
-        assert_eq!(members[0].command, "Google Chrome Helper");
-    }
-
-    #[test]
-    fn malformed_lines_are_errors() {
-        for line in ["500 501 notanumber cmd", "500 501", "500 501 10"] {
-            assert!(parse_ps(line, GROUP).is_err(), "{line}");
+    fn row(id: u32, parent: u32, group: u32, started: &str, rss: u64) -> ProcessRow {
+        ProcessRow {
+            identity: ProcessIdentity::new(id, StartTime::new(started)),
+            ppid: parent,
+            pgid: Some(group),
+            zombie: false,
+            rss: Kib(rss),
+            command: format!("p{id}"),
         }
+    }
+
+    fn id(pid: u32, started: &str) -> ProcessIdentity {
+        ProcessIdentity::new(pid, StartTime::new(started))
+    }
+
+    #[test]
+    fn observation_sums_the_whole_tree_including_setsid_descendants() {
+        let table = ProcessTable::from_rows(vec![
+            row(10, 1, 10, T0, 100),
+            row(11, 10, 11, T0, 200),
+            row(12, 11, 11, T0, 300),
+            row(13, 12, 13, T0, 400),
+            row(99, 1, 99, T0, 5000),
+        ]);
+        let mut watch = TreeWatch::new(10);
+        let RssReading::Measured { total, processes } = watch.observe(&table, ParentLink::Pid)
+        else {
+            panic!("tree should be measured");
+        };
+        assert_eq!(total, Kib(1000));
+        assert_eq!(processes.len(), 4);
+    }
+
+    #[test]
+    fn a_vanished_leader_is_unavailable() {
+        let mut watch = TreeWatch::new(10);
+        let reading = watch.observe(&ProcessTable::default(), ParentLink::Pid);
+        assert_matches!(reading, RssReading::Unavailable { .. });
+    }
+
+    #[test]
+    fn a_recycled_leader_pid_is_not_mistaken_for_the_leader() {
+        let mut watch = TreeWatch::new(10);
+        watch.observe(
+            &ProcessTable::from_rows(vec![row(10, 1, 10, T0, 1)]),
+            ParentLink::Pid,
+        );
+        let recycled =
+            ProcessTable::from_rows(vec![row(10, 1, 10, T1, 777), row(11, 10, 10, T1, 1)]);
         assert_matches!(
-            rss_reading("500 501 oops\n", GROUP),
+            watch.observe(&recycled, ParentLink::Pid),
             RssReading::Unavailable { .. }
         );
     }
 
     #[test]
-    fn malformed_lines_of_other_processes_are_ignored() {
-        let output = "garbage\n  77 notapid 5 odd\n\n500 500 2048 mcpls\n  x\n";
-        let members = parse_ps(output, GROUP).unwrap();
-        assert_eq!(members.len(), 1);
-        assert_eq!(members[0].pid, 500);
+    fn survivors_match_on_pid_and_start_time_only() {
+        let mut watch = TreeWatch::new(10);
+        let before = ProcessTable::from_rows(vec![
+            row(10, 1, 10, T0, 1),
+            row(11, 10, 11, T0, 1),
+            row(12, 11, 12, T0, 1),
+        ]);
+        watch.observe(&before, ParentLink::Pid);
+        let after = ProcessTable::from_rows(vec![
+            row(11, 1, 11, T0, 1),
+            row(12, 1, 12, T1, 1),
+            row(40, 1, 40, T1, 1),
+        ]);
+        assert_eq!(watch.survivors(&after, None), [id(11, T0)]);
     }
 
     #[test]
-    fn empty_group_has_no_reading() {
-        assert_matches!(
-            rss_reading("1 1 10 init\n", GROUP),
-            RssReading::Unavailable { .. }
-        );
+    fn group_members_survive_even_if_never_observed() {
+        let watch = TreeWatch::new(10);
+        let mut zombie = row(12, 1, 10, T0, 0);
+        zombie.zombie = true;
+        let table =
+            ProcessTable::from_rows(vec![row(11, 1, 10, T0, 1), zombie, row(13, 1, 13, T0, 1)]);
+        assert_eq!(watch.survivors(&table, Some(10)), [id(11, T0)]);
+        assert!(watch.survivors(&table, None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_processes_with_a_matching_start_time_are_killable() {
+        let table = ProcessTable::from_rows(vec![
+            row(11, 1, 11, T0, 1),
+            row(12, 1, 12, T1, 1),
+            row(1, 0, 1, T0, 1),
+        ]);
+        let targets = [id(11, T0), id(12, T0), id(1, T0), id(77, T0)];
+        assert_eq!(killable(&table, &targets), [11]);
     }
 
     #[cfg(unix)]
     mod unix {
+        use std::process::Stdio;
+
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         use super::*;
@@ -399,6 +649,13 @@ mod tests {
             command
         }
 
+        async fn first_line(group: &mut ProcessGroup) -> String {
+            let (stdout, _stdin) = group.take_stdio().unwrap();
+            let mut line = String::new();
+            BufReader::new(stdout).read_line(&mut line).await.unwrap();
+            line.trim().to_owned()
+        }
+
         async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
             for _ in 0..60 {
                 if condition() {
@@ -409,49 +666,119 @@ mod tests {
             false
         }
 
+        fn alive(pid: &str) -> bool {
+            let pid = rustix::process::Pid::from_raw(pid.parse().unwrap()).unwrap();
+            rustix::process::test_kill_process(pid).is_ok()
+        }
+
+        const SETSID_SLEEP: &str =
+            "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(30)' & echo $!";
+
         #[tokio::test]
         async fn clean_exit_is_clean_only_when_the_session_closed() {
-            let group = ProcessGroup::spawn(&mut sh("exit 0")).unwrap();
-            assert_eq!(group.finish(true).await, ShutdownOutcome::Clean);
-            let group = ProcessGroup::spawn(&mut sh("exit 0")).unwrap();
-            assert_eq!(group.finish(false).await, ShutdownOutcome::Killed);
+            let watch = TreeWatch::new(0);
+            let group = ProcessGroup::spawn(sh("exit 0")).unwrap();
+            assert_eq!(
+                group.finish(SessionEnd::Closed, &watch).await,
+                ShutdownOutcome::Clean
+            );
+            let group = ProcessGroup::spawn(sh("exit 0")).unwrap();
+            assert_eq!(
+                group.finish(SessionEnd::Abandoned, &watch).await,
+                ShutdownOutcome::Killed
+            );
         }
 
         #[tokio::test]
         async fn members_outliving_the_leader_are_killed() {
-            let mut group = ProcessGroup::spawn(&mut sh("sleep 30 & echo $!")).unwrap();
+            let mut group = ProcessGroup::spawn(sh("sleep 30 & echo $!")).unwrap();
             let pgid = group.pgid();
-            let (stdout, _stdin) = group.take_stdio().unwrap();
-            let mut line = String::new();
-            BufReader::new(stdout).read_line(&mut line).await.unwrap();
-            assert!(!line.trim().is_empty());
-            assert_eq!(group.finish(true).await, ShutdownOutcome::OrphansKilled);
+            let member = first_line(&mut group).await;
+            assert!(!member.is_empty());
+            let watch = TreeWatch::new(group.leader_pid());
+            let outcome = group
+                .finish_within(
+                    SessionEnd::Closed,
+                    &watch,
+                    SHUTDOWN_GRACE,
+                    Duration::from_millis(400),
+                )
+                .await;
+            assert_eq!(outcome, ShutdownOutcome::OrphansKilled);
             assert!(wait_until(|| group_is_empty(pgid)).await);
         }
 
         #[tokio::test]
-        async fn cancelling_finish_during_the_orphan_grace_still_sweeps() {
-            let mut group = ProcessGroup::spawn(&mut sh("sleep 30 & echo $!")).unwrap();
-            let (stdout, _stdin) = group.take_stdio().unwrap();
-            let mut line = String::new();
-            BufReader::new(stdout).read_line(&mut line).await.unwrap();
-            let member = rustix::process::Pid::from_raw(line.trim().parse().unwrap()).unwrap();
+        async fn a_setsid_descendant_is_counted_and_killed_after_the_leader_exits() {
+            let mut group = ProcessGroup::spawn(sh(&format!("{SETSID_SLEEP}; sleep 1"))).unwrap();
+            let escapee = first_line(&mut group).await;
+            let mut watch = TreeWatch::new(group.leader_pid());
+            let reading = watch.sample().await;
+            let RssReading::Measured { processes, .. } = reading else {
+                panic!("tree should be measured: {reading:?}");
+            };
+            assert!(
+                processes.iter().any(|p| p.pid.to_string() == escapee),
+                "setsid child {escapee} missing from {processes:?}"
+            );
+            let outcome = group
+                .finish_within(
+                    SessionEnd::Closed,
+                    &watch,
+                    SHUTDOWN_GRACE,
+                    Duration::from_millis(600),
+                )
+                .await;
+            assert_eq!(outcome, ShutdownOutcome::OrphansKilled);
+            assert!(wait_until(|| !alive(&escapee)).await);
+        }
+
+        #[tokio::test]
+        async fn a_forced_kill_still_finds_and_kills_escaped_descendants() {
+            let script = format!("{SETSID_SLEEP}; sleep 30");
+            let mut group = ProcessGroup::spawn(sh(&script)).unwrap();
+            let escapee = first_line(&mut group).await;
+            let mut watch = TreeWatch::new(group.leader_pid());
+            watch.sample().await;
+            let outcome = group
+                .finish_within(
+                    SessionEnd::Closed,
+                    &watch,
+                    Duration::from_millis(200),
+                    Duration::from_millis(600),
+                )
+                .await;
+            assert_eq!(outcome, ShutdownOutcome::OrphansKilled);
+            assert!(wait_until(|| !alive(&escapee)).await);
+        }
+
+        #[tokio::test]
+        async fn cancelling_wait_status_kills_grandchildren() {
+            let mut group = ProcessGroup::spawn(sh("sleep 30 & echo $!; wait")).unwrap();
+            let member = first_line(&mut group).await;
+            assert!(alive(&member));
             let cancelled =
-                tokio::time::timeout(Duration::from_millis(300), group.finish(true)).await;
+                tokio::time::timeout(Duration::from_millis(300), group.wait_status()).await;
             assert!(cancelled.is_err());
-            assert!(wait_until(|| rustix::process::test_kill_process(member).is_err()).await);
+            assert!(wait_until(|| !alive(&member)).await);
+        }
+
+        #[tokio::test]
+        async fn wait_status_sweeps_leftovers_of_a_finished_command() {
+            let mut group = ProcessGroup::spawn(sh("sleep 30 & echo $!")).unwrap();
+            let member = first_line(&mut group).await;
+            let status = group.wait_status().await.unwrap();
+            assert!(status.success());
+            assert!(wait_until(|| !alive(&member)).await);
         }
 
         #[tokio::test]
         async fn dropping_the_guard_kills_the_whole_group() {
-            let mut group = ProcessGroup::spawn(&mut sh("sleep 30 & echo $!; wait")).unwrap();
-            let (stdout, _stdin) = group.take_stdio().unwrap();
-            let mut line = String::new();
-            BufReader::new(stdout).read_line(&mut line).await.unwrap();
-            let member = rustix::process::Pid::from_raw(line.trim().parse().unwrap()).unwrap();
-            assert!(rustix::process::test_kill_process(member).is_ok());
+            let mut group = ProcessGroup::spawn(sh("sleep 30 & echo $!; wait")).unwrap();
+            let member = first_line(&mut group).await;
+            assert!(alive(&member));
             drop(group);
-            assert!(wait_until(|| rustix::process::test_kill_process(member).is_err()).await);
+            assert!(wait_until(|| !alive(&member)).await);
         }
 
         #[test]
@@ -463,16 +790,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rss_of_a_live_group_is_measured() {
-            let group = ProcessGroup::spawn(&mut sh("sleep 5")).unwrap();
-            let pgid = group.pgid();
-            let RssReading::Measured { total, processes } = sample_rss(pgid).await else {
-                panic!("ps should be available on unix");
-            };
-            assert!(processes.iter().any(|p| p.pid == pgid.get()));
-            assert!(total.0 > 0);
-            group.sweep();
-            group.finish(false).await;
+        async fn the_live_process_table_contains_this_process_with_a_start_time() {
+            let table = capture_table().await.unwrap();
+            let me = table.identity_of(std::process::id()).unwrap();
+            assert!(!me.started().as_str().is_empty());
+            assert!(!table.tree_of(me, ParentLink::Pid).is_empty());
         }
     }
 }

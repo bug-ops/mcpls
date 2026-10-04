@@ -153,6 +153,12 @@ const MAX_SOURCES_PER_FILE: usize = 8;
 /// Maximum number of server messages to store.
 const MAX_SERVER_MESSAGES: usize = 50;
 
+/// Most empty-entry removals remembered for replay on `subscriptions/listen`.
+const MAX_RECENT_EVICTIONS: usize = 256;
+
+/// How long an empty-entry removal stays replayable.
+const EVICTION_REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_mins(2);
+
 /// Conservative fixed-field/JSON-structure overhead assumed per diagnostic
 /// (`range`, `severity`, and object/field-name punctuation) by
 /// [`cap_diagnostics_entry_size`]'s cheap size estimate. Deliberately
@@ -648,6 +654,13 @@ pub struct NotificationCache {
     /// `is_empty_entry`), not by mirroring membership here. Maintained only
     /// by `insert_entry`/`take_entry`.
     empty_diagnostics_count: usize,
+    /// File keys of empty entries removed within `EVICTION_REPLAY_WINDOW`,
+    /// oldest first and bounded by `MAX_RECENT_EVICTIONS`. Only empty entries
+    /// are recorded: a clear lost to eviction is what a listen re-attaching
+    /// after its lease gap must still replay, while replaying a removed
+    /// non-empty entry would make clients re-read "not published" and drop
+    /// valid errors. Written only by `evict_entry`, never by publishers.
+    recent_evictions: VecDeque<(DiagnosticsKey, std::time::Instant)>,
     /// Recent log entries (FIFO queue with max size).
     logs: VecDeque<LogEntry>,
     /// Recent server messages (FIFO queue with max size).
@@ -688,6 +701,7 @@ impl NotificationCache {
             next_diagnostic_seq: 0,
             diagnostics_route_count: None,
             empty_diagnostics_count: 0,
+            recent_evictions: VecDeque::new(),
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
             push_degraded: HashSet::new(),
@@ -949,7 +963,7 @@ impl NotificationCache {
                 );
                 return;
             };
-            self.take_entry(&oldest_alias);
+            self.evict_entry(&oldest_alias);
         }
 
         // Bound each diagnostic's free-form message text (#311); see
@@ -981,7 +995,7 @@ impl NotificationCache {
             while self.entries.len() >= MAX_DIAGNOSTIC_ENTRIES
                 && let Some((_, _, evict_key)) = self.entry_to_evict(server_id)
             {
-                self.take_entry(&evict_key);
+                self.evict_entry(&evict_key);
             }
         }
 
@@ -1052,6 +1066,52 @@ impl NotificationCache {
             self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
         }
         Some(entry)
+    }
+
+    /// Removes the entry under `key` for good (eviction, alias replacement,
+    /// server clear) and remembers an empty one in the replay ring, so a
+    /// clear lost in a listen's lease gap is still replayed.
+    fn evict_entry(&mut self, key: &DiagnosticsKey) {
+        let Some(entry) = self.take_entry(key) else {
+            return;
+        };
+        if entry.info.diagnostics.is_empty() {
+            self.record_empty_eviction(entry.file(key).clone(), std::time::Instant::now());
+        }
+    }
+
+    fn record_empty_eviction(&mut self, file: DiagnosticsKey, now: std::time::Instant) {
+        while self
+            .recent_evictions
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) > EVICTION_REPLAY_WINDOW)
+        {
+            self.recent_evictions.pop_front();
+        }
+        self.recent_evictions
+            .retain(|(recorded, _)| *recorded != file);
+        if self.recent_evictions.len() >= MAX_RECENT_EVICTIONS {
+            self.recent_evictions.pop_front();
+        }
+        self.recent_evictions.push_back((file, now));
+    }
+
+    /// Whether `uri` had an empty entry removed within the replay window and
+    /// has not been cached again since.
+    fn was_recently_evicted(&self, uri: &Uri, now: std::time::Instant) -> bool {
+        let key = DiagnosticsKey::of(uri);
+        !self.has_diagnostics(uri)
+            && self.recent_evictions.iter().any(|(evicted, at)| {
+                *evicted == key && now.saturating_duration_since(*at) <= EVICTION_REPLAY_WINDOW
+            })
+    }
+
+    /// Whether a `subscriptions/listen` attaching now must be told about
+    /// `uri`: it has cached diagnostics, or a clear for it was removed
+    /// recently enough that a client re-attaching after a lease gap may have
+    /// missed it.
+    pub(crate) fn is_listen_replayable(&self, uri: &Uri) -> bool {
+        self.has_diagnostics(uri) || self.was_recently_evicted(uri, std::time::Instant::now())
     }
 
     /// Panics unless `order`, `files` and `empty_diagnostics_count` describe
@@ -1352,7 +1412,7 @@ impl NotificationCache {
         };
         let mut cleared = Vec::with_capacity(order.len());
         for key in order.into_values() {
-            self.take_entry(&key);
+            self.evict_entry(&key);
             cleared.push(key);
         }
         cleared
@@ -3316,5 +3376,149 @@ mod tests {
                 cache.assert_consistent();
             }
         }
+    }
+
+    fn first_uri() -> Uri {
+        Uri::from("file:///first.rs")
+    }
+
+    fn error_diagnostic() -> LspDiagnostic {
+        LspDiagnostic {
+            severity: Some(lsp_types::DiagnosticSeverity::Error),
+            message: "broken".to_owned().into(),
+            ..LspDiagnostic::default()
+        }
+    }
+
+    /// Fills the cache with `MAX_DIAGNOSTIC_ENTRIES` entries: `file:///first.rs`
+    /// (empty or not, per `first_empty`) then non-empty fillers.
+    fn full_cache(first_empty: bool) -> NotificationCache {
+        let mut cache = NotificationCache::new();
+        let first: Uri = Uri::from("file:///first.rs");
+        let diagnostics = if first_empty {
+            vec![]
+        } else {
+            vec![error_diagnostic()]
+        };
+        cache.store_diagnostics(&test_server(), &first, None, diagnostics);
+        for i in 1..MAX_DIAGNOSTIC_ENTRIES {
+            let uri: Uri = Uri::from(format!("file:///filler{i}.rs"));
+            cache.store_diagnostics(&test_server(), &uri, None, vec![error_diagnostic()]);
+        }
+        cache
+    }
+
+    fn evict_one(cache: &mut NotificationCache) {
+        let overflow: Uri = Uri::from("file:///overflow.rs");
+        cache.store_diagnostics(&test_server(), &overflow, None, vec![error_diagnostic()]);
+    }
+
+    #[test]
+    fn test_evicted_empty_entry_is_listen_replayable() {
+        let mut cache = full_cache(true);
+        assert!(cache.is_listen_replayable(&first_uri()));
+        evict_one(&mut cache);
+        assert!(!cache.has_diagnostics(&first_uri()));
+        assert!(cache.is_listen_replayable(&first_uri()));
+        assert!(!cache.is_listen_replayable(&Uri::from("file:///unrelated.rs")));
+    }
+
+    #[test]
+    fn test_evicted_non_empty_entry_is_not_replayable() {
+        let mut cache = full_cache(false);
+        evict_one(&mut cache);
+        assert!(!cache.has_diagnostics(&first_uri()));
+        assert!(!cache.is_listen_replayable(&first_uri()));
+    }
+
+    #[test]
+    fn test_recached_entry_leaves_the_replay_ring_view() {
+        let mut cache = full_cache(true);
+        evict_one(&mut cache);
+        let first: Uri = Uri::from("file:///first.rs");
+        cache.store_diagnostics(&test_server(), &first, None, vec![error_diagnostic()]);
+        assert!(cache.has_diagnostics(&first_uri()));
+        assert!(!cache.was_recently_evicted(&first_uri(), std::time::Instant::now()));
+    }
+
+    #[test]
+    fn test_eviction_replay_expires_after_the_window() {
+        let mut cache = NotificationCache::new();
+        let now = std::time::Instant::now();
+        let gone = Uri::from("file:///gone.rs");
+        cache.record_empty_eviction(DiagnosticsKey::of(&gone), now);
+        assert!(cache.was_recently_evicted(&gone, now + EVICTION_REPLAY_WINDOW));
+        assert!(!cache.was_recently_evicted(
+            &gone,
+            now + EVICTION_REPLAY_WINDOW + std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn test_eviction_ring_is_bounded_and_keeps_the_newest() {
+        let mut cache = NotificationCache::new();
+        let now = std::time::Instant::now();
+        for i in 0..MAX_RECENT_EVICTIONS + 44 {
+            let gone = Uri::from(format!("file:///gone{i}.rs"));
+            cache.record_empty_eviction(DiagnosticsKey::of(&gone), now);
+        }
+        assert_eq!(cache.recent_evictions.len(), MAX_RECENT_EVICTIONS);
+        assert!(!cache.was_recently_evicted(&Uri::from("file:///gone0.rs"), now));
+        let newest = MAX_RECENT_EVICTIONS + 43;
+        assert!(cache.was_recently_evicted(&Uri::from(format!("file:///gone{newest}.rs")), now));
+    }
+
+    #[test]
+    fn test_eviction_ring_deduplicates_and_prunes_expired_entries() {
+        let mut cache = NotificationCache::new();
+        let now = std::time::Instant::now();
+        let a = DiagnosticsKey::of(&Uri::from("file:///a.rs"));
+        cache.record_empty_eviction(a.clone(), now);
+        cache.record_empty_eviction(a, now);
+        assert_eq!(cache.recent_evictions.len(), 1);
+        let later = now + EVICTION_REPLAY_WINDOW + std::time::Duration::from_secs(1);
+        cache.record_empty_eviction(DiagnosticsKey::of(&Uri::from("file:///b.rs")), later);
+        assert_eq!(cache.recent_evictions.len(), 1);
+    }
+
+    #[test]
+    fn test_alias_eviction_of_an_empty_entry_is_recorded() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        for n in 0..MAX_SOURCES_PER_FILE {
+            cache.store_published_diagnostics(
+                &server,
+                &published(&format!("a{n}.rs")),
+                None,
+                vec![],
+            );
+        }
+        assert!(cache.recent_evictions.is_empty());
+
+        cache.store_published_diagnostics(
+            &server,
+            &PublishedDiagnosticsUri::for_test(file_uri("main.rs"), file_uri("main.rs")),
+            None,
+            vec![diagnostic_at(1, "e")],
+        );
+
+        assert!(cache.diagnostics(&file_uri("a0.rs")).is_none());
+        assert_eq!(cache.recent_evictions.len(), 1);
+        assert!(cache.is_listen_replayable(&file_uri("main.rs")));
+    }
+
+    #[test]
+    fn test_clearing_a_server_records_its_empty_entries() {
+        let mut cache = NotificationCache::new();
+        let empty = file_uri("empty.rs");
+        let broken = file_uri("broken.rs");
+        cache.store_diagnostics(&test_server(), &empty, None, vec![]);
+        cache.store_diagnostics(&test_server(), &broken, None, vec![error_diagnostic()]);
+
+        let cleared = cache.clear_server_diagnostics(&test_server());
+
+        assert_eq!(cleared.len(), 2);
+        assert!(cache.is_listen_replayable(&empty));
+        assert!(!cache.is_listen_replayable(&broken));
     }
 }

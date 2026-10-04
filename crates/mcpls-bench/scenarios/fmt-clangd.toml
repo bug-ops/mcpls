@@ -1,0 +1,50 @@
+name = "fmt-clangd"
+setup = [
+    { command = "sh", args = ["-c", "printf '%s\\n' -xc++ -std=c++20 -Iinclude > compile_flags.txt"] },
+]
+
+[source]
+kind = "git"
+url = "https://github.com/fmtlib/fmt"
+commit = "1be298e1bd68957e4cd352e1f676f00e07dcfb57" # 12.2.0
+
+[server]
+language_id = "cpp"
+file_patterns = ["**/*.cc", "**/*.h"]
+
+[server.executable]
+command = "clangd"
+version_args = ["--version"]
+
+[ready_probe]
+kind = "hover"
+file = "src/os.cc"
+position = { line = 183, character = 8 }
+contains = "buffered_file"
+symbol = "buffered_file"
+
+[[probes]]
+kind = "hover"
+file = "src/os.cc"
+position = { line = 183, character = 8 }
+contains = "buffered_file"
+symbol = "buffered_file"
+
+[[probes]]
+kind = "definition"
+file = "src/os.cc"
+position = { line = 183, character = 8 }
+uri_suffix = "include/fmt/os.h"
+symbol = "buffered_file"
+
+[[probes]]
+kind = "references"
+file = "src/os.cc"
+position = { line = 183, character = 8 }
+min_count = 2
+symbol = "buffered_file"
+
+[[probes]]
+kind = "document_symbols"
+file = "src/os.cc"
+symbol = "buffered_file::close"

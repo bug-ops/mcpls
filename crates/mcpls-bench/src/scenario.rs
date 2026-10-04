@@ -127,6 +127,15 @@ impl From<GitUrl> for String {
     }
 }
 
+/// Whether `text` is non-empty and made of `[a-z0-9-]` only, so it is safe as a directory name.
+#[must_use]
+pub fn is_slug(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// A scenario identifier safe to use as a directory name (`[a-z0-9-]+`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -144,11 +153,7 @@ impl TryFrom<String> for ScenarioName {
     type Error = String;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        let valid = !value.is_empty()
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-        if valid {
+        if is_slug(&value) {
             Ok(Self(value))
         } else {
             Err(format!("scenario name `{value}` must match [a-z0-9-]+"))
@@ -178,6 +183,12 @@ impl From<ScenarioName> for String {
 pub struct RepoPath(String);
 
 impl RepoPath {
+    /// The path as written, with forward slashes.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Resolves this path against the repository root.
     #[must_use]
     pub fn in_repo(&self, repo: &Path) -> PathBuf {
@@ -239,6 +250,9 @@ pub struct Executable {
     /// Arguments that make the executable print its version.
     #[serde(default)]
     pub version_args: Vec<String>,
+    /// Separate command that prints the version, for servers that have no version flag of their own.
+    #[serde(default)]
+    pub version_command: Option<String>,
     /// Substring the version output must contain; mismatch aborts the run.
     #[serde(default)]
     pub expected_version: Option<String>,
@@ -295,6 +309,9 @@ pub enum Probe {
         position: Position2D,
         /// Substring of the hover text.
         contains: String,
+        /// Identifier at the position; only comparison targets that address symbols by name need it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol: Option<String>,
     },
     /// `get_definition`; some location uri must end with `uri_suffix`.
     Definition {
@@ -304,6 +321,9 @@ pub enum Probe {
         position: Position2D,
         /// Suffix of a returned location uri.
         uri_suffix: String,
+        /// Identifier at the position; only comparison targets that address symbols by name need it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol: Option<String>,
     },
     /// `get_references`; at least `min_count` locations (declaration included).
     References {
@@ -313,6 +333,9 @@ pub enum Probe {
         position: Position2D,
         /// Minimum number of locations.
         min_count: usize,
+        /// Identifier at the position; only comparison targets that address symbols by name need it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol: Option<String>,
     },
     /// `get_document_symbols`; a symbol named `symbol` must exist.
     DocumentSymbols {
@@ -381,12 +404,52 @@ mod tests {
         include_str!("../scenarios/smoke-fixture.toml"),
     ];
 
+    fn bundled() -> Vec<(String, Scenario)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            let scenario = Scenario::load(&path).unwrap();
+            found.push((stem, scenario));
+        }
+        found
+    }
+
     #[test]
-    fn bundled_scenarios_parse() {
-        for text in SCENARIOS {
-            let scenario: Scenario = toml::from_str(text).unwrap();
+    fn bundled_scenarios_parse_and_are_named_after_their_file() {
+        let scenarios = bundled();
+        assert!(scenarios.len() >= 11, "{} scenarios", scenarios.len());
+        for (stem, scenario) in &scenarios {
+            assert_eq!(scenario.name.as_str(), stem);
             assert!(!scenario.probes.is_empty());
         }
+    }
+
+    #[test]
+    fn the_language_matrix_is_covered() {
+        let names: Vec<String> = bundled().into_iter().map(|(stem, _)| stem).collect();
+        for wanted in [
+            "httpx-pyright",
+            "httpx-ty",
+            "react-hook-form-tsgo",
+            "cobra-gopls",
+            "fmt-clangd",
+            "zls-zig-args",
+            "mcp-typescript-sdk-tsls",
+            "vscode-tsls",
+        ] {
+            assert!(names.iter().any(|n| n == wanted), "{wanted}");
+        }
+    }
+
+    #[test]
+    fn scenario_names_are_unique() {
+        let scenarios = bundled();
+        let mut names: Vec<&str> = scenarios.iter().map(|(_, s)| s.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), scenarios.len());
     }
 
     #[test]

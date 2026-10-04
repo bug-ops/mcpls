@@ -1,0 +1,54 @@
+name = "cobra-gopls"
+setup = [
+    { command = "go", args = ["mod", "download"] },
+]
+
+[source]
+kind = "git"
+url = "https://github.com/spf13/cobra"
+commit = "88b30ab89da2d0d0abb153818746c5a2d30eccec" # v1.10.2
+
+[server]
+language_id = "go"
+file_patterns = ["**/*.go"]
+
+[server.executable]
+command = "gopls"
+version_args = ["version"]
+
+[[runtime]]
+command = "go"
+version_args = ["version"]
+
+[ready_probe]
+kind = "hover"
+file = "command.go"
+position = { line = 1070, character = 12 }
+contains = "Command"
+symbol = "Command"
+
+[[probes]]
+kind = "hover"
+file = "command.go"
+position = { line = 1070, character = 12 }
+contains = "Command"
+symbol = "Command"
+
+[[probes]]
+kind = "definition"
+file = "command.go"
+position = { line = 1070, character = 12 }
+uri_suffix = "command.go"
+symbol = "Command"
+
+[[probes]]
+kind = "references"
+file = "command.go"
+position = { line = 1070, character = 21 }
+min_count = 2
+symbol = "Execute"
+
+[[probes]]
+kind = "document_symbols"
+file = "command.go"
+symbol = "Command"

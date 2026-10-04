@@ -72,10 +72,11 @@ impl fmt::Display for MemoryCheckpoint {
     }
 }
 
-/// Resident memory of the mcpls process group, summed over its members.
+/// Resident memory of the mcpls process tree, summed over its members.
 ///
-/// The sum double-counts pages shared between processes and misses
-/// descendants that left the group with `setsid`.
+/// The tree is the parent-pid closure of mcpls, so it includes the language
+/// servers and descendants that left the group with `setsid`, as long as
+/// their parent is alive. The sum double-counts pages shared between processes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RssReading {
@@ -86,7 +87,7 @@ pub enum RssReading {
         /// Every member of the group.
         processes: Vec<ProcessRss>,
     },
-    /// Memory could not be read on this platform or `ps` failed.
+    /// The process table could not be read, or mcpls was no longer in it.
     Unavailable {
         /// Why no reading exists.
         reason: String,
@@ -162,6 +163,8 @@ pub enum Outcome {
     },
     /// The call did not finish within the call timeout.
     TimedOut,
+    /// The target has no tool for this probe, so nothing was called.
+    Unsupported,
 }
 
 /// One timed observation.
@@ -185,7 +188,7 @@ pub enum ShutdownOutcome {
     Clean,
     /// The process had to be killed.
     Killed,
-    /// The process exited, but members of its process group outlived it and were killed.
+    /// The process exited, but members of its tree (same pid and start time) outlived it and were killed.
     OrphansKilled,
 }
 
@@ -214,10 +217,39 @@ pub struct RunRecord {
     pub samples: Vec<Sample>,
     /// Process-tree memory observations in execution order.
     pub memory: Vec<MemoryRecord>,
-    /// File receiving the stderr of the mcpls process.
-    pub stderr_log: PathBuf,
+    /// Capped capture of the stderr of the process under test.
+    pub stderr_log: StderrLogRecord,
     /// How the process ended.
     pub shutdown: ShutdownOutcome,
+}
+
+/// What became of the stderr capture of one run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StderrLogRecord {
+    /// File receiving the stderr.
+    pub path: PathBuf,
+    /// Bytes written to the file (the truncation marker is not counted).
+    pub written_bytes: u64,
+    /// Bytes read from the process but not written because the cap was reached.
+    pub dropped_bytes: u64,
+    /// False when the stream had not ended after the drain grace and the copy was abandoned.
+    pub drain_complete: bool,
+    /// A read or write failure of the capture, if any.
+    pub error: Option<String>,
+}
+
+impl StderrLogRecord {
+    /// A record for a log that received nothing.
+    #[must_use]
+    pub fn untouched(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            written_bytes: 0,
+            dropped_bytes: 0,
+            drain_complete: true,
+            error: None,
+        }
+    }
 }
 
 /// Resolved executable identity.
@@ -317,6 +349,8 @@ pub struct RunParams {
     pub ready_retry_interval_ms: u64,
     /// Whether version mismatches were tolerated.
     pub allow_version_mismatch: bool,
+    /// Largest stderr log per run, in bytes.
+    pub stderr_log_cap_bytes: u64,
 }
 
 /// Fewest samples for which a 95th percentile is distinct from the maximum.
@@ -370,12 +404,61 @@ pub struct RegionSummary {
     pub region: Region,
     /// Successful samples across measured runs.
     pub ok: usize,
-    /// Samples that were not [`Outcome::Ok`].
+    /// Samples that failed, were incorrect or timed out.
     pub not_ok: usize,
+    /// Samples of probes the target has no tool for; a capability gap, not a failure.
+    pub unsupported: usize,
     /// Successful samples with `iteration == 0`.
     pub first: Option<Stats>,
     /// Successful samples with `iteration > 0`.
     pub steady: Option<Stats>,
+}
+
+/// How a target's answers were checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verification {
+    /// Decoded into mcpls's typed results.
+    Structured,
+    /// Searched as text for substrings and marker counts; weaker than `Structured`.
+    Textual,
+}
+
+/// The system that was measured, with the identity of everything that determined its behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TargetRecord {
+    /// mcpls itself, driving the scenario's language server.
+    Mcpls {
+        /// The mcpls binary under test.
+        binary: PinRecord,
+        /// Fingerprint of the mcpls binary under test.
+        build: BinaryRecord,
+        /// The language server under test.
+        server: PinRecord,
+    },
+    /// A comparison target that brings its own language servers.
+    External {
+        /// Target name from its definition file.
+        name: String,
+        /// The executable that launches it (`uvx`, `npx`).
+        launcher: PinRecord,
+        /// The pinned version or commit that appears in the launch arguments.
+        pinned: String,
+        /// How its answers were checked.
+        verification: Verification,
+    },
+}
+
+impl TargetRecord {
+    /// Every executable pin of the target, for version-mismatch checks.
+    #[must_use]
+    pub fn pins(&self) -> Vec<&PinRecord> {
+        match self {
+            Self::Mcpls { binary, server, .. } => vec![binary, server],
+            Self::External { launcher, .. } => vec![launcher],
+        }
+    }
 }
 
 /// The full machine-readable result of `mcpls-bench run`.
@@ -385,12 +468,8 @@ pub struct RunReport {
     pub scenario: ScenarioName,
     /// Source provenance.
     pub source: SourceRecord,
-    /// The mcpls binary under test.
-    pub mcpls: PinRecord,
-    /// Fingerprint of the mcpls binary under test.
-    pub mcpls_binary: BinaryRecord,
-    /// The language server under test.
-    pub server: PinRecord,
+    /// What was measured.
+    pub target: TargetRecord,
     /// Other recorded executables.
     pub runtime: Vec<PinRecord>,
     /// Run parameters.
@@ -437,7 +516,7 @@ fn stats(mut values: Vec<Micros>) -> Option<Stats> {
 /// ```
 /// use mcpls_bench::report::{
 ///     summarize_memory, Kib, MemoryCheckpoint, MemoryRecord, ReadyRecord, RssReading, RunRecord,
-///     ShutdownOutcome,
+///     ShutdownOutcome, StderrLogRecord,
 /// };
 ///
 /// let run = RunRecord {
@@ -450,7 +529,7 @@ fn stats(mut values: Vec<Micros>) -> Option<Stats> {
 ///         checkpoint: MemoryCheckpoint::Ready,
 ///         reading: RssReading::Measured { total: Kib(2048), processes: Vec::new() },
 ///     }],
-///     stderr_log: "run-0.log".into(),
+///     stderr_log: StderrLogRecord::untouched("run-0.log"),
 ///     shutdown: ShutdownOutcome::Clean,
 /// };
 /// let summary = summarize_memory(&[run]);
@@ -506,6 +585,7 @@ pub fn summarize_memory(runs: &[RunRecord]) -> Vec<MemorySummary> {
 /// ```
 /// use mcpls_bench::report::{
 ///     summarize, Micros, Outcome, ReadyRecord, Region, RunRecord, Sample, ShutdownOutcome,
+///     StderrLogRecord,
 /// };
 ///
 /// let sample = |iteration, us| Sample {
@@ -521,7 +601,7 @@ pub fn summarize_memory(runs: &[RunRecord]) -> Vec<MemorySummary> {
 ///     truncated_after_timeout: false,
 ///     samples: vec![sample(0, 900), sample(1, 30), sample(2, 10), sample(3, 20)],
 ///     memory: Vec::new(),
-///     stderr_log: "run-0.log".into(),
+///     stderr_log: StderrLogRecord::untouched("run-0.log"),
 ///     shutdown: ShutdownOutcome::Clean,
 /// };
 /// let summary = summarize(&[run]);
@@ -556,10 +636,15 @@ pub fn summarize(runs: &[RunRecord]) -> Vec<RegionSummary> {
                 .iter()
                 .filter(|s| s.outcome == Outcome::Ok)
                 .count();
+            let unsupported = in_region
+                .iter()
+                .filter(|s| s.outcome == Outcome::Unsupported)
+                .count();
             RegionSummary {
                 region,
                 ok: ok_count,
-                not_ok: in_region.len() - ok_count,
+                not_ok: in_region.len() - ok_count - unsupported,
+                unsupported,
                 first: ok(true),
                 steady: ok(false),
             }
@@ -592,7 +677,7 @@ mod tests {
             truncated_after_timeout: false,
             samples,
             memory: Vec::new(),
-            stderr_log: PathBuf::from("run.log"),
+            stderr_log: StderrLogRecord::untouched("run.log"),
             shutdown: ShutdownOutcome::Clean,
         }
     }
@@ -635,6 +720,23 @@ mod tests {
         assert_eq!(summary[0].ok, 1);
         assert_eq!(summary[0].not_ok, 1);
         assert_eq!(summary[0].steady, None);
+    }
+
+    #[test]
+    fn unsupported_probes_are_not_failures() {
+        let runs = [run(
+            false,
+            vec![
+                sample(Region::Hover, Outcome::Unsupported, 0, 0),
+                sample(Region::Hover, Outcome::TimedOut, 5, 1),
+                sample(Region::Hover, Outcome::Ok, 7, 2),
+            ],
+        )];
+        let summary = summarize(&runs);
+        assert_eq!(
+            (summary[0].ok, summary[0].not_ok, summary[0].unsupported),
+            (1, 1, 1)
+        );
     }
 
     #[test]

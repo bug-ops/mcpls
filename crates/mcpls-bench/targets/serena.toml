@@ -1,0 +1,36 @@
+name = "serena"
+pinned = "949a27ef1e5fda1a6e7b561e777bcece345c6ffd" # v1.7.0
+cleanup = [".serena"]
+args = [
+    "--from",
+    "git+https://github.com/oraios/serena@949a27ef1e5fda1a6e7b561e777bcece345c6ffd",
+    "serena",
+    "start-mcp-server",
+    "--project",
+    "{repo}",
+    "--context",
+    "ide",
+    "--enable-web-dashboard",
+    "false",
+    "--open-web-dashboard",
+    "false",
+    "--enable-gui-log-window",
+    "false",
+]
+
+[launcher]
+command = "uvx"
+version_args = ["--version"]
+
+[tools.document_symbols]
+tool = "get_symbols_overview"
+arguments = { relative_path = "{relative_file}" }
+
+[tools.definition]
+tool = "find_symbol"
+arguments = { name_path_pattern = "{symbol}" }
+
+[tools.references]
+tool = "find_referencing_symbols"
+arguments = { name_path = "{symbol}", relative_path = "{relative_file}" }
+count_marker = "content_around_reference"
