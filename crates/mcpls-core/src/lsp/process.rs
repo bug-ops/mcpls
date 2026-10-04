@@ -25,6 +25,7 @@ mod lifeline;
 pub const LIFELINE_SWEEP_BUDGET: Duration = Duration::from_secs(8);
 
 /// Whether an out-of-process watchdog guards a server.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binding {
     /// A live watchdog sweeps the server's tree if mcpls dies, so the server
@@ -205,11 +206,6 @@ impl ServerProcess {
         wrapped.spawn().map(|child| Self { child })
     }
 
-    /// Windows servers always see the real mcpls pid; the job kills the tree.
-    pub(crate) const fn binding(&mut self) -> Binding {
-        Binding::Unbound
-    }
-
     pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.stdin().take()
     }
@@ -230,15 +226,6 @@ impl ServerProcess {
     /// until every process in the job is gone.
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.inner_mut().wait().await
-    }
-
-    /// Nothing to freeze: the job covers every descendant.
-    #[allow(
-        clippy::unused_async,
-        reason = "mirrors the Unix signature so callers are platform independent"
-    )]
-    pub(crate) async fn mark_escapees(&mut self) -> MarkOutcome {
-        MarkOutcome::Confirmed
     }
 
     /// Dropping the job handle kills the whole tree.

@@ -620,8 +620,12 @@ mod tests {
 
     #[test]
     fn counting_bindings_need_a_marker() {
-        let text = LSMCP.replace("count_marker = \".ts:\"\n", "");
-        assert_ne!(text, LSMCP);
+        let text: Vec<&str> = LSMCP
+            .lines()
+            .filter(|line| !line.starts_with("count_marker"))
+            .collect();
+        assert!(text.len() < LSMCP.lines().count());
+        let text = text.join("\n");
         let error = ExternalTarget::parse(&text).unwrap_err();
         assert!(error.to_string().contains("count_marker"), "{error}");
     }

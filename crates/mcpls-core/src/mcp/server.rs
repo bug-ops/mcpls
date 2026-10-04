@@ -1448,7 +1448,7 @@ impl ServerHandler for McplsServer {
     /// every transport and, unlike `resources/subscribe`, needs no session.
     ///
     /// Over HTTP a stream also ends abruptly after its lease
-    /// ([`ListenLease`](crate::transport::ListenLease)); a live client listens
+    /// (`ListenLease`); a live client listens
     /// again and the replay below covers the gap.
     ///
     /// Streams are capped at `MAX_LISTEN_STREAMS` (shared by stdio and HTTP,

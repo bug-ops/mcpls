@@ -30,7 +30,9 @@ use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
-use crate::lsp::process::{Binding, MarkOutcome, ServerProcess};
+#[cfg(unix)]
+use crate::lsp::process::Binding;
+use crate::lsp::process::{MarkOutcome, ServerProcess};
 use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
@@ -467,7 +469,10 @@ impl LspServer {
             lifecycle_tx,
             Arc::clone(&redactions),
         );
+        #[cfg(unix)]
         let process_id = initialize_process_id(child.binding());
+        #[cfg(windows)]
+        let process_id = Some(mcpls_process_id());
         let (capabilities, position_encoding) =
             match Self::initialize_as(&client, &config, process_id).await {
                 Ok(negotiated) => negotiated,
@@ -855,22 +860,32 @@ impl LspServer {
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         let client = self.client;
 
+        #[cfg(unix)]
         let mut child = self.child;
-        let mut mark = MarkOutcome::Confirmed;
-        let handshake: Result<()> = timeout_at(deadline, async {
+        #[cfg(windows)]
+        let child = self.child;
+        let handshake: Result<MarkOutcome> = timeout_at(deadline, async {
             let _: serde_json::Value = client
                 .request(ShutdownRequest::METHOD.as_str(), (), Duration::from_secs(5))
                 .await?;
-            if let Some(child) = child.as_mut() {
-                mark = child.mark_escapees().await;
-                if mark != MarkOutcome::Confirmed {
-                    return Ok(());
-                }
+            #[cfg(unix)]
+            let mark = match child.as_mut() {
+                Some(child) => child.mark_escapees().await,
+                None => MarkOutcome::Confirmed,
+            };
+            #[cfg(windows)]
+            let mark = MarkOutcome::Confirmed;
+            if mark == MarkOutcome::Confirmed {
+                client.notify_typed::<ExitNotification>(()).await?;
             }
-            client.notify_typed::<ExitNotification>(()).await
+            Ok(mark)
         })
         .await
         .unwrap_or(Err(Error::ShutdownTimeout));
+        let mark = handshake
+            .as_ref()
+            .map_or(MarkOutcome::Confirmed, |mark| *mark);
+        let handshake = handshake.map(drop);
         let handshake = match client.shutdown_until(deadline).await {
             Ok(()) => handshake,
             Err(e) => handshake.and(Err(e)),
@@ -1041,9 +1056,9 @@ fn mcpls_process_id() -> i32 {
 
 /// The `processId` to send: none while a lifeline watchdog is bound, the real
 /// mcpls pid otherwise.
+#[cfg(unix)]
 fn initialize_process_id(binding: Binding) -> Option<i32> {
     match binding {
-        #[cfg(unix)]
         Binding::Bound => None,
         Binding::Unbound => Some(mcpls_process_id()),
     }
@@ -1965,6 +1980,7 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_unbound_server_gets_the_real_process_id() {
         assert_eq!(
