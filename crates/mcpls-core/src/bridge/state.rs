@@ -398,13 +398,16 @@ pub struct DocumentTracker {
     /// path, so calls for different paths never wait on each other. See
     /// `lock_path` for how entries are created and evicted.
     ///
-    /// Also doubles as the "has an in-flight operation" signal
-    /// `Self::open`'s LRU eviction consults (#495): a path is present here
-    /// for the whole duration of any `ensure_open` call against it
-    /// (`lock_path`'s guard is held across it), so excluding every path
-    /// present in this map from eviction candidates is exactly "never evict
-    /// a document with an operation in flight".
+    /// Also excluded from `Self::open`'s LRU eviction (#495): a path is
+    /// present here for the whole duration of any `ensure_open` call against
+    /// it (`lock_path`'s guard is held across it). That window ends before
+    /// the caller's own LSP round-trip, which `in_flight` covers.
     path_locks: StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+    /// Refcount of [`InFlightGuard`]s per path: documents a handler is still
+    /// using across its LSP round-trip, which [`Self::open`]'s LRU eviction
+    /// must not remove (#503). Shared with each guard so it can release
+    /// without borrowing the tracker.
+    in_flight: InFlightMap,
     /// Per-server sync generation, bumped by [`Self::forget_server`].
     ///
     /// `ensure_open` captures a server's generation before doing any I/O and
@@ -429,6 +432,7 @@ impl DocumentTracker {
         Self {
             documents: StdMutex::new(HashMap::new()),
             path_locks: StdMutex::new(HashMap::new()),
+            in_flight: Arc::default(),
             generations: StdMutex::new(HashMap::new()),
             limits,
             extension_map,
@@ -444,6 +448,28 @@ impl DocumentTracker {
     /// `synced_servers`.
     pub fn take_evicted(&self) -> Vec<EvictedDocument> {
         std::mem::take(&mut lock_std(&self.evicted))
+    }
+
+    /// Marks `path` as in use by a handler until the returned guard drops, so
+    /// [`Self::open`]'s LRU eviction skips it (#503).
+    ///
+    /// Take the guard *before* [`Self::ensure_open`] and keep it alive across
+    /// the LSP round-trip that follows; guards for the same path stack, and
+    /// the path is evictable again only once all of them have dropped.
+    pub(crate) fn mark_in_flight(&self, path: &Path) -> InFlightGuard {
+        *lock_std(&self.in_flight)
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
+        InFlightGuard {
+            in_flight: Arc::clone(&self.in_flight),
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// Number of live [`InFlightGuard`]s for `path`.
+    #[cfg(test)]
+    pub(crate) fn in_flight_count(&self, path: &Path) -> usize {
+        lock_std(&self.in_flight).get(path).copied().unwrap_or(0)
     }
 
     /// Check if a document is currently open.
@@ -507,16 +533,9 @@ impl DocumentTracker {
     /// without it, a concurrent `ensure_open` for the same path could
     /// interleave with the insert below and lose its disk snapshot.
     ///
-    /// Note the narrower guarantee than "no operation in flight" might
-    /// suggest: the `ensure_open` lock this checks (`path_locks`)
-    /// is released once that call returns, *before* the caller's actual LSP
-    /// round-trip for the document runs (see `path_locks`'s doc) -- a
-    /// document already past its own `ensure_open` can still be evicted
-    /// while its handler's request is in flight. Harmless at the default
-    /// `max_documents` (100): the just-prepared document is always the most
-    /// recently used, so it's never the LRU candidate. At a very small
-    /// configured limit with enough concurrent calls, two in-flight
-    /// documents could in principle evict each other mid-request.
+    /// A document a handler is still using across its LSP round-trip (see
+    /// `mark_in_flight`) is never evicted, so a concurrent `open` cannot take
+    /// it away mid-request even at a very small `max_documents` (#503).
     ///
     /// # Errors
     ///
@@ -548,7 +567,7 @@ impl DocumentTracker {
             && !documents.contains_key(&path)
         {
             let Some((evicted_path, evicted_state)) =
-                Self::evict_lru(&mut documents, &self.path_locks)
+                Self::evict_lru(&mut documents, &self.path_locks, &self.in_flight)
             else {
                 return Err(Error::DocumentLimitExceeded {
                     current: documents.len(),
@@ -567,10 +586,9 @@ impl DocumentTracker {
     }
 
     /// Removes and returns the least-recently-used entry in `documents` that
-    /// is both unlocked and disk-verified -- see `path_locks`'s doc for why
-    /// "present in `path_locks`" is exactly "has an `ensure_open`
-    /// operation in flight" (#495), and below for why "disk-verified" is
-    /// required too.
+    /// is unlocked (not in `path_locks`, #495), not held by an
+    /// [`InFlightGuard`] (#503), and disk-verified -- see below for why that
+    /// last condition is required.
     ///
     /// A candidate whose `disk()` is `None` is skipped: its in-memory
     /// `content` has not been read-back-verified against disk (e.g. it was
@@ -579,19 +597,22 @@ impl DocumentTracker {
     /// unlike a disk-verified candidate, whose evicted content is
     /// reproducible by re-reading the file.
     ///
-    /// Returns `None` if every tracked document is currently locked or not
-    /// disk-verified, in which case the caller must not evict anything.
+    /// Returns `None` if every tracked document is currently locked, in
+    /// flight, or not disk-verified, in which case the caller must not evict
+    /// anything.
     fn evict_lru(
         documents: &mut HashMap<PathBuf, DocumentState>,
         path_locks: &StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+        in_flight: &InFlightMap,
     ) -> Option<(PathBuf, DocumentState)> {
-        let locked = lock_std(path_locks)
+        let mut busy = lock_std(path_locks)
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
+        busy.extend(lock_std(in_flight).keys().cloned());
         let lru_path = documents
             .iter()
-            .filter(|(path, state)| !locked.contains(path.as_path()) && state.disk().is_some())
+            .filter(|(path, state)| !busy.contains(path.as_path()) && state.disk().is_some())
             .min_by_key(|(_, state)| state.last_accessed)
             .map(|(path, _)| path.clone())?;
         documents.remove(&lru_path).map(|state| (lru_path, state))
@@ -1249,6 +1270,34 @@ impl DocumentTracker {
     }
 }
 
+/// Per-path count of live [`InFlightGuard`]s.
+type InFlightMap = Arc<StdMutex<HashMap<PathBuf, usize>>>;
+
+/// RAII marker that keeps a document out of [`DocumentTracker::open`]'s LRU
+/// eviction for as long as it is alive (#503).
+///
+/// Obtained from [`DocumentTracker::mark_in_flight`]. Releases on drop, so
+/// every exit path -- including errors and cancelled futures -- unprotects
+/// the path again.
+#[derive(Debug)]
+#[must_use = "dropping the guard immediately makes the document evictable again"]
+pub struct InFlightGuard {
+    in_flight: InFlightMap,
+    path: PathBuf,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut in_flight = lock_std(&self.in_flight);
+        if let Some(count) = in_flight.get_mut(&self.path) {
+            *count -= 1;
+            if *count == 0 {
+                in_flight.remove(&self.path);
+            }
+        }
+    }
+}
+
 /// RAII guard for the per-path lock acquired by
 /// [`DocumentTracker::lock_path`].
 ///
@@ -1646,6 +1695,101 @@ mod tests {
             "the locked document must not be evicted"
         );
         assert!(tracker.take_evicted().is_empty());
+    }
+
+    /// Opens `name` through `ensure_open` so it is disk-verified (the only
+    /// kind `evict_lru` will consider).
+    async fn ensure_open_disk_verified(
+        tracker: &DocumentTracker,
+        dir: &TempDir,
+        name: &str,
+    ) -> PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, name).unwrap();
+        set_mtime(&path, settled_past());
+        let (client, _server) = fake_lsp_client();
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
+        path
+    }
+
+    /// #503: a document held by an `InFlightGuard` is never evicted -- `open`
+    /// falls back to `DocumentLimitExceeded` -- and becomes evictable the
+    /// moment the guard drops.
+    #[tokio::test]
+    async fn test_open_does_not_evict_in_flight_document_until_guard_drops() {
+        let dir = TempDir::new().unwrap();
+        let limits = ResourceLimits {
+            max_documents: 1,
+            max_file_size: 0,
+        };
+        let tracker = DocumentTracker::new(limits, HashMap::new());
+        let path_a = ensure_open_disk_verified(&tracker, &dir, "a.rs").await;
+
+        let guard = tracker.mark_in_flight(&path_a);
+        let path_b = dir.path().join("b.rs");
+        std::fs::write(&path_b, "BBBB").unwrap();
+
+        let result = tracker.open(path_b.clone(), "BBBB".to_string());
+        assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+        assert!(tracker.is_open(&path_a));
+        assert!(tracker.take_evicted().is_empty());
+
+        drop(guard);
+        tracker.open(path_b.clone(), "BBBB".to_string()).unwrap();
+        assert!(!tracker.is_open(&path_a));
+        assert!(tracker.is_open(&path_b));
+        let evicted = tracker.take_evicted();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].path, path_a);
+    }
+
+    /// #503: guards for one path stack -- dropping one leaves the path
+    /// protected until the last is gone, and the bookkeeping entry is removed.
+    #[tokio::test]
+    async fn test_in_flight_guards_are_refcounted_per_path() {
+        let dir = TempDir::new().unwrap();
+        let limits = ResourceLimits {
+            max_documents: 1,
+            max_file_size: 0,
+        };
+        let tracker = DocumentTracker::new(limits, HashMap::new());
+        let path_a = ensure_open_disk_verified(&tracker, &dir, "a.rs").await;
+
+        let first = tracker.mark_in_flight(&path_a);
+        let second = tracker.mark_in_flight(&path_a);
+        drop(first);
+
+        let path_b = dir.path().join("b.rs");
+        let result = tracker.open(path_b.clone(), "BBBB".to_string());
+        assert!(
+            matches!(result, Err(Error::DocumentLimitExceeded { .. })),
+            "one guard still outstanding"
+        );
+
+        drop(second);
+        assert!(lock_std(&tracker.in_flight).is_empty());
+        tracker.open(path_b, "BBBB".to_string()).unwrap();
+        assert!(!tracker.is_open(&path_a));
+    }
+
+    /// #503: a guard held inside a future that is cancelled mid-await is
+    /// released, so a timed-out handler cannot pin its document forever.
+    #[tokio::test]
+    async fn test_in_flight_guard_released_when_holding_future_is_cancelled() {
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/test/cancelled.rs");
+
+        let held = async {
+            let _guard = tracker.mark_in_flight(&path);
+            std::future::pending::<()>().await;
+        };
+        let timed_out = tokio::time::timeout(Duration::from_millis(10), held).await;
+
+        assert!(timed_out.is_err());
+        assert_eq!(tracker.in_flight_count(&path), 0);
     }
 
     /// #495 S4: a document with no disk-verified snapshot (`disk()` is

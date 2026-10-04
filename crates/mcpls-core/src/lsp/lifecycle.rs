@@ -1177,7 +1177,7 @@ mod tests {
             notification_tx: None,
         };
 
-        assert!(config.workspace_roots.is_empty());
+        assert_eq!(config.workspace_roots.len(), 0);
     }
 
     #[test]

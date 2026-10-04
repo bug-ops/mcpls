@@ -156,10 +156,11 @@ impl Translator {
         file_path: String,
         notification_cache: &Mutex<NotificationCache>,
     ) -> Result<DiagnosticsResult> {
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_document(&file_path, ToolKind::Diagnostics)
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
 
         let params = DocumentDiagnosticParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
@@ -193,7 +194,7 @@ impl Translator {
                 };
                 let mut diagnostics = Vec::with_capacity(items.len());
                 for d in &items {
-                    diagnostics.push(diagnostic_to_mcp(d, &ctx, &uri).await);
+                    diagnostics.push(diagnostic_to_mcp(d, &ctx, uri).await);
                 }
                 let pull = DiagnosticsResult {
                     diagnostics,

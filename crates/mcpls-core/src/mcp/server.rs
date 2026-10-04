@@ -515,7 +515,7 @@ impl McplsServer {
     /// real HTTP factory/session-close path (`transport.rs`'s integration
     /// tests) can assert on registry state without reaching into private
     /// `BridgeContext` fields cross-module.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "transport-http"))]
     pub(crate) fn subscription_registry(&self) -> SubscriptionRegistry {
         self.context.subscription_registry.clone()
     }
@@ -686,7 +686,7 @@ impl McplsServer {
     // read-only: returns a proposed WorkspaceEdit, does not apply it -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = concat!("Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty. ", positions_note_request!()),
+        description = concat!("Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. ", positions_note_request!()),
         title = "Rename Symbol"
     )]
     async fn rename_symbol(
@@ -799,7 +799,7 @@ impl McplsServer {
     // read-only: returns proposed CodeAction edits, does not apply them --
     // mcpls has no write-back path today; revisit if that changes.
     #[tool(
-        description = concat!("Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. ", positions_note_request!()),
+        description = concat!("Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. ", positions_note_request!()),
         title = "Code Actions"
     )]
     async fn get_code_actions(
@@ -858,7 +858,7 @@ impl McplsServer {
 
     /// Get incoming calls (callers).
     #[tool(
-        description = concat!("Functions calling the specified item. Takes call hierarchy item, returns all callers. ", positions_note_request!()),
+        description = concat!("Functions calling the specified item. Takes call hierarchy item, returns callers, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
         title = "Incoming Calls"
     )]
     async fn get_incoming_calls(
@@ -870,7 +870,7 @@ impl McplsServer {
 
     /// Get outgoing calls (callees).
     #[tool(
-        description = concat!("Functions called by the specified item. Takes call hierarchy item, returns all callees. ", positions_note_request!()),
+        description = concat!("Functions called by the specified item. Takes call hierarchy item, returns callees, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
         title = "Outgoing Calls"
     )]
     async fn get_outgoing_calls(
@@ -1026,7 +1026,7 @@ impl McplsServer {
 
     /// Get inlay hints for a range.
     #[tool(
-        description = concat!("Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Keep the range end inside the file. ", positions_note_request!()),
+        description = concat!("Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Capped at a fixed maximum; `truncated: true` on the result means more hints exist than are returned. Keep the range end inside the file. ", positions_note_request!()),
         title = "Inlay Hints"
     )]
     async fn get_inlay_hints(
@@ -1705,7 +1705,7 @@ mod tests {
 
         let result = call.await.unwrap().unwrap();
         assert!(result.0.signals.indexing_in_progress);
-        assert!(result.0.result.diagnostics.is_empty());
+        assert_eq!(result.0.result.diagnostics.len(), 0);
     }
 
     /// Counterpart to the above: once the server has no active `Loading`
@@ -3343,7 +3343,7 @@ sleep 0.3
     fn test_paginate_out_of_range_cursor_yields_empty_page_not_error() {
         let p = paths(5);
         let (page, next_cursor) = paginate_resource_paths(&p, Some("9999"), 100).unwrap();
-        assert!(page.is_empty());
+        assert_eq!(page.len(), 0);
         assert!(next_cursor.is_none());
     }
 
@@ -3354,7 +3354,7 @@ sleep 0.3
         let p = paths(5);
         let cursor = usize::MAX.to_string();
         let (page, next_cursor) = paginate_resource_paths(&p, Some(&cursor), 100).unwrap();
-        assert!(page.is_empty());
+        assert_eq!(page.len(), 0);
         assert!(next_cursor.is_none());
     }
 
@@ -3397,7 +3397,7 @@ sleep 0.3
             ResourceDiagnosticsResponse::new(false, None, DiagnosticsRouteSignals::default());
         assert!(!response.tracked);
         assert!(response.version.is_none());
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics.len(), 0);
 
         // #132's contract is the wire shape, not the Rust struct -- assert the JSON directly.
         let json = serde_json::to_value(&response).unwrap();
@@ -3412,7 +3412,7 @@ sleep 0.3
             ResourceDiagnosticsResponse::new(true, None, DiagnosticsRouteSignals::default());
         assert!(response.tracked);
         assert!(response.version.is_none());
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics.len(), 0);
 
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["tracked"], true);
@@ -3475,7 +3475,7 @@ sleep 0.3
         let response =
             build_resource_diagnostics_response(false, None, DiagnosticsRouteSignals::default());
         assert!(!response.tracked);
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics.len(), 0);
     }
 
     #[test]
@@ -3483,7 +3483,7 @@ sleep 0.3
         let response =
             build_resource_diagnostics_response(true, None, DiagnosticsRouteSignals::default());
         assert!(response.tracked);
-        assert!(response.diagnostics.is_empty());
+        assert_eq!(response.diagnostics.len(), 0);
     }
 
     /// Regression: an LSP server can publish diagnostics for a file mcpls never
