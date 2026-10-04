@@ -53,7 +53,8 @@ related:
 >   using, so clients should ask before running it.
 > - **Always on (FR-013):** no configuration flag.
 > - **Startup-failed servers (FR-015):** reported as `not_running`; starting them is a follow-up.
->   A server still starting reports `initializing`.
+>   A server still starting reports `initializing`, and so does every restart while startup is
+>   still settling (a restarted pump's diagnostics role is fixed at spawn).
 > - **Termination order:** kill-then-respawn: the old server gets 3 s to answer `shutdown`; one
 >   that answered may then take up to 10 s to exit on its own (rust-analyzer and jdtls flush
 >   caches), after which the whole process group is killed; one that did not answer is killed

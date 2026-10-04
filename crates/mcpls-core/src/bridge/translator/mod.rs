@@ -150,6 +150,8 @@ pub struct Translator {
     restart_attempts: Arc<StdMutex<HashMap<ServerId, std::time::Instant>>>,
     /// Set once shutdown has begun; a restart then declines to start a server.
     shutting_down: AtomicBool,
+    /// Set while the initial servers are still settling; see [`Translator::begin_startup`].
+    startup_settling: AtomicBool,
     /// Set when the background init task panicked, so a restart that finds no
     /// notification wiring knows none will ever be installed.
     init_panicked: AtomicBool,
@@ -199,6 +201,7 @@ impl Translator {
             restart_generations: Arc::new(StdMutex::new(HashMap::new())),
             restart_attempts: Arc::new(StdMutex::new(HashMap::new())),
             shutting_down: AtomicBool::new(false),
+            startup_settling: AtomicBool::new(false),
             init_panicked: AtomicBool::new(false),
             clock: Arc::new(SystemClock),
             indexing_ready_timeout: navigation::INDEXING_READY_TIMEOUT,

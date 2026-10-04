@@ -1101,6 +1101,7 @@ async fn init_lsp_servers(
     };
     // Installed before the first server settles, so every settled server can
     // be restarted and no init path leaves a registered server unwired.
+    let mut startup = Some(translator.begin_startup());
     translator.install_wiring(Arc::new(PumpWiring {
         shared: pump_shared.clone(),
         cancel_rx: cancel_rx.clone(),
@@ -1131,8 +1132,11 @@ async fn init_lsp_servers(
         pending = FuturesUnordered::new();
     }
     loop {
-        if pending.is_empty() && settler.pumps.is_empty() {
-            break;
+        if pending.is_empty() {
+            drop(startup.take());
+            if settler.pumps.is_empty() {
+                break;
+            }
         }
         tokio::select! {
             biased;

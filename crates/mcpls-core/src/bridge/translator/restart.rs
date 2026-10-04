@@ -322,6 +322,17 @@ pub trait NotificationWiring: std::fmt::Debug + Send + Sync {
     fn publish_invalidated<'a>(&'a self, cleared: &'a [DiagnosticsKey]) -> BoxFuture<'a, ()>;
 }
 
+/// Keeps restarts reporting `initializing` until dropped, so an init panic,
+/// task abort or early return can never leave the flag set.
+#[derive(Debug)]
+pub struct StartupGuard<'a>(&'a Translator);
+
+impl Drop for StartupGuard<'_> {
+    fn drop(&mut self) {
+        self.0.startup_settling.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A server taken out of the registries for termination, restored on every
 /// exit path (error, early return, panic, cancelled future).
 struct Deregistered<'a> {
@@ -482,8 +493,10 @@ impl Translator {
 
     /// Install how restarted servers get their diagnostics pump back.
     ///
-    /// Called once, after the initial pumps are registered with
-    /// [`Self::set_notification_task`]; a repeat call keeps the first wiring.
+    /// Called once, before the first server settles, so each initial pump is
+    /// registered with [`Self::set_notification_task`] as its server
+    /// registers; a repeat call keeps the first wiring. Restarts stay blocked
+    /// until startup has settled (see [`Self::begin_startup`]).
     pub(crate) fn install_wiring(&self, wiring: Arc<dyn NotificationWiring>) {
         if self.wiring.set(wiring).is_err() {
             tracing::debug!("notification wiring already installed");
@@ -494,6 +507,15 @@ impl Translator {
     /// stop it before starting its replacement.
     pub(crate) fn set_notification_task(&self, id: ServerId, handle: AbortHandle) {
         lock_std(&self.notification_tasks).insert(id, handle);
+    }
+
+    /// Declare that the initial server startup is still settling; restarts
+    /// report `initializing` until the returned guard is dropped, because a
+    /// restarted pump's diagnostics role is fixed at spawn and routes still
+    /// change while servers settle.
+    pub(crate) fn begin_startup(&self) -> StartupGuard<'_> {
+        self.startup_settling.store(true, Ordering::SeqCst);
+        StartupGuard(self)
     }
 
     /// Declare that shutdown has begun; no restart starts a server after this.
@@ -528,7 +550,8 @@ impl Translator {
     }
 
     /// Why `id` cannot be restarted right now, in classification order:
-    /// shutting down, never started, not yet wired, then the cooldown.
+    /// shutting down, never started or failed to start, init panicked, startup
+    /// still settling or not yet wired, then the cooldown.
     fn restart_blocker(&self, id: &ServerId) -> Option<RestartOutcome> {
         if self.is_shutting_down() {
             return Some(RestartOutcome::Failed {
@@ -553,7 +576,7 @@ impl Translator {
                 message: "startup was interrupted by a panic, so servers cannot be restarted; restart mcpls".to_string(),
             });
         }
-        if self.wiring.get().is_none() {
+        if self.startup_settling.load(Ordering::SeqCst) || self.wiring.get().is_none() {
             return Some(RestartOutcome::Initializing);
         }
         self.restart_cooldown_remaining(id)
@@ -941,6 +964,69 @@ mod tests {
             }]);
             translator.rebind_router(&HashSet::new());
             translator.clear_expected_servers();
+
+            let result = translator
+                .restart_servers(server_ids(&["rust"]))
+                .await
+                .unwrap();
+
+            assert_matches!(
+                only_outcome(&result),
+                RestartOutcome::NotRunning { .. },
+                "{result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_restart_of_a_settled_server_while_startup_settles_reports_initializing() {
+            let dir = TempDir::new().unwrap();
+            let log = dir.path().join("server.log");
+            let script = write_protocol_server_script(dir.path(), &log, None);
+            let fx = fixture(dir, &script, true).await;
+            let startup = fx.translator.begin_startup();
+
+            let during = fx
+                .translator
+                .restart_servers(server_ids(&["rust"]))
+                .await
+                .unwrap();
+            assert_eq!(*only_outcome(&during), RestartOutcome::Initializing);
+
+            drop(startup);
+            let after = fx
+                .translator
+                .restart_servers(server_ids(&["rust"]))
+                .await
+                .unwrap();
+            assert_matches!(
+                only_outcome(&after),
+                RestartOutcome::Restarted { .. },
+                "{after:?}"
+            );
+        }
+
+        #[test]
+        fn test_dropping_the_startup_guard_clears_the_flag() {
+            let translator = Translator::new();
+            let startup = translator.begin_startup();
+            assert!(translator.startup_settling.load(Ordering::SeqCst));
+            drop(startup);
+            assert!(!translator.startup_settling.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn test_restart_of_a_startup_failed_server_while_startup_settles_reports_not_running()
+        {
+            let id = ServerId::from("rust");
+            let translator = Translator::new()
+                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            translator.record_startup_failures(&[ServerSpawnFailure {
+                server_id: id,
+                language_id: "rust".to_string(),
+                command: "missing".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
+            }]);
+            let _startup = translator.begin_startup();
 
             let result = translator
                 .restart_servers(server_ids(&["rust"]))
