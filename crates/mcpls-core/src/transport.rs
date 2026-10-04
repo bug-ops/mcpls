@@ -501,8 +501,14 @@ pub(crate) async fn run_stdio(
 /// the next write, at most one SSE keep-alive (15 s) later. A silently vanished
 /// peer (half-open TCP: sleeping laptop, dropped NAT mapping) keeps its stream,
 /// and with it the session, open until the OS gives up retransmitting
-/// (roughly 15-30 minutes on Linux) -- bounded, but not by the idle timeout
-/// (see #531). A client with a GET stream open is never reaped by mcpls, but
+/// (roughly 15-30 minutes on Linux) -- bounded, but not by the idle timeout.
+/// On Linux and Android every accepted socket gets `TCP_USER_TIMEOUT` of
+/// `HALF_OPEN_TIMEOUT` (60 s), so unacknowledged data (the 15 s SSE pings
+/// guarantee some) drops the connection about 75 s after the peer vanishes
+/// (#531). macOS and Windows keep the kernel default. Behind the recommended
+/// reverse proxy the accepted socket faces the proxy, so the proxy's own
+/// timeouts govern instead. A client that stops reading with a full receive
+/// window for longer than the timeout may be dropped too. A client with a GET stream open is never reaped by mcpls, but
 /// rmcp's own 5-minute `keep_alive` still ends a session that sees no event at
 /// all in that time (SSE pings do not count). Clients should send `DELETE` on
 /// shutdown; after an expiry they must re-initialize and re-subscribe.
@@ -564,7 +570,6 @@ pub(crate) async fn run_http(
     cfg: HttpConfig,
     shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
-    // TODO(#531): bound half-open GET/listen streams via TCP_USER_TIMEOUT
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
@@ -784,6 +789,10 @@ async fn serve_http1(
             },
         };
 
+        // TODO(#543): portable half-open detection via MCP ping
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        set_half_open_timeout(&stream);
+
         let conn =
             builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone()));
         let cancel = cancel.clone();
@@ -918,6 +927,28 @@ fn is_connection_error(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::ConnectionReset
     )
+}
+
+/// `TCP_USER_TIMEOUT` applied to accepted HTTP sockets on Linux and Android.
+///
+/// Must exceed the 15 s SSE keep-alive interval so a healthy but quiet stream
+/// is never dropped.
+#[cfg(all(
+    feature = "transport-http",
+    any(target_os = "linux", target_os = "android")
+))]
+const HALF_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bounds how long unacknowledged data may linger on `stream` before the
+/// kernel drops the connection; failures are logged and the connection kept.
+#[cfg(all(
+    feature = "transport-http",
+    any(target_os = "linux", target_os = "android")
+))]
+fn set_half_open_timeout(stream: &tokio::net::TcpStream) {
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_user_timeout(Some(HALF_OPEN_TIMEOUT)) {
+        tracing::debug!(error = %e, "failed to set TCP_USER_TIMEOUT on accepted connection");
+    }
 }
 
 /// Upper bound [`run_http`] waits, once shutdown has been signaled, for
@@ -1343,6 +1374,26 @@ async fn enforce_session_cap(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// An accepted stream must read back the half-open `TCP_USER_TIMEOUT`.
+    #[cfg(all(
+        feature = "transport-http",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[tokio::test]
+    async fn test_set_half_open_timeout_applies_tcp_user_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+
+        super::set_half_open_timeout(&accepted);
+
+        let timeout = socket2::SockRef::from(&accepted)
+            .tcp_user_timeout()
+            .unwrap();
+        assert_eq!(timeout, Some(super::HALF_OPEN_TIMEOUT));
+    }
+
     /// `Transport::Stdio` is always constructible regardless of feature flags.
     #[test]
     fn test_transport_stdio_variant() {
