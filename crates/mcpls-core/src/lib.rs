@@ -851,9 +851,9 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// subscribed, a signal delivered during `shutdown_servers`/
 /// `await_lsp_init_handle` (bounded by [`lsp::SHUTDOWN_TIMEOUT`] and
 /// [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst case) is recorded and then
-/// silently discarded — there is no receiver to broadcast it to. Before this fix, that made cleanup **uninterruptible**:
-/// an operator's repeat `Ctrl-C`/`SIGTERM` during that window was a no-op
-/// short of `SIGKILL`.
+/// silently discarded — there is no receiver to broadcast it to. Before this
+/// fix, that made cleanup **uninterruptible**: an operator's repeat
+/// `Ctrl-C`/`SIGTERM` during that window was a no-op short of `SIGKILL`.
 ///
 /// This function re-registers a fresh `ShutdownSignal` first thing to give
 /// cleanup a listener again, restoring the ability to force-quit a stuck
