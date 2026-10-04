@@ -7,6 +7,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
 use super::routing::{ServerId, ToolKind};
+use super::settings::LspSettings;
 use crate::bridge::IndexingPolicy;
 
 /// Default max depth for recursive marker search.
@@ -180,6 +181,13 @@ pub struct LspServerConfig {
     /// See `SECURITY.md` for the trust model.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
+
+    /// Per-server settings pushed after `initialized` via
+    /// `workspace/didChangeConfiguration` and served on
+    /// `workspace/configuration`. Top-level dotted keys are expanded into
+    /// nested objects; keys inside values are left untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<LspSettings>,
 
     /// Handshake timeout in seconds: bounds the `initialize` request during
     /// server startup. Does not affect individual tool-call requests sent
@@ -427,6 +435,7 @@ impl LspServerConfig {
             env: HashMap::new(),
             file_patterns: file_patterns.iter().map(ToString::to_string).collect(),
             initialization_options: None,
+            settings: None,
             timeout_seconds: default_timeout(),
             request_timeout_seconds: default_request_timeout(),
             heuristics: Some(ServerHeuristics::with_markers(markers)),
@@ -597,6 +606,7 @@ mod tests {
             env: env.clone(),
             file_patterns: vec!["**/*.custom".to_string()],
             initialization_options: Some(serde_json::json!({"key": "value"})),
+            settings: None,
             timeout_seconds: 60,
             request_timeout_seconds: 45,
             heuristics: None,
@@ -776,6 +786,7 @@ mod tests {
             env: HashMap::new(),
             file_patterns: vec![],
             initialization_options: None,
+            settings: None,
             timeout_seconds: 30,
             request_timeout_seconds: 30,
             heuristics: None,

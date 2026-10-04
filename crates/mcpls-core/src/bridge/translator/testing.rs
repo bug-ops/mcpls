@@ -240,6 +240,7 @@ mod sh_servers {
                 env: HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
+                settings: None,
                 // Generous relative to the sub-second fake scripts these
                 // tests spawn, to absorb CI scheduling jitter under
                 // concurrent nextest load (a bare `sh` invocation has no

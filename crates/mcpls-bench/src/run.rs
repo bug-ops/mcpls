@@ -81,6 +81,7 @@ pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> Ser
         env: HashMap::new(),
         file_patterns: scenario.server.file_patterns.clone(),
         initialization_options: None,
+        settings: None,
         timeout_seconds: LSP_TIMEOUT_SECS,
         request_timeout_seconds: LSP_TIMEOUT_SECS,
         heuristics: None,

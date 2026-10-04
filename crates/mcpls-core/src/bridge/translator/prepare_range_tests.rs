@@ -231,6 +231,7 @@ fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
         env: std::collections::HashMap::new(),
         file_patterns: vec![],
         initialization_options: None,
+        settings: None,
         timeout_seconds: 30,
         request_timeout_seconds: 30,
         heuristics: None,
