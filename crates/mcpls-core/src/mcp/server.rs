@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::FutureExt as _;
@@ -40,8 +40,8 @@ use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
 };
 use crate::bridge::{
-    AddressableTool, Addressed, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
-    DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult,
+    AddressableTool, Addressed, CallHierarchyPrepareResult, ClientPath, CodeActionsResult,
+    CompletionsResult, DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult,
     FormatDocumentResult, HoverResult, IncomingCallsResult, IndexingState, InlayHintsResult,
     LocationsResult, NotificationCache, OutgoingCallsResult, Position, PositionEncoding,
     ReferencesResult, RenameResult, RestartServerResult, ServerLogsResult, ServerMessagesResult,
@@ -217,6 +217,14 @@ fn map_bridge_error(e: crate::error::Error) -> McpError {
             error_with_data(ErrorCode(data.code()), message, &data)
         }
     }
+}
+
+/// Parses a client-supplied `file_path` at the tool boundary. Done in the
+/// tool method rather than while deserializing the parameters, because the MCP
+/// layer reports a deserialization failure as a tool-result error instead of
+/// a JSON-RPC `-32602`.
+fn parse_client_path(path: PathBuf) -> Result<ClientPath, McpError> {
+    ClientPath::try_from(path).map_err(|e| map_bridge_error(e.into()))
 }
 
 /// Builds an error with `data` as its payload; a failed serialization is
@@ -539,6 +547,7 @@ impl McplsServer {
         &self,
         Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<HoverResult>>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
         to_structured_tool_result(
             translator
@@ -561,6 +570,7 @@ impl McplsServer {
         &self,
         Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<DefinitionResult>>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
         to_structured_tool_result(
             translator
@@ -586,6 +596,7 @@ impl McplsServer {
             include_declaration,
         }): Parameters<ReferencesParams>,
     ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
         to_structured_tool_result(
             translator
@@ -610,6 +621,7 @@ impl McplsServer {
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
     ) -> Result<Json<DiagnosticsResponse>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         // Resolved from the validated/canonicalized path (mirrors
         // `read_resource`), not the raw client-supplied path: a symlink
         // whose extension differs from its target must route to the same
@@ -619,16 +631,15 @@ impl McplsServer {
         // `false` here and fails properly inside `handle_diagnostics` below,
         // and a failed-to-start server's `ServerFailedToStart` is likewise
         // reported there by the pull request itself.
-        let route_id =
-            validate_path_against_roots(Path::new(&file_path), &self.context.workspace_roots)
-                .ok()
-                .and_then(|validated_path| {
-                    self.context
-                        .translator
-                        .diagnostics_route_for_path(&validated_path)
-                        .server_id()
-                        .cloned()
-                });
+        let route_id = validate_path_against_roots(&file_path, &self.context.workspace_roots)
+            .ok()
+            .and_then(|validated_path| {
+                self.context
+                    .translator
+                    .diagnostics_route_for_path(&validated_path)
+                    .server_id()
+                    .cloned()
+            });
 
         // Sampled before and after the pull: indexing may finish, or a respawn may mark push-degraded, mid-pull.
         let before = {
@@ -668,6 +679,7 @@ impl McplsServer {
             new_name,
         }): Parameters<RenameParams>,
     ) -> Result<Json<Addressed<RenameResult>>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
         to_structured_tool_result(
             translator
@@ -698,6 +710,7 @@ impl McplsServer {
             trigger,
         }): Parameters<CompletionsParams>,
     ) -> Result<Json<CompletionsResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         to_structured_tool_result(
             self.context
                 .translator
@@ -715,6 +728,7 @@ impl McplsServer {
         &self,
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
     ) -> Result<Json<DocumentSymbolsResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         to_structured_tool_result(
             self.context
                 .translator
@@ -738,6 +752,7 @@ impl McplsServer {
             insert_spaces,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<Json<FormatDocumentResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         to_structured_tool_result(
             self.context
                 .translator
@@ -788,6 +803,7 @@ impl McplsServer {
             kind_filter,
         }): Parameters<CodeActionsParams>,
     ) -> Result<Json<CodeActionsResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         to_structured_tool_result(
             self.context
                 .translator
@@ -816,6 +832,7 @@ impl McplsServer {
         &self,
         Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<CallHierarchyPrepareResult>>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
         to_structured_tool_result(
             translator
@@ -864,6 +881,7 @@ impl McplsServer {
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<Json<CachedDiagnosticsResponse>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         // The route is resolved independently of the cache lookup below: a
         // respawn clears `diagnostics_owner` for this server's entries along
         // with its stale diagnostics (#359), so the degraded flag can't be
@@ -952,6 +970,7 @@ impl McplsServer {
             character,
         }): Parameters<PositionParams>,
     ) -> Result<Json<SignatureHelpResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         to_structured_tool_result(
             self.context
                 .translator
@@ -969,6 +988,7 @@ impl McplsServer {
         &self,
         Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
         to_structured_tool_result(
             translator
@@ -991,6 +1011,7 @@ impl McplsServer {
         &self,
         Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
         to_structured_tool_result(
             translator
@@ -1017,6 +1038,7 @@ impl McplsServer {
             character,
         }): Parameters<PositionParams>,
     ) -> Result<Json<LocationsResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         to_structured_tool_result(
             self.context
                 .translator
@@ -1052,9 +1074,10 @@ impl McplsServer {
         &self,
         Parameters(ToolSupportParams { file_path }): Parameters<ToolSupportParams>,
     ) -> Result<Json<ToolSupportReport>, McpError> {
+        let file_path = file_path.map(parse_client_path).transpose()?;
         let translator = &self.context.translator;
         let file_language = file_path
-            .as_deref()
+            .as_ref()
             .map(|path| translator.language_for_path(path))
             .transpose();
         let snapshot = translator.tool_support_snapshot();
@@ -1083,6 +1106,7 @@ impl McplsServer {
                 },
         }): Parameters<InlayHintsParams>,
     ) -> Result<Json<InlayHintsResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
         to_structured_tool_result(
             self.context
                 .translator
@@ -1108,7 +1132,7 @@ impl McplsServer {
     /// `RequestContext`.
     async fn resource_diagnostics_response(
         &self,
-        path: &Path,
+        path: &ClientPath,
     ) -> Result<ResourceDiagnosticsResponse, McpError> {
         // Enforce workspace-root containment — mirrors the guard in every LSP tool.
         // Validated against a lock-free snapshot of workspace_roots (fixed at
@@ -1590,11 +1614,13 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
+    use std::path::Path;
 
     use super::*;
     use crate::bridge::Capability;
     use crate::bridge::resources::ResourceSubscriptions;
     use crate::mcp::tool_support::ToolBackend;
+    use crate::test_lsp::client_path;
 
     #[test]
     fn test_symbol_resolution_error_maps_to_invalid_params_with_the_outcome_as_data() {
@@ -1709,7 +1735,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         (server, temp_dir, test_file)
     }
@@ -1782,6 +1808,7 @@ mod tests {
             crate::error::Error::InvalidUri("not a uri".to_string()),
             crate::error::Error::DocumentNotFound(PathBuf::from("/missing.rs")),
             crate::error::Error::FileSizeLimitExceeded { size: 100, max: 10 },
+            crate::error::Error::InvalidClientPath(crate::bridge::InvalidClientPath::Empty),
         ];
 
         for err in caller_fault_errors {
@@ -1994,7 +2021,7 @@ mod tests {
     async fn test_hover_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             line: 1,
             character: 1,
         });
@@ -2017,7 +2044,7 @@ mod tests {
     async fn test_hover_tool_with_params_no_workspace_roots() {
         let server = create_test_server();
         let params = Parameters(PositionParams {
-            file_path: "/test/file.rs".to_string(),
+            file_path: PathBuf::from("/test/file.rs"),
             line: 1,
             character: 1,
         });
@@ -2035,7 +2062,7 @@ mod tests {
     async fn test_definition_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             line: 10,
             character: 5,
         });
@@ -2049,7 +2076,7 @@ mod tests {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(ReferencesParams {
             target: PositionParams {
-                file_path: test_file.to_str().unwrap().to_string(),
+                file_path: PathBuf::from(test_file.to_str().unwrap()),
                 line: 10,
                 character: 5,
             }
@@ -2065,7 +2092,7 @@ mod tests {
     async fn test_diagnostics_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(DiagnosticsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
 
         let result = server.get_diagnostics(params).await;
@@ -2096,7 +2123,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2115,7 +2144,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -2123,7 +2152,7 @@ mod tests {
 
         let call = {
             let params = Parameters(DiagnosticsParams {
-                file_path: path_str,
+                file_path: PathBuf::from(path_str),
             });
             tokio::spawn(async move { mcp_server.get_diagnostics(params).await })
         };
@@ -2166,7 +2195,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2180,7 +2211,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -2188,7 +2219,7 @@ mod tests {
 
         let call = {
             let params = Parameters(DiagnosticsParams {
-                file_path: path_str,
+                file_path: PathBuf::from(path_str),
             });
             tokio::spawn(async move { mcp_server.get_diagnostics(params).await })
         };
@@ -2234,7 +2265,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2253,7 +2286,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -2261,7 +2294,7 @@ mod tests {
 
         let call = {
             let params = Parameters(DiagnosticsParams {
-                file_path: path_str,
+                file_path: PathBuf::from(path_str),
             });
             tokio::spawn(async move { mcp_server.get_diagnostics(params).await })
         };
@@ -2318,7 +2351,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
         let translator = Arc::new(translator);
         let (client, fake) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2330,7 +2365,7 @@ mod tests {
         let server = Arc::new(McplsServer::new(
             translator,
             Arc::clone(&cache),
-            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -2379,7 +2414,7 @@ mod tests {
         let call = {
             let server = Arc::clone(&fx.server);
             let params = Parameters(DiagnosticsParams {
-                file_path: fx.path.to_string_lossy().to_string(),
+                file_path: PathBuf::from(fx.path.to_string_lossy().into_owned()),
             });
             tokio::spawn(async move { server.get_diagnostics(params).await })
         };
@@ -2402,7 +2437,7 @@ mod tests {
     async fn read_all_diagnostics_readers(
         fx: &mut DiagnosticsFixture,
     ) -> [(&'static str, serde_json::Value); 3] {
-        let file_path = fx.path.to_string_lossy().to_string();
+        let file_path = fx.path.clone();
         let call = {
             let server = Arc::clone(&fx.server);
             let params = Parameters(DiagnosticsParams {
@@ -2423,7 +2458,7 @@ mod tests {
         .unwrap();
         let resource = serde_json::to_value(
             fx.server
-                .resource_diagnostics_response(&fx.path)
+                .resource_diagnostics_response(&client_path(&fx.path))
                 .await
                 .unwrap(),
         )
@@ -2616,7 +2651,9 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2637,7 +2674,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -2645,7 +2682,7 @@ mod tests {
 
         let call = {
             let params = Parameters(DiagnosticsParams {
-                file_path: path_str,
+                file_path: PathBuf::from(path_str),
             });
             tokio::spawn(async move { mcp_server.get_diagnostics(params).await })
         };
@@ -2675,7 +2712,7 @@ mod tests {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(RenameParams {
             target: PositionParams {
-                file_path: test_file.to_str().unwrap().to_string(),
+                file_path: PathBuf::from(test_file.to_str().unwrap()),
                 line: 10,
                 character: 5,
             }
@@ -2692,7 +2729,7 @@ mod tests {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(CompletionsParams {
             position: PositionParams {
-                file_path: test_file.to_str().unwrap().to_string(),
+                file_path: PathBuf::from(test_file.to_str().unwrap()),
                 line: 10,
                 character: 5,
             },
@@ -2707,7 +2744,7 @@ mod tests {
     async fn test_document_symbols_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(DocumentSymbolsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
 
         let result = server.get_document_symbols(params).await;
@@ -2718,7 +2755,7 @@ mod tests {
     async fn test_format_document_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(FormatDocumentParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             tab_size: 4,
             insert_spaces: true,
         });
@@ -2743,7 +2780,7 @@ mod tests {
     async fn test_code_actions_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(CodeActionsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             range: RangeParams {
                 start_line: 10,
                 start_character: 5,
@@ -2760,7 +2797,7 @@ mod tests {
     async fn test_prepare_call_hierarchy_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             line: 10,
             character: 5,
         });
@@ -2825,11 +2862,11 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
 
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
 
         let result = server.get_cached_diagnostics(params).await;
@@ -2862,7 +2899,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
 
         let canonical_path = test_file.canonicalize().unwrap();
@@ -2901,7 +2938,7 @@ mod tests {
         // Textually distinct from `test_file`, but canonicalizes to the same path.
         let noncanonical = subdir.join("..").join("sub").join("test.rs");
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: noncanonical.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(noncanonical.to_str().unwrap()),
         });
 
         let result = server.get_cached_diagnostics(params).await;
@@ -2912,6 +2949,48 @@ mod tests {
         let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].get("message").unwrap(), "cached error");
+    }
+
+    /// #571 RT-010: a root loaded from a config file stays addressable by its
+    /// configured symlinked spelling through the tool handler.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cached_diagnostics_tool_admits_config_loaded_symlinked_root() {
+        use std::fs;
+
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("main.rs"), "fn main() {}").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let config_path = base.join("mcpls.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[workspace]\nroots = [{}]\n",
+                crate::test_lsp::toml_path_literal(&link)
+            ),
+        )
+        .unwrap();
+
+        let config = crate::config::ServerConfig::load_from(&config_path).unwrap();
+        let server = create_test_server_with_workspace_roots(
+            ProjectConfigStatus::NotIgnored,
+            McpConfig::default(),
+            WorkspaceRoots::from_configured(&config.workspace.roots).unwrap(),
+        );
+
+        let result = server
+            .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+                file_path: link.join("main.rs"),
+            }))
+            .await;
+
+        assert!(result.is_ok(), "rejected: {:?}", result.err());
     }
 
     /// #290 gap: a cache-only read must resolve the *owner* server's
@@ -2936,7 +3015,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let owner = crate::config::ServerId::from("rust");
         server.context.translator.register_server(
@@ -2976,7 +3055,7 @@ mod tests {
         }
 
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
@@ -3009,7 +3088,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         // Deliberately not registered with `translator.register_server`.
         let owner = crate::config::ServerId::from("rust");
@@ -3043,7 +3122,7 @@ mod tests {
         }
 
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
@@ -3094,7 +3173,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3110,7 +3189,7 @@ mod tests {
         }
 
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
@@ -3150,7 +3229,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3160,7 +3239,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
@@ -3203,7 +3282,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3215,7 +3294,7 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: link.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(link.to_str().unwrap()),
         });
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
@@ -3309,7 +3388,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3335,7 +3414,7 @@ sleep 0.3
         let test_file = dir.path().join("main.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
@@ -3362,11 +3441,11 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
 
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
         });
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
@@ -3382,14 +3461,15 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
         let params = Parameters(CachedDiagnosticsParams {
-            file_path: dir
-                .path()
-                .join("nonexistent/file.rs")
-                .to_string_lossy()
-                .to_string(),
+            file_path: PathBuf::from(
+                dir.path()
+                    .join("nonexistent/file.rs")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
         });
 
         let result = server.get_cached_diagnostics(params).await;
@@ -3431,7 +3511,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            WorkspaceRoots::resolve(vec![root]),
+            WorkspaceRoots::from_configured(&[root]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3447,7 +3527,7 @@ sleep 0.3
 
         let result = server
             .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
-                file_path: file.to_string_lossy().to_string(),
+                file_path: PathBuf::from(file.to_string_lossy().into_owned()),
             }))
             .await;
 
@@ -3462,7 +3542,9 @@ sleep 0.3
     async fn test_diagnostics_resource_reports_failed_server_start() {
         let (_dir, file, server) = server_with_failed_rust_server();
 
-        let result = server.resource_diagnostics_response(&file).await;
+        let result = server
+            .resource_diagnostics_response(&client_path(file))
+            .await;
 
         let Err(err) = result else {
             panic!("expected the startup failure to be reported");
@@ -3622,7 +3704,7 @@ sleep 0.3
     async fn test_get_signature_help_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             line: 10,
             character: 5,
         });
@@ -3635,7 +3717,7 @@ sleep 0.3
     async fn test_go_to_implementation_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             line: 10,
             character: 5,
         });
@@ -3648,7 +3730,7 @@ sleep 0.3
     async fn test_go_to_type_definition_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(PositionParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             line: 10,
             character: 5,
         });
@@ -3661,7 +3743,7 @@ sleep 0.3
     async fn test_get_inlay_hints_tool_with_params() {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(InlayHintsParams {
-            file_path: test_file.to_str().unwrap().to_string(),
+            file_path: PathBuf::from(test_file.to_str().unwrap()),
             range: RangeParams {
                 start_line: 1,
                 start_character: 1,
@@ -4139,9 +4221,11 @@ sleep 0.3
         let noncanonical = link_dir.join("test.rs");
         assert_ne!(noncanonical, test_file);
 
-        let validated =
-            validate_path_against_roots(&noncanonical, &WorkspaceRoots::resolve(vec![base]))
-                .unwrap();
+        let validated = validate_path_against_roots(
+            &client_path(&noncanonical),
+            &WorkspaceRoots::from_configured(&[base]).unwrap(),
+        )
+        .unwrap();
         assert_eq!(validated, test_file.canonicalize().unwrap());
 
         let uri_from_raw_path = crate::bridge::path_to_uri(&noncanonical).unwrap();
@@ -4160,8 +4244,11 @@ sleep 0.3
 
         let dir = tempfile::TempDir::new().unwrap();
         let mut translator = Translator::new();
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
-        let result = translator.validate_path(&dir.path().join("this/path/does/not/exist.rs"));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
+        let result =
+            translator.validate_path(&client_path(dir.path().join("this/path/does/not/exist.rs")));
         assert_matches!(result, Err(Error::FileIo { .. }));
     }
 
@@ -4176,14 +4263,125 @@ sleep 0.3
     #[test]
     fn test_read_resource_nonexistent_path_maps_to_invalid_params() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let roots = WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]);
+        let roots = WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap();
         let missing = temp_dir.path().join("does-not-exist.rs");
 
-        let result = validate_path_against_roots(&missing, &roots);
+        let result = validate_path_against_roots(&client_path(missing), &roots);
         assert_matches!(result, Err(crate::error::Error::FileIo { .. }));
 
         let mcp_err = map_bridge_error(result.unwrap_err());
         assert_eq!(mcp_err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    /// #575: a path that runs through a regular file (`<file>/x`) is a
+    /// malformed caller path, so it is `INVALID_PARAMS`, not an internal error.
+    #[test]
+    fn test_path_through_a_regular_file_maps_to_invalid_params() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file = temp_dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let roots = WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap();
+
+        let err = validate_path_against_roots(&client_path(file.join("x")), &roots).unwrap_err();
+
+        assert_matches!(
+            err,
+            crate::error::Error::MalformedPath { .. } | crate::error::Error::FileIo { .. },
+            "{err:?}"
+        );
+        assert_eq!(map_bridge_error(err).code, ErrorCode::INVALID_PARAMS);
+    }
+
+    /// Serves `server` over an in-memory duplex pipe, performs the MCP
+    /// handshake as a raw JSON-RPC client and returns the response to one
+    /// `tools/call get_hover` with `arguments`, so parameter parsing and error
+    /// mapping run exactly as in production.
+    async fn hover_over_the_wire(
+        server: McplsServer,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let serving = tokio::spawn(async move {
+            if let Ok(running) = server.serve(tokio::io::split(server_io)).await {
+                running.waiting().await.ok();
+            }
+        });
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut lines = BufReader::new(client_read).lines();
+        let send = |message: serde_json::Value| {
+            let mut line = message.to_string();
+            line.push('\n');
+            line
+        };
+
+        let initialize = send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            },
+        }));
+        client_write.write_all(initialize.as_bytes()).await.unwrap();
+        lines.next_line().await.unwrap().unwrap();
+        let initialized =
+            send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        client_write
+            .write_all(initialized.as_bytes())
+            .await
+            .unwrap();
+        let call = send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "get_hover", "arguments": arguments},
+        }));
+        client_write.write_all(call.as_bytes()).await.unwrap();
+
+        let response = loop {
+            let line = lines.next_line().await.unwrap().unwrap();
+            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if message["id"] == 1 {
+                break message;
+            }
+        };
+        serving.abort();
+        response
+    }
+
+    /// #575: a malformed `file_path` is reported as `-32602` by the real tool
+    /// dispatch (not only by the unit-level parsing and mapping tests): empty,
+    /// NUL byte, and a path through a regular file.
+    #[tokio::test]
+    async fn test_get_hover_malformed_file_path_is_invalid_params_over_the_wire() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file = temp_dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let through_file = file.join("x");
+
+        for bad in [
+            String::new(),
+            format!("{}\u{0}x", file.display()),
+            through_file.display().to_string(),
+        ] {
+            let roots = WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap();
+            let mut translator = Translator::new();
+            translator.set_workspace_roots(roots.clone());
+            let server = McplsServer::new(
+                Arc::new(translator),
+                Arc::new(Mutex::new(NotificationCache::new())),
+                roots,
+                SubscriptionRegistry::new(),
+                ProjectConfigStatus::NotIgnored,
+                McpConfig::default(),
+            );
+            let arguments = serde_json::json!({"file_path": bad, "line": 1, "character": 1});
+
+            let response = hover_over_the_wire(server, arguments).await;
+
+            assert_eq!(response["error"]["code"], -32602, "{bad:?}: {response}");
+        }
     }
 
     /// #496 site 2 regression: a `SubscriptionError::LimitReached`, routed
@@ -4225,8 +4423,8 @@ sleep 0.3
         symlink(&real_dir, &link_dir).unwrap();
         let noncanonical = link_dir.join("test.rs");
 
-        let roots = &WorkspaceRoots::resolve(vec![base.clone()]);
-        let validated = validate_path_against_roots(&noncanonical, roots).unwrap();
+        let roots = &WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+        let validated = validate_path_against_roots(&client_path(&noncanonical), roots).unwrap();
         let raw_uri = make_uri(&noncanonical).unwrap();
         let canonical_uri = DiagnosticsResourceUri::resolve(&raw_uri, roots)
             .unwrap()
@@ -4246,7 +4444,7 @@ sleep 0.3
         // Delete the file (through the real path, not the symlink) so
         // canonicalizing the symlinked path at unsubscribe time fails.
         fs::remove_file(&test_file).unwrap();
-        assert!(validate_path_against_roots(&noncanonical, roots).is_err());
+        assert!(validate_path_against_roots(&client_path(&noncanonical), roots).is_err());
 
         // Mirrors `unsubscribe`'s handler: no canonical URI once
         // canonicalization fails, only the raw one.
@@ -4344,7 +4542,7 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::resolve(vec![root]),
+            WorkspaceRoots::from_configured(&[root]).unwrap(),
         );
         (server, dir, uri)
     }
@@ -4501,7 +4699,9 @@ sleep 0.3
                 ("py".to_string(), "python".to_string()),
             ]))
             .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![root.clone()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+        );
         match state {
             RustServerState::Starting => translator.set_expected_servers(HashSet::from([id])),
             RustServerState::FailedToStart => {
@@ -4520,7 +4720,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            WorkspaceRoots::resolve(vec![root.clone()]),
+            WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -4529,7 +4729,7 @@ sleep 0.3
             server,
             rust_file,
             python_file,
-            roots: WorkspaceRoots::resolve(vec![root]),
+            roots: WorkspaceRoots::from_configured(&[root]).unwrap(),
             _dir: dir,
         }
     }
@@ -4540,7 +4740,7 @@ sleep 0.3
     ) -> Result<Json<CachedDiagnosticsResponse>, McpError> {
         fx.server
             .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
-                file_path: path.to_string_lossy().to_string(),
+                file_path: PathBuf::from(path.to_string_lossy().into_owned()),
             }))
             .await
     }
@@ -4550,7 +4750,11 @@ sleep 0.3
     async fn cache_reader_errors(fx: &StartupFixture) -> [McpError; 2] {
         [
             expect_err(read_cached(fx, &fx.rust_file).await),
-            expect_err(fx.server.resource_diagnostics_response(&fx.rust_file).await),
+            expect_err(
+                fx.server
+                    .resource_diagnostics_response(&client_path(&fx.rust_file))
+                    .await,
+            ),
         ]
     }
 
@@ -4590,7 +4794,7 @@ sleep 0.3
         let tool = read_cached(&fx, &fx.python_file).await.unwrap();
         let resource = fx
             .server
-            .resource_diagnostics_response(&fx.python_file)
+            .resource_diagnostics_response(&client_path(fx.python_file))
             .await
             .unwrap();
 
@@ -4792,7 +4996,9 @@ sleep 0.3
                 ("rs".to_string(), "rust".to_string()),
                 ("py".to_string(), "python".to_string()),
             ]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
         let mut fake_servers = Vec::new();
         for (id, _, caps) in servers {
             let (client, fake) = fake_lsp_client();
@@ -4803,7 +5009,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             mcp,
@@ -4824,7 +5030,7 @@ sleep 0.3
     async fn call_tool(server: &McplsServer, tool: McpTool, file: &Path) -> Result<(), McpError> {
         let file_path = file.to_str().unwrap().to_string();
         let position = || PositionParams {
-            file_path: file_path.clone(),
+            file_path: PathBuf::from(file_path.clone()),
             line: 1,
             character: 1,
         };
@@ -4865,7 +5071,7 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::GetDiagnostics => server
                 .get_diagnostics(Parameters(DiagnosticsParams {
-                    file_path: file_path.clone(),
+                    file_path: PathBuf::from(file_path.clone()),
                 }))
                 .await
                 .map(|_| ()),
@@ -4885,13 +5091,13 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::GetDocumentSymbols => server
                 .get_document_symbols(Parameters(DocumentSymbolsParams {
-                    file_path: file_path.clone(),
+                    file_path: PathBuf::from(file_path.clone()),
                 }))
                 .await
                 .map(|_| ()),
             McpTool::FormatDocument => server
                 .format_document(Parameters(FormatDocumentParams {
-                    file_path: file_path.clone(),
+                    file_path: PathBuf::from(file_path.clone()),
                     tab_size: 4,
                     insert_spaces: true,
                 }))
@@ -4907,7 +5113,7 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::GetCodeActions => server
                 .get_code_actions(Parameters(CodeActionsParams {
-                    file_path: file_path.clone(),
+                    file_path: PathBuf::from(file_path.clone()),
                     range: range(),
                     kind_filter: None,
                 }))
@@ -4927,7 +5133,7 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::GetCachedDiagnostics => server
                 .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
-                    file_path: file_path.clone(),
+                    file_path: PathBuf::from(file_path.clone()),
                 }))
                 .await
                 .map(|_| ()),
@@ -4960,7 +5166,7 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::GetInlayHints => server
                 .get_inlay_hints(Parameters(InlayHintsParams {
-                    file_path: file_path.clone(),
+                    file_path: PathBuf::from(file_path.clone()),
                     range: range(),
                 }))
                 .await
@@ -5041,7 +5247,7 @@ sleep 0.3
         }
     }
 
-    fn report_json(server: &McplsServer, file_path: Option<String>) -> serde_json::Value {
+    fn report_json(server: &McplsServer, file_path: Option<PathBuf>) -> serde_json::Value {
         let text = server
             .get_tool_support(Parameters(ToolSupportParams { file_path }))
             .unwrap();
@@ -5108,16 +5314,13 @@ sleep 0.3
             ],
             McpConfig::default(),
         );
-        let report = report_json(
-            &fixture.server,
-            Some(fixture.file.to_str().unwrap().to_string()),
-        );
+        let report = report_json(&fixture.server, Some(PathBuf::from(&fixture.file)));
         assert_eq!(report["languages"], serde_json::json!(["rust"]));
 
         let outside = fixture
             .server
             .get_tool_support(Parameters(ToolSupportParams {
-                file_path: Some("/definitely/not/in/workspace.rs".to_string()),
+                file_path: Some(PathBuf::from("/definitely/not/in/workspace.rs")),
             }));
         assert!(outside.is_err());
         drop(fixture.dir);

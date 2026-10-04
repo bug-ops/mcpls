@@ -141,7 +141,7 @@ impl CachedEntry {
 /// results against a subscription.
 pub fn diagnostics_cache_key(uri: &DiagnosticsResourceUri) -> Option<DiagnosticsKey> {
     let path = crate::bridge::resources::parse_uri(uri.as_str()).ok()?;
-    let lsp_uri = crate::bridge::try_path_to_uri(&path)?;
+    let lsp_uri = crate::bridge::try_path_to_uri(path.as_path())?;
     Some(DiagnosticsKey::of(&lsp_uri))
 }
 

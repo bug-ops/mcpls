@@ -41,14 +41,14 @@ pub(super) fn test_ctx() -> EncodingCtx {
 /// tests that need a non-UTF-16 encoding and don't care about the
 /// tracker fast path (e.g. exercising the disk-read fallback directly).
 pub(super) fn test_ctx_with(encoding: PositionEncoding) -> EncodingCtx {
-    test_ctx_with_roots(encoding, Vec::new())
+    test_ctx_with_roots(encoding, WorkspaceRoots::default())
 }
 
 /// [`test_ctx_with`] with explicit workspace roots, for tests exercising
 /// [`EncodingCtx::is_out_of_workspace`](super::encoding_ctx::EncodingCtx::is_out_of_workspace).
 pub(super) fn test_ctx_with_roots(
     encoding: PositionEncoding,
-    workspace_roots: Vec<PathBuf>,
+    workspace_roots: WorkspaceRoots,
 ) -> EncodingCtx {
     EncodingCtx::new(
         encoding,
@@ -56,7 +56,7 @@ pub(super) fn test_ctx_with_roots(
             ResourceLimits::default(),
             HashMap::new(),
         )),
-        Arc::from(workspace_roots),
+        workspace_roots,
     )
 }
 
@@ -127,7 +127,8 @@ pub(super) fn translator_with_capabilities(
                 server_id.clone(),
                 "rust".to_string(),
             )]));
-    translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+    translator
+        .set_workspace_roots(WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap());
 
     let (client, server) = fake_lsp_client();
     translator.register_client(server_id.clone(), client);
@@ -155,7 +156,8 @@ pub(super) fn translator_with_capabilities_and_encoding(
                 server_id.clone(),
                 "rust".to_string(),
             )]));
-    translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+    translator
+        .set_workspace_roots(WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap());
 
     let (client, server) = fake_lsp_client();
     translator.register_client(server_id.clone(), client);

@@ -1345,7 +1345,7 @@ One entry per targeted server, sorted by id:
 
 **Type**: String
 **Format**: Absolute path
-**Validation**: Must exist within workspace roots
+**Validation**: Must be non-empty, free of NUL bytes, and exist within workspace roots
 
 A path is accepted when it names a location under a workspace root through one of these spellings: the root's canonical (symlink-free) path, the root exactly as configured, or the logical working directory (`$PWD`) when it resolves to the same directory as the real working directory. The path is then resolved on disk and must still lie under a root, so a symlink inside a root that points elsewhere is rejected. A path that reaches a root only through some other symlink spelling is rejected with `PathOutsideWorkspace`, even though earlier versions accepted it; use one of the spellings above. Paths outside every root are rejected before the filesystem is consulted, so the error does not reveal whether such a file exists.
 
@@ -1397,6 +1397,7 @@ Common error scenarios:
 |-------|-------|----------|
 | LSP server not available | No server configured for file type | Add LSP server to config |
 | File not found | File doesn't exist | Check file path |
+| Invalid params (`-32602`) | `file_path` is empty, contains a NUL byte, or runs through a regular file (`main.rs/x`) | Fix the path |
 | Position out of bounds | Invalid line/character | Verify position is valid |
 | Timeout | LSP server too slow | Increase `request_timeout_seconds` in config |
 | No hover information | Not hoverable | Try different position |

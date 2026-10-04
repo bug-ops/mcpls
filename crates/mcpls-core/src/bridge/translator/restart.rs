@@ -179,6 +179,8 @@ impl RestartFailure {
             // reported as an initialization failure rather than a new reason.
             | Error::McpServer(_)
             | Error::HttpBind { .. }
+            | Error::InvalidClientPath(_)
+            | Error::MalformedPath { .. }
             | Error::DocumentNotFound(_)
             | Error::NoServerForLanguage(_)
             | Error::NoServerForTool { .. }
@@ -808,7 +810,9 @@ mod tests {
                 .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
                 .with_notification_cache(Arc::clone(&cache))
                 .with_clock(clock.clone());
-            translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+            translator.set_workspace_roots(
+                WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            );
 
             let mut server = LspServer::spawn(stub_server_config("rust", script))
                 .await
@@ -1326,7 +1330,9 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let cache = Arc::new(Mutex::new(NotificationCache::new()));
             let mut translator = Translator::new().with_notification_cache(Arc::clone(&cache));
-            translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+            translator.set_workspace_roots(
+                WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            );
             let (_cancel, cancel_rx) = watch::channel(false);
             let wiring = crate::PumpWiring {
                 shared: PumpShared {

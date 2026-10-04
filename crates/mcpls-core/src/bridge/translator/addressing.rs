@@ -16,6 +16,7 @@ use super::Translator;
 use super::dto::{Position, Position2D};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
+use crate::bridge::ClientPath;
 use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
 use crate::bridge::state::uri_to_path;
 use crate::error::{Error, Result, SymbolCandidate, SymbolResolutionData};
@@ -549,12 +550,17 @@ impl Translator {
     /// # Examples
     ///
     /// ```no_run
-    /// use mcpls_core::bridge::{AddressableTool, Position, SymbolTarget, Translator};
+    /// use std::path::PathBuf;
     ///
-    /// # async fn run(translator: &Translator) -> mcpls_core::error::Result<()> {
+    /// use mcpls_core::bridge::{
+    ///     AddressableTool, ClientPath, Position, SymbolTarget, Translator,
+    /// };
+    ///
+    /// # async fn run(translator: &Translator) -> Result<(), Box<dyn std::error::Error>> {
+    /// let file = ClientPath::try_from(PathBuf::from("/ws/src/lib.rs"))?;
     /// let target = SymbolTarget::Position(Position { line: 3, character: 5 });
     /// let resolved = translator
-    ///     .resolve_symbol_target("/ws/src/lib.rs", target, AddressableTool::Hover)
+    ///     .resolve_symbol_target(&file, target, AddressableTool::Hover)
     ///     .await?;
     /// assert!(resolved.resolved.is_none());
     /// # Ok(())
@@ -562,7 +568,7 @@ impl Translator {
     /// ```
     pub async fn resolve_symbol_target(
         &self,
-        file_path: &str,
+        file_path: &ClientPath,
         target: SymbolTarget,
         tool: AddressableTool,
     ) -> Result<ResolvedTarget> {
@@ -667,13 +673,13 @@ impl Translator {
     /// As [`Self::resolve_symbol_target`], then whatever `call` returns.
     pub async fn with_resolved_target<T, F, Fut>(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         target: SymbolTarget,
         tool: AddressableTool,
         call: F,
     ) -> Result<Addressed<T>>
     where
-        F: FnOnce(String, Position) -> Fut,
+        F: FnOnce(ClientPath, Position) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
         let resolved = self.resolve_symbol_target(&file_path, target, tool).await?;
@@ -937,6 +943,7 @@ mod resolver_tests {
     };
     use super::*;
     use crate::config::ServerId;
+    use crate::test_lsp::client_path;
 
     fn caps(hover: bool) -> lsp_types::ServerCapabilities {
         lsp_types::ServerCapabilities {
@@ -990,7 +997,7 @@ mod resolver_tests {
         let translator = Arc::new(translator);
         let handle = {
             let translator = Arc::clone(&translator);
-            let path = path.to_string_lossy().to_string();
+            let path = client_path(&path);
             tokio::spawn(async move {
                 translator
                     .resolve_symbol_target(&path, target, AddressableTool::Hover)
@@ -1361,7 +1368,7 @@ mod resolver_tests {
 
         let resolved = translator
             .resolve_symbol_target(
-                "/never/opened.rs",
+                &client_path("/never/opened.rs"),
                 SymbolTarget::Position(pos(3, 4)),
                 AddressableTool::Hover,
             )
@@ -1382,7 +1389,7 @@ mod resolver_tests {
 
         let err = translator
             .resolve_symbol_target(
-                &path.to_string_lossy(),
+                &client_path(&path),
                 query_target("main", None, None),
                 AddressableTool::Hover,
             )
@@ -1397,5 +1404,26 @@ mod resolver_tests {
             },
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_name_in_a_file_outside_the_workspace_fails_containment_not_resolution() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let (translator, _server) =
+            translator_with_capabilities(&dir, &ServerId::from("rust"), caps(true));
+        let path = outside.path().join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let err = translator
+            .resolve_symbol_target(
+                &client_path(&path),
+                query_target("main", None, None),
+                AddressableTool::Hover,
+            )
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, Error::PathOutsideWorkspace(_), "{err:?}");
     }
 }

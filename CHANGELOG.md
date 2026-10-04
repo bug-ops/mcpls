@@ -77,6 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `NotificationCache` diagnostics readers take `&Uri` and `Translator::cached_diagnostics_uri` returns `Uri`. (#590)
 - **Breaking:** `LspServer::spawn_batch` is concurrent and `ToolRouter::rebind` re-derives routes per `ServerSettlement`. (#590)
 - `cargo-deny` denies yanked crates. (#590)
+- Rename and code-action edits and `out_of_workspace` accept alias spellings of a root; edits additionally need exact-case containment and a canonical path under a root, so a symlink pointing out or a retargeted alias is dropped. (#580)
+- **Breaking:** `WorkspaceRoots::resolve` is replaced by the fallible `WorkspaceRoots::from_configured`, and `canonical_shared` is removed. (#580)
+- **Breaking:** `ServerConfig::load_from`, `load` and `load_with_trust` keep `workspace.roots` as written (not canonical; relative for a relative config path or the global config); `WorkspaceRoots::from_configured` canonicalizes at startup. (#580)
+- **Breaking:** `Translator` path handlers, `validate_path_against_roots` and `bridge::resources::parse_uri` use the new `ClientPath`; `Error` gains `InvalidClientPath` and `MalformedPath`. (#580)
 
 ### Fixed
 
@@ -86,6 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP session ids are no longer logged at the default level. (#590)
 - Configured secrets are redacted from server messages, errors, wire traces and spawn arguments. (#590)
 - `escape_control` and stderr cleaning share one deceptive-character set. (#590)
+- Roots from a config file are admitted under their configured symlinked spelling again, including relative roots of a relative config path. (#580)
+- An empty, NUL-containing or not-a-directory `file_path` returns `-32602` instead of `-32603`, including an empty `get_tool_support` `file_path`, which no longer acts as no filter. (#580)
 - Abandoned HTTP sessions now expire after 5 min without client activity instead of living on while subscribed files change. (#536)
 - Columns past the end of a line now clamp to the line length, and column 1 or the empty line after a final newline no longer raise a false `positions_degraded`. (#520)
 - Call-hierarchy, inlay-hint, code-action, and rename handlers now cap normalized items with one shared budget, reporting overflow via `truncated` / `dropped.exceeds_item_cap`. (#487, #519)

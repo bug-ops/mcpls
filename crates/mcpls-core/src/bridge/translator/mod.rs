@@ -471,7 +471,7 @@ impl Translator {
         EncodingCtx::new(
             self.position_encoding_for(server_id),
             self.document_tracker.clone(),
-            self.workspace_roots.canonical_shared(),
+            self.workspace_roots.clone(),
         )
     }
 
@@ -1010,7 +1010,7 @@ mod tests {
     fn test_set_workspace_roots() {
         let mut translator = Translator::new();
         let roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
-        translator.set_workspace_roots(WorkspaceRoots::new(roots.clone(), Vec::new()));
+        translator.set_workspace_roots(WorkspaceRoots::for_test(roots.clone(), Vec::new()));
         assert_eq!(translator.workspace_roots.canonical(), roots);
     }
 

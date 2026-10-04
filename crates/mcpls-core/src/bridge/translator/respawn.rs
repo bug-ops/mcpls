@@ -424,6 +424,8 @@ mod tests {
     use super::*;
     use crate::bridge::translator::clock::{Clock, FakeClock};
     use crate::config::ServerId;
+    #[cfg(unix)]
+    use crate::test_lsp::client_path;
 
     #[test]
     fn test_respawn_backoff_remaining_returns_none_once_delay_elapsed() {
@@ -1268,7 +1270,9 @@ sleep 1
             let mut translator = Translator::new()
                 .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-            translator.set_workspace_roots(WorkspaceRoots::resolve(vec![workspace.to_path_buf()]));
+            translator.set_workspace_roots(
+                WorkspaceRoots::from_configured(&[workspace.to_path_buf()]).unwrap(),
+            );
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
             wait_until_dead(&translator, &id).await;
@@ -1281,7 +1285,10 @@ sleep 1
             );
 
             let result = translator
-                .prepare_document(&file_path.to_string_lossy(), ToolKind::Hover)
+                .prepare_document(
+                    &client_path(file_path.to_string_lossy().into_owned()),
+                    ToolKind::Hover,
+                )
                 .await;
             assert!(result.is_ok(), "got {result:?}");
 

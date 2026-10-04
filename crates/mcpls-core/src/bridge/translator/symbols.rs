@@ -15,7 +15,7 @@ use super::navigation::MAX_NORMALIZED_LOCATIONS;
 use super::routing::{
     Capability, IndexingGate, PreparedDocument, WorkspaceRouteLookup, lookup_workspace_route,
 };
-use crate::bridge::lock_std;
+use crate::bridge::{ClientPath, lock_std};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 use crate::lsp::SUPPORTED_SYMBOL_KINDS;
@@ -130,7 +130,7 @@ impl Translator {
     /// or the routed server does not advertise `documentSymbolProvider` support.
     pub async fn handle_document_symbols(
         &self,
-        file_path: String,
+        file_path: ClientPath,
     ) -> Result<DocumentSymbolsResult> {
         let FetchedSymbols { doc, ctx, response } =
             self.request_document_symbols(&file_path).await?;
@@ -185,7 +185,10 @@ impl Translator {
     /// # Errors
     ///
     /// Routing, capability and document errors, or the LSP request's error.
-    pub(super) async fn request_document_symbols(&self, file_path: &str) -> Result<FetchedSymbols> {
+    pub(super) async fn request_document_symbols(
+        &self,
+        file_path: &ClientPath,
+    ) -> Result<FetchedSymbols> {
         let doc = self
             .prepare_gated_document(
                 file_path,
@@ -314,7 +317,7 @@ impl Translator {
         let mut raw_symbols: Vec<RawWorkspaceSymbol> = Vec::new();
         match response {
             // Not filtered to workspace roots -- like other read-only
-            // navigation results (see `uri_in_workspace_roots`'s doc
+            // navigation results (see `WorkspaceRoots::admits_uri`'s doc
             // comment), a legitimate workspace-symbol result routinely
             // points outside the workspace (stdlib, a dependency), and any
             // subsequent open/read of it still hits the inbound
@@ -419,6 +422,7 @@ mod tests {
     use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
+    use crate::test_lsp::client_path;
 
     /// #355/#467 regression: `resolve_kind_filter`'s name-matching branch
     /// accepts/rejects `kind_filter` values based on `SymbolKind`'s derived
@@ -656,7 +660,11 @@ mod tests {
         let translator = Arc::new(translator);
         let handle = {
             let translator = Arc::clone(&translator);
-            tokio::spawn(async move { translator.handle_document_symbols(path_str).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_document_symbols(client_path(path_str))
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -724,7 +732,11 @@ mod tests {
         let translator = Arc::new(translator);
         let handle = {
             let translator = Arc::clone(&translator);
-            tokio::spawn(async move { translator.handle_document_symbols(path_str).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_document_symbols(client_path(path_str))
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -792,7 +804,11 @@ mod tests {
         let translator = Arc::new(translator);
         let handle = {
             let translator = Arc::clone(&translator);
-            tokio::spawn(async move { translator.handle_document_symbols(path_str).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_document_symbols(client_path(path_str))
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -916,7 +932,7 @@ mod tests {
 
     /// #415 (revised: `search_workspace_symbols` is read-only navigation,
     /// same policy as `get_definition`/`get_references`/call hierarchy --
-    /// see `uri_in_workspace_roots`'s doc comment): a result whose URI falls
+    /// see `WorkspaceRoots::admits_uri`'s doc comment): a result whose URI falls
     /// outside every configured workspace root must still be returned, e.g.
     /// a symbol defined in the standard library or a crates.io dependency.
     #[tokio::test]
@@ -1113,7 +1129,7 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = path.to_string_lossy().to_string();
-            tokio::spawn(async move { translator.handle_document_symbols(path).await })
+            tokio::spawn(async move { translator.handle_document_symbols(client_path(path)).await })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);

@@ -56,7 +56,6 @@ mod test_lsp;
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,7 +68,6 @@ use error::ServerSpawnFailure;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _};
 use lsp::{LspNotification, LspServer, ServerInitConfig, ServerStartOutcome};
-use lsp_types::Uri;
 use mcp::SubscriptionRegistry;
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
@@ -86,36 +84,6 @@ pub use transport::{
 use transport::{ShutdownSignal, run_stdio};
 pub use util::escape_control;
 
-/// Whether `uri` falls within one of `workspace_roots`.
-///
-/// Used to reject diagnostics for out-of-workspace URIs before caching them:
-/// a misbehaving or compromised LSP server could otherwise publish
-/// diagnostics for an unbounded number of fabricated (often non-existent)
-/// URIs, defeating `MAX_DIAGNOSTIC_ENTRIES`'s FIFO cap by flushing every
-/// legitimate entry out of the cache before it (see #234). Thin wrapper
-/// around [`bridge::uri_in_workspace_roots`], the same containment check
-/// rename/code-action `WorkspaceEdit` results use for the identical
-/// untrusted-URI problem -- see that function's docs for why read-only
-/// navigation results are deliberately exempt (and how `document_symbols`'
-/// flat response shape takes a different, non-filtering approach), plus the
-/// canonicalization and preconditions this inherits.
-///
-/// Admits the canonical roots and their aliases (configured form, logical
-/// `$PWD`), so a server publishing under such a spelling still reaches
-/// `PublishedDiagnosticsUri::resolve`, which canonicalizes it and makes the
-/// authoritative containment decision. Paths with `.`/`..` components are
-/// rejected outright: a legitimate server never publishes them.
-fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &WorkspaceRoots) -> bool {
-    let Some(path) = bridge::uri_to_path(uri) else {
-        return false;
-    };
-    path.is_absolute()
-        && !path
-            .components()
-            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-        && workspace_roots.admits_lexically(&path)
-}
-
 /// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
 /// `serve_with` run, factored out of `diagnostics_pump`'s parameter list to
 /// keep it under clippy's argument-count lint. `Clone` is cheap (`Arc`
@@ -127,8 +95,9 @@ pub(crate) struct PumpShared {
     /// or the single stdio session); the pump hands each one the URI and the
     /// session decides whether it is subscribed -- see [`SubscriptionRegistry`].
     pub(crate) subs: SubscriptionRegistry,
-    /// Used to reject diagnostics for out-of-workspace URIs; see
-    /// `diagnostic_path_in_workspace`.
+    /// Used to reject diagnostics for out-of-workspace URIs (see #234): a
+    /// misbehaving server could otherwise flush the FIFO-capped cache with
+    /// fabricated URIs.
     pub(crate) workspace_roots: WorkspaceRoots,
 }
 
@@ -245,7 +214,7 @@ pub(crate) async fn diagnostics_pump(
                         if *role_rx.borrow() == DiagnosticsRole::Secondary {
                             continue;
                         }
-                        if !diagnostic_path_in_workspace(&p.uri, &workspace_roots) {
+                        if !workspace_roots.admits_uri(&p.uri) {
                             debug!(
                                 "dropping diagnostics for out-of-workspace URI: {}",
                                 p.uri.as_ref()
@@ -253,7 +222,7 @@ pub(crate) async fn diagnostics_pump(
                             continue;
                         }
                         let Some(published) =
-                            PublishedDiagnosticsUri::resolve(&p.uri, workspace_roots.canonical()).await
+                            PublishedDiagnosticsUri::resolve(&p.uri, &workspace_roots).await
                         else {
                             debug!(
                                 "dropping diagnostics for URI resolving outside the workspace: {}",
@@ -386,190 +355,6 @@ impl bridge::NotificationWiring for PumpWiring {
     }
 }
 
-/// Build the [`WorkspaceRoots`](WorkspaceRoots) for `config_roots`:
-/// the canonical roots plus the lexical aliases clients may name them by.
-///
-/// `current_dir()` always returns an absolute path. Configs loaded from a
-/// TOML file have already had relative roots rebased to that file's
-/// directory in `ServerConfig::load_from`; this second pass covers
-/// caller-built `ServerConfig`s, whose relative roots are defined against the
-/// process cwd. Only called when a root needs it (empty `roots`, which
-/// defaults to cwd, or at least one relative root): a fully-absolute
-/// `workspace.roots` must not fail startup just because cwd happens to be
-/// unreadable/removed (#348).
-fn build_workspace_roots(config_roots: &[PathBuf]) -> Result<WorkspaceRoots, Error> {
-    if config_roots.is_empty() || config_roots.iter().any(|root| root.is_relative()) {
-        let base_dir = std::env::current_dir().map_err(Error::Io)?;
-        let canonical = resolve_workspace_roots(config_roots, &base_dir)?;
-        let logical_cwd = logical_cwd_from(std::env::var_os("PWD"), &base_dir);
-        let aliases = workspace_root_aliases(config_roots, &base_dir, logical_cwd.as_deref());
-        Ok(WorkspaceRoots::new(canonical, aliases))
-    } else {
-        // Every root is absolute already, so `base_dir` is never joined
-        // against inside `canonicalize_workspace_roots` -- pass an
-        // arbitrary placeholder rather than paying for `current_dir()`.
-        let canonical = canonicalize_workspace_roots(config_roots, Path::new(""))?;
-        Ok(WorkspaceRoots::new(canonical, config_roots.to_vec()))
-    }
-}
-
-/// `$PWD`, accepted only when it is absolute and names the same directory as
-/// `base_dir`; a forged or stale value is ignored.
-fn logical_cwd_from(pwd: Option<std::ffi::OsString>, base_dir: &Path) -> Option<PathBuf> {
-    let pwd = PathBuf::from(pwd?);
-    if !pwd.is_absolute() {
-        return None;
-    }
-    let same = dunce::canonicalize(&pwd).ok()? == dunce::canonicalize(base_dir).ok()?;
-    same.then_some(pwd)
-}
-
-/// The pre-canonical forms of the roots: as configured, resolved against
-/// `base_dir`, and (for relative roots) against the logical cwd.
-fn workspace_root_aliases(
-    config_roots: &[PathBuf],
-    base_dir: &Path,
-    logical_cwd: Option<&Path>,
-) -> Vec<PathBuf> {
-    if config_roots.is_empty() {
-        return std::iter::once(base_dir)
-            .chain(logical_cwd)
-            .map(Path::to_path_buf)
-            .collect();
-    }
-    let mut aliases = Vec::new();
-    for root in config_roots {
-        if root.is_relative() {
-            aliases.push(join_relative_root(base_dir, root));
-            aliases.extend(logical_cwd.map(|cwd| join_relative_root(cwd, root)));
-        } else {
-            aliases.push(root.clone());
-        }
-    }
-    aliases
-}
-
-/// Resolve workspace roots against an absolute base directory.
-///
-/// If no workspace roots are provided, the base directory itself is used.
-/// Configured relative roots are joined to the base directory. Every existing
-/// path is canonicalized before it can reach workspace heuristics, LSP
-/// initialization, path validation, or diagnostics filtering.
-///
-/// # Returns
-///
-/// A vector of absolute workspace root paths. A relative root that cannot be
-/// canonicalized is rejected as invalid configuration rather than being left
-/// to fail later during `file://` URI conversion. An absolute root retains the
-/// previous fallback behavior and is kept as-is if canonicalization fails.
-fn resolve_workspace_roots(
-    config_roots: &[PathBuf],
-    base_dir: &Path,
-) -> Result<Vec<PathBuf>, Error> {
-    if !base_dir.is_absolute() {
-        return Err(Error::InvalidConfig(format!(
-            "workspace root base must be absolute: {}",
-            base_dir.display()
-        )));
-    }
-
-    if config_roots.is_empty() {
-        let root = match dunce::canonicalize(base_dir) {
-            Ok(canonical) => canonical,
-            Err(e) => {
-                warn!(
-                    "Failed to canonicalize workspace base directory {}: {e}, using non-canonical absolute path",
-                    base_dir.display()
-                );
-                base_dir.to_path_buf()
-            }
-        };
-        info!("Using workspace base directory as root: {}", root.display());
-        Ok(vec![root])
-    } else {
-        canonicalize_workspace_roots(config_roots, base_dir)
-    }
-}
-
-/// Resolve and canonicalize each configured workspace root.
-///
-/// Relative roots are resolved against `base_dir` and must exist. Absolute
-/// roots keep the historical fallback behavior: if canonicalization fails
-/// (for example because the directory is created after startup), the original
-/// absolute path is retained.
-///
-/// Uses [`dunce::canonicalize`] rather than [`Path::canonicalize`]: on
-/// Windows, the latter returns the `\\?\`-prefixed verbatim form (e.g.
-/// `\\?\C:\...`), which a URI-derived path from `Url::to_file_path` (never
-/// verbatim-prefixed) can never `starts_with`-match, silently dropping every
-/// diagnostic. `dunce::canonicalize` resolves symlinks identically but
-/// returns the ordinary `C:\...` form when the result doesn't require the
-/// verbatim syntax (i.e. essentially always, for realistic workspace paths).
-fn canonicalize_workspace_roots(roots: &[PathBuf], base_dir: &Path) -> Result<Vec<PathBuf>, Error> {
-    roots
-        .iter()
-        .map(|root| {
-            let is_relative = root.is_relative();
-            let resolved = if is_relative {
-                join_relative_root(base_dir, root)
-            } else {
-                root.clone()
-            };
-
-            match dunce::canonicalize(&resolved) {
-                Ok(canonical) => Ok(canonical),
-                Err(source) if is_relative => Err(Error::InvalidConfig(format!(
-                    "workspace root '{}' resolved relative to '{}' as '{}' could not be canonicalized: {source}",
-                    root.display(),
-                    base_dir.display(),
-                    resolved.display()
-                ))),
-                Err(source) => {
-                    warn!(
-                        "Failed to canonicalize absolute workspace root {}: {source}, using non-canonical path",
-                        resolved.display()
-                    );
-                    Ok(bridge::canonicalize_existing_prefix(&resolved).unwrap_or(resolved))
-                }
-            }
-        })
-        .collect()
-}
-
-/// Join a relative `root` onto `base_dir`, correctly handling a root that
-/// [`Path::is_relative`] classifies `true` yet still carries a leading
-/// [`Component::Prefix`] and/or [`Component::RootDir`] -- on Windows,
-/// `is_absolute()` requires *both* a prefix and a root, so two distinct
-/// shapes are `is_relative() == true` despite being (partially) rooted:
-/// - no prefix, has root (e.g. `\workspace`) -- rooted on whichever drive is
-///   current.
-/// - has prefix, no root (e.g. `C:workspace`) -- drive-relative, resolved
-///   against that drive's own current directory.
-///
-/// Plain `base_dir.join(root)` would hit [`PathBuf::push`]'s documented
-/// special cases for both shapes, each discarding some or all of `base_dir`
-/// (e.g. `C:\proj\.agents`.join(`\workspace`) -> `C:\workspace`, and
-/// `C:\proj\.agents`.join(`C:workspace`) -> `C:workspace` -- `proj\.agents`
-/// is silently dropped either way). Skipping any leading `Prefix`/`RootDir`
-/// components before joining sidesteps both: only the ordinary relative tail
-/// (`Normal`/`CurDir`/`ParentDir` components) is ever appended to `base_dir`.
-/// For an already-ordinary relative root (the common case, no such leading
-/// components), this is equivalent to `base_dir.join(root)` up to a trailing
-/// separator (`.join` preserves one from a trailing empty/`CurDir`
-/// component; `.extend` does not -- immaterial after canonicalization, and
-/// the one case where it mattered, an empty root, is now rejected by
-/// `validate()`). Detected via `Component` iteration (not
-/// `#[cfg(windows)]`), so the logic itself is exercised by a unit test on
-/// any host -- see `#348`.
-fn join_relative_root(base_dir: &Path, root: &Path) -> PathBuf {
-    let mut joined = base_dir.to_path_buf();
-    joined.extend(
-        root.components()
-            .skip_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir)),
-    );
-    joined
-}
-
 /// Start the MCPLS server with the given configuration over stdio.
 ///
 /// This is the backward-compatible entry point. It is equivalent to calling
@@ -685,7 +470,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
     config.validate()?;
 
-    let workspace_roots = build_workspace_roots(&config.workspace.roots)?;
+    let workspace_roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
@@ -1395,481 +1180,13 @@ mod test_support {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
+    use std::path::PathBuf;
 
     use bridge::{
         DEFAULT_INDEXING_READY_TIMEOUT_SECS, DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE,
     };
 
     use super::*;
-
-    #[test]
-    fn test_diagnostic_path_in_workspace_empty_roots_rejects_any_uri() {
-        let uri: Uri = Uri::from("file:///anywhere/at/all.rs");
-        assert!(!diagnostic_path_in_workspace(
-            &uri,
-            &WorkspaceRoots::default()
-        ));
-    }
-
-    #[test]
-    fn test_diagnostic_path_in_workspace_accepts_uri_under_root() {
-        // `Url::to_file_path` on Windows requires the URL's first path
-        // segment to be a drive letter; a Unix-style path with no drive
-        // letter fails to convert at all (`uri_to_path` returns `None`),
-        // trivially satisfying this assertion for the wrong reason. Use a
-        // drive-letter path so the test actually exercises the prefix check
-        // on every platform.
-        #[cfg(windows)]
-        let (root, uri_str) = (
-            PathBuf::from(r"C:\workspace\project"),
-            "file:///C:/workspace/project/src/main.rs",
-        );
-        #[cfg(not(windows))]
-        let (root, uri_str) = (
-            PathBuf::from("/workspace/project"),
-            "file:///workspace/project/src/main.rs",
-        );
-        let uri: Uri = Uri::from(uri_str);
-        assert!(diagnostic_path_in_workspace(
-            &uri,
-            &WorkspaceRoots::new(vec![root], vec![])
-        ));
-    }
-
-    #[test]
-    fn test_diagnostic_path_in_workspace_rejects_uri_outside_roots() {
-        #[cfg(windows)]
-        let (root, uri_str) = (
-            PathBuf::from(r"C:\workspace\project"),
-            "file:///C:/etc/passwd",
-        );
-        #[cfg(not(windows))]
-        let (root, uri_str) = (PathBuf::from("/workspace/project"), "file:///etc/passwd");
-        let uri: Uri = Uri::from(uri_str);
-        assert!(!diagnostic_path_in_workspace(
-            &uri,
-            &WorkspaceRoots::new(vec![root], vec![])
-        ));
-    }
-
-    #[test]
-    fn test_diagnostic_path_in_workspace_rejects_non_file_uri() {
-        let root = PathBuf::from("/workspace/project");
-        let uri: Uri = Uri::from("untitled:Untitled-1");
-        assert!(!diagnostic_path_in_workspace(
-            &uri,
-            &WorkspaceRoots::new(vec![root], vec![])
-        ));
-    }
-
-    /// `Path::starts_with` is a lexical, component-wise comparison that does
-    /// not resolve `.`/`..` — without an explicit check, a URI like
-    /// `file:///workspace/project/../../etc/passwd` would lexically "start
-    /// with" `/workspace/project` despite pointing outside it.
-    #[test]
-    fn test_diagnostic_path_in_workspace_rejects_parent_dir_traversal() {
-        #[cfg(windows)]
-        let (root, uri_str) = (
-            PathBuf::from(r"C:\workspace\project"),
-            "file:///C:/workspace/project/../../etc/passwd",
-        );
-        #[cfg(not(windows))]
-        let (root, uri_str) = (
-            PathBuf::from("/workspace/project"),
-            "file:///workspace/project/../../etc/passwd",
-        );
-        let uri: Uri = Uri::from(uri_str);
-        assert!(!diagnostic_path_in_workspace(
-            &uri,
-            &WorkspaceRoots::new(vec![root], vec![])
-        ));
-    }
-
-    #[test]
-    fn test_canonicalize_workspace_roots_falls_back_on_nonexistent_absolute_path() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let missing = base.join("missing");
-        let result = canonicalize_workspace_roots(std::slice::from_ref(&missing), &base).unwrap();
-        assert_eq!(result, vec![missing]);
-    }
-
-    #[test]
-    fn test_canonicalize_workspace_roots_rejects_nonexistent_relative_path() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let missing = PathBuf::from("missing");
-
-        let err = canonicalize_workspace_roots(std::slice::from_ref(&missing), &base).unwrap_err();
-
-        let Error::InvalidConfig(message) = err else {
-            panic!("expected InvalidConfig, got {err:?}");
-        };
-        assert!(message.contains("workspace root 'missing'"));
-        assert!(message.contains(&base.display().to_string()));
-    }
-
-    /// #234 round-3 regression: a symlinked workspace root must canonicalize
-    /// to its real path, matching what LSP servers report in diagnostics --
-    /// otherwise `diagnostic_path_in_workspace`'s uncanonicalized prefix check
-    /// would silently drop every diagnostic for that workspace.
-    #[test]
-    #[cfg(unix)]
-    fn test_canonicalize_workspace_roots_resolves_symlink() {
-        use std::os::unix::fs::symlink;
-
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let real_dir = base.join("real");
-        std::fs::create_dir(&real_dir).unwrap();
-        let link_dir = base.join("link");
-        symlink(&real_dir, &link_dir).unwrap();
-
-        let result = canonicalize_workspace_roots(&[link_dir], &base).unwrap();
-        assert_eq!(result, vec![real_dir]);
-    }
-
-    /// #348 case 3 (S2): direct, platform-independent test of
-    /// `join_relative_root`'s `Component`-stripping logic. The bug it fixes
-    /// (a root that's rooted-without-prefix, e.g. `\workspace`) only makes
-    /// `Path::is_relative()` return `true` on Windows, so the end-to-end
-    /// `#[cfg(windows)]` test below is the only one that reproduces the
-    /// actual failure through the public call path -- but the underlying
-    /// `Component` shape it strips (a leading `RootDir` with no preceding
-    /// `Prefix`) is reproducible on any OS by calling the helper directly,
-    /// bypassing the `is_relative()` gate that would otherwise route such
-    /// input elsewhere on non-Windows hosts.
-    #[test]
-    fn test_join_relative_root_strips_leading_root_and_prefix_components() {
-        let base = Path::new("/base/dir");
-
-        assert_eq!(
-            join_relative_root(base, Path::new("/workspace")),
-            PathBuf::from("/base/dir/workspace")
-        );
-        assert_eq!(
-            join_relative_root(base, Path::new("/workspace/sub")),
-            PathBuf::from("/base/dir/workspace/sub")
-        );
-        // An ordinary relative root (no leading `Prefix`/`RootDir`) is
-        // unaffected -- equivalent to a plain `base_dir.join(root)`.
-        assert_eq!(
-            join_relative_root(base, Path::new("workspace")),
-            PathBuf::from("/base/dir/workspace")
-        );
-        assert_eq!(
-            join_relative_root(base, Path::new("..")),
-            PathBuf::from("/base/dir/..")
-        );
-    }
-
-    /// #348 case 3: a configured root with no drive/UNC prefix (e.g.
-    /// `\workspace`) is `Path::is_relative() == true` on Windows despite
-    /// being rooted (`is_absolute()` requires a prefix there). Plain
-    /// `base_dir.join(root)` would hit `PathBuf::push`'s "root without
-    /// prefix" behavior and silently discard everything in `base_dir` past
-    /// its own prefix -- only reproducible on Windows, since elsewhere a
-    /// leading `/` either makes the root absolute (Unix) or isn't a
-    /// separator at all.
-    #[test]
-    #[cfg(windows)]
-    fn test_canonicalize_workspace_roots_windows_root_without_prefix() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let nested = base.join("workspace");
-        std::fs::create_dir(&nested).unwrap();
-
-        let root = PathBuf::from(r"\workspace");
-        assert!(root.is_relative());
-
-        let result = canonicalize_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
-        assert_eq!(result, vec![nested]);
-    }
-
-    /// #348 M2: a Windows drive-relative root (`C:workspace` -- a leading
-    /// `Component::Prefix` with no `RootDir`) is also `is_relative() ==
-    /// true`. Plain `base_dir.join(root)` would hit `PathBuf::push`'s
-    /// "has a prefix" special case and discard `base_dir` entirely instead
-    /// of joining under it -- the same class of failure as the
-    /// rooted-without-prefix case above, via a prefix instead of a root
-    /// separator. `join_relative_root` deliberately does not replicate
-    /// native Windows drive-relative resolution (which resolves against
-    /// that drive's own current directory); it joins under `base_dir`
-    /// instead, consistent with every other relative root.
-    #[test]
-    #[cfg(windows)]
-    fn test_canonicalize_workspace_roots_windows_drive_relative_root() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let nested = base.join("workspace");
-        std::fs::create_dir(&nested).unwrap();
-
-        // Built from `base`'s own drive prefix so the test doesn't depend on
-        // which drive CI happens to check the repo out onto.
-        let Some(drive_prefix) = base.components().find_map(|c| match c {
-            Component::Prefix(p) => Some(p.as_os_str().to_owned()),
-            _ => None,
-        }) else {
-            panic!("temp dir path should have a Windows drive prefix");
-        };
-        let mut root = drive_prefix;
-        root.push("workspace");
-        let root = PathBuf::from(root);
-        assert!(root.is_relative());
-
-        let result = canonicalize_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
-        assert_eq!(result, vec![nested]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_logical_cwd_accepted_only_when_it_names_the_cwd() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let link = base.join("link");
-        std::os::unix::fs::symlink(&base, &link).unwrap();
-        let other = tempfile::TempDir::new().unwrap();
-
-        assert_eq!(
-            logical_cwd_from(Some(link.clone().into_os_string()), &base),
-            Some(link)
-        );
-        assert_eq!(
-            logical_cwd_from(Some(other.path().as_os_str().to_owned()), &base),
-            None
-        );
-        assert_eq!(logical_cwd_from(Some(".".into()), &base), None);
-        assert_eq!(logical_cwd_from(None, &base), None);
-    }
-
-    #[test]
-    fn test_workspace_root_aliases_cover_configured_and_logical_forms() {
-        let base = PathBuf::from("/real/proj");
-        let logical = PathBuf::from("/logical/proj");
-
-        assert_eq!(
-            workspace_root_aliases(&[], &base, Some(&logical)),
-            vec![base.clone(), logical.clone()]
-        );
-        let abs = crate::test_lsp::absolute_path("abs");
-        assert_eq!(
-            workspace_root_aliases(&[PathBuf::from("sub"), abs.clone()], &base, Some(&logical)),
-            vec![base.join("sub"), logical.join("sub"), abs]
-        );
-    }
-
-    /// The configured spelling of an absolute root stays admitted as an alias
-    /// while the canonical root is the symlink-free path.
-    #[cfg(unix)]
-    #[test]
-    fn test_build_workspace_roots_keeps_symlinked_root_as_alias() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let real = base.join("real");
-        std::fs::create_dir(&real).unwrap();
-        let link = base.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let roots = build_workspace_roots(std::slice::from_ref(&link)).unwrap();
-
-        assert_eq!(roots.canonical(), std::slice::from_ref(&real));
-        assert!(roots.admits_lexically(&link.join("a.rs")));
-        assert!(roots.admits_lexically(&real.join("a.rs")));
-        assert!(!roots.admits_lexically(&base.join("other/a.rs")));
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn test_build_workspace_roots_keeps_absolute_root_as_alias() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let raw = temp_dir.path().to_path_buf();
-
-        let roots = build_workspace_roots(std::slice::from_ref(&raw)).unwrap();
-
-        assert!(roots.admits_lexically(&raw.join("a.rs")));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_empty_config() {
-        let cwd = std::env::current_dir().unwrap();
-        let roots = resolve_workspace_roots(&[], &cwd).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert!(
-            roots[0].is_absolute(),
-            "Workspace root should be absolute path"
-        );
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_with_config() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let root = base.join("root");
-        std::fs::create_dir(&root).unwrap();
-
-        let roots = resolve_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
-        assert_eq!(roots, vec![root]);
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_multiple_paths() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let config_roots = vec![base.join("root1"), base.join("root2")];
-        for root in &config_roots {
-            std::fs::create_dir(root).unwrap();
-        }
-
-        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
-        assert_eq!(roots, config_roots);
-        assert_eq!(roots.len(), 2);
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_preserves_order() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let config_roots = vec![base.join("alpha"), base.join("beta"), base.join("gamma")];
-        for root in &config_roots {
-            std::fs::create_dir(root).unwrap();
-        }
-
-        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
-        assert_eq!(roots, config_roots);
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_single_path() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let root = base.join("workspace");
-        std::fs::create_dir(&root).unwrap();
-
-        let roots = resolve_workspace_roots(std::slice::from_ref(&root), &base).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0], root);
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_empty_returns_cwd() {
-        let cwd = std::env::current_dir().unwrap();
-        let roots = resolve_workspace_roots(&[], &cwd).unwrap();
-        assert_eq!(roots, vec![dunce::canonicalize(cwd).unwrap()]);
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_relative_paths() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let config_roots = vec![
-            PathBuf::from("relative/path1"),
-            PathBuf::from("relative/path2"),
-        ];
-        for root in &config_roots {
-            std::fs::create_dir_all(base.join(root)).unwrap();
-        }
-
-        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
-        assert_eq!(
-            roots,
-            vec![base.join("relative/path1"), base.join("relative/path2")]
-        );
-        assert!(roots.iter().all(|root| root.is_absolute()));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_mixed_paths() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let absolute = base.join("absolute");
-        let relative = PathBuf::from("relative/path");
-        std::fs::create_dir(&absolute).unwrap();
-        std::fs::create_dir_all(base.join(&relative)).unwrap();
-        let config_roots = vec![absolute.clone(), relative];
-        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], absolute);
-        assert_eq!(roots[1], base.join("relative/path"));
-        assert!(roots.iter().all(|root| root.is_absolute()));
-    }
-
-    /// #348 case 1: `serve_with` skips `std::env::current_dir()` entirely
-    /// for a fully-absolute `workspace.roots`, passing an unused placeholder
-    /// base directory straight to `canonicalize_workspace_roots` instead of
-    /// `resolve_workspace_roots`. Confirms that placeholder is never
-    /// dereferenced when every root is already absolute.
-    #[test]
-    fn test_canonicalize_workspace_roots_ignores_base_dir_when_all_absolute() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let root = base.join("root");
-        std::fs::create_dir(&root).unwrap();
-
-        let result =
-            canonicalize_workspace_roots(std::slice::from_ref(&root), Path::new("")).unwrap();
-        assert_eq!(result, vec![root]);
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_with_dot_path() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let config_roots = vec![PathBuf::from(".")];
-        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
-        assert_eq!(roots, vec![base]);
-        assert!(roots[0].is_absolute());
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_with_parent_path() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let parent = dunce::canonicalize(temp_dir.path()).unwrap();
-        let base = parent.join("nested");
-        std::fs::create_dir(&base).unwrap();
-        let config_roots = vec![PathBuf::from("..")];
-        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0], parent);
-        assert!(roots[0].is_absolute());
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_unicode_paths() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let config_roots = vec![
-            PathBuf::from("workspace/テスト"),
-            PathBuf::from("workspace/тест"),
-        ];
-        for root in &config_roots {
-            std::fs::create_dir_all(base.join(root)).unwrap();
-        }
-
-        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], base.join("workspace/テスト"));
-        assert_eq!(roots[1], base.join("workspace/тест"));
-    }
-
-    #[test]
-    fn test_resolve_workspace_roots_spaces_in_paths() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let base = dunce::canonicalize(temp_dir.path()).unwrap();
-        let config_roots = vec![
-            PathBuf::from("workspace/path with spaces"),
-            PathBuf::from("another path/workspace"),
-        ];
-        for root in &config_roots {
-            std::fs::create_dir_all(base.join(root)).unwrap();
-        }
-
-        let roots = resolve_workspace_roots(&config_roots, &base).unwrap();
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], base.join("workspace/path with spaces"));
-        assert_eq!(roots[1], base.join("another path/workspace"));
-    }
 
     // Tests for graceful degradation behavior
     mod graceful_degradation_tests {
@@ -2106,12 +1423,11 @@ mod tests {
 
         /// #348 case 1 (tester-flagged coverage gap): proves `serve_with`
         /// itself skips `current_dir()` for an all-absolute
-        /// `workspace.roots`, not just that `canonicalize_workspace_roots`
-        /// tolerates an unused base when called directly (see
-        /// `test_canonicalize_workspace_roots_ignores_base_dir_when_all_absolute`
-        /// in the outer `tests` module, which never exercises `serve_with`'s
-        /// branch selection and would still pass if that `if` were inverted
-        /// or deleted). Mutates the process cwd (chdir into a directory,
+        /// `workspace.roots`, not just that `WorkspaceRoots::from_configured_with`
+        /// tolerates an unread cwd when called directly (see
+        /// `test_from_configured_ignores_cwd_when_all_absolute` in
+        /// `bridge::workspace_roots`, which never exercises `serve_with`'s
+        /// wiring). Mutates the process cwd (chdir into a directory,
         /// then remove it -- `current_dir()` reliably fails afterward on
         /// Unix), so it uses the crate-shared `test_support::CwdGuard` --
         /// the same lock/restore-on-drop `config::tests` uses -- rather than
@@ -3014,11 +2330,11 @@ mod tests {
         /// `test_pump_drops_diagnostics_outside_workspace_roots`.
         #[cfg(windows)]
         fn test_workspace_roots() -> WorkspaceRoots {
-            WorkspaceRoots::new(vec![PathBuf::from(r"C:\test")], vec![])
+            WorkspaceRoots::for_test(vec![PathBuf::from(r"C:\test")], vec![])
         }
         #[cfg(not(windows))]
         fn test_workspace_roots() -> WorkspaceRoots {
-            WorkspaceRoots::new(vec![PathBuf::from("/test")], vec![])
+            WorkspaceRoots::for_test(vec![PathBuf::from("/test")], vec![])
         }
 
         /// A `file://` URI for `file` beneath [`test_workspace_roots`]'s root.
@@ -3099,7 +2415,7 @@ mod tests {
             let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-            // See `test_diagnostic_path_in_workspace_accepts_uri_under_root`
+            // See `test_admits_uri_under_root_and_alias`
             // for why Windows needs a drive-letter path here.
             #[cfg(windows)]
             let (workspace_root, outside_uri_str, inside_uri_str) = (
@@ -3113,7 +2429,7 @@ mod tests {
                 "file:///etc/passwd",
                 "file:///workspace/src/main.rs",
             );
-            let workspace_roots = WorkspaceRoots::new(vec![workspace_root], vec![]);
+            let workspace_roots = WorkspaceRoots::for_test(vec![workspace_root], vec![]);
 
             tokio::spawn(diagnostics_pump(
                 ServerId::from("rust"),
@@ -3565,10 +2881,10 @@ mod tests {
 
             let cache = make_cache();
             let id = ServerId::from("rust");
-            let roots = WorkspaceRoots::resolve(vec![root]);
+            let roots = WorkspaceRoots::from_configured(&[root]).unwrap();
             let published = PublishedDiagnosticsUri::resolve(
                 &bridge::path_to_uri(&cleared_file).unwrap(),
-                roots.canonical(),
+                &roots,
             )
             .await
             .unwrap();
@@ -3654,7 +2970,7 @@ mod tests {
 
             let (tx, _cancel_tx) = spawn_test_pump_with_cache(
                 subs,
-                WorkspaceRoots::resolve(vec![root]),
+                WorkspaceRoots::from_configured(&[root]).unwrap(),
                 Arc::clone(&cache),
             );
             let error = lsp_types::Diagnostic {
@@ -3702,7 +3018,7 @@ mod tests {
             std::fs::write(real.join("main.rs"), "fn main() {}").unwrap();
             let link = base.join("link");
             std::os::unix::fs::symlink(&real, &link).unwrap();
-            let roots = WorkspaceRoots::resolve(vec![link.clone()]);
+            let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&link)).unwrap();
             assert_eq!(roots.canonical(), std::slice::from_ref(&real));
 
             let cache = make_cache();
@@ -3765,7 +3081,7 @@ mod tests {
                 .unwrap();
             let (tx, _cancel_tx) = spawn_test_pump_with_cache(
                 subs,
-                WorkspaceRoots::resolve(vec![root]),
+                WorkspaceRoots::from_configured(&[root]).unwrap(),
                 Arc::clone(&cache),
             );
             let error = lsp_types::Diagnostic {
@@ -3887,7 +3203,7 @@ mod tests {
             let server = mcp::McplsServer::new(
                 Arc::new(Translator::new()),
                 make_cache(),
-                WorkspaceRoots::resolve(vec![root.clone()]),
+                WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
                 subs.clone(),
                 ProjectConfigStatus::NotIgnored,
                 config::McpConfig::default(),
@@ -3923,7 +3239,8 @@ mod tests {
                 "subscribe failed: {response}"
             );
 
-            let (tx, _cancel_tx) = spawn_test_pump(subs, WorkspaceRoots::resolve(vec![root]));
+            let (tx, _cancel_tx) =
+                spawn_test_pump(subs, WorkspaceRoots::from_configured(&[root]).unwrap());
             tx.send(LspNotification::PublishDiagnostics(
                 PublishDiagnosticsParams {
                     uri: bridge::path_to_uri(&file).unwrap(),
@@ -3972,7 +3289,9 @@ mod tests {
                         id.clone(),
                         "rust".to_string(),
                     )]));
-                translator.set_workspace_roots(WorkspaceRoots::resolve(vec![root.clone()]));
+                translator.set_workspace_roots(
+                    WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+                );
                 translator.set_expected_servers(HashSet::from([id]));
                 let translator = Arc::new(translator);
 
@@ -3980,7 +3299,7 @@ mod tests {
                 let server = mcp::McplsServer::new(
                     Arc::clone(&translator),
                     make_cache(),
-                    WorkspaceRoots::resolve(vec![root]),
+                    WorkspaceRoots::from_configured(&[root]).unwrap(),
                     subs.clone(),
                     ProjectConfigStatus::NotIgnored,
                     config::McpConfig::default(),
