@@ -297,9 +297,7 @@ impl ShutdownSignal {
 
 /// Run the MCP server over stdio.
 ///
-/// Serves the given `mcp_server` using stdin/stdout and populates `peer_cell`
-/// once the transport is established so that diagnostic pump tasks can begin
-/// forwarding `resources/updated` notifications. Returns as soon as either
+/// Serves the given `mcp_server` using stdin/stdout. Returns as soon as either
 /// the stdio transport closes (client disconnect / stdin EOF) or a `SIGTERM`/
 /// `SIGINT` is received, so callers can run orderly cleanup — such as
 /// [`crate::bridge::Translator::shutdown_servers`] — before the process
@@ -325,7 +323,6 @@ impl ShutdownSignal {
 /// runtime shutdown indefinitely (see `mcpls-cli`'s `main.rs` and #308).
 pub(crate) async fn run_stdio(
     mcp_server: crate::mcp::McplsServer,
-    peer_cell: &tokio::sync::OnceCell<rmcp::Peer<rmcp::RoleServer>>,
     mut shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
     let service = tokio::select! {
@@ -337,10 +334,6 @@ pub(crate) async fn run_stdio(
             return Ok(());
         }
     };
-
-    if let Err(e) = peer_cell.set(service.peer().clone()) {
-        tracing::debug!("Peer cell already set ({}), ignoring", e);
-    }
 
     tokio::select! {
         result = service.waiting() => result
@@ -363,19 +356,34 @@ pub(crate) async fn run_stdio(
 /// inside is the same across all sessions, so LSP state is still global per
 /// process.
 ///
-/// # Note
+/// # Resource update notifications
 ///
-/// Diagnostic push notifications (`resources/updated`) are not forwarded to
-/// HTTP sessions in this release — the single-peer pump architecture from
-/// stdio is kept as-is. Clients can still poll diagnostics via the existing
-/// MCP tools. A follow-up issue will add per-session broadcast.
+/// `resources/updated` goes to each session's standalone GET (SSE) stream, and
+/// only for the URIs that session itself subscribed to (`resources/subscribe`
+/// must come from a session established via the `initialize` handshake).
+/// rmcp caches the last 16 GET-stream events per session
+/// (`SessionConfig::DEFAULT_CHANNEL_CAPACITY`) and replays them when a GET
+/// opens, including when a dead primary GET is replaced, so a client may see
+/// duplicates. A second GET opened while the first is still considered alive
+/// receives no notifications until the first is detected dead.
+///
+/// A session that sends no requests expires after rmcp's 5-minute idle
+/// `keep_alive` only while no server-initiated notifications flow: each
+/// `resources/updated` re-arms that timer. An abandoned but subscribed session
+/// therefore stays alive, holding one `max_concurrent_sessions` permit, for as
+/// long as its files keep receiving diagnostics (#521). Clients should send `DELETE`
+/// on shutdown; after an expiry they must re-initialize and re-subscribe.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
 /// "one instance per request"; `resources/subscribe`/`unsubscribe` detect
 /// that path and return an explicit error rather than silently accepting a
 /// subscription that would never be observed -- see
-/// [`SubscriptionRegistry`](crate::bridge::SubscriptionRegistry)'s "Known
-/// limitation" section.
+/// [`SubscriptionRegistry`](crate::mcp::SubscriptionRegistry)'s docs.
+///
+/// Per-session isolation assumes the `Mcp-Session-Id` stays secret: whoever
+/// holds it can open that session's GET stream once its previous stream is
+/// gone. mcpls performs no authentication of its own, so keep the id out of
+/// logs and place a non-loopback bind behind an authenticating reverse proxy.
 ///
 /// # Resource limits
 ///
@@ -449,11 +457,11 @@ pub(crate) async fn run_http(
     http_cfg.max_request_body_bytes = cfg.max_request_body_bytes;
 
     // `for_new_session`, not `.clone()`: every session must get its own
-    // `ResourceSubscriptions` set (#478) rather than sharing `mcp_for_factory`'s,
-    // while still sharing its `Arc<Translator>` and the rest of the LSP-facing
-    // state via a cheap `Arc` bump. On rmcp's stateless path this factory runs
-    // once per request, not per session -- see `SubscriptionRegistry`'s
-    // "Known limitation" doc.
+    // subscription state (#478) rather than sharing `mcp_for_factory`'s, while
+    // still sharing its `Arc<Translator>` and the rest of the LSP-facing state
+    // via a cheap `Arc` bump. On rmcp's stateless path this factory runs once
+    // per request, not per session; those instances never subscribe, so they
+    // never register with the `SubscriptionRegistry`.
     let service = StreamableHttpService::new(
         move || Ok::<_, std::io::Error>(mcp_for_factory.for_new_session()),
         session_manager,
@@ -842,9 +850,9 @@ mod tests {
 
         use tokio::sync::Mutex;
 
-        use crate::bridge::{NotificationCache, SubscriptionRegistry, Translator};
+        use crate::bridge::{NotificationCache, Translator};
         use crate::config::McpConfig;
-        use crate::mcp::McplsServer;
+        use crate::mcp::{McplsServer, SubscriptionRegistry};
 
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
@@ -858,11 +866,9 @@ mod tests {
             false,
             McpConfig::default(),
         );
-        let peer_cell = tokio::sync::OnceCell::new();
-
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            super::run_stdio(server, &peer_cell, super::ShutdownSignal::new()),
+            super::run_stdio(server, super::ShutdownSignal::new()),
         )
         .await;
 
@@ -950,9 +956,9 @@ mod tests {
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{NotificationCache, SubscriptionRegistry, Translator};
+            use crate::bridge::{NotificationCache, Translator};
             use crate::config::McpConfig;
-            use crate::mcp::McplsServer;
+            use crate::mcp::{McplsServer, SubscriptionRegistry};
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
@@ -1054,9 +1060,9 @@ mod tests {
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{NotificationCache, SubscriptionRegistry, Translator};
+            use crate::bridge::{NotificationCache, Translator};
             use crate::config::McpConfig;
-            use crate::mcp::McplsServer;
+            use crate::mcp::{McplsServer, SubscriptionRegistry};
 
             // Hold a listener to make the port unavailable.
             let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1097,9 +1103,9 @@ mod tests {
 
             use tokio::sync::Mutex;
 
-            use crate::bridge::{NotificationCache, SubscriptionRegistry, Translator};
+            use crate::bridge::{NotificationCache, Translator};
             use crate::config::McpConfig;
-            use crate::mcp::McplsServer;
+            use crate::mcp::{McplsServer, SubscriptionRegistry};
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
@@ -1461,18 +1467,14 @@ mod tests {
             server_task.abort();
         }
 
-        /// #478/#482 regression pin: on rmcp's stateless path (see
+        /// #478/#482/#492 regression pin: on rmcp's stateless path (see
         /// `test_run_http_stateless_request_bypasses_session_cap` above), the
         /// service factory -- and therefore `McplsServer::for_new_session` --
-        /// runs once per *request*, not once per session, registering a new
-        /// `ResourceSubscriptions` set each time. Firing many stateless
-        /// requests must not grow `SubscriptionRegistry` without bound (S2's
-        /// prune-before-push in `register`); it must stay pinned near the
-        /// handful of instances actually alive (the long-lived template
-        /// `McplsServer` this test built, plus at most one not-yet-pruned
-        /// stateless-request entry).
+        /// runs once per *request*. Such an instance never subscribes, so it
+        /// must never enter `SubscriptionRegistry` at all, however many
+        /// requests are served.
         #[tokio::test]
-        async fn test_stateless_requests_do_not_grow_subscription_registry_unboundedly() {
+        async fn test_stateless_requests_never_register_with_subscription_registry() {
             const REQUEST_COUNT: u32 = 20;
 
             let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1504,19 +1506,10 @@ mod tests {
                 );
             }
 
-            // Let the background task each stateless request's handler is
-            // spawned on (`serve_directly_with_ct`'s `waiting()` task in rmcp)
-            // finish dropping its per-request `McplsServer`.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            // Raw (unpruned) length: nothing in this test ever calls
-            // `any_contains`/`is_all_empty` (no LSP server is running to
-            // publish diagnostics), so the only thing that can keep this
-            // bounded is `register` pruning dead entries on the way in.
-            let raw = registry.raw_len();
-            assert!(
-                raw <= 2,
-                "registry should stay bounded across {REQUEST_COUNT} stateless requests, got {raw} raw entries"
+            assert_eq!(
+                registry.raw_len(),
+                0,
+                "stateless instances must never register with the subscription registry"
             );
 
             server_task.abort();
@@ -1527,6 +1520,7 @@ mod tests {
         /// `resources/subscribe` requests validate and reach the handler.
         struct SubscribeTestServer {
             addr: SocketAddr,
+            registry: crate::mcp::SubscriptionRegistry,
             uri: String,
             server_task: tokio::task::JoinHandle<Result<(), crate::Error>>,
             // Held so the file `subscribe` canonicalizes stays on disk.
@@ -1545,6 +1539,7 @@ mod tests {
 
             let server =
                 test_server_with_roots(std::sync::Arc::from(vec![workspace.path().to_path_buf()]));
+            let registry = server.subscription_registry();
 
             let cfg = HttpConfig::new(addr, "/mcp");
             let server_task = tokio::spawn(super::super::run_http(
@@ -1556,6 +1551,7 @@ mod tests {
 
             SubscribeTestServer {
                 addr,
+                registry,
                 uri,
                 server_task,
                 _workspace: workspace,
@@ -1617,6 +1613,11 @@ mod tests {
                      stateless-subscription guard, not silently succeed, got: {response}"
                 );
             }
+            assert_eq!(
+                srv.registry.raw_len(),
+                0,
+                "a rejected stateless subscribe must never register a session"
+            );
 
             srv.server_task.abort();
         }
@@ -1698,6 +1699,177 @@ mod tests {
                         .then(|| value.trim().to_string())
                 })
                 .unwrap()
+        }
+
+        /// A raw-TCP Server-Sent-Events GET stream for one MCP session.
+        struct SseStream {
+            stream: tokio::net::TcpStream,
+            buf: String,
+        }
+
+        impl SseStream {
+            /// Opens the session's standalone GET stream and returns once the
+            /// `200` response headers have arrived, so nothing published
+            /// afterwards can race the stream's registration.
+            async fn open(addr: SocketAddr, session_id: &str) -> Self {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let request = format!(
+                    "GET /mcp HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {session_id}\r\n\r\n"
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+
+                let mut head = String::new();
+                let mut chunk = [0u8; 4096];
+                let body_start = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0, "GET stream closed before headers arrived");
+                        head.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                        if let Some(pos) = head.find("\r\n\r\n") {
+                            return pos + 4;
+                        }
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("GET stream headers not received within 5 s"));
+                assert!(
+                    head.starts_with("HTTP/1.1 200"),
+                    "GET stream must open with 200, got: {head}"
+                );
+                Self {
+                    stream,
+                    buf: head[body_start..].to_owned(),
+                }
+            }
+
+            /// Next `notifications/resources/updated` URI on the stream,
+            /// skipping `retry:` priming events, keep-alive comments and
+            /// chunked-encoding framing.
+            async fn next_resource_update(&mut self) -> String {
+                use tokio::io::AsyncReadExt as _;
+
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        while let Some(pos) = self.buf.find('\n') {
+                            let line: String = self.buf.drain(..=pos).collect();
+                            let Some(data) = line.trim().strip_prefix("data:") else {
+                                continue;
+                            };
+                            let Ok(message) =
+                                serde_json::from_str::<serde_json::Value>(data.trim())
+                            else {
+                                continue;
+                            };
+                            if message["method"] == "notifications/resources/updated" {
+                                return message["params"]["uri"].as_str().unwrap().to_owned();
+                            }
+                        }
+                        let mut chunk = [0u8; 4096];
+                        let n = self.stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0, "GET stream closed before the expected update");
+                        self.buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("no resources/updated on the GET stream within 5 s"))
+            }
+        }
+
+        /// POSTs `body` within `session_id` and returns the raw response.
+        async fn post_in_session(addr: SocketAddr, session_id: &str, body: &str) -> String {
+            let headers = format!(
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMcp-Session-Id: {session_id}\r\n"
+            );
+            raw_http_post(addr, "/mcp", &headers, body.as_bytes()).await
+        }
+
+        /// Completes the handshake for a fresh legacy session and opens its
+        /// GET stream.
+        async fn establish_session(addr: SocketAddr) -> (String, SseStream) {
+            let session_id = initialize_legacy_session(addr).await;
+            let initialized = post_in_session(
+                addr,
+                &session_id,
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            )
+            .await;
+            assert!(
+                initialized.starts_with("HTTP/1.1 202"),
+                "notifications/initialized must be accepted, got: {initialized}"
+            );
+            let stream = SseStream::open(addr, &session_id).await;
+            (session_id, stream)
+        }
+
+        async fn subscribe_in_session(addr: SocketAddr, session_id: &str, uri: &str) {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{{"uri":"{uri}"}}}}"#
+            );
+            let response = post_in_session(addr, session_id, &body).await;
+            assert!(
+                response.starts_with("HTTP/1.1 200") && !response.contains(r#""error""#),
+                "subscribe to {uri} must succeed, got: {response}"
+            );
+        }
+
+        /// #468 end to end over HTTP: each session's GET stream carries
+        /// `resources/updated` only for that session's own subscriptions.
+        /// A subscribes to X and Y, B only to Y; X is published first, so B's
+        /// first update being Y proves X never reached B.
+        #[tokio::test]
+        async fn test_http_sessions_receive_updates_only_for_own_subscriptions() {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let file_x = root.join("x.rs");
+            let file_y = root.join("y.rs");
+            std::fs::write(&file_x, "fn x() {}").unwrap();
+            std::fs::write(&file_y, "fn y() {}").unwrap();
+            let uri_x = crate::bridge::resources::make_uri(&file_x).unwrap();
+            let uri_y = crate::bridge::resources::make_uri(&file_y).unwrap();
+
+            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let registry = server.subscription_registry();
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+            let server_task = tokio::spawn(super::super::run_http(
+                server,
+                HttpConfig::new(addr, "/mcp"),
+                super::super::ShutdownSignal::new(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let (session_a, mut stream_a) = establish_session(addr).await;
+            let (session_b, mut stream_b) = establish_session(addr).await;
+            subscribe_in_session(addr, &session_a, &uri_x).await;
+            subscribe_in_session(addr, &session_a, &uri_y).await;
+            subscribe_in_session(addr, &session_b, &uri_y).await;
+
+            let (tx, _cancel_tx) =
+                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+            let publish = |file: &std::path::Path| {
+                let notification = crate::lsp::LspNotification::PublishDiagnostics(
+                    lsp_types::PublishDiagnosticsParams {
+                        uri: crate::bridge::path_to_uri(file).unwrap(),
+                        diagnostics: vec![],
+                        version: None,
+                    },
+                );
+                let tx = tx.clone();
+                async move { tx.send(notification).await.unwrap() }
+            };
+
+            publish(&file_x).await;
+            assert_eq!(stream_a.next_resource_update().await, uri_x);
+            // Gives a wrongly queued X time to reach B's stream before Y exists.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            publish(&file_y).await;
+            assert_eq!(stream_b.next_resource_update().await, uri_y);
+            assert_eq!(stream_a.next_resource_update().await, uri_y);
+
+            server_task.abort();
         }
 
         /// #233: binding to a non-loopback address must log a warning that

@@ -95,8 +95,9 @@ breaking change discovered at an `rmcp` major-version bump.
 - Implementing `subscriptions/listen` replacing `resources/subscribe` /
   `resources/unsubscribe` — resource subscriptions were added in
   [[mcp/002-mcp-resources-diagnostics/spec|Spec mcp/002]] under the 2025-11-25 model;
-  re-scoping them is a future spec once the MRTR/subscriptions API stabilizes
-  upstream in `rmcp`
+  `rmcp` 3.5.0 now exposes the replacement API, and the remaining gap is analysed
+  in the "Resource subscriptions on the stateless path (#493)" section below and
+  tracked by a follow-up issue
 - Updating `.claude/rules/continuous-improvement.md`'s reference spec version —
   premature until `rmcp` and mcpls actually target 2026-07-28
 
@@ -148,7 +149,7 @@ this finding is P3 research, and `rmcp` conformance work is incomplete.
 | FR-001 | WHEN `rmcp` publishes a release claiming 2026-07-28 conformance THE SYSTEM'S maintainers SHALL re-review `crates/mcpls-core/src/mcp/server.rs`'s `get_info()`/`ServerCapabilities` implementation for compatibility with per-request `_meta` protocol-version/capability fields replacing `initialize` | must |
 | FR-002 | mcpls's MCP-side capability negotiation SHALL have a documented migration path away from the `initialize`/`notifications/initialized` handshake before upgrading to an `rmcp` version that removes stateful `initialize` as a supported mode | must |
 | FR-003 | IF `rmcp` retains a backward-compatible/dual-mode `initialize` path during its deprecation window (Roots/Sampling/Logging carry a 12-month deprecation per the spec) THEN mcpls SHOULD defer the stateless migration until that window's expiry is imminent, to avoid churn on an unstable upstream API | should |
-| FR-004 | WHEN mcpls does migrate, THE SYSTEM SHALL re-audit `notifications.rs`'s push-based diagnostics caching against the `subscriptions/listen` replacement for `resources/subscribe`/`resources/unsubscribe`, since [[mcp/002-mcp-resources-diagnostics/spec|Spec mcp/002]]'s design assumes the 2025-11-25 subscribe/unsubscribe API | should |
+| FR-004 | WHEN mcpls does migrate, THE SYSTEM SHALL re-audit `notifications.rs`'s push-based diagnostics caching against the `subscriptions/listen` replacement for `resources/subscribe`/`resources/unsubscribe`, since [[mcp/002-mcp-resources-diagnostics/spec|Spec mcp/002]]'s design assumes the 2025-11-25 subscribe/unsubscribe API; the re-audit is scoped in "Resource subscriptions on the stateless path (#493)" | should |
 | FR-005 | THE SYSTEM'S issue tracker SHALL retain a link between this spec, issue #119 (tasks extension redesign), and issue #122 (Streamable HTTP parity), since all three are touched by different facets of the same MCP spec revision | must |
 
 ## 4. Non-Functional Requirements
@@ -206,6 +207,15 @@ that mcpls's MCP layer will eventually need to represent:
 - Update `.claude/rules/continuous-improvement.md`'s cited spec version
   without a maintainer decision — that reference documents current behavior,
   not aspirational future behavior
+
+## 8a. Resource subscriptions on the stateless path (#493)
+
+Closed as research; no code change. Findings:
+
+- On rmcp's stateless per-request HTTP path (`_meta` carries the discover-lifecycle keys, or no `Mcp-Session-Id` is echoed) no durable client identity exists, so a `resources/subscribe` has nowhere to persist. mcpls rejects it explicitly (error `-32052`, #482) and, since #492, structurally: only a `StatefulSession` capability token obtained via `SessionHandle::require_stateful` can mutate subscription state, and a session joins the delivery registry only on its first guarded subscribe.
+- 2026-07-28 replaces `resources/subscribe` with a request-scoped `subscriptions/listen` stream. `rmcp` 3.5.0 implements it (`ServerHandler::accepted_subscription_filter` plus `listen(SubscriptionContext)` and `SubscriptionSink`).
+- Supporting it needs more than a plug-in: `accepted_subscription_filter` is synchronous, has no `RequestContext`, and `rmcp` intersects its result with the requested URIs by exact match, so it must echo the client's raw URIs (validated against the workspace roots and capped). One canonical URI can map to several raw URIs, which the one-alias-per-canonical model in `ResourceSubscriptions` does not represent, so a separate canonical-to-raw-set mapping is required. The delivery `Target` would gain a `Sink(SubscriptionSink)` variant.
+- Follow-up issue: #522, "resource subscriptions unavailable to 2026-07-28 clients via subscriptions/listen" (`enhancement`, P3). The per-session registry, delivery loop and capability token are reusable; the URI mapping is not.
 
 ## 9. Open Questions
 

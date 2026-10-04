@@ -29,7 +29,6 @@ pub(crate) use notifications::apply_lifecycle_notification;
 pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
-pub use resources::{ResourceSubscriptions, SubscriptionError, SubscriptionRegistry};
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, EvictedDocument, ResourceLimits,
     path_to_uri, uri_to_path,

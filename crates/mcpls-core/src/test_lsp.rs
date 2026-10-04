@@ -248,3 +248,38 @@ done
 pub fn with_read_preamble(body: &str) -> String {
     format!("{READ_REQUEST_SH}{body}")
 }
+
+/// Spawns a real [`crate::diagnostics_pump`] over `subs` and returns the
+/// sender feeding it plus the cancel sender (keep it alive: dropping it stops
+/// the pump).
+pub fn spawn_test_pump(
+    subs: crate::mcp::SubscriptionRegistry,
+    workspace_roots: std::sync::Arc<[std::path::PathBuf]>,
+) -> (
+    tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        // Held so the lifecycle lane stays open for the pump's lifetime.
+        let _lifecycle_tx = lifecycle_tx;
+        crate::diagnostics_pump(
+            crate::config::ServerId::from("rust"),
+            rx,
+            lifecycle_rx,
+            cancel_rx,
+            true,
+            crate::PumpShared {
+                notification_cache: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::bridge::NotificationCache::new(),
+                )),
+                subs,
+                workspace_roots,
+            },
+        )
+        .await;
+    });
+    (tx, cancel_tx)
+}

@@ -55,14 +55,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bridge::resources::make_uri;
-use bridge::{NotificationCache, SubscriptionRegistry, Translator};
+use bridge::{NotificationCache, Translator};
 pub use config::{ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
 use lsp_types::Uri;
-use rmcp::model::ResourceUpdatedNotificationParam;
-use tokio::sync::{Mutex, OnceCell};
+use mcp::SubscriptionRegistry;
+use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 #[cfg(feature = "transport-http")]
@@ -97,19 +97,17 @@ fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &[PathBuf]) -> bool 
 #[derive(Clone)]
 pub(crate) struct PumpShared {
     pub(crate) notification_cache: Arc<Mutex<NotificationCache>>,
-    /// Aggregated across every live MCP session's own subscription set (one
-    /// per HTTP session, or the single set stdio ever has), so the pump can
-    /// ask "does *any* live session want this URI?" without holding a
-    /// reference to any one session's set -- see [`SubscriptionRegistry`].
+    /// Every session that has subscribed to anything (one per HTTP session,
+    /// or the single stdio session); the pump hands each one the URI and the
+    /// session decides whether it is subscribed -- see [`SubscriptionRegistry`].
     pub(crate) subs: SubscriptionRegistry,
-    pub(crate) peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     /// Used to reject diagnostics for out-of-workspace URIs; see
     /// `diagnostic_path_in_workspace`.
     pub(crate) workspace_roots: Arc<[PathBuf]>,
 }
 
 /// Background task that drains LSP notifications, writes them to the cache,
-/// and forwards `resources/updated` to the MCP peer when subscribed.
+/// and queues `resources/updated` for each MCP session subscribed to the URI.
 ///
 /// Selects over two independent lanes (P3) rather than one: `rx` carries
 /// diagnostics/log/showMessage, `lifecycle_rx` carries `$/progress`
@@ -120,10 +118,11 @@ pub(crate) struct PumpShared {
 /// signal, or vice versa -- see `lsp::client::LspClient::message_loop_inner`
 /// for where each notification is classified onto its lane.
 ///
-/// The task operates in two phases without explicit state:
-/// - **Phase A** (before peer is set): caches every notification, skips peer notify.
-/// - **Phase B** (after peer is set): additionally fires `notify_resource_updated`
-///   for subscribed `PublishDiagnostics` URIs.
+/// Delivery is per session and never awaits a peer: the pump only calls
+/// `SessionState::publish_if_subscribed` on each registered session, whose own
+/// task notifies that session's peer. A session that has not subscribed yet is
+/// not registered, so notifications arriving before the first subscribe are
+/// only cached.
 ///
 /// The task exits when:
 /// - **Both** lanes have closed (`rx.recv()` and `lifecycle_rx.recv()` both
@@ -131,7 +130,6 @@ pub(crate) struct PumpShared {
 ///   `LspClient` and close together, but each lane is tracked independently
 ///   so one closing early can never stop the other from still being drained.
 /// - The cancellation watch fires (or the sender is dropped).
-/// - `notify_resource_updated` returns an error (peer disconnect / transport closed).
 ///
 /// # Lock independence
 /// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock entirely
@@ -156,7 +154,6 @@ pub(crate) async fn diagnostics_pump(
     let PumpShared {
         notification_cache,
         subs,
-        peer_cell,
         workspace_roots,
     } = shared;
     let mut notification_closed = false;
@@ -203,10 +200,6 @@ pub(crate) async fn diagnostics_pump(
                             cache.store_diagnostics(&server_id, &p.uri, p.version, p.diagnostics);
                         }
 
-                        // One snapshot of live sessions, queried twice below
-                        // (empty check, then contains check), instead of
-                        // `is_all_empty`/`any_contains` each independently
-                        // locking the registry and re-upgrading every `Weak`.
                         let sessions = subs.live_sessions();
 
                         // Fast path: skip URI construction when nothing is subscribed.
@@ -221,31 +214,11 @@ pub(crate) async fn diagnostics_pump(
                             continue;
                         }
 
-                        // Notify only when peer is ready and URI is subscribed.
-                        let Some(peer) = peer_cell.get() else { continue };
                         let Some(path) = bridge::uri_to_path(&p.uri) else { continue };
                         let Ok(mcp_uri) = make_uri(&path) else { continue };
 
-                        let mut subscribed_here = false;
                         for session in &sessions {
-                            if session.contains(&mcp_uri).await {
-                                subscribed_here = true;
-                                break;
-                            }
-                        }
-                        if !subscribed_here {
-                            continue;
-                        }
-
-                        if peer
-                            .notify_resource_updated(ResourceUpdatedNotificationParam::new(
-                                mcp_uri,
-                            ))
-                            .await
-                            .is_err()
-                        {
-                            // Peer disconnected; stop the pump.
-                            break;
+                            session.publish_if_subscribed(&mcp_uri).await;
                         }
                     }
                     LspNotification::LogMessage(m) => {
@@ -647,7 +620,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // conflicting `[[lsp_servers]]` entries, not a silent drop.
     let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
 
-    // Built here (rather than alongside `subscription_registry`/`peer_cell` below) so
+    // Built here (rather than alongside `subscription_registry` below) so
     // it can be handed to the translator, which uses it to invalidate a
     // respawned server's stale cached diagnostics -- see
     // `Translator::with_notification_cache`. Independent of `translator`
@@ -695,12 +668,9 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     let translator = Arc::new(translator);
     // Shared across every session (one per HTTP session, or the sole stdio
-    // session): `McplsServer::new` and `McplsServer::for_new_session` each
-    // register a fresh, isolated `ResourceSubscriptions` set into it -- see
+    // session): each joins it on its first subscribe -- see
     // `SubscriptionRegistry`.
     let subscription_registry = SubscriptionRegistry::new();
-    // Peer cell is populated after the MCP transport is established (Phase B).
-    let peer_cell = Arc::new(OnceCell::new());
 
     // Cancellation for pump tasks: send `true` to request shutdown.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -718,7 +688,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
             subscription_registry.clone(),
-            Arc::clone(&peer_cell),
             cancel_rx.clone(),
             Arc::clone(&workspace_roots_snapshot),
         ))
@@ -738,7 +707,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let result = match transport {
         Transport::Stdio => {
             info!("Listening for MCP requests on stdio...");
-            run_stdio(mcp_server, &peer_cell, shutdown_signal).await
+            run_stdio(mcp_server, shutdown_signal).await
         }
         #[cfg(feature = "transport-http")]
         Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
@@ -927,7 +896,6 @@ fn spawn_lsp_servers_background(
     translator: Arc<Translator>,
     notification_cache: Arc<Mutex<NotificationCache>>,
     subscription_registry: SubscriptionRegistry,
-    peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     workspace_roots: Arc<[PathBuf]>,
 ) -> JoinHandle<()> {
@@ -994,7 +962,6 @@ fn spawn_lsp_servers_background(
         let pump_shared = PumpShared {
             notification_cache,
             subs: subscription_registry,
-            peer_cell,
             workspace_roots,
         };
         let mut pumps: JoinSet<()> = JoinSet::new();
@@ -2026,12 +1993,6 @@ mod tests {
             SubscriptionRegistry::new()
         }
 
-        type PeerCell = Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>;
-
-        fn make_peer_cell() -> PeerCell {
-            Arc::new(OnceCell::new())
-        }
-
         /// A single real workspace root shared by the pump-mechanics tests
         /// below, cfg-gated because `Url::to_file_path` requires a drive
         /// letter on Windows -- mirrors
@@ -2060,7 +2021,6 @@ mod tests {
         async fn test_pump_caches_before_peer_set() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
             let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             // Keep _cancel_tx alive: dropping it causes cancel_rx.changed() to return Err,
@@ -2077,7 +2037,6 @@ mod tests {
                 PumpShared {
                     notification_cache: c,
                     subs: subs.clone(),
-                    peer_cell: Arc::clone(&peer_cell),
                     workspace_roots: test_workspace_roots(),
                 },
             ));
@@ -2121,7 +2080,6 @@ mod tests {
         async fn test_pump_drops_diagnostics_outside_workspace_roots() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
             let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -2151,7 +2109,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: subs.clone(),
-                    peer_cell: Arc::clone(&peer_cell),
                     workspace_roots,
                 },
             ));
@@ -2212,7 +2169,6 @@ mod tests {
         async fn test_pump_exits_on_cancel() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
             let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
             let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -2226,7 +2182,6 @@ mod tests {
                 PumpShared {
                     notification_cache: cache,
                     subs,
-                    peer_cell,
                     workspace_roots: test_workspace_roots(),
                 },
             ));
@@ -2244,7 +2199,6 @@ mod tests {
         async fn test_pump_exits_when_cancel_sender_dropped() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
             let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
             let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -2258,7 +2212,6 @@ mod tests {
                 PumpShared {
                     notification_cache: cache,
                     subs,
-                    peer_cell,
                     workspace_roots: test_workspace_roots(),
                 },
             ));
@@ -2280,7 +2233,6 @@ mod tests {
             let translator = Arc::new(Mutex::new(Translator::new()));
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(8);
             let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -2305,7 +2257,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
-                    peer_cell,
                     workspace_roots: test_workspace_roots(),
                 },
             ));
@@ -2352,7 +2303,6 @@ mod tests {
         async fn test_pump_routes_other_notifications_to_indexing_signal() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
             let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -2367,7 +2317,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
-                    peer_cell,
                     workspace_roots: test_workspace_roots(),
                 },
             ));
@@ -2411,7 +2360,6 @@ mod tests {
         async fn test_pump_routes_progress_begin_to_indexing_signal() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (_tx, rx) = mpsc::channel::<LspNotification>(8);
             let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -2426,7 +2374,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
-                    peer_cell,
                     workspace_roots: test_workspace_roots(),
                 },
             ));
@@ -2466,7 +2413,6 @@ mod tests {
         async fn test_lifecycle_lane_unaffected_by_saturated_notification_lane() {
             let cache = make_cache();
             let subs = make_subs();
-            let peer_cell = make_peer_cell();
             let (tx, rx) = mpsc::channel(2);
             let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -2494,7 +2440,6 @@ mod tests {
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs,
-                    peer_cell,
                     workspace_roots: test_workspace_roots(),
                 },
             ));
@@ -2522,6 +2467,207 @@ mod tests {
             })
             .await
             .expect("lifecycle lane must still be served while the notification lane is backed up");
+        }
+
+        use crate::test_lsp::spawn_test_pump;
+
+        fn test_mcp_uri(file: &str) -> String {
+            make_uri(&bridge::uri_to_path(&test_uri(file)).unwrap()).unwrap()
+        }
+
+        fn publish(file: &str) -> LspNotification {
+            LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+                uri: test_uri(file),
+                diagnostics: vec![],
+                version: None,
+            })
+        }
+
+        async fn recv_within(rx: &mut mpsc::Receiver<String>) -> String {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no resources/updated within 5 s")
+                .expect("delivery channel closed")
+        }
+
+        /// #468 isolation: a session never receives updates for URIs it did not
+        /// subscribe to. B's first message must be Y even though X was
+        /// published first (ordering, not a timeout).
+        #[tokio::test]
+        async fn test_pump_delivers_only_to_subscribed_sessions() {
+            use crate::mcp::{SessionHandle, Target};
+
+            let subs = make_subs();
+            let session_a = SessionHandle::new(subs.clone());
+            let session_b = SessionHandle::new(subs.clone());
+            let (tx_a, mut rx_a) = mpsc::channel(8);
+            let (tx_b, mut rx_b) = mpsc::channel(8);
+            let (x, y) = (test_mcp_uri("x.rs"), test_mcp_uri("y.rs"));
+            for uri in [&x, &y] {
+                session_a
+                    .subscribe_for_test(uri, Target::Channel(tx_a.clone()))
+                    .await
+                    .unwrap();
+            }
+            session_b
+                .subscribe_for_test(&y, Target::Channel(tx_b.clone()))
+                .await
+                .unwrap();
+
+            let (tx, _cancel_tx) = spawn_test_pump(subs, test_workspace_roots());
+            tx.send(publish("x.rs")).await.unwrap();
+            assert_eq!(recv_within(&mut rx_a).await, x);
+            // Gives a wrongly queued X time to reach B before Y exists.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                matches!(rx_b.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "B never subscribed to X"
+            );
+
+            tx.send(publish("y.rs")).await.unwrap();
+            assert_eq!(recv_within(&mut rx_b).await, y);
+            assert_eq!(recv_within(&mut rx_a).await, y);
+        }
+
+        /// #468: a session whose peer stopped reading neither blocks the pump
+        /// nor other sessions, and loses no URI once it resumes.
+        #[tokio::test]
+        async fn test_pump_stalled_session_does_not_block_others_or_lose_updates() {
+            use crate::mcp::{SessionHandle, Target};
+
+            const URI_COUNT: usize = 5;
+
+            let subs = make_subs();
+            let stalled = SessionHandle::new(subs.clone());
+            let healthy = SessionHandle::new(subs.clone());
+            let (tx_stalled, mut rx_stalled) = mpsc::channel(1);
+            let (tx_healthy, mut rx_healthy) = mpsc::channel(URI_COUNT);
+            let expected: HashSet<String> = (0..URI_COUNT)
+                .map(|i| test_mcp_uri(&format!("f{i}.rs")))
+                .collect();
+            for uri in &expected {
+                stalled
+                    .subscribe_for_test(uri, Target::Channel(tx_stalled.clone()))
+                    .await
+                    .unwrap();
+                healthy
+                    .subscribe_for_test(uri, Target::Channel(tx_healthy.clone()))
+                    .await
+                    .unwrap();
+            }
+
+            let (tx, _cancel_tx) = spawn_test_pump(subs, test_workspace_roots());
+            for i in 0..URI_COUNT {
+                tx.send(publish(&format!("f{i}.rs"))).await.unwrap();
+            }
+
+            let mut healthy_received = HashSet::new();
+            for _ in 0..URI_COUNT {
+                healthy_received.insert(recv_within(&mut rx_healthy).await);
+            }
+            assert_eq!(healthy_received, expected);
+
+            let mut stalled_received = HashSet::new();
+            for _ in 0..URI_COUNT {
+                stalled_received.insert(recv_within(&mut rx_stalled).await);
+            }
+            assert_eq!(stalled_received, expected);
+        }
+
+        type DuplexReader = tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>;
+
+        /// Reads newline-delimited JSON-RPC lines until one satisfies `matches`.
+        async fn read_json_line_matching(
+            reader: &mut DuplexReader,
+            matches: impl Fn(&serde_json::Value) -> bool + Send + Sync,
+        ) -> serde_json::Value {
+            use tokio::io::AsyncBufReadExt as _;
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    assert!(n > 0, "stream closed before the expected message");
+                    let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    if matches(&value) {
+                        return value;
+                    }
+                }
+            })
+            .await
+            .expect("expected JSON-RPC message not received within 5 s")
+        }
+
+        /// #468/#492 stdio path: a real `Peer` over an in-memory duplex stream,
+        /// driven with raw JSON-RPC, receives `resources/updated` from the real
+        /// `diagnostics_pump` after a guarded subscribe.
+        #[tokio::test]
+        async fn test_stdio_shaped_peer_receives_resource_updates_through_pump() {
+            use rmcp::ServiceExt as _;
+            use tokio::io::AsyncWriteExt as _;
+
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let file = root.join("main.rs");
+            std::fs::write(&file, "fn main() {}").unwrap();
+            let canonical_uri = make_uri(&file).unwrap();
+
+            let subs = make_subs();
+            let server = mcp::McplsServer::new(
+                Arc::new(Translator::new()),
+                make_cache(),
+                Arc::from(vec![root.clone()]),
+                subs.clone(),
+                false,
+                config::McpConfig::default(),
+            );
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let serving = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+            let (read_half, mut write_half) = tokio::io::split(client_io);
+            let mut reader = tokio::io::BufReader::new(read_half);
+
+            let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+            write_half
+                .write_all(format!("{initialize}\n").as_bytes())
+                .await
+                .unwrap();
+            read_json_line_matching(&mut reader, |v| v["id"] == 1).await;
+
+            let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+            let subscribe = serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "resources/subscribe",
+                "params": {"uri": canonical_uri},
+            });
+            for line in [initialized.to_owned(), subscribe.to_string()] {
+                write_half
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            // Keeps the service (and its peer) alive for the rest of the test.
+            let _running = serving.await.unwrap();
+            let response = read_json_line_matching(&mut reader, |v| v["id"] == 2).await;
+            assert!(
+                response.get("error").is_none(),
+                "subscribe failed: {response}"
+            );
+
+            let (tx, _cancel_tx) = spawn_test_pump(subs, Arc::from(vec![root]));
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: bridge::path_to_uri(&file).unwrap(),
+                    diagnostics: vec![],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+            let update = read_json_line_matching(&mut reader, |v| {
+                v["method"] == "notifications/resources/updated"
+            })
+            .await;
+            assert_eq!(update["params"]["uri"], canonical_uri);
         }
     }
 }
