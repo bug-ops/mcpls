@@ -94,40 +94,63 @@ const _: () = assert!(
      budget under rmcp's 128-byte tool name limit"
 );
 
-/// Response shape for the `get_cached_diagnostics` tool.
-///
-/// Wraps `DiagnosticsResult` (shared with the pull-model `get_diagnostics`
-/// handler) with a flag specific to the cache-only read: whether the file's
-/// *diagnostics-route* server (resolved via
-/// `Translator::diagnostics_route_id_for_path` from the file's detected
-/// language, independent of the cache entry's own `diagnostics_owner`)
-/// crashed and was respawned since it last published. `Translator::respawn_if_dead`
-/// discards a respawned server's push notifications rather than reconnecting
-/// them to a live `diagnostics_pump` (#359), so a cache entry from before
-/// the crash can never be refreshed by a later push -- this makes that
-/// degradation visible to the caller instead of only appearing in server
-/// logs. Deliberately not keyed on `diagnostics_owner`: a respawn clears
-/// that ownership record for the crashed server's entries in the same step
-/// that marks it degraded, so a flag derived from ownership would always
-/// read back `false` for the exact case it exists to catch.
+/// Tool-description sentences shared by every tool carrying `positions_degraded`.
+macro_rules! positions_note_request {
+    () => {
+        "`positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact."
+    };
+}
+
+macro_rules! positions_note_response {
+    () => {
+        "`positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact."
+    };
+}
+
+/// Route-level health signals shared by every diagnostics reader
+/// (`get_diagnostics`, `get_cached_diagnostics`, and the diagnostics
+/// resource), so the three can never report different keys or semantics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, JsonSchema)]
+struct DiagnosticsRouteSignals {
+    /// `true` if the language server publishing this file's diagnostics crashed and was
+    /// restarted during this mcpls session. Diagnostics it delivers only by push (e.g.
+    /// rust-analyzer's flycheck/clippy) are no longer received, so the returned
+    /// diagnostics may be incomplete until mcpls restarts.
+    push_notifications_degraded: bool,
+    /// `true` if the routed language server reported its initial workspace indexing as
+    /// in progress during this read; the diagnostics may reflect a partial index.
+    indexing_in_progress: bool,
+}
+
+impl DiagnosticsRouteSignals {
+    // Keyed on the routing identity, not cache ownership, which a respawn clears (#359).
+    fn sample(cache: &NotificationCache, route_id: Option<&crate::config::ServerId>) -> Self {
+        Self {
+            push_notifications_degraded: route_id.is_some_and(|id| cache.is_push_degraded(id)),
+            indexing_in_progress: route_id
+                .is_some_and(|id| cache.indexing_state(id) == IndexingState::Loading),
+        }
+    }
+
+    /// Combines two samples taken at different times: a signal is set if it was set in
+    /// either.
+    const fn union(self, later: Self) -> Self {
+        Self {
+            push_notifications_degraded: self.push_notifications_degraded
+                || later.push_notifications_degraded,
+            indexing_in_progress: self.indexing_in_progress || later.indexing_in_progress,
+        }
+    }
+}
+
+/// Response shape for the `get_cached_diagnostics` tool: the shared diagnostics result plus
+/// the file's [`DiagnosticsRouteSignals`].
 #[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CachedDiagnosticsResponse {
     #[serde(flatten)]
     result: DiagnosticsResult,
-    /// `true` if the file's diagnostics-route server's push notifications
-    /// are known to be dark (see
-    /// [`crate::bridge::NotificationCache::is_push_degraded`]); `false` both
-    /// when that server is healthy and when no route is configured for the
-    /// file's language at all.
-    push_notifications_degraded: bool,
-    /// `true` if the file's diagnostics-route server has an active signal
-    /// indicating its initial workspace-load/indexing phase is still in
-    /// progress as of this read -- the returned diagnostics may reflect a
-    /// partial index (#445). `false` both when the server is done indexing
-    /// (or never reported a readiness signal) and when no route is
-    /// configured for the file's language at all.
-    indexing_in_progress: bool,
+    #[serde(flatten)]
+    signals: DiagnosticsRouteSignals,
 }
 
 /// MCP server that exposes LSP capabilities as tools.
@@ -163,9 +186,13 @@ fn map_bridge_error(e: crate::error::Error) -> McpError {
     match e.mcp_error_kind() {
         crate::error::McpErrorKind::InvalidParams => McpError::invalid_params(message, None),
         crate::error::McpErrorKind::Internal => McpError::internal_error(message, None),
-        crate::error::McpErrorKind::Retryable { code, data } => {
-            McpError::new(ErrorCode(code), message, Some(data))
-        }
+        crate::error::McpErrorKind::Retryable(data) => match serde_json::to_value(&data) {
+            Ok(value) => McpError::new(ErrorCode(data.code()), message, Some(value)),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize retryable error data");
+                McpError::new(ErrorCode(data.code()), message, None)
+            }
+        },
     }
 }
 
@@ -193,14 +220,6 @@ fn to_structured_tool_result<T: Serialize + JsonSchema>(
         Ok(value) => Ok(Json(value)),
         Err(e) => Err(map_bridge_error(e)),
     }
-}
-
-/// Whether `route_id`'s server is actively indexing; `None` reads `false`.
-fn route_indexing_loading(
-    cache: &NotificationCache,
-    route_id: Option<&crate::config::ServerId>,
-) -> bool {
-    route_id.is_some_and(|id| cache.indexing_state(id) == IndexingState::Loading)
 }
 
 /// Fixed page size for `list_resources` pagination.
@@ -265,32 +284,19 @@ fn paginate_resource_paths<'a>(
 
 /// `get_diagnostics`'s response shape.
 ///
-/// Wraps `DiagnosticsResult` with an explicit signal that the pull-model
-/// diagnostics read may be incomplete: `handle_diagnostics` deliberately
-/// stays ungated on workspace-indexing readiness (#445 -- it reads from the
-/// notification-cache poll path, not a live whole-workspace LSP request, so
-/// blocking it the way `IndexingGate::Required` blocks hover/definition/etc.
-/// would be the wrong fix shape for this one call site; see
-/// `routing::IndexingGate`'s doc). Instead this flags the result rather than
-/// silently returning what can read as "no errors" while the routed server
-/// is still loading.
+/// Wraps `DiagnosticsResult` with the route's [`DiagnosticsRouteSignals`]:
+/// `handle_diagnostics` deliberately stays ungated on workspace-indexing readiness (#445 -- it
+/// reads from the notification-cache poll path, not a live whole-workspace LSP request, so
+/// blocking it the way `IndexingGate::Required` blocks hover/definition/etc. would be the
+/// wrong fix shape for this one call site; see `routing::IndexingGate`'s doc). Instead this
+/// flags the result rather than silently returning what can read as "no errors" while the
+/// routed server is still loading.
 #[derive(serde::Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 struct DiagnosticsResponse {
     #[serde(flatten)]
     result: DiagnosticsResult,
-    /// `true` if the file's diagnostics-route server (resolved via
-    /// [`Translator::diagnostics_route_id_for_path`]) had an active signal
-    /// indicating its initial workspace-load/indexing phase was still in
-    /// progress at any point during this read -- the returned diagnostics
-    /// may reflect a partial index. Sampled both before and after the pull
-    /// request (see `McplsServer::get_diagnostics`), not just at one point
-    /// in time, so a server that was `Loading` mid-pull but finished by the
-    /// time the pull settled still reads `true` here. `false` both when the
-    /// server was done indexing for the whole read (or never reported a
-    /// readiness signal) and when no route is configured for the file's
-    /// language at all.
-    indexing_in_progress: bool,
+    #[serde(flatten)]
+    signals: DiagnosticsRouteSignals,
 }
 
 /// `read_resource`'s diagnostics payload, distinguishing a file mcpls has no
@@ -306,38 +312,30 @@ struct DiagnosticsResponse {
 /// published yet. `uri` is deliberately omitted: the caller already knows it
 /// (it's the resource they requested).
 ///
-/// `push_notifications_degraded` mirrors `get_cached_diagnostics`'s field of
-/// the same name (#359): `true` when the file's diagnostics-route server
-/// crashed and was respawned, so `subscribe`'s replay and the pump's
+/// The shared [`DiagnosticsRouteSignals`] mirror `get_cached_diagnostics`
+/// (#359): a push-degraded route means `subscribe`'s replay and the pump's
 /// `notify_resource_updated` calls for it have gone dark until the whole
 /// mcpls process restarts, same as this cache-only read.
 #[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ResourceDiagnosticsResponse {
     tracked: bool,
     version: Option<i32>,
     diagnostics: Vec<lsp_types::Diagnostic>,
-    push_notifications_degraded: bool,
-    /// Same #445 signal as `get_diagnostics`/`get_cached_diagnostics`: `true`
-    /// if the file's diagnostics-route server has an active signal
-    /// indicating its initial workspace-load/indexing phase is still in
-    /// progress as of this read.
-    indexing_in_progress: bool,
+    #[serde(flatten)]
+    signals: DiagnosticsRouteSignals,
 }
 
 impl ResourceDiagnosticsResponse {
     fn new(
         tracked: bool,
         entry: Option<&DiagnosticInfo>,
-        push_notifications_degraded: bool,
-        indexing_in_progress: bool,
+        signals: DiagnosticsRouteSignals,
     ) -> Self {
         Self {
             tracked,
             version: entry.and_then(|e| e.version),
             diagnostics: entry.map(|e| e.diagnostics.clone()).unwrap_or_default(),
-            push_notifications_degraded,
-            indexing_in_progress,
+            signals,
         }
     }
 }
@@ -354,15 +352,9 @@ impl ResourceDiagnosticsResponse {
 fn build_resource_diagnostics_response(
     document_open: bool,
     entry: Option<&DiagnosticInfo>,
-    push_notifications_degraded: bool,
-    indexing_in_progress: bool,
+    signals: DiagnosticsRouteSignals,
 ) -> ResourceDiagnosticsResponse {
-    ResourceDiagnosticsResponse::new(
-        document_open || entry.is_some(),
-        entry,
-        push_notifications_degraded,
-        indexing_in_progress,
-    )
+    ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry, signals)
 }
 
 #[tool_router(router = declared_tool_router)]
@@ -516,7 +508,7 @@ impl McplsServer {
 
     /// Get hover information at a position in a file.
     #[tool(
-        description = "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols. `positions_degraded: true` on the result means the returned range's `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Type and documentation info at position. Returns signatures, docs, and inferred types for symbols. ", positions_note_request!()),
         title = "Hover"
     )]
     async fn get_hover(
@@ -537,7 +529,7 @@ impl McplsServer {
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = "Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Definition location of symbol at position. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!()),
         title = "Go to Definition"
     )]
     async fn get_definition(
@@ -558,7 +550,7 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = "References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("References to symbol at position, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", positions_note_request!()),
         title = "Find References"
     )]
     async fn get_references(
@@ -583,7 +575,7 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexingInProgress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!()),
         title = "Diagnostics"
     )]
     async fn get_diagnostics(
@@ -606,19 +598,10 @@ impl McplsServer {
                         .diagnostics_route_id_for_path(&validated_path)
                 });
 
-        // Sampled both before and after the pull request, OR'd:
-        // `handle_diagnostics` deliberately never makes an `IndexingGate`
-        // decision (#445), so this is the only place indexing readiness is
-        // observed for this call. A server that was `Loading` while the
-        // pull was computed but finished before a post-only sample would
-        // read `false` -- a false negative on exactly the case #445 exists
-        // to catch. Sampling only before risks the opposite miss (indexing
-        // starts mid-pull). A stale `true` from either sample is harmless:
-        // this flag only ever claims "may be incomplete", never "is
-        // complete".
-        let indexing_before = {
+        // Sampled before and after the pull: indexing may finish, or a respawn may mark push-degraded, mid-pull.
+        let before = {
             let cache = self.context.notification_cache.lock().await;
-            route_indexing_loading(&cache, route_id.as_ref())
+            DiagnosticsRouteSignals::sample(&cache, route_id.as_ref())
         };
 
         // Merging push-model (flycheck/clippy) diagnostics into the pull
@@ -630,23 +613,20 @@ impl McplsServer {
             .handle_diagnostics(file_path, &self.context.notification_cache)
             .await;
 
-        let indexing_after = {
+        let after = {
             let cache = self.context.notification_cache.lock().await;
-            route_indexing_loading(&cache, route_id.as_ref())
+            DiagnosticsRouteSignals::sample(&cache, route_id.as_ref())
         };
-        let indexing_in_progress = indexing_before || indexing_after;
+        let signals = before.union(after);
 
-        to_structured_tool_result(result.map(|result| DiagnosticsResponse {
-            result,
-            indexing_in_progress,
-        }))
+        to_structured_tool_result(result.map(|result| DiagnosticsResponse { result, signals }))
     }
 
     /// Rename a symbol across the workspace.
     // read-only: returns a proposed WorkspaceEdit, does not apply it -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty. `positions_degraded: true` means some returned edit ranges' `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files) -- the rename is then incomplete even though `changes` is non-empty. ", positions_note_request!()),
         title = "Rename Symbol"
     )]
     async fn rename_symbol(
@@ -671,7 +651,7 @@ impl McplsServer {
 
     /// Get code completion suggestions.
     #[tool(
-        description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets.",
+        description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted.",
         title = "Completions"
     )]
     async fn get_completions(
@@ -696,7 +676,7 @@ impl McplsServer {
 
     /// Get all symbols in a document.
     #[tool(
-        description = "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations. ", positions_note_response!()),
         title = "Document Symbols"
     )]
     async fn get_document_symbols(
@@ -715,7 +695,7 @@ impl McplsServer {
     // read-only: returns proposed text edits, does not apply them -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Format document with language-specific rules. Returns text edits for indentation, spacing, and style. `positions_degraded: true` on the result means some returned edit ranges' `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Format document with language-specific rules. Returns text edits for indentation, spacing, and style. ", positions_note_response!()),
         title = "Format Document"
     )]
     async fn format_document(
@@ -736,7 +716,7 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. ", positions_note_response!()),
         title = "Workspace Symbol Search"
     )]
     async fn workspace_symbol_search(
@@ -759,7 +739,7 @@ impl McplsServer {
     // read-only: returns proposed CodeAction edits, does not apply them --
     // mcpls has no write-back path today; revisit if that changes.
     #[tool(
-        description = "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). `positions_degraded: true` on the result means some returned `character` offsets (diagnostic or edit ranges) may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Code actions for range. Returns quick fixes, refactorings, and source actions with edits. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. ", positions_note_request!()),
         title = "Code Actions"
     )]
     async fn get_code_actions(
@@ -797,7 +777,7 @@ impl McplsServer {
 
     /// Prepare call hierarchy at a position.
     #[tool(
-        description = "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis. ", positions_note_request!()),
         title = "Prepare Call Hierarchy"
     )]
     async fn prepare_call_hierarchy(
@@ -818,7 +798,7 @@ impl McplsServer {
 
     /// Get incoming calls (callers).
     #[tool(
-        description = "Functions calling the specified item. Takes call hierarchy item, returns all callers. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Functions calling the specified item. Takes call hierarchy item, returns all callers. ", positions_note_request!()),
         title = "Incoming Calls"
     )]
     async fn get_incoming_calls(
@@ -830,7 +810,7 @@ impl McplsServer {
 
     /// Get outgoing calls (callees).
     #[tool(
-        description = "Functions called by the specified item. Takes call hierarchy item, returns all callees. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Functions called by the specified item. Takes call hierarchy item, returns all callees. ", positions_note_request!()),
         title = "Outgoing Calls"
     )]
     async fn get_outgoing_calls(
@@ -842,7 +822,7 @@ impl McplsServer {
 
     /// Get cached diagnostics for a file.
     #[tool(
-        description = "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. `positions_degraded: true` on the result means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!()),
         title = "Cached Diagnostics"
     )]
     async fn get_cached_diagnostics(
@@ -868,20 +848,11 @@ impl McplsServer {
                 // Lock only long enough for the map lookup + clone: no
                 // canonicalize() or Vec mapping while `notification_cache`
                 // is held, since `diagnostics_pump` needs the same lock.
-                let (diag_info, owner, push_degraded, indexing_in_progress) = {
+                let (diag_info, owner, signals) = {
                     let cache = self.context.notification_cache.lock().await;
                     let owner = cache.diagnostics_owner(&uri).cloned();
-                    let push_degraded = route_id
-                        .as_ref()
-                        .is_some_and(|id| cache.is_push_degraded(id));
-                    // #445: same signal `get_diagnostics` surfaces.
-                    let indexing_in_progress = route_indexing_loading(&cache, route_id.as_ref());
-                    (
-                        cache.diagnostics(&uri).cloned(),
-                        owner,
-                        push_degraded,
-                        indexing_in_progress,
-                    )
+                    let signals = DiagnosticsRouteSignals::sample(&cache, route_id.as_ref());
+                    (cache.diagnostics(&uri).cloned(), owner, signals)
                 };
                 let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
                     self.context.translator.position_encoding_for(&server_id)
@@ -892,11 +863,7 @@ impl McplsServer {
                     self.context.translator.document_tracker(),
                 )
                 .await;
-                Ok(CachedDiagnosticsResponse {
-                    result,
-                    push_notifications_degraded: push_degraded,
-                    indexing_in_progress,
-                })
+                Ok(CachedDiagnosticsResponse { result, signals })
             }
             Err(e) => Err(e),
         };
@@ -936,7 +903,7 @@ impl McplsServer {
 
     /// Get signature help at a position.
     #[tool(
-        description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call.",
+        description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted.",
         title = "Signature Help"
     )]
     async fn get_signature_help(
@@ -957,7 +924,7 @@ impl McplsServer {
 
     /// Go to implementation locations.
     #[tool(
-        description = "Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Implementation locations of trait method or interface member at position. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. ", positions_note_request!()),
         title = "Go to Implementation"
     )]
     async fn go_to_implementation(
@@ -978,7 +945,7 @@ impl McplsServer {
 
     /// Go to type definition location.
     #[tool(
-        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. `positions_degraded: true` means some returned `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Type definition location of expression at position. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!()),
         title = "Go to Type Definition"
     )]
     async fn go_to_type_definition(
@@ -999,7 +966,7 @@ impl McplsServer {
 
     /// Get inlay hints for a range.
     #[tool(
-        description = "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. `positions_degraded: true` on the result means some returned hint `character` offsets may be inexact (only possible for a non-UTF-16 server).",
+        description = concat!("Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Keep the range end inside the file. ", positions_note_request!()),
         title = "Inlay Hints"
     )]
     async fn get_inlay_hints(
@@ -1031,6 +998,43 @@ impl McplsServer {
                 )
                 .await,
         )
+    }
+}
+
+impl McplsServer {
+    /// Builds the diagnostics resource payload for `path`; split out of
+    /// `read_resource` so tests can drive the real wiring without a
+    /// `RequestContext`.
+    async fn resource_diagnostics_response(
+        &self,
+        path: &Path,
+    ) -> Result<ResourceDiagnosticsResponse, McpError> {
+        // Enforce workspace-root containment — mirrors the guard in every LSP tool.
+        // Validated against a lock-free snapshot of workspace_roots (fixed at
+        // startup) so this cache-only read never needs to touch `translator` at all.
+        let validated_path = validate_path_against_roots(path, &self.context.workspace_roots)
+            .map_err(map_bridge_error)?;
+
+        // Build the URI from the canonicalized path (not the raw input path):
+        // it must match what `diagnostics_pump` stores from LSP notifications,
+        // which are always keyed by the canonical form.
+        let lsp_uri = crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
+
+        let route_id = self
+            .context
+            .translator
+            .diagnostics_route_id_for_path(&validated_path);
+
+        // Built from a borrow of the cache entry rather than `.cloned()`-ing the
+        // whole `DiagnosticInfo` first: `build_resource_diagnostics_response`
+        // only ever needs `version` (Copy) and its own clone of `diagnostics`,
+        // so cloning the entry up front would clone `diagnostics` twice.
+        let cache = self.context.notification_cache.lock().await;
+        Ok(build_resource_diagnostics_response(
+            self.context.translator.is_document_open(&validated_path),
+            cache.diagnostics(lsp_uri.as_ref()),
+            DiagnosticsRouteSignals::sample(&cache, route_id.as_ref()),
+        ))
     }
 }
 
@@ -1091,46 +1095,7 @@ impl ServerHandler for McplsServer {
     ) -> Result<ReadResourceResponse, McpError> {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-        // Enforce workspace-root containment — mirrors the guard in every LSP tool.
-        // Validated against a lock-free snapshot of workspace_roots (fixed at
-        // startup) so this cache-only read never needs to touch `translator` at all.
-        let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
-            .map_err(map_bridge_error)?;
-
-        // Build the URI from the canonicalized path (not the raw input path):
-        // it must match what `diagnostics_pump` stores from LSP notifications,
-        // which are always keyed by the canonical form.
-        let lsp_uri = crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
-
-        // Resolved independently of the cache lookup below -- see the same
-        // reasoning on `get_cached_diagnostics` (#359): a respawn clears
-        // `diagnostics_owner` for the crashed server's entries, so the
-        // degraded flag can't be keyed on cache ownership.
-        let route_id = self
-            .context
-            .translator
-            .diagnostics_route_id_for_path(&validated_path);
-
-        // Built from a borrow of the cache entry rather than `.cloned()`-ing the
-        // whole `DiagnosticInfo` first: `build_resource_diagnostics_response`
-        // only ever needs `version` (Copy) and its own clone of `diagnostics`,
-        // so cloning the entry up front would clone `diagnostics` twice.
-        let response = {
-            let cache = self.context.notification_cache.lock().await;
-            let push_degraded = route_id
-                .as_ref()
-                .is_some_and(|id| cache.is_push_degraded(id));
-            // #445: same signal `get_diagnostics`/`get_cached_diagnostics`
-            // surface.
-            let indexing_in_progress = route_indexing_loading(&cache, route_id.as_ref());
-            build_resource_diagnostics_response(
-                self.context.translator.is_document_open(&validated_path),
-                cache.diagnostics(lsp_uri.as_ref()),
-                push_degraded,
-                indexing_in_progress,
-            )
-        };
+        let response = self.resource_diagnostics_response(&path).await?;
 
         let json = serde_json::to_string(&response)
             .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
@@ -1360,8 +1325,8 @@ mod tests {
             ErrorCode(crate::error::WORKSPACE_INDEXING_ERROR_CODE)
         );
         let data = mcp_err.data.unwrap();
-        assert_eq!(data["serverId"], "rust");
-        assert_eq!(data["elapsedSecs"], 30);
+        assert_eq!(data["server_id"], "rust");
+        assert_eq!(data["elapsed_secs"], 30);
     }
 
     /// #479: `Error::ServerInitializing` must be distinguishable on the wire
@@ -1383,7 +1348,7 @@ mod tests {
             ErrorCode(crate::error::WORKSPACE_INDEXING_ERROR_CODE)
         );
         let data = mcp_err.data.unwrap();
-        assert_eq!(data["serverId"], "python");
+        assert_eq!(data["server_id"], "python");
     }
 
     /// Counterpart to the above: a variant with no explicit classification
@@ -1605,7 +1570,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// #445: `get_diagnostics` must flag `indexingInProgress: true` when the
+    /// #445: `get_diagnostics` must flag `indexing_in_progress: true` when the
     /// file's diagnostics-route server has an active `Loading` signal as of
     /// this read, since `handle_diagnostics` itself deliberately stays
     /// ungated (see `routing::IndexingGate`'s doc) -- this is the only place
@@ -1674,12 +1639,12 @@ mod tests {
         .await;
 
         let result = call.await.unwrap().unwrap();
-        assert!(result.0.indexing_in_progress);
+        assert!(result.0.signals.indexing_in_progress);
         assert!(result.0.result.diagnostics.is_empty());
     }
 
     /// Counterpart to the above: once the server has no active `Loading`
-    /// signal, `indexingInProgress` must read back `false`.
+    /// signal, `indexing_in_progress` must read back `false`.
     #[tokio::test]
     async fn test_get_diagnostics_indexing_in_progress_false_when_ready() {
         use std::collections::HashMap;
@@ -1739,13 +1704,13 @@ mod tests {
         .await;
 
         let result = call.await.unwrap().unwrap();
-        assert!(!result.0.indexing_in_progress);
+        assert!(!result.0.signals.indexing_in_progress);
     }
 
     /// S2 regression: the server is `Loading` when the pull *starts* but
     /// transitions to `Ready` before the pull *settles* -- sampling only
     /// after the pull (the original, buggy shape) would read `false` here,
-    /// the exact false negative #445 exists to close. `indexingInProgress`
+    /// the exact false negative #445 exists to close. `indexing_in_progress`
     /// must still read `true`, proving the "sample before" half of the OR
     /// actually does its job.
     #[tokio::test]
@@ -1823,9 +1788,296 @@ mod tests {
 
         let result = call.await.unwrap().unwrap();
         assert!(
-            result.0.indexing_in_progress,
+            result.0.signals.indexing_in_progress,
             "the pre-pull sample must still catch a server that finished indexing mid-pull"
         );
+    }
+
+    struct DiagnosticsFixture {
+        server: Arc<McplsServer>,
+        cache: Arc<Mutex<NotificationCache>>,
+        fake: crate::test_lsp::FakeServer,
+        server_id: crate::config::ServerId,
+        path: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn diagnostics_fixture() -> DiagnosticsFixture {
+        use std::collections::HashMap;
+
+        use crate::config::{ServerId, ToolRouter};
+        use crate::test_lsp::fake_lsp_client;
+
+        let server_id = ServerId::from("rust");
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(
+                server_id.clone(),
+                "rust".to_string(),
+            )]))
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        let translator = Arc::new(translator);
+        let (client, fake) = fake_lsp_client();
+        translator.register_client(server_id.clone(), client);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let path = dir.path().join("lib.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+
+        let server = Arc::new(McplsServer::new(
+            translator,
+            Arc::clone(&cache),
+            Arc::from(vec![dir.path().to_path_buf()]),
+            SubscriptionRegistry::new(),
+            false,
+            McpConfig::default(),
+        ));
+        DiagnosticsFixture {
+            server,
+            cache,
+            fake,
+            server_id,
+            path,
+            _dir: dir,
+        }
+    }
+
+    /// Answers the `didOpen` + `textDocument/diagnostic` pair a `get_diagnostics`
+    /// call sends, running `mid_pull` after the pull request is read and
+    /// before it is answered.
+    async fn serve_empty_pull<F: std::future::Future<Output = ()>>(
+        fake: &mut crate::test_lsp::FakeServer,
+        mid_pull: F,
+    ) {
+        use tokio::io::BufReader;
+
+        use crate::test_lsp::{read_framed_message, write_response};
+
+        let mut wire = BufReader::new(&mut fake.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let diag_request = read_framed_message(&mut wire).await;
+        assert_eq!(diag_request["method"], "textDocument/diagnostic");
+        mid_pull.await;
+        write_response(
+            &mut fake.read_half_stdin,
+            &diag_request["id"],
+            serde_json::json!({"kind": "full", "items": []}),
+        )
+        .await;
+    }
+
+    /// #480: the route is marked push-degraded *after* the pull request was
+    /// read (a respawn triggered by the pull itself) -- only the post-pull
+    /// sample can see it.
+    #[tokio::test]
+    async fn test_get_diagnostics_flags_push_degraded_marked_mid_pull() {
+        let mut fx = diagnostics_fixture();
+        let call = {
+            let server = Arc::clone(&fx.server);
+            let params = Parameters(DiagnosticsParams {
+                file_path: fx.path.to_string_lossy().to_string(),
+            });
+            tokio::spawn(async move { server.get_diagnostics(params).await })
+        };
+
+        let cache = Arc::clone(&fx.cache);
+        let server_id = fx.server_id.clone();
+        serve_empty_pull(&mut fx.fake, async move {
+            cache.lock().await.mark_push_degraded(&server_id);
+        })
+        .await;
+
+        let result = call.await.unwrap().unwrap();
+        assert!(
+            result.0.signals.push_notifications_degraded,
+            "the post-pull sample must catch a push degradation marked mid-pull"
+        );
+    }
+
+    /// Serialized output of the three diagnostics readers for the fixture's file.
+    async fn read_all_diagnostics_readers(
+        fx: &mut DiagnosticsFixture,
+    ) -> [(&'static str, serde_json::Value); 3] {
+        let file_path = fx.path.to_string_lossy().to_string();
+        let call = {
+            let server = Arc::clone(&fx.server);
+            let params = Parameters(DiagnosticsParams {
+                file_path: file_path.clone(),
+            });
+            tokio::spawn(async move { server.get_diagnostics(params).await })
+        };
+        serve_empty_pull(&mut fx.fake, async {}).await;
+        let pulled = serde_json::to_value(call.await.unwrap().unwrap().0).unwrap();
+
+        let cached: serde_json::Value = serde_json::from_str(
+            &fx.server
+                .get_cached_diagnostics(Parameters(CachedDiagnosticsParams { file_path }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let resource = serde_json::to_value(
+            fx.server
+                .resource_diagnostics_response(&fx.path)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        [
+            ("get_diagnostics", pulled),
+            ("get_cached_diagnostics", cached),
+            ("resource", resource),
+        ]
+    }
+
+    /// #480 + #504: `get_diagnostics`, `get_cached_diagnostics` and the
+    /// diagnostics resource must report the same route signals under the same
+    /// `snake_case` keys, checked on the serialized JSON each client sees --
+    /// both when nothing is wrong and when the route is degraded.
+    #[tokio::test]
+    async fn test_diagnostics_readers_agree_on_route_signals() {
+        let mut healthy = diagnostics_fixture();
+        for (reader, json) in read_all_diagnostics_readers(&mut healthy).await {
+            assert_eq!(json["push_notifications_degraded"], false, "{reader}");
+            assert_eq!(json["indexing_in_progress"], false, "{reader}");
+        }
+
+        let mut fx = diagnostics_fixture();
+        fx.cache.lock().await.mark_push_degraded(&fx.server_id);
+        fx.cache.lock().await.observe_indexing_signal(
+            &fx.server_id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": false})),
+        );
+        for (reader, json) in read_all_diagnostics_readers(&mut fx).await {
+            assert_eq!(json["push_notifications_degraded"], true, "{reader}");
+            assert_eq!(json["indexing_in_progress"], true, "{reader}");
+            let skip: &[&str] = if reader == "resource" {
+                &["diagnostics"]
+            } else {
+                &[]
+            };
+            assert_value_keys_snake_case(&json, skip);
+        }
+    }
+
+    /// Fails on any object key containing an ASCII uppercase letter, except
+    /// inside the subtrees named in `skip_subtrees` (verbatim LSP objects).
+    fn assert_value_keys_snake_case(value: &serde_json::Value, skip_subtrees: &[&str]) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    assert!(
+                        !key.chars().any(|c| c.is_ascii_uppercase()),
+                        "non-snake_case key `{key}`"
+                    );
+                    if !skip_subtrees.contains(&key.as_str()) {
+                        assert_value_keys_snake_case(child, skip_subtrees);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_value_keys_snake_case(item, skip_subtrees);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fails on any `properties` name containing an ASCII uppercase letter,
+    /// recursing through every other schema keyword (`$defs`, `items`,
+    /// `anyOf`, `oneOf`, ...) without checking their names, since those are
+    /// type names and JSON Schema keywords rather than wire keys.
+    fn assert_schema_property_names_snake_case(schema: &serde_json::Value) {
+        match schema {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "properties" {
+                        let serde_json::Value::Object(properties) = child else {
+                            continue;
+                        };
+                        for (name, property) in properties {
+                            assert!(
+                                !name.chars().any(|c| c.is_ascii_uppercase()),
+                                "non-snake_case schema property `{name}`"
+                            );
+                            assert_schema_property_names_snake_case(property);
+                        }
+                    } else {
+                        assert_schema_property_names_snake_case(child);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_schema_property_names_snake_case(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// #504 guard. Tools without an `outputSchema` (returning `String`) are not
+    /// covered by value-level checks here; their DTOs are `snake_case` by serde
+    /// default and any `rename_all` on them would need a new check. Covers: every tool `outputSchema` (property names only),
+    /// the serialized `DiagnosticsResponse`/`CachedDiagnosticsResponse`/
+    /// `ResourceDiagnosticsResponse` with both signals set (the resource's raw
+    /// LSP `diagnostics` subtree excepted), and the `data` of every
+    /// `RetryableErrorData` variant.
+    #[test]
+    fn test_mcpls_owned_keys_are_snake_case() {
+        use crate::config::ServerId;
+        use crate::error::RetryableErrorData;
+
+        let tools = serde_json::to_value(McplsServer::build_tool_router(None).list_all()).unwrap();
+        let mut visited = 0;
+        for tool in tools.as_array().unwrap() {
+            if let Some(schema) = tool.get("outputSchema") {
+                assert_schema_property_names_snake_case(schema);
+                visited += 1;
+            }
+        }
+        assert!(visited > 0, "no outputSchema visited; the guard is a no-op");
+
+        let signals = DiagnosticsRouteSignals {
+            push_notifications_degraded: true,
+            indexing_in_progress: true,
+        };
+        let result = || DiagnosticsResult {
+            diagnostics: Vec::new(),
+            positions_degraded: Some(crate::bridge::PositionDegradation::Request),
+        };
+        let pulled = serde_json::to_value(DiagnosticsResponse {
+            result: result(),
+            signals,
+        })
+        .unwrap();
+        let cached = serde_json::to_value(CachedDiagnosticsResponse {
+            result: result(),
+            signals,
+        })
+        .unwrap();
+        let resource =
+            serde_json::to_value(build_resource_diagnostics_response(true, None, signals)).unwrap();
+        assert_value_keys_snake_case(&pulled, &[]);
+        assert_value_keys_snake_case(&cached, &[]);
+        assert_value_keys_snake_case(&resource, &["diagnostics"]);
+
+        for data in [
+            RetryableErrorData::WorkspaceIndexing {
+                server_id: ServerId::from("rust"),
+                elapsed_secs: 1,
+            },
+            RetryableErrorData::ServerInitializing {
+                server_id: ServerId::from("rust"),
+            },
+            RetryableErrorData::WorkspaceServersInitializing {},
+        ] {
+            assert_value_keys_snake_case(&serde_json::to_value(&data).unwrap(), &[]);
+        }
     }
 
     /// M2 regression: `get_diagnostics` must resolve the indexing-signal
@@ -1834,7 +2086,7 @@ mod tests {
     /// `.rs`) must still route to the same server the actual pull request
     /// canonicalizes and routes to internally, or the raw-path lookup would
     /// silently resolve no route at all (`plaintext` has none configured)
-    /// and always read `indexingInProgress: false` regardless of the real
+    /// and always read `indexing_in_progress: false` regardless of the real
     /// server's state.
     #[cfg(unix)]
     #[tokio::test]
@@ -1905,7 +2157,7 @@ mod tests {
 
         let result = call.await.unwrap().unwrap();
         assert!(
-            result.0.indexing_in_progress,
+            result.0.signals.indexing_in_progress,
             "route resolution must follow the symlink to its .rs target, not \
              stop at the .txt extension of the raw client path"
         );
@@ -2298,7 +2550,7 @@ mod tests {
         );
     }
 
-    /// #359: `get_cached_diagnostics` must surface `pushNotificationsDegraded`
+    /// #359: `get_cached_diagnostics` must surface `push_notifications_degraded`
     /// when the cached entry's owning server was marked degraded (respawned
     /// with its push notifications discarded), so a caller can tell the
     /// result may be stale rather than treating it as current.
@@ -2356,11 +2608,11 @@ mod tests {
 
         let json_str = result.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed.get("pushNotificationsDegraded").unwrap(), true);
+        assert_eq!(parsed.get("push_notifications_degraded").unwrap(), true);
     }
 
     /// #445: `get_cached_diagnostics` must surface the same
-    /// `indexingInProgress` signal `get_diagnostics` does -- a cache-only
+    /// `indexing_in_progress` signal `get_diagnostics` does -- a cache-only
     /// read is exactly as vulnerable to reflecting a partial index as the
     /// pull-model one.
     #[tokio::test]
@@ -2405,14 +2657,14 @@ mod tests {
 
         let json_str = result.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed.get("indexingInProgress").unwrap(), true);
+        assert_eq!(parsed.get("indexing_in_progress").unwrap(), true);
     }
 
     /// M2 counterpart for `get_cached_diagnostics`: route resolution must
     /// follow a symlink to its target's extension (`.txt` -> `.rs`), not
     /// stop at the raw client path's extension, or this would silently
     /// resolve no route (`plaintext` has none configured) and always read
-    /// `indexingInProgress: false` regardless of the real server's state.
+    /// `indexing_in_progress: false` regardless of the real server's state.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_cached_diagnostics_tool_resolves_indexing_route_through_symlink() {
@@ -2460,7 +2712,7 @@ mod tests {
         let json_str = result.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(
-            parsed.get("indexingInProgress").unwrap(),
+            parsed.get("indexing_in_progress").unwrap(),
             true,
             "route resolution must follow the symlink to its .rs target, not \
              stop at the .txt extension of the raw client path"
@@ -2473,7 +2725,7 @@ mod tests {
     /// `clear_server_diagnostics` removes `diagnostics_owner` for the
     /// crashed server before `mark_push_degraded` runs) and asserts through
     /// the real `get_cached_diagnostics` MCP handler that
-    /// `pushNotificationsDegraded` comes back `true` afterward -- proving
+    /// `push_notifications_degraded` comes back `true` afterward -- proving
     /// the flag is actually reachable in production, keyed on the stable
     /// routing identity rather than the cleared per-URI ownership map.
     ///
@@ -2582,14 +2834,14 @@ sleep 0.3
         let json_str = result.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(
-            parsed.get("pushNotificationsDegraded").unwrap(),
+            parsed.get("push_notifications_degraded").unwrap(),
             true,
             "a real respawn must be observable through the actual MCP handler, got: {parsed}"
         );
     }
 
     /// Companion to the test above: an entry from a server that was never
-    /// marked degraded must report `pushNotificationsDegraded: false`.
+    /// marked degraded must report `push_notifications_degraded: false`.
     #[tokio::test]
     async fn test_cached_diagnostics_tool_reports_not_degraded_by_default() {
         use tempfile::TempDir;
@@ -2612,7 +2864,7 @@ sleep 0.3
 
         let json_str = result.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed.get("pushNotificationsDegraded").unwrap(), false);
+        assert_eq!(parsed.get("push_notifications_degraded").unwrap(), false);
     }
 
     #[tokio::test]
@@ -3076,7 +3328,8 @@ sleep 0.3
 
     #[test]
     fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
-        let response = ResourceDiagnosticsResponse::new(false, None, false, false);
+        let response =
+            ResourceDiagnosticsResponse::new(false, None, DiagnosticsRouteSignals::default());
         assert!(!response.tracked);
         assert!(response.version.is_none());
         assert!(response.diagnostics.is_empty());
@@ -3090,7 +3343,8 @@ sleep 0.3
 
     #[test]
     fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
-        let response = ResourceDiagnosticsResponse::new(true, None, false, false);
+        let response =
+            ResourceDiagnosticsResponse::new(true, None, DiagnosticsRouteSignals::default());
         assert!(response.tracked);
         assert!(response.version.is_none());
         assert!(response.diagnostics.is_empty());
@@ -3123,7 +3377,11 @@ sleep 0.3
             tags: None,
             data: None,
         }]);
-        let response = ResourceDiagnosticsResponse::new(true, Some(&entry), false, false);
+        let response = ResourceDiagnosticsResponse::new(
+            true,
+            Some(&entry),
+            DiagnosticsRouteSignals::default(),
+        );
         assert!(response.tracked);
         assert_eq!(response.version, Some(1));
         assert_eq!(response.diagnostics.len(), 1);
@@ -3149,14 +3407,16 @@ sleep 0.3
 
     #[test]
     fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
-        let response = build_resource_diagnostics_response(false, None, false, false);
+        let response =
+            build_resource_diagnostics_response(false, None, DiagnosticsRouteSignals::default());
         assert!(!response.tracked);
         assert!(response.diagnostics.is_empty());
     }
 
     #[test]
     fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
-        let response = build_resource_diagnostics_response(true, None, false, false);
+        let response =
+            build_resource_diagnostics_response(true, None, DiagnosticsRouteSignals::default());
         assert!(response.tracked);
         assert!(response.diagnostics.is_empty());
     }
@@ -3190,7 +3450,11 @@ sleep 0.3
             data: None,
         }]);
 
-        let response = build_resource_diagnostics_response(false, Some(&entry), false, false);
+        let response = build_resource_diagnostics_response(
+            false,
+            Some(&entry),
+            DiagnosticsRouteSignals::default(),
+        );
         assert!(
             response.tracked,
             "a cached diagnostics entry must make the response tracked, \
@@ -3200,27 +3464,41 @@ sleep 0.3
     }
 
     /// #359 S2: `read_resource`'s response carries the same
-    /// `pushNotificationsDegraded` signal as `get_cached_diagnostics`, since
+    /// `push_notifications_degraded` signal as `get_cached_diagnostics`, since
     /// both serve the same cache and go dark the same way after a respawn.
     #[test]
     fn test_build_resource_diagnostics_response_flags_push_degraded() {
-        let response = build_resource_diagnostics_response(false, None, true, false);
-        assert!(response.push_notifications_degraded);
+        let response = build_resource_diagnostics_response(
+            false,
+            None,
+            DiagnosticsRouteSignals {
+                push_notifications_degraded: true,
+                indexing_in_progress: false,
+            },
+        );
+        assert!(response.signals.push_notifications_degraded);
 
         let json = serde_json::to_value(&response).unwrap();
-        assert_eq!(json["pushNotificationsDegraded"], true);
+        assert_eq!(json["push_notifications_degraded"], true);
     }
 
     /// #445 counterpart to the push-degraded test above: `read_resource`'s
-    /// response carries the same `indexingInProgress` signal
+    /// response carries the same `indexing_in_progress` signal
     /// `get_diagnostics`/`get_cached_diagnostics` surface.
     #[test]
     fn test_build_resource_diagnostics_response_flags_indexing_in_progress() {
-        let response = build_resource_diagnostics_response(false, None, false, true);
-        assert!(response.indexing_in_progress);
+        let response = build_resource_diagnostics_response(
+            false,
+            None,
+            DiagnosticsRouteSignals {
+                push_notifications_degraded: false,
+                indexing_in_progress: true,
+            },
+        );
+        assert!(response.signals.indexing_in_progress);
 
         let json = serde_json::to_value(&response).unwrap();
-        assert_eq!(json["indexingInProgress"], true);
+        assert_eq!(json["indexing_in_progress"], true);
     }
 
     /// `parse_uri` rejects `file://` scheme — ensures `read_resource` would return an error.
