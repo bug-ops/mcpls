@@ -208,14 +208,15 @@ that mcpls's MCP layer will eventually need to represent:
   without a maintainer decision — that reference documents current behavior,
   not aspirational future behavior
 
-## 8a. Resource subscriptions on the stateless path (#493)
-
-Closed as research; no code change. Findings:
+## 8a. Resource subscriptions on the stateless path (#493, #522)
 
 - On rmcp's stateless per-request HTTP path (`_meta` carries the discover-lifecycle keys, or no `Mcp-Session-Id` is echoed) no durable client identity exists, so a `resources/subscribe` has nowhere to persist. mcpls rejects it explicitly (error `-32052`, #482) and, since #492, structurally: only a `StatefulSession` capability token obtained via `SessionHandle::require_stateful` can mutate subscription state, and a session joins the delivery registry only on its first guarded subscribe.
-- 2026-07-28 replaces `resources/subscribe` with a request-scoped `subscriptions/listen` stream. `rmcp` 3.5.0 implements it (`ServerHandler::accepted_subscription_filter` plus `listen(SubscriptionContext)` and `SubscriptionSink`).
-- Supporting it needs more than a plug-in: `accepted_subscription_filter` is synchronous, has no `RequestContext`, and `rmcp` intersects its result with the requested URIs by exact match, so it must echo the client's raw URIs (validated against the workspace roots and capped). One canonical URI can map to several raw URIs, which the one-alias-per-canonical model in `ResourceSubscriptions` does not represent, so a separate canonical-to-raw-set mapping is required. The delivery `Target` would gain a `Sink(SubscriptionSink)` variant.
-- Follow-up issue: #522, "resource subscriptions unavailable to 2026-07-28 clients via subscriptions/listen" (`enhancement`, P3). The per-session registry, delivery loop and capability token are reusable; the URI mapping is not.
+- 2026-07-28 replaces `resources/subscribe` with a request-scoped `subscriptions/listen` stream. mcpls implements it (#522) through `ServerHandler::accepted_subscription_filter` and `listen(SubscriptionContext)` on rmcp 3.5.0. It works on every transport and needs no session.
+- `accepted_subscription_filter` is synchronous and cannot see the request context, and rmcp intersects its result with the requested URIs by exact match, so it echoes the client's raw URIs. It is syntax-only (`lsp-diagnostics:///` scheme, empty authority, deduplicated) and touches no filesystem; a request naming more than `MAX_SUBSCRIPTIONS` URIs gets an empty filter, which rmcp short-circuits in O(1), and `listen` then fails with invalid-params.
+- `listen` takes one of `MAX_LISTEN_STREAMS` (100) slots first (retryable error `-32053` when exhausted), then resolves the URIs against the workspace roots on a blocking thread. The pool is shared by stdio and HTTP and is independent of `max_concurrent_sessions`. A listen that names resource URIs of which none resolves inside the workspace fails with invalid-params after the acknowledgment and holds no slot; a listen naming no resource URIs completes at once.
+- One canonical URI can map to several raw spellings. `ListenUris` groups the raw URIs under their canonical URI; the request-scoped subscription set and the `Target::Sink` fan-out are both derived from that single value, so the pump's one canonical key yields one `resources/updated` per raw URI, tagged with the subscription id. Cached diagnostics are replayed after registration, as for `resources/subscribe`.
+- The acknowledgment is advisory: it can list a URI that `listen` later drops (deleted, or outside the workspace by then), and a request refused for capacity gets its error after the acknowledgment. A dropped URI is summarized in one debug line per listen.
+- The stream lives as long as its connection. Over stdio, closing the input with a stream open makes rmcp wait out its drain timeout (a few seconds), because it does not cancel request tokens at EOF.
 
 ## 9. Open Questions
 

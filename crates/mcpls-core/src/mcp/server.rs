@@ -13,15 +13,16 @@ use rmcp::model::{
     ErrorCode, Implementation, ListResourcesResult, ReadResourceRequestParams,
     ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
     ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig as RmcpServerConfig,
-    SubscribeRequestParams, ToolAnnotations, UnsubscribeRequestParams,
+    SubscribeRequestParams, SubscriptionFilter, ToolAnnotations, UnsubscribeRequestParams,
 };
+use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
-use super::session::SubscriptionRegistry;
+use super::session::{ListenPermit, ListenUris, SubscriptionRegistry, Target};
 use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
@@ -29,7 +30,9 @@ use super::tools::{
     PositionParams, RangeParams, ReferencesParams, RenameParams, ServerLogsParams,
     ServerMessagesParams, ToolSupportParams, WorkspaceSymbolParams,
 };
-use crate::bridge::resources::{make_uri, parse_uri};
+use crate::bridge::resources::{
+    DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
+};
 use crate::bridge::{
     DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, IndexingState,
     NotificationCache, Position, PositionEncoding, ReferencesResult, Translator,
@@ -1061,6 +1064,53 @@ impl McplsServer {
     }
 }
 
+impl McplsServer {
+    /// Admits a `subscriptions/listen` request and resolves its URIs.
+    ///
+    /// Gate order matters: the size check and the empty fast path touch
+    /// nothing, the listen slot is taken before any filesystem access, and
+    /// the canonicalizing resolution runs off the runtime threads. Returns
+    /// `None` when no resource URIs were requested at all; requesting URIs
+    /// of which none resolves is an error, not a silent empty stream.
+    async fn prepare_listen(
+        &self,
+        requested: &[String],
+        accepted: &[String],
+    ) -> crate::error::Result<Option<(ListenPermit, ListenUris)>> {
+        if ListenUris::exceeds_budget(requested) {
+            return Err(crate::error::Error::ListenFilterTooLarge {
+                max: MAX_SUBSCRIPTIONS,
+            });
+        }
+        if requested.is_empty() {
+            return Ok(None);
+        }
+        if accepted.is_empty() {
+            return Err(no_resolvable_listen_uris());
+        }
+        let permit = self.context.session.registry().try_reserve_listen()?;
+        let roots = Arc::clone(&self.context.workspace_roots);
+        let accepted = accepted.to_vec();
+        let uris = tokio::task::spawn_blocking(move || ListenUris::resolve(&accepted, &roots))
+            .await
+            .map_err(|e| listen_join_error(&e))?;
+        if uris.is_empty() {
+            return Err(no_resolvable_listen_uris());
+        }
+        Ok(Some((permit, uris)))
+    }
+}
+
+fn no_resolvable_listen_uris() -> crate::error::Error {
+    crate::error::Error::InvalidUri(
+        "none of the requested resource URIs resolve inside the workspace".to_owned(),
+    )
+}
+
+fn listen_join_error(e: &tokio::task::JoinError) -> crate::error::Error {
+    crate::error::Error::McpServer(format!("subscriptions/listen resolution: {e}"))
+}
+
 // `list_resources` is synchronous (no `.await`), but `ServerHandler::list_resources`
 // requires `async fn`; `#[tool_handler]` also expands other trait methods without
 // `.await`, so the lint is suppressed for the whole impl block.
@@ -1139,22 +1189,12 @@ impl ServerHandler for McplsServer {
     ) -> Result<(), McpError> {
         let session = self.context.session.require_stateful(&context)?;
 
-        let path =
-            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-        // Enforce workspace-root containment (same invariant as every LSP tool).
-        // Validated against a lock-free snapshot of workspace_roots so subscribing
-        // never needs to touch `translator` at all (see `read_resource`).
-        let validated_path = validate_path_against_roots(&path, &self.context.workspace_roots)
+        // Keyed by the canonical URI: the pump publishes canonical paths only.
+        let ResolvedResource {
+            path: validated_path,
+            uri: canonical_uri,
+        } = DiagnosticsResourceUri::resolve(&request.uri, &self.context.workspace_roots)
             .map_err(map_bridge_error)?;
-
-        // Track and reply under the canonical resource URI, not the client's raw
-        // `request.uri`: `diagnostics_pump` derives `mcp_uri` from the canonical LSP
-        // path (see below), so a subscription keyed by a non-canonical but equivalent
-        // URI (symlink, macOS /var vs /private/var, ...) would never match its
-        // `subs.contains` check and silently stop receiving pushes.
-        let canonical_uri =
-            make_uri(&validated_path).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // Record the subscription *before* checking the cache. This closes the race where
         // a PublishDiagnostics notification lands between the cache check and the
@@ -1186,7 +1226,7 @@ impl ServerHandler for McplsServer {
             && let Err(e) = context
                 .peer
                 .notify_resource_updated(ResourceUpdatedNotificationParam::new(
-                    canonical_uri.clone(),
+                    canonical_uri.as_str(),
                 ))
                 .await
         {
@@ -1203,25 +1243,88 @@ impl ServerHandler for McplsServer {
     ) -> Result<(), McpError> {
         let session = self.context.session.require_stateful(&context)?;
 
-        // Parse the URI for consistency with subscribe validation.
-        let path =
-            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // Only a malformed URI errors; a deleted file resolves via its alias (#499).
+        let canonical =
+            match DiagnosticsResourceUri::resolve(&request.uri, &self.context.workspace_roots) {
+                Ok(resolved) => Some(resolved.uri),
+                Err(e @ crate::error::Error::InvalidUri(_)) => return Err(map_bridge_error(e)),
+                Err(_) => None,
+            };
 
-        // Remove under the same canonical URI `subscribe` recorded under. Best-effort
-        // fall back to the raw URI if canonicalization fails (e.g. the file was
-        // deleted since subscribing) so unsubscribing a stale entry never errors --
-        // the session's unsubscribe then resolves it via the alias
-        // `subscribe` recorded for this raw URI (#499).
-        let key = validate_path_against_roots(&path, &self.context.workspace_roots)
-            .ok()
-            .and_then(|validated_path| make_uri(&validated_path).ok())
-            .unwrap_or_else(|| request.uri.clone());
-
-        if !session.unsubscribe(&key).await {
+        if !session.unsubscribe(canonical.as_ref(), &request.uri).await {
             tracing::debug!(
-                "client unsubscribed from resource with no matching subscription: {key}"
+                "client unsubscribed from resource with no matching subscription: {}",
+                request.uri
             );
         }
+        Ok(())
+    }
+
+    /// Syntax-only: no filesystem access and no capacity check, so an
+    /// unauthenticated caller cannot make this cheap synchronous hook expensive.
+    /// The acknowledgment is advisory -- `listen` delivers only for URIs that
+    /// still resolve inside the workspace and may be refused for capacity after
+    /// the acknowledgment was sent. Always `Some`: `None` would answer
+    /// `subscriptions/listen` with method-not-found.
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let mut filter = SubscriptionFilter::new();
+        filter.resource_subscriptions = requested
+            .resource_subscriptions
+            .as_deref()
+            .and_then(ListenUris::syntactic_filter);
+        Some(filter)
+    }
+
+    /// Serves one `subscriptions/listen` stream (2026-07-28): request-scoped
+    /// delivery of `resources/updated`, echoing each raw URI the client asked
+    /// for, until the request is cancelled or its connection closes. Works on
+    /// every transport and, unlike `resources/subscribe`, needs no session.
+    ///
+    /// Streams are capped at `MAX_LISTEN_STREAMS` (shared by stdio and HTTP,
+    /// independent of `max_concurrent_sessions`); beyond it the request fails
+    /// with a retryable error after the acknowledgment. Over stdio, closing
+    /// the input with a stream open makes rmcp wait out its drain timeout
+    /// (a few seconds) because it does not cancel request tokens at EOF.
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
+        let requested = context
+            .requested()
+            .resource_subscriptions
+            .as_deref()
+            .unwrap_or_default();
+        let accepted = context
+            .accepted()
+            .resource_subscriptions
+            .as_deref()
+            .unwrap_or_default();
+        let Some((permit, uris)) = self
+            .prepare_listen(requested, accepted)
+            .await
+            .map_err(map_bridge_error)?
+        else {
+            return Ok(());
+        };
+
+        let uris = Arc::new(uris);
+        let sink = context.sink().clone();
+        let registration = permit.register(Arc::clone(&uris), |uris| Target::Sink { sink, uris });
+
+        // Registered above, before the cache read, so no publish is lost in between.
+        let cached: Vec<&DiagnosticsResourceUri> = {
+            let cache = self.context.notification_cache.lock().await;
+            uris.canonical()
+                .filter(|(_, lsp_uri)| cache.diagnostics(lsp_uri.as_ref()).is_some())
+                .map(|(uri, _)| uri)
+                .collect()
+        };
+        for uri in cached {
+            registration.publish(uri).await;
+        }
+
+        context.cancelled().await;
+        drop(registration);
         Ok(())
     }
 
@@ -3687,8 +3790,11 @@ sleep 0.3
         let roots = std::slice::from_ref(&base);
         let validated = validate_path_against_roots(&noncanonical, roots).unwrap();
         let raw_uri = make_uri(&noncanonical).unwrap();
-        let canonical_uri = make_uri(&validated).unwrap();
-        assert_ne!(raw_uri, canonical_uri);
+        let canonical_uri = DiagnosticsResourceUri::resolve(&raw_uri, roots)
+            .unwrap()
+            .uri;
+        assert_eq!(canonical_uri.as_str(), make_uri(&validated).unwrap());
+        assert_ne!(raw_uri, canonical_uri.as_str());
 
         let subscriptions = ResourceSubscriptions::new();
         subscriptions
@@ -3696,7 +3802,7 @@ sleep 0.3
             .await
             .unwrap();
         subscriptions
-            .record_alias(raw_uri.clone(), canonical_uri.clone())
+            .record_alias(raw_uri.clone(), &canonical_uri)
             .await;
 
         // Delete the file (through the real path, not the symlink) so
@@ -3704,10 +3810,10 @@ sleep 0.3
         fs::remove_file(&test_file).unwrap();
         assert!(validate_path_against_roots(&noncanonical, roots).is_err());
 
-        // Mirrors `unsubscribe`'s handler: falls back to the raw URI once
-        // canonicalization fails.
-        let key = raw_uri;
-        assert!(subscriptions.unsubscribe(&key).await.is_some());
+        // Mirrors `unsubscribe`'s handler: no canonical URI once
+        // canonicalization fails, only the raw one.
+        assert!(DiagnosticsResourceUri::resolve(&raw_uri, roots).is_err());
+        assert!(subscriptions.unsubscribe(None, &raw_uri).await.is_some());
         assert!(!subscriptions.contains(&canonical_uri).await);
     }
 
@@ -3719,12 +3825,16 @@ sleep 0.3
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         for i in 0..MAX_SUBSCRIPTIONS {
             subscriptions
-                .subscribe(format!("lsp-diagnostics:///file{i}.rs"))
+                .subscribe(DiagnosticsResourceUri::for_test(&format!(
+                    "lsp-diagnostics:///file{i}.rs"
+                )))
                 .await
                 .unwrap();
         }
         let over = subscriptions
-            .subscribe("lsp-diagnostics:///overflow.rs".to_string())
+            .subscribe(DiagnosticsResourceUri::for_test(
+                "lsp-diagnostics:///overflow.rs",
+            ))
             .await;
         assert!(over.is_err());
     }
@@ -3733,8 +3843,9 @@ sleep 0.3
     #[tokio::test]
     async fn test_unsubscribe_nonexistent_is_noop() {
         let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let missing = DiagnosticsResourceUri::for_test("lsp-diagnostics:///nonexistent.rs");
         let removed = subscriptions
-            .unsubscribe("lsp-diagnostics:///nonexistent.rs")
+            .unsubscribe(Some(&missing), missing.as_str())
             .await;
         assert!(removed.is_none());
     }
@@ -3751,7 +3862,10 @@ sleep 0.3
         session_a
             .context
             .session
-            .subscribe_for_test("lsp-diagnostics:///a.rs", super::super::Target::Channel(tx))
+            .subscribe_for_test(
+                &DiagnosticsResourceUri::for_test("lsp-diagnostics:///a.rs"),
+                super::super::Target::Channel(tx),
+            )
             .await
             .unwrap();
 
@@ -3772,12 +3886,153 @@ sleep 0.3
             session
                 .context
                 .session
-                .subscribe_for_test("lsp-diagnostics:///a.rs", super::super::Target::Channel(tx))
+                .subscribe_for_test(
+                    &DiagnosticsResourceUri::for_test("lsp-diagnostics:///a.rs"),
+                    super::super::Target::Channel(tx),
+                )
                 .await
                 .unwrap();
             assert_eq!(registry.live_sessions().len(), 1);
         }
         assert!(registry.live_sessions().is_empty());
+    }
+
+    fn listen_test_server() -> (McplsServer, tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let uri = make_uri(&file).unwrap();
+        let server = create_test_server_with_workspace_roots(
+            false,
+            McpConfig::default(),
+            Arc::from(vec![root]),
+        );
+        (server, dir, uri)
+    }
+
+    #[test]
+    fn test_accepted_subscription_filter_is_always_some_and_syntax_only() {
+        let server = create_test_server();
+        let mut requested = SubscriptionFilter::new();
+        let missing = crate::test_lsp::absolute_uri("no/such/file.rs");
+        requested.resource_subscriptions = Some(vec![missing.clone(), "file:///bad.rs".to_owned()]);
+        let accepted = server.accepted_subscription_filter(&requested).unwrap();
+        assert_eq!(accepted.resource_subscriptions, Some(vec![missing]));
+
+        requested.resource_subscriptions = Some(vec![
+            "lsp-diagnostics:///a.rs".to_owned();
+            MAX_SUBSCRIPTIONS + 1
+        ]);
+        let accepted = server.accepted_subscription_filter(&requested).unwrap();
+        assert_eq!(accepted.resource_subscriptions, None);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_listen_rejects_oversized_request() {
+        let (server, _dir, uri) = listen_test_server();
+        let err = server
+            .prepare_listen(&vec![uri.clone(); MAX_SUBSCRIPTIONS + 1], &[uri])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::ListenFilterTooLarge { .. }
+        ));
+        assert_eq!(map_bridge_error(err).code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_listen_rejects_oversized_total_bytes() {
+        let (server, _dir, uri) = listen_test_server();
+        let long = format!("lsp-diagnostics:///{}", "a".repeat(4096));
+        let requested = vec![long; 100];
+        let err = server.prepare_listen(&requested, &[uri]).await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::ListenFilterTooLarge { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_listen_join_error_maps_to_internal_error() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let err = listen_join_error(&handle.await.unwrap_err());
+        assert_eq!(map_bridge_error(err).code, ErrorCode::INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_listen_requested_but_none_accepted_fails() {
+        let (server, _dir, _uri) = listen_test_server();
+        let bad = "file:///bad.rs".to_owned();
+        let err = server
+            .prepare_listen(std::slice::from_ref(&bad), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(map_bridge_error(err).code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_listen_without_requested_uris_takes_no_slot() {
+        let (server, _dir, _uri) = listen_test_server();
+        let registry = server.subscription_registry();
+        let held: Vec<_> = (0..crate::bridge::resources::MAX_LISTEN_STREAMS)
+            .map(|_| registry.try_reserve_listen().unwrap())
+            .collect();
+        assert!(server.prepare_listen(&[], &[]).await.unwrap().is_none());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_listen_reports_exhaustion_as_retryable() {
+        let (server, _dir, uri) = listen_test_server();
+        let registry = server.subscription_registry();
+        let _held: Vec<_> = (0..crate::bridge::resources::MAX_LISTEN_STREAMS)
+            .map(|_| registry.try_reserve_listen().unwrap())
+            .collect();
+        let err = server
+            .prepare_listen(std::slice::from_ref(&uri), std::slice::from_ref(&uri))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::ListenStreamsExhausted { .. }
+        ));
+        assert_eq!(
+            map_bridge_error(err).code,
+            ErrorCode(crate::error::LISTEN_STREAMS_EXHAUSTED_ERROR_CODE)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_listen_unresolvable_uris_fail_and_release_the_slot() {
+        let (server, _dir, _uri) = listen_test_server();
+        let missing = crate::test_lsp::absolute_uri("no/such/file.rs");
+        let err = server
+            .prepare_listen(
+                std::slice::from_ref(&missing),
+                std::slice::from_ref(&missing),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(map_bridge_error(err).code, ErrorCode::INVALID_PARAMS);
+        let registry = server.subscription_registry();
+        let held: Vec<_> = (0..crate::bridge::resources::MAX_LISTEN_STREAMS)
+            .map(|_| registry.try_reserve_listen())
+            .collect();
+        assert!(held.iter().all(Result::is_ok), "the slot must be released");
+    }
+
+    #[tokio::test]
+    async fn test_prepare_listen_resolves_valid_uris() {
+        let (server, _dir, uri) = listen_test_server();
+        let (_permit, uris) = server
+            .prepare_listen(std::slice::from_ref(&uri), std::slice::from_ref(&uri))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uris.canonical().count(), 1);
     }
 
     /// Server capabilities advertise resources support.
