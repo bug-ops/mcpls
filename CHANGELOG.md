@@ -9,21 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `get_diagnostics` now reports `push_notifications_degraded`, sampled before and after the pull so a restart triggered by the call itself is caught. (#PR)
-- Completions and signature help now report `positions_degraded`. (#PR)
+- `get_diagnostics` now reports `push_notifications_degraded`, sampled before and after the pull so a restart triggered by the call itself is caught. (#520)
+- Completions and signature help now report `positions_degraded`. (#520)
 
 ### Changed
 
 - **Breaking:** `NotificationCache`/`DocumentTracker`/`DocumentState` internals are no longer public; removed `NotificationCache::{clear_diagnostics, clear_all_diagnostics, clear_logs, clear_messages}` and `DocumentTracker::{update, close_all}`. (#512)
 - **Breaking:** `workspace.heuristics_max_depth` is now bounded by `MAX_HEURISTICS_DEPTH` (64); larger values fail config validation. (#512)
-- **Breaking:** keys mcpls defines in tool results and the `mcpls-diagnostics://` resource are now snake_case (`indexing_in_progress`, `push_notifications_degraded`). (#PR)
-- **Breaking:** retryable error `data` keys are now `server_id` and `elapsed_secs`, and `McpErrorKind::Retryable` wraps the new typed `RetryableErrorData`. (#PR)
-- **Breaking:** `positions_degraded` is now `"request"` or `"response"` instead of a bool, and is omitted when positions are exact. (#PR)
-- **Breaking:** `mcp_to_lsp_position`/`lsp_to_mcp_position` take the typed `Position`/`Position2D`, return `Converted` values, and are now crate-private. (#512, #PR)
+- **Breaking:** keys mcpls defines in tool results and the `mcpls-diagnostics://` resource are now snake_case (`indexing_in_progress`, `push_notifications_degraded`). (#520)
+- **Breaking:** retryable error `data` keys are now `server_id` and `elapsed_secs`, and `McpErrorKind::Retryable` wraps the new typed `RetryableErrorData`. (#520)
+- **Breaking:** `positions_degraded` is now `"request"` or `"response"` instead of a bool, and is omitted when positions are exact. (#520)
+- **Breaking:** `mcp_to_lsp_position`/`lsp_to_mcp_position` take the typed `Position`/`Position2D`, return `Converted` values, and are now crate-private. (#512, #520)
 
 ### Fixed
 
-- Columns past the end of a line now clamp to the line length, and column 1 or the empty line after a final newline no longer raise a false `positions_degraded`. (#PR)
+- Columns past the end of a line now clamp to the line length, and column 1 or the empty line after a final newline no longer raise a false `positions_degraded`. (#520)
 
 ## [0.6.0] - 2026-09-21
 
