@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use super::Translator;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
-use crate::bridge::{InFlightGuard, WorkspaceRoots, lexically_normalize, lock_std};
+use crate::bridge::{ClientPath, InFlightGuard, WorkspaceRoots, lexically_normalize, lock_std};
 use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
@@ -72,20 +72,32 @@ impl PreparedDocument {
 /// Returns `Error::NoWorkspaceRoots` if `workspace_roots` is empty -- fails
 /// closed rather than allowing unrestricted access -- and
 /// `Error::PathOutsideWorkspace` if the path is outside all configured
-/// workspace roots. `Error::FileIo` is returned when the path cannot be made
-/// absolute (for example an empty path), or when the lexical check admitted it
-/// but it cannot be canonicalized (for example it does not exist).
+/// workspace roots. When the lexical check admitted the path but it cannot be
+/// canonicalized, `Error::FileIo` is returned (for example it does not exist),
+/// or `Error::MalformedPath` when the path itself is malformed (it runs
+/// through a regular file, or has an invalid or over-long name).
+/// Empty and NUL-containing paths cannot reach this function: they are
+/// rejected when the [`ClientPath`] is parsed.
 pub fn validate_path_against_roots(
-    path: &Path,
+    path: &ClientPath,
     workspace_roots: &WorkspaceRoots,
 ) -> Result<PathBuf> {
+    let path = path.as_path();
     if workspace_roots.is_empty() {
         return Err(Error::NoWorkspaceRoots(path.to_path_buf()));
     }
 
-    let io_error = |source| Error::FileIo {
-        path: path.to_path_buf(),
-        source,
+    let io_error = |source: std::io::Error| match source.kind() {
+        std::io::ErrorKind::NotADirectory
+        | std::io::ErrorKind::InvalidFilename
+        | std::io::ErrorKind::InvalidInput => Error::MalformedPath {
+            path: path.to_path_buf(),
+            source,
+        },
+        _ => Error::FileIo {
+            path: path.to_path_buf(),
+            source,
+        },
     };
     let absolute = std::path::absolute(path).map_err(io_error)?;
     let normalized = lexically_normalize(dunce::simplified(&absolute));
@@ -635,7 +647,7 @@ impl Translator {
     /// Returns `Error::NoWorkspaceRoots` if no workspace roots are
     /// configured (fails closed), or `Error::PathOutsideWorkspace` if the
     /// path is outside all configured workspace roots.
-    pub(crate) fn validate_path(&self, path: &Path) -> Result<PathBuf> {
+    pub(crate) fn validate_path(&self, path: &ClientPath) -> Result<PathBuf> {
         validate_path_against_roots(path, &self.workspace_roots)
     }
 
@@ -816,7 +828,7 @@ impl Translator {
         uri: &DiagnosticsResourceUri,
     ) -> DiagnosticsRoute {
         parse_uri(uri.as_str()).map_or(DiagnosticsRoute::Unrouted, |path| {
-            self.diagnostics_route_for_path(&path)
+            self.diagnostics_route_for_path(path.as_path())
         })
     }
 
@@ -830,10 +842,10 @@ impl Translator {
     /// observe an open notification for a request it can't service.
     async fn resolve_validated_client_for_file(
         &self,
-        file_path: &str,
+        file_path: &ClientPath,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient, PathBuf)> {
-        let validated_path = self.validate_path(Path::new(file_path))?;
+        let validated_path = self.validate_path(file_path)?;
         let (server_id, client) = self.resolve_client_for_file(&validated_path, tool).await?;
         Ok((server_id, client, validated_path))
     }
@@ -873,7 +885,7 @@ impl Translator {
     /// server-B call for that *same* file.)
     pub(super) async fn prepare_document(
         &self,
-        file_path: &str,
+        file_path: &ClientPath,
         tool: ToolKind,
     ) -> Result<PreparedDocument> {
         let (server_id, client, validated_path) = self
@@ -931,7 +943,7 @@ impl Translator {
     /// [`IndexingGate::Required`] and the server is still indexing.
     pub(super) async fn prepare_gated_document(
         &self,
-        file_path: &str,
+        file_path: &ClientPath,
         capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
@@ -1140,8 +1152,7 @@ impl Translator {
             ))
         })?;
 
-        // Validate path is within workspace
-        self.validate_path(&path)
+        self.validate_path(&ClientPath::try_from(path)?)
     }
 }
 
@@ -1167,6 +1178,7 @@ mod tests {
     use crate::config::{LspServerConfig, ToolRouter};
     use crate::error::Error;
     use crate::lsp::LspServer;
+    use crate::test_lsp::client_path;
 
     type JsonValue = serde_json::Value;
 
@@ -1378,7 +1390,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         // With no workspace roots configured, access is rejected (fail closed)
-        let result = translator.validate_path(&test_file);
+        let result = translator.validate_path(&client_path(test_file));
         assert_matches!(result, Err(Error::NoWorkspaceRoots(_)));
     }
 
@@ -1387,12 +1399,12 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().to_path_buf();
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![workspace_root]));
+        translator.set_workspace_roots(WorkspaceRoots::from_configured(&[workspace_root]).unwrap());
 
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result = translator.validate_path(&test_file);
+        let result = translator.validate_path(&client_path(test_file));
         assert!(result.is_ok());
     }
 
@@ -1403,15 +1415,15 @@ mod tests {
         let temp_dir2 = TempDir::new().unwrap();
 
         // Set workspace root to temp_dir1
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![
-            temp_dir1.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[temp_dir1.path().to_path_buf()]).unwrap(),
+        );
 
         // Create file in temp_dir2 (outside workspace)
         let test_file = temp_dir2.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result = translator.validate_path(&test_file);
+        let result = translator.validate_path(&client_path(test_file));
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
@@ -1421,9 +1433,10 @@ mod tests {
     fn test_validate_path_nonexistent_outside_path_is_outside_workspace() {
         let root = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let roots = WorkspaceRoots::resolve(vec![root.path().to_path_buf()]);
+        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result = validate_path_against_roots(&outside.path().join("missing.rs"), &roots);
+        let result =
+            validate_path_against_roots(&client_path(outside.path().join("missing.rs")), &roots);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1431,9 +1444,10 @@ mod tests {
     #[test]
     fn test_validate_path_dotdot_escape_is_outside_workspace() {
         let root = TempDir::new().unwrap();
-        let roots = WorkspaceRoots::resolve(vec![root.path().to_path_buf()]);
+        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result = validate_path_against_roots(&root.path().join("../escape.rs"), &roots);
+        let result =
+            validate_path_against_roots(&client_path(root.path().join("../escape.rs")), &roots);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1443,9 +1457,10 @@ mod tests {
         let root = TempDir::new().unwrap();
         fs::create_dir(root.path().join("a")).unwrap();
         fs::write(root.path().join("b.rs"), "").unwrap();
-        let roots = WorkspaceRoots::resolve(vec![root.path().to_path_buf()]);
+        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result = validate_path_against_roots(&root.path().join("./a/../b.rs"), &roots);
+        let result =
+            validate_path_against_roots(&client_path(root.path().join("./a/../b.rs")), &roots);
 
         assert_eq!(
             result.unwrap(),
@@ -1466,7 +1481,7 @@ mod tests {
         } = alias_fixture();
         fs::write(real.join("a.rs"), "").unwrap();
 
-        let result = validate_path_against_roots(&alias.join("a.rs"), &roots);
+        let result = validate_path_against_roots(&client_path(alias.join("a.rs")), &roots);
 
         assert_eq!(
             result.unwrap(),
@@ -1484,7 +1499,7 @@ mod tests {
         } = alias_fixture();
         fs::write(dir.path().join("outside.rs"), "").unwrap();
 
-        let result = validate_path_against_roots(&alias.join("../outside.rs"), &roots);
+        let result = validate_path_against_roots(&client_path(alias.join("../outside.rs")), &roots);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1501,7 +1516,7 @@ mod tests {
             ..
         } = alias_fixture();
 
-        let result = validate_path_against_roots(&alias.join("missing.rs"), &roots);
+        let result = validate_path_against_roots(&client_path(alias.join("missing.rs")), &roots);
 
         assert_matches!(result, Err(Error::FileIo { .. }), "{result:?}");
     }
@@ -1521,7 +1536,8 @@ mod tests {
         fs::write(outside.path().join("secret.rs"), "").unwrap();
         std::os::unix::fs::symlink(outside.path(), real.join("link")).unwrap();
 
-        let result = validate_path_against_roots(&alias.join("link/secret.rs"), &roots);
+        let result =
+            validate_path_against_roots(&client_path(alias.join("link/secret.rs")), &roots);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1535,9 +1551,10 @@ mod tests {
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("secret.rs"), "").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
-        let roots = WorkspaceRoots::resolve(vec![root.path().to_path_buf()]);
+        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result = validate_path_against_roots(&root.path().join("link/secret.rs"), &roots);
+        let result =
+            validate_path_against_roots(&client_path(root.path().join("link/secret.rs")), &roots);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1571,7 +1588,10 @@ mod tests {
         fs::write(&outside_path, "fn outside() {}").unwrap();
 
         let result = translator
-            .handle_hover(outside_path.to_string_lossy().to_string(), pos(1, 1))
+            .handle_hover(
+                client_path(outside_path.to_string_lossy().into_owned()),
+                pos(1, 1),
+            )
             .await;
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
@@ -1589,8 +1609,9 @@ mod tests {
     async fn test_parse_file_uri_valid_scheme() {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1609,8 +1630,9 @@ mod tests {
     async fn test_parse_file_uri_percent_decodes_space_and_non_ascii() {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
         let test_file = temp_dir.path().join("my file café.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1934,14 +1956,16 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
         translator.record_startup_failures(&[not_found_failure(&id, "rust", "sh")]);
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
         let cache = Mutex::new(crate::bridge::NotificationCache::new());
 
         let err = translator
-            .handle_diagnostics(file.to_string_lossy().to_string(), &cache)
+            .handle_diagnostics(client_path(file.to_string_lossy().into_owned()), &cache)
             .await
             .unwrap_err();
 
@@ -1967,10 +1991,7 @@ mod tests {
         fs::create_dir(&real).unwrap();
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let roots = WorkspaceRoots::new(
-            vec![dunce::canonicalize(&real).unwrap()],
-            vec![alias.clone()],
-        );
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&alias)).unwrap();
         AliasFixture {
             dir,
             real,
@@ -2084,7 +2105,9 @@ mod tests {
                     (ServerId::from("lang_a"), "lang_a".to_string()),
                     (ServerId::from("lang_b"), "lang_b".to_string()),
                 ]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client_a, mut server_a) = fake_lsp_client();
         let (client_b, mut server_b) = fake_lsp_client();
@@ -2107,7 +2130,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_hover(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -2133,7 +2156,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_hover(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -2184,7 +2207,9 @@ mod tests {
                     ServerId::from("lang_a"),
                     "lang_a".to_string(),
                 )]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client);
@@ -2204,7 +2229,7 @@ mod tests {
                 tokio::spawn(async move {
                     translator
                         .handle_hover(
-                            path_str,
+                            client_path(path_str),
                             Position {
                                 line: 1,
                                 character: 1,
@@ -2255,7 +2280,9 @@ mod tests {
                 max_documents: 1,
                 max_file_size: 0,
             });
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client, server) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client);
@@ -2328,7 +2355,10 @@ mod tests {
 
         drop(
             translator
-                .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+                .prepare_document(
+                    &client_path(path_a.to_string_lossy().into_owned()),
+                    ToolKind::Hover,
+                )
                 .await
                 .unwrap(),
         );
@@ -2339,7 +2369,10 @@ mod tests {
 
         drop(
             translator
-                .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+                .prepare_document(
+                    &client_path(path_b.to_string_lossy().into_owned()),
+                    ToolKind::Hover,
+                )
                 .await
                 .unwrap(),
         );
@@ -2373,12 +2406,18 @@ mod tests {
         fs::write(&path_b, "content b").unwrap();
 
         let doc_a = translator
-            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+            .prepare_document(
+                &client_path(path_a.to_string_lossy().into_owned()),
+                ToolKind::Hover,
+            )
             .await
             .unwrap();
 
         let err = translator
-            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .prepare_document(
+                &client_path(path_b.to_string_lossy().into_owned()),
+                ToolKind::Hover,
+            )
             .await
             .unwrap_err();
         assert_matches!(err, Error::DocumentLimitExceeded { .. });
@@ -2386,7 +2425,10 @@ mod tests {
         drop(doc_a);
         drop(
             translator
-                .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+                .prepare_document(
+                    &client_path(path_b.to_string_lossy().into_owned()),
+                    ToolKind::Hover,
+                )
                 .await
                 .unwrap(),
         );
@@ -2406,18 +2448,27 @@ mod tests {
         let canonical_a = dunce::canonicalize(&path_a).unwrap();
 
         let first = translator
-            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+            .prepare_document(
+                &client_path(path_a.to_string_lossy().into_owned()),
+                ToolKind::Hover,
+            )
             .await
             .unwrap();
         let second = translator
-            .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+            .prepare_document(
+                &client_path(path_a.to_string_lossy().into_owned()),
+                ToolKind::Hover,
+            )
             .await
             .unwrap();
         assert_eq!(translator.document_tracker.in_flight_count(&canonical_a), 2);
 
         drop(first);
         let err = translator
-            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .prepare_document(
+                &client_path(path_b.to_string_lossy().into_owned()),
+                ToolKind::Hover,
+            )
             .await
             .unwrap_err();
         assert_matches!(err, Error::DocumentLimitExceeded { .. });
@@ -2426,7 +2477,10 @@ mod tests {
         assert_eq!(translator.document_tracker.in_flight_count(&canonical_a), 0);
         drop(
             translator
-                .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+                .prepare_document(
+                    &client_path(path_b.to_string_lossy().into_owned()),
+                    ToolKind::Hover,
+                )
                 .await
                 .unwrap(),
         );
@@ -2447,7 +2501,9 @@ mod tests {
                     ServerId::from("lang_b"),
                     "lang_b".to_string(),
                 )]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client, _server) = fake_lsp_client();
         translator.register_client("lang_b".to_string(), client.clone());
@@ -2458,7 +2514,10 @@ mod tests {
 
         client.shutdown().await.unwrap();
         let err = translator
-            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .prepare_document(
+                &client_path(path_b.to_string_lossy().into_owned()),
+                ToolKind::Hover,
+            )
             .await
             .unwrap_err();
 
@@ -2493,7 +2552,9 @@ mod tests {
                 max_documents: 1,
                 max_file_size: 0,
             });
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client_a, mut server_a) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client_a);
@@ -2507,7 +2568,10 @@ mod tests {
 
         drop(
             translator
-                .prepare_document(&path_a.to_string_lossy(), ToolKind::Hover)
+                .prepare_document(
+                    &client_path(path_a.to_string_lossy().into_owned()),
+                    ToolKind::Hover,
+                )
                 .await
                 .unwrap(),
         );
@@ -2523,7 +2587,10 @@ mod tests {
         client_b.shutdown().await.unwrap();
 
         let err = translator
-            .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
+            .prepare_document(
+                &client_path(path_b.to_string_lossy().into_owned()),
+                ToolKind::Hover,
+            )
             .await
             .unwrap_err();
         assert_matches!(err, Error::ServerTerminated);
@@ -2586,7 +2653,9 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(extensions)
             .with_router(router);
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client_pyright, mut server_pyright) = fake_lsp_client();
         let (client_pylsp, mut server_pylsp) = fake_lsp_client();
@@ -2595,14 +2664,14 @@ mod tests {
 
         let path = dir.path().join("main.py");
         fs::write(&path, "x = 1").unwrap();
-        let path_str = path.to_string_lossy().to_string();
+        let file = client_path(&path);
 
         let translator = Arc::new(translator);
 
         // rename is claimed by neither server -> NoServerForTool, checked
         // first so it can't be masked by either server's wire state.
         let rename_result = translator
-            .handle_rename(path_str.clone(), pos(1, 1), "renamed".to_string())
+            .handle_rename(file.clone(), pos(1, 1), "renamed".to_string())
             .await;
         assert_matches!(
             rename_result,
@@ -2616,8 +2685,8 @@ mod tests {
         // hover must route to pyright: didOpen + hover request on its wire.
         let hover = {
             let translator = Arc::clone(&translator);
-            let path_str = path_str.clone();
-            tokio::spawn(async move { translator.handle_hover(path_str, pos(1, 1)).await })
+            let file = file.clone();
+            tokio::spawn(async move { translator.handle_hover(file, pos(1, 1)).await })
         };
         let mut wire_pyright = BufReader::new(&mut server_pyright.write_stdout);
         let opened = read_framed_message(&mut wire_pyright).await;
@@ -2643,7 +2712,7 @@ mod tests {
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             tokio::spawn(async move {
                 translator
-                    .handle_diagnostics(path_str, &notification_cache)
+                    .handle_diagnostics(file, &notification_cache)
                     .await
             })
         };
@@ -2707,7 +2776,7 @@ mod tests {
 
         let result = translator
             .handle_rename(
-                "/main.rs".to_string(),
+                client_path("/main.rs"),
                 Position {
                     line: 1,
                     character: 1,
@@ -2734,7 +2803,7 @@ mod tests {
 
         let result = translator
             .handle_rename(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -2767,7 +2836,7 @@ mod tests {
 
         let result = translator
             .handle_code_actions(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -2804,7 +2873,7 @@ mod tests {
 
         let result = translator
             .handle_signature_help(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -2916,7 +2985,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_format_document(path.to_string_lossy().to_string(), 4, true)
+            .handle_format_document(client_path(path.to_string_lossy().into_owned()), 4, true)
             .await;
 
         assert_matches!(
@@ -2943,7 +3012,7 @@ mod tests {
 
         let result = translator
             .handle_call_hierarchy_prepare(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -2975,7 +3044,7 @@ mod tests {
 
         let result = translator
             .handle_inlay_hints(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -3011,7 +3080,7 @@ mod tests {
 
         let result = translator
             .handle_hover(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -3043,7 +3112,7 @@ mod tests {
 
         let result = translator
             .handle_definition(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -3075,7 +3144,7 @@ mod tests {
 
         let result = translator
             .handle_references(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -3102,7 +3171,7 @@ mod tests {
 
         let result = translator
             .handle_completions(
-                "/main.rs".to_string(),
+                client_path("/main.rs"),
                 Position {
                     line: 1,
                     character: 1,
@@ -3129,7 +3198,7 @@ mod tests {
 
         let result = translator
             .handle_completions(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -3161,7 +3230,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_document_symbols(path.to_string_lossy().to_string())
+            .handle_document_symbols(client_path(path.to_string_lossy().into_owned()))
             .await;
 
         assert_matches!(
@@ -3211,7 +3280,7 @@ mod tests {
 
         let result = translator
             .handle_implementation(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -3243,7 +3312,7 @@ mod tests {
 
         let result = translator
             .handle_type_definition(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -3308,7 +3377,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_rename(
-                        path_str,
+                        client_path(path_str),
                         Position {
                             line: 1,
                             character: 1,

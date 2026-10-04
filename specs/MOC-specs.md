@@ -41,6 +41,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 008 | [[mcp/008-manual-lsp-server-restart/spec\|manual-lsp-server-restart]] | enhancement | P2 | draft | #564 |
 | 009 | [[mcp/009-speculative-edit-diagnostic-preview/spec\|speculative-edit-diagnostic-preview]] | research | P4 | draft | #570 |
 | 010 | [[mcp/010-http-session-keepalive-with-live-stream/spec\|http-session-keepalive-with-live-stream]] | enhancement | P3 | implemented | #573 |
+| 011 | [[mcp/011-client-path-boundary-parsing/spec\|client-path-boundary-parsing]] | bug | P2 | implemented (#580) | #575 |
 
 ## bridge
 
@@ -53,8 +54,9 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 005 | [[bridge/005-expose-document-tracker-limits/spec\|expose-document-tracker-limits]] | enhancement | P2 | implemented (#324) | — |
 | 006 | [[bridge/006-lsp-indexing-readiness-gate/spec\|lsp-indexing-readiness-gate]] | bug | P1 | implemented (#421) | #420 |
 | 007 | [[bridge/007-enclosing-symbol-context/spec\|enclosing-symbol-context]] | research | P4 | draft | #565 |
-| 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | draft | #571 |
+| 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | implemented (#580) | #571 |
 | 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | draft | #574 |
+| 010 | [[bridge/010-workspace-containment-single-predicate/spec\|workspace-containment-single-predicate]] | refactor | P2 | implemented (#580) | #558 |
 
 ## runtime
 

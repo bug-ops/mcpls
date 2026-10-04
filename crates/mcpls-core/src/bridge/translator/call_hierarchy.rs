@@ -14,6 +14,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE};
+use crate::bridge::ClientPath;
 use crate::error::{Error, Result};
 
 /// Parsed form of an MCP-facing `CallHierarchyItemResult` JSON value (1-based
@@ -102,7 +103,7 @@ impl Translator {
     /// or the routed server does not advertise `callHierarchyProvider` support.
     pub async fn handle_call_hierarchy_prepare(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         position: Position,
     ) -> Result<CallHierarchyPrepareResult> {
         let Position { line, character } = position;
@@ -338,13 +339,14 @@ mod tests {
     use crate::bridge::translator::testing::*;
     use crate::bridge::{NotificationCache, WorkspaceRoots};
     use crate::config::ServerId;
+    use crate::test_lsp::client_path;
 
     #[tokio::test]
     async fn test_handle_call_hierarchy_prepare_invalid_position_zero() {
         let translator = Translator::new();
         let result = translator
             .handle_call_hierarchy_prepare(
-                "/tmp/test.rs".to_string(),
+                client_path("/tmp/test.rs"),
                 Position {
                     line: 0,
                     character: 1,
@@ -355,7 +357,7 @@ mod tests {
 
         let result = translator
             .handle_call_hierarchy_prepare(
-                "/tmp/test.rs".to_string(),
+                client_path("/tmp/test.rs"),
                 Position {
                     line: 1,
                     character: 0,
@@ -370,7 +372,7 @@ mod tests {
         let translator = Translator::new();
         let result = translator
             .handle_call_hierarchy_prepare(
-                "/tmp/test.rs".to_string(),
+                client_path("/tmp/test.rs"),
                 Position {
                     line: 1_000_001,
                     character: 1,
@@ -381,7 +383,7 @@ mod tests {
 
         let result = translator
             .handle_call_hierarchy_prepare(
-                "/tmp/test.rs".to_string(),
+                client_path("/tmp/test.rs"),
                 Position {
                     line: 1,
                     character: 1_000_001,
@@ -532,12 +534,13 @@ mod tests {
         // A workspace root is required so `validate_path` reaches
         // `canonicalize()` instead of failing closed on `NoWorkspaceRoots`.
         #[cfg(windows)]
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![std::path::PathBuf::from(
-            r"C:\",
-        )]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[std::path::PathBuf::from(r"C:\")]).unwrap(),
+        );
         #[cfg(not(windows))]
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![std::path::PathBuf::from("/")]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[std::path::PathBuf::from("/")]).unwrap(),
+        );
         // `Url::to_file_path` on Windows requires a drive-letter first path
         // segment; a Unix-style path with none fails to convert at all
         // (`uri_to_path` returns `None`, i.e. `Error::InvalidToolParams`)
@@ -581,12 +584,13 @@ mod tests {
         // A workspace root is required so `validate_path` reaches
         // `canonicalize()` instead of failing closed on `NoWorkspaceRoots`.
         #[cfg(windows)]
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![std::path::PathBuf::from(
-            r"C:\",
-        )]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[std::path::PathBuf::from(r"C:\")]).unwrap(),
+        );
         #[cfg(not(windows))]
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![std::path::PathBuf::from("/")]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[std::path::PathBuf::from("/")]).unwrap(),
+        );
         #[cfg(windows)]
         let uri = "file:///C:/this/path/does/not/exist/anywhere.rs";
         #[cfg(not(windows))]
@@ -1211,7 +1215,7 @@ mod tests {
             let path = file_path.to_string_lossy().into_owned();
             tokio::spawn(async move {
                 translator
-                    .handle_call_hierarchy_prepare(path, pos(1, 1))
+                    .handle_call_hierarchy_prepare(client_path(path), pos(1, 1))
                     .await
             })
         };
@@ -1488,7 +1492,7 @@ mod tests {
                 let path = path.to_string_lossy().into_owned();
                 tokio::spawn(async move {
                     translator
-                        .handle_call_hierarchy_prepare(path, pos(1, 1))
+                        .handle_call_hierarchy_prepare(client_path(path), pos(1, 1))
                         .await
                 })
             };

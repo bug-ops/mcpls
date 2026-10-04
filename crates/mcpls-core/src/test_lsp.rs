@@ -488,6 +488,17 @@ pub fn absolute_path(relative: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(root).join(relative)
 }
 
+/// A TOML string literal for `path`, escaped as the TOML grammar requires.
+pub fn toml_path_literal(path: &std::path::Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
+/// A [`ClientPath`](crate::bridge::ClientPath) for a path a test knows is
+/// well-formed.
+pub fn client_path(path: impl AsRef<std::path::Path>) -> crate::bridge::ClientPath {
+    crate::bridge::ClientPath::try_from(path.as_ref().to_path_buf()).unwrap()
+}
+
 /// The `lsp-diagnostics:///` URI of the path [`absolute_path`] returns.
 pub fn absolute_uri(relative: &str) -> String {
     crate::bridge::resources::make_uri(&absolute_path(relative)).unwrap()

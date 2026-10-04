@@ -39,7 +39,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::resources::{CanonicalForm, PublishedDiagnosticsUri};
-use super::{lexically_normalize, uri_to_path};
+use super::{WorkspaceRoots, lexically_normalize, uri_to_path};
 
 /// Maximum canonicalizations running concurrently for one resolver.
 pub const RESOLVE_CONCURRENCY: usize = 8;
@@ -239,7 +239,7 @@ impl PublishedPathResolver {
         }
     }
 
-    /// Resolves `publications` against `canonical_roots`, returning one entry
+    /// Resolves `publications` against `roots`, returning one entry
     /// per input in the same order.
     ///
     /// An entry is `None` for a non-`file:` URI, a path that cannot be
@@ -258,7 +258,7 @@ impl PublishedPathResolver {
     pub async fn resolve_batch(
         &mut self,
         publications: &[Publication<'_>],
-        canonical_roots: &[PathBuf],
+        roots: &WorkspaceRoots,
     ) -> Vec<Option<PublishedDiagnosticsUri>> {
         let sources: Vec<Option<PathBuf>> = publications
             .iter()
@@ -304,7 +304,7 @@ impl PublishedPathResolver {
                     &source,
                     &canonical,
                     form,
-                    canonical_roots,
+                    roots,
                 )
             })
             .collect()
@@ -400,12 +400,9 @@ pub const fn diagnostics(uri: &Uri) -> Publication<'_> {
 
 /// Resolves a single URI with a throwaway resolver.
 #[cfg(test)]
-pub async fn resolve_one(
-    uri: &Uri,
-    canonical_roots: &[PathBuf],
-) -> Option<PublishedDiagnosticsUri> {
+pub async fn resolve_one(uri: &Uri, roots: &WorkspaceRoots) -> Option<PublishedDiagnosticsUri> {
     PublishedPathResolver::new()
-        .resolve_batch(&[diagnostics(uri)], canonical_roots)
+        .resolve_batch(&[diagnostics(uri)], roots)
         .await
         .pop()
         .flatten()
@@ -424,6 +421,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dunce::canonicalize(dir.path()).unwrap();
         (dir, root)
+    }
+
+    fn roots_of(root: &Path) -> WorkspaceRoots {
+        WorkspaceRoots::from_configured(&[root.to_path_buf()]).unwrap()
     }
 
     fn uri(path: &Path) -> Uri {
@@ -473,11 +474,7 @@ mod tests {
         let raw = format!("{}/missing/../link/f.rs", root.display());
         let uri = Uri::from(format!("file://{raw}").as_str());
 
-        assert!(
-            resolve_one(&uri, std::slice::from_ref(&root))
-                .await
-                .is_none()
-        );
+        assert!(resolve_one(&uri, &roots_of(&root)).await.is_none());
     }
 
     #[test]
@@ -548,9 +545,9 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, _| None));
 
-        let roots = std::slice::from_ref(&root);
-        assert!(resolver.resolve_batch(&[diagnostics(&file)], roots).await[0].is_some());
-        assert!(resolver.resolve_batch(&[diagnostics(&file)], roots).await[0].is_some());
+        let roots = roots_of(&root);
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_some());
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_some());
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -563,10 +560,10 @@ mod tests {
         let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, n| {
             (n < 3).then_some(io::ErrorKind::TimedOut)
         }));
-        let roots = std::slice::from_ref(&root);
+        let roots = roots_of(&root);
 
-        assert!(resolver.resolve_batch(&[diagnostics(&file)], roots).await[0].is_none());
-        assert!(resolver.resolve_batch(&[diagnostics(&file)], roots).await[0].is_none());
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_none());
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_none());
 
         assert_eq!(calls.load(Ordering::SeqCst), 3, "held off: no new calls");
     }
@@ -597,9 +594,7 @@ mod tests {
             kind: PublicationKind::Clear,
         };
 
-        let out = resolver
-            .resolve_batch(&[clear], std::slice::from_ref(&root))
-            .await;
+        let out = resolver.resolve_batch(&[clear], &roots_of(&root)).await;
 
         let published = out[0].as_ref().unwrap();
         assert_eq!(published.canonical(), &real);
@@ -621,7 +616,7 @@ mod tests {
         let mut resolver = PublishedPathResolver::with_canonicalizer(failing_then_ok(&calls, 2));
 
         let out = resolver
-            .resolve_batch(&[diagnostics(&file)], std::slice::from_ref(&root))
+            .resolve_batch(&[diagnostics(&file)], &roots_of(&root))
             .await;
 
         assert!(out[0].is_some());
@@ -641,7 +636,7 @@ mod tests {
         };
 
         let out = resolver
-            .resolve_batch(&[diagnostics(&file), clear], std::slice::from_ref(&root))
+            .resolve_batch(&[diagnostics(&file), clear], &roots_of(&root))
             .await;
 
         assert!(out[0].is_none());
@@ -666,9 +661,7 @@ mod tests {
             diagnostics(&a),
         ];
 
-        let out = resolver
-            .resolve_batch(&batch, std::slice::from_ref(&root))
-            .await;
+        let out = resolver.resolve_batch(&batch, &roots_of(&root)).await;
 
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].as_ref().unwrap().source(), &a);
@@ -684,10 +677,7 @@ mod tests {
         let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, _| None));
 
         let out = resolver
-            .resolve_batch(
-                &[diagnostics(&file), diagnostics(&file)],
-                std::slice::from_ref(&root),
-            )
+            .resolve_batch(&[diagnostics(&file), diagnostics(&file)], &roots_of(&root))
             .await;
 
         assert!(out.iter().all(Option::is_some));
@@ -704,9 +694,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, _| None));
 
-        let out = resolver
-            .resolve_batch(&refs, std::slice::from_ref(&root))
-            .await;
+        let out = resolver.resolve_batch(&refs, &roots_of(&root)).await;
 
         assert_eq!(out.len(), 5000);
         for (input, resolved) in uris.iter().zip(&out) {
@@ -739,9 +727,7 @@ mod tests {
         });
         let mut resolver = PublishedPathResolver::with_canonicalizer(canon);
 
-        let out = resolver
-            .resolve_batch(&refs, std::slice::from_ref(&root))
-            .await;
+        let out = resolver.resolve_batch(&refs, &roots_of(&root)).await;
 
         assert_eq!(out.len(), 40);
         for (input, resolved) in uris.iter().zip(&out) {
@@ -762,11 +748,11 @@ mod tests {
             Ok(p.to_path_buf())
         });
         let mut resolver = PublishedPathResolver::with_canonicalizer(canon);
-        let roots = std::slice::from_ref(&root);
+        let roots = roots_of(&root);
 
         let timed_out = tokio::time::timeout(
             Duration::from_millis(50),
-            resolver.resolve_batch(&[diagnostics(&file)], roots),
+            resolver.resolve_batch(&[diagnostics(&file)], &roots),
         )
         .await;
 

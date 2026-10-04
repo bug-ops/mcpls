@@ -68,16 +68,16 @@ pub struct Location {
     /// workspace root (e.g. the standard library or a crates.io dependency).
     ///
     /// Advisory only, not a security/safety guarantee: read-only navigation
-    /// results are never filtered by workspace containment (see
-    /// `bridge::uri_in_workspace_roots`'s docs for why), so callers that
-    /// want to apply their own policy toward out-of-workspace locations can
-    /// check this flag. The underlying check is purely lexical -- it does
-    /// not resolve symlinks -- so a location reached through a symlinked
-    /// workspace root (e.g. macOS's `/var` -> `/private/var`, or a package
-    /// manager's symlinked dependency store) can read `true` even though it
-    /// is genuinely inside the workspace. Also always `true` when no
-    /// workspace roots are configured, consistent with
-    /// `bridge::uri_in_workspace_roots`'s fail-closed convention: without a
+    /// results are never filtered by workspace containment (a legitimate
+    /// result routinely points into the standard library or a dependency),
+    /// so callers that want to apply their own policy toward out-of-workspace
+    /// locations can check this flag. The check is purely lexical -- it does
+    /// not resolve symlinks. A root counts together with the spellings it
+    /// was configured or launched under (for example a symlinked path or the
+    /// shell's logical working directory), but a location reached through any
+    /// other symlink (e.g. a package manager's symlinked dependency store)
+    /// can read `true` even though it is genuinely inside the workspace. Also
+    /// always `true` when no workspace roots are configured: without a
     /// configured root, nothing can be vouched for as inside the workspace.
     /// Omitted (defaults to `false`) when serialized.
     #[serde(default, skip_serializing_if = "is_false")]
