@@ -455,7 +455,10 @@ impl std::str::FromStr for HttpPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamLiveness {
     /// Never probe; a vanished peer is noticed only when the OS gives up on
-    /// the connection.
+    /// the connection. Without proof of life an open GET stream does not keep
+    /// its session alive: the session expires after the idle timeout (5
+    /// minutes) without inbound requests, even while the stream receives
+    /// notifications.
     Disabled,
     /// Probe every `interval`; close the stream when unanswered for
     /// `deadline`.
@@ -812,11 +815,11 @@ pub(crate) async fn run_stdio(
 ///
 /// A session is closed, freeing its `max_concurrent_sessions` permit, once it
 /// has had no inbound client activity and no open response stream (POST or
-/// GET) for [`IdleTimeout::DEFAULT`] (5 minutes), swept every fifth of that.
-/// Outbound `resources/updated` notifications do not count as activity, unlike
-/// rmcp's own `keep_alive` timer, which each one re-arms (#521). The idle clock
-/// starts at the later of the last inbound request and the moment the last
-/// stream closed. A client that closes its connections cleanly is noticed on
+/// probed GET) for [`IdleTimeout::DEFAULT`] (5 minutes), swept every fifth of
+/// that. This reaper is the only expiry owner: rmcp's own `keep_alive` timer is
+/// switched off, so neither outbound `resources/updated` notifications (#521)
+/// nor SSE pings affect expiry. The idle clock starts at the later of the last
+/// inbound request and the moment the last stream closed. A client that closes its connections cleanly is noticed on
 /// the next write, at most one SSE keep-alive (15 s) later. A silently vanished
 /// peer (half-open TCP: sleeping laptop, dropped NAT mapping) is detected by
 /// the liveness probe above: its stream closes within one probe interval plus
@@ -829,13 +832,17 @@ pub(crate) async fn run_stdio(
 /// behind the recommended reverse proxy the accepted socket faces the proxy,
 /// so the proxy's own timeouts govern that hop. A client that stops reading
 /// with a full receive window for longer than the timeout may be dropped too.
-/// With probing disabled and no such timeout, a vanished peer holds its stream
-/// until the OS gives up retransmitting (roughly 15-30 minutes on Linux). A
-/// client that answers probes and keeps a GET stream open is never reaped by
-/// mcpls, but rmcp's own 5-minute `keep_alive` still ends a session that sees
-/// no event at all in that time (SSE pings do not count). Clients should send
-/// `DELETE` on shutdown; after an expiry they must re-initialize and
-/// re-subscribe.
+/// A client that answers probes and keeps a GET stream open is never reaped
+/// (#573). With [`StreamLiveness::Disabled`] there is no proof of life, so an
+/// open GET stream does not hold its session: the session expires
+/// [`IdleTimeout::DEFAULT`] after the last inbound request even while the stream
+/// receives notifications, and such clients must send a request (any `POST`,
+/// for example a `ping`) more often than that. A POST response stream whose
+/// peer vanished mid-write keeps its session until TCP gives up on the
+/// connection (the `TCP_USER_TIMEOUT` above on Linux and Android, the OS
+/// default elsewhere, or the reverse proxy's timeout), since rmcp's `keep_alive`
+/// no longer frees it after 5 minutes. Clients should send `DELETE` on
+/// shutdown; after an expiry they must re-initialize and re-subscribe.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
 /// "one instance per request"; `resources/subscribe`/`unsubscribe` detect
@@ -1349,8 +1356,10 @@ struct CappedSessionManager {
 #[cfg(feature = "transport-http")]
 impl CappedSessionManager {
     fn new(max_sessions: SessionLimit, idle: IdleTimeout) -> Self {
+        let mut inner = LocalSessionManager::default();
+        inner.session_config.keep_alive = None;
         Self {
-            inner: std::sync::Arc::new(LocalSessionManager::default()),
+            inner: std::sync::Arc::new(inner),
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_sessions.get())),
             slots: StdMutex::new(std::collections::HashMap::new()),
             idle,
@@ -1404,7 +1413,10 @@ impl CappedSessionManager {
                 .forward(stream, guard)
                 .left_stream()
             }
-            StreamLiveness::Disabled => Self::guarded(guard, stream).right_stream(),
+            StreamLiveness::Disabled => {
+                drop(guard);
+                stream.right_stream()
+            }
         })
     }
 
@@ -1485,9 +1497,12 @@ non_zero_duration! {
     /// Non-zero duration after which a session without inbound client activity
     /// or open response stream is closed by [`run_idle_reaper`].
     ///
-    /// Deliberately separate from rmcp's own `keep_alive`, which measures any
-    /// event on the session -- including outbound notifications -- and so never
-    /// fires for an abandoned but subscribed session (#521).
+    /// The sole session expiry owner: rmcp's own `keep_alive` is disabled
+    /// because it measures any event on the session -- including outbound
+    /// notifications and, for an answering GET listener, nothing at all -- so it
+    /// both never fired for an abandoned but subscribed session (#521) and cut
+    /// off a healthy one (#573). An open response stream holds the session only
+    /// while it is proven alive (a POST stream, or a probed GET stream).
     pub(crate) IdleTimeout, 300, "5 minutes."
 }
 
@@ -3430,16 +3445,27 @@ mod tests {
             assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 0);
 
             drop(stream);
+            tokio::task::yield_now().await;
             tokio::time::advance(std::time::Duration::from_secs(10)).await;
             assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 1);
+        }
+
+        /// A one-session manager with a 10 s idle timeout whose probes are far
+        /// enough apart that they never fire within a test.
+        fn quietly_probing_manager() -> CappedSessionManager {
+            let hour = std::time::Duration::from_secs(3600);
+            CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10))
+                .with_stream_liveness(StreamLiveness::Probe {
+                    interval: ProbeInterval::new(hour).unwrap(),
+                    deadline: ProbeDeadline::new(hour).unwrap(),
+                })
         }
 
         // `manager` lives to the end of the test.
         #[allow(clippy::significant_drop_tightening)]
         #[tokio::test(start_paused = true)]
         async fn test_open_resume_stream_blocks_reaping() {
-            let manager =
-                CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10));
+            let manager = quietly_probing_manager();
             let (id, serving) = initialized_session(&manager).await;
             let stream = manager.resume(&id, "0".to_owned()).await.unwrap();
             assert_open_stream_blocks_reaping(&manager, stream).await;
@@ -3466,8 +3492,7 @@ mod tests {
         #[allow(clippy::significant_drop_tightening)]
         #[tokio::test(start_paused = true)]
         async fn test_open_standalone_stream_blocks_reaping() {
-            let manager =
-                CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10));
+            let manager = quietly_probing_manager();
             let (id, serving) = initialized_session(&manager).await;
             let stream = manager.create_standalone_stream(&id).await.unwrap();
             assert_open_stream_blocks_reaping(&manager, stream).await;
@@ -3539,6 +3564,41 @@ mod tests {
             let manager = probing_manager(PROBE_STEP, PROBE_STEP * 2);
             let (id, serving) = initialized_session(&manager).await;
             (manager, id, serving)
+        }
+
+        /// #573: rmcp's own `keep_alive` must not end a session whose client
+        /// answers probes on an open GET stream.
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_answering_get_listener_outlives_rmcp_keep_alive() {
+            let (manager, id, serving) = probed_session().await;
+            let stream = manager.create_standalone_stream(&id).await.unwrap();
+            let listener = spawn_drain(&manager, &id, stream, true);
+
+            tokio::time::sleep(rmcp::transport::streamable_http_server::session::local::SessionConfig::DEFAULT_KEEP_ALIVE * 2).await;
+
+            assert!(manager.has_session(&id).await.unwrap());
+            assert!(!listener.is_finished());
+            listener.abort();
+            serving.abort();
+        }
+
+        /// With probing off, an open GET stream no longer holds a session: a
+        /// quiet peer that may have vanished expires within the idle timeout.
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_disabled_liveness_get_stream_does_not_block_reaping() {
+            let manager =
+                CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10));
+            let (id, serving) = initialized_session(&manager).await;
+            let _stream = manager.create_standalone_stream(&id).await.unwrap();
+
+            tokio::time::advance(std::time::Duration::from_secs(30)).await;
+
+            assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 1);
+            serving.abort();
         }
 
         // `manager` lives to the end of the test.
