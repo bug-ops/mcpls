@@ -284,7 +284,7 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 > default mcpls pins the TypeScript server's `tsserver` to the one bundled with
 > `typescript-language-server`, for `npm -g` style symlink installs (verified
 > with Homebrew's node) with a global `typescript`. Windows `.cmd` shims, pnpm,
-> Volta, asdf, mise and `npx`/`bunx` launchers are not covered. See [SECURITY.md](SECURITY.md) for the trust model.
+> Volta, asdf, mise and `npx`/`bunx` launchers are not covered (#604). See [SECURITY.md](SECURITY.md) for the trust model.
 
 </details>
 

@@ -192,7 +192,7 @@ Trusting the config is not trusting the workspace: language servers run workspac
 analyze an untrusted checkout only inside a container or disposable VM. For the TypeScript
 server, mcpls pins `tsserver` to the one bundled with `typescript-language-server` on symlink
 installs (`npm -g` style, verified with Homebrew's node) with a global `typescript`; Windows
-`.cmd`, pnpm, Volta, asdf, mise and `npx`/`bunx` launchers are not covered, and `initialization_options.tsserver.path` overrides
+`.cmd`, pnpm, Volta, asdf, mise and `npx`/`bunx` launchers are not covered (#604), and `initialization_options.tsserver.path` overrides
 the pin. See [SECURITY.md](https://github.com/bug-ops/mcpls/blob/main/SECURITY.md).
 
 When a project config is found but ignored, mcpls does not just log a `tracing::warn!`

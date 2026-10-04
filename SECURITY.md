@@ -60,5 +60,5 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   resolved once at startup. The pin narrows one vector. It does not make an
   untrusted workspace safe.
 
-Run `mcpls` against untrusted code only inside an environment you are willing to
+An untrusted-workspace mode is tracked in #603. Run `mcpls` against untrusted code only inside an environment you are willing to
 have that code execute in (a container or a disposable VM).

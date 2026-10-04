@@ -610,8 +610,8 @@ file_patterns = ["**/*.go"]
 
 **Reasons and fixes**:
 - Server not found on `PATH` (resolved from the server's own `env` override, else the mcpls environment): install `typescript-language-server` or fix `command`
-- Windows `.cmd` shim or script launcher (pnpm, Volta, asdf, mise): not covered, so the workspace's tsserver can be selected; point `initialization_options.tsserver.path` at a trusted `tsserver.js` yourself
-- `npx`, `bunx`, `node cli.mjs` or another wrapper that only names the server in `args`: not covered; use the `typescript-language-server` executable as `command`, or set `initialization_options.tsserver.path` yourself
+- Windows `.cmd` shim or script launcher (pnpm, Volta, asdf, mise): not covered (#604), so the workspace's tsserver can be selected; point `initialization_options.tsserver.path` at a trusted `tsserver.js` yourself
+- `npx`, `bunx`, `node cli.mjs` or another wrapper that only names the server in `args`: not covered (#604); use the `typescript-language-server` executable as `command`, or set `initialization_options.tsserver.path` yourself
 - No valid `typescript` package (with a `package.json` `version`) next to the server: install it globally (`npm install -g typescript`)
 - You set `initialization_options` for the server without `tsserver.path`: the pin is skipped; add `tsserver.path` to keep it
 - A warning after startup that the server reports a version source other than `user-setting`: the pin did not take effect, for example after a restart with a stale pin

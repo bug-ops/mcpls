@@ -64,7 +64,7 @@ willing to have that code execute in (a container or a disposable VM).
 `typescript-language-server` as `initializationOptions.tsserver.path`, so a workspace's own
 `node_modules` tsserver is not selected. Covered: `npm -g` style symlink installs (verified with
 Homebrew's node) that have a global `typescript` package with a `package.json` `version` next to
-the server. Not covered, with a warning logged: Windows `.cmd` shims, script launchers (pnpm,
+the server. Not covered (#604), with a warning logged: Windows `.cmd` shims, script launchers (pnpm,
 Volta, asdf, mise), `npx`/`bunx`/`node cli.mjs` wrappers, and installs with no valid `typescript`
 package. A server installed inside the workspace is pinned with a warning, but that narrows
 nothing because the server itself is workspace code. A

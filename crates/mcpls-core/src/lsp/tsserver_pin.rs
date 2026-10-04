@@ -181,7 +181,7 @@ fn bundled_tsserver(package_dir: &Path) -> Option<PathBuf> {
 ///
 /// `PATH` is read as the child sees it: the config's `env` override, else
 /// `parent_env`.
-// TODO(review): identify typescript-language-server launched via npx/bunx/node args and pin it, or resolve .cmd and script shims (pnpm, Volta, asdf/mise) to the package dir, so the pin covers them
+// TODO(#604): pin npx/bunx/node launchers, .cmd and script shims (pnpm, Volta, asdf/mise)
 pub fn resolve(
     config: &LspServerConfig,
     parent_env: impl Fn(&str) -> Option<OsString>,

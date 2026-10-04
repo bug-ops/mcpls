@@ -321,7 +321,7 @@ and no configured or logical spelling covers it. Status: implemented.
 
 Non-goals: links not located directly under `/` (`~/link`) stay unadmitted unless configured, and
 `Location.out_of_workspace` stays canonical-only, so a `/tmp`-spelled server location may still read
-`out_of_workspace: true`. Non-Unix platforms add no system aliases.
+`out_of_workspace: true` (alias-aware flag: #605). Non-Unix platforms add no system aliases.
 
 Tests: a unix symlink-table test over a tempdir standing in for `/`, a forged-alias test
 (`p/a/../b` lexically vs physically), an unreadable-directory test, `..`/sibling rejection without

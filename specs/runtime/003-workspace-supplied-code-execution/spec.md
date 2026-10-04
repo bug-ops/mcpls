@@ -28,7 +28,7 @@ related:
 ## Decision (#566): documentation plus a best-effort tsserver pin
 
 > [!important] Resolved
-> Scope: FR-001 to FR-006, FR-009 implemented. FR-007 and FR-008 (untrusted-workspace mode) are
+> Scope: FR-001 to FR-006, FR-009 implemented. FR-007 and FR-008 (untrusted-workspace mode, #603) are
 > deferred to a follow-up issue. Open questions 1 to 3, 7 and 8 are answered below.
 
 - **Docs.** `SECURITY.md` carries the per-server trust table, the `--trust-project-config`

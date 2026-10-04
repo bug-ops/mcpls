@@ -65,7 +65,7 @@ tools declare `context` in their schemas, and an unknown `context` field sent to
 ignored rather than rejected (`#[serde(flatten)]` position structs are incompatible with
 `deny_unknown_fields`); schema absence is the contract.
 
-Out of scope, recorded: `go_to_declaration` (added after this spec; it shares the location shape and can adopt `context` later), `get_cached_diagnostics`, hit-line snippets, grouping by symbol, call
+Out of scope, recorded: `go_to_declaration` (#608) (added after this spec; it shares the location shape and can adopt `context` later), `get_cached_diagnostics`, hit-line snippets, grouping by symbol, call
 hierarchy and workspace-symbol enrichment, cross-call symbol-tree caching.
 
 ## 1. Overview

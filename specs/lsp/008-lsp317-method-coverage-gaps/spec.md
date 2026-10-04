@@ -77,13 +77,13 @@ related:
   (rust-analyzer's "Invalid offset" text) is checked first and stays a caller-fault error.
 - **Highlights (FR-025).** `kind` is `text`, `read` or `write`; an omitted or custom kind maps to
   `text`.
-- **Known deviations.** FR-027 rejects zero, oversized and reversed ranges but does not check the
+- **Known deviations.** (Position and range bounds against document content: #607; `tab_size` bound: #606.) FR-027 rejects zero, oversized and reversed ranges but does not check the
   range against the document's length, like `get_code_actions` and `get_inlay_hints`. clangd reports
   both "no symbol at this position" and "line out of range" as `-32001` with different messages, so
   its non-renameable answer surfaces as a server error rather than `not_renameable`.
 
 > [!abstract]
-> mcpls exposed 21 MCP tools when this was written (23 now, including `go_to_declaration`), covering most LSP 3.17 navigation and editing requests. Six
+> mcpls exposed 21 MCP tools when this was written (29 now, including `go_to_declaration` and the tools this spec added), covering most LSP 3.17 navigation and editing requests. Six
 > request methods remain unexposed while competing bridges already ship them:
 > `textDocument/declaration`, `textDocument/prepareTypeHierarchy` with
 > `typeHierarchy/supertypes` and `typeHierarchy/subtypes`, `textDocument/prepareRename`,
