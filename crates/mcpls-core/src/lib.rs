@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use bridge::{NotificationCache, Translator, WorkspaceRoots};
-pub use config::{ProjectConfigTrust, ServerConfig};
+pub use config::{ProjectConfigStatus, ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
 use futures::FutureExt as _;
@@ -721,7 +721,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             config.workspace.indexing_ready_timeout_seconds,
         ));
     // moved, not cloned -- `config`'s last use is above
-    let (project_config_ignored, mcp) = (config.project_config_ignored, config.mcp);
+    let (project_config_status, mcp) = (config.project_config_status, config.mcp);
     translator.set_workspace_roots(workspace_roots.clone());
 
     // Mark applicable servers as "expected" so a tool call that arrives while
@@ -776,7 +776,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Arc::clone(&notification_cache),
         workspace_roots,
         subscription_registry,
-        project_config_ignored,
+        project_config_status,
         mcp,
     );
     info!("MCPLS server initialized successfully");
@@ -1908,7 +1908,7 @@ mod tests {
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
                 }],
-                project_config_ignored: false,
+                project_config_status: ProjectConfigStatus::NotIgnored,
             };
 
             // serve() proceeds to run the MCP server and blocks on the stdio
@@ -1950,7 +1950,7 @@ mod tests {
                     indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
                 },
                 lsp_servers: vec![],
-                project_config_ignored: false,
+                project_config_status: ProjectConfigStatus::NotIgnored,
             };
 
             let result = serve(config).await;
@@ -2008,7 +2008,7 @@ mod tests {
                     indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
                 },
                 lsp_servers: vec![],
-                project_config_ignored: false,
+                project_config_status: ProjectConfigStatus::NotIgnored,
             };
 
             // serve() with no LSP servers configured blocks on the stdio
@@ -2073,7 +2073,7 @@ mod tests {
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
                 }],
-                project_config_ignored: false,
+                project_config_status: ProjectConfigStatus::NotIgnored,
             };
 
             // `validate()` runs before any spawn/transport work and should
@@ -3268,7 +3268,7 @@ mod tests {
                 make_cache(),
                 WorkspaceRoots::resolve(vec![root.clone()]),
                 subs.clone(),
-                false,
+                ProjectConfigStatus::NotIgnored,
                 config::McpConfig::default(),
             );
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -3361,7 +3361,7 @@ mod tests {
                     make_cache(),
                     WorkspaceRoots::resolve(vec![root]),
                     subs.clone(),
-                    false,
+                    ProjectConfigStatus::NotIgnored,
                     config::McpConfig::default(),
                 );
                 let (client_io, server_io) = tokio::io::duplex(64 * 1024);

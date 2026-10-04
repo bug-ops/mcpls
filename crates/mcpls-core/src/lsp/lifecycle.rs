@@ -29,7 +29,7 @@ use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 use crate::lsp::process::ServerProcess;
-use crate::lsp::stderr::StderrCapture;
+use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 use crate::redaction::Redactions;
@@ -395,20 +395,7 @@ impl LspServer {
                 Some((name.into_string().ok()?, value.into_string().ok()?))
             }),
         ));
-        info!(
-            "Spawning LSP server: {} ({} arg(s))",
-            config.server_config.command,
-            config.server_config.args.len()
-        );
-        debug!(
-            "LSP server args: {:?}",
-            config
-                .server_config
-                .args
-                .iter()
-                .map(|arg| redactions.apply(arg))
-                .collect::<Vec<_>>()
-        );
+        Self::log_spawn(&config.server_config, &redactions);
 
         let command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
 
@@ -465,9 +452,12 @@ impl LspServer {
             Ok(negotiated) => negotiated,
             Err(init_error) if is_connection_loss(&init_error) => {
                 let exit_status = early_exit_status(&mut child).await;
-                let stderr = stderr_capture
-                    .finish(exit_status.is_some(), &redactions)
-                    .await;
+                let eof_wait = if exit_status.is_some() {
+                    EofWait::Grace
+                } else {
+                    EofWait::Skip
+                };
+                let stderr = stderr_capture.finish(eof_wait, &redactions).await;
                 return Err(match exit_status {
                     Some(status) => Error::ServerExitedDuringInit {
                         command: config.server_config.command.clone(),
@@ -484,7 +474,7 @@ impl LspServer {
                 // The server may be about to exit after printing its reason,
                 // so wait the (bounded) end-of-file grace whether or not it
                 // has exited yet.
-                let stderr = stderr_capture.finish(true, &redactions).await;
+                let stderr = stderr_capture.finish(EofWait::Grace, &redactions).await;
                 return Err(Error::LspInitFailed { message, stderr });
             }
             Err(init_error) => return Err(init_error),
@@ -501,6 +491,24 @@ impl LspServer {
             child: Some(child),
             init_config: config,
         })
+    }
+
+    /// Logs the command and argument count at `info`, and the argument values
+    /// (redacted) only at `debug`.
+    fn log_spawn(server_config: &LspServerConfig, redactions: &Redactions) {
+        info!(
+            "Spawning LSP server: {} ({} arg(s))",
+            server_config.command,
+            server_config.args.len()
+        );
+        debug!(
+            "LSP server args: {:?}",
+            server_config
+                .args
+                .iter()
+                .map(|arg| redactions.apply(arg))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Build the child `Command` for a spawned LSP server, without spawning it.
@@ -1949,6 +1957,45 @@ echo 'fatal: bad toolchain' >&2
         assert!(text.contains("token=[redacted:API_TOKEN]"), "{text}");
         assert!(text.contains("toolchain=nightly-2024-01-01"), "{text}");
         assert!(!text.contains("s3cr3t-value"), "{text}");
+    }
+
+    #[test]
+    fn test_log_spawn_hides_argument_values() {
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let mut config = LspServerConfig::rust_analyzer();
+        config.args = vec!["--api-key=SuperSecretArg456".to_string()];
+        let redactions = Redactions::for_server(&config, std::iter::empty());
+        let info_only = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer({
+                        let writer = buf.clone();
+                        move || writer.clone()
+                    })
+                    .with_ansi(false),
+            );
+
+        tracing::subscriber::with_default(info_only, || {
+            LspServer::log_spawn(&config, &redactions);
+        });
+        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("(1 arg(s))"), "{output}");
+        assert!(!output.contains("SuperSecretArg456"), "{output}");
     }
 
     /// `window/logMessage` and `window/showMessage` text echoing configured

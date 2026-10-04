@@ -562,7 +562,7 @@ impl LspClient {
                     // read it again -- drop the now-orphaned entry instead of
                     // leaking it in `pending_requests` forever.
                     self.pending_requests.lock().await.remove(&id);
-                    return Err(Error::Timeout(timeout_duration.as_secs()));
+                    return Err(Error::Timeout(timeout_duration));
                 }
             };
 
@@ -1724,7 +1724,7 @@ mod tests {
             tokio::time::advance(TIMEOUT + Duration::from_secs(1)).await;
             assert_matches!(
                 first.await.unwrap(),
-                Err(Error::Timeout(5)),
+                Err(Error::Timeout(limit)) if limit == TIMEOUT,
                 "request awaiting its reply must time out"
             );
             assert!(

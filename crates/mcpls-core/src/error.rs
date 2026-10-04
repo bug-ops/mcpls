@@ -544,9 +544,9 @@ pub enum Error {
     #[error("transport error: {0}")]
     Transport(String),
 
-    /// Request timeout.
-    #[error("request timed out after {0} seconds")]
-    Timeout(u64),
+    /// Request timeout, carrying the elapsed limit.
+    #[error("request timed out after {0:?}")]
+    Timeout(Duration),
 
     /// LSP server failed to spawn.
     #[error("failed to spawn LSP server '{command}': {source}")]
@@ -1314,8 +1314,14 @@ mod tests {
 
     #[test]
     fn test_error_display_timeout() {
-        let err = Error::Timeout(30);
-        assert_eq!(err.to_string(), "request timed out after 30 seconds");
+        assert_eq!(
+            Error::Timeout(Duration::from_secs(30)).to_string(),
+            "request timed out after 30s"
+        );
+        assert_eq!(
+            Error::Timeout(Duration::from_millis(500)).to_string(),
+            "request timed out after 500ms"
+        );
     }
 
     #[test]

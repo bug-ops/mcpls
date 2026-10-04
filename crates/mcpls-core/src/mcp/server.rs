@@ -46,7 +46,7 @@ use crate::bridge::{
     ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator, WorkspaceRoots,
     WorkspaceSymbolResult, validate_path_against_roots,
 };
-use crate::config::{McpConfig, ToolPrefix};
+use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 
 /// Built-in `serverInfo.title`, used when `[mcp].title` is not configured.
 const DEFAULT_SERVER_TITLE: &str = "MCPLS - MCP to LSP Bridge";
@@ -379,9 +379,9 @@ impl McplsServer {
     /// [`Self::for_new_session`] for how per-HTTP-session isolation builds on
     /// top of that.
     ///
-    /// `project_config_ignored` reports whether a CWD-discovered
+    /// `project_config_status` reports whether a CWD-discovered
     /// `./mcpls.toml` was skipped as untrusted when the active config was
-    /// loaded (see [`ServerConfig::project_config_ignored`](crate::config::ServerConfig::project_config_ignored));
+    /// loaded (see [`ServerConfig::project_config_status`](crate::config::ServerConfig::project_config_status));
     /// `get_info` surfaces it in [`RmcpServerConfig::instructions`]. `mcp` carries
     /// the configured `[mcp]` presentation overrides (see
     /// [`crate::config::McpConfig`]), also read by `get_info`.
@@ -391,7 +391,7 @@ impl McplsServer {
         notification_cache: Arc<Mutex<NotificationCache>>,
         workspace_roots: WorkspaceRoots,
         subscription_registry: SubscriptionRegistry,
-        project_config_ignored: bool,
+        project_config_status: ProjectConfigStatus,
         mcp: McpConfig,
     ) -> Self {
         let tool_router = Arc::new(Self::build_tool_router(mcp.tool_prefix.as_ref()));
@@ -400,7 +400,7 @@ impl McplsServer {
             notification_cache,
             workspace_roots,
             subscription_registry,
-            project_config_ignored,
+            project_config_status,
             mcp,
         ));
         Self {
@@ -431,7 +431,7 @@ impl McplsServer {
     /// use std::sync::Arc;
     ///
     /// use mcpls_core::bridge::{NotificationCache, Translator, WorkspaceRoots};
-    /// use mcpls_core::config::McpConfig;
+    /// use mcpls_core::config::{McpConfig, ProjectConfigStatus};
     /// use mcpls_core::mcp::{McplsServer, SubscriptionRegistry};
     /// use tokio::sync::Mutex;
     ///
@@ -440,7 +440,7 @@ impl McplsServer {
     ///     Arc::new(Mutex::new(NotificationCache::new())),
     ///     WorkspaceRoots::default(),
     ///     SubscriptionRegistry::new(),
-    ///     false,
+    ///     ProjectConfigStatus::NotIgnored,
     ///     McpConfig::default(),
     /// );
     /// // One `McplsServer` clone per HTTP session; each gets isolated resource
@@ -454,7 +454,7 @@ impl McplsServer {
             notification_cache: Arc::clone(&self.context.notification_cache),
             workspace_roots: self.context.workspace_roots.clone(),
             session: self.context.session.sibling(),
-            project_config_ignored: self.context.project_config_ignored,
+            project_config_status: self.context.project_config_status,
             mcp: self.context.mcp.clone(),
         });
         Self {
@@ -1512,7 +1512,7 @@ impl ServerHandler for McplsServer {
             )
         });
 
-        if self.context.project_config_ignored {
+        if self.context.project_config_status == ProjectConfigStatus::IgnoredUntrusted {
             instructions.push_str(
                 " NOTE: a project-local mcpls.toml was found in the current directory but \
                  ignored as untrusted; the server is running on built-in defaults or a global \
@@ -1537,19 +1537,19 @@ mod tests {
     use crate::mcp::tool_support::ToolBackend;
 
     fn create_test_server() -> McplsServer {
-        create_test_server_with_ignored_flag(false)
+        create_test_server_with_status(ProjectConfigStatus::NotIgnored)
     }
 
-    fn create_test_server_with_ignored_flag(project_config_ignored: bool) -> McplsServer {
-        create_test_server_with_mcp_config(project_config_ignored, McpConfig::default())
+    fn create_test_server_with_status(project_config_status: ProjectConfigStatus) -> McplsServer {
+        create_test_server_with_mcp_config(project_config_status, McpConfig::default())
     }
 
     fn create_test_server_with_mcp_config(
-        project_config_ignored: bool,
+        project_config_status: ProjectConfigStatus,
         mcp: McpConfig,
     ) -> McplsServer {
         let workspace_roots = WorkspaceRoots::default();
-        create_test_server_with_workspace_roots(project_config_ignored, mcp, workspace_roots)
+        create_test_server_with_workspace_roots(project_config_status, mcp, workspace_roots)
     }
 
     /// Like [`create_test_server_with_mcp_config`], for tests that exercise a
@@ -1557,7 +1557,7 @@ mod tests {
     /// workspace root -- an empty one now makes `validate_path_against_roots`
     /// fail closed with `Error::NoWorkspaceRoots`.
     fn create_test_server_with_workspace_roots(
-        project_config_ignored: bool,
+        project_config_status: ProjectConfigStatus,
         mcp: McpConfig,
         workspace_roots: WorkspaceRoots,
     ) -> McplsServer {
@@ -1568,7 +1568,7 @@ mod tests {
             notification_cache,
             workspace_roots,
             SubscriptionRegistry::new(),
-            project_config_ignored,
+            project_config_status,
             mcp,
         )
     }
@@ -1602,7 +1602,7 @@ mod tests {
         let test_file = temp_dir.path().join("file.rs");
         std::fs::write(&test_file, "fn main() {}").unwrap();
         let server = create_test_server_with_workspace_roots(
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
@@ -1795,7 +1795,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_info_omits_ignore_notice_when_not_ignored() {
-        let server = create_test_server_with_ignored_flag(false);
+        let server = create_test_server_with_status(ProjectConfigStatus::NotIgnored);
         let info = server.get_info();
 
         assert!(!info.instructions.unwrap().contains("ignored as untrusted"));
@@ -1803,7 +1803,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_info_surfaces_ignored_project_config() {
-        let server = create_test_server_with_ignored_flag(true);
+        let server = create_test_server_with_status(ProjectConfigStatus::IgnoredUntrusted);
         let info = server.get_info();
 
         let instructions = info.instructions.unwrap();
@@ -1813,7 +1813,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_info_default_mcp_config_uses_built_in_text() {
-        let server = create_test_server_with_mcp_config(false, McpConfig::default());
+        let server = create_test_server_with_mcp_config(
+            ProjectConfigStatus::NotIgnored,
+            McpConfig::default(),
+        );
         let info = server.get_info();
 
         assert_eq!(
@@ -1835,7 +1838,8 @@ mod tests {
             tool_prefix: Some("p".parse().unwrap()),
             ..McpConfig::default()
         };
-        let info = create_test_server_with_mcp_config(false, mcp).get_info();
+        let info =
+            create_test_server_with_mcp_config(ProjectConfigStatus::NotIgnored, mcp).get_info();
 
         assert!(info.instructions.unwrap().contains("p_get_tool_support"));
     }
@@ -1848,7 +1852,7 @@ mod tests {
             instructions: Some("Custom instructions.".to_string()),
             tool_prefix: None,
         };
-        let server = create_test_server_with_mcp_config(false, mcp);
+        let server = create_test_server_with_mcp_config(ProjectConfigStatus::NotIgnored, mcp);
         let info = server.get_info();
 
         assert_eq!(info.server_info.title.as_deref(), Some("Custom Title"));
@@ -1873,7 +1877,7 @@ mod tests {
             instructions: Some(instructions.clone()),
             tool_prefix: None,
         };
-        let server = create_test_server_with_mcp_config(true, mcp);
+        let server = create_test_server_with_mcp_config(ProjectConfigStatus::IgnoredUntrusted, mcp);
         let info = server.get_info();
 
         let returned_instructions = info.instructions.unwrap();
@@ -2007,7 +2011,7 @@ mod tests {
             Arc::clone(&notification_cache),
             WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
 
@@ -2072,7 +2076,7 @@ mod tests {
             Arc::clone(&notification_cache),
             WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
 
@@ -2145,7 +2149,7 @@ mod tests {
             Arc::clone(&notification_cache),
             WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
 
@@ -2222,7 +2226,7 @@ mod tests {
             Arc::clone(&cache),
             WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         ));
         DiagnosticsFixture {
@@ -2529,7 +2533,7 @@ mod tests {
             Arc::clone(&notification_cache),
             WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
 
@@ -2712,7 +2716,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let server = create_test_server_with_workspace_roots(
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
@@ -2749,7 +2753,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let server = create_test_server_with_workspace_roots(
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
@@ -2823,7 +2827,7 @@ mod tests {
         fs::write(&test_file, "héllo").unwrap();
 
         let server = create_test_server_with_workspace_roots(
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
@@ -2896,7 +2900,7 @@ mod tests {
         fs::write(&test_file, "héllo").unwrap();
 
         let server = create_test_server_with_workspace_roots(
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
@@ -2985,7 +2989,7 @@ mod tests {
             Arc::clone(&notification_cache),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
 
@@ -3041,7 +3045,7 @@ mod tests {
             Arc::clone(&notification_cache),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
 
@@ -3094,7 +3098,7 @@ mod tests {
             Arc::clone(&notification_cache),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
 
@@ -3200,7 +3204,7 @@ sleep 0.3
             Arc::clone(&notification_cache),
             WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
 
@@ -3249,7 +3253,7 @@ sleep 0.3
         std::fs::write(&test_file, "fn main() {}").unwrap();
 
         let server = create_test_server_with_workspace_roots(
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
             WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
         );
@@ -3269,7 +3273,7 @@ sleep 0.3
     async fn test_cached_diagnostics_tool_nonexistent_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let server = create_test_server_with_workspace_roots(
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
             WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
         );
@@ -3322,7 +3326,7 @@ sleep 0.3
             Arc::new(Mutex::new(NotificationCache::new())),
             WorkspaceRoots::resolve(vec![root]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
         (dir, file, server)
@@ -4229,7 +4233,7 @@ sleep 0.3
         std::fs::write(&file, "fn main() {}").unwrap();
         let uri = make_uri(&file).unwrap();
         let server = create_test_server_with_workspace_roots(
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
             WorkspaceRoots::resolve(vec![root]),
         );
@@ -4409,7 +4413,7 @@ sleep 0.3
             Arc::new(Mutex::new(NotificationCache::new())),
             WorkspaceRoots::resolve(vec![root.clone()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
         StartupFixture {
@@ -4692,7 +4696,7 @@ sleep 0.3
             Arc::new(Mutex::new(NotificationCache::new())),
             WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             mcp,
         );
         SupportFixture {
@@ -5153,7 +5157,7 @@ sleep 0.3
             Arc::new(Mutex::new(NotificationCache::new())),
             WorkspaceRoots::default(),
             SubscriptionRegistry::new(),
-            false,
+            ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
         let report = report_json(&server, None);
@@ -5250,7 +5254,7 @@ sleep 0.3
             tool_prefix: Some("p".parse().unwrap()),
             ..McpConfig::default()
         };
-        let server = create_test_server_with_mcp_config(false, mcp);
+        let server = create_test_server_with_mcp_config(ProjectConfigStatus::NotIgnored, mcp);
 
         assert!(server.get_tool("p_get_hover").is_some());
         assert!(server.get_tool("get_hover").is_none());

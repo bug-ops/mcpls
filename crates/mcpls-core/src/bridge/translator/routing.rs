@@ -2015,7 +2015,7 @@ mod tests {
                 indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
             },
             lsp_servers: vec![],
-            project_config_ignored: false,
+            project_config_status: crate::ProjectConfigStatus::NotIgnored,
         };
 
         let extension_map = config.build_effective_extension_map();

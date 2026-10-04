@@ -1762,7 +1762,7 @@ mod tests {
             notification_cache,
             workspace_roots,
             subs,
-            false,
+            crate::ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
         let outcome = tokio::time::timeout(
@@ -1876,7 +1876,7 @@ mod tests {
                 notification_cache,
                 workspace_roots,
                 subs,
-                false,
+                crate::ProjectConfigStatus::NotIgnored,
                 McpConfig::default(),
             );
 
@@ -1972,7 +1972,7 @@ mod tests {
                 notification_cache,
                 workspace_roots,
                 subs,
-                false,
+                crate::ProjectConfigStatus::NotIgnored,
                 McpConfig::default(),
             );
 
@@ -2228,7 +2228,7 @@ mod tests {
                 notification_cache,
                 workspace_roots,
                 subs,
-                false,
+                crate::ProjectConfigStatus::NotIgnored,
                 McpConfig::default(),
             )
         }
@@ -3791,7 +3791,7 @@ mod tests {
                 cache,
                 WorkspaceRoots::resolve(vec![root]),
                 crate::mcp::SubscriptionRegistry::new(),
-                false,
+                crate::ProjectConfigStatus::NotIgnored,
                 crate::config::McpConfig::default(),
             );
             let registry = server.subscription_registry();
