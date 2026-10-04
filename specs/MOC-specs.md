@@ -23,7 +23,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 004 | [[lsp/004-lsp-318-draft-gaps/spec\|lsp-318-draft-gaps]] | research | P3 (bumped from P4, 2026-09-21, SC-003: LSP 3.18 finalized) | draft | #299 (also #116, resolved by #124; #290 resolved by #289/#291); #477 (SC-003 re-assessment, resolved) |
 | 005 | [[lsp/005-lsp-content-modified-retry/spec\|lsp-content-modified-retry]] | bug | P2 | implemented (#390) | #382 |
 | 006 | [[lsp/006-server-spawn-install-hint/spec\|server-spawn-install-hint]] | research | P3 | implemented (#530) | #494 |
-| 007 | [[lsp/007-lsp-child-process-lifetime/spec\|lsp-child-process-lifetime]] | enhancement | P2 | implemented (#PR) | #526 |
+| 007 | [[lsp/007-lsp-child-process-lifetime/spec\|lsp-child-process-lifetime]] | enhancement | P2 | implemented (#546) | #526 |
 
 ## mcp
 
