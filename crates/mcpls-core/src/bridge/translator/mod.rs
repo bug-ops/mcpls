@@ -432,14 +432,14 @@ impl Translator {
     /// # Limitations
     ///
     /// This only runs on the normal shutdown path (stdio EOF, `SIGTERM`/
-    /// `SIGINT`, or the HTTP transport's own graceful shutdown). This crate's
-    /// workspace `[profile.release]` builds with `panic = "abort"`, so a
-    /// panic reachable from a request handler or background pump task in a
-    /// release build still terminates the process without unwinding — this
-    /// method never runs, and spawned LSP children are orphaned exactly as
-    /// before this fix. Making that path safe would need process-group
-    /// isolation (`kill_on_drop` alone doesn't help, since no `Drop` runs
-    /// either); tracked separately, out of scope here.
+    /// `SIGINT`, or the HTTP transport's own graceful shutdown). A panic is
+    /// covered separately: release builds unwind, and the binary's `main`
+    /// shuts the runtime down so every task, and with it every LSP child
+    /// (`kill_on_drop`), is dropped. LSP children can still outlive mcpls
+    /// when no Rust code runs: the parent killed by `SIGKILL` or the OOM
+    /// killer, the forced `exit(1)` on a second signal during shutdown, or a
+    /// panic inside a `Drop` during unwinding. Compliant servers also exit
+    /// on stdin EOF or when their `processId` dies.
     ///
     /// `pub(crate)` rather than `pub`: this is meant for exactly one call
     /// site (`serve_with`'s post-transport shutdown sequence), after the MCP

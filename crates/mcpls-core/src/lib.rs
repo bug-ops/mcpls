@@ -896,8 +896,7 @@ async fn shutdown(
         }
     });
     // Aborts `force_exit_on_signal` on every exit from this scope, including
-    // an unwind out of `shutdown_servers().await` below (debug builds only;
-    // release uses `panic = "abort"`) — otherwise that path would merely
+    // an unwind out of `shutdown_servers().await` below — otherwise that path would merely
     // detach the task instead of stopping it, unlike the equivalent
     // abort-on-timeout handling in `await_lsp_init_handle`.
     let _abort_force_exit_on_signal = AbortOnDrop(&force_exit_on_signal);

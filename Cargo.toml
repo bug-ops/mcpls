@@ -60,7 +60,6 @@ assert_is_empty = "allow"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
 
 [profile.dev]
 opt-level = 0
