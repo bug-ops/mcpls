@@ -18,7 +18,7 @@ use self::respawn::RespawnBackoff;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots, lock_std};
-use crate::config::{ServerId, ToolKind, ToolRouter};
+use crate::config::{ServerId, ServerSettlement, ToolKind, ToolRouter};
 use crate::error::{ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
@@ -87,14 +87,15 @@ pub struct Translator {
     /// initializing" error instead of "no server configured".
     expected_servers: Arc<StdMutex<HashSet<ServerId>>>,
     /// Per-tool routing table: resolves `(language, tool)` to a `ServerId`.
-    /// Locked independently so `rebind_router` (called from a background
-    /// task once registration completes) never contends with an in-flight
-    /// LSP round trip.
+    /// Locked independently so a rebind (called from the background init task
+    /// as each server settles) never contends with an in-flight LSP round
+    /// trip.
     router: Arc<StdMutex<Arc<ToolRouter>>>,
-    /// The routing table as installed by [`Self::with_router`], before
-    /// `rebind_router` drops routes to servers that failed to start. Read-only
-    /// afterwards: lets a failed lookup be traced back to the server that
-    /// would have served it, to report that server's [`StartupFailure`].
+    /// The routing table as installed by [`Self::with_router`], before any
+    /// route to a server that failed to start is dropped. Read-only
+    /// afterwards: the active `router` is derived from it on every
+    /// settlement, and it lets a failed lookup be traced back to the server
+    /// that would have served it, to report that server's [`StartupFailure`].
     configured_router: Arc<ToolRouter>,
     /// Why each configured server that never registered failed to start,
     /// keyed by routing identity. Written once, when initialization settles
@@ -306,7 +307,7 @@ impl Translator {
                     });
             }
         }
-        self.rebind_router(&registered);
+        self.rebind_router_to_settled();
         self.clear_expected_servers();
 
         if let Some(cache) = &self.notification_cache {
@@ -319,18 +320,109 @@ impl Translator {
     }
 
     /// Rebind the routing table to the set of servers that actually
-    /// registered, dropping or redirecting routes to servers that failed to
-    /// spawn. See `ToolRouter::rebind_to_registered` for the full semantics.
+    /// registered, dropping or redirecting routes to every other server as if
+    /// it had failed to spawn. See [`ToolRouter::rebind`] for the semantics.
     pub fn rebind_router(&self, registered: &HashSet<ServerId>) {
-        Arc::make_mut(&mut lock_std(&self.router)).rebind_to_registered(registered);
+        self.install_router(|id| {
+            if registered.contains(id) {
+                ServerSettlement::Registered
+            } else {
+                ServerSettlement::Failed
+            }
+        });
+    }
+
+    /// Re-derive the routing table from the configured one and what has
+    /// settled so far: servers with a registered client are `Registered`,
+    /// servers with a recorded startup failure are `Failed`, all others are
+    /// still `Pending` and keep their routes. A pure function of that state,
+    /// so it does not matter in which order servers settled.
+    pub(crate) fn rebind_router_to_settled(&self) {
+        let registered: HashSet<ServerId> = lock_std(&self.lsp_clients).keys().cloned().collect();
+        let failed: HashSet<ServerId> = lock_std(&self.startup_failures).keys().cloned().collect();
+        self.install_router(|id| {
+            if registered.contains(id) {
+                ServerSettlement::Registered
+            } else if failed.contains(id) {
+                ServerSettlement::Failed
+            } else {
+                ServerSettlement::Pending
+            }
+        });
+    }
+
+    fn install_router(&self, settlement: impl Fn(&ServerId) -> ServerSettlement) {
+        let mut router = (*self.configured_router).clone();
+        router.rebind(settlement);
+        *lock_std(&self.router) = Arc::new(router);
+    }
+
+    /// Settle a server that initialized: register its client then the server,
+    /// re-derive the routes, then remove its id from the expected set.
+    /// Returns its routing identity and language.
+    ///
+    /// The write order lets a reader that reads the expected set first and the
+    /// router last never see a server that is neither expected, registered
+    /// nor failed.
+    pub(crate) fn settle_started(&self, server: LspServer) -> (ServerId, String) {
+        let id = server.init_config().server_config.id();
+        let language = server.client().language_id().to_string();
+        self.register_server_complete(server);
+        self.rebind_router_to_settled();
+        self.remove_settled_expected(&id);
+        (id, language)
+    }
+
+    /// Settle a server that failed to start: record the failure, re-derive the
+    /// routes, then remove its id from the expected set, in that order (see
+    /// [`Self::settle_started`]).
+    pub(crate) fn settle_failed(&self, failure: &ServerSpawnFailure) {
+        let id = failure.server_id.clone();
+        self.record_startup_failures(std::slice::from_ref(failure));
+        self.rebind_router_to_settled();
+        self.warn_failed_routes(&id);
+        self.remove_settled_expected(&id);
+    }
+
+    fn remove_settled_expected(&self, id: &ServerId) {
+        if !lock_std(&self.expected_servers).remove(id) {
+            tracing::error!("LSP server '{id}' settled twice or was never expected");
+        }
+    }
+
+    /// Logs which languages lost a route to the failed server `id` and what
+    /// the state of each language's catch-all is.
+    fn warn_failed_routes(&self, id: &ServerId) {
+        let languages = self.configured_router.languages_routed_to(id);
+        let catch_all_states: Vec<String> = languages
+            .iter()
+            .map(|language| {
+                let state = match self.configured_router.catch_all_for(language) {
+                    None => "no catch-all".to_string(),
+                    Some(catch_all) if catch_all == id => "it was the catch-all".to_string(),
+                    Some(catch_all) if lock_std(&self.lsp_clients).contains_key(catch_all) => {
+                        format!("catch-all '{catch_all}' registered")
+                    }
+                    Some(catch_all) if self.startup_failure(catch_all).is_some() => {
+                        format!("catch-all '{catch_all}' failed")
+                    }
+                    Some(catch_all) => format!("catch-all '{catch_all}' pending"),
+                };
+                format!("{language}: {state}")
+            })
+            .collect();
+        tracing::warn!(
+            "server '{id}' failed to start; routes of [{}] are rebound or dropped",
+            catch_all_states.join(", ")
+        );
     }
 
     /// Whether `id` is the server the router currently resolves
     /// `ToolKind::Diagnostics` to for `language_id`.
     ///
-    /// Purpose-built for `register_servers`, which needs this to compute the
-    /// diagnostics-cache filter passed into each pump task, without exposing
-    /// the router's lock guard outside this module.
+    /// Purpose-built for the startup settlement, which needs this to compute
+    /// each pump's diagnostics role and the diagnostics-route count, without
+    /// exposing the router's lock guard outside this module.
     #[must_use]
     pub fn is_diagnostics_route(&self, language_id: &str, id: &ServerId) -> bool {
         lock_std(&self.router).resolve(language_id, ToolKind::Diagnostics) == Some(id)
@@ -587,6 +679,207 @@ mod tests {
         assert!(lock_std(&translator.lsp_servers).contains_key(&id));
     }
 
+    fn named_config(
+        name: &str,
+        language: &str,
+        handles: Option<Vec<ToolKind>>,
+    ) -> crate::config::LspServerConfig {
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.name = Some(name.to_string());
+        config.language_id = language.to_string();
+        config.handles = handles;
+        config
+    }
+
+    fn spawn_failure(config: &crate::config::LspServerConfig) -> ServerSpawnFailure {
+        ServerSpawnFailure {
+            server_id: config.id(),
+            language_id: config.language_id.clone(),
+            command: config.command.clone(),
+            reason: StartupFailure::InitTaskPanicked,
+        }
+    }
+
+    fn settle_all(
+        translator: &Translator,
+        configs: &[crate::config::LspServerConfig],
+        up: &[bool],
+    ) {
+        for (config, up) in configs.iter().zip(up) {
+            if *up {
+                translator.settle_started(crate::lsp::fake_lsp_server_with_config(config.clone()));
+            } else {
+                translator.settle_failed(&spawn_failure(config));
+            }
+        }
+    }
+
+    /// FR-006 / NFR-005: whatever order servers settle in, the final routes,
+    /// failure set and expected set equal the batch result.
+    #[tokio::test]
+    async fn settle_in_any_completion_order_yields_the_batch_router_and_failures() {
+        let configs = [
+            named_config("x", "rust", Some(vec![ToolKind::Hover])),
+            named_config("c", "rust", None),
+            named_config("y", "python", None),
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for outcome in 0..8u8 {
+            let up: Vec<bool> = (0..3).map(|bit| outcome & (1 << bit) != 0).collect();
+            let registered: HashSet<ServerId> = configs
+                .iter()
+                .zip(&up)
+                .filter(|(_, up)| **up)
+                .map(|(config, _)| config.id())
+                .collect();
+            let mut batch = ToolRouter::from_configs(&configs).unwrap();
+            batch.rebind_to_registered(&registered);
+
+            for order in orders {
+                let translator =
+                    Translator::new().with_router(ToolRouter::from_configs(&configs).unwrap());
+                translator.set_expected_servers(
+                    configs
+                        .iter()
+                        .map(crate::config::LspServerConfig::id)
+                        .collect(),
+                );
+                for index in order {
+                    settle_all(
+                        &translator,
+                        std::slice::from_ref(&configs[index]),
+                        &[up[index]],
+                    );
+                }
+
+                let router = lock_std(&translator.router).clone();
+                for language in ["rust", "python"] {
+                    for tool in ToolKind::ALL.iter().copied() {
+                        assert_eq!(
+                            router.resolve(language, tool),
+                            batch.resolve(language, tool),
+                            "{language}/{tool:?}, up {up:?}, order {order:?}"
+                        );
+                    }
+                }
+                for tool in ToolKind::ALL.iter().copied() {
+                    assert_eq!(router.resolve_any(tool), batch.resolve_any(tool));
+                }
+                let failed: HashSet<ServerId> = translator
+                    .startup_failures()
+                    .into_iter()
+                    .map(|failure| failure.server_id)
+                    .collect();
+                let expected_failed: HashSet<ServerId> = configs
+                    .iter()
+                    .map(crate::config::LspServerConfig::id)
+                    .filter(|id| !registered.contains(id))
+                    .collect();
+                assert_eq!(failed, expected_failed);
+                assert!(lock_std(&translator.expected_servers).is_empty());
+            }
+        }
+    }
+
+    /// FR-007 window: the explicit server failed, its catch-all is still
+    /// initializing. The route stays on the failed server, which reports its
+    /// own failure instead of a dangling-route error; once the catch-all
+    /// registers the route is served by it.
+    #[tokio::test]
+    async fn dead_explicit_route_reports_its_failure_while_the_catch_all_initializes() {
+        use tracing_subscriber::prelude::*;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let x = named_config(
+            "x",
+            "rust",
+            Some(vec![ToolKind::Hover, ToolKind::Diagnostics]),
+        );
+        let c = named_config("c", "rust", None);
+        let translator = Translator::new()
+            .with_extensions(crate::test_lsp::test_extensions())
+            .with_router(ToolRouter::from_configs([&x, &c]).unwrap());
+        translator.set_expected_servers([x.id(), c.id()].into_iter().collect());
+        let path = PathBuf::from("/ws/main.rs");
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(logs.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            translator.settle_failed(&spawn_failure(&x));
+
+            let hover = translator
+                .client_for_file(&path, ToolKind::Hover)
+                .unwrap_err();
+            assert!(
+                matches!(&hover, Error::ServerFailedToStart(failure) if failure.server_id == x.id()),
+                "got {hover:?}"
+            );
+            assert!(translator.diagnostics_route_for_path(&path).is_failed());
+            assert!(
+                logs.entries()
+                    .iter()
+                    .all(|(level, _)| *level != tracing::Level::ERROR),
+                "{:?}",
+                logs.messages()
+            );
+        });
+
+        translator.settle_started(crate::lsp::fake_lsp_server_with_config(c.clone()));
+        let (served_by, _) = translator.client_for_file(&path, ToolKind::Hover).unwrap();
+        assert_eq!(served_by, c.id());
+    }
+
+    /// A settlement that finds an earlier failure keeps it and records only
+    /// the servers that never settled.
+    #[tokio::test]
+    async fn settle_after_init_panic_after_partial_settlement_records_only_unsettled() {
+        let configs = [
+            named_config("a", "rust", Some(vec![ToolKind::Hover])),
+            named_config("b", "python", None),
+            named_config("c", "typescript", None),
+        ];
+        let translator = Translator::new().with_router(ToolRouter::from_configs(&configs).unwrap());
+        translator.set_expected_servers(
+            configs
+                .iter()
+                .map(crate::config::LspServerConfig::id)
+                .collect(),
+        );
+        translator.settle_started(crate::lsp::fake_lsp_server_with_config(configs[0].clone()));
+        translator.settle_failed(&ServerSpawnFailure {
+            reason: StartupFailure::Spawn(std::sync::Arc::new(Error::ServerNotFound {
+                command: "b".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })),
+            ..spawn_failure(&configs[1])
+        });
+        let init_configs: Vec<_> = configs
+            .iter()
+            .cloned()
+            .map(crate::test_lsp::init_config_for)
+            .collect();
+
+        translator.settle_after_init_panic(&init_configs).await;
+
+        assert!(translator.startup_failure(&configs[0].id()).is_none());
+        assert!(matches!(
+            translator.startup_failure(&configs[1].id()).unwrap().reason,
+            StartupFailure::Spawn(_)
+        ));
+        assert!(matches!(
+            translator.startup_failure(&configs[2].id()).unwrap().reason,
+            StartupFailure::InitTaskPanicked
+        ));
+    }
+
     /// #528: after an init-task panic, a configured server that never
     /// registered gets a terminal `ServerFailedToStart` instead of
     /// `ServerInitializing` forever.
@@ -754,10 +1047,9 @@ mod tests {
 
     #[test]
     fn test_clear_expected_servers_reverts_to_no_server_after_all_routes_dropped() {
-        // Mirrors the real `serve_with` flow: `rebind_router` (called from
-        // `register_servers`/the all-failed path) drops routes to servers
-        // that never registered, then `clear_expected_servers` runs under
-        // the same lock. Subsequent lookups must fall back to
+        // Mirrors the settled state of the real `serve_with` flow: the router
+        // has dropped routes to servers that never registered and the
+        // expected set is empty. Subsequent lookups must fall back to
         // NoServerForLanguage rather than keep implying the server is still
         // on its way.
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");

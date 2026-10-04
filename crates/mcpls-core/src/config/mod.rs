@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub use language::{base_language_id, react_variant_language_id};
-pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
+pub use routing::{NoServerReason, ServerId, ServerSettlement, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
     BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_HEURISTICS_DEPTH,

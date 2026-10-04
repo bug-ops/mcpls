@@ -706,6 +706,11 @@ impl NotificationCache {
         self.diagnostics_route_count = Some(count.max(1));
     }
 
+    #[cfg(test)]
+    pub(crate) const fn configured_route_count(&self) -> Option<usize> {
+        self.diagnostics_route_count
+    }
+
     /// Current per-server fair share of `MAX_DIAGNOSTIC_ENTRIES`, divided
     /// evenly across the configured server count and floored at 1 so a
     /// large server count can never reduce a server's share to zero.

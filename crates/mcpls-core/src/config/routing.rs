@@ -215,18 +215,39 @@ pub enum NoServerReason {
     NoClaimant,
 }
 
+/// How far one configured server's startup has progressed, as seen by
+/// [`ToolRouter::rebind`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::{ServerId, ServerSettlement, ToolKind, ToolRouter};
+///
+/// let mut router = ToolRouter::catch_all([(ServerId::from("pyright"), "python".to_string())]);
+/// router.rebind(|_| ServerSettlement::Failed);
+/// assert!(router.resolve("python", ToolKind::Hover).is_none());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSettlement {
+    /// Still initializing: its routes stay as configured.
+    Pending,
+    /// Initialized and registered.
+    Registered,
+    /// Failed to start: routes naming it are redirected or dropped.
+    Failed,
+}
+
 /// Resolves `(language, tool)` to the [`ServerId`] that should handle it.
 ///
 /// Built once at startup by [`Self::from_configs`] over the *applicable*
-/// (post-heuristics) server configs, then rebound once at registration time
-/// by [`Self::rebind_to_registered`] so that no route ever points at a
-/// server that failed to spawn.
+/// (post-heuristics) server configs. The table in use is derived from that
+/// immutable original by [`Self::rebind`] each time a server settles, so no
+/// route ever points at a server known to have failed to spawn.
 #[derive(Debug, Default, Clone)]
 pub struct ToolRouter {
     by_language: HashMap<String, LanguageRoutes>,
     /// Config declaration order, used by `resolve_any` for a deterministic
-    /// choice among candidates. Pruned to registered servers by
-    /// `rebind_to_registered`.
+    /// choice among candidates. Pruned to non-failed servers by `rebind`.
     order: Vec<ServerId>,
 }
 
@@ -342,79 +363,94 @@ impl ToolRouter {
         Self { by_language, order }
     }
 
-    /// Rebind every route pointing at a server that did not register — i.e.
-    /// failed to spawn — to that language's live catch-all, or drop the
-    /// route entirely if no catch-all is live.
+    /// Derives the active routes from the configured ones and the current
+    /// [`ServerSettlement`] of every server; a pure function of those, so the
+    /// result never depends on the order in which servers settled, and once
+    /// none is `Pending` it equals what a single batch rebind produces.
     ///
-    /// A dead route is never rebound to a *narrowly-scoped* live server: a
-    /// server that declared `handles = [...]` has explicitly declined every
-    /// other tool, and conscripting it would override that declaration (and,
-    /// via the diagnostics cache filter, start caching diagnostics the user
-    /// deliberately routed away).
+    /// Per language:
     ///
-    /// # Preconditions
+    /// - an explicit route to a `Registered` or `Pending` server is kept;
+    /// - an explicit route to a `Failed` server is rebound to the language's
+    ///   catch-all when that is `Registered`, kept pointing at the failed
+    ///   server while the catch-all is `Pending` (the route is never bound to
+    ///   a server that has not registered), and dropped when the catch-all is
+    ///   `Failed` or absent;
+    /// - a `Failed` catch-all is dropped;
+    /// - a dead route is never rebound to a *narrowly-scoped* live server: a
+    ///   server that declared `handles = [...]` has explicitly declined every
+    ///   other tool, and conscripting it would override that declaration (and,
+    ///   via the diagnostics cache filter, start caching diagnostics the user
+    ///   deliberately routed away).
     ///
-    /// Call this exactly once, after all spawn attempts for a `serve_with`
-    /// invocation have completed and before any request can observe the
-    /// router. This is sound only because `LspServer::spawn_batch` is a
-    /// sequential loop that produces one `ServerInitResult` registered under
-    /// a single lock — registration is one atomic all-or-nothing event, so
-    /// no request can observe a half-rebound router. If server registration
-    /// is ever made incremental (servers registering as they finish spawning,
-    /// rather than all together), an early rebind here would permanently
-    /// steal a slow server's routes with no way back; this function would
-    /// need to be replaced with a design that derives the active table on
-    /// each lookup instead of mutating it once.
-    pub fn rebind_to_registered(&mut self, registered: &HashSet<ServerId>) {
-        for (language, routes) in &mut self.by_language {
-            let live_catch_all = routes.default.clone().filter(|id| registered.contains(id));
+    /// The server order used by [`Self::resolve_any`] keeps every server that
+    /// is not `Failed`, so a pending server's position is preserved.
+    ///
+    /// Silent: callers log the server that just settled, not every earlier
+    /// failure again.
+    pub fn rebind(&mut self, settlement: impl Fn(&ServerId) -> ServerSettlement) {
+        for routes in self.by_language.values_mut() {
+            let catch_all = routes.default.clone().map(|id| (settlement(&id), id));
 
-            let mut dead: HashMap<ServerId, Vec<ToolKind>> = HashMap::new();
-            for (tool, id) in &routes.explicit {
-                if !registered.contains(id) {
-                    dead.entry(id.clone()).or_default().push(*tool);
+            let dead: Vec<ToolKind> = routes
+                .explicit
+                .iter()
+                .filter(|(_, id)| settlement(id) == ServerSettlement::Failed)
+                .map(|(tool, _)| *tool)
+                .collect();
+            for tool in dead {
+                match &catch_all {
+                    Some((ServerSettlement::Registered, id)) => {
+                        routes.explicit.insert(tool, id.clone());
+                    }
+                    Some((ServerSettlement::Pending, _)) => {}
+                    Some((ServerSettlement::Failed, _)) | None => {
+                        routes.explicit.remove(&tool);
+                    }
                 }
             }
 
-            for (dead_id, tools) in dead {
-                let tool_names: Vec<&str> = tools.iter().map(ToolKind::as_str).collect();
-                if let Some(catch_all_id) = &live_catch_all {
-                    for tool in &tools {
-                        routes.explicit.insert(*tool, catch_all_id.clone());
-                    }
-                    tracing::warn!(
-                        "language '{language}': server '{dead_id}' failed to spawn; \
-                         rebinding [{}] to catch-all '{catch_all_id}'",
-                        tool_names.join(", ")
-                    );
-                } else {
-                    for tool in &tools {
-                        routes.explicit.remove(tool);
-                    }
-                    tracing::warn!(
-                        "language '{language}': server '{dead_id}' failed to spawn and no \
-                         live catch-all is available; [{}] will report no server available",
-                        tool_names.join(", ")
-                    );
-                }
-            }
-
-            if let Some(dead_catch_all) = routes
-                .default
-                .as_ref()
-                .filter(|id| !registered.contains(*id))
-                .cloned()
-            {
+            if matches!(catch_all, Some((ServerSettlement::Failed, _))) {
                 routes.default = None;
-                tracing::warn!(
-                    "language '{language}': catch-all server '{dead_catch_all}' failed to \
-                     spawn; every tool it wasn't already explicitly rebound above will report \
-                     no server available"
-                );
             }
         }
 
-        self.order.retain(|id| registered.contains(id));
+        self.order
+            .retain(|id| settlement(id) != ServerSettlement::Failed);
+    }
+
+    /// [`Self::rebind`] for a finished startup: every server in `registered`
+    /// is `Registered`, every other one `Failed`.
+    pub fn rebind_to_registered(&mut self, registered: &HashSet<ServerId>) {
+        self.rebind(|id| {
+            if registered.contains(id) {
+                ServerSettlement::Registered
+            } else {
+                ServerSettlement::Failed
+            }
+        });
+    }
+
+    /// The configured languages with a route (explicit or catch-all) naming
+    /// `id`, sorted.
+    #[must_use]
+    pub fn languages_routed_to(&self, id: &ServerId) -> Vec<String> {
+        let mut languages: Vec<String> = self
+            .by_language
+            .iter()
+            .filter(|(_, routes)| {
+                routes.default.as_ref() == Some(id) || routes.explicit.values().any(|v| v == id)
+            })
+            .map(|(language, _)| language.clone())
+            .collect();
+        languages.sort_unstable();
+        languages
+    }
+
+    /// The catch-all server configured for `language_id`, if any.
+    #[must_use]
+    pub fn catch_all_for(&self, language_id: &str) -> Option<&ServerId> {
+        self.by_language.get(language_id)?.default.as_ref()
     }
 
     /// Resolve the server that should handle `tool` for `language_id`.
@@ -746,6 +782,98 @@ mod tests {
         // must report NoServerForLanguage upstream, not NoServerForTool --
         // has_language must go back to false once every route is dropped.
         assert!(!router.has_language("rust"));
+    }
+
+    fn explicit_and_catch_all_router() -> ToolRouter {
+        ToolRouter::from_configs(&[
+            cfg("python", Some("pyright"), Some(vec![ToolKind::Hover])),
+            cfg("python", Some("pylsp"), None),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn rebind_keeps_pending_routes_and_order() {
+        let mut router = ToolRouter::from_configs(&[
+            cfg("rust", Some("slow"), None),
+            cfg("python", Some("fast"), None),
+        ])
+        .unwrap();
+
+        router.rebind(|id| {
+            if id.as_str() == "fast" {
+                ServerSettlement::Registered
+            } else {
+                ServerSettlement::Pending
+            }
+        });
+
+        assert_eq!(
+            router.resolve("rust", ToolKind::Hover),
+            Some(&ServerId::from("slow"))
+        );
+        assert_eq!(
+            router.resolve_any(ToolKind::Hover),
+            Ok(&ServerId::from("slow"))
+        );
+    }
+
+    #[test]
+    fn dead_explicit_route_waits_for_pending_catch_all_and_drops_when_it_fails() {
+        let settle = |pyright, pylsp| {
+            let mut router = explicit_and_catch_all_router();
+            router.rebind(|id| {
+                if id.as_str() == "pyright" {
+                    pyright
+                } else {
+                    pylsp
+                }
+            });
+            router.resolve("python", ToolKind::Hover).cloned()
+        };
+
+        let pending_catch_all = settle(ServerSettlement::Failed, ServerSettlement::Pending);
+        assert_eq!(pending_catch_all, Some(ServerId::from("pyright")));
+        let registered_catch_all = settle(ServerSettlement::Failed, ServerSettlement::Registered);
+        assert_eq!(registered_catch_all, Some(ServerId::from("pylsp")));
+        let failed_catch_all = settle(ServerSettlement::Failed, ServerSettlement::Failed);
+        assert_eq!(failed_catch_all, None);
+    }
+
+    #[test]
+    fn rebind_without_pending_servers_matches_the_batch_rule_for_every_outcome() {
+        for pyright_up in [false, true] {
+            for pylsp_up in [false, true] {
+                let registered: HashSet<ServerId> = [("pyright", pyright_up), ("pylsp", pylsp_up)]
+                    .into_iter()
+                    .filter(|(_, up)| *up)
+                    .map(|(id, _)| ServerId::from(id))
+                    .collect();
+                let mut router = explicit_and_catch_all_router();
+                router.rebind_to_registered(&registered);
+
+                let hover = if pyright_up {
+                    Some("pyright")
+                } else if pylsp_up {
+                    Some("pylsp")
+                } else {
+                    None
+                };
+                assert_eq!(
+                    router
+                        .resolve("python", ToolKind::Hover)
+                        .map(ServerId::as_str),
+                    hover,
+                    "pyright up: {pyright_up}, pylsp up: {pylsp_up}"
+                );
+                assert_eq!(
+                    router
+                        .resolve("python", ToolKind::Diagnostics)
+                        .map(ServerId::as_str),
+                    pylsp_up.then_some("pylsp")
+                );
+            }
+        }
     }
 
     #[test]
