@@ -222,6 +222,18 @@ impl SessionState {
         }
     }
 
+    /// Queues every subscribed URI for which `pred` holds.
+    ///
+    /// `pred` runs on a snapshot with no subscription lock held, so it may
+    /// take other locks.
+    async fn publish_matching(&self, pred: &(impl Fn(&DiagnosticsResourceUri) -> bool + Sync)) {
+        for uri in self.subs.snapshot().await {
+            if pred(&uri) {
+                self.publish_if_subscribed(&uri).await;
+            }
+        }
+    }
+
     async fn subscribe(
         &self,
         canonical: DiagnosticsResourceUri,
@@ -413,6 +425,21 @@ impl SubscriptionRegistry {
         let mut guard = lock_std(&self.0.sessions);
         guard.retain(|weak| weak.strong_count() > 0);
         guard.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Queues, on every live session, each subscribed URI for which `pred`
+    /// holds.
+    ///
+    /// Used once initialization settles, to tell clients subscribed to a
+    /// file whose server failed to start that a re-read now returns the
+    /// error. Delivery stays per session and never awaits a peer.
+    pub(crate) async fn publish_matching(
+        &self,
+        pred: impl Fn(&DiagnosticsResourceUri) -> bool + Sync,
+    ) {
+        for session in self.live_sessions() {
+            session.publish_matching(&pred).await;
+        }
     }
 
     /// Reserves one of the [`MAX_LISTEN_STREAMS`] listen slots.
@@ -860,6 +887,65 @@ mod tests {
             .unwrap_or_else(|_| panic!("delivery task did not exit after the session was dropped"));
         assert!(closed.is_none());
         assert!(registry.live_sessions().is_empty());
+    }
+
+    /// `publish_matching` publishes only subscribed URIs the predicate selects,
+    /// on every live session.
+    #[tokio::test]
+    async fn test_publish_matching_publishes_only_selected_subscribed_uris() {
+        let registry = SubscriptionRegistry::new();
+        let failed = DiagnosticsResourceUri::for_test("lsp-diagnostics:///failed.rs");
+        let healthy = DiagnosticsResourceUri::for_test("lsp-diagnostics:///healthy.rs");
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let handle = SessionHandle::new(registry.clone());
+            let (tx, rx) = mpsc::channel(4);
+            handle
+                .subscribe_for_test(&failed, Target::Channel(tx))
+                .await
+                .unwrap();
+            handle.state.subs.subscribe(healthy.clone()).await.unwrap();
+            sessions.push((handle, rx));
+        }
+
+        registry.publish_matching(|uri| *uri == failed).await;
+
+        for (_handle, rx) in &mut sessions {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, failed.as_str());
+            assert!(rx.try_recv().is_err(), "the healthy URI must not publish");
+        }
+    }
+
+    /// The predicate runs with no subscription lock held: taking the write
+    /// lock from inside it completes immediately instead of deadlocking.
+    #[tokio::test]
+    async fn test_publish_matching_predicate_runs_without_subscription_lock() {
+        use futures::FutureExt as _;
+
+        let handle = SessionHandle::new(SubscriptionRegistry::new());
+        let registry = handle.registry();
+        let uri = DiagnosticsResourceUri::for_test("lsp-diagnostics:///a.rs");
+        let (tx, _rx) = mpsc::channel(4);
+        handle
+            .subscribe_for_test(&uri, Target::Channel(tx))
+            .await
+            .unwrap();
+        let state = Arc::clone(handle.state());
+        let other = DiagnosticsResourceUri::for_test("lsp-diagnostics:///b.rs");
+
+        registry
+            .publish_matching(|_| {
+                assert!(
+                    state.subs.subscribe(other.clone()).now_or_never().is_some(),
+                    "the subscription lock must not be held while the predicate runs"
+                );
+                true
+            })
+            .await;
     }
 
     /// With the peer not reading, repeated publishes of one URI collapse into

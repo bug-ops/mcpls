@@ -27,7 +27,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
-use super::session::{ListenPermit, ListenUris, SubscriptionRegistry, Target};
+use super::session::{ListenPermit, ListenRegistration, ListenUris, SubscriptionRegistry, Target};
 use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
@@ -610,8 +610,8 @@ impl McplsServer {
                     self.context
                         .translator
                         .diagnostics_route_for_path(&validated_path)
-                        .ok()
-                        .flatten()
+                        .server_id()
+                        .cloned()
                 });
 
         // Sampled before and after the pull: indexing may finish, or a respawn may mark push-degraded, mid-pull.
@@ -838,7 +838,7 @@ impl McplsServer {
 
     /// Get cached diagnostics for a file.
     #[tool(
-        description = concat!("Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!()),
+        description = concat!("Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. Errors with a retryable `ServerInitializing` while the file's server is still starting, and with `ServerFailedToStart` if it failed to start, instead of returning an empty list. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!()),
         title = "Cached Diagnostics"
     )]
     async fn get_cached_diagnostics(
@@ -857,7 +857,8 @@ impl McplsServer {
                     let route_id = self
                         .context
                         .translator
-                        .diagnostics_route_for_path(&validated_path)?;
+                        .diagnostics_route_for_path(&validated_path)
+                        .into_read_result()?;
                     Ok((route_id, uri))
                 });
         let result = match resolved {
@@ -1064,6 +1065,7 @@ impl McplsServer {
             .context
             .translator
             .diagnostics_route_for_path(&validated_path)
+            .into_read_result()
             .map_err(map_bridge_error)?;
 
         // Only the snapshot is taken under the cache lock: merging the sources
@@ -1158,6 +1160,41 @@ impl McplsServer {
             return Err(no_resolvable_listen_uris());
         }
         Ok(Some((permit, uris)))
+    }
+
+    /// Reports startup failures of the servers behind a listen's URIs.
+    ///
+    /// Resolved after registering, like `subscribe`, so a failure settling
+    /// concurrently is seen by one side or the other. A failed URI is
+    /// published once so the client re-reads and gets the error. If every URI
+    /// failed there is nothing to stream, so the registration is dropped and
+    /// the first failure is returned (the same rule as "none resolves").
+    async fn settle_listen_startup_failures(
+        &self,
+        registration: ListenRegistration,
+        uris: &ListenUris,
+    ) -> Result<ListenRegistration, McpError> {
+        let failed: Vec<_> = uris
+            .canonical()
+            .filter_map(|(uri, _)| {
+                self.context
+                    .translator
+                    .diagnostics_route_for_uri(uri)
+                    .into_startup_failure()
+                    .map(|failure| (uri, failure))
+            })
+            .collect();
+        if let Some(((_, first), _)) = failed.split_first()
+            && failed.len() == uris.canonical().count()
+        {
+            return Err(map_bridge_error(crate::error::Error::ServerFailedToStart(
+                first.clone(),
+            )));
+        }
+        for (uri, _) in &failed {
+            registration.publish(uri).await;
+        }
+        Ok(registration)
     }
 }
 
@@ -1286,6 +1323,29 @@ impl ServerHandler for McplsServer {
                     );
                 }
 
+                // Resolved after recording, mirroring the settle publish in
+                // `lib.rs` (which mutates the translator, then snapshots the
+                // subscriptions): one side always observes the other, so the
+                // client sees either this error or exactly one update. A stray
+                // update for the rolled-back URI is harmless. A re-subscribe to
+                // an already-subscribed failed route errors too but keeps its
+                // earlier subscription; the settle publish already covered it.
+                if let Some(failure) = self
+                    .context
+                    .translator
+                    .diagnostics_route_for_path(&validated_path)
+                    .into_startup_failure()
+                {
+                    if newly_subscribed {
+                        session
+                            .unsubscribe(Some(&canonical_uri), &request.uri)
+                            .await;
+                    }
+                    return Err(map_bridge_error(crate::error::Error::ServerFailedToStart(
+                        failure,
+                    )));
+                }
+
                 // Build the URI from the canonicalized path, matching `read_resource` and
                 // what `diagnostics_pump` stores from LSP notifications.
                 let lsp_uri =
@@ -1396,6 +1456,10 @@ impl ServerHandler for McplsServer {
         let sink = context.sink().clone();
         let registration = permit.register(Arc::clone(&uris), |uris| Target::Sink { sink, uris });
 
+        let registration = self
+            .settle_listen_startup_failures(registration, &uris)
+            .await?;
+
         // Registered above, before the cache read, so no publish is lost in between.
         let cached: Vec<&DiagnosticsResourceUri> = {
             let cache = self.context.notification_cache.lock().await;
@@ -1505,6 +1569,25 @@ mod tests {
             project_config_ignored,
             mcp,
         )
+    }
+
+    /// Registers a fake client for `id`; keep the returned server alive for
+    /// the test. A route to an unregistered, unexpected server reads as
+    /// unrouted, so route-dependent tests need a registered one.
+    fn register_fake_client(
+        translator: &Translator,
+        id: &crate::config::ServerId,
+    ) -> crate::test_lsp::FakeServer {
+        let (client, fake) = crate::test_lsp::fake_lsp_client();
+        translator.register_client(id.clone(), client);
+        fake
+    }
+
+    fn expect_err<T>(result: Result<T, McpError>) -> McpError {
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        }
     }
 
     /// A server with no LSP servers configured, backed by a real file under
@@ -2890,6 +2973,7 @@ mod tests {
                 .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
+        let _fake = register_fake_client(&translator, &owner);
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -2948,6 +3032,7 @@ mod tests {
                 .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
+        let _fake = register_fake_client(&translator, &owner);
         let temp_dir = TempDir::new().unwrap();
         let server = McplsServer::new(
             translator,
@@ -3000,6 +3085,7 @@ mod tests {
                 .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
+        let _fake = register_fake_client(&translator, &owner);
         let temp_dir = TempDir::new().unwrap();
         let server = McplsServer::new(
             translator,
@@ -4270,6 +4356,220 @@ sleep 0.3
             .unwrap()
             .unwrap();
         assert_eq!(uris.canonical().count(), 1);
+    }
+
+    /// Where the sole `rust` server stands in a [`startup_fixture`].
+    #[derive(Clone, Copy)]
+    enum RustServerState {
+        Starting,
+        FailedToStart,
+    }
+
+    struct StartupFixture {
+        server: McplsServer,
+        rust_file: PathBuf,
+        python_file: PathBuf,
+        roots: WorkspaceRoots,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A server whose only configured language server (`rust`) is either
+    /// still starting or failed to start; `.py` files have no route.
+    fn startup_fixture(state: RustServerState) -> StartupFixture {
+        use std::collections::{HashMap, HashSet};
+
+        use crate::config::{ServerId, ToolRouter};
+        use crate::error::{ServerSpawnFailure, StartupFailure};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let rust_file = root.join("main.rs");
+        let python_file = root.join("script.py");
+        std::fs::write(&rust_file, "fn main() {}").unwrap();
+        std::fs::write(&python_file, "pass").unwrap();
+
+        let id = ServerId::from("rust");
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([
+                ("rs".to_string(), "rust".to_string()),
+                ("py".to_string(), "python".to_string()),
+            ]))
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![root.clone()]));
+        match state {
+            RustServerState::Starting => translator.set_expected_servers(HashSet::from([id])),
+            RustServerState::FailedToStart => {
+                translator.record_startup_failures(&[ServerSpawnFailure {
+                    server_id: id,
+                    language_id: "rust".to_string(),
+                    command: "rust-analyzer".to_string(),
+                    reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
+                        command: "rust-analyzer".to_string(),
+                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                    })),
+                }]);
+                translator.rebind_router(&HashSet::new());
+            }
+        }
+        let server = McplsServer::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            WorkspaceRoots::resolve(vec![root.clone()]),
+            SubscriptionRegistry::new(),
+            false,
+            McpConfig::default(),
+        );
+        StartupFixture {
+            server,
+            rust_file,
+            python_file,
+            roots: WorkspaceRoots::resolve(vec![root]),
+            _dir: dir,
+        }
+    }
+
+    async fn read_cached(
+        fx: &StartupFixture,
+        path: &Path,
+    ) -> Result<Json<CachedDiagnosticsResponse>, McpError> {
+        fx.server
+            .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+                file_path: path.to_string_lossy().to_string(),
+            }))
+            .await
+    }
+
+    /// The errors the cached-diagnostics tool and the resource read return
+    /// for the fixture's Rust file.
+    async fn cache_reader_errors(fx: &StartupFixture) -> [McpError; 2] {
+        [
+            expect_err(read_cached(fx, &fx.rust_file).await),
+            expect_err(fx.server.resource_diagnostics_response(&fx.rust_file).await),
+        ]
+    }
+
+    /// #545: a still-starting server is a retryable error on both cache
+    /// readers, not an empty (apparently clean) list.
+    #[tokio::test]
+    async fn test_cache_readers_report_server_initializing() {
+        let fx = startup_fixture(RustServerState::Starting);
+        let expected = ErrorCode(crate::error::SERVER_INITIALIZING_ERROR_CODE);
+
+        for err in cache_reader_errors(&fx).await {
+            assert_eq!(err.code, expected);
+        }
+    }
+
+    /// #535: a server that failed to start is reported by both cache readers
+    /// with the spawn failure's detail.
+    #[tokio::test]
+    async fn test_cache_readers_report_server_failed_to_start() {
+        let fx = startup_fixture(RustServerState::FailedToStart);
+
+        for err in cache_reader_errors(&fx).await {
+            assert!(err.message.contains("rust-analyzer"), "{}", err.message);
+            assert_ne!(
+                err.code,
+                ErrorCode(crate::error::SERVER_INITIALIZING_ERROR_CODE)
+            );
+        }
+    }
+
+    /// A file whose language has no configured server still reads as an empty
+    /// cache: there is no server whose failure could be reported.
+    #[tokio::test]
+    async fn test_cache_readers_keep_empty_result_for_unrouted_language() {
+        let fx = startup_fixture(RustServerState::FailedToStart);
+
+        let tool = read_cached(&fx, &fx.python_file).await.unwrap();
+        let resource = fx
+            .server
+            .resource_diagnostics_response(&fx.python_file)
+            .await
+            .unwrap();
+
+        assert!(tool.0.result.diagnostics.is_empty());
+        assert!(resource.diagnostics.is_empty());
+    }
+
+    fn register_listen(
+        fx: &StartupFixture,
+        files: &[&Path],
+    ) -> (
+        ListenRegistration,
+        Arc<ListenUris>,
+        tokio::sync::mpsc::Receiver<String>,
+    ) {
+        let accepted: Vec<String> = files.iter().map(|f| make_uri(f).unwrap()).collect();
+        let uris = Arc::new(ListenUris::resolve(&accepted, &fx.roots));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let registration = fx
+            .server
+            .subscription_registry()
+            .try_reserve_listen()
+            .unwrap()
+            .register(Arc::clone(&uris), |_| Target::Channel(tx));
+        (registration, uris, rx)
+    }
+
+    /// #535 listen: when every URI's server failed to start there is nothing
+    /// to stream, so the listen errors and releases its slot.
+    #[tokio::test]
+    async fn test_listen_settle_errors_when_every_uri_failed_to_start() {
+        let fx = startup_fixture(RustServerState::FailedToStart);
+        let (registration, uris, _rx) = register_listen(&fx, &[&fx.rust_file]);
+
+        let err = fx
+            .server
+            .settle_listen_startup_failures(registration, &uris)
+            .await
+            .unwrap_err();
+
+        assert!(err.message.contains("rust-analyzer"), "{}", err.message);
+        let registry = fx.server.subscription_registry();
+        let held: Vec<_> = (0..crate::bridge::resources::MAX_LISTEN_STREAMS)
+            .map(|_| registry.try_reserve_listen())
+            .collect();
+        assert!(held.iter().all(Result::is_ok), "the slot must be released");
+    }
+
+    /// A listen mixing a failed URI with a healthy one keeps streaming and
+    /// publishes exactly the failed URI, so the client re-reads the error.
+    #[tokio::test]
+    async fn test_listen_settle_publishes_only_failed_uris_in_a_mixed_listen() {
+        let fx = startup_fixture(RustServerState::FailedToStart);
+        let (registration, uris, mut rx) = register_listen(&fx, &[&fx.rust_file, &fx.python_file]);
+
+        let registration = fx
+            .server
+            .settle_listen_startup_failures(registration, &uris)
+            .await
+            .unwrap();
+
+        let published = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published, make_uri(&fx.rust_file).unwrap());
+        assert!(rx.try_recv().is_err(), "the healthy URI must not publish");
+        drop(registration);
+    }
+
+    /// A listen whose servers are merely starting streams as normal: updates
+    /// follow once they register.
+    #[tokio::test]
+    async fn test_listen_settle_ignores_starting_servers() {
+        let fx = startup_fixture(RustServerState::Starting);
+        let (registration, uris, mut rx) = register_listen(&fx, &[&fx.rust_file]);
+
+        let registration = fx
+            .server
+            .settle_listen_startup_failures(registration, &uris)
+            .await
+            .unwrap();
+
+        assert!(rx.try_recv().is_err());
+        drop(registration);
     }
 
     /// Server capabilities advertise resources support.

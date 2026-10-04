@@ -329,10 +329,11 @@ mcpls --listen 127.0.0.1:8080
 
 The HTTP service is mounted at the configured `HttpConfig::path` **and** at `/`, so reverse-proxy rules must cover both paths.
 
-mcpls serves HTTP/1 only and bounds slow clients with two limits, both configurable through `HttpConfig` when embedding `mcpls-core`:
+mcpls serves HTTP/1 only and bounds slow or vanished clients with three limits, all configurable through `HttpConfig` when embedding `mcpls-core`:
 
-- `HeaderReadTimeout` (default 30 s) bounds the request head, a pause between request-body chunks (answered with `408 Request Timeout`) and idle keep-alive connections. It does not bound a client that stops reading a response, such as an SSE stream (#531).
+- `HeaderReadTimeout` (default 30 s) bounds the request head, a pause between request-body chunks (answered with `408 Request Timeout`) and idle keep-alive connections. It does not bound a client that stops reading a response, such as an SSE stream; the liveness probe below covers that.
 - `ConnectionLimit` (default 512) caps concurrent connections. On macOS, launchd's default soft file-descriptor limit is 256, so raise it with `ulimit -n` (at least 600) before serving more than ~250 connections; library users can lower the cap with `HttpConfig::with_max_concurrent_connections`.
+- `StreamLiveness` (default: probe every 60 s, answer within 30 s) pings each session's standalone GET (SSE) stream with an MCP `ping` request and closes it when the client stops answering, so a vanished peer (sleeping laptop, dropped NAT mapping) no longer holds its stream until the OS gives up. It runs inside mcpls, so it also works behind a reverse proxy. A client that never answers server `ping` requests would be disconnected every 90 s: pass `--http-stream-liveness off` (or `MCPLS_HTTP_STREAM_LIVENESS=off`), or `HttpConfig::with_stream_liveness(StreamLiveness::Disabled)` when embedding. The probe is the portable complement to the kernel-level `TCP_USER_TIMEOUT` (60 s) that mcpls sets on accepted sockets on Linux and Android (#552), which does not see through a reverse proxy; it does not cover stateless `subscriptions/listen` streams.
 
 Authentication is never provided in-process, so the reverse proxy remains required.
 

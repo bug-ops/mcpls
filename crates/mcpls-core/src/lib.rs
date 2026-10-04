@@ -77,7 +77,9 @@ pub use transport::Transport;
 use transport::run_http;
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
-pub use transport::{ConnectionLimit, HeaderReadTimeout, HttpConfig};
+pub use transport::{
+    ConnectionLimit, HeaderReadTimeout, HttpConfig, ProbeDeadline, ProbeInterval, StreamLiveness,
+};
 use transport::{ShutdownSignal, run_stdio};
 pub use util::escape_control;
 
@@ -974,6 +976,7 @@ fn spawn_lsp_servers_background(
     workspace_roots: WorkspaceRoots,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let settle_registry = subscription_registry.clone();
         let body = init_lsp_servers(
             &applicable_configs,
             &translator,
@@ -982,8 +985,35 @@ fn spawn_lsp_servers_background(
             cancel_rx,
             workspace_roots,
         );
-        run_init_supervised(&translator, &applicable_configs, body).await;
+        if run_init_supervised(&translator, &applicable_configs, body).await
+            == InitOutcome::Panicked
+        {
+            publish_startup_failures(&translator, &settle_registry).await;
+        }
     })
+}
+
+/// How [`run_init_supervised`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitOutcome {
+    /// The init body ran to completion.
+    Completed,
+    /// The init body panicked and the translator was settled after it.
+    Panicked,
+}
+
+/// Tells subscribers of files whose server failed to start that a re-read now
+/// returns the error.
+///
+/// Called once initialization has settled, after the translator state it reads
+/// (recorded failures, router, expected set) is final.
+async fn publish_startup_failures(translator: &Translator, registry: &SubscriptionRegistry) {
+    if translator.startup_failures().is_empty() {
+        return;
+    }
+    registry
+        .publish_matching(|uri| translator.diagnostics_route_for_uri(uri).is_failed())
+        .await;
 }
 
 /// Best-effort text of a panic payload, for logging.
@@ -1008,13 +1038,16 @@ async fn run_init_supervised(
     translator: &Translator,
     configs: &[ServerInitConfig],
     body: impl std::future::Future<Output = ()>,
-) {
+) -> InitOutcome {
     if let Err(payload) = AssertUnwindSafe(body).catch_unwind().await {
         error!(
             "Background LSP initialization task panicked: {}",
             panic_message(payload.as_ref())
         );
         translator.settle_after_init_panic(configs).await;
+        InitOutcome::Panicked
+    } else {
+        InitOutcome::Completed
     }
 }
 
@@ -1047,6 +1080,7 @@ async fn init_lsp_servers(
         // skipping it would leave every route pointed at a dead server.
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
+        publish_startup_failures(translator, &subscription_registry).await;
         return;
     }
 
@@ -1071,6 +1105,7 @@ async fn init_lsp_servers(
     // This must stay after `register_servers`: `Translator::tool_support_snapshot`'s
     // read order relies on it (`healthy_server_never_misreported_for_any_write_read_interleaving`).
     translator.clear_expected_servers();
+    publish_startup_failures(translator, &subscription_registry).await;
     info!("Proceeding with {} LSP server(s)", server_count);
 
     // Give each diagnostics-route server a fair share of the shared
@@ -2244,6 +2279,69 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_run_init_supervised_reports_outcome() {
+            let translator = Translator::new();
+            let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+
+            let completed =
+                run_init_supervised(&translator, std::slice::from_ref(&config), async {}).await;
+            let panicked = run_init_supervised(&translator, &[config], async {
+                panic!("init boom");
+            })
+            .await;
+
+            assert_eq!(completed, InitOutcome::Completed);
+            assert_eq!(panicked, InitOutcome::Panicked);
+        }
+
+        /// #535: once settling recorded a failure, subscribers of a file the
+        /// failed server would have served are told to re-read; before that
+        /// nothing publishes.
+        #[tokio::test]
+        async fn test_publish_startup_failures_notifies_failed_uris_after_settle() {
+            use crate::bridge::resources::make_uri;
+            use crate::config::ToolRouter;
+            use crate::mcp::{SessionHandle, Target};
+
+            let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+            let id = config.server_config.id();
+            let translator = Translator::new()
+                .with_extensions(crate::test_lsp::test_extensions())
+                .with_router(ToolRouter::catch_all([(id, "rust".to_string())]));
+            translator.set_expected_servers(HashSet::from([config.server_config.id()]));
+            let registry = SubscriptionRegistry::new();
+            let session = SessionHandle::new(registry.clone());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let failed = crate::test_lsp::diagnostics_uri(
+                &make_uri(&crate::test_lsp::absolute_path("main.rs")).unwrap(),
+            );
+            session
+                .subscribe_for_test(&failed, Target::Channel(tx))
+                .await
+                .unwrap();
+
+            publish_startup_failures(&translator, &registry).await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err(),
+                "no failure is recorded yet, so nothing may publish"
+            );
+
+            run_init_supervised(&translator, &[config], async {
+                panic!("init boom");
+            })
+            .await;
+            publish_startup_failures(&translator, &registry).await;
+
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, failed.as_str());
+        }
+
+        #[tokio::test]
         async fn test_run_init_supervised_leaves_translator_alone_without_panic() {
             let translator = Translator::new();
             let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
@@ -3216,6 +3314,199 @@ mod tests {
             })
             .await;
             assert_eq!(update["params"]["uri"], canonical_uri);
+        }
+
+        /// A real `resources/subscribe` client over an in-memory duplex stream,
+        /// against a server whose only language server (`rust`) is still
+        /// starting; [`Self::settle_failed`] then records its startup failure.
+        struct SubscribeHarness {
+            translator: Arc<Translator>,
+            subs: SubscriptionRegistry,
+            uri: String,
+            reader: DuplexReader,
+            write_half: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            next_id: u32,
+            _running: rmcp::service::RunningService<rmcp::RoleServer, mcp::McplsServer>,
+            _workspace: tempfile::TempDir,
+        }
+
+        impl SubscribeHarness {
+            async fn start() -> Self {
+                use rmcp::ServiceExt as _;
+
+                let workspace = tempfile::TempDir::new().unwrap();
+                let root = dunce::canonicalize(workspace.path()).unwrap();
+                let file = root.join("main.rs");
+                std::fs::write(&file, "fn main() {}").unwrap();
+                let uri = bridge::resources::make_uri(&file).unwrap();
+
+                let id = ServerId::from("rust");
+                let mut translator = Translator::new()
+                    .with_extensions(crate::test_lsp::test_extensions())
+                    .with_router(config::ToolRouter::catch_all([(
+                        id.clone(),
+                        "rust".to_string(),
+                    )]));
+                translator.set_workspace_roots(WorkspaceRoots::resolve(vec![root.clone()]));
+                translator.set_expected_servers(HashSet::from([id]));
+                let translator = Arc::new(translator);
+
+                let subs = make_subs();
+                let server = mcp::McplsServer::new(
+                    Arc::clone(&translator),
+                    make_cache(),
+                    WorkspaceRoots::resolve(vec![root]),
+                    subs.clone(),
+                    false,
+                    config::McpConfig::default(),
+                );
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let serving = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+                let (read_half, mut write_half) = tokio::io::split(client_io);
+                let mut reader = tokio::io::BufReader::new(read_half);
+
+                let initialize = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "0"},
+                    },
+                });
+                let initialized =
+                    serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+                send_json_line(&mut write_half, &initialize).await;
+                read_json_line_matching(&mut reader, |v| v["id"] == 0).await;
+                send_json_line(&mut write_half, &initialized).await;
+                let running = serving.await.unwrap();
+
+                Self {
+                    translator,
+                    subs,
+                    uri,
+                    reader,
+                    write_half,
+                    next_id: 1,
+                    _running: running,
+                    _workspace: workspace,
+                }
+            }
+
+            /// Sends `resources/subscribe` for the fixture file and returns the response.
+            async fn subscribe(&mut self) -> serde_json::Value {
+                let id = self.next_id;
+                self.next_id += 1;
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": "resources/subscribe",
+                    "params": {"uri": self.uri},
+                });
+                send_json_line(&mut self.write_half, &request).await;
+                read_json_line_matching(&mut self.reader, |v| v["id"] == id).await
+            }
+
+            /// Records the `rust` server's startup failure the way `init_lsp_servers` does.
+            fn settle_failed(&self) {
+                self.translator
+                    .record_startup_failures(&[crate::error::ServerSpawnFailure {
+                        server_id: ServerId::from("rust"),
+                        language_id: "rust".to_string(),
+                        command: "rust-analyzer".to_string(),
+                        reason: crate::error::StartupFailure::Spawn(Arc::new(
+                            Error::ServerNotFound {
+                                command: "rust-analyzer".to_string(),
+                                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                            },
+                        )),
+                    }]);
+                self.translator.rebind_router(&HashSet::new());
+                self.translator.clear_expected_servers();
+            }
+
+            /// Counts `resources/updated` notifications that arrive within `window`.
+            async fn updates_within(&mut self, window: std::time::Duration) -> usize {
+                use tokio::io::AsyncBufReadExt as _;
+
+                let mut count = 0;
+                let _ = tokio::time::timeout(window, async {
+                    loop {
+                        let mut line = String::new();
+                        if self.reader.read_line(&mut line).await.unwrap() == 0 {
+                            return;
+                        }
+                        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                        if value["method"] == "notifications/resources/updated" {
+                            assert_eq!(value["params"]["uri"], self.uri);
+                            count += 1;
+                        }
+                    }
+                })
+                .await;
+                count
+            }
+        }
+
+        async fn send_json_line(
+            write_half: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            value: &serde_json::Value,
+        ) {
+            use tokio::io::AsyncWriteExt as _;
+
+            write_half
+                .write_all(format!("{value}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        const UPDATE_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+
+        /// FR-010: a subscribe to a failed route errors and rolls back the
+        /// subscription it added, so a later publish reaches nobody.
+        #[tokio::test]
+        async fn test_subscribe_to_failed_route_errors_and_rolls_back() {
+            let mut harness = SubscribeHarness::start().await;
+            harness.settle_failed();
+
+            let response = harness.subscribe().await;
+
+            assert!(response.get("error").is_some(), "{response}");
+            assert!(response.to_string().contains("rust-analyzer"), "{response}");
+            harness.subs.publish_matching(|_| true).await;
+            assert_eq!(harness.updates_within(UPDATE_WINDOW).await, 0);
+        }
+
+        /// FR-010: a re-subscribe to a failed route errors but keeps the
+        /// subscription made while the server was still starting.
+        #[tokio::test]
+        async fn test_resubscribe_to_failed_route_keeps_earlier_subscription() {
+            let mut harness = SubscribeHarness::start().await;
+            let first = harness.subscribe().await;
+            assert!(first.get("error").is_none(), "{first}");
+            harness.settle_failed();
+
+            let second = harness.subscribe().await;
+
+            assert!(second.get("error").is_some(), "{second}");
+            harness.subs.publish_matching(|_| true).await;
+            assert_eq!(harness.updates_within(UPDATE_WINDOW).await, 1);
+        }
+
+        /// FR-010/FR-012: subscribing while the server starts succeeds, and
+        /// the settle publish then notifies exactly once for the failed URI.
+        #[tokio::test]
+        async fn test_subscribe_during_startup_gets_one_update_when_startup_fails() {
+            let mut harness = SubscribeHarness::start().await;
+            let response = harness.subscribe().await;
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(
+                harness.updates_within(UPDATE_WINDOW).await,
+                0,
+                "nothing may publish before settle"
+            );
+
+            harness.settle_failed();
+            publish_startup_failures(&harness.translator, &harness.subs).await;
+
+            assert_eq!(harness.updates_within(UPDATE_WINDOW).await, 1);
         }
     }
 }

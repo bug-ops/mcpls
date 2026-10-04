@@ -905,9 +905,11 @@ Get diagnostics from LSP server push notifications (cached), without making a ne
 
 - Returns only diagnostics pushed by the LSP server via `textDocument/publishDiagnostics`, without making a new pull request
 - Filtered by the same routing rules as `get_diagnostics`, so both tools use the same server when routed explicitly
-- Returns an empty array if the file hasn't been analyzed yet or no push notifications have been received
+- Returns an empty array if the file hasn't been analyzed yet or no push notifications have been received, but only once the file's server is running (or no server is configured for its language)
 - If the server for the file's language failed to start, returns that startup error (`... failed to start: ...`, including the server's stderr when it printed any) instead of an empty array; the `lsp-diagnostics://` resource read behaves the same. Startup failures are not retried: fix the server and restart mcpls
 - A server may publish diagnostics for one file under several spellings (a symlink and its target, for example). mcpls keys them by the file's canonical path and returns the union, with exact duplicates removed and entries ordered by range, so errors published under a symlink path are visible when you ask for the real path. A symlink pointing outside the workspace roots is ignored
+- While the file's server is still starting, returns the retryable `ServerInitializing` error (code `-32051`) instead of an empty array; retry after a short wait
+- The diagnostics resource read, `resources/subscribe` and `subscriptions/listen` follow the same rules: subscribing while the server is still starting succeeds, and a subscriber is sent one `resources/updated` when startup fails, after which a re-read returns the error
 - Useful when you want fast, cached-only results without waiting for a fresh pull request
 
 ---

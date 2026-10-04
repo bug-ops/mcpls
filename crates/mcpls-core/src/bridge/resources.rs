@@ -464,6 +464,12 @@ impl ResourceSubscriptions {
         removed
     }
 
+    /// A copy of the canonical subscription set, so a caller can evaluate a
+    /// predicate on each URI without holding the subscription lock.
+    pub(crate) async fn snapshot(&self) -> Vec<DiagnosticsResourceUri> {
+        self.0.read().await.canonical.iter().cloned().collect()
+    }
+
     /// Check if a URI is currently subscribed.
     pub(crate) async fn contains(&self, uri: &DiagnosticsResourceUri) -> bool {
         self.0.read().await.canonical.contains(uri)

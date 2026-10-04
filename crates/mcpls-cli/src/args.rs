@@ -27,6 +27,27 @@ pub fn parse_bool_flag(s: &str) -> Result<bool, String> {
     }
 }
 
+/// Liveness probing of HTTP GET (SSE) streams, selected by
+/// `--http-stream-liveness`.
+#[cfg(feature = "transport-http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HttpStreamLiveness {
+    /// Ping GET streams and close those whose client stops answering.
+    Probe,
+    /// Never probe; for clients that ignore server `ping` requests.
+    Off,
+}
+
+#[cfg(feature = "transport-http")]
+impl From<HttpStreamLiveness> for mcpls_core::StreamLiveness {
+    fn from(value: HttpStreamLiveness) -> Self {
+        match value {
+            HttpStreamLiveness::Probe => Self::DEFAULT,
+            HttpStreamLiveness::Off => Self::Disabled,
+        }
+    }
+}
+
 /// Universal MCP to LSP Bridge
 ///
 /// Exposes Language Server Protocol capabilities as MCP tools,
@@ -92,6 +113,23 @@ pub struct Args {
         env = "MCPLS_HTTP_PATH"
     )]
     pub http_path: String,
+
+    /// Liveness probing of HTTP GET streams: `probe` or `off`.
+    ///
+    /// `probe` pings each GET stream with an MCP `ping` request and closes it
+    /// when the client stops answering, which frees streams of vanished
+    /// peers. Use `off` for a client that ignores server `ping` requests and
+    /// would otherwise be disconnected periodically. Only meaningful when
+    /// `--listen` is set.
+    #[cfg(feature = "transport-http")]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        default_value_t = HttpStreamLiveness::Probe,
+        env = "MCPLS_HTTP_STREAM_LIVENESS"
+    )]
+    pub http_stream_liveness: HttpStreamLiveness,
 }
 
 #[cfg(test)]
@@ -296,6 +334,33 @@ mod tests {
         fn test_http_path_custom() {
             let args = Args::parse_from(["mcpls", "--http-path", "/api/mcp"]);
             assert_eq!(args.http_path, "/api/mcp");
+        }
+
+        #[test]
+        fn test_http_stream_liveness_defaults_to_probe() {
+            let args = Args::parse_from(["mcpls"]);
+            assert_eq!(args.http_stream_liveness, HttpStreamLiveness::Probe);
+            assert_eq!(
+                mcpls_core::StreamLiveness::from(args.http_stream_liveness),
+                mcpls_core::StreamLiveness::DEFAULT
+            );
+        }
+
+        #[test]
+        fn test_http_stream_liveness_off() {
+            let args = Args::parse_from(["mcpls", "--http-stream-liveness", "off"]);
+            assert_eq!(args.http_stream_liveness, HttpStreamLiveness::Off);
+            assert_eq!(
+                mcpls_core::StreamLiveness::from(args.http_stream_liveness),
+                mcpls_core::StreamLiveness::Disabled
+            );
+        }
+
+        #[test]
+        fn test_http_stream_liveness_rejects_unknown_mode() {
+            assert!(
+                Args::try_parse_from(["mcpls", "--http-stream-liveness", "sometimes"]).is_err()
+            );
         }
 
         #[test]
