@@ -508,10 +508,11 @@ pub(crate) async fn run_stdio(
 /// (#531). macOS and Windows keep the kernel default. Behind the recommended
 /// reverse proxy the accepted socket faces the proxy, so the proxy's own
 /// timeouts govern instead. A client that stops reading with a full receive
-/// window for longer than the timeout may be dropped too. A client with a GET stream open is never reaped by mcpls, but
-/// rmcp's own 5-minute `keep_alive` still ends a session that sees no event at
-/// all in that time (SSE pings do not count). Clients should send `DELETE` on
-/// shutdown; after an expiry they must re-initialize and re-subscribe.
+/// window for longer than the timeout may be dropped too. A client with a GET
+/// stream open is never reaped by mcpls, but rmcp's own 5-minute `keep_alive`
+/// still ends a session that sees no event at all in that time (SSE pings do
+/// not count). Clients should send `DELETE` on shutdown; after an expiry they
+/// must re-initialize and re-subscribe.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
 /// "one instance per request"; `resources/subscribe`/`unsubscribe` detect
@@ -1374,6 +1375,8 @@ async fn enforce_session_cap(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::bridge::WorkspaceRoots;
+
     /// An accepted stream must read back the half-open `TCP_USER_TIMEOUT`.
     #[cfg(all(
         feature = "transport-http",
@@ -1483,7 +1486,7 @@ mod tests {
 
         let translator = Arc::new(Translator::new());
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let workspace_roots = crate::bridge::WorkspaceRoots::default();
+        let workspace_roots = WorkspaceRoots::default();
         let subs = SubscriptionRegistry::new();
         let server = McplsServer::new(
             translator,
@@ -1521,6 +1524,7 @@ mod tests {
             HttpConfig, IdleTimeout, SessionActivity, SessionManager as _, Transport,
             run_idle_reaper,
         };
+        use crate::bridge::WorkspaceRoots;
         use crate::test_lsp::CapturedLogs;
 
         #[test]
@@ -1594,7 +1598,7 @@ mod tests {
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots = crate::bridge::WorkspaceRoots::default();
+            let workspace_roots = WorkspaceRoots::default();
             let subs = SubscriptionRegistry::new();
             let server = McplsServer::new(
                 translator,
@@ -1690,7 +1694,7 @@ mod tests {
 
             let translator = Arc::new(Translator::new());
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots = crate::bridge::WorkspaceRoots::default();
+            let workspace_roots = WorkspaceRoots::default();
             let subs = SubscriptionRegistry::new();
             let server = McplsServer::new(
                 translator,
@@ -1936,9 +1940,7 @@ mod tests {
         /// Builds a `McplsServer` with default collaborators and the given
         /// workspace roots, matching the setup shared by every
         /// `run_http`-driving test in this module.
-        fn test_server_with_roots(
-            workspace_roots: crate::bridge::WorkspaceRoots,
-        ) -> crate::mcp::McplsServer {
+        fn test_server_with_roots(workspace_roots: WorkspaceRoots) -> crate::mcp::McplsServer {
             use std::sync::Arc;
 
             use tokio::sync::Mutex;
@@ -1962,7 +1964,7 @@ mod tests {
 
         /// [`test_server_with_roots`] with no workspace roots configured.
         fn test_server() -> crate::mcp::McplsServer {
-            test_server_with_roots(crate::bridge::WorkspaceRoots::default())
+            test_server_with_roots(WorkspaceRoots::default())
         }
 
         /// Polls a TCP connect until it succeeds or the 5s budget runs out;
@@ -2365,7 +2367,7 @@ mod tests {
             std::fs::write(&file_path, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file_path).unwrap();
 
-            let server = test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![
                 workspace.path().to_path_buf(),
             ]));
             let registry = server.subscription_registry();
@@ -2692,8 +2694,7 @@ mod tests {
             let uri_x = crate::bridge::resources::make_uri(&file_x).unwrap();
             let uri_y = crate::bridge::resources::make_uri(&file_y).unwrap();
 
-            let server =
-                test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
 
@@ -2704,7 +2705,7 @@ mod tests {
             subscribe_in_session(addr, &session_b, &uri_y).await;
 
             let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
             let publish = |file: &std::path::Path| {
                 let notification = crate::lsp::LspNotification::PublishDiagnostics(
                     lsp_types::PublishDiagnosticsParams {
@@ -2953,8 +2954,7 @@ mod tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-            let server =
-                test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
@@ -2963,7 +2963,7 @@ mod tests {
             drop(stream);
 
             let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
             let accept_headers =
                 "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
             let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
@@ -2998,15 +2998,14 @@ mod tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-            let server =
-                test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
             let (session, mut stream) = establish_session(addr).await;
             subscribe_in_session(addr, &session, &uri).await;
             let (tx, _cancel_tx) =
-                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+                crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::resolve(vec![root]));
 
             let started = tokio::time::Instant::now();
             while started.elapsed() < TEST_IDLE * 3 {
@@ -3049,8 +3048,7 @@ mod tests {
             let file = root.join("main.rs");
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = crate::bridge::resources::make_uri(&file).unwrap();
-            let server =
-                test_server_with_roots(crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]));
+            let server = test_server_with_roots(WorkspaceRoots::resolve(vec![root.clone()]));
             let registry = server.subscription_registry();
             let (addr, server_task) = spawn_idle_test_server(1, server).await;
             ListenFixture {
@@ -3124,7 +3122,7 @@ mod tests {
             }
             let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
                 fx.registry.clone(),
-                std::sync::Arc::from(vec![fx.root.clone()]),
+                WorkspaceRoots::resolve(vec![fx.root.clone()]),
             );
             tx.send(publish_notification(&fx.file)).await.unwrap();
 
@@ -3199,7 +3197,7 @@ mod tests {
             let server = crate::mcp::McplsServer::new(
                 std::sync::Arc::new(crate::bridge::Translator::new()),
                 cache,
-                crate::bridge::WorkspaceRoots::resolve(vec![root]),
+                WorkspaceRoots::resolve(vec![root]),
                 crate::mcp::SubscriptionRegistry::new(),
                 false,
                 crate::config::McpConfig::default(),

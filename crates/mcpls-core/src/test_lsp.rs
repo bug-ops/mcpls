@@ -20,6 +20,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::time::Duration;
 
+use crate::bridge::WorkspaceRoots;
 use crate::config::LspServerConfig;
 use crate::lsp::{LspClient, LspTransport, LspTransportReader, ServerInitConfig};
 
@@ -344,7 +345,23 @@ pub fn with_read_preamble(body: &str) -> String {
 /// the pump).
 pub fn spawn_test_pump(
     subs: crate::mcp::SubscriptionRegistry,
-    workspace_roots: std::sync::Arc<[std::path::PathBuf]>,
+    workspace_roots: WorkspaceRoots,
+) -> (
+    tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let cache = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::bridge::NotificationCache::new(),
+    ));
+    spawn_test_pump_with_cache(subs, workspace_roots, cache)
+}
+
+/// As [`spawn_test_pump`], over a caller-supplied notification cache so the
+/// test can inspect what the pump stored.
+pub fn spawn_test_pump_with_cache(
+    subs: crate::mcp::SubscriptionRegistry,
+    workspace_roots: WorkspaceRoots,
+    notification_cache: std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
 ) -> (
     tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
     tokio::sync::watch::Sender<bool>,
@@ -352,7 +369,14 @@ pub fn spawn_test_pump(
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
     // Held so the lifecycle lane stays open for the pump's lifetime.
-    let (_cache, cancel_tx) = spawn_pump(rx, lifecycle_rx, lifecycle_tx, subs, workspace_roots);
+    let (_cache, cancel_tx) = spawn_pump(
+        rx,
+        lifecycle_rx,
+        lifecycle_tx,
+        subs,
+        workspace_roots,
+        notification_cache,
+    );
     (tx, cancel_tx)
 }
 
@@ -370,7 +394,10 @@ pub fn spawn_test_pump_over_lanes(
         lanes.lifecycle_rx,
         (),
         crate::mcp::SubscriptionRegistry::default(),
-        std::sync::Arc::from([]),
+        WorkspaceRoots::default(),
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::bridge::NotificationCache::new(),
+        )),
     )
 }
 
@@ -379,15 +406,13 @@ fn spawn_pump<K: Send + 'static>(
     lifecycle_rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
     keep_alive: K,
     subs: crate::mcp::SubscriptionRegistry,
-    workspace_roots: std::sync::Arc<[std::path::PathBuf]>,
+    workspace_roots: WorkspaceRoots,
+    notification_cache: std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
 ) -> (
     std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
     tokio::sync::watch::Sender<bool>,
 ) {
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let notification_cache = std::sync::Arc::new(tokio::sync::Mutex::new(
-        crate::bridge::NotificationCache::new(),
-    ));
     let shared = crate::PumpShared {
         notification_cache: std::sync::Arc::clone(&notification_cache),
         subs,

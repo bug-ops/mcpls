@@ -748,6 +748,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::bridge::WorkspaceRoots;
     use crate::bridge::translator::dto::DiagnosticSeverity;
     use crate::bridge::translator::testing::*;
 
@@ -1024,9 +1025,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            temp_dir.path().to_path_buf(),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1055,9 +1055,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            temp_dir.path().to_path_buf(),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1085,9 +1084,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            temp_dir.path().to_path_buf(),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1115,9 +1113,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            temp_dir.path().to_path_buf(),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1185,9 +1182,8 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            temp_dir.path().to_path_buf(),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 

@@ -13,7 +13,7 @@ use super::dto::Position;
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
-use crate::bridge::{DiagnosticInfo, DocumentTracker};
+use crate::bridge::{DiagnosticInfo, DocumentTracker, WorkspaceRoots};
 use crate::config::{ServerId, ToolRouter};
 use crate::lsp::LspServer;
 pub(super) use crate::test_lsp::{
@@ -127,9 +127,7 @@ pub(super) fn translator_with_capabilities(
                 server_id.clone(),
                 "rust".to_string(),
             )]));
-    translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-        dir.path().to_path_buf(),
-    ]));
+    translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
     let (client, server) = fake_lsp_client();
     translator.register_client(server_id.clone(), client);
@@ -157,9 +155,7 @@ pub(super) fn translator_with_capabilities_and_encoding(
                 server_id.clone(),
                 "rust".to_string(),
             )]));
-    translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-        dir.path().to_path_buf(),
-    ]));
+    translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
     let (client, server) = fake_lsp_client();
     translator.register_client(server_id.clone(), client);

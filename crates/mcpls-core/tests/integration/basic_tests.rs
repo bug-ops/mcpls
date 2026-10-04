@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use mcpls_core::bridge::Translator;
+use mcpls_core::bridge::{Translator, WorkspaceRoots};
 use mcpls_core::config::{ServerConfig, ServerId, ToolKind, ToolRouter};
 
 #[allow(unused)]
@@ -62,7 +62,7 @@ fn test_workspace_roots_configuration() {
     let mut translator = Translator::new();
     let roots = vec![PathBuf::from("/tmp/test1"), PathBuf::from("/tmp/test2")];
 
-    translator.set_workspace_roots(mcpls_core::bridge::WorkspaceRoots::resolve(roots));
+    translator.set_workspace_roots(WorkspaceRoots::resolve(roots));
 }
 
 #[test]

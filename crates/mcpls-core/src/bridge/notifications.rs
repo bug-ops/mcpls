@@ -393,6 +393,21 @@ pub struct DiagnosticInfo {
     pub diagnostics: Vec<LspDiagnostic>,
 }
 
+/// Where a published URI's entry is indexed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceIndex {
+    canonical_key: String,
+    is_canonical: bool,
+}
+
+/// One cached entry of a [`DiagnosticSources`] snapshot.
+#[derive(Debug, Clone)]
+struct SourceEntry {
+    info: DiagnosticInfo,
+    /// Whether the server published under the canonical spelling of the path.
+    is_canonical: bool,
+}
+
 /// Owned snapshot of the diagnostics cached for one file, possibly spread
 /// over several published URIs (a canonical path plus symlink aliases).
 ///
@@ -402,41 +417,51 @@ pub struct DiagnosticInfo {
 #[derive(Debug, Clone)]
 pub struct DiagnosticSources {
     requested: Uri,
-    entries: Vec<DiagnosticInfo>,
+    entries: Vec<SourceEntry>,
 }
 
 impl DiagnosticSources {
     /// Collapses the sources into one entry for the requested file.
     ///
-    /// A single source is returned unchanged. Several are concatenated in
-    /// source-URI order with exact duplicates removed, ordered by range, and
-    /// re-capped to the per-entry size bound. The merged `version` is the
-    /// requested (canonical) source's, or `None` when only aliases published.
+    /// - No source: `None`.
+    /// - One source: returned unchanged, with its own `uri` and `version`,
+    ///   even when it is a symlink alias.
+    /// - Several sources: diagnostics are concatenated in source-URI order,
+    ///   exact duplicates (equal in every field) are removed, the result is
+    ///   ordered by range and re-capped to the per-entry size bound. The
+    ///   entry's `uri` is the requested one and its `version` is that of the
+    ///   source published under the canonical spelling, or `None` when only
+    ///   aliases published.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::NotificationCache;
+    ///
+    /// let cache = NotificationCache::new();
+    /// let sources = cache.diagnostic_sources("file:///workspace/main.rs");
+    /// assert!(sources.merge().is_none());
+    /// ```
     #[must_use]
     pub fn merge(self) -> Option<DiagnosticInfo> {
         let Self { requested, entries } = self;
         if entries.len() <= 1 {
-            return entries.into_iter().next();
+            return entries.into_iter().next().map(|entry| entry.info);
         }
-        let requested_key = uri_cache_key(requested.as_ref()).into_owned();
         let version = entries
             .iter()
-            .find(|entry| uri_cache_key(entry.uri.as_ref()) == requested_key)
-            .and_then(|entry| entry.version);
+            .find(|entry| entry.is_canonical)
+            .and_then(|entry| entry.info.version);
 
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut merged: Vec<LspDiagnostic> = Vec::new();
-        let mut by_start: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
-        for diagnostic in entries.into_iter().flat_map(|entry| entry.diagnostics) {
-            let start = (
-                diagnostic.range.start.line,
-                diagnostic.range.start.character,
-            );
-            let bucket = by_start.entry(start).or_default();
-            if bucket.iter().any(|&index| merged[index] == diagnostic) {
-                continue;
+        for diagnostic in entries.into_iter().flat_map(|entry| entry.info.diagnostics) {
+            // A serialization error cannot happen for a `Diagnostic`; keeping
+            // the item is the safe fallback.
+            let unique = serde_json::to_vec(&diagnostic).map_or(true, |bytes| seen.insert(bytes));
+            if unique {
+                merged.push(diagnostic);
             }
-            bucket.push(merged.len());
-            merged.push(diagnostic);
         }
         merged.sort_by_key(|d| {
             (
@@ -560,8 +585,9 @@ pub struct NotificationCache {
     /// themselves stay keyed by published URI, so caps, eviction and owner
     /// bookkeeping are unchanged; pruned wherever an entry is removed.
     diagnostics_sources: HashMap<String, BTreeSet<String>>,
-    /// Reverse of `diagnostics_sources`: published-URI key -> canonical key.
-    source_canonical: HashMap<String, String>,
+    /// Reverse of `diagnostics_sources`: published-URI key -> where it is
+    /// indexed and whether it is the canonical spelling.
+    source_canonical: HashMap<String, SourceIndex>,
     /// Next sequence number to assign in `diagnostic_order`. Shared across
     /// every server's order map and monotonically increasing for the
     /// cache's lifetime; never reused, so it never collides with an older
@@ -902,17 +928,9 @@ impl NotificationCache {
             while self.diagnostics.len() >= MAX_DIAGNOSTIC_ENTRIES
                 && let Some((owner, seq, evict_key)) = self.entry_to_evict(server_id)
             {
-                if let Some(order) = self.diagnostic_order.get_mut(&owner) {
-                    order.remove(&seq);
-                }
-                self.diagnostic_seq.remove(&evict_key);
-                self.diagnostics_owners.remove(&evict_key);
-                self.unindex_source(&evict_key);
-                if let Some(removed) = self.diagnostics.remove(&evict_key)
-                    && removed.diagnostics.is_empty()
-                {
-                    self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
-                }
+                debug_assert_eq!(self.diagnostic_seq.get(&evict_key), Some(&seq));
+                debug_assert_eq!(self.diagnostics_owners.get(&evict_key), Some(&owner));
+                self.remove_entry(&evict_key);
             }
         }
 
@@ -949,8 +967,11 @@ impl NotificationCache {
     /// its canonical file so every spelling of one file is read back as the
     /// union of what each published.
     ///
-    /// An empty publish replaces only its own source's entry. A new source
-    /// beyond `MAX_SOURCES_PER_FILE` is dropped before anything is stored.
+    /// An empty publish replaces only its own source's entry. At most
+    /// `MAX_SOURCES_PER_FILE` spellings are kept per file: a further alias is
+    /// dropped before anything is stored, but the canonical spelling is always
+    /// admitted, evicting the oldest alias, so a server fanning one file out
+    /// cannot suppress the canonical publishes.
     pub(crate) fn store_published_diagnostics(
         &mut self,
         server_id: &ServerId,
@@ -961,19 +982,28 @@ impl NotificationCache {
         let source_key = uri_cache_key(published.source().as_ref()).into_owned();
         let canonical_key = uri_cache_key(published.canonical().as_ref()).into_owned();
 
-        let already_indexed = self.source_canonical.get(&source_key) == Some(&canonical_key);
-        if !already_indexed
-            && self
-                .diagnostics_sources
-                .get(&canonical_key)
-                .is_some_and(|sources| sources.len() >= MAX_SOURCES_PER_FILE)
-        {
-            debug!(
-                "dropping diagnostics for {}: {MAX_SOURCES_PER_FILE} published URIs already cached for {}",
-                published.source().as_ref(),
-                published.canonical().as_ref()
-            );
-            return;
+        let already_indexed = self
+            .source_canonical
+            .get(&source_key)
+            .is_some_and(|index| index.canonical_key == canonical_key);
+        let at_capacity = self
+            .diagnostics_sources
+            .get(&canonical_key)
+            .is_some_and(|sources| sources.len() >= MAX_SOURCES_PER_FILE);
+        if !already_indexed && at_capacity {
+            let evicted = published
+                .is_canonical()
+                .then(|| self.oldest_alias_source(&canonical_key))
+                .flatten();
+            let Some(oldest_alias) = evicted else {
+                debug!(
+                    "dropping diagnostics for {}: {MAX_SOURCES_PER_FILE} published URIs already cached for {}",
+                    published.source().as_ref(),
+                    published.canonical().as_ref()
+                );
+                return;
+            };
+            self.remove_entry(&oldest_alias);
         }
 
         self.store_diagnostics(server_id, published.source(), version, diagnostics);
@@ -983,17 +1013,57 @@ impl NotificationCache {
             .entry(canonical_key.clone())
             .or_default()
             .insert(source_key.clone());
-        self.source_canonical.insert(source_key, canonical_key);
+        self.source_canonical.insert(
+            source_key,
+            SourceIndex {
+                canonical_key,
+                is_canonical: published.is_canonical(),
+            },
+        );
+    }
+
+    /// The least recently written non-canonical source indexed under
+    /// `canonical_key`.
+    fn oldest_alias_source(&self, canonical_key: &str) -> Option<String> {
+        self.diagnostics_sources
+            .get(canonical_key)?
+            .iter()
+            .filter(|source| {
+                self.source_canonical
+                    .get(*source)
+                    .is_some_and(|index| !index.is_canonical)
+            })
+            .min_by_key(|source| self.diagnostic_seq.get(*source))
+            .cloned()
+    }
+
+    /// Removes one cached entry and every piece of bookkeeping for it.
+    fn remove_entry(&mut self, key: &str) {
+        if let Some(seq) = self.diagnostic_seq.remove(key)
+            && let Some(owner) = self.diagnostics_owners.get(key)
+            && let Some(order) = self.diagnostic_order.get_mut(owner)
+        {
+            order.remove(&seq);
+        }
+        self.diagnostics_owners.remove(key);
+        if self
+            .diagnostics
+            .remove(key)
+            .is_some_and(|removed| removed.diagnostics.is_empty())
+        {
+            self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
+        }
+        self.unindex_source(key);
     }
 
     fn unindex_source(&mut self, source_key: &str) {
-        let Some(canonical_key) = self.source_canonical.remove(source_key) else {
+        let Some(index) = self.source_canonical.remove(source_key) else {
             return;
         };
-        if let Some(sources) = self.diagnostics_sources.get_mut(&canonical_key) {
+        if let Some(sources) = self.diagnostics_sources.get_mut(&index.canonical_key) {
             sources.remove(source_key);
             if sources.is_empty() {
-                self.diagnostics_sources.remove(&canonical_key);
+                self.diagnostics_sources.remove(&index.canonical_key);
             }
         }
     }
@@ -1146,13 +1216,34 @@ impl NotificationCache {
 
     /// Snapshot of every entry cached for the file `uri` names, to be
     /// [merged](DiagnosticSources::merge) after the cache lock is released.
+    ///
+    /// Clones the entries (at most 8, each bounded to 1 MiB) so the merge can
+    /// run without the lock.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::NotificationCache;
+    ///
+    /// let cache = NotificationCache::new();
+    /// let snapshot = cache.diagnostic_sources("file:///workspace/main.rs");
+    /// // Merge once the cache lock has been released.
+    /// assert!(snapshot.merge().is_none());
+    /// ```
     #[must_use]
     pub fn diagnostic_sources(&self, uri: &str) -> DiagnosticSources {
         let key = uri_cache_key(uri);
         let entries = self
             .source_keys(&key)
             .into_iter()
-            .filter_map(|source| self.diagnostics.get(source).cloned())
+            .filter_map(|source| {
+                let info = self.diagnostics.get(source)?.clone();
+                let is_canonical = self
+                    .source_canonical
+                    .get(source)
+                    .map_or_else(|| source == key.as_ref(), |index| index.is_canonical);
+                Some(SourceEntry { info, is_canonical })
+            })
             .collect();
         DiagnosticSources {
             requested: Uri::from(uri.to_owned()),
@@ -1162,6 +1253,15 @@ impl NotificationCache {
 
     /// Whether any diagnostics entry (possibly empty) is cached for the file
     /// `uri` names, under any of its published URIs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::NotificationCache;
+    ///
+    /// let cache = NotificationCache::new();
+    /// assert!(!cache.has_diagnostics("file:///workspace/main.rs"));
+    /// ```
     #[must_use]
     pub fn has_diagnostics(&self, uri: &str) -> bool {
         let key = uri_cache_key(uri);
@@ -3000,5 +3100,106 @@ mod tests {
             cache.diagnostics_owner(file_uri("main.rs").as_ref()),
             Some(&server)
         );
+    }
+
+    /// S5: a server fanning one file out over many spellings must not be able
+    /// to suppress the canonical publishes.
+    #[test]
+    fn test_canonical_source_is_admitted_when_aliases_fill_the_cap() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        for n in 0..MAX_SOURCES_PER_FILE {
+            cache.store_published_diagnostics(
+                &server,
+                &published(&format!("a{n}.rs")),
+                None,
+                vec![diagnostic_at(
+                    u32::try_from(n).unwrap(),
+                    &format!("alias{n}"),
+                )],
+            );
+        }
+
+        cache.store_published_diagnostics(
+            &server,
+            &published("main.rs"),
+            Some(5),
+            vec![diagnostic_at(99, "canonical")],
+        );
+
+        let info = merged(&cache).unwrap();
+        let shown = messages(&info);
+        assert!(shown.contains(&"canonical".to_owned()), "{shown:?}");
+        assert!(
+            !shown.contains(&"alias0".to_owned()),
+            "oldest alias is evicted"
+        );
+        assert_eq!(shown.len(), MAX_SOURCES_PER_FILE);
+        assert_eq!(info.version, Some(5));
+        assert_eq!(cache.diagnostics_count(), MAX_SOURCES_PER_FILE);
+    }
+
+    #[test]
+    fn test_alias_beyond_the_cap_is_still_dropped_when_canonical_is_present() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        cache.store_published_diagnostics(&server, &published("main.rs"), None, vec![]);
+        for n in 0..MAX_SOURCES_PER_FILE - 1 {
+            cache.store_published_diagnostics(
+                &server,
+                &published(&format!("a{n}.rs")),
+                None,
+                vec![],
+            );
+        }
+
+        cache.store_published_diagnostics(
+            &server,
+            &published("extra.rs"),
+            None,
+            vec![diagnostic_at(1, "x")],
+        );
+
+        assert!(cache.diagnostics(file_uri("extra.rs").as_ref()).is_none());
+        assert!(cache.diagnostics(file_uri("main.rs").as_ref()).is_some());
+    }
+
+    /// The merge must not compare every diagnostic against every other one
+    /// sharing its start: 8 sources of 3000 same-start diagnostics each.
+    #[test]
+    fn test_merge_handles_many_same_start_diagnostics_across_sources() {
+        const PER_SOURCE: u32 = 3000;
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        for source in 0..MAX_SOURCES_PER_FILE {
+            let diagnostics = (0..PER_SOURCE)
+                .map(|n| diagnostic_at(0, &format!("diagnostic-{n}")))
+                .collect();
+            cache.store_published_diagnostics(
+                &server,
+                &published(&format!("a{source}.rs")),
+                None,
+                diagnostics,
+            );
+        }
+
+        let info = merged(&cache).unwrap();
+
+        assert_eq!(info.diagnostics.len(), PER_SOURCE as usize);
+    }
+
+    /// Diagnostics equal in range and message but differing elsewhere are
+    /// distinct and both survive the merge.
+    #[test]
+    fn test_merge_keeps_diagnostics_that_differ_outside_range_and_message() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        let plain = diagnostic_at(1, "same");
+        let mut coded = diagnostic_at(1, "same");
+        coded.code = Some(lsp_types::Code::String("E1".to_owned()));
+        cache.store_published_diagnostics(&server, &published("a1.rs"), None, vec![plain]);
+        cache.store_published_diagnostics(&server, &published("a2.rs"), None, vec![coded]);
+
+        assert_eq!(merged(&cache).unwrap().diagnostics.len(), 2);
     }
 }

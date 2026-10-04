@@ -600,7 +600,9 @@ impl McplsServer {
         // language `handle_diagnostics`'s own validation resolves, or this
         // could observe the wrong server's (or no server's) indexing state.
         // Best-effort (`.ok()`): an invalid/out-of-workspace path just reads
-        // `false` here and fails properly inside `handle_diagnostics` below.
+        // `false` here and fails properly inside `handle_diagnostics` below,
+        // and a failed-to-start server's `ServerFailedToStart` is likewise
+        // reported there by the pull request itself.
         let route_id =
             validate_path_against_roots(Path::new(&file_path), &self.context.workspace_roots)
                 .ok()
@@ -1899,9 +1901,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -1971,9 +1971,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2041,9 +2039,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2127,9 +2123,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, fake) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -2427,9 +2421,7 @@ mod tests {
                 "rust".to_string(),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -3968,13 +3960,9 @@ sleep 0.3
 
         let mut translator = Translator::new();
         #[cfg(windows)]
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            PathBuf::from(r"C:\"),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![PathBuf::from(r"C:\")]));
         #[cfg(not(windows))]
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            PathBuf::from("/"),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![PathBuf::from("/")]));
         let result = translator.validate_path(Path::new("/this/path/does/not/exist/at/all.rs"));
         assert!(matches!(result, Err(Error::FileIo { .. })));
     }

@@ -508,6 +508,7 @@ mod tests {
         use tokio::time::Duration;
 
         use super::*;
+        use crate::bridge::WorkspaceRoots;
         use crate::config::{LspServerConfig, ToolKind, ToolRouter};
         use crate::lsp::ServerInitConfig;
         use crate::test_lsp::with_read_preamble;
@@ -1270,9 +1271,7 @@ sleep 1
             let mut translator = Translator::new()
                 .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-            translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-                workspace.to_path_buf(),
-            ]));
+            translator.set_workspace_roots(WorkspaceRoots::resolve(vec![workspace.to_path_buf()]));
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
             wait_until_dead(&translator, &id).await;

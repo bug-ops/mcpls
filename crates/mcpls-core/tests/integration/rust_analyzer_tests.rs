@@ -15,7 +15,8 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{
-    IndexingState, NotificationCache, Position, Translator, apply_lifecycle_notification,
+    IndexingState, NotificationCache, Position, Translator, WorkspaceRoots,
+    apply_lifecycle_notification,
 };
 use mcpls_core::config::{LspServerConfig, ServerId, ToolRouter};
 use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig};
@@ -81,9 +82,7 @@ fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
             ServerId::from("rust"),
             "rust".to_string(),
         )]));
-    translator.set_workspace_roots(mcpls_core::bridge::WorkspaceRoots::resolve(vec![
-        workspace_path,
-    ]));
+    translator.set_workspace_roots(WorkspaceRoots::resolve(vec![workspace_path]));
     translator.register_server_complete(server);
 
     Arc::new(Mutex::new(translator))

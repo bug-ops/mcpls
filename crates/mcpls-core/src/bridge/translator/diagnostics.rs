@@ -461,7 +461,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &crate::bridge::WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             test_file.to_str().unwrap(),
         )
         .unwrap();
@@ -577,7 +577,7 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &crate::bridge::WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             test_file.to_str().unwrap(),
         )
         .unwrap();
@@ -696,7 +696,7 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), diagnostics);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &crate::bridge::WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             test_file.to_str().unwrap(),
         )
         .unwrap();
@@ -760,7 +760,7 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &crate::bridge::WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
+            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
             test_file.to_str().unwrap(),
         )
         .unwrap();
@@ -782,7 +782,7 @@ mod tests {
         #[cfg(not(windows))]
         let root = PathBuf::from("/");
         let result = Translator::cached_diagnostics_uri(
-            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+            &WorkspaceRoots::resolve(vec![root]),
             "/nonexistent/path/file.rs",
         );
         assert!(matches!(result, Err(Error::FileIo { .. })));
@@ -1336,7 +1336,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = Translator::cached_diagnostics_uri(
-            &crate::bridge::WorkspaceRoots::resolve(workspace_roots),
+            &WorkspaceRoots::resolve(workspace_roots),
             test_file.to_str().unwrap(),
         );
         assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
@@ -1359,9 +1359,7 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);
@@ -1449,9 +1447,7 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);
@@ -1515,9 +1511,7 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);

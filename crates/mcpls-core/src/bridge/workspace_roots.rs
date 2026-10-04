@@ -40,13 +40,22 @@ impl CaseRule {
     }
 }
 
-/// Drive letters compare equal across `C:` and `\\?\C:` (dunce keeps the
+/// Drive letters compare equal across `C:` and `\\?\C:`, and network shares
+/// across `\\server\share` and `\\?\UNC\server\share` (dunce keeps the
 /// verbatim form for paths beyond `MAX_PATH`).
 fn prefix_eq(a: PrefixComponent<'_>, b: PrefixComponent<'_>) -> bool {
+    let same_name = |x: &std::ffi::OsStr, y: &std::ffi::OsStr| {
+        x.to_string_lossy()
+            .eq_ignore_ascii_case(&y.to_string_lossy())
+    };
     match (a.kind(), b.kind()) {
         (Prefix::Disk(x) | Prefix::VerbatimDisk(x), Prefix::Disk(y) | Prefix::VerbatimDisk(y)) => {
             x.eq_ignore_ascii_case(&y)
         }
+        (
+            Prefix::UNC(server_a, share_a) | Prefix::VerbatimUNC(server_a, share_a),
+            Prefix::UNC(server_b, share_b) | Prefix::VerbatimUNC(server_b, share_b),
+        ) => same_name(server_a, server_b) && same_name(share_a, share_b),
         _ => a == b,
     }
 }
@@ -93,6 +102,11 @@ pub fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
 
 /// The canonical workspace roots plus the lexical aliases they may be named by.
 ///
+/// A path is admitted by `validate_path_against_roots` only if it passes the
+/// lexical pre-check against the canonical roots and their aliases (configured
+/// form, logical `$PWD`) *and* its physical, canonical form lies under a
+/// canonical root; the aliases only widen the pre-check.
+///
 /// Cheap to clone (both lists are shared). Fields are private so every
 /// instance upholds the invariants: aliases are absolute, simplified,
 /// lexically normalized and distinct from the canonical roots.
@@ -105,24 +119,12 @@ pub struct WorkspaceRoots {
 impl WorkspaceRoots {
     /// Builds a root set from already-canonical roots and extra lexical aliases.
     ///
-    /// Aliases that are relative, empty after normalization, duplicated, or
-    /// equal to a canonical root are dropped.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::PathBuf;
-    ///
-    /// use mcpls_core::bridge::WorkspaceRoots;
-    ///
-    /// let roots = WorkspaceRoots::new(
-    ///     vec![PathBuf::from("/private/ws")],
-    ///     vec![PathBuf::from("/ws"), PathBuf::from("relative")],
-    /// );
-    /// assert_eq!(roots.canonical().len(), 1);
-    /// ```
+    /// The caller vouches that `canonical` is already canonical (the
+    /// containment check trusts it); [`Self::resolve`] is the public
+    /// constructor that guarantees it. Aliases that are relative, empty after
+    /// normalization, duplicated, or equal to a canonical root are dropped.
     #[must_use]
-    pub fn new(canonical: Vec<PathBuf>, aliases: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(canonical: Vec<PathBuf>, aliases: Vec<PathBuf>) -> Self {
         let mut kept: Vec<PathBuf> = Vec::new();
         for alias in aliases {
             if !alias.is_absolute() {
@@ -281,6 +283,14 @@ mod tests {
         let roots = WorkspaceRoots::new(vec![PathBuf::from("/Real")], vec![]);
         assert!(roots.contains_canonical(Path::new("/Real/a")));
         assert!(!roots.contains_canonical(Path::new("/real/a")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_verbatim_unc_equals_unc() {
+        let roots = WorkspaceRoots::new(vec![PathBuf::from(r"\\server\share\ws")], vec![]);
+        assert!(roots.contains_canonical(Path::new(r"\\?\UNC\server\share\ws\a.rs")));
+        assert!(!roots.contains_canonical(Path::new(r"\\?\UNC\server\other\ws\a.rs")));
     }
 
     #[cfg(windows)]

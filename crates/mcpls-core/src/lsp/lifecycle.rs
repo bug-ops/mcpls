@@ -25,13 +25,14 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, ServerId};
-use crate::error::{Error, MIN_REDACTED_SECRET_BYTES, Result, ServerSpawnFailure, StartupFailure};
+use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 use crate::lsp::process::ServerProcess;
 use crate::lsp::stderr::StderrCapture;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
+use crate::redaction::Redactions;
 
 /// Environment variables passed through to a spawned LSP server even though
 /// its environment is otherwise cleared.
@@ -444,18 +445,23 @@ impl LspServer {
             lifecycle_tx,
         );
 
-        let secrets: Vec<&str> = config
-            .server_config
-            .env
-            .values()
-            .map(String::as_str)
-            .filter(|value| value.len() >= MIN_REDACTED_SECRET_BYTES)
-            .collect();
+        // Only needed on the failure paths below, so the environment scan is
+        // not paid for by a successful start.
+        let redactions = || {
+            Redactions::for_server(
+                &config.server_config,
+                std::env::vars_os().filter_map(|(name, value)| {
+                    Some((name.into_string().ok()?, value.into_string().ok()?))
+                }),
+            )
+        };
         let (capabilities, position_encoding) = match Self::initialize(&client, &config).await {
             Ok(negotiated) => negotiated,
             Err(init_error) if is_connection_loss(&init_error) => {
                 let exit_status = early_exit_status(&mut child).await;
-                let stderr = stderr_capture.finish(exit_status.is_some(), &secrets).await;
+                let stderr = stderr_capture
+                    .finish(exit_status.is_some(), &redactions())
+                    .await;
                 return Err(match exit_status {
                     Some(status) => Error::ServerExitedDuringInit {
                         command: config.server_config.command.clone(),
@@ -469,8 +475,10 @@ impl LspServer {
                 });
             }
             Err(Error::LspInitFailed { message, .. }) => {
-                let exited = matches!(child.try_wait(), Ok(Some(_)));
-                let stderr = stderr_capture.finish(exited, &secrets).await;
+                // The server may be about to exit after printing its reason,
+                // so wait the (bounded) end-of-file grace whether or not it
+                // has exited yet.
+                let stderr = stderr_capture.finish(true, &redactions()).await;
                 return Err(Error::LspInitFailed { message, stderr });
             }
             Err(init_error) => return Err(init_error),
@@ -1861,6 +1869,35 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
         assert!(err.to_string().contains("stderr: fatal: bad toolchain"));
     }
 
+    /// A server that rejects `initialize` and prints its reason just before
+    /// exiting must not lose that last line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_rejection_keeps_stderr_written_just_before_exit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(
+                r#"body='{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"rejected by server"}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 0.02
+echo 'fatal: bad toolchain' >&2
+"#,
+            ),
+        );
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let Error::LspInitFailed {
+            stderr: Some(stderr),
+            ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(stderr.head(), "fatal: bad toolchain");
+    }
+
     /// #534: a server that hangs after writing to stderr times out with its
     /// output attached.
     #[cfg(unix)]
@@ -1892,7 +1929,11 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
         let dir = tempfile::TempDir::new().unwrap();
         let mut config = crate::test_lsp::sh_script_init_config(
             dir.path(),
-            "echo \"token=$API_TOKEN\" >&2\nexit 1\n",
+            "echo \"token=$API_TOKEN toolchain=$RUSTUP_TOOLCHAIN\" >&2\nexit 1\n",
+        );
+        config.server_config.env.insert(
+            "RUSTUP_TOOLCHAIN".to_string(),
+            "nightly-2024-01-01".to_string(),
         );
         config
             .server_config
@@ -1902,7 +1943,8 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
         let err = LspServer::spawn(config).await.unwrap_err();
 
         let text = err.to_string();
-        assert!(text.contains("token=[redacted]"), "{text}");
+        assert!(text.contains("token=[redacted:API_TOKEN]"), "{text}");
+        assert!(text.contains("toolchain=nightly-2024-01-01"), "{text}");
         assert!(!text.contains("s3cr3t-value"), "{text}");
     }
 

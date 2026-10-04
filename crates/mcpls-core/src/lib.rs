@@ -46,6 +46,7 @@ pub mod config;
 pub mod error;
 pub mod lsp;
 pub mod mcp;
+mod redaction;
 pub mod transport;
 mod util;
 
@@ -60,7 +61,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
-use bridge::{NotificationCache, Translator};
+use bridge::{NotificationCache, Translator, WorkspaceRoots};
 pub use config::{ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
@@ -93,8 +94,21 @@ pub use util::escape_control;
 /// navigation results are deliberately exempt (and how `document_symbols`'
 /// flat response shape takes a different, non-filtering approach), plus the
 /// canonicalization and preconditions this inherits.
-fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &[PathBuf]) -> bool {
-    bridge::uri_in_workspace_roots(uri, workspace_roots)
+///
+/// Admits the canonical roots and their aliases (configured form, logical
+/// `$PWD`), so a server publishing under such a spelling still reaches
+/// `PublishedDiagnosticsUri::resolve`, which canonicalizes it and makes the
+/// authoritative containment decision. Paths with `.`/`..` components are
+/// rejected outright: a legitimate server never publishes them.
+fn diagnostic_path_in_workspace(uri: &Uri, workspace_roots: &WorkspaceRoots) -> bool {
+    let Some(path) = bridge::uri_to_path(uri) else {
+        return false;
+    };
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+        && workspace_roots.admits_lexically(&path)
 }
 
 /// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
@@ -110,7 +124,7 @@ pub(crate) struct PumpShared {
     pub(crate) subs: SubscriptionRegistry,
     /// Used to reject diagnostics for out-of-workspace URIs; see
     /// `diagnostic_path_in_workspace`.
-    pub(crate) workspace_roots: Arc<[PathBuf]>,
+    pub(crate) workspace_roots: WorkspaceRoots,
 }
 
 /// Background task that drains LSP notifications, writes them to the cache,
@@ -203,7 +217,7 @@ pub(crate) async fn diagnostics_pump(
                             continue;
                         }
                         let Some(published) =
-                            PublishedDiagnosticsUri::resolve(&p.uri, &workspace_roots).await
+                            PublishedDiagnosticsUri::resolve(&p.uri, workspace_roots.canonical()).await
                         else {
                             debug!(
                                 "dropping diagnostics for URI resolving outside the workspace: {}",
@@ -346,7 +360,7 @@ pub(crate) fn register_servers(
     }
 }
 
-/// Build the [`WorkspaceRoots`](bridge::WorkspaceRoots) for `config_roots`:
+/// Build the [`WorkspaceRoots`](WorkspaceRoots) for `config_roots`:
 /// the canonical roots plus the lexical aliases clients may name them by.
 ///
 /// `current_dir()` always returns an absolute path. Configs loaded from a
@@ -357,22 +371,19 @@ pub(crate) fn register_servers(
 /// defaults to cwd, or at least one relative root): a fully-absolute
 /// `workspace.roots` must not fail startup just because cwd happens to be
 /// unreadable/removed (#348).
-fn build_workspace_roots(config_roots: &[PathBuf]) -> Result<bridge::WorkspaceRoots, Error> {
+fn build_workspace_roots(config_roots: &[PathBuf]) -> Result<WorkspaceRoots, Error> {
     if config_roots.is_empty() || config_roots.iter().any(|root| root.is_relative()) {
         let base_dir = std::env::current_dir().map_err(Error::Io)?;
         let canonical = resolve_workspace_roots(config_roots, &base_dir)?;
         let logical_cwd = logical_cwd_from(std::env::var_os("PWD"), &base_dir);
         let aliases = workspace_root_aliases(config_roots, &base_dir, logical_cwd.as_deref());
-        Ok(bridge::WorkspaceRoots::new(canonical, aliases))
+        Ok(WorkspaceRoots::new(canonical, aliases))
     } else {
         // Every root is absolute already, so `base_dir` is never joined
         // against inside `canonicalize_workspace_roots` -- pass an
         // arbitrary placeholder rather than paying for `current_dir()`.
         let canonical = canonicalize_workspace_roots(config_roots, Path::new(""))?;
-        Ok(bridge::WorkspaceRoots::new(
-            canonical,
-            config_roots.to_vec(),
-        ))
+        Ok(WorkspaceRoots::new(canonical, config_roots.to_vec()))
     }
 }
 
@@ -648,14 +659,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
     config.validate()?;
 
-    // `current_dir()` always returns an absolute path. Configs loaded from a
-    // TOML file have already had relative roots rebased to that file's
-    // directory in `ServerConfig::load_from`; this second pass covers
-    // caller-built `ServerConfig`s, whose relative roots are defined against
-    // the process cwd. Only actually called when a root needs it (empty
-    // `roots`, which defaults to cwd, or at least one relative root): a
-    // fully-absolute `workspace.roots` must not fail startup just because
-    // cwd happens to be unreadable/removed (#348).
     let workspace_roots = build_workspace_roots(&config.workspace.roots)?;
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
@@ -734,15 +737,9 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // in a background task and registered into this shared translator once ready.
     // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
     // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
-    // Fixed for the server's lifetime: shared as a lock-free snapshot so
-    // cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`) can
-    // validate a path without locking `translator` below.
-    //
-    // `resolve_workspace_roots` canonicalizes before any consumer sees these
-    // paths. The snapshot can therefore stay allocation-only while preserving
-    // `diagnostic_path_in_workspace`'s canonical-root precondition and avoiding
-    // filesystem I/O on the hot per-notification path.
-    let workspace_roots_snapshot: Arc<[PathBuf]> = workspace_roots.canonical_shared();
+    // `workspace_roots` is fixed for the server's lifetime and cheap to clone,
+    // so cache-only handlers (e.g. `get_cached_diagnostics`, `read_resource`)
+    // validate a path from their own copy without locking `translator` below.
 
     let translator = Arc::new(translator);
     // Shared across every session (one per HTTP session, or the sole stdio
@@ -767,7 +764,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             Arc::clone(&notification_cache),
             subscription_registry.clone(),
             cancel_rx.clone(),
-            Arc::clone(&workspace_roots_snapshot),
+            workspace_roots.clone(),
         ))
     };
 
@@ -974,7 +971,7 @@ fn spawn_lsp_servers_background(
     notification_cache: Arc<Mutex<NotificationCache>>,
     subscription_registry: SubscriptionRegistry,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
-    workspace_roots: Arc<[PathBuf]>,
+    workspace_roots: WorkspaceRoots,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let body = init_lsp_servers(
@@ -1029,7 +1026,7 @@ async fn init_lsp_servers(
     notification_cache: Arc<Mutex<NotificationCache>>,
     subscription_registry: SubscriptionRegistry,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
-    workspace_roots: Arc<[PathBuf]>,
+    workspace_roots: WorkspaceRoots,
 ) {
     let result = LspServer::spawn_batch(configs).await;
     translator.record_startup_failures(&result.failures);
@@ -1232,7 +1229,10 @@ mod tests {
     #[test]
     fn test_diagnostic_path_in_workspace_empty_roots_rejects_any_uri() {
         let uri: Uri = Uri::from("file:///anywhere/at/all.rs");
-        assert!(!diagnostic_path_in_workspace(&uri, &[]));
+        assert!(!diagnostic_path_in_workspace(
+            &uri,
+            &WorkspaceRoots::default()
+        ));
     }
 
     #[test]
@@ -1254,7 +1254,10 @@ mod tests {
             "file:///workspace/project/src/main.rs",
         );
         let uri: Uri = Uri::from(uri_str);
-        assert!(diagnostic_path_in_workspace(&uri, &[root]));
+        assert!(diagnostic_path_in_workspace(
+            &uri,
+            &WorkspaceRoots::new(vec![root], vec![])
+        ));
     }
 
     #[test]
@@ -1267,14 +1270,20 @@ mod tests {
         #[cfg(not(windows))]
         let (root, uri_str) = (PathBuf::from("/workspace/project"), "file:///etc/passwd");
         let uri: Uri = Uri::from(uri_str);
-        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+        assert!(!diagnostic_path_in_workspace(
+            &uri,
+            &WorkspaceRoots::new(vec![root], vec![])
+        ));
     }
 
     #[test]
     fn test_diagnostic_path_in_workspace_rejects_non_file_uri() {
         let root = PathBuf::from("/workspace/project");
         let uri: Uri = Uri::from("untitled:Untitled-1");
-        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+        assert!(!diagnostic_path_in_workspace(
+            &uri,
+            &WorkspaceRoots::new(vec![root], vec![])
+        ));
     }
 
     /// `Path::starts_with` is a lexical, component-wise comparison that does
@@ -1294,7 +1303,10 @@ mod tests {
             "file:///workspace/project/../../etc/passwd",
         );
         let uri: Uri = Uri::from(uri_str);
-        assert!(!diagnostic_path_in_workspace(&uri, &[root]));
+        assert!(!diagnostic_path_in_workspace(
+            &uri,
+            &WorkspaceRoots::new(vec![root], vec![])
+        ));
     }
 
     #[test]
@@ -1475,6 +1487,27 @@ mod tests {
         );
     }
 
+    /// The configured spelling of an absolute root stays admitted as an alias
+    /// while the canonical root is the symlink-free path.
+    #[cfg(unix)]
+    #[test]
+    fn test_build_workspace_roots_keeps_symlinked_root_as_alias() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(temp_dir.path()).unwrap();
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let roots = build_workspace_roots(std::slice::from_ref(&link)).unwrap();
+
+        assert_eq!(roots.canonical(), std::slice::from_ref(&real));
+        assert!(roots.admits_lexically(&link.join("a.rs")));
+        assert!(roots.admits_lexically(&real.join("a.rs")));
+        assert!(!roots.admits_lexically(&base.join("other/a.rs")));
+    }
+
+    #[cfg(not(unix))]
     #[test]
     fn test_build_workspace_roots_keeps_absolute_root_as_alias() {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2327,12 +2360,12 @@ mod tests {
         /// letter on Windows -- mirrors
         /// `test_pump_drops_diagnostics_outside_workspace_roots`.
         #[cfg(windows)]
-        fn test_workspace_roots() -> Arc<[PathBuf]> {
-            Arc::from([PathBuf::from(r"C:\test")])
+        fn test_workspace_roots() -> WorkspaceRoots {
+            WorkspaceRoots::new(vec![PathBuf::from(r"C:\test")], vec![])
         }
         #[cfg(not(windows))]
-        fn test_workspace_roots() -> Arc<[PathBuf]> {
-            Arc::from([PathBuf::from("/test")])
+        fn test_workspace_roots() -> WorkspaceRoots {
+            WorkspaceRoots::new(vec![PathBuf::from("/test")], vec![])
         }
 
         /// A `file://` URI for `file` beneath [`test_workspace_roots`]'s root.
@@ -2427,7 +2460,7 @@ mod tests {
                 "file:///etc/passwd",
                 "file:///workspace/src/main.rs",
             );
-            let workspace_roots: Arc<[PathBuf]> = Arc::from([workspace_root]);
+            let workspace_roots = WorkspaceRoots::new(vec![workspace_root], vec![]);
 
             tokio::spawn(diagnostics_pump(
                 ServerId::from("rust"),
@@ -2799,6 +2832,8 @@ mod tests {
         }
 
         use crate::test_lsp::spawn_test_pump;
+        #[cfg(unix)]
+        use crate::test_lsp::spawn_test_pump_with_cache;
 
         fn test_mcp_uri(file: &str) -> DiagnosticsResourceUri {
             DiagnosticsResourceUri::for_published(&PublishedDiagnosticsUri::for_test(
@@ -2894,21 +2929,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (tx, rx) = mpsc::channel(8);
-            let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-            let (_cancel_tx, cancel_rx) = watch::channel(false);
-            tokio::spawn(diagnostics_pump(
-                ServerId::from("rust"),
-                rx,
-                lifecycle_rx,
-                cancel_rx,
-                true,
-                PumpShared {
-                    notification_cache: Arc::clone(&cache),
-                    subs,
-                    workspace_roots: Arc::from(vec![root]),
-                },
-            ));
+            let (tx, _cancel_tx) = spawn_test_pump_with_cache(
+                subs,
+                WorkspaceRoots::resolve(vec![root]),
+                Arc::clone(&cache),
+            );
             let error = lsp_types::Diagnostic {
                 message: "boom".to_owned().into(),
                 ..Default::default()
@@ -2939,6 +2964,116 @@ mod tests {
                 !escaped,
                 "a symlink pointing outside the workspace must be dropped"
             );
+        }
+
+        /// A server publishing under the configured spelling of a root that is a
+        /// symlink (or the logical `$PWD`) is not dropped by the pre-filter: the
+        /// diagnostics are cached under the canonical key.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_pump_accepts_publish_under_a_configured_root_alias() {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let base = dunce::canonicalize(workspace.path()).unwrap();
+            let real = base.join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::write(real.join("main.rs"), "fn main() {}").unwrap();
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let roots = WorkspaceRoots::resolve(vec![link.clone()]);
+            assert_eq!(roots.canonical(), std::slice::from_ref(&real));
+
+            let cache = make_cache();
+            let subs = make_subs();
+            let (tx, _cancel_tx) = spawn_test_pump_with_cache(subs, roots, Arc::clone(&cache));
+            let error = lsp_types::Diagnostic {
+                message: "boom".to_owned().into(),
+                ..Default::default()
+            };
+            tx.send(LspNotification::PublishDiagnostics(
+                PublishDiagnosticsParams {
+                    uri: bridge::path_to_uri(&link.join("main.rs")).unwrap(),
+                    diagnostics: vec![error],
+                    version: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+            let canonical_uri = bridge::path_to_uri(&real.join("main.rs")).unwrap();
+            let info = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let sources = cache
+                        .lock()
+                        .await
+                        .diagnostic_sources(canonical_uri.as_ref());
+                    if let Some(info) = sources.merge() {
+                        return info;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            let info = info.unwrap_or_else(|_| panic!("alias publish was dropped by the pump"));
+            assert_eq!(info.diagnostics.len(), 1);
+        }
+
+        /// #532: every stored publish notifies the canonical subscriber, and
+        /// an empty canonical publish after errors on an alias keeps the errors.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_pump_notifies_canonical_key_on_each_alias_publish() {
+            use crate::mcp::{SessionHandle, Target};
+
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let file = root.join("main.rs");
+            std::fs::write(&file, "fn main() {}").unwrap();
+            let link = root.join("link.rs");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+
+            let cache = make_cache();
+            let subs = make_subs();
+            let session = SessionHandle::new(subs.clone());
+            let (tx_session, mut rx_session) = mpsc::channel(8);
+            let canonical = bridge::resources::make_uri(&file).unwrap();
+            session
+                .subscribe_for_test(
+                    &DiagnosticsResourceUri::for_test(&canonical),
+                    Target::Channel(tx_session),
+                )
+                .await
+                .unwrap();
+            let (tx, _cancel_tx) = spawn_test_pump_with_cache(
+                subs,
+                WorkspaceRoots::resolve(vec![root]),
+                Arc::clone(&cache),
+            );
+            let error = lsp_types::Diagnostic {
+                message: "boom".to_owned().into(),
+                ..Default::default()
+            };
+            let publishes = [(&link, vec![error]), (&file, vec![]), (&link, vec![])];
+            for (path, diagnostics) in publishes {
+                tx.send(LspNotification::PublishDiagnostics(
+                    PublishDiagnosticsParams {
+                        uri: bridge::path_to_uri(path).unwrap(),
+                        diagnostics,
+                        version: None,
+                    },
+                ))
+                .await
+                .unwrap();
+                assert_eq!(recv_within(&mut rx_session).await, canonical);
+            }
+
+            let canonical_lsp = bridge::path_to_uri(&file).unwrap();
+            let info = cache
+                .lock()
+                .await
+                .diagnostic_sources(canonical_lsp.as_ref())
+                .merge()
+                .unwrap();
+            assert!(info.diagnostics.is_empty(), "the alias's clear must apply");
         }
 
         /// #468: a session whose peer stopped reading neither blocks the pump
@@ -3032,7 +3167,7 @@ mod tests {
             let server = mcp::McplsServer::new(
                 Arc::new(Translator::new()),
                 make_cache(),
-                bridge::WorkspaceRoots::resolve(vec![root.clone()]),
+                WorkspaceRoots::resolve(vec![root.clone()]),
                 subs.clone(),
                 false,
                 config::McpConfig::default(),
@@ -3068,7 +3203,7 @@ mod tests {
                 "subscribe failed: {response}"
             );
 
-            let (tx, _cancel_tx) = spawn_test_pump(subs, Arc::from(vec![root]));
+            let (tx, _cancel_tx) = spawn_test_pump(subs, WorkspaceRoots::resolve(vec![root]));
             tx.send(LspNotification::PublishDiagnostics(
                 PublishDiagnosticsParams {
                     uri: bridge::path_to_uri(&file).unwrap(),

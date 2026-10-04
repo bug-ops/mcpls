@@ -58,19 +58,22 @@ impl PreparedDocument {
 /// full `Arc<Mutex<Translator>>`, which may be held elsewhere across a slow
 /// in-flight LSP round-trip.
 ///
-/// Containment is checked lexically first (absolute, `.`/`..` resolved, against
-/// the canonical roots and their aliases) so an out-of-workspace path is
-/// rejected without touching it; only an admitted path is canonicalized, and
-/// that canonical form must again lie under a canonical root. `..` following
-/// an in-root symlink is therefore resolved lexically by the pre-check.
+/// The lexical check (absolute, `.`/`..` resolved, against the canonical roots
+/// and their aliases) is only a pre-filter: it rejects an out-of-workspace path
+/// without touching the filesystem, and it can only reject, never accept. The
+/// decision that counts uses the physical path: the original `path` is
+/// canonicalized (so `..` after a symlink is resolved against the real
+/// directory) and that canonical form must lie under a canonical root. The
+/// returned path is the canonical one.
 ///
 /// # Errors
 ///
 /// Returns `Error::NoWorkspaceRoots` if `workspace_roots` is empty -- fails
 /// closed rather than allowing unrestricted access -- and
 /// `Error::PathOutsideWorkspace` if the path is outside all configured
-/// workspace roots. `Error::FileIo` is returned only for a path the lexical
-/// check admitted but that cannot be canonicalized.
+/// workspace roots. `Error::FileIo` is returned when the path cannot be made
+/// absolute (for example an empty path), or when the lexical check admitted it
+/// but it cannot be canonicalized (for example it does not exist).
 pub fn validate_path_against_roots(
     path: &Path,
     workspace_roots: &WorkspaceRoots,
@@ -691,8 +694,10 @@ impl Translator {
     /// the server the configured routing would have used failed to start, so
     /// a cache-only read reports the failure instead of an empty list. A
     /// surviving catch-all route wins, as in [`Self::client_for_file`].
-    // TODO(#544): `resources/subscribe` still succeeds for a language whose server failed to start.
-    // TODO(#545): cached reads during initialization return an empty list, not `ServerInitializing`.
+    // TODO(#544): `resources/subscribe` still succeeds for a language whose
+    // server failed to start.
+    // TODO(#545): cached reads during initialization return an empty list, not
+    // `ServerInitializing`.
     pub(crate) fn diagnostics_route_for_path(&self, path: &Path) -> Result<Option<ServerId>> {
         let candidates = self.language_candidates(path);
 
@@ -1280,8 +1285,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().to_path_buf();
-        translator
-            .set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![workspace_root]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![workspace_root]));
 
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1297,7 +1301,7 @@ mod tests {
         let temp_dir2 = TempDir::new().unwrap();
 
         // Set workspace root to temp_dir1
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![
             temp_dir1.path().to_path_buf(),
         ]));
 
@@ -1352,16 +1356,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_validate_path_symlink_alias_of_root_is_accepted() {
-        let dir = TempDir::new().unwrap();
-        let real = dir.path().join("real");
-        fs::create_dir(&real).unwrap();
+        let AliasFixture {
+            dir: _dir,
+            real,
+            alias,
+            roots,
+        } = alias_fixture();
         fs::write(real.join("a.rs"), "").unwrap();
-        let alias = dir.path().join("alias");
-        std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let roots = WorkspaceRoots::new(
-            vec![dunce::canonicalize(&real).unwrap()],
-            vec![alias.clone()],
-        );
 
         let result = validate_path_against_roots(&alias.join("a.rs"), &roots);
 
@@ -1369,6 +1370,58 @@ mod tests {
             result.unwrap(),
             dunce::canonicalize(real.join("a.rs")).unwrap()
         );
+    }
+
+    /// `..` right after an alias root leaves both the alias and the canonical
+    /// root, so the pre-check rejects it.
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_path_dotdot_after_alias_root_is_outside_workspace() {
+        let AliasFixture {
+            dir, alias, roots, ..
+        } = alias_fixture();
+        fs::write(dir.path().join("outside.rs"), "").unwrap();
+
+        let result = validate_path_against_roots(&alias.join("../outside.rs"), &roots);
+
+        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+    }
+
+    /// Inside an alias root the pre-check admits the path, so a missing file
+    /// is a plain I/O error.
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_path_missing_file_under_alias_root_is_file_io() {
+        let AliasFixture {
+            dir: _dir,
+            alias,
+            roots,
+            ..
+        } = alias_fixture();
+
+        let result = validate_path_against_roots(&alias.join("missing.rs"), &roots);
+
+        assert!(matches!(result, Err(Error::FileIo { .. })), "{result:?}");
+    }
+
+    /// A symlink inside an alias root that escapes the workspace is still
+    /// rejected by the canonical check.
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_path_escaping_symlink_under_alias_root_is_outside_workspace() {
+        let AliasFixture {
+            dir: _dir,
+            real,
+            alias,
+            roots,
+        } = alias_fixture();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.rs"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), real.join("link")).unwrap();
+
+        let result = validate_path_against_roots(&alias.join("link/secret.rs"), &roots);
+
+        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
     }
 
     /// A symlink inside the root pointing outside passes the lexical
@@ -1434,9 +1487,8 @@ mod tests {
     async fn test_parse_file_uri_valid_scheme() {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            temp_dir.path().to_path_buf(),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1455,9 +1507,8 @@ mod tests {
     async fn test_parse_file_uri_percent_decodes_space_and_non_ascii() {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            temp_dir.path().to_path_buf(),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
         let test_file = temp_dir.path().join("my file café.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
@@ -1676,6 +1727,116 @@ mod tests {
         );
     }
 
+    /// The failure is found through the React base language, like routing.
+    #[test]
+    fn test_diagnostics_route_for_path_reports_failure_through_react_base_language() {
+        let id = ServerId::from("typescript");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                "typescript".to_string(),
+            )]));
+        translator.record_startup_failures(&[not_found_failure(
+            &id,
+            "typescript",
+            "typescript-language-server",
+        )]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        let err = translator
+            .diagnostics_route_for_path(Path::new("/ws/app.tsx"))
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
+            "got {err:?}"
+        );
+    }
+
+    /// A failed server whose route excludes diagnostics is not the diagnostics
+    /// route, so its failure must not surface for diagnostics reads.
+    #[test]
+    fn test_diagnostics_route_for_path_ignores_failure_of_server_without_diagnostics_route() {
+        let configs = [router_config(
+            "rust",
+            "hover-only",
+            Some(vec![ToolKind::Hover]),
+        )];
+        let router = ToolRouter::from_configs(configs.iter()).unwrap();
+        let failed = ServerId::from("hover-only");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(router);
+        translator.record_startup_failures(&[not_found_failure(&failed, "rust", "sh")]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        assert_eq!(
+            translator
+                .diagnostics_route_for_path(Path::new("/ws/main.rs"))
+                .unwrap(),
+            None
+        );
+    }
+
+    /// The live pull path (`get_diagnostics`) also reports the failure.
+    #[tokio::test]
+    async fn test_handle_diagnostics_reports_failed_server_start() {
+        let dir = TempDir::new().unwrap();
+        let file = dunce::canonicalize(dir.path()).unwrap().join("main.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+        let id = ServerId::from("rust");
+        let mut translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.record_startup_failures(&[not_found_failure(&id, "rust", "sh")]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+        let cache = Mutex::new(crate::bridge::NotificationCache::new());
+
+        let err = translator
+            .handle_diagnostics(file.to_string_lossy().to_string(), &cache)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
+            "got {err:?}"
+        );
+    }
+
+    /// `dir/real` (the canonical root) with `dir/alias` symlinked to it, and
+    /// roots admitting both spellings.
+    #[cfg(unix)]
+    struct AliasFixture {
+        dir: TempDir,
+        real: PathBuf,
+        alias: PathBuf,
+        roots: WorkspaceRoots,
+    }
+
+    #[cfg(unix)]
+    fn alias_fixture() -> AliasFixture {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let roots = WorkspaceRoots::new(
+            vec![dunce::canonicalize(&real).unwrap()],
+            vec![alias.clone()],
+        );
+        AliasFixture {
+            dir,
+            real,
+            alias,
+            roots,
+        }
+    }
+
     /// A file whose language has no configured route resolves to `None`
     /// rather than panicking or falling back to some default server.
     #[test]
@@ -1797,9 +1958,7 @@ mod tests {
                     (ServerId::from("lang_a"), "lang_a".to_string()),
                     (ServerId::from("lang_b"), "lang_b".to_string()),
                 ]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client_a, mut server_a) = fake_lsp_client();
         let (client_b, mut server_b) = fake_lsp_client();
@@ -1899,9 +2058,7 @@ mod tests {
                     ServerId::from("lang_a"),
                     "lang_a".to_string(),
                 )]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client);
@@ -1972,9 +2129,7 @@ mod tests {
                 max_documents: 1,
                 max_file_size: 0,
             });
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, server) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client);
@@ -2166,9 +2321,7 @@ mod tests {
                     ServerId::from("lang_b"),
                     "lang_b".to_string(),
                 )]));
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client, _server) = fake_lsp_client();
         translator.register_client("lang_b".to_string(), client.clone());
@@ -2214,9 +2367,7 @@ mod tests {
                 max_documents: 1,
                 max_file_size: 0,
             });
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client_a, mut server_a) = fake_lsp_client();
         translator.register_client("lang_a".to_string(), client_a);
@@ -2309,9 +2460,7 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(extensions)
             .with_router(router);
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            dir.path().to_path_buf(),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
 
         let (client_pyright, mut server_pyright) = fake_lsp_client();
         let (client_pylsp, mut server_pylsp) = fake_lsp_client();

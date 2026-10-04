@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::config::{BuiltinServer, ServerId, ToolKind};
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
+use crate::redaction::Redactions;
 use crate::util::{escape_control, truncate_str};
 
 /// Host platform, as far as [`NotFoundGuidance`] cares.
@@ -214,22 +215,59 @@ impl fmt::Display for FailureList<'_> {
     }
 }
 
-/// Shortest `env` value redacted from a [`StderrExcerpt`]; shorter values
-/// would match unrelated text.
-pub(crate) const MIN_REDACTED_SECRET_BYTES: usize = 8;
-
 /// What a failed server startup wrote to stderr, bounded and sanitized.
 ///
 /// Holds the first and last bytes of the output (or all of it when short), so
-/// both the opening banner and the final error survive. Control characters
-/// other than newline and tab are dropped, and exact occurrences of the
-/// server's configured `env` values (at least 8 bytes) are replaced with
-/// `[redacted]`; secrets belong in `env`. Encoded forms (URL, base64,
-/// JSON-escaped) and a secret straddling the head/tail cut are not matched.
+/// both the opening banner and the final error survive.
+///
+/// # Sanitizing
+///
+/// Control characters other than newline and tab are dropped, as are
+/// characters that forge or reorder text in logs and terminals: the Unicode
+/// line and paragraph separators, bidirectional controls and zero-width
+/// characters.
+///
+/// # Redaction
+///
+/// Values that look secret are replaced with `[redacted:NAME]` before the text
+/// leaves mcpls. A value counts as secret (and must be at least 8 bytes) when
+/// it is:
+/// - an environment variable value, from the server's configured `env` or
+///   mcpls's own environment, whose name contains `TOKEN`, `KEY`, `SECRET`,
+///   `PASSW`, `CRED` or `AUTH` (case-insensitive);
+/// - the value of a `--flag=value` or `--flag value` argument whose flag name
+///   matches the same patterns;
+/// - a string under a matching key of `initialization_options`.
+///
+/// Other values, such as `RUSTUP_TOOLCHAIN`, stay visible so the cause of a
+/// failure can still be read. Matching is by exact value: encoded forms (URL,
+/// base64, JSON-escaped) are not found. A secret cut by the head/tail elision
+/// is hidden only for the fragment of at least 4 bytes on either side of the
+/// cut. Put secrets in a name-matching `env` entry rather than in other
+/// places.
 ///
 /// `Display` renders one line: trimmed non-empty lines joined with ` | `,
 /// with `...` between head and tail when elided. The raw multi-line text is
 /// available through [`Self::head`] and [`Self::tail`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::Error;
+///
+/// fn server_output(err: &Error) -> Option<String> {
+///     match err {
+///         Error::LspInitFailed { stderr: Some(stderr), .. }
+///         | Error::ServerExitedDuringInit { stderr: Some(stderr), .. } => {
+///             Some(stderr.to_string())
+///         }
+///         _ => None,
+///     }
+/// }
+///
+/// let err = Error::LspInitFailed { message: "timed out".into(), stderr: None };
+/// assert_eq!(server_output(&err), None);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StderrExcerpt {
     body: ExcerptBody,
@@ -244,8 +282,8 @@ enum ExcerptBody {
 impl StderrExcerpt {
     /// Excerpt of output that fit entirely in the capture buffer; `None` when
     /// it holds no visible text.
-    pub(crate) fn complete(bytes: &[u8], secrets: &[&str]) -> Option<Self> {
-        let text = clean_stderr(&String::from_utf8_lossy(bytes), secrets);
+    pub(crate) fn complete(bytes: &[u8], redactions: &Redactions) -> Option<Self> {
+        let text = clean_stderr(&String::from_utf8_lossy(bytes), redactions);
         (!text.is_empty()).then(|| Self {
             body: ExcerptBody::Complete(text.into()),
         })
@@ -254,13 +292,22 @@ impl StderrExcerpt {
     /// Excerpt of output whose middle was dropped. The cut can split a UTF-8
     /// sequence at the end of `head` and at the start of `tail`; both partial
     /// sequences are discarded rather than shown as replacement characters.
-    pub(crate) fn elided(head: &[u8], tail: &[u8], secrets: &[&str]) -> Option<Self> {
-        let head = clean_stderr(&decode_cut_head(head), secrets);
+    /// A secret split by the cut is masked as far as `redactions` allows.
+    pub(crate) fn elided(head: &[u8], tail: &[u8], redactions: &Redactions) -> Option<Self> {
+        let head = clean_stderr(
+            &redactions.mask_cut_head(&decode_cut_head(head)),
+            redactions,
+        );
         let tail_start = tail
             .iter()
             .position(|byte| byte & 0xC0 != 0x80)
             .unwrap_or(tail.len());
-        let tail = clean_stderr(&String::from_utf8_lossy(&tail[tail_start..]), secrets);
+        let tail = clean_stderr(
+            &redactions.mask_cut_tail(&String::from_utf8_lossy(
+                tail.get(tail_start..).unwrap_or_default(),
+            )),
+            redactions,
+        );
         match (head.is_empty(), tail.is_empty()) {
             (true, true) => None,
             (false, true) => Some(Self {
@@ -323,27 +370,37 @@ fn decode_cut_head(head: &[u8]) -> String {
     match std::str::from_utf8(head) {
         Ok(text) => text.to_owned(),
         Err(e) if e.error_len().is_none() => {
-            String::from_utf8_lossy(&head[..e.valid_up_to()]).into_owned()
+            String::from_utf8_lossy(head.get(..e.valid_up_to()).unwrap_or_default()).into_owned()
         }
         Err(_) => String::from_utf8_lossy(head).into_owned(),
     }
 }
 
-/// Redacts `secrets`, drops control characters other than `\n`/`\t` (they
-/// could forge log lines or drive a terminal) and trims.
-fn clean_stderr(text: &str, secrets: &[&str]) -> String {
-    let redacted = secrets
-        .iter()
-        .filter(|secret| secret.len() >= MIN_REDACTED_SECRET_BYTES)
-        .fold(text.to_owned(), |acc, secret| {
-            acc.replace(secret, "[redacted]")
-        });
-    redacted
+/// Characters that forge or reorder text without being visible: zero-width
+/// and bidirectional marks, line/paragraph separators and bidi overrides.
+const fn is_deceptive_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Redacts secrets, drops control and deceptive format characters (other than
+/// `\n`/`\t`: they could forge log lines or drive a terminal) and trims.
+/// Redaction runs before and after the filter so a dropped character cannot
+/// split a secret into a form that escapes it.
+fn clean_stderr(text: &str, redactions: &Redactions) -> String {
+    let filtered: String = redactions
+        .apply(text)
         .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect::<String>()
-        .trim()
-        .to_owned()
+        .filter(|c| (!c.is_control() || matches!(c, '\n' | '\t')) && !is_deceptive_format_char(*c))
+        .collect();
+    redactions.apply(&filtered).trim().to_owned()
 }
 
 /// `Display` suffix appending a server's stderr excerpt to a startup error.
@@ -1017,25 +1074,33 @@ mod tests {
 
     #[test]
     fn test_stderr_excerpt_none_when_nothing_visible() {
-        assert_eq!(StderrExcerpt::complete(b"  \n\x1b\r\n ", &[]), None);
-        assert_eq!(StderrExcerpt::complete(b"", &[]), None);
+        assert_eq!(
+            StderrExcerpt::complete(b"  \n\x1b\r\n ", &Redactions::default()),
+            None
+        );
+        assert_eq!(StderrExcerpt::complete(b"", &Redactions::default()), None);
     }
 
     #[test]
     fn test_stderr_excerpt_strips_control_characters_but_keeps_newline_and_tab() {
-        let excerpt = StderrExcerpt::complete(b"a\x1b[31mb\x00\r\nc\td", &[]).unwrap();
+        let excerpt =
+            StderrExcerpt::complete(b"a\x1b[31mb\x00\r\nc\td", &Redactions::default()).unwrap();
         assert_eq!(excerpt.head(), "a[31mb\nc\td");
     }
 
     #[test]
     fn test_stderr_excerpt_display_is_single_line() {
-        let excerpt = StderrExcerpt::complete(b"first\n\n  second  \nthird\n", &[]).unwrap();
+        let excerpt =
+            StderrExcerpt::complete(b"first\n\n  second  \nthird\n", &Redactions::default())
+                .unwrap();
         assert_eq!(excerpt.to_string(), "first | second | third");
     }
 
     #[test]
     fn test_stderr_excerpt_elided_display_marks_the_gap() {
-        let excerpt = StderrExcerpt::elided(b"start\nbanner", b"last\nerror", &[]).unwrap();
+        let excerpt =
+            StderrExcerpt::elided(b"start\nbanner", b"last\nerror", &Redactions::default())
+                .unwrap();
         assert!(excerpt.is_elided());
         assert_eq!(excerpt.tail(), Some("last\nerror"));
         assert_eq!(excerpt.to_string(), "start | banner | ... | last | error");
@@ -1047,23 +1112,90 @@ mod tests {
         let head = [b"ok ".as_slice(), &text[..1]].concat();
         let tail = [&text[1..], b" end".as_slice()].concat();
 
-        let excerpt = StderrExcerpt::elided(&head, &tail, &[]).unwrap();
+        let excerpt = StderrExcerpt::elided(&head, &tail, &Redactions::default()).unwrap();
 
         assert_eq!(excerpt.head(), "ok");
         assert_eq!(excerpt.tail(), Some("end"));
     }
 
+    fn secrets(pairs: &[(&str, &str)]) -> Redactions {
+        Redactions::new(
+            pairs
+                .iter()
+                .map(|(label, value)| ((*label).to_owned(), (*value).to_owned())),
+        )
+    }
+
     #[test]
-    fn test_stderr_excerpt_redacts_long_secrets_only() {
+    fn test_stderr_excerpt_redacts_secrets_with_their_label() {
+        let excerpt = StderrExcerpt::complete(
+            b"token=hunter2hunter2 id=abc",
+            &secrets(&[("API_TOKEN", "hunter2hunter2"), ("SHORT_KEY", "abc")]),
+        )
+        .unwrap();
+        assert_eq!(excerpt.head(), "token=[redacted:API_TOKEN] id=abc");
+    }
+
+    #[test]
+    fn test_stderr_excerpt_redacts_longest_overlapping_secret_whole() {
+        let excerpt = StderrExcerpt::complete(
+            b"v=abcdefghXYZ12345",
+            &secrets(&[("A_KEY", "abcdefgh"), ("B_KEY", "abcdefghXYZ12345")]),
+        )
+        .unwrap();
+        assert_eq!(excerpt.head(), "v=[redacted:B_KEY]");
+    }
+
+    #[test]
+    fn test_stderr_excerpt_keeps_non_secret_values_visible() {
+        let excerpt = StderrExcerpt::complete(
+            b"toolchain 'nightly-2024-01-01' is not installed",
+            &secrets(&[("API_TOKEN", "hunter2hunter2")]),
+        )
+        .unwrap();
+        assert_eq!(
+            excerpt.head(),
+            "toolchain 'nightly-2024-01-01' is not installed"
+        );
+    }
+
+    #[test]
+    fn test_stderr_excerpt_redacts_a_secret_split_by_a_control_character() {
+        let excerpt = StderrExcerpt::complete(
+            "tok=hunter2\u{200B}hunter2".as_bytes(),
+            &secrets(&[("API_TOKEN", "hunter2hunter2")]),
+        )
+        .unwrap();
+        assert_eq!(excerpt.head(), "tok=[redacted:API_TOKEN]");
+    }
+
+    /// A secret cut in two by the elision boundary: the fragments of at least
+    /// four bytes on each side are masked.
+    #[test]
+    fn test_stderr_excerpt_masks_a_secret_split_across_the_elision_boundary() {
+        let redactions = secrets(&[("API_TOKEN", "supersecretvalue")]);
+
         let excerpt =
-            StderrExcerpt::complete(b"token=hunter2hunter2 id=abc", &["hunter2hunter2", "abc"])
-                .unwrap();
-        assert_eq!(excerpt.head(), "token=[redacted] id=abc");
+            StderrExcerpt::elided(b"token=supersec", b"retvalue done", &redactions).unwrap();
+
+        let shown = excerpt.to_string();
+        assert!(!shown.contains("supersec"), "{shown}");
+        assert!(!shown.contains("retvalue"), "{shown}");
+        assert!(shown.contains("[redacted:API_TOKEN]"), "{shown}");
+    }
+
+    #[test]
+    fn test_stderr_excerpt_strips_separators_bidi_and_zero_width_characters() {
+        let text = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200B}f\u{FEFF}g\u{200F}h";
+
+        let excerpt = StderrExcerpt::complete(text.as_bytes(), &Redactions::default()).unwrap();
+
+        assert_eq!(excerpt.head(), "abcdefgh");
     }
 
     #[test]
     fn test_init_errors_append_stderr_to_display() {
-        let stderr = StderrExcerpt::complete(b"fatal: bad config", &[]);
+        let stderr = StderrExcerpt::complete(b"fatal: bad config", &Redactions::default());
         let failed = Error::LspInitFailed {
             message: "boom".to_string(),
             stderr: stderr.clone(),

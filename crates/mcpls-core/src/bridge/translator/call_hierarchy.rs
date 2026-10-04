@@ -334,9 +334,9 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::NotificationCache;
     use crate::bridge::translator::dto::{Position, Position2D, Range};
     use crate::bridge::translator::testing::*;
+    use crate::bridge::{NotificationCache, WorkspaceRoots};
     use crate::config::ServerId;
 
     #[tokio::test]
@@ -532,13 +532,12 @@ mod tests {
         // A workspace root is required so `validate_path` reaches
         // `canonicalize()` instead of failing closed on `NoWorkspaceRoots`.
         #[cfg(windows)]
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            std::path::PathBuf::from(r"C:\"),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![std::path::PathBuf::from(
+            r"C:\",
+        )]));
         #[cfg(not(windows))]
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            std::path::PathBuf::from("/"),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![std::path::PathBuf::from("/")]));
         // `Url::to_file_path` on Windows requires a drive-letter first path
         // segment; a Unix-style path with none fails to convert at all
         // (`uri_to_path` returns `None`, i.e. `Error::InvalidToolParams`)
@@ -581,13 +580,12 @@ mod tests {
         // A workspace root is required so `validate_path` reaches
         // `canonicalize()` instead of failing closed on `NoWorkspaceRoots`.
         #[cfg(windows)]
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            std::path::PathBuf::from(r"C:\"),
-        ]));
+        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![std::path::PathBuf::from(
+            r"C:\",
+        )]));
         #[cfg(not(windows))]
-        translator.set_workspace_roots(crate::bridge::WorkspaceRoots::resolve(vec![
-            std::path::PathBuf::from("/"),
-        ]));
+        translator
+            .set_workspace_roots(WorkspaceRoots::resolve(vec![std::path::PathBuf::from("/")]));
         #[cfg(windows)]
         let uri = "file:///C:/this/path/does/not/exist/anywhere.rs";
         #[cfg(not(windows))]

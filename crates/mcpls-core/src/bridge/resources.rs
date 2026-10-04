@@ -184,6 +184,10 @@ pub(crate) struct DiagnosticsResourceUri(String);
 pub(crate) struct PublishedDiagnosticsUri {
     source: lsp_types::Uri,
     canonical: lsp_types::Uri,
+    /// Whether the server spelled the path canonically, decided on the paths
+    /// rather than the URI text so percent-encoding and drive-letter case
+    /// cannot make a canonical spelling look like an alias.
+    is_canonical: bool,
 }
 
 impl PublishedDiagnosticsUri {
@@ -199,6 +203,7 @@ impl PublishedDiagnosticsUri {
         canonical_roots: &[PathBuf],
     ) -> Option<Self> {
         let path = uri_to_path(published)?;
+        let published_path = path.clone();
         let canonical_path =
             tokio::task::spawn_blocking(move || super::canonicalize_existing_prefix(&path))
                 .await
@@ -207,12 +212,23 @@ impl PublishedDiagnosticsUri {
         super::uri_in_workspace_roots(&canonical, canonical_roots).then(|| Self {
             source: published.clone(),
             canonical,
+            is_canonical: same_path(&published_path, &canonical_path),
         })
     }
 
     #[cfg(test)]
-    pub(crate) const fn for_test(source: lsp_types::Uri, canonical: lsp_types::Uri) -> Self {
-        Self { source, canonical }
+    pub(crate) fn for_test(source: lsp_types::Uri, canonical: lsp_types::Uri) -> Self {
+        let is_canonical = source == canonical;
+        Self {
+            source,
+            canonical,
+            is_canonical,
+        }
+    }
+
+    /// Whether the server published under the canonical spelling of the path.
+    pub(crate) const fn is_canonical(&self) -> bool {
+        self.is_canonical
     }
 
     /// The URI exactly as the server published it.
@@ -223,6 +239,18 @@ impl PublishedDiagnosticsUri {
     /// The canonical URI of the published file.
     pub(crate) const fn canonical(&self) -> &lsp_types::Uri {
         &self.canonical
+    }
+}
+
+/// Path equality as the platform's filesystem sees the spelling: drive
+/// letters and names are case-insensitive on Windows only.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    } else {
+        a == b
     }
 }
 
@@ -573,7 +601,7 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let err = DiagnosticsResourceUri::resolve(
             "file:///tmp/main.rs",
-            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+            &WorkspaceRoots::resolve(vec![root]),
         )
         .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidUri(_)), "got {err:?}");
@@ -584,7 +612,7 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let err = DiagnosticsResourceUri::resolve(
             "lsp-diagnostics://host/main.rs",
-            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+            &WorkspaceRoots::resolve(vec![root]),
         )
         .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidUri(_)), "got {err:?}");
@@ -596,11 +624,7 @@ mod tests {
         let (_other_dir, _other_root, other_file) = workspace();
         let raw = make_uri(&other_file).unwrap();
         assert!(
-            DiagnosticsResourceUri::resolve(
-                &raw,
-                &crate::bridge::WorkspaceRoots::resolve(vec![root])
-            )
-            .is_err()
+            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::resolve(vec![root])).is_err()
         );
     }
 
@@ -609,11 +633,7 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let raw = make_uri(&root.join("missing.rs")).unwrap();
         assert!(
-            DiagnosticsResourceUri::resolve(
-                &raw,
-                &crate::bridge::WorkspaceRoots::resolve(vec![root])
-            )
-            .is_err()
+            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::resolve(vec![root])).is_err()
         );
     }
 
@@ -621,11 +641,8 @@ mod tests {
     fn test_resolve_yields_canonical_path_and_uri() {
         let (_dir, root, file) = workspace();
         let raw = make_uri(&file).unwrap();
-        let resolved = DiagnosticsResourceUri::resolve(
-            &raw,
-            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
-        )
-        .unwrap();
+        let resolved =
+            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::resolve(vec![root])).unwrap();
         assert_eq!(resolved.path, file);
         assert_eq!(resolved.uri.as_str(), raw);
     }
@@ -637,11 +654,8 @@ mod tests {
         let link = root.join("link.rs");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let raw = make_uri(&link).unwrap();
-        let resolved = DiagnosticsResourceUri::resolve(
-            &raw,
-            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
-        )
-        .unwrap();
+        let resolved =
+            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::resolve(vec![root])).unwrap();
         assert_eq!(resolved.uri.as_str(), make_uri(&file).unwrap());
     }
 
@@ -650,7 +664,7 @@ mod tests {
         let (_dir, root, file) = workspace();
         let resolved = DiagnosticsResourceUri::resolve(
             &make_uri(&file).unwrap(),
-            &crate::bridge::WorkspaceRoots::resolve(vec![root.clone()]),
+            &WorkspaceRoots::resolve(vec![root.clone()]),
         )
         .unwrap();
         let published = crate::bridge::path_to_uri(&file).unwrap();
@@ -668,6 +682,23 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let uri = lsp_types::Uri::from("untitled:Untitled-1");
         assert_eq!(PublishedDiagnosticsUri::resolve(&uri, &[root]).await, None);
+    }
+
+    /// Percent-encoding the path must not make a canonical spelling look like
+    /// an alias.
+    #[tokio::test]
+    async fn test_published_resolve_percent_encoded_spelling_is_canonical() {
+        let (_dir, root, file) = workspace();
+        let canonical = crate::bridge::path_to_uri(&file).unwrap();
+        let encoded = lsp_types::Uri::from(canonical.as_ref().replace("main.rs", "main%2Ers"));
+        assert_ne!(encoded, canonical);
+
+        let published = PublishedDiagnosticsUri::resolve(&encoded, &[root])
+            .await
+            .unwrap();
+
+        assert!(published.is_canonical());
+        assert_eq!(published.canonical(), &canonical);
     }
 
     #[tokio::test]
@@ -701,7 +732,7 @@ mod tests {
             &crate::bridge::path_to_uri(&file).unwrap()
         );
         let client_side = crate::bridge::Translator::cached_diagnostics_uri(
-            &crate::bridge::WorkspaceRoots::resolve(vec![root]),
+            &WorkspaceRoots::resolve(vec![root]),
             link.to_str().unwrap(),
         )
         .unwrap();
