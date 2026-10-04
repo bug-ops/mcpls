@@ -4,6 +4,7 @@
 //! binary and communicating with it as a real MCP client would.
 
 use anyhow::Result;
+use mcpls_core::bridge::resources::make_uri;
 use mcpls_core::error::SERVER_INITIALIZING_ERROR_CODE;
 use serde_json::json;
 use tempfile::TempDir;
@@ -831,7 +832,7 @@ fn test_e2e_missing_server_binary_is_reported_by_cached_diagnostics_and_subscrib
     const MISSING_COMMAND: &str = "mcpls-e2e-no-such-language-server";
 
     let workspace = TempDir::new()?;
-    let root = workspace.path().canonicalize()?;
+    let root = dunce::canonicalize(workspace.path())?;
     let file = root.join("main.rs");
     std::fs::write(&file, "fn main() {}\n")?;
 
@@ -880,7 +881,7 @@ fn test_e2e_missing_server_binary_is_reported_by_cached_diagnostics_and_subscrib
     };
     assert!(settled.contains(MISSING_COMMAND), "{settled}");
 
-    let uri = format!("lsp-diagnostics://{}", file.to_string_lossy());
+    let uri = make_uri(&file)?;
     let subscribed = describe(client.subscribe_resource(&uri));
     assert!(subscribed.contains(MISSING_COMMAND), "{subscribed}");
 
