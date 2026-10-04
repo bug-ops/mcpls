@@ -479,7 +479,9 @@ impl LspServer {
                         stderr,
                     },
                     None => Error::LspInitFailed {
-                        message: format!("Initialize request failed: {init_error}"),
+                        message: redactions
+                            .apply(&format!("Initialize request failed: {init_error}"))
+                            .into_owned(),
                         stderr,
                     },
                 });
@@ -489,6 +491,7 @@ impl LspServer {
                 // so wait the (bounded) end-of-file grace whether or not it
                 // has exited yet.
                 let stderr = stderr_capture.finish(EofWait::Grace, &redactions).await;
+                let message = redactions.apply(&message).into_owned();
                 return Err(Error::LspInitFailed { message, stderr });
             }
             Err(init_error) => return Err(init_error),
@@ -2123,6 +2126,31 @@ sleep 5
         assert!(!joined.contains("SuperSecretArg456"), "{joined}");
         assert!(joined.contains("[redacted:API_TOKEN]"), "{joined}");
         assert!(joined.contains("[redacted:api-key]"), "{joined}");
+    }
+
+    /// A secret echoed into a mistyped `initialize` result reaches the serde
+    /// error text, which is redacted too (#554).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_redacts_secrets_in_initialize_decode_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":"SuperSecretValue123"}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 5
+"#;
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(script),
+        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let text = err.to_string();
+        assert!(!text.contains("SuperSecretValue123"), "{text}");
     }
 
     /// The server's own `initialize` error text is redacted (#554).

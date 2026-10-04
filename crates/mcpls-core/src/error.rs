@@ -158,8 +158,8 @@ impl RewrittenServerError {
 pub enum StartupFailure {
     /// Spawning or initializing the server failed.
     Spawn(Arc<Error>),
-    /// The background initialization task panicked before the server
-    /// registered.
+    /// Starting this server, or the background initialization task as a whole,
+    /// panicked before the server registered.
     InitTaskPanicked,
 }
 
@@ -1195,9 +1195,36 @@ mod tests {
     #[test]
     fn test_escape_control_and_stderr_agree_on_deceptive_characters() {
         let deceptive = [
-            '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{2028}',
-            '\u{2029}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}',
-            '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202A}',
+            '\u{202B}',
+            '\u{202C}',
+            '\u{202D}',
+            '\u{202E}',
+            '\u{2060}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{180E}',
+            '\u{2061}',
+            '\u{2064}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{E0000}',
+            '\u{E0041}',
+            '\u{E007F}',
         ];
         for c in deceptive {
             let text = format!("a{c}b");

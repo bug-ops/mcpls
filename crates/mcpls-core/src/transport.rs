@@ -1621,9 +1621,23 @@ enum CappedSessionManagerError {
     /// The concurrent-session cap was already reached.
     #[error("{SESSION_CAP_MARKER}: maximum concurrent HTTP sessions already active")]
     CapReached,
+    /// The session is gone. Carries no id: rmcp logs this error and the id is
+    /// a bearer secret (#555).
+    #[error("session not found")]
+    SessionGone,
     /// The wrapped [`LocalSessionManager`] failed.
     #[error(transparent)]
-    Inner(#[from] LocalSessionManagerError),
+    Inner(LocalSessionManagerError),
+}
+
+#[cfg(feature = "transport-http")]
+impl From<LocalSessionManagerError> for CappedSessionManagerError {
+    fn from(error: LocalSessionManagerError) -> Self {
+        match error {
+            LocalSessionManagerError::SessionNotFound(_) => Self::SessionGone,
+            other => Self::Inner(other),
+        }
+    }
 }
 
 #[cfg(feature = "transport-http")]
@@ -3775,10 +3789,9 @@ mod tests {
             let (manager, id, serving) = probed_session().await;
             crate::bridge::lock_std(&manager.slots).remove(&id);
 
-            assert!(matches!(
-                manager.create_standalone_stream(&id).await,
-                Err(CappedSessionManagerError::Inner(_))
-            ));
+            let error = manager.create_standalone_stream(&id).await.err().unwrap();
+            assert_matches!(error, CappedSessionManagerError::SessionGone);
+            assert!(!error.to_string().contains(&*id), "{error}");
             serving.abort();
         }
 
