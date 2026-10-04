@@ -455,7 +455,7 @@ impl McplsServer {
     /// real HTTP factory/session-close path (`transport.rs`'s integration
     /// tests) can assert on registry state without reaching into private
     /// `BridgeContext` fields cross-module.
-    #[cfg(all(test, feature = "transport-http"))]
+    #[cfg(test)]
     pub(crate) fn subscription_registry(&self) -> SubscriptionRegistry {
         self.context.session.registry()
     }
