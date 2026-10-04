@@ -6,6 +6,7 @@
 mod client;
 mod lifecycle;
 mod process;
+mod stderr;
 mod transport;
 pub(crate) mod types;
 

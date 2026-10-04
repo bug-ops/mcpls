@@ -214,6 +214,149 @@ impl fmt::Display for FailureList<'_> {
     }
 }
 
+/// Shortest `env` value redacted from a [`StderrExcerpt`]; shorter values
+/// would match unrelated text.
+pub(crate) const MIN_REDACTED_SECRET_BYTES: usize = 8;
+
+/// What a failed server startup wrote to stderr, bounded and sanitized.
+///
+/// Holds the first and last bytes of the output (or all of it when short), so
+/// both the opening banner and the final error survive. Control characters
+/// other than newline and tab are dropped, and exact occurrences of the
+/// server's configured `env` values (at least 8 bytes) are replaced with
+/// `[redacted]`; secrets belong in `env`. Encoded forms (URL, base64,
+/// JSON-escaped) and a secret straddling the head/tail cut are not matched.
+///
+/// `Display` renders one line: trimmed non-empty lines joined with ` | `,
+/// with `...` between head and tail when elided. The raw multi-line text is
+/// available through [`Self::head`] and [`Self::tail`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StderrExcerpt {
+    body: ExcerptBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExcerptBody {
+    Complete(Box<str>),
+    Elided { head: Box<str>, tail: Box<str> },
+}
+
+impl StderrExcerpt {
+    /// Excerpt of output that fit entirely in the capture buffer; `None` when
+    /// it holds no visible text.
+    pub(crate) fn complete(bytes: &[u8], secrets: &[&str]) -> Option<Self> {
+        let text = clean_stderr(&String::from_utf8_lossy(bytes), secrets);
+        (!text.is_empty()).then(|| Self {
+            body: ExcerptBody::Complete(text.into()),
+        })
+    }
+
+    /// Excerpt of output whose middle was dropped. The cut can split a UTF-8
+    /// sequence at the end of `head` and at the start of `tail`; both partial
+    /// sequences are discarded rather than shown as replacement characters.
+    pub(crate) fn elided(head: &[u8], tail: &[u8], secrets: &[&str]) -> Option<Self> {
+        let head = clean_stderr(&decode_cut_head(head), secrets);
+        let tail_start = tail
+            .iter()
+            .position(|byte| byte & 0xC0 != 0x80)
+            .unwrap_or(tail.len());
+        let tail = clean_stderr(&String::from_utf8_lossy(&tail[tail_start..]), secrets);
+        match (head.is_empty(), tail.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(Self {
+                body: ExcerptBody::Complete(head.into()),
+            }),
+            (true, false) => Some(Self {
+                body: ExcerptBody::Complete(tail.into()),
+            }),
+            (false, false) => Some(Self {
+                body: ExcerptBody::Elided {
+                    head: head.into(),
+                    tail: tail.into(),
+                },
+            }),
+        }
+    }
+
+    /// The start of the output, or all of it when nothing was dropped.
+    #[must_use]
+    pub fn head(&self) -> &str {
+        match &self.body {
+            ExcerptBody::Complete(text) => text,
+            ExcerptBody::Elided { head, .. } => head,
+        }
+    }
+
+    /// The end of the output, present only when the middle was dropped.
+    #[must_use]
+    pub fn tail(&self) -> Option<&str> {
+        match &self.body {
+            ExcerptBody::Complete(_) => None,
+            ExcerptBody::Elided { tail, .. } => Some(tail),
+        }
+    }
+
+    /// Whether the middle of the output was dropped.
+    #[must_use]
+    pub const fn is_elided(&self) -> bool {
+        matches!(self.body, ExcerptBody::Elided { .. })
+    }
+}
+
+impl fmt::Display for StderrExcerpt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn visible_lines(text: &str) -> impl Iterator<Item = &str> {
+            text.lines().map(str::trim).filter(|line| !line.is_empty())
+        }
+
+        let mut parts: Vec<&str> = visible_lines(self.head()).collect();
+        if let Some(tail) = self.tail() {
+            parts.push("...");
+            parts.extend(visible_lines(tail));
+        }
+        f.write_str(&parts.join(" | "))
+    }
+}
+
+/// Decodes `head`, dropping a UTF-8 sequence cut off at its end.
+fn decode_cut_head(head: &[u8]) -> String {
+    match std::str::from_utf8(head) {
+        Ok(text) => text.to_owned(),
+        Err(e) if e.error_len().is_none() => {
+            String::from_utf8_lossy(&head[..e.valid_up_to()]).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(head).into_owned(),
+    }
+}
+
+/// Redacts `secrets`, drops control characters other than `\n`/`\t` (they
+/// could forge log lines or drive a terminal) and trims.
+fn clean_stderr(text: &str, secrets: &[&str]) -> String {
+    let redacted = secrets
+        .iter()
+        .filter(|secret| secret.len() >= MIN_REDACTED_SECRET_BYTES)
+        .fold(text.to_owned(), |acc, secret| {
+            acc.replace(secret, "[redacted]")
+        });
+    redacted
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// `Display` suffix appending a server's stderr excerpt to a startup error.
+struct StderrSuffix<'a>(&'a Option<StderrExcerpt>);
+
+impl fmt::Display for StderrSuffix<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0
+            .as_ref()
+            .map_or(Ok(()), |excerpt| write!(f, "; stderr: {excerpt}"))
+    }
+}
+
 /// `Display` suffix for [`Error::ServerExitedDuringInit`] carrying the exit
 /// status and, for builtin servers with a known early-exit cause, a hint.
 struct EarlyExitDetail<'a>(&'a str, Option<i32>);
@@ -240,10 +383,12 @@ impl fmt::Display for EarlyExitDetail<'_> {
 #[non_exhaustive]
 pub enum Error {
     /// LSP server failed to initialize.
-    #[error("LSP server initialization failed: {message}")]
+    #[error("LSP server initialization failed: {message}{}", StderrSuffix(.stderr))]
     LspInitFailed {
         /// Description of the initialization failure.
         message: String,
+        /// What the server wrote to stderr before failing, if anything.
+        stderr: Option<StderrExcerpt>,
     },
 
     /// LSP server returned an error response.
@@ -401,12 +546,14 @@ pub enum Error {
 
     /// LSP server process exited before completing the `initialize`
     /// handshake.
-    #[error("LSP server '{command}' exited during initialization{}", EarlyExitDetail(.command, *.exit_code))]
+    #[error("LSP server '{command}' exited during initialization{}{}", EarlyExitDetail(.command, *.exit_code), StderrSuffix(.stderr))]
     ServerExitedDuringInit {
         /// Command that was spawned.
         command: String,
         /// Exit code, or `None` if the process was terminated by a signal.
         exit_code: Option<i32>,
+        /// What the server wrote to stderr before exiting, if anything.
+        stderr: Option<StderrExcerpt>,
     },
 
     /// A crashed server could not be automatically respawned.
@@ -860,10 +1007,79 @@ mod tests {
     fn test_error_display_lsp_init_failed() {
         let err = Error::LspInitFailed {
             message: "server not found".to_string(),
+            stderr: None,
         };
         assert_eq!(
             err.to_string(),
             "LSP server initialization failed: server not found"
+        );
+    }
+
+    #[test]
+    fn test_stderr_excerpt_none_when_nothing_visible() {
+        assert_eq!(StderrExcerpt::complete(b"  \n\x1b\r\n ", &[]), None);
+        assert_eq!(StderrExcerpt::complete(b"", &[]), None);
+    }
+
+    #[test]
+    fn test_stderr_excerpt_strips_control_characters_but_keeps_newline_and_tab() {
+        let excerpt = StderrExcerpt::complete(b"a\x1b[31mb\x00\r\nc\td", &[]).unwrap();
+        assert_eq!(excerpt.head(), "a[31mb\nc\td");
+    }
+
+    #[test]
+    fn test_stderr_excerpt_display_is_single_line() {
+        let excerpt = StderrExcerpt::complete(b"first\n\n  second  \nthird\n", &[]).unwrap();
+        assert_eq!(excerpt.to_string(), "first | second | third");
+    }
+
+    #[test]
+    fn test_stderr_excerpt_elided_display_marks_the_gap() {
+        let excerpt = StderrExcerpt::elided(b"start\nbanner", b"last\nerror", &[]).unwrap();
+        assert!(excerpt.is_elided());
+        assert_eq!(excerpt.tail(), Some("last\nerror"));
+        assert_eq!(excerpt.to_string(), "start | banner | ... | last | error");
+    }
+
+    #[test]
+    fn test_stderr_excerpt_elided_drops_utf8_sequences_cut_by_the_split() {
+        let text = "é".as_bytes();
+        let head = [b"ok ".as_slice(), &text[..1]].concat();
+        let tail = [&text[1..], b" end".as_slice()].concat();
+
+        let excerpt = StderrExcerpt::elided(&head, &tail, &[]).unwrap();
+
+        assert_eq!(excerpt.head(), "ok");
+        assert_eq!(excerpt.tail(), Some("end"));
+    }
+
+    #[test]
+    fn test_stderr_excerpt_redacts_long_secrets_only() {
+        let excerpt =
+            StderrExcerpt::complete(b"token=hunter2hunter2 id=abc", &["hunter2hunter2", "abc"])
+                .unwrap();
+        assert_eq!(excerpt.head(), "token=[redacted] id=abc");
+    }
+
+    #[test]
+    fn test_init_errors_append_stderr_to_display() {
+        let stderr = StderrExcerpt::complete(b"fatal: bad config", &[]);
+        let failed = Error::LspInitFailed {
+            message: "boom".to_string(),
+            stderr: stderr.clone(),
+        };
+        assert_eq!(
+            failed.to_string(),
+            "LSP server initialization failed: boom; stderr: fatal: bad config"
+        );
+        let exited = Error::ServerExitedDuringInit {
+            command: "gopls".to_string(),
+            exit_code: Some(2),
+            stderr,
+        };
+        assert_eq!(
+            exited.to_string(),
+            "LSP server 'gopls' exited during initialization with exit code 2; stderr: fatal: bad config"
         );
     }
 
@@ -1115,6 +1331,7 @@ mod tests {
             "rust-analyzer",
             Error::LspInitFailed {
                 message: "boom".to_string(),
+                stderr: None,
             },
         );
         assert_eq!(
@@ -1170,6 +1387,7 @@ mod tests {
             Error::ServerExitedDuringInit {
                 command: "x".to_string(),
                 exit_code: Some(1),
+                stderr: None,
             },
             Error::ServerUnavailable {
                 server_id: ServerId::from("rust"),
@@ -1185,6 +1403,7 @@ mod tests {
         let hinted = Error::ServerExitedDuringInit {
             command: "rust-analyzer".to_string(),
             exit_code: Some(1),
+            stderr: None,
         }
         .to_string();
         assert!(hinted.contains("exit code 1"), "{hinted}");
@@ -1196,6 +1415,7 @@ mod tests {
         let plain = Error::ServerExitedDuringInit {
             command: "gopls".to_string(),
             exit_code: None,
+            stderr: None,
         }
         .to_string();
         assert!(plain.contains("terminated by a signal"), "{plain}");
@@ -1224,6 +1444,7 @@ mod tests {
                     "pyright",
                     Error::LspInitFailed {
                         message: "denied".to_string(),
+                        stderr: None,
                     },
                 ),
             ],
