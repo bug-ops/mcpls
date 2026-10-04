@@ -1093,6 +1093,8 @@ impl LspServer {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -1205,7 +1207,7 @@ mod tests {
     #[test]
     fn test_workspace_folder_rejects_relative_root() {
         let err = workspace_folder(Path::new("relative/root")).unwrap_err();
-        assert!(matches!(err, Error::InvalidUri(_)), "got {err:?}");
+        assert_matches!(err, Error::InvalidUri(_), "got {err:?}");
     }
 
     #[test]
@@ -1435,9 +1437,9 @@ mod tests {
         let started = Instant::now();
         let result = server.shutdown().await;
 
-        assert!(matches!(result, Err(Error::Timeout(_))), "got {result:?}");
+        assert_matches!(result, Err(Error::Timeout(_)), "got {result:?}");
         assert!(started.elapsed() <= SHUTDOWN_TIMEOUT);
-        assert!(matches!(probe.state().await, ServerState::Shutdown));
+        assert_matches!(probe.state().await, ServerState::Shutdown);
     }
 
     #[tokio::test]
@@ -1714,9 +1716,9 @@ mod tests {
         use std::io::{Error as IoError, ErrorKind};
 
         let missing = spawn_error("x".to_string(), IoError::from(ErrorKind::NotFound));
-        assert!(matches!(missing, Error::ServerNotFound { .. }));
+        assert_matches!(missing, Error::ServerNotFound { .. });
         let denied = spawn_error("x".to_string(), IoError::from(ErrorKind::PermissionDenied));
-        assert!(matches!(denied, Error::ServerSpawnFailed { .. }));
+        assert_matches!(denied, Error::ServerSpawnFailed { .. });
     }
 
     #[tokio::test]
@@ -1731,7 +1733,7 @@ mod tests {
             notification_tx: None,
         };
         let err = LspServer::spawn(config).await.unwrap_err();
-        assert!(matches!(err, Error::ServerNotFound { .. }), "got {err:?}");
+        assert_matches!(err, Error::ServerNotFound { .. }, "got {err:?}");
     }
 
     #[tokio::test]
@@ -1768,8 +1770,7 @@ mod tests {
         let failure = &result.failures[0];
         assert_eq!(failure.language_id, "rust");
         assert_eq!(failure.command, "nonexistent-command-12345");
-        assert!(
-            matches!(&failure.reason, StartupFailure::Spawn(e) if matches!(**e, Error::ServerNotFound { .. })),
+        assert_matches!(&failure.reason, StartupFailure::Spawn(e) if matches!(**e, Error::ServerNotFound { .. }),
             "got {:?}",
             failure.reason
         );
@@ -1804,8 +1805,7 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
-        assert!(
-            matches!(&err, Error::LspInitFailed { message, .. } if message.contains("rejected by server")),
+        assert_matches!(&err, Error::LspInitFailed { message, .. } if message.contains("rejected by server"),
             "got {err:?}"
         );
     }
@@ -1820,8 +1820,7 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
-        assert!(
-            matches!(&err, Error::LspInitFailed { message, .. } if message.contains("Initialize request failed")),
+        assert_matches!(&err, Error::LspInitFailed { message, .. } if message.contains("Initialize request failed"),
             "got {err:?}"
         );
     }
@@ -1834,14 +1833,12 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
-        assert!(
-            matches!(
-                err,
-                Error::ServerExitedDuringInit {
-                    exit_code: Some(1),
-                    ..
-                }
-            ),
+        assert_matches!(
+            err,
+            Error::ServerExitedDuringInit {
+                exit_code: Some(1),
+                ..
+            },
             "got {err:?}"
         );
     }

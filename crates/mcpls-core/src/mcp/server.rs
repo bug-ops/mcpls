@@ -346,7 +346,7 @@ impl ResourceDiagnosticsResponse {
         Self {
             tracked,
             version: entry.and_then(|e| e.version),
-            diagnostics: entry.map(|e| e.diagnostics.clone()).unwrap_or_default(),
+            diagnostics: entry.map_or_default(|e| e.diagnostics.clone()),
             signals,
         }
     }
@@ -1529,6 +1529,8 @@ impl ServerHandler for McplsServer {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::bridge::Capability;
     use crate::bridge::resources::ResourceSubscriptions;
@@ -4047,7 +4049,7 @@ sleep 0.3
         let mut translator = Translator::new();
         translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
         let result = translator.validate_path(&dir.path().join("this/path/does/not/exist.rs"));
-        assert!(matches!(result, Err(Error::FileIo { .. })));
+        assert_matches!(result, Err(Error::FileIo { .. }));
     }
 
     /// #479 regression: `read_resource`/`subscribe` must still return
@@ -4065,7 +4067,7 @@ sleep 0.3
         let missing = temp_dir.path().join("does-not-exist.rs");
 
         let result = validate_path_against_roots(&missing, &roots);
-        assert!(matches!(result, Err(crate::error::Error::FileIo { .. })));
+        assert_matches!(result, Err(crate::error::Error::FileIo { .. }));
 
         let mcp_err = map_bridge_error(result.unwrap_err());
         assert_eq!(mcp_err.code, ErrorCode::INVALID_PARAMS);
@@ -4258,10 +4260,7 @@ sleep 0.3
             .prepare_listen(&vec![uri.clone(); MAX_SUBSCRIPTIONS + 1], &[uri])
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::Error::ListenFilterTooLarge { .. }
-        ));
+        assert_matches!(err, crate::error::Error::ListenFilterTooLarge { .. });
         assert_eq!(map_bridge_error(err).code, ErrorCode::INVALID_PARAMS);
     }
 
@@ -4271,10 +4270,7 @@ sleep 0.3
         let long = format!("lsp-diagnostics:///{}", "a".repeat(4096));
         let requested = vec![long; 100];
         let err = server.prepare_listen(&requested, &[uri]).await.unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::Error::ListenFilterTooLarge { .. }
-        ));
+        assert_matches!(err, crate::error::Error::ListenFilterTooLarge { .. });
     }
 
     #[tokio::test]
@@ -4318,10 +4314,7 @@ sleep 0.3
             .prepare_listen(std::slice::from_ref(&uri), std::slice::from_ref(&uri))
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::Error::ListenStreamsExhausted { .. }
-        ));
+        assert_matches!(err, crate::error::Error::ListenStreamsExhausted { .. });
         assert_eq!(
             map_bridge_error(err).code,
             ErrorCode(crate::error::LISTEN_STREAMS_EXHAUSTED_ERROR_CODE)

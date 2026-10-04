@@ -479,6 +479,8 @@ impl ResourceSubscriptions {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     // ------------------------------------------------------------------
@@ -610,7 +612,7 @@ mod tests {
             &WorkspaceRoots::resolve(vec![root]),
         )
         .unwrap_err();
-        assert!(matches!(err, crate::Error::InvalidUri(_)), "got {err:?}");
+        assert_matches!(err, crate::Error::InvalidUri(_), "got {err:?}");
     }
 
     #[test]
@@ -621,7 +623,7 @@ mod tests {
             &WorkspaceRoots::resolve(vec![root]),
         )
         .unwrap_err();
-        assert!(matches!(err, crate::Error::InvalidUri(_)), "got {err:?}");
+        assert_matches!(err, crate::Error::InvalidUri(_), "got {err:?}");
     }
 
     #[test]

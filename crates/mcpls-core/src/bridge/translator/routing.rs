@@ -1119,8 +1119,8 @@ impl Translator {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::fs;
     use std::sync::Arc;
+    use std::{assert_matches, fs};
 
     use tempfile::TempDir;
     use tokio::io::BufReader;
@@ -1157,7 +1157,7 @@ mod tests {
         let err = translator
             .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
-        assert!(matches!(err, Error::ServerInitializing { server_id } if server_id == id));
+        assert_matches!(err, Error::ServerInitializing { server_id } if server_id == id);
     }
 
     #[test]
@@ -1171,7 +1171,7 @@ mod tests {
         let err = translator
             .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
-        assert!(matches!(err, Error::NoServerForLanguage(ref l) if *l == lang));
+        assert_matches!(err, Error::NoServerForLanguage(ref l) if *l == lang);
     }
 
     use crate::test_lsp::test_extensions;
@@ -1251,7 +1251,7 @@ mod tests {
             .client_for_file(Path::new("/ws/script.py"), ToolKind::Hover)
             .unwrap_err();
 
-        assert!(matches!(err, Error::NoServerForLanguage(_)), "got {err:?}");
+        assert_matches!(err, Error::NoServerForLanguage(_), "got {err:?}");
     }
 
     /// A failed explicit server must not mask a live catch-all it was
@@ -1307,8 +1307,7 @@ mod tests {
             .client_for_file(Path::new("/ws/main.rs"), ToolKind::Definition)
             .unwrap_err();
 
-        assert!(
-            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == failed_id),
+        assert_matches!(&err, Error::ServerFailedToStart(f) if f.server_id == failed_id,
             "got {err:?}"
         );
     }
@@ -1336,8 +1335,7 @@ mod tests {
             .client_for_file(Path::new("/ws/app.tsx"), ToolKind::Hover)
             .unwrap_err();
 
-        assert!(
-            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
+        assert_matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id,
             "got {err:?}"
         );
     }
@@ -1351,7 +1349,7 @@ mod tests {
 
         // With no workspace roots configured, access is rejected (fail closed)
         let result = translator.validate_path(&test_file);
-        assert!(matches!(result, Err(Error::NoWorkspaceRoots(_))));
+        assert_matches!(result, Err(Error::NoWorkspaceRoots(_)));
     }
 
     #[test]
@@ -1384,7 +1382,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = translator.validate_path(&test_file);
-        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
     /// #533: an outside path that does not exist must be rejected as outside
@@ -1397,7 +1395,7 @@ mod tests {
 
         let result = validate_path_against_roots(&outside.path().join("missing.rs"), &roots);
 
-        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
     #[test]
@@ -1407,7 +1405,7 @@ mod tests {
 
         let result = validate_path_against_roots(&root.path().join("../escape.rs"), &roots);
 
-        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
     #[test]
@@ -1458,7 +1456,7 @@ mod tests {
 
         let result = validate_path_against_roots(&alias.join("../outside.rs"), &roots);
 
-        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
     /// Inside an alias root the pre-check admits the path, so a missing file
@@ -1475,7 +1473,7 @@ mod tests {
 
         let result = validate_path_against_roots(&alias.join("missing.rs"), &roots);
 
-        assert!(matches!(result, Err(Error::FileIo { .. })), "{result:?}");
+        assert_matches!(result, Err(Error::FileIo { .. }), "{result:?}");
     }
 
     /// A symlink inside an alias root that escapes the workspace is still
@@ -1495,7 +1493,7 @@ mod tests {
 
         let result = validate_path_against_roots(&alias.join("link/secret.rs"), &roots);
 
-        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
     /// A symlink inside the root pointing outside passes the lexical
@@ -1511,7 +1509,7 @@ mod tests {
 
         let result = validate_path_against_roots(&root.path().join("link/secret.rs"), &roots);
 
-        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
     /// Regression guard: `prepare_gated_document`'s `&str` overload (used by
@@ -1546,7 +1544,7 @@ mod tests {
             .handle_hover(outside_path.to_string_lossy().to_string(), pos(1, 1))
             .await;
 
-        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
     #[tokio::test]
@@ -1554,7 +1552,7 @@ mod tests {
         let translator = Translator::new();
         let uri: lsp_types::Uri = lsp_types::Uri::from("http://example.com/file.rs");
         let result = translator.parse_file_uri(&uri);
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -1604,7 +1602,7 @@ mod tests {
         let translator = Translator::new();
         let uri: lsp_types::Uri = lsp_types::Uri::from("file://host/some/path.rs");
         let result = translator.parse_file_uri(&uri);
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[test]
@@ -1739,8 +1737,7 @@ mod tests {
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
 
-        assert!(
-            matches!(&route, DiagnosticsRoute::Live(live) if *live == id),
+        assert_matches!(&route, DiagnosticsRoute::Live(live) if *live == id,
             "{route:?}"
         );
         assert_eq!(route.server_id(), Some(&id));
@@ -1759,14 +1756,12 @@ mod tests {
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
 
-        assert!(
-            matches!(&route, DiagnosticsRoute::Initializing(i) if *i == id),
+        assert_matches!(&route, DiagnosticsRoute::Initializing(i) if *i == id,
             "{route:?}"
         );
         assert_eq!(route.server_id(), Some(&id));
         let err = route.into_read_result().unwrap_err();
-        assert!(
-            matches!(&err, Error::ServerInitializing { server_id } if *server_id == id),
+        assert_matches!(&err, Error::ServerInitializing { server_id } if *server_id == id,
             "{err:?}"
         );
     }
@@ -1787,8 +1782,7 @@ mod tests {
         assert!(route.is_failed(), "{route:?}");
         assert_eq!(route.server_id(), None);
         let err = route.into_read_result().unwrap_err();
-        assert!(
-            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
+        assert_matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id,
             "{err:?}"
         );
     }
@@ -1807,7 +1801,7 @@ mod tests {
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/script.py"));
 
-        assert!(matches!(route, DiagnosticsRoute::Unrouted), "{route:?}");
+        assert_matches!(route, DiagnosticsRoute::Unrouted, "{route:?}");
         assert_eq!(route.into_read_result().unwrap(), None);
     }
 
@@ -1822,7 +1816,7 @@ mod tests {
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
 
-        assert!(matches!(route, DiagnosticsRoute::Unrouted), "{route:?}");
+        assert_matches!(route, DiagnosticsRoute::Unrouted, "{route:?}");
     }
 
     /// A live catch-all the router was rebound to beats a failed explicit
@@ -1847,8 +1841,7 @@ mod tests {
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
 
-        assert!(
-            matches!(&route, DiagnosticsRoute::Live(id) if *id == live_id),
+        assert_matches!(&route, DiagnosticsRoute::Live(id) if *id == live_id,
             "{route:?}"
         );
     }
@@ -1873,8 +1866,7 @@ mod tests {
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/app.tsx"));
 
-        assert!(
-            matches!(&route, DiagnosticsRoute::FailedToStart(f) if f.server_id == id),
+        assert_matches!(&route, DiagnosticsRoute::FailedToStart(f) if f.server_id == id,
             "{route:?}"
         );
     }
@@ -1899,7 +1891,7 @@ mod tests {
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
 
-        assert!(matches!(route, DiagnosticsRoute::Unrouted), "{route:?}");
+        assert_matches!(route, DiagnosticsRoute::Unrouted, "{route:?}");
     }
 
     /// The live pull path (`get_diagnostics`) also reports the failure.
@@ -1923,8 +1915,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
+        assert_matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id,
             "got {err:?}"
         );
     }
@@ -2360,7 +2351,7 @@ mod tests {
             .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::DocumentLimitExceeded { .. }));
+        assert_matches!(err, Error::DocumentLimitExceeded { .. });
 
         drop(doc_a);
         drop(
@@ -2399,7 +2390,7 @@ mod tests {
             .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::DocumentLimitExceeded { .. }));
+        assert_matches!(err, Error::DocumentLimitExceeded { .. });
 
         drop(second);
         assert_eq!(translator.document_tracker.in_flight_count(&canonical_a), 0);
@@ -2441,7 +2432,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::ServerTerminated));
+        assert_matches!(err, Error::ServerTerminated);
         assert_eq!(translator.document_tracker.in_flight_count(&canonical_b), 0);
     }
 
@@ -2505,7 +2496,7 @@ mod tests {
             .prepare_document(&path_b.to_string_lossy(), ToolKind::Hover)
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::ServerTerminated));
+        assert_matches!(err, Error::ServerTerminated);
 
         // `a` was evicted (LRU, to make room for `b`) before `b`'s own
         // notify failed, and its didClose must still have gone out on
@@ -2583,14 +2574,12 @@ mod tests {
         let rename_result = translator
             .handle_rename(path_str.clone(), pos(1, 1), "renamed".to_string())
             .await;
-        assert!(
-            matches!(
-                rename_result,
-                Err(Error::NoServerForTool {
-                    tool: ToolKind::Rename,
-                    ..
-                })
-            ),
+        assert_matches!(
+            rename_result,
+            Err(Error::NoServerForTool {
+                tool: ToolKind::Rename,
+                ..
+            }),
             "expected NoServerForTool for rename, got {rename_result:?}"
         );
 
@@ -2670,13 +2659,13 @@ mod tests {
         translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
 
         let result = translator.require_capability(&server_id, Capability::Rename);
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "renameProvider",
                 ..
             })
-        ));
+        );
     }
 
     /// #309: an oversized `new_name` must be rejected before any server
@@ -2697,7 +2686,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -2724,13 +2713,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "renameProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -2761,13 +2750,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "codeActionProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -2793,13 +2782,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "signatureHelpProvider",
                 ..
             })
-        ));
+        );
     }
 
     /// `handle_incoming_calls` resolves its server via `client_for_file`
@@ -2835,13 +2824,13 @@ mod tests {
 
         let result = translator.handle_incoming_calls(item).await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "callHierarchyProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -2874,13 +2863,13 @@ mod tests {
 
         let result = translator.handle_outgoing_calls(item).await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "callHierarchyProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -2900,13 +2889,13 @@ mod tests {
             .handle_format_document(path.to_string_lossy().to_string(), 4, true)
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "documentFormattingProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -2932,13 +2921,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "callHierarchyProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -2968,13 +2957,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "inlayHintProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -3000,13 +2989,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "hoverProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -3032,13 +3021,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "definitionProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -3065,13 +3054,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "referencesProvider",
                 ..
             })
-        ));
+        );
     }
 
     /// #309 M3: an oversized `trigger` must be rejected before any server
@@ -3092,7 +3081,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -3119,13 +3108,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "completionProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -3145,13 +3134,13 @@ mod tests {
             .handle_document_symbols(path.to_string_lossy().to_string())
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "documentSymbolProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -3168,13 +3157,13 @@ mod tests {
             .handle_workspace_symbol("main".to_string(), None, 100)
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "workspaceSymbolProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -3200,13 +3189,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "implementationProvider",
                 ..
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -3232,13 +3221,13 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "typeDefinitionProvider",
                 ..
             })
-        ));
+        );
     }
 
     /// Explicit `Some(RenameProvider::Bool(false))` -- as distinct from an absent
@@ -3255,13 +3244,13 @@ mod tests {
         translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
 
         let result = translator.require_capability(&server_id, Capability::Rename);
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "renameProvider",
                 ..
             })
-        ));
+        );
     }
 
     /// Positive path: when the routed server *does* advertise the gated

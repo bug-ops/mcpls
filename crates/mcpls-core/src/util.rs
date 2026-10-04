@@ -18,6 +18,7 @@ pub const fn bounded_read_cap(max: u64) -> u64 {
 
 /// Outcome of checking a bounded read's raw bytes against `max` and decoding
 /// them as UTF-8.
+#[derive(Debug)]
 pub enum BoundedReadOutcome {
     /// `buf` was within `max` bytes and valid UTF-8.
     Ok(String),
@@ -70,8 +71,8 @@ pub const MAX_LOG_STRING_BYTES: usize = 200;
 /// counted against the limit.
 ///
 /// `s` is typically attacker-influenceable (forwarded from a spawned LSP
-/// server), so the cut point is found via `char_indices` rather than a raw
-/// byte index, which would panic if it fell inside a multi-byte codepoint.
+/// server), so the cut point is found via `floor_char_boundary` rather than a
+/// raw byte index, which would panic if it fell inside a multi-byte codepoint.
 ///
 /// Always allocates a fresh `String`, even when `s` is already within the
 /// limit. Prefer [`truncate_string`] when the caller already owns `s` and
@@ -81,12 +82,7 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    let cut = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= max_bytes)
-        .last()
-        .unwrap_or(0);
+    let cut = s.floor_char_boundary(max_bytes);
     format!("{}{TRUNCATION_MARKER}", &s[..cut])
 }
 
@@ -104,12 +100,7 @@ pub fn truncate_string(mut s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s;
     }
-    let cut = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= max_bytes)
-        .last()
-        .unwrap_or(0);
+    let cut = s.floor_char_boundary(max_bytes);
     s.truncate(cut);
     s.push_str(TRUNCATION_MARKER);
     s
@@ -117,7 +108,7 @@ pub fn truncate_string(mut s: String, max_bytes: usize) -> String {
 
 /// Whether `c` could forge a log line or reorder displayed text: a control
 /// character, a Unicode line or paragraph separator, or a bidi control.
-fn needs_escape(c: char) -> bool {
+const fn needs_escape(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
@@ -164,14 +155,13 @@ pub fn escape_control(s: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
     fn escape_control_borrows_clean_text() {
-        assert!(matches!(
-            escape_control("plain ✓"),
-            Cow::Borrowed("plain ✓")
-        ));
+        assert_matches!(escape_control("plain ✓"), Cow::Borrowed("plain ✓"));
     }
 
     #[test]
@@ -196,6 +186,12 @@ mod tests {
     }
 
     #[test]
+    fn truncate_with_zero_budget_keeps_only_marker() {
+        assert_eq!(truncate_str("é", 0), TRUNCATION_MARKER);
+        assert_eq!(truncate_string("abc".to_owned(), 0), TRUNCATION_MARKER);
+    }
+
+    #[test]
     fn bounded_read_cap_is_max_plus_one() {
         assert_eq!(bounded_read_cap(100), 101);
         assert_eq!(bounded_read_cap(u64::MAX - 1), u64::MAX);
@@ -209,25 +205,25 @@ mod tests {
     #[test]
     fn check_bounded_utf8_within_limit() {
         let outcome = check_bounded_utf8(b"hello".to_vec(), 10);
-        assert!(matches!(outcome, BoundedReadOutcome::Ok(s) if s == "hello"));
+        assert_matches!(outcome, BoundedReadOutcome::Ok(s) if s == "hello");
     }
 
     #[test]
     fn check_bounded_utf8_too_large() {
         let outcome = check_bounded_utf8(b"hello".to_vec(), 4);
-        assert!(matches!(outcome, BoundedReadOutcome::TooLarge { size: 5 }));
+        assert_matches!(outcome, BoundedReadOutcome::TooLarge { size: 5 });
     }
 
     #[test]
     fn check_bounded_utf8_unlimited_when_max_zero() {
         let outcome = check_bounded_utf8(b"a".repeat(1000), 0);
-        assert!(matches!(outcome, BoundedReadOutcome::Ok(s) if s.len() == 1000));
+        assert_matches!(outcome, BoundedReadOutcome::Ok(s) if s.len() == 1000);
     }
 
     #[test]
     fn check_bounded_utf8_invalid_utf8_within_limit() {
         let outcome = check_bounded_utf8(vec![0xFF, 0xFE], 10);
-        assert!(matches!(outcome, BoundedReadOutcome::InvalidUtf8(_)));
+        assert_matches!(outcome, BoundedReadOutcome::InvalidUtf8(_));
     }
 
     /// A multibyte character split by the bound must be reported as
@@ -238,7 +234,7 @@ mod tests {
         let mut buf = "é".repeat(3).into_bytes();
         buf.truncate(5);
         let outcome = check_bounded_utf8(buf, 4);
-        assert!(matches!(outcome, BoundedReadOutcome::TooLarge { size: 5 }));
+        assert_matches!(outcome, BoundedReadOutcome::TooLarge { size: 5 });
     }
 
     #[test]

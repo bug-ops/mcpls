@@ -687,9 +687,9 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 mod tests {
-    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
+    use std::{assert_matches, fs};
 
     use tempfile::TempDir;
     use tokio::io::BufReader;
@@ -772,7 +772,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::WorkspaceIndexing { elapsed_secs, .. } if elapsed_secs == 5));
+        assert_matches!(err, Error::WorkspaceIndexing { elapsed_secs, .. } if elapsed_secs == 5);
         assert_eq!(start.elapsed(), Duration::from_secs(5));
     }
 
@@ -796,10 +796,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == ServerId::from("rust")
-        ));
+        );
     }
 
     #[tokio::test]
@@ -871,10 +871,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, elapsed_secs: 30 } if id == server_id
-        ));
+        );
     }
 
     /// Companion to the timeout test above: when the cache reports `Ready`,
@@ -966,10 +966,7 @@ mod tests {
 
         let timeout_secs = crate::config::LspServerConfig::rust_analyzer().request_timeout_seconds;
         tokio::time::advance(Duration::from_secs(timeout_secs + 1)).await;
-        assert!(matches!(
-            first.await.unwrap().unwrap_err(),
-            Error::Timeout(_)
-        ));
+        assert_matches!(first.await.unwrap().unwrap_err(), Error::Timeout(_));
 
         let second = spawn_hover();
         let second_request = read_framed_message(&mut wire).await;
@@ -1016,10 +1013,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// Companion: when the cache reports `Ready`, `handle_definition` must
@@ -1097,10 +1094,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// Companion: when the cache reports `Ready`, `handle_references` must
@@ -1179,10 +1176,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// S3 fix, companion for `handle_type_definition`.
@@ -1212,10 +1209,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// A timed-out wait must return `Error::WorkspaceIndexing` to its own
@@ -1299,8 +1296,9 @@ mod tests {
         };
 
         let short_result = short.await.unwrap();
-        assert!(
-            matches!(short_result, Err(Error::WorkspaceIndexing { .. })),
+        assert_matches!(
+            short_result,
+            Err(Error::WorkspaceIndexing { .. }),
             "the short-timeout waiter must time out on its own schedule, got {short_result:?}"
         );
 

@@ -1,3 +1,4 @@
+use std::assert_matches;
 use std::path::PathBuf;
 
 use mcpls_core::bridge::{Translator, WorkspaceRoots};
@@ -162,5 +163,5 @@ fn test_mutually_exclusive_heuristics_fixture_errors_when_both_applicable() {
 
     let err = ToolRouter::from_configs(applicable)
         .expect_err("two applicable nameless servers for one language must be ambiguous");
-    assert!(matches!(err, mcpls_core::error::Error::InvalidConfig(_)));
+    assert_matches!(err, mcpls_core::error::Error::InvalidConfig(_));
 }

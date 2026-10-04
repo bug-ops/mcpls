@@ -4,7 +4,7 @@ Complete installation guide for mcpls - the universal MCP to LSP bridge.
 
 ## Prerequisites
 
-- Rust 1.88 or later (for building from source)
+- Rust 1.99 or later (for building from source)
 - At least one Language Server installed (see [Language Server Setup](#language-server-setup))
 
 ## Installation Methods
@@ -472,7 +472,7 @@ Expected output should be a JSON response with `"method":"initialize"` result.
 
 **Solution:**
 ```bash
-# Update Rust to 1.88+
+# Update Rust to 1.99+
 rustup update stable
 rustup default stable
 

@@ -745,7 +745,7 @@ impl Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::fs;
+    use std::{assert_matches, fs};
 
     use super::*;
     use crate::bridge::WorkspaceRoots;
@@ -977,7 +977,7 @@ mod tests {
     fn test_validate_rename_params_rejects_oversized_new_name() {
         let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
         let result = validate_rename_params(&new_name);
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[test]
@@ -1016,7 +1016,7 @@ mod tests {
                 Some("invalid_kind".to_string()),
             )
             .await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -1153,7 +1153,7 @@ mod tests {
                 None,
             )
             .await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -1173,7 +1173,7 @@ mod tests {
                 None,
             )
             .await;
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -1344,22 +1344,13 @@ mod tests {
         )
         .await;
         assert_eq!(result.diagnostics.len(), 4);
-        assert!(matches!(
-            result.diagnostics[0].severity,
-            DiagnosticSeverity::Error
-        ));
-        assert!(matches!(
-            result.diagnostics[1].severity,
-            DiagnosticSeverity::Warning
-        ));
-        assert!(matches!(
+        assert_matches!(result.diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert_matches!(result.diagnostics[1].severity, DiagnosticSeverity::Warning);
+        assert_matches!(
             result.diagnostics[2].severity,
             DiagnosticSeverity::Information
-        ));
-        assert!(matches!(
-            result.diagnostics[3].severity,
-            DiagnosticSeverity::Hint
-        ));
+        );
+        assert_matches!(result.diagnostics[3].severity, DiagnosticSeverity::Hint);
         assert_eq!(result.diagnostics[0].code, Some("1".to_string()));
         assert_eq!(result.diagnostics[1].code, Some("W001".to_string()));
     }
@@ -2202,10 +2193,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// Companion: when the cache reports `Ready`, `handle_code_actions` must
@@ -2823,10 +2814,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// Companion: when the cache reports `Ready`, `handle_rename` must

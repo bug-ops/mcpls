@@ -8,7 +8,7 @@ description: >-
   mcpls or one of its language servers fails to start.
 license: MIT OR Apache-2.0
 compatibility: >-
-  Wraps the `mcpls` Rust binary (Rust 1.88+ / edition 2024 to build from source). Requires at
+  Wraps the `mcpls` Rust binary (Rust 1.99+ / edition 2024 to build from source). Requires at
   least one LSP server on PATH (rust-analyzer, pyright, gopls, clangd, …). HTTP transport
   requires building with the non-default `transport-http` feature.
 metadata:

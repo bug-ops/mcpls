@@ -515,6 +515,8 @@ impl ToolRouter {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     fn cfg(
@@ -602,7 +604,7 @@ mod tests {
             cfg("typescript", Some("python"), None),
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
-        assert!(matches!(err, Error::InvalidConfig(_)));
+        assert_matches!(err, Error::InvalidConfig(_));
     }
 
     #[test]
@@ -682,7 +684,7 @@ mod tests {
             cfg("python", Some("b"), None),
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
-        assert!(matches!(err, Error::InvalidConfig(_)));
+        assert_matches!(err, Error::InvalidConfig(_));
     }
 
     #[test]
@@ -692,7 +694,7 @@ mod tests {
             cfg("python", Some("b"), Some(vec![ToolKind::Hover])),
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
-        assert!(matches!(err, Error::InvalidConfig(_)));
+        assert_matches!(err, Error::InvalidConfig(_));
     }
 
     #[test]

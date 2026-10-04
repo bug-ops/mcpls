@@ -563,6 +563,7 @@ impl Default for Translator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::assert_matches;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
@@ -601,10 +602,7 @@ mod tests {
         let before = translator
             .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
-        assert!(
-            matches!(before, Error::ServerInitializing { .. }),
-            "got {before:?}"
-        );
+        assert_matches!(before, Error::ServerInitializing { .. }, "got {before:?}");
 
         translator
             .settle_after_init_panic(&[crate::test_lsp::init_config_for(config)])
@@ -613,12 +611,10 @@ mod tests {
         let after = translator
             .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
-        assert!(
-            matches!(
+        assert_matches!(
                 &after,
                 Error::ServerFailedToStart(f)
-                    if f.server_id == id && matches!(f.reason, StartupFailure::InitTaskPanicked)
-            ),
+                    if f.server_id == id && matches!(f.reason, StartupFailure::InitTaskPanicked),
             "got {after:?}"
         );
     }
@@ -779,7 +775,7 @@ mod tests {
         let err = translator
             .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
-        assert!(matches!(err, Error::NoServerForLanguage(_)));
+        assert_matches!(err, Error::NoServerForLanguage(_));
     }
 
     #[test]

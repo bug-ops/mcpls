@@ -248,8 +248,8 @@ non_zero_duration! {
     /// use mcpls_core::ProbeInterval;
     ///
     /// assert!(ProbeInterval::new(Duration::ZERO).is_none());
-    /// let interval = ProbeInterval::new(Duration::from_secs(60)).unwrap();
-    /// assert_eq!(interval.get(), Duration::from_secs(60));
+    /// let interval = ProbeInterval::new(Duration::from_mins(1)).unwrap();
+    /// assert_eq!(interval.get(), Duration::from_mins(1));
     /// ```
     ProbeInterval, 60, "60 seconds."
 }
@@ -288,9 +288,11 @@ non_zero_duration! {
 /// # Examples
 ///
 /// ```
+/// use std::assert_matches;
+///
 /// use mcpls_core::StreamLiveness;
 ///
-/// assert!(matches!(StreamLiveness::default(), StreamLiveness::Probe { .. }));
+/// assert_matches!(StreamLiveness::default(), StreamLiveness::Probe { .. });
 /// ```
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
@@ -1105,7 +1107,7 @@ fn is_connection_error(e: &std::io::Error) -> bool {
     feature = "transport-http",
     any(target_os = "linux", target_os = "android")
 ))]
-const HALF_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const HALF_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Bounds how long unacknowledged data may linger on `stream` before the
 /// kernel drops the connection; failures are logged and the connection kept.
@@ -1609,6 +1611,8 @@ async fn enforce_session_cap(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use crate::bridge::WorkspaceRoots;
 
     /// An accepted stream must read back the half-open `TCP_USER_TIMEOUT`.
@@ -1741,14 +1745,16 @@ mod tests {
             "run_stdio must not hang when stdin is already closed"
         );
         let result = outcome.unwrap();
-        assert!(
-            matches!(result, Err(crate::Error::McpServer(_))),
+        assert_matches!(
+            result,
+            Err(crate::Error::McpServer(_)),
             "expected a McpServer error from the failed handshake, got: {result:?}"
         );
     }
 
     #[cfg(feature = "transport-http")]
     mod http_tests {
+        use std::assert_matches;
         use std::net::SocketAddr;
 
         use rmcp::model::ClientJsonRpcMessage;
@@ -2268,7 +2274,7 @@ mod tests {
                     Ok(Err(e)) => panic!("read error: {e}"),
                 }
             }
-            String::from_utf8_lossy(&response).into_owned()
+            String::from_utf8_lossy_owned(response)
         }
 
         /// A POST body exceeding `cfg.max_request_body_bytes` must be rejected
@@ -2340,11 +2346,9 @@ mod tests {
             let (first_id, _transport) = manager.create_session().await.unwrap();
 
             let second_err = manager.create_session().await.map(|_| ()).unwrap_err();
-            assert!(
-                matches!(
-                    second_err,
-                    super::super::CappedSessionManagerError::CapReached
-                ),
+            assert_matches!(
+                second_err,
+                super::super::CappedSessionManagerError::CapReached,
                 "expected CapReached once at capacity, got: {second_err:?}"
             );
 
@@ -3023,7 +3027,7 @@ mod tests {
         async fn test_session_with_open_stream_is_never_idle() {
             let activity = SessionActivity::new();
             let guard = activity.open_stream();
-            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+            tokio::time::advance(std::time::Duration::from_mins(1)).await;
             assert!(!activity.is_idle(tokio::time::Instant::now(), idle_secs(5)));
 
             drop(guard);
@@ -3359,15 +3363,15 @@ mod tests {
             let anonymous_error = message(serde_json::json!({
                 "jsonrpc": "2.0", "error": {"code": -32700, "message": "parse"},
             }));
-            assert!(matches!(
+            assert_matches!(
                 manager.accept_message(&id, anonymous_error).await,
                 Err(CappedSessionManagerError::Inner(_))
-            ));
+            );
             let foreign = message(serde_json::json!({"jsonrpc": "2.0", "id": 5, "result": {}}));
-            assert!(matches!(
+            assert_matches!(
                 manager.accept_message(&id, foreign).await,
                 Err(CappedSessionManagerError::Inner(_))
-            ));
+            );
         }
 
         #[test]
@@ -3388,8 +3392,7 @@ mod tests {
             let (id, serving) = initialized_session(&manager).await;
             let mut stream = Box::pin(manager.create_standalone_stream(&id).await.unwrap());
 
-            let next =
-                tokio::time::timeout(std::time::Duration::from_secs(120), stream.next()).await;
+            let next = tokio::time::timeout(std::time::Duration::from_mins(2), stream.next()).await;
             assert!(next.is_err(), "a disabled stream must stay silent and open");
             serving.abort();
         }

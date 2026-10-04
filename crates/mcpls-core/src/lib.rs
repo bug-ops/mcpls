@@ -1255,6 +1255,8 @@ mod test_support {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use bridge::{
         DEFAULT_INDEXING_READY_TIMEOUT_SECS, DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE,
     };
@@ -2087,8 +2089,9 @@ mod tests {
                     "serve() must reject the invalid config immediately, not hang until \
                      timeout: {elapsed}"
                 ),
-                Ok(result) => assert!(
-                    matches!(result, Err(Error::InvalidConfig(_))),
+                Ok(result) => assert_matches!(
+                    result,
+                    Err(Error::InvalidConfig(_)),
                     "serve() must reject a caller-supplied config with an empty `command` via \
                      Error::InvalidConfig, matching the load_from path; got: {result:?}"
                 ),
@@ -2275,7 +2278,7 @@ mod tests {
             .await;
 
             let failure = translator.startup_failure(&id).unwrap();
-            assert!(matches!(failure.reason, StartupFailure::InitTaskPanicked));
+            assert_matches!(failure.reason, StartupFailure::InitTaskPanicked);
         }
 
         #[tokio::test]
@@ -2370,7 +2373,7 @@ mod tests {
             .await;
 
             let failure = translator.startup_failure(&id).unwrap();
-            assert!(matches!(failure.reason, StartupFailure::Spawn(_)));
+            assert_matches!(failure.reason, StartupFailure::Spawn(_));
         }
 
         #[tokio::test]
@@ -2982,8 +2985,9 @@ mod tests {
             assert_eq!(recv_within(&mut rx_a).await, x.as_str());
             // Gives a wrongly queued X time to reach B before Y exists.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert!(
-                matches!(rx_b.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            assert_matches!(
+                rx_b.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty),
                 "B never subscribed to X"
             );
 

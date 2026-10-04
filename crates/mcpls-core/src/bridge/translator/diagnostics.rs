@@ -417,9 +417,9 @@ impl Translator {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
+    use std::{assert_matches, fs};
 
     use tempfile::TempDir;
     use tokio::io::BufReader;
@@ -514,7 +514,7 @@ mod tests {
 
         // Test with invalid filter
         let result = Translator::handle_server_logs(&cache, 10, Some("invalid".to_string()));
-        assert!(matches!(result, Err(Error::InvalidToolParams(_))));
+        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[test]
@@ -591,10 +591,7 @@ mod tests {
         assert_eq!(diags.diagnostics.len(), 1);
         assert_eq!(diags.diagnostics[0].message, "test error");
         assert_eq!(diags.diagnostics[0].code, Some("E001".to_string()));
-        assert!(matches!(
-            diags.diagnostics[0].severity,
-            DiagnosticSeverity::Error
-        ));
+        assert_matches!(diags.diagnostics[0].severity, DiagnosticSeverity::Error);
         assert_eq!(diags.diagnostics[0].range.start.line, 1);
         assert_eq!(diags.diagnostics[0].range.start.character, 1);
     }
@@ -708,22 +705,13 @@ mod tests {
         )
         .await;
         assert_eq!(diags.diagnostics.len(), 4);
-        assert!(matches!(
-            diags.diagnostics[0].severity,
-            DiagnosticSeverity::Error
-        ));
-        assert!(matches!(
-            diags.diagnostics[1].severity,
-            DiagnosticSeverity::Warning
-        ));
-        assert!(matches!(
+        assert_matches!(diags.diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert_matches!(diags.diagnostics[1].severity, DiagnosticSeverity::Warning);
+        assert_matches!(
             diags.diagnostics[2].severity,
             DiagnosticSeverity::Information
-        ));
-        assert!(matches!(
-            diags.diagnostics[3].severity,
-            DiagnosticSeverity::Hint
-        ));
+        );
+        assert_matches!(diags.diagnostics[3].severity, DiagnosticSeverity::Hint);
     }
 
     #[tokio::test]
@@ -783,7 +771,7 @@ mod tests {
             &WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
             missing.to_str().unwrap(),
         );
-        assert!(matches!(result, Err(Error::FileIo { .. })));
+        assert_matches!(result, Err(Error::FileIo { .. }));
     }
 
     #[tokio::test]
@@ -810,10 +798,7 @@ mod tests {
 
         assert_eq!(merged.diagnostics.len(), 1);
         assert_eq!(merged.diagnostics[0].message, "unused import: `std::fmt`");
-        assert!(matches!(
-            merged.diagnostics[0].severity,
-            DiagnosticSeverity::Warning
-        ));
+        assert_matches!(merged.diagnostics[0].severity, DiagnosticSeverity::Warning);
     }
 
     #[tokio::test]
@@ -1337,7 +1322,7 @@ mod tests {
             &WorkspaceRoots::resolve(workspace_roots),
             test_file.to_str().unwrap(),
         );
-        assert!(matches!(result, Err(Error::PathOutsideWorkspace(_))));
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
     /// S1 regression (#244): a push-only server (or one that times out)

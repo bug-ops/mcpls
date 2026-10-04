@@ -1037,12 +1037,7 @@ impl ServerConfig {
         // unchanged rather than the empty string the user presumably meant
         // to be an accident -- reject it explicitly instead of letting it
         // pass through workspace-root resolution unnoticed (#348 M4).
-        if self
-            .workspace
-            .roots
-            .iter()
-            .any(|root| root.as_os_str().is_empty())
-        {
+        if self.workspace.roots.iter().any(|root| root.is_empty()) {
             return Err(Error::InvalidConfig(
                 "workspace.roots entries cannot be empty".to_string(),
             ));
@@ -1261,7 +1256,7 @@ impl Default for ServerConfig {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::fs;
+    use std::{assert_matches, fs};
 
     use tempfile::TempDir;
 
@@ -1757,10 +1752,10 @@ mod tests {
         fs::write(&config_path, &oversized).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
-        ));
+        );
     }
 
     #[test]
@@ -1798,10 +1793,10 @@ mod tests {
         );
 
         let result = ServerConfig::load_from(path);
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
-        ));
+        );
     }
 
     #[test]
@@ -2883,7 +2878,7 @@ mod tests {
         fs::write(&config_path, "[mcp]\nbogus_field = \"x\"\n").unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        assert!(matches!(result, Err(Error::TomlDe(_))));
+        assert_matches!(result, Err(Error::TomlDe(_)));
     }
 
     #[test]
@@ -3212,10 +3207,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("config.toml");
         fs::write(&config_path, "[mcp]\ntool_prefix = \"optics_\"\n").unwrap();
-        assert!(matches!(
-            ServerConfig::load_from(&config_path),
-            Err(Error::TomlDe(_))
-        ));
+        assert_matches!(ServerConfig::load_from(&config_path), Err(Error::TomlDe(_)));
     }
 
     /// Pins the actual behavior of a `serde::de::Error::custom` raised from

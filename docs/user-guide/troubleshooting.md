@@ -43,10 +43,10 @@ which mcpls
 
 **Solution**:
 ```bash
-# Update to Rust 1.88 or later
+# Update to Rust 1.99 or later
 rustup update stable
 rustc --version
-# Should output: rustc 1.88.0 or higher
+# Should output: rustc 1.99.0 or higher
 ```
 
 **Problem**: Missing build dependencies
