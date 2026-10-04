@@ -3,8 +3,14 @@
 //! A language server's stderr is shown to the MCP client when startup fails.
 //! A server that dumps its environment or echoes a rejected argument could
 //! otherwise hand over credentials, so values that look secret are replaced
-//! with `[redacted:NAME]` first. Matching is by exact value: encoded forms
-//! (URL, base64, JSON-escaped) are not found.
+//! with `[redacted:NAME]` first. Matching is by exact value plus its JSON and
+//! `Debug` escaped spellings, so a secret is also found inside a logged wire
+//! frame or a `{:?}` rendering. Other encodings (URL, base64) are not found,
+//! and neither is a JSON spelling written by a foreign encoder that escapes
+//! non-ASCII as `\uXXXX` or `/` as `\/`: such a secret can slip past trace
+//! redaction.
+
+use std::borrow::Cow;
 
 use crate::config::LspServerConfig;
 
@@ -34,11 +40,39 @@ pub fn is_secret_name(name: &str) -> bool {
 struct Secret {
     label: String,
     value: String,
+    /// JSON- and `Debug`-escaped spellings of `value` that differ from it.
+    escaped: Vec<String>,
 }
 
 impl Secret {
+    fn new(label: String, value: String) -> Self {
+        let json = serde_json::Value::String(value.clone()).to_string();
+        let debug = format!("{value:?}");
+        let mut escaped: Vec<String> = [json, debug]
+            .into_iter()
+            .filter_map(|quoted| {
+                quoted
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .map(str::to_owned)
+            })
+            .filter(|spelling| *spelling != value)
+            .collect();
+        escaped.sort();
+        escaped.dedup();
+        Self {
+            label,
+            value,
+            escaped,
+        }
+    }
+
     fn marker(&self) -> String {
         format!("[redacted:{}]", self.label)
+    }
+
+    fn spellings(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.value.as_str()).chain(self.escaped.iter().map(String::as_str))
     }
 }
 
@@ -55,10 +89,7 @@ impl Redactions {
         let mut secrets: Vec<Secret> = candidates
             .into_iter()
             .filter(|(_, value)| value.len() >= MIN_SECRET_BYTES)
-            .map(|(label, value)| Secret {
-                label: sanitize_label(&label),
-                value,
-            })
+            .map(|(label, value)| Secret::new(sanitize_label(&label), value))
             .collect();
         secrets.sort_by(|a, b| {
             b.value
@@ -93,10 +124,17 @@ impl Redactions {
         Self::new(candidates)
     }
 
-    /// Replaces every secret in `text` with its marker.
-    pub(crate) fn apply(&self, text: &str) -> String {
-        self.0.iter().fold(text.to_owned(), |acc, secret| {
-            acc.replace(&secret.value, &secret.marker())
+    /// Replaces every secret, in raw, JSON-escaped and `Debug`-escaped
+    /// spelling, in `text` with its marker; borrows `text` when none occurs.
+    pub(crate) fn apply<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        self.0.iter().fold(Cow::Borrowed(text), |acc, secret| {
+            secret.spellings().fold(acc, |acc, spelling| {
+                if acc.contains(spelling) {
+                    Cow::Owned(acc.replace(spelling, &secret.marker()))
+                } else {
+                    acc
+                }
+            })
         })
     }
 
@@ -218,6 +256,26 @@ mod tests {
         config.args = Vec::new();
         config.initialization_options = None;
         config
+    }
+
+    #[test]
+    fn test_apply_finds_json_and_debug_escaped_spellings() {
+        let set = redactions(&[("API_TOKEN", "pa\"ss\\word-12345")]);
+        let frame = serde_json::json!({"token": "pa\"ss\\word-12345"}).to_string();
+        let debug = format!("{:?}", ["pa\"ss\\word-12345"]);
+
+        for text in [frame, debug, "raw pa\"ss\\word-12345".to_owned()] {
+            let cleaned = set.apply(&text);
+            assert!(cleaned.contains("[redacted:API_TOKEN]"), "{cleaned}");
+            assert!(!cleaned.contains("word-12345"), "{cleaned}");
+        }
+    }
+
+    #[test]
+    fn test_apply_borrows_text_without_secrets() {
+        let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
+
+        assert!(matches!(set.apply("nothing here"), Cow::Borrowed(_)));
     }
 
     #[test]

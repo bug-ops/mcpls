@@ -88,6 +88,7 @@ pub fn fake_lsp_client_with_lanes() -> (LspClient, FakeServer, FakeLanes) {
         transport,
         notification_tx,
         lifecycle_tx,
+        std::sync::Arc::default(),
     );
     (
         client,

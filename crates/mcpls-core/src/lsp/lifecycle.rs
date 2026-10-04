@@ -389,9 +389,25 @@ impl LspServer {
     /// - Initialize request fails or times out
     /// - Server returns error during initialization
     pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
+        let redactions = Arc::new(Redactions::for_server(
+            &config.server_config,
+            std::env::vars_os().filter_map(|(name, value)| {
+                Some((name.into_string().ok()?, value.into_string().ok()?))
+            }),
+        ));
         info!(
-            "Spawning LSP server: {} {:?}",
-            config.server_config.command, config.server_config.args
+            "Spawning LSP server: {} ({} arg(s))",
+            config.server_config.command,
+            config.server_config.args.len()
+        );
+        debug!(
+            "LSP server args: {:?}",
+            config
+                .server_config
+                .args
+                .iter()
+                .map(|arg| redactions.apply(arg))
+                .collect::<Vec<_>>()
         );
 
         let command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
@@ -435,7 +451,7 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stderr".to_string()))?;
         let stderr_capture = StderrCapture::start(stderr);
 
-        let transport = LspTransport::new(stdin, stdout);
+        let transport = LspTransport::with_redactions(stdin, stdout, Arc::clone(&redactions));
         let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
         let client = LspClient::from_transport_with_notifications(
@@ -443,24 +459,14 @@ impl LspServer {
             transport,
             notification_tx,
             lifecycle_tx,
+            Arc::clone(&redactions),
         );
-
-        // Only needed on the failure paths below, so the environment scan is
-        // not paid for by a successful start.
-        let redactions = || {
-            Redactions::for_server(
-                &config.server_config,
-                std::env::vars_os().filter_map(|(name, value)| {
-                    Some((name.into_string().ok()?, value.into_string().ok()?))
-                }),
-            )
-        };
         let (capabilities, position_encoding) = match Self::initialize(&client, &config).await {
             Ok(negotiated) => negotiated,
             Err(init_error) if is_connection_loss(&init_error) => {
                 let exit_status = early_exit_status(&mut child).await;
                 let stderr = stderr_capture
-                    .finish(exit_status.is_some(), &redactions())
+                    .finish(exit_status.is_some(), &redactions)
                     .await;
                 return Err(match exit_status {
                     Some(status) => Error::ServerExitedDuringInit {
@@ -478,7 +484,7 @@ impl LspServer {
                 // The server may be about to exit after printing its reason,
                 // so wait the (bounded) end-of-file grace whether or not it
                 // has exited yet.
-                let stderr = stderr_capture.finish(true, &redactions()).await;
+                let stderr = stderr_capture.finish(true, &redactions).await;
                 return Err(Error::LspInitFailed { message, stderr });
             }
             Err(init_error) => return Err(init_error),
@@ -1943,6 +1949,76 @@ echo 'fatal: bad toolchain' >&2
         assert!(text.contains("token=[redacted:API_TOKEN]"), "{text}");
         assert!(text.contains("toolchain=nightly-2024-01-01"), "{text}");
         assert!(!text.contains("s3cr3t-value"), "{text}");
+    }
+
+    /// `window/logMessage` and `window/showMessage` text echoing configured
+    /// secrets is redacted before it reaches the notification lane (#554).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_redacts_secrets_in_server_log_and_show_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = r#"body='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+body="{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":3,\"message\":\"env=$API_TOKEN arg=$1\"}}"
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+body="{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":3,\"message\":\"env=$API_TOKEN\"}}"
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 5
+"#;
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(script),
+        );
+        config
+            .server_config
+            .args
+            .push("--api-key=SuperSecretArg456".to_string());
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+
+        let mut server = LspServer::spawn(config).await.unwrap();
+        let mut rx = server.take_notification_rx();
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let notification = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            texts.push(format!("{notification:?}"));
+        }
+
+        let joined = texts.join("\n");
+        assert!(!joined.contains("SuperSecretValue123"), "{joined}");
+        assert!(!joined.contains("SuperSecretArg456"), "{joined}");
+        assert!(joined.contains("[redacted:API_TOKEN]"), "{joined}");
+        assert!(joined.contains("[redacted:api-key]"), "{joined}");
+    }
+
+    /// The server's own `initialize` error text is redacted (#554).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_redacts_secrets_in_initialize_error_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = r#"body="{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"bad token $API_TOKEN\"}}"
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+sleep 5
+"#;
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(script),
+        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("[redacted:API_TOKEN]"), "{text}");
+        assert!(!text.contains("SuperSecretValue123"), "{text}");
     }
 
     /// Regression guard for the drain: a server flooding stderr both before
