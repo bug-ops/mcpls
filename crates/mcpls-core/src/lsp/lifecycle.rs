@@ -694,6 +694,24 @@ impl LspServer {
         }
     }
 
+    /// Whether this server can no longer serve requests: its child process
+    /// has exited, or its message loop has stopped (e.g. it panicked) while
+    /// the child is still running.
+    ///
+    /// Unlike [`Self::has_exited`], this catches a live child whose connection
+    /// is already dead, which nothing else would ever respawn. Test fixtures
+    /// with no child process are never reported dead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS fails to report the process's status.
+    pub fn is_dead(&mut self) -> Result<bool> {
+        if self.has_exited()? {
+            return Ok(true);
+        }
+        Ok(self.child.is_some() && self.client.is_message_loop_finished())
+    }
+
     /// Shutdown server gracefully, bounded in total by [`SHUTDOWN_TIMEOUT`].
     ///
     /// Sends the LSP `shutdown` request, waits for the response, sends the
@@ -936,6 +954,20 @@ pub fn fake_lsp_server_with_config(server_config: LspServerConfig) -> LspServer 
         child: None,
         init_config: test_init_config(server_config),
     }
+}
+
+/// A server whose child process (`sleep`) is alive but whose message loop
+/// dies at once on its inert transport -- the shape of a panicked loop.
+#[cfg(all(test, unix))]
+pub fn fake_lsp_server_with_dead_loop_and_live_child() -> LspServer {
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut server = fake_lsp_server();
+    server.child = Some(child);
+    server
 }
 
 /// Minimal [`ServerInitConfig`] around `server_config` for test fixtures.
@@ -1294,6 +1326,31 @@ mod tests {
             server.has_exited().unwrap(),
             "killed child must report as exited"
         );
+    }
+
+    /// A live child whose message loop has stopped must be reported dead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_is_dead_when_message_loop_finished_but_child_alive() {
+        let mut server = fake_lsp_server_with_dead_loop_and_live_child();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !server.client.is_message_loop_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!server.has_exited().unwrap());
+        assert!(server.is_dead().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_is_dead_false_for_childless_fixture() {
+        let mut server = fake_lsp_server();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!server.is_dead().unwrap());
     }
 
     #[tokio::test]

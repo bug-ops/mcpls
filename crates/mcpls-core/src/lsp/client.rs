@@ -670,6 +670,17 @@ impl LspClient {
         })
     }
 
+    /// Whether the message loop this client owns has stopped (it returned
+    /// or panicked), leaving the connection permanently dead.
+    ///
+    /// Always `false` for a clone or a placeholder client: only the owning
+    /// client holds the loop handle.
+    pub(crate) fn is_message_loop_finished(&self) -> bool {
+        self.receiver_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+    }
+
     /// Fail every request still parked in `pending_requests` with
     /// `Error::ServerTerminated`, instead of leaving each to discover a dead
     /// connection only when its own timeout elapses.

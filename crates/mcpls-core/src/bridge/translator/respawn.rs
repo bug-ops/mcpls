@@ -47,7 +47,9 @@ const RESPAWN_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 impl Translator {
-    /// Whether the server tracked under `id` is registered and has exited.
+    /// Whether the server tracked under `id` is registered and dead: its
+    /// process has exited, or its message loop has stopped while the process
+    /// is still running.
     ///
     /// Returns `false` ("not dead") for an `id` that isn't registered at
     /// all -- that's the separate `ServerInitializing`/`NoServerForTool`
@@ -58,7 +60,7 @@ impl Translator {
     fn is_server_dead(&self, id: &ServerId) -> bool {
         lock_std(&self.lsp_servers)
             .get_mut(id)
-            .and_then(|server| server.has_exited().ok())
+            .and_then(|server| server.is_dead().ok())
             .unwrap_or(false)
     }
 
@@ -277,6 +279,12 @@ impl Translator {
         // Another caller may have already respawned it while we waited.
         if !self.is_server_dead(id) {
             return Ok(());
+        }
+
+        // A panicked message loop never drains its own pending requests.
+        let dead_client = lock_std(&self.lsp_clients).get(id).cloned();
+        if let Some(client) = dead_client {
+            client.fail_pending_requests().await;
         }
 
         self.reconcile_respawn_stability(id);
@@ -606,6 +614,27 @@ sleep __SLEEP__
             // the alive fast path skipped respawning entirely.
 
             assert!(translator.respawn_if_dead(&id).await.is_ok());
+        }
+
+        /// A live child behind a stopped message loop (e.g. a panicked loop)
+        /// is dead for routing purposes and must be respawned.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_respawn_if_dead_replaces_server_with_stopped_message_loop() {
+            let dir = TempDir::new().unwrap();
+            let script = write_responder_script(dir.path(), 5);
+            let id = ServerId::from("rust");
+
+            let seed = crate::lsp::fake_lsp_server_with_dead_loop_and_live_child();
+            let translator = Translator::new();
+            translator.register_client(id.clone(), seed.client().clone());
+            translator.register_server(id.clone(), seed);
+            translator.register_server_config(id.clone(), stub_server_config("rust", &script));
+            wait_until_dead(&translator, &id).await;
+
+            translator.respawn_if_dead(&id).await.unwrap();
+
+            assert!(!translator.is_server_dead(&id));
         }
 
         #[tokio::test]
