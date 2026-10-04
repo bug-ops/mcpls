@@ -152,7 +152,7 @@ THEN the request is rejected with the same PathOutsideWorkspace error regardless
 | FR-008 | THE SYSTEM SHALL map every bridge-layer `Result<T, Error>` to the MCP tool response shape via one shared function, so error formatting stays consistent across all 21 tool handlers | must |
 | FR-009 | THE SYSTEM SHALL classify all 21 tools as read-only (`ToolAnnotations`) at the router level, once, rather than repeating an identical annotation block on every `#[tool]` attribute, since every mcpls tool is a query or a proposed-edit generator that never itself writes to disk | must |
 | FR-010 | WHEN a tool call resolves to a server whose process has died THE SYSTEM SHALL attempt to respawn it (per [[lsp/001-lsp-server-lifecycle-and-respawn/spec|spec lsp/001]]) before the request is treated as failed | must |
-| FR-011 | THE SYSTEM SHALL advertise `outputSchema` and return `structuredContent` (via `to_structured_tool_result`/`Json<T>` handler signatures) for `get_diagnostics`, `get_definition`, `get_references`, and `get_document_symbols`, while every other tool continues to return a plain serialized-string response via `to_tool_result` | must |
+| FR-011 | THE SYSTEM SHALL advertise `outputSchema` and return `structuredContent` (via `to_structured_tool_result`/`Json<T>` handler signatures, with an object root) for all 21 tools | must |
 | FR-012 | WHEN the optional `[mcp].tool_prefix` config value is set THE SYSTEM SHALL prefix every tool's registered name with `{tool_prefix}_` at `build_tool_router` time, so a client can tell apart tools exposed by multiple concurrently running mcpls bridges; omitting it SHALL leave tool names unprefixed | must |
 
 ## 4. Non-Functional Requirements
@@ -245,5 +245,4 @@ None — this is a retroactive spec documenting stable, already-shipped, well-te
 - `crates/mcpls-core/src/bridge/translator/routing.rs` — `client_for_file`,
   `resolve_client_for_file`, `validate_path_against_roots`
 - `crates/mcpls-core/src/config/mod.rs` — `McpConfig`, `ToolPrefix` (FR-012)
-- `to_tool_result`/`to_structured_tool_result` in `mcp/server.rs` — the plain-string vs.
-  structured (`outputSchema`/`structuredContent`) response-mapping split (FR-011)
+- `to_structured_tool_result` in `mcp/server.rs` — maps every bridge result to `Json<T>` (`outputSchema`/`structuredContent`, FR-011)

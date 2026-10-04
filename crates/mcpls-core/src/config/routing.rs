@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::server::LspServerConfig;
@@ -27,7 +28,7 @@ use crate::error::{Error, Result};
 /// layer (`Translator::lsp_clients`, `lsp_servers`, notification receivers)
 /// instead of a raw language string, so two servers sharing a language no
 /// longer silently overwrite each other.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ServerId(String);
 
 impl ServerId {

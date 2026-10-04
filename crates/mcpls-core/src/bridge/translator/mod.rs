@@ -498,11 +498,12 @@ impl Translator {
     /// `SIGINT`, or the HTTP transport's own graceful shutdown). A panic is
     /// covered separately: release builds unwind, and the binary's `main`
     /// shuts the runtime down so every task, and with it every LSP child
-    /// (`kill_on_drop`), is dropped. LSP children can still outlive mcpls
-    /// when no Rust code runs: the parent killed by `SIGKILL` or the OOM
-    /// killer, the forced `exit(1)` on a second signal during shutdown, or a
-    /// panic inside a `Drop` during unwinding. Compliant servers also exit
-    /// on stdin EOF or when their `processId` dies.
+    /// (`kill_on_drop`), is dropped. When no Rust code runs (`SIGKILL`, the
+    /// OOM killer, the forced `exit(1)` on a second signal during shutdown,
+    /// or a panic inside a `Drop` during unwinding) the children are still
+    /// killed by the lifeline watchdog (Unix) or Job Object (Windows), see
+    /// `specs/lsp/007-lsp-child-process-lifetime`; only descendants that
+    /// leave the process group (`setsid`/`setpgid`) can survive.
     ///
     /// `pub(crate)` rather than `pub`: this is meant for exactly one call
     /// site (`serve_with`'s post-transport shutdown sequence), after the MCP

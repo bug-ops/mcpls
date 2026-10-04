@@ -19,3 +19,13 @@ updates:
     labels:
       - dependencies
       - ci/cd
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+      - rust

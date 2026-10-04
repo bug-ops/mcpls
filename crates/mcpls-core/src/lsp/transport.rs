@@ -239,7 +239,7 @@ impl LspTransportReader {
                 break;
             }
 
-            lines_read += 1;
+            lines_read = lines_read.saturating_add(1);
             if lines_read > MAX_HEADERS {
                 return Err(Error::LspProtocolError(format!(
                     "LSP frame exceeded {MAX_HEADERS} header lines"
@@ -564,5 +564,70 @@ mod tests {
 
         let headers = reader.read_headers().await.unwrap();
         assert_eq!(headers.len(), MAX_HEADERS);
+    }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn block_on<F: std::future::Future>(future: F) -> F::Output {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(future)
+        }
+
+        proptest! {
+            #[test]
+            fn test_send_receive_round_trips_notifications(
+                method in any::<String>(),
+                text in any::<String>(),
+            ) {
+                let message = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {"text": text},
+                });
+                let received = block_on(async {
+                    let (client_end, server_end) = tokio::io::duplex(1 << 20);
+                    let (mut writer, _) = LspTransport::new(client_end, tokio::io::empty());
+                    let (_, mut reader) = LspTransport::new(tokio::io::sink(), server_end);
+                    writer.send(&message).await.unwrap();
+                    reader.receive().await.unwrap()
+                });
+                let InboundMessage::Notification(notification) = received else {
+                    panic!("expected notification, got {received:?}");
+                };
+                prop_assert_eq!(notification.method, method);
+                prop_assert_eq!(notification.params, Some(serde_json::json!({"text": text})));
+            }
+
+            #[test]
+            fn test_arbitrary_bytes_never_panic_the_frame_parser(
+                data in proptest::collection::vec(any::<u8>(), 0..2048),
+            ) {
+                block_on(async {
+                    let (_, mut reader) =
+                        LspTransport::new(tokio::io::sink(), std::io::Cursor::new(data));
+                    while reader.receive().await.is_ok() {}
+                });
+            }
+
+            #[test]
+            fn test_arbitrary_framed_bodies_never_panic_the_frame_parser(
+                header in "Content-Length: [0-9]{0,12}\\r\\n([A-Za-z-]{0,12}: [ -~]{0,24}\\r\\n){0,4}\\r\\n",
+                body in proptest::collection::vec(any::<u8>(), 0..512),
+            ) {
+                let mut data = header.into_bytes();
+                data.extend(body);
+                block_on(async {
+                    let (_, mut reader) =
+                        LspTransport::new(tokio::io::sink(), std::io::Cursor::new(data));
+                    while reader.receive().await.is_ok() {}
+                });
+            }
+        }
     }
 }

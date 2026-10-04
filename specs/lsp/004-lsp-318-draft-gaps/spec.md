@@ -40,9 +40,8 @@ related:
 > Two facts verified today trigger this spec's own SC-003 re-assessment condition:
 > 1. **LSP 3.18 has finalized.** The [LSP 3.18 specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/)
 >    page now shows "3.18 (Current)" in its version nav, with "3.19 (Upcoming)" as the new draft.
->    This supersedes LSP 3.17, which `.claude/rules/continuous-improvement.md` still cites as the
->    project's "authoritative protocol reference" — flagged here as stale but intentionally left
->    unedited; updating that rules file is a separate followup.
+>    This supersedes LSP 3.17, which `.claude/rules/continuous-improvement.md` cited as the
+>    project's "authoritative protocol reference"; the re-assessment is done. The stale 3.17 reference in the local rules file is outside the tracked tree (`.claude/` is not in the repository).
 > 2. **This spec's original `ls-types` premise (Section 1, "Out of Scope", FR-006, "See Also")
 >    was already superseded before today**, by [[lsp/003-lsp-types-unmaintained-migration/spec|spec lsp/003]]'s
 >    own resolution: `ls-types` turned out to be archived/superseded upstream, and mcpls migrated
@@ -76,9 +75,9 @@ related:
 
 ### Problem Statement
 
-mcpls's reference-projects list in `.claude/rules/continuous-improvement.md` still cites LSP 3.17
+mcpls's reference-projects list in `.claude/rules/continuous-improvement.md` cited LSP 3.17
 as the project's authoritative protocol reference — stale as of the finalization noted in the
-Re-assessment callout above, flagged here but left unedited (separate followup). mcpls already
+Re-assessment callout above, and the stale reference lives in a local rules file outside the tracked tree (re-assessment done in #477). mcpls already
 tracks a known gap of 3.17-era tools in [[lsp/002-lsp317-missing-tools/spec|spec lsp/002]] / issue
 #116, resolved by PR #124 (`get_signature_help`, `go_to_implementation`, `go_to_type_definition`,
 `get_inlay_hints`, `prepare_type_hierarchy` are all implemented) — plus the separate issue #290

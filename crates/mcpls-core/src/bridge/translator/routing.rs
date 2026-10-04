@@ -383,6 +383,20 @@ impl serde::Serialize for Capability {
     }
 }
 
+/// Serialized as its [`Capability::name`] string.
+impl schemars::JsonSchema for Capability {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Capability".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "LSP server capability the tool is gated on."
+        })
+    }
+}
+
 /// A file's detected language plus its React base-language fallback
 /// (`typescriptreact` -> `typescript`), in resolution order.
 ///

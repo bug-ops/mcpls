@@ -116,7 +116,7 @@ pub const CONTENT_MODIFIED_RETRY_METHODS: &[&str] = &[
 /// error. Still far below #311's 256 KiB cache-entry cap: this string is
 /// echoed directly into the MCP tool result / model context, not merely
 /// cached.
-const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
+pub const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
 
 /// Upper bound on the effective timeout for completion requests, regardless
 /// of `request_timeout_seconds`.
@@ -534,7 +534,7 @@ impl LspClient {
                     method, attempt, SERVER_CANCELLED_MAX_RETRIES, delay_ms
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                delay_ms *= 2;
+                delay_ms = delay_ms.saturating_mul(2);
             }
 
             let id = RequestId::Number(self.request_counter.fetch_add(1, Ordering::SeqCst));
@@ -752,6 +752,10 @@ impl LspClient {
     /// Returns [`Error::ShutdownTimeout`] if the loop did not stop in time (it is then
     /// aborted and every pending request fails with [`Error::ServerTerminated`]), or
     /// another error if the background task failed.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "SHUTDOWN_TIMEOUT is a small constant"
+    )]
     pub async fn shutdown(self) -> Result<()> {
         self.shutdown_until(Instant::now() + SHUTDOWN_TIMEOUT).await
     }

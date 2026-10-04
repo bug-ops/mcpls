@@ -1,0 +1,23 @@
+[package]
+name = "mcpls-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+mcpls-core = { path = "../crates/mcpls-core" }
+tokio = { version = "1.53", features = ["io-util", "rt"] }
+
+[[bin]]
+name = "lsp_frame"
+path = "fuzz_targets/lsp_frame.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

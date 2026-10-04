@@ -63,14 +63,46 @@ pub fn fake_lsp_client() -> (LspClient, FakeServer) {
 
 /// As [`fake_lsp_client`], with a caller-chosen [`LspServerConfig`].
 pub fn fake_lsp_client_with_config(config: LspServerConfig) -> (LspClient, FakeServer) {
-    let (client_stdin, write_stdout) = tokio::io::duplex(MOCK_PIPE_CAPACITY);
-    let (read_half_stdin, client_stdout) = tokio::io::duplex(MOCK_PIPE_CAPACITY);
+    let (transport, fake_server) = fake_transport();
+    (LspClient::from_transport(config, transport), fake_server)
+}
 
-    let transport = LspTransport::new(client_stdin, client_stdout);
-    let client = LspClient::from_transport(config, transport);
+/// Both notification lanes of a client built by
+/// [`fake_lsp_client_with_lanes`].
+pub struct FakeLanes {
+    /// Diagnostics/log/showMessage lane.
+    pub notification_rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
+    /// Lifecycle lane (`$/progress` `begin`/`end`, unrecognized notifications).
+    pub lifecycle_rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
+}
 
+/// As [`fake_lsp_client`], but the client forwards notifications onto real
+/// lanes, returned for the test to drain or hand to a pump.
+pub fn fake_lsp_client_with_lanes() -> (LspClient, FakeServer, FakeLanes) {
+    let (transport, fake_server) = fake_transport();
+    let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(32);
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
+    let client = LspClient::from_transport_with_notifications(
+        LspServerConfig::rust_analyzer(),
+        transport,
+        notification_tx,
+        lifecycle_tx,
+    );
     (
         client,
+        fake_server,
+        FakeLanes {
+            notification_rx,
+            lifecycle_rx,
+        },
+    )
+}
+
+fn fake_transport() -> ((LspTransport, LspTransportReader), FakeServer) {
+    let (client_stdin, write_stdout) = tokio::io::duplex(MOCK_PIPE_CAPACITY);
+    let (read_half_stdin, client_stdout) = tokio::io::duplex(MOCK_PIPE_CAPACITY);
+    (
+        LspTransport::new(client_stdin, client_stdout),
         FakeServer {
             read_half_stdin,
             write_stdout,
@@ -163,6 +195,33 @@ pub async fn write_error_response(writer: &mut DuplexStream, id: &Value, code: i
             "jsonrpc": "2.0",
             "id": id,
             "error": { "code": code, "message": message },
+        }),
+    )
+    .await;
+}
+
+/// Writes a framed server-to-client JSON-RPC request.
+pub async fn write_request(writer: &mut DuplexStream, id: &Value, method: &str, params: Value) {
+    write_framed(
+        writer,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    )
+    .await;
+}
+
+/// Writes a framed JSON-RPC notification, as a real LSP server would.
+pub async fn write_notification(writer: &mut DuplexStream, method: &str, params: Value) {
+    write_framed(
+        writer,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
         }),
     )
     .await;
@@ -292,27 +351,61 @@ pub fn spawn_test_pump(
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
+    // Held so the lifecycle lane stays open for the pump's lifetime.
+    let (_cache, cancel_tx) = spawn_pump(rx, lifecycle_rx, lifecycle_tx, subs, workspace_roots);
+    (tx, cancel_tx)
+}
+
+/// As [`spawn_test_pump`], but over a client's own [`FakeLanes`]; returns the
+/// pump's notification cache (for asserting on indexing state) and the
+/// cancel sender (keep it alive: dropping it stops the pump).
+pub fn spawn_test_pump_over_lanes(
+    lanes: FakeLanes,
+) -> (
+    std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    spawn_pump(
+        lanes.notification_rx,
+        lanes.lifecycle_rx,
+        (),
+        crate::mcp::SubscriptionRegistry::default(),
+        std::sync::Arc::from([]),
+    )
+}
+
+fn spawn_pump<K: Send + 'static>(
+    rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
+    lifecycle_rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
+    keep_alive: K,
+    subs: crate::mcp::SubscriptionRegistry,
+    workspace_roots: std::sync::Arc<[std::path::PathBuf]>,
+) -> (
+    std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let notification_cache = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::bridge::NotificationCache::new(),
+    ));
+    let shared = crate::PumpShared {
+        notification_cache: std::sync::Arc::clone(&notification_cache),
+        subs,
+        workspace_roots,
+    };
     tokio::spawn(async move {
-        // Held so the lifecycle lane stays open for the pump's lifetime.
-        let _lifecycle_tx = lifecycle_tx;
+        let _keep_alive = keep_alive;
         crate::diagnostics_pump(
             crate::config::ServerId::from("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
             true,
-            crate::PumpShared {
-                notification_cache: std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::bridge::NotificationCache::new(),
-                )),
-                subs,
-                workspace_roots,
-            },
+            shared,
         )
         .await;
     });
-    (tx, cancel_tx)
+    (notification_cache, cancel_tx)
 }
 
 /// A temp workspace holding `main.rs`: the guard, the canonical root and the file.

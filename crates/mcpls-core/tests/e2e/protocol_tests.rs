@@ -776,3 +776,46 @@ fn test_e2e_max_file_size_config_enforced() -> Result<()> {
 
     Ok(())
 }
+
+/// #459: a real `tools/call` returns `structuredContent` that matches the
+/// tool's advertised `outputSchema` (required keys present, no undeclared
+/// keys) and equals the JSON in `content[0].text`.
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_tool_call_returns_structured_content_matching_output_schema() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+    client.initialize()?;
+
+    let tools = client.list_tools()?;
+    let schema = tools["result"]["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|t| t["name"] == "get_server_logs"))
+        .map(|t| t["outputSchema"].clone())
+        .ok_or_else(|| anyhow::anyhow!("get_server_logs not listed: {tools}"))?;
+    assert!(schema.is_object(), "get_server_logs has no outputSchema");
+
+    let response = client.call_tool("get_server_logs", &json!({}))?;
+    let result = &response["result"];
+    let structured = result["structuredContent"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("no structuredContent object: {result}"))?;
+
+    for required in schema["required"].as_array().into_iter().flatten() {
+        let key = required.as_str().unwrap_or_default();
+        assert!(structured.contains_key(key), "missing required key {key}");
+    }
+    let declared = schema["properties"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("outputSchema has no properties: {schema}"))?;
+    for key in structured.keys() {
+        assert!(declared.contains_key(key), "undeclared key {key}");
+    }
+
+    let text = result["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no content[0].text: {result}"))?;
+    let from_text: serde_json::Value = serde_json::from_str(text)?;
+    assert_eq!(from_text, result["structuredContent"]);
+
+    Ok(())
+}

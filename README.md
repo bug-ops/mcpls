@@ -327,6 +327,15 @@ mcpls --listen 127.0.0.1:8080
 > - Enforces authentication before forwarding requests
 > - Rewrites the `Host` header (rmcp's host validation only allows `localhost`, `127.0.0.1`, or `::1` by default)
 
+The HTTP service is mounted at the configured `HttpConfig::path` **and** at `/`, so reverse-proxy rules must cover both paths.
+
+mcpls serves HTTP/1 only and bounds slow clients with two limits, both configurable through `HttpConfig` when embedding `mcpls-core`:
+
+- `HeaderReadTimeout` (default 30 s) bounds the request head, a pause between request-body chunks (answered with `408 Request Timeout`) and idle keep-alive connections. It does not bound a client that stops reading a response, such as an SSE stream (#531).
+- `ConnectionLimit` (default 512) caps concurrent connections. On macOS, launchd's default soft file-descriptor limit is 256, so raise it with `ulimit -n` (at least 600) before serving more than ~250 connections; library users can lower the cap with `HttpConfig::with_max_concurrent_connections`.
+
+Authentication is never provided in-process, so the reverse proxy remains required.
+
 **Example (nginx):**
 ```nginx
 location / {
@@ -337,6 +346,16 @@ location / {
 ```
 
 </details>
+
+## Process Lifetime
+
+When mcpls exits for any reason, including `SIGKILL` and OOM kills, LSP servers and the descendants that stay in their process tree are killed. This includes processes that are meant to outlive their server, such as shared build daemons. Caveats:
+
+- **Unix:** servers share one process group that a watchdog kills. A descendant that calls `setsid()` or `setpgid()` leaves the group and survives `kill -9` of mcpls. This includes the `cargo check` that rust-analyzer's flycheck runs in its own session. Tracked in #541.
+- **Unix:** when a server crashes and is respawned, its surviving descendants stay alive until mcpls exits (#542).
+- **Unix:** servers run in their own process group, so Ctrl-C in the terminal no longer reaches them directly. A descendant that reads `/dev/tty` (for example an ssh or git credential prompt) while mcpls runs in an interactive terminal may be stopped by `SIGTTIN`.
+- **Unix:** if the watchdog cannot be started, mcpls logs a warning and spawns the server unbound, in its own fresh process group. Ctrl-C does not reach servers in either case.
+- **Windows:** servers run in a job object without breakaway, and the whole tree is killed. A descendant that requests `CREATE_BREAKAWAY_FROM_JOB` fails to spawn. If the job cannot be created or assigned, the server spawn fails.
 
 ## Supported Language Servers
 

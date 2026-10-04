@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -165,6 +166,11 @@ fn largest_fitting_prefix(
     fits: impl Fn(&[LspDiagnostic]) -> bool,
 ) -> usize {
     let (mut lo, mut hi) = (0usize, diagnostics.len());
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        reason = "binary search over 0..=len: lo < hi gives mid in 1..=hi"
+    )]
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
         if fits(&diagnostics[..mid]) {
@@ -261,14 +267,16 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
         let estimated: usize = diagnostics
             .iter()
             .map(|d| {
-                let raw_string_bytes = message_as_str(&d.message).len()
-                    + d.source.as_deref().map_or(0, str::len)
-                    + match &d.code {
+                let raw_string_bytes = message_as_str(&d.message)
+                    .len()
+                    .saturating_add(d.source.as_deref().map_or(0, str::len))
+                    .saturating_add(match &d.code {
                         Some(lsp_types::Code::String(s)) => s.len(),
                         _ => 0,
-                    };
-                raw_string_bytes * JSON_ESCAPE_WORST_CASE_FACTOR
-                    + DIAGNOSTIC_ESTIMATE_OVERHEAD_BYTES
+                    });
+                raw_string_bytes
+                    .saturating_mul(JSON_ESCAPE_WORST_CASE_FACTOR)
+                    .saturating_add(DIAGNOSTIC_ESTIMATE_OVERHEAD_BYTES)
             })
             .sum();
         if estimated <= MAX_DIAGNOSTICS_ENTRY_BYTES {
@@ -305,6 +313,7 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
     // Drop opaque/structured fields first -- cheap, and often enough on
     // its own (e.g. the single-huge-`data`-blob shape).
     if diagnostics.len() == 1 && !fits(diagnostics) {
+        #[allow(clippy::indexing_slicing, reason = "len == 1 checked above")]
         let diagnostic = &mut diagnostics[0];
         let had_data = diagnostic.data.is_some();
         diagnostic.data = None;
@@ -327,6 +336,7 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
     // fields above) are truncated rather than dropped, to preserve some
     // content.
     if diagnostics.len() == 1 && !fits(diagnostics) {
+        #[allow(clippy::indexing_slicing, reason = "len == 1 checked above")]
         let diagnostic = &mut diagnostics[0];
         if let Some(source) = &diagnostic.source {
             diagnostic.source = Some(truncate_str(source, MAX_ENTRY_TEXT_BYTES));
@@ -378,7 +388,7 @@ pub struct DiagnosticInfo {
 }
 
 /// A log entry from the LSP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogEntry {
     /// Log level.
     pub level: LogLevel,
@@ -389,7 +399,7 @@ pub struct LogEntry {
 }
 
 /// Log severity level.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     /// Error log level.
@@ -415,7 +425,7 @@ impl From<lsp_types::MessageType> for LogLevel {
 }
 
 /// A message from the LSP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServerMessage {
     /// Message type.
     pub message_type: MessageType,
@@ -426,7 +436,7 @@ pub struct ServerMessage {
 }
 
 /// Server message type.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageType {
     /// Error message.
@@ -603,7 +613,10 @@ impl NotificationCache {
                     .count()
             })
             .max(1);
-        (MAX_DIAGNOSTIC_ENTRIES / count).max(1)
+        MAX_DIAGNOSTIC_ENTRIES
+            .checked_div(count)
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// Picks which server's oldest entry to evict once the aggregate cache
@@ -819,7 +832,7 @@ impl NotificationCache {
                 if let Some(removed) = self.diagnostics.remove(&evict_key)
                     && removed.diagnostics.is_empty()
                 {
-                    self.empty_diagnostics_count -= 1;
+                    self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
                 }
             }
         }
@@ -827,7 +840,7 @@ impl NotificationCache {
         self.diagnostics_owners
             .insert(key.clone(), server_id.clone());
         let seq = self.next_diagnostic_seq;
-        self.next_diagnostic_seq += 1;
+        self.next_diagnostic_seq = self.next_diagnostic_seq.saturating_add(1);
         self.diagnostic_order
             .entry(server_id.clone())
             .or_default()
@@ -842,8 +855,12 @@ impl NotificationCache {
         let was_empty = self.is_empty_entry(&key);
         let is_empty_now = info.diagnostics.is_empty();
         match (was_empty, is_empty_now) {
-            (false, true) => self.empty_diagnostics_count += 1,
-            (true, false) => self.empty_diagnostics_count -= 1,
+            (false, true) => {
+                self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_add(1);
+            }
+            (true, false) => {
+                self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
+            }
             _ => {}
         }
         self.diagnostics.insert(key, info);
@@ -1014,7 +1031,7 @@ impl NotificationCache {
                 .remove(&key)
                 .is_some_and(|info| info.diagnostics.is_empty())
             {
-                self.empty_diagnostics_count -= 1;
+                self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
             }
             self.diagnostics_owners.remove(&key);
             self.diagnostic_seq.remove(&key);

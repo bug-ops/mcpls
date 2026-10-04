@@ -22,8 +22,12 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    "NCSA",
 ]
 confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "warn"
@@ -33,6 +37,6 @@ workspace-default-features = "allow"
 external-default-features = "allow"
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

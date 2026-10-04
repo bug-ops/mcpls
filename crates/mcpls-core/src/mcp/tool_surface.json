@@ -28,6 +28,108 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "TextEdit": {
+          "description": "A text edit operation.",
+          "properties": {
+            "new_text": {
+              "description": "New text.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range to replace."
+            }
+          },
+          "required": [
+            "range",
+            "new_text"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "edits": {
+          "description": "List of edits to format the document.",
+          "items": {
+            "$ref": "#/$defs/TextEdit"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        }
+      },
+      "required": [
+        "edits"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Format Document",
       "readOnlyHint": true,
@@ -49,6 +151,148 @@
       },
       "required": [
         "file_path"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Diagnostic": {
+          "description": "A single diagnostic.",
+          "properties": {
+            "code": {
+              "description": "Optional diagnostic code.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Diagnostic message.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range where the diagnostic applies."
+            },
+            "severity": {
+              "$ref": "#/$defs/DiagnosticSeverity",
+              "description": "Severity of the diagnostic."
+            }
+          },
+          "required": [
+            "range",
+            "severity",
+            "message"
+          ],
+          "type": "object"
+        },
+        "DiagnosticSeverity": {
+          "description": "Diagnostic severity.",
+          "oneOf": [
+            {
+              "const": "error",
+              "description": "Error diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "warning",
+              "description": "Warning diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "information",
+              "description": "Informational diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "hint",
+              "description": "Hint diagnostic.",
+              "type": "string"
+            }
+          ]
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "diagnostics": {
+          "description": "List of diagnostics for the document.",
+          "items": {
+            "$ref": "#/$defs/Diagnostic"
+          },
+          "type": "array"
+        },
+        "indexing_in_progress": {
+          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during this read; the diagnostics may reflect a partial index.",
+          "type": "boolean"
+        },
+        "positions_degraded": {
+          "$ref": "#/$defs/PositionDegradation",
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "push_notifications_degraded": {
+          "description": "`true` if the language server publishing this file's diagnostics crashed and was\nrestarted during this mcpls session. Diagnostics it delivers only by push (e.g.\nrust-analyzer's flycheck/clippy) are no longer received, so the returned\ndiagnostics may be incomplete until mcpls restarts.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "diagnostics",
+        "push_notifications_degraded",
+        "indexing_in_progress"
       ],
       "type": "object"
     },
@@ -111,6 +355,321 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "CodeAction": {
+          "description": "A single code action.",
+          "properties": {
+            "command": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CommandDescription"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Command to execute."
+            },
+            "diagnostics": {
+              "description": "Diagnostics that this action resolves.",
+              "items": {
+                "$ref": "#/$defs/Diagnostic"
+              },
+              "type": "array"
+            },
+            "edit": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkspaceEditDescription"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Workspace edit to apply."
+            },
+            "is_preferred": {
+              "default": false,
+              "description": "Whether this is the preferred action.",
+              "type": "boolean"
+            },
+            "kind": {
+              "description": "Kind of code action (quickfix, refactor, etc.).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "description": "Title of the code action.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "title"
+          ],
+          "type": "object"
+        },
+        "CommandDescription": {
+          "description": "Description of a command.",
+          "properties": {
+            "arguments": {
+              "description": "Command arguments.",
+              "items": true,
+              "type": "array"
+            },
+            "command": {
+              "description": "Command identifier.",
+              "type": "string"
+            },
+            "title": {
+              "description": "Title of the command.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "command"
+          ],
+          "type": "object"
+        },
+        "Diagnostic": {
+          "description": "A single diagnostic.",
+          "properties": {
+            "code": {
+              "description": "Optional diagnostic code.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Diagnostic message.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range where the diagnostic applies."
+            },
+            "severity": {
+              "$ref": "#/$defs/DiagnosticSeverity",
+              "description": "Severity of the diagnostic."
+            }
+          },
+          "required": [
+            "range",
+            "severity",
+            "message"
+          ],
+          "type": "object"
+        },
+        "DiagnosticSeverity": {
+          "description": "Diagnostic severity.",
+          "oneOf": [
+            {
+              "const": "error",
+              "description": "Error diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "warning",
+              "description": "Warning diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "information",
+              "description": "Informational diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "hint",
+              "description": "Hint diagnostic.",
+              "type": "string"
+            }
+          ]
+        },
+        "DocumentChanges": {
+          "description": "Changes to a document.",
+          "properties": {
+            "edits": {
+              "description": "List of edits to apply.",
+              "items": {
+                "$ref": "#/$defs/TextEdit"
+              },
+              "type": "array"
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "edits"
+          ],
+          "type": "object"
+        },
+        "DroppedEdits": {
+          "description": "Counts of `WorkspaceEdit` entries withheld during conversion to MCP DTOs,\nbroken down by reason (#475).\n\n`convert_workspace_edit` silently discarded such entries with only a\n`tracing` log line, so a client applying a [`RenameResult`] or\n`WorkspaceEditDescription` straight to disk could not tell \"nothing to\nrename\" apart from \"some of the rename was withheld\" -- this makes that\ndistinction visible in the result itself.",
+          "properties": {
+            "exceeds_item_cap": {
+              "description": "Edits not admitted because the response exceeded\n`MAX_NORMALIZED_LOCATIONS` (#487), including whole files skipped once\nthe budget was spent.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "out_of_workspace": {
+              "description": "Entries referencing a URI outside every configured workspace root.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "shadowed_by_changes": {
+              "description": "`documentChanges` text-document edits ignored because a non-empty\n`changes` map took precedence and did not already name their URI\n(#498).",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unsupported_file_operation": {
+              "description": "`CreateFile`/`RenameFile`/`DeleteFile` document changes, which mcpls\ndoes not translate into MCP DTOs.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unsupported_snippet_edit": {
+              "description": "`SnippetTextEdit` entries, which mcpls does not translate since it\nadvertises no `snippetEditSupport`.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "TextEdit": {
+          "description": "A text edit operation.",
+          "properties": {
+            "new_text": {
+              "description": "New text.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range to replace."
+            }
+          },
+          "required": [
+            "range",
+            "new_text"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditDescription": {
+          "description": "Description of a workspace edit.",
+          "properties": {
+            "changes": {
+              "description": "Changes to apply to documents.",
+              "items": {
+                "$ref": "#/$defs/DocumentChanges"
+              },
+              "type": "array"
+            },
+            "dropped": {
+              "$ref": "#/$defs/DroppedEdits",
+              "description": "Entries withheld from `changes` -- see [`DroppedEdits`]."
+            }
+          },
+          "required": [
+            "changes"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "actions": {
+          "description": "Available code actions.",
+          "items": {
+            "$ref": "#/$defs/CodeAction"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "truncated": {
+          "description": "Whether `actions`, their diagnostics, or their edits were capped below\nthe LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487);\na per-action `dropped.exceeds_item_cap` pinpoints dropped edits.\nOmitted (defaults to `false`) when serialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "actions"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Code Actions",
       "readOnlyHint": true,
@@ -153,6 +712,86 @@
         "file_path",
         "line",
         "character"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Completion": {
+          "description": "A completion item.",
+          "properties": {
+            "detail": {
+              "description": "Detail information.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "documentation": {
+              "description": "Documentation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric completion-item kind (e.g. 3 for Function).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "label": {
+              "description": "Label of the completion.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "items": {
+          "description": "List of completion items.",
+          "items": {
+            "$ref": "#/$defs/Completion"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        }
+      },
+      "required": [
+        "items"
       ],
       "type": "object"
     },
@@ -642,6 +1281,98 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "contents": {
+          "description": "Hover contents as markdown string.",
+          "type": "string"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Range"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional range the hover applies to."
+        }
+      },
+      "required": [
+        "contents"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Hover",
       "readOnlyHint": true,
@@ -662,6 +1393,164 @@
       },
       "required": [
         "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "CallHierarchyItemResult": {
+          "description": "A call hierarchy item.",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass to incoming/outgoing calls."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
+        "IncomingCall": {
+          "description": "An incoming call (caller of the current item).",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/CallHierarchyItemResult",
+              "description": "The item that calls the current item."
+            },
+            "from_ranges": {
+              "description": "Ranges where the call occurs.",
+              "items": {
+                "$ref": "#/$defs/Range"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "from",
+            "from_ranges"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "calls": {
+          "description": "List of incoming calls.",
+          "items": {
+            "$ref": "#/$defs/IncomingCall"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "truncated": {
+          "description": "Whether `calls` (together with their `from_ranges`) was capped below\nthe LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487).\nOmitted (defaults to `false`) when serialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "calls"
       ],
       "type": "object"
     },
@@ -717,6 +1606,124 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "InlayHintEntry": {
+          "description": "A single inlay hint entry.",
+          "properties": {
+            "kind": {
+              "description": "LSP numeric inlay-hint kind (1 = Type, 2 = Parameter, or a\nserver-defined custom value).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "label": {
+              "description": "Label text for the hint.",
+              "type": "string"
+            },
+            "padding_left": {
+              "description": "Whether to add a space before the hint.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "padding_right": {
+              "description": "Whether to add a space after the hint.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "position": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Position of the hint (1-based MCP)."
+            },
+            "tooltip": {
+              "description": "Tooltip text.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "position",
+            "label"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "hints": {
+          "description": "List of inlay hints.",
+          "items": {
+            "$ref": "#/$defs/InlayHintEntry"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "truncated": {
+          "description": "Whether `hints` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`, #487). Omitted (defaults to `false`) when\nserialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hints"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Inlay Hints",
       "readOnlyHint": true,
@@ -737,6 +1744,164 @@
       },
       "required": [
         "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "CallHierarchyItemResult": {
+          "description": "A call hierarchy item.",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass to incoming/outgoing calls."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
+        "OutgoingCall": {
+          "description": "An outgoing call (callee from the current item).",
+          "properties": {
+            "from_ranges": {
+              "description": "Ranges where the call occurs.",
+              "items": {
+                "$ref": "#/$defs/Range"
+              },
+              "type": "array"
+            },
+            "to": {
+              "$ref": "#/$defs/CallHierarchyItemResult",
+              "description": "The item being called."
+            }
+          },
+          "required": [
+            "to",
+            "from_ranges"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "calls": {
+          "description": "List of outgoing calls.",
+          "items": {
+            "$ref": "#/$defs/OutgoingCall"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "truncated": {
+          "description": "Whether `calls` (together with their `from_ranges`) was capped below\nthe LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487).\nOmitted (defaults to `false`) when serialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "calls"
       ],
       "type": "object"
     },
@@ -917,6 +2082,73 @@
       },
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "LogEntry": {
+          "description": "A log entry from the LSP server.",
+          "properties": {
+            "level": {
+              "$ref": "#/$defs/LogLevel",
+              "description": "Log level."
+            },
+            "message": {
+              "description": "Log message.",
+              "type": "string"
+            },
+            "timestamp": {
+              "description": "Timestamp when the log was received.",
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "level",
+            "message",
+            "timestamp"
+          ],
+          "type": "object"
+        },
+        "LogLevel": {
+          "description": "Log severity level.",
+          "oneOf": [
+            {
+              "const": "error",
+              "description": "Error log level.",
+              "type": "string"
+            },
+            {
+              "const": "warning",
+              "description": "Warning log level.",
+              "type": "string"
+            },
+            {
+              "const": "info",
+              "description": "Info log level.",
+              "type": "string"
+            },
+            {
+              "const": "debug",
+              "description": "Debug log level.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "logs": {
+          "description": "List of log entries.",
+          "items": {
+            "$ref": "#/$defs/LogEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "logs"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Server Logs",
       "readOnlyHint": true,
@@ -939,6 +2171,73 @@
           "type": "integer"
         }
       },
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "MessageType": {
+          "description": "Server message type.",
+          "oneOf": [
+            {
+              "const": "error",
+              "description": "Error message.",
+              "type": "string"
+            },
+            {
+              "const": "warning",
+              "description": "Warning message.",
+              "type": "string"
+            },
+            {
+              "const": "info",
+              "description": "Info message.",
+              "type": "string"
+            },
+            {
+              "const": "log",
+              "description": "Log message.",
+              "type": "string"
+            }
+          ]
+        },
+        "ServerMessage": {
+          "description": "A message from the LSP server.",
+          "properties": {
+            "message": {
+              "description": "Message content.",
+              "type": "string"
+            },
+            "message_type": {
+              "$ref": "#/$defs/MessageType",
+              "description": "Message type."
+            },
+            "timestamp": {
+              "description": "Timestamp when the message was received.",
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "message_type",
+            "message",
+            "timestamp"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "messages": {
+          "description": "List of server messages.",
+          "items": {
+            "$ref": "#/$defs/ServerMessage"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "messages"
+      ],
       "type": "object"
     },
     "annotations": {
@@ -979,6 +2278,116 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "SignatureInfo": {
+          "description": "A single signature overload.",
+          "properties": {
+            "documentation": {
+              "description": "Optional documentation for the signature.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "description": "Full label of the signature.",
+              "type": "string"
+            },
+            "parameters": {
+              "description": "Parameters of the signature.",
+              "items": {
+                "$ref": "#/$defs/SignatureParameter"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "label",
+            "parameters"
+          ],
+          "type": "object"
+        },
+        "SignatureParameter": {
+          "description": "A single parameter in a signature.",
+          "properties": {
+            "documentation": {
+              "description": "Optional documentation for the parameter.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "description": "Label of the parameter, or `None` when the server gave an offset pair\ninto the signature label that does not resolve to a substring of it\n(out of range, inside a character, or reversed).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "active_parameter": {
+          "description": "Index of the active parameter within the active signature.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "active_signature": {
+          "description": "Index of the active signature.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "signatures": {
+          "description": "Available signatures.",
+          "items": {
+            "$ref": "#/$defs/SignatureInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "signatures"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Signature Help",
       "readOnlyHint": true,
@@ -1001,6 +2410,174 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Capability": {
+          "description": "LSP server capability the tool is gated on.",
+          "type": "string"
+        },
+        "RouteEntry": {
+          "description": "One route of a tool in the report: a language (absent for workspace-wide\ntools) and its support status.",
+          "oneOf": [
+            {
+              "description": "The routed server is registered and advertises the tool's capability.",
+              "properties": {
+                "server": {
+                  "$ref": "#/$defs/ServerId",
+                  "description": "The server the call would be dispatched to."
+                },
+                "status": {
+                  "const": "supported",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "server"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The routed server is registered but does not advertise the capability.",
+              "properties": {
+                "capability": {
+                  "$ref": "#/$defs/Capability",
+                  "description": "The capability the server does not advertise."
+                },
+                "server": {
+                  "$ref": "#/$defs/ServerId",
+                  "description": "The server the call would be dispatched to."
+                },
+                "status": {
+                  "const": "capability_not_advertised",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "server",
+                "capability"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The routed server has not finished initializing, or its capabilities\nare not known yet.",
+              "properties": {
+                "status": {
+                  "const": "initializing",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "No server is routed for this tool.",
+              "properties": {
+                "status": {
+                  "const": "no_server",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "language": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "ServerId": {
+          "description": "Unique identity of a configured LSP server within a workspace.\n\nDerived from [`LspServerConfig::id`]: a server's explicit `name` if set,\notherwise its `language_id`. This is the key used throughout the bridge\nlayer (`Translator::lsp_clients`, `lsp_servers`, notification receivers)\ninstead of a raw language string, so two servers sharing a language no\nlonger silently overwrite each other.",
+          "type": "string"
+        },
+        "ToolCoverage": {
+          "description": "How widely a tool is usable across the languages in the report.",
+          "oneOf": [
+            {
+              "const": "all",
+              "description": "Supported for every listed language.",
+              "type": "string"
+            },
+            {
+              "const": "some",
+              "description": "Supported for some listed languages but not all.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "Supported for no listed language (or nothing is configured).",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "Not supported anywhere yet, but at least one server is still initializing.",
+              "type": "string"
+            },
+            {
+              "const": "always",
+              "description": "Answered by mcpls itself; independent of language servers.",
+              "type": "string"
+            }
+          ]
+        },
+        "ToolEntry": {
+          "description": "One tool in the report.",
+          "properties": {
+            "coverage": {
+              "$ref": "#/$defs/ToolCoverage"
+            },
+            "name": {
+              "type": "string"
+            },
+            "routes": {
+              "items": {
+                "$ref": "#/$defs/RouteEntry"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "coverage"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "languages": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ToolEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "languages",
+        "tools"
+      ],
       "type": "object"
     },
     "annotations": {
@@ -1038,6 +2615,116 @@
         "file_path",
         "line",
         "character"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Location": {
+          "description": "Location in a document.",
+          "properties": {
+            "out_of_workspace": {
+              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (see\n`bridge::uri_in_workspace_roots`'s docs for why), so callers that\nwant to apply their own policy toward out-of-workspace locations can\ncheck this flag. The underlying check is purely lexical -- it does\nnot resolve symlinks -- so a location reached through a symlinked\nworkspace root (e.g. macOS's `/var` -> `/private/var`, or a package\nmanager's symlinked dependency store) can read `true` even though it\nis genuinely inside the workspace. Also always `true` when no\nworkspace roots are configured, consistent with\n`bridge::uri_in_workspace_roots`'s fail-closed convention: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range within the document."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "locations": {
+          "description": "Locations found.",
+          "items": {
+            "$ref": "#/$defs/Location"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "truncated": {
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "locations"
       ],
       "type": "object"
     },
@@ -1079,6 +2766,116 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "Location": {
+          "description": "Location in a document.",
+          "properties": {
+            "out_of_workspace": {
+              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (see\n`bridge::uri_in_workspace_roots`'s docs for why), so callers that\nwant to apply their own policy toward out-of-workspace locations can\ncheck this flag. The underlying check is purely lexical -- it does\nnot resolve symlinks -- so a location reached through a symlinked\nworkspace root (e.g. macOS's `/var` -> `/private/var`, or a package\nmanager's symlinked dependency store) can read `true` even though it\nis genuinely inside the workspace. Also always `true` when no\nworkspace roots are configured, consistent with\n`bridge::uri_in_workspace_roots`'s fail-closed convention: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range within the document."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "locations": {
+          "description": "Locations found.",
+          "items": {
+            "$ref": "#/$defs/Location"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "truncated": {
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "locations"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Go to Type Definition",
       "readOnlyHint": true,
@@ -1114,6 +2911,143 @@
         "file_path",
         "line",
         "character"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "CallHierarchyItemResult": {
+          "description": "A call hierarchy item.",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass to incoming/outgoing calls."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "items": {
+          "description": "List of callable items at the position.",
+          "items": {
+            "$ref": "#/$defs/CallHierarchyItemResult"
+          },
+          "type": "array"
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "truncated": {
+          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`, #516). Omitted (defaults to `false`) when\nserialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items"
       ],
       "type": "object"
     },
@@ -1160,6 +3094,169 @@
       ],
       "type": "object"
     },
+    "outputSchema": {
+      "$defs": {
+        "DocumentChanges": {
+          "description": "Changes to a document.",
+          "properties": {
+            "edits": {
+              "description": "List of edits to apply.",
+              "items": {
+                "$ref": "#/$defs/TextEdit"
+              },
+              "type": "array"
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "edits"
+          ],
+          "type": "object"
+        },
+        "DroppedEdits": {
+          "description": "Counts of `WorkspaceEdit` entries withheld during conversion to MCP DTOs,\nbroken down by reason (#475).\n\n`convert_workspace_edit` silently discarded such entries with only a\n`tracing` log line, so a client applying a [`RenameResult`] or\n`WorkspaceEditDescription` straight to disk could not tell \"nothing to\nrename\" apart from \"some of the rename was withheld\" -- this makes that\ndistinction visible in the result itself.",
+          "properties": {
+            "exceeds_item_cap": {
+              "description": "Edits not admitted because the response exceeded\n`MAX_NORMALIZED_LOCATIONS` (#487), including whole files skipped once\nthe budget was spent.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "out_of_workspace": {
+              "description": "Entries referencing a URI outside every configured workspace root.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "shadowed_by_changes": {
+              "description": "`documentChanges` text-document edits ignored because a non-empty\n`changes` map took precedence and did not already name their URI\n(#498).",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unsupported_file_operation": {
+              "description": "`CreateFile`/`RenameFile`/`DeleteFile` document changes, which mcpls\ndoes not translate into MCP DTOs.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unsupported_snippet_edit": {
+              "description": "`SnippetTextEdit` entries, which mcpls does not translate since it\nadvertises no `snippetEditSupport`.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "TextEdit": {
+          "description": "A text edit operation.",
+          "properties": {
+            "new_text": {
+              "description": "New text.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range to replace."
+            }
+          },
+          "required": [
+            "range",
+            "new_text"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "changes": {
+          "description": "Changes to apply across documents.",
+          "items": {
+            "$ref": "#/$defs/DocumentChanges"
+          },
+          "type": "array"
+        },
+        "dropped": {
+          "$ref": "#/$defs/DroppedEdits",
+          "description": "Entries withheld from `changes` -- see [`DroppedEdits`]. A non-empty\nvalue means the rename is incomplete even if `changes` is non-empty,\nand callers must not treat this result as the full rename otherwise."
+        },
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        }
+      },
+      "required": [
+        "changes"
+      ],
+      "type": "object"
+    },
     "annotations": {
       "title": "Rename Symbol",
       "readOnlyHint": true,
@@ -1195,6 +3292,148 @@
       },
       "required": [
         "query"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Location": {
+          "description": "Location in a document.",
+          "properties": {
+            "out_of_workspace": {
+              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (see\n`bridge::uri_in_workspace_roots`'s docs for why), so callers that\nwant to apply their own policy toward out-of-workspace locations can\ncheck this flag. The underlying check is purely lexical -- it does\nnot resolve symlinks -- so a location reached through a symlinked\nworkspace root (e.g. macOS's `/var` -> `/private/var`, or a package\nmanager's symlinked dependency store) can read `true` even though it\nis genuinely inside the workspace. Also always `true` when no\nworkspace roots are configured, consistent with\n`bridge::uri_in_workspace_roots`'s fail-closed convention: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range within the document."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "WorkspaceSymbol": {
+          "description": "A workspace symbol.",
+          "properties": {
+            "container_name": {
+              "description": "Optional container name (parent scope).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "location": {
+              "$ref": "#/$defs/Location",
+              "description": "Location of the symbol."
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "location"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "positions_degraded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionDegradation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+        },
+        "symbols": {
+          "description": "List of symbols found.",
+          "items": {
+            "$ref": "#/$defs/WorkspaceSymbol"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "description": "Whether more symbols matched than are returned in `symbols` -- set\nwhenever any are dropped, whether by the caller's own smaller\n`limit` or by the server-side maximum it's clamped to (see\n`MAX_NORMALIZED_LOCATIONS`, #474); this does not distinguish which of\nthe two caused it. Omitted (defaults to `false`) when serialized.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "symbols"
       ],
       "type": "object"
     },

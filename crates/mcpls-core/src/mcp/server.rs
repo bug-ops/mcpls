@@ -39,8 +39,11 @@ use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
 };
 use crate::bridge::{
-    DefinitionResult, DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, IndexingState,
-    NotificationCache, Position, PositionEncoding, ReferencesResult, Translator,
+    CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
+    DiagnosticInfo, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
+    IncomingCallsResult, IndexingState, InlayHintsResult, LocationsResult, NotificationCache,
+    OutgoingCallsResult, Position, PositionEncoding, ReferencesResult, RenameResult,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator, WorkspaceSymbolResult,
     validate_path_against_roots,
 };
 use crate::config::{McpConfig, ToolPrefix};
@@ -154,7 +157,7 @@ impl DiagnosticsRouteSignals {
 
 /// Response shape for the `get_cached_diagnostics` tool: the shared diagnostics result plus
 /// the file's [`DiagnosticsRouteSignals`].
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, JsonSchema)]
 struct CachedDiagnosticsResponse {
     #[serde(flatten)]
     result: DiagnosticsResult,
@@ -194,25 +197,25 @@ fn map_bridge_error(e: crate::error::Error) -> McpError {
     let message = e.to_string();
     match e.mcp_error_kind() {
         crate::error::McpErrorKind::InvalidParams => McpError::invalid_params(message, None),
+        crate::error::McpErrorKind::InvalidPosition(raw) => {
+            error_with_data(ErrorCode::INVALID_PARAMS, message, &raw)
+        }
         crate::error::McpErrorKind::Internal => McpError::internal_error(message, None),
-        crate::error::McpErrorKind::Retryable(data) => match serde_json::to_value(&data) {
-            Ok(value) => McpError::new(ErrorCode(data.code()), message, Some(value)),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to serialize retryable error data");
-                McpError::new(ErrorCode(data.code()), message, None)
-            }
-        },
+        crate::error::McpErrorKind::Retryable(data) => {
+            error_with_data(ErrorCode(data.code()), message, &data)
+        }
     }
 }
 
-/// Map a bridge-layer result to the MCP tool response shape shared by every `#[tool]` handler.
-fn to_tool_result<T: serde::Serialize>(
-    result: crate::error::Result<T>,
-) -> Result<String, McpError> {
-    match result {
-        Ok(value) => serde_json::to_string(&value)
-            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-        Err(e) => Err(map_bridge_error(e)),
+/// Builds an error with `data` as its payload; a failed serialization is
+/// logged and the error is sent without `data` rather than lost.
+fn error_with_data(code: ErrorCode, message: String, data: &impl Serialize) -> McpError {
+    match serde_json::to_value(data) {
+        Ok(value) => McpError::new(code, message, Some(value)),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to serialize error data");
+            McpError::new(code, message, None)
+        }
     }
 }
 
@@ -281,7 +284,7 @@ fn paginate_resource_paths<'a>(
     };
 
     let rest = paths.get(start..).unwrap_or_default();
-    let page = &rest[..rest.len().min(page_size)];
+    let page = rest.get(..rest.len().min(page_size)).unwrap_or_default();
     // `start` is client-controlled (parsed straight from the cursor), so the
     // addition must not panic (debug) or silently wrap (release) for a
     // cursor near `usize::MAX`.
@@ -527,8 +530,8 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<HoverResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_hover(file_path, Position { line, character })
@@ -649,8 +652,8 @@ impl McplsServer {
                 },
             new_name,
         }): Parameters<RenameParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<RenameResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_rename(file_path, Position { line, character }, new_name)
@@ -674,8 +677,8 @@ impl McplsServer {
                 },
             trigger,
         }): Parameters<CompletionsParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<CompletionsResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_completions(file_path, Position { line, character }, trigger)
@@ -714,8 +717,8 @@ impl McplsServer {
             tab_size,
             insert_spaces,
         }): Parameters<FormatDocumentParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<FormatDocumentResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_format_document(file_path, tab_size, insert_spaces)
@@ -735,8 +738,8 @@ impl McplsServer {
             kind_filter,
             limit,
         }): Parameters<WorkspaceSymbolParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<WorkspaceSymbolResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_workspace_symbol(query, kind_filter, limit)
@@ -764,8 +767,8 @@ impl McplsServer {
                 },
             kind_filter,
         }): Parameters<CodeActionsParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<CodeActionsResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_code_actions(
@@ -796,8 +799,8 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<CallHierarchyPrepareResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_call_hierarchy_prepare(file_path, Position { line, character })
@@ -813,8 +816,8 @@ impl McplsServer {
     async fn get_incoming_calls(
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(self.context.translator.handle_incoming_calls(item).await)
+    ) -> Result<Json<IncomingCallsResult>, McpError> {
+        to_structured_tool_result(self.context.translator.handle_incoming_calls(item).await)
     }
 
     /// Get outgoing calls (callees).
@@ -825,8 +828,8 @@ impl McplsServer {
     async fn get_outgoing_calls(
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(self.context.translator.handle_outgoing_calls(item).await)
+    ) -> Result<Json<OutgoingCallsResult>, McpError> {
+        to_structured_tool_result(self.context.translator.handle_outgoing_calls(item).await)
     }
 
     /// Get cached diagnostics for a file.
@@ -837,7 +840,7 @@ impl McplsServer {
     async fn get_cached_diagnostics(
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
-    ) -> Result<String, McpError> {
+    ) -> Result<Json<CachedDiagnosticsResponse>, McpError> {
         let result = match Translator::cached_diagnostics_path_and_uri(
             &self.context.workspace_roots,
             &file_path,
@@ -877,7 +880,7 @@ impl McplsServer {
             Err(e) => Err(e),
         };
 
-        to_tool_result(result)
+        to_structured_tool_result(result)
     }
 
     /// Get recent LSP server log messages.
@@ -888,8 +891,8 @@ impl McplsServer {
     async fn get_server_logs(
         &self,
         Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result({
+    ) -> Result<Json<ServerLogsResult>, McpError> {
+        to_structured_tool_result({
             let cache = self.context.notification_cache.lock().await;
             Translator::handle_server_logs(&cache, limit, min_level)
         })
@@ -903,8 +906,8 @@ impl McplsServer {
     async fn get_server_messages(
         &self,
         Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result({
+    ) -> Result<Json<ServerMessagesResult>, McpError> {
+        to_structured_tool_result({
             let cache = self.context.notification_cache.lock().await;
             Translator::handle_server_messages(&cache, limit)
         })
@@ -922,8 +925,8 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<SignatureHelpResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_signature_help(file_path, Position { line, character })
@@ -943,8 +946,8 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<LocationsResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_implementation(file_path, Position { line, character })
@@ -964,8 +967,8 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<LocationsResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_type_definition(file_path, Position { line, character })
@@ -981,14 +984,14 @@ impl McplsServer {
     fn get_tool_support(
         &self,
         Parameters(ToolSupportParams { file_path }): Parameters<ToolSupportParams>,
-    ) -> Result<String, McpError> {
+    ) -> Result<Json<ToolSupportReport>, McpError> {
         let translator = &self.context.translator;
         let file_language = file_path
             .as_deref()
             .map(|path| translator.language_for_path(path))
             .transpose();
         let snapshot = translator.tool_support_snapshot();
-        to_tool_result(file_language.map(|file_language| {
+        to_structured_tool_result(file_language.map(|file_language| {
             let languages =
                 file_language.map_or_else(|| snapshot.languages(), |language| vec![language]);
             ToolSupportReport::build(&snapshot, languages, self.context.mcp.tool_prefix.as_ref())
@@ -1012,8 +1015,8 @@ impl McplsServer {
                     end_character,
                 },
         }): Parameters<InlayHintsParams>,
-    ) -> Result<String, McpError> {
-        to_tool_result(
+    ) -> Result<Json<InlayHintsResult>, McpError> {
+        to_structured_tool_result(
             self.context
                 .translator
                 .handle_inlay_hints(
@@ -1646,6 +1649,27 @@ mod tests {
         assert_eq!(err.unwrap_err().code, ErrorCode::INVALID_PARAMS);
     }
 
+    /// #465: the rewritten "position out of range" error is `INVALID_PARAMS` and
+    /// still exposes the server's raw error as `data`.
+    #[test]
+    fn test_map_bridge_error_invalid_position_carries_raw_error_as_data() {
+        let mcp_err = map_bridge_error(crate::error::Error::LspServerError {
+            code: -32603,
+            message: "Invalid offset LineCol { line: 9, col: 0 }".to_string(),
+            data: None,
+        });
+
+        assert_eq!(mcp_err.code, ErrorCode::INVALID_PARAMS);
+        assert!(mcp_err.message.contains("position out of range"));
+        assert_eq!(
+            mcp_err.data,
+            Some(serde_json::json!({
+                "code": -32603,
+                "raw_message": "Invalid offset LineCol { line: 9, col: 0 }"
+            }))
+        );
+    }
+
     /// #479 follow-up: `WorkspaceServersInitializing` (the no-single-server
     /// counterpart of `ServerInitializing`, see its doc comment) must be
     /// retryable too, sharing `SERVER_INITIALIZING_ERROR_CODE` since it's the
@@ -1777,7 +1801,7 @@ mod tests {
 
     /// #417: the fail-closed `Error::NoWorkspaceRoots` path must propagate
     /// correctly through a `#[tool]` handler's full error-mapping chain
-    /// (`to_tool_result`/`McpError::internal_error`), not just through the
+    /// (`to_structured_tool_result`/`McpError::internal_error`), not just through the
     /// lower-level `Translator::validate_path`/`validate_path_against_roots`
     /// unit tests -- `create_test_server()` here deliberately keeps the
     /// empty roots that `create_test_server_with_real_file()` (used by the
@@ -1792,7 +1816,7 @@ mod tests {
         });
 
         let result = server.get_hover(params).await;
-        let err = result.unwrap_err();
+        let err = result.err().unwrap();
         assert!(
             err.message.contains("no workspace roots configured"),
             "expected the NoWorkspaceRoots error to propagate through the tool handler, got: {}",
@@ -2181,11 +2205,12 @@ mod tests {
         serve_empty_pull(&mut fx.fake, async {}).await;
         let pulled = serde_json::to_value(call.await.unwrap().unwrap().0).unwrap();
 
-        let cached: serde_json::Value = serde_json::from_str(
-            &fx.server
+        let cached = serde_json::to_value(
+            fx.server
                 .get_cached_diagnostics(Parameters(CachedDiagnosticsParams { file_path }))
                 .await
-                .unwrap(),
+                .unwrap()
+                .0,
         )
         .unwrap();
         let resource = serde_json::to_value(
@@ -2257,10 +2282,15 @@ mod tests {
         }
     }
 
+    const CAMEL_CASE_ROUND_TRIP_KEY: &str = "selectionRange";
+
     /// Fails on any `properties` name containing an ASCII uppercase letter,
     /// recursing through every other schema keyword (`$defs`, `items`,
     /// `anyOf`, `oneOf`, ...) without checking their names, since those are
     /// type names and JSON Schema keywords rather than wire keys.
+    ///
+    /// `selectionRange` is the one deliberate exception: call hierarchy items are
+    /// passed back verbatim as LSP `CallHierarchyItem`s.
     fn assert_schema_property_names_snake_case(schema: &serde_json::Value) {
         match schema {
             serde_json::Value::Object(map) => {
@@ -2271,7 +2301,8 @@ mod tests {
                         };
                         for (name, property) in properties {
                             assert!(
-                                !name.chars().any(|c| c.is_ascii_uppercase()),
+                                name == CAMEL_CASE_ROUND_TRIP_KEY
+                                    || !name.chars().any(|c| c.is_ascii_uppercase()),
                                 "non-snake_case schema property `{name}`"
                             );
                             assert_schema_property_names_snake_case(property);
@@ -2290,9 +2321,7 @@ mod tests {
         }
     }
 
-    /// #504 guard. Tools without an `outputSchema` (returning `String`) are not
-    /// covered by value-level checks here; their DTOs are `snake_case` by serde
-    /// default and any `rename_all` on them would need a new check. Covers: every tool `outputSchema` (property names only),
+    /// #504 guard. Covers: every tool `outputSchema` (property names only),
     /// the serialized `DiagnosticsResponse`/`CachedDiagnosticsResponse`/
     /// `ResourceDiagnosticsResponse` with both signals set (the resource's raw
     /// LSP `diagnostics` subtree excepted), and the `data` of every
@@ -2597,8 +2626,8 @@ mod tests {
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         assert!(parsed.get("diagnostics").is_some());
     }
 
@@ -2669,8 +2698,8 @@ mod tests {
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].get("message").unwrap(), "cached error");
@@ -2743,8 +2772,8 @@ mod tests {
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
         assert_eq!(
             diagnostics[0]["range"]["end"]["character"], 3,
@@ -2810,8 +2839,8 @@ mod tests {
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
         assert_eq!(
             diagnostics[0]["range"]["end"]["character"], 4,
@@ -2876,8 +2905,8 @@ mod tests {
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         assert_eq!(parsed.get("push_notifications_degraded").unwrap(), true);
     }
 
@@ -2925,8 +2954,8 @@ mod tests {
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         assert_eq!(parsed.get("indexing_in_progress").unwrap(), true);
     }
 
@@ -2979,8 +3008,8 @@ mod tests {
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         assert_eq!(
             parsed.get("indexing_in_progress").unwrap(),
             true,
@@ -3099,8 +3128,8 @@ sleep 0.3
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         assert_eq!(
             parsed.get("push_notifications_degraded").unwrap(),
             true,
@@ -3130,8 +3159,8 @@ sleep 0.3
         let result = server.get_cached_diagnostics(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         assert_eq!(parsed.get("push_notifications_degraded").unwrap(), false);
     }
 
@@ -3148,7 +3177,7 @@ sleep 0.3
         });
 
         let result = server.get_cached_diagnostics(params).await;
-        let err = result.unwrap_err();
+        let err = result.err().unwrap();
         assert!(
             err.message.contains("file I/O error"),
             "expected a file I/O error for a nonexistent path, got: {}",
@@ -3167,8 +3196,8 @@ sleep 0.3
         let result = server.get_server_logs(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         assert!(parsed.get("logs").is_some());
     }
 
@@ -3183,8 +3212,8 @@ sleep 0.3
         let result = server.get_server_logs(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         let logs = parsed.get("logs").unwrap().as_array().unwrap();
         assert_eq!(logs.len(), 0);
     }
@@ -3248,8 +3277,8 @@ sleep 0.3
         let result = server.get_server_logs(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         let logs = parsed.get("logs").unwrap().as_array().unwrap();
         assert_eq!(logs.len(), 0);
     }
@@ -3262,8 +3291,8 @@ sleep 0.3
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         assert!(parsed.get("messages").is_some());
     }
 
@@ -3275,8 +3304,8 @@ sleep 0.3
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         let messages = parsed.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 0);
     }
@@ -3289,8 +3318,8 @@ sleep 0.3
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
 
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let output = result.unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&output.0).unwrap();
         let messages = parsed.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 0);
     }
@@ -4194,29 +4223,17 @@ sleep 0.3
         );
     }
 
-    /// Structured output (`outputSchema`) is advertised for exactly the tools migrated to
-    /// `Result<Json<T>, McpError>` handler signatures, and only those. Driven off a literal
-    /// expected-name set (not derived from the router) so both a future migration and an
-    /// accidental scope change fail loudly here instead of only showing up as an opaque diff in
-    /// `test_tool_surface_matches_golden_snapshot`.
+    /// Every tool advertises an `outputSchema`, i.e. every handler returns
+    /// `Result<Json<T>, McpError>`.
     #[test]
-    fn test_output_schema_present_only_for_structured_tools() {
-        const STRUCTURED_TOOLS: &[&str] = &[
-            "get_diagnostics",
-            "get_definition",
-            "get_references",
-            "get_document_symbols",
-        ];
-
+    fn test_every_tool_has_output_schema() {
         let tools = McplsServer::build_tool_router(None).list_all();
         assert!(!tools.is_empty(), "no tools registered");
 
         for tool in &tools {
-            let expects_schema = STRUCTURED_TOOLS.contains(&tool.name.as_ref());
-            assert_eq!(
+            assert!(
                 tool.output_schema.is_some(),
-                expects_schema,
-                "tool `{}`: expected output_schema.is_some() == {expects_schema}",
+                "tool `{}` has no output_schema",
                 tool.name
             );
         }
@@ -4524,7 +4541,7 @@ sleep 0.3
         let text = server
             .get_tool_support(Parameters(ToolSupportParams { file_path }))
             .unwrap();
-        serde_json::from_str(&text).unwrap()
+        serde_json::to_value(&text.0).unwrap()
     }
 
     fn tool_entry<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {

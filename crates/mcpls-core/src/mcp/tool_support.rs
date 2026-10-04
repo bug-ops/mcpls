@@ -4,6 +4,7 @@
 //! [`McpTool::backend`], which LSP route (if any) serves it, so the report is
 //! derived from the same routing vocabulary the bridge enforces with.
 
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::bridge::{RouteSupport, ToolSupportSnapshot};
@@ -73,6 +74,10 @@ impl McpTool {
     ];
 
     /// Byte length of the longest unprefixed tool name.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the loop condition keeps `i` below `ALL.len()`"
+    )]
     pub(super) const MAX_NAME_BYTES: usize = {
         let mut max = 0;
         let mut i = 0;
@@ -147,7 +152,7 @@ pub(super) fn prefixed_tool_name(prefix: Option<&ToolPrefix>, name: &str) -> Str
 }
 
 /// How widely a tool is usable across the languages in the report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ToolCoverage {
     /// Supported for every listed language.
@@ -168,9 +173,9 @@ impl ToolCoverage {
     fn from_routes<'a>(routes: impl Iterator<Item = &'a RouteSupport>) -> Self {
         let (mut total, mut supported, mut initializing) = (0_usize, 0_usize, false);
         for route in routes {
-            total += 1;
+            total = total.saturating_add(1);
             match route {
-                RouteSupport::Supported { .. } => supported += 1,
+                RouteSupport::Supported { .. } => supported = supported.saturating_add(1),
                 RouteSupport::Initializing => initializing = true,
                 RouteSupport::CapabilityNotAdvertised { .. } | RouteSupport::NoServer => {}
             }
@@ -191,7 +196,7 @@ impl ToolCoverage {
 
 /// One route of a tool in the report: a language (absent for workspace-wide
 /// tools) and its support status.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct RouteEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     language: Option<String>,
@@ -200,7 +205,7 @@ pub(super) struct RouteEntry {
 }
 
 /// One tool in the report.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct ToolEntry {
     name: String,
     coverage: ToolCoverage,
@@ -209,7 +214,7 @@ pub(super) struct ToolEntry {
 }
 
 /// The `get_tool_support` response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct ToolSupportReport {
     languages: Vec<String>,
     tools: Vec<ToolEntry>,

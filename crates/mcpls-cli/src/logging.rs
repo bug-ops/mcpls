@@ -1,8 +1,57 @@
 //! Logging initialization and configuration.
 
 use anyhow::{Context, Result};
+use mcpls_core::escape_control;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::fmt::format::{FormatFields, Writer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
+
+/// Text-mode field formatter that control-escapes every field value, so
+/// attacker-influenceable text (an LSP server's message or method name, a
+/// client URI, a file name) cannot forge log lines or inject terminal
+/// escapes. JSON mode already escapes control characters.
+struct EscapingFields;
+
+impl<'writer> FormatFields<'writer> for EscapingFields {
+    fn format_fields<R: RecordFields>(
+        &self,
+        writer: Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        let mut visitor = EscapingVisitor {
+            writer,
+            first: true,
+            result: Ok(()),
+        };
+        fields.record(&mut visitor);
+        visitor.result
+    }
+}
+
+struct EscapingVisitor<'writer> {
+    writer: Writer<'writer>,
+    first: bool,
+    result: std::fmt::Result,
+}
+
+impl Visit for EscapingVisitor<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if self.result.is_err() {
+            return;
+        }
+        let rendered = format!("{value:?}");
+        let escaped = escape_control(&rendered);
+        let separator = if self.first { "" } else { " " };
+        self.first = false;
+        self.result = if field.name() == "message" {
+            write!(self.writer, "{separator}{escaped}")
+        } else {
+            write!(self.writer, "{separator}{}={escaped}", field.name())
+        };
+    }
+}
 
 /// Initialize the logging subsystem.
 ///
@@ -45,6 +94,7 @@ pub fn init(level: &str, log_json: bool) -> Result<()> {
                     .with_thread_ids(false)
                     .with_file(false)
                     .with_line_number(false)
+                    .fmt_fields(EscapingFields)
                     .compact(),
             )
             .try_init()
@@ -55,8 +105,56 @@ pub fn init(level: &str, log_json: bool) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_text_logs_escape_control_characters_in_every_field() {
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .fmt_fields(EscapingFields)
+                .compact(),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let uri = "file:///a\nERROR forged\u{1b}[31m";
+            tracing::warn!("bad uri {uri} for {}", "x\ry");
+            tracing::warn!(method = %uri, "dropped");
+        });
+
+        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.lines().count(), 2, "got {output:?}");
+        assert!(!output.contains('\u{1b}'), "got {output:?}");
+        assert!(
+            output.contains("\\nERROR forged\\u{1b}[31m"),
+            "got {output:?}"
+        );
+        assert!(
+            output.contains("method=file:///a\\nERROR"),
+            "got {output:?}"
+        );
+    }
 
     #[test]
     fn test_init_with_valid_trace_level() {

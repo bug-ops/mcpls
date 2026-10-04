@@ -11,6 +11,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::config::{BuiltinServer, ServerId, ToolKind};
+use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
+use crate::util::{escape_control, truncate_str};
 
 /// Host platform, as far as [`NotFoundGuidance`] cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +92,57 @@ fn sanitize_lsp_server_message(message: &str) -> String {
     if message.contains(INVALID_OFFSET_MARKER) {
         "position out of range for this document".to_string()
     } else {
-        message.to_string()
+        escape_control(message).into_owned()
+    }
+}
+
+/// The raw LSP error behind a position-out-of-range rewrite, carried as the
+/// JSON-RPC `data` of the resulting `-32602` error.
+///
+/// [`Error::LspServerError`]'s `Display` replaces rust-analyzer's internal
+/// "Invalid offset" text with a clean message; this keeps the original
+/// reachable for the caller. The fields are private so the message can only
+/// be built through [`Self::new`], which bounds it.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::RewrittenServerError;
+///
+/// let raw = RewrittenServerError::new(-32603, "Invalid offset LineCol { line: 9, col: 0 }");
+/// assert_eq!(raw.code(), -32603);
+/// assert_eq!(
+///     serde_json::to_value(&raw).unwrap(),
+///     serde_json::json!({"code": -32603, "raw_message": "Invalid offset LineCol { line: 9, col: 0 }"})
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RewrittenServerError {
+    code: i32,
+    raw_message: String,
+}
+
+impl RewrittenServerError {
+    /// Build from the server's JSON-RPC `code` and raw message, truncating
+    /// the message to the budget used for text forwarded to MCP callers.
+    #[must_use]
+    pub fn new(code: i32, raw_message: &str) -> Self {
+        Self {
+            code,
+            raw_message: truncate_str(raw_message, MAX_ERROR_MESSAGE_CALLER_BYTES),
+        }
+    }
+
+    /// The server's JSON-RPC error code.
+    #[must_use]
+    pub const fn code(&self) -> i32 {
+        self.code
+    }
+
+    /// The server's raw message, bounded by [`Self::new`].
+    #[must_use]
+    pub fn raw_message(&self) -> &str {
+        &self.raw_message
     }
 }
 
@@ -332,7 +384,7 @@ pub enum Error {
     },
 
     /// LSP protocol error during message parsing.
-    #[error("LSP protocol error: {0}")]
+    #[error("LSP protocol error: {}", escape_control(.0))]
     LspProtocolError(String),
 
     /// Invalid URI format.
@@ -648,11 +700,18 @@ impl RetryableErrorData {
 /// let err = Error::InvalidToolParams("missing `file_path`".to_string());
 /// assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
 /// ```
+///
+/// This enum is `#[non_exhaustive]`: match it with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum McpErrorKind {
     /// Caller-fault: the request itself was invalid. Maps to JSON-RPC
     /// `-32602` (`INVALID_PARAMS`).
     InvalidParams,
+    /// Caller-fault: the position fell outside the document and the server's
+    /// raw error was rewritten for display. Maps to `-32602` with the
+    /// original error as `data`.
+    InvalidPosition(RewrittenServerError),
     /// A transient, retryable server-side condition, distinct from a crash.
     /// Maps to a bespoke JSON-RPC `code` with a structured `data` payload a
     /// caller can act on mechanically, rather than the generic
@@ -745,8 +804,10 @@ impl Error {
             // request's line/character falls outside the target document --
             // caller-fault. Every other `LspServerError` shape is a genuine
             // server-side problem and stays `Internal`.
-            Self::LspServerError { message, .. } if message.contains(INVALID_OFFSET_MARKER) => {
-                McpErrorKind::InvalidParams
+            Self::LspServerError { code, message, .. }
+                if message.contains(INVALID_OFFSET_MARKER) =>
+            {
+                McpErrorKind::InvalidPosition(RewrittenServerError::new(*code, message))
             }
 
             Self::LspInitFailed { .. }
@@ -1394,7 +1455,40 @@ mod tests {
                 .to_string(),
             data: None,
         };
-        assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
+        assert_eq!(
+            err.mcp_error_kind(),
+            McpErrorKind::InvalidPosition(RewrittenServerError::new(
+                -32603,
+                "Invalid offset LineCol { line: 2291, col: 0 } (line index length: 100417)"
+            ))
+        );
+    }
+
+    /// #465: server-supplied control characters never reach an error `Display`
+    /// raw, so a logged or echoed error cannot forge log lines.
+    #[test]
+    fn test_display_escapes_control_characters_from_the_server() {
+        let server_error = Error::LspServerError {
+            code: -32603,
+            message: "boom\nERROR forged\x1b[31m".to_string(),
+            data: None,
+        };
+        assert_eq!(
+            server_error.to_string(),
+            "LSP server error: -32603 - boom\\nERROR forged\\u{1b}[31m"
+        );
+
+        let protocol_error = Error::LspProtocolError("bad\nline".to_string());
+        assert_eq!(protocol_error.to_string(), "LSP protocol error: bad\\nline");
+    }
+
+    /// The raw message carried as `data` is bounded at construction.
+    #[test]
+    fn test_rewritten_server_error_bounds_raw_message() {
+        let raw =
+            RewrittenServerError::new(-32603, &"x".repeat(MAX_ERROR_MESSAGE_CALLER_BYTES * 2));
+        assert!(raw.raw_message().len() < MAX_ERROR_MESSAGE_CALLER_BYTES * 2);
+        assert!(raw.raw_message().ends_with("(truncated)"));
     }
 
     /// Counterpart: an `LspServerError` whose message doesn't match the

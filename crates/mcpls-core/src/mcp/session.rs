@@ -305,7 +305,7 @@ impl ListenUris {
                 let lsp_uri = crate::bridge::try_path_to_uri(&resolved.path)?;
                 Some((resolved, lsp_uri))
             }) else {
-                dropped += 1;
+                dropped = dropped.saturating_add(1);
                 continue;
             };
             map.entry(resolved.uri)

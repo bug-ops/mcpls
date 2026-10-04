@@ -16,10 +16,13 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
 futures = { workspace = true }
+http-body = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, optional = true, features = ["service", "tokio"] }
 ignore = { workspace = true }
 lsp-types = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io", "macros"] }
-schemars = { workspace = true }
+schemars = { workspace = true, features = ["chrono04"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -33,13 +36,16 @@ url = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
+process-wrap = { workspace = true, features = [
+    "tokio1",
+    "job-object",
+    "kill-on-drop",
 ] }
+winapi-util = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
@@ -50,6 +56,9 @@ default = []
 transport-http = [
     "rmcp/transport-streamable-http-server",
     "dep:axum",
+    "dep:http-body",
+    "dep:hyper",
+    "dep:hyper-util",
     "dep:tokio-util",
 ]
 

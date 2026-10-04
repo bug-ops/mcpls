@@ -111,7 +111,7 @@ pub enum PositionDegradation {
 }
 
 /// Result of a hover request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HoverResult {
     /// Hover contents as markdown string.
     pub contents: String,
@@ -203,7 +203,7 @@ pub struct DiagnosticsResult {
 }
 
 /// A text edit operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TextEdit {
     /// Range to replace.
     pub range: Range,
@@ -212,7 +212,7 @@ pub struct TextEdit {
 }
 
 /// Changes to a document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentChanges {
     /// URI of the document.
     pub uri: String,
@@ -221,7 +221,7 @@ pub struct DocumentChanges {
 }
 
 /// Result of a rename request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RenameResult {
     /// Changes to apply across documents.
     pub changes: Vec<DocumentChanges>,
@@ -245,7 +245,7 @@ pub struct RenameResult {
 /// `WorkspaceEditDescription` straight to disk could not tell "nothing to
 /// rename" apart from "some of the rename was withheld" -- this makes that
 /// distinction visible in the result itself.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DroppedEdits {
     /// Entries referencing a URI outside every configured workspace root.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -285,7 +285,7 @@ const fn is_zero(count: &usize) -> bool {
 }
 
 /// A completion item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Completion {
     /// Label of the completion.
     pub label: String,
@@ -298,7 +298,7 @@ pub struct Completion {
 }
 
 /// Result of a completions request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompletionsResult {
     /// List of completion items.
     pub items: Vec<Completion>,
@@ -339,7 +339,7 @@ pub struct DocumentSymbolsResult {
 }
 
 /// Result of a format document request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FormatDocumentResult {
     /// List of edits to format the document.
     pub edits: Vec<TextEdit>,
@@ -351,7 +351,7 @@ pub struct FormatDocumentResult {
 }
 
 /// A workspace symbol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceSymbol {
     /// Name of the symbol.
     pub name: String,
@@ -365,7 +365,7 @@ pub struct WorkspaceSymbol {
 }
 
 /// Result of workspace symbol search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceSymbolResult {
     /// List of symbols found.
     pub symbols: Vec<WorkspaceSymbol>,
@@ -384,7 +384,7 @@ pub struct WorkspaceSymbolResult {
 }
 
 /// A single code action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CodeAction {
     /// Title of the code action.
     pub title: String,
@@ -406,7 +406,7 @@ pub struct CodeAction {
 }
 
 /// Description of a workspace edit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceEditDescription {
     /// Changes to apply to documents.
     pub changes: Vec<DocumentChanges>,
@@ -416,7 +416,7 @@ pub struct WorkspaceEditDescription {
 }
 
 /// Description of a command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CommandDescription {
     /// Title of the command.
     pub title: String,
@@ -428,7 +428,7 @@ pub struct CommandDescription {
 }
 
 /// Result of code actions request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CodeActionsResult {
     /// Available code actions.
     pub actions: Vec<CodeAction>,
@@ -446,7 +446,7 @@ pub struct CodeActionsResult {
 }
 
 /// A call hierarchy item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CallHierarchyItemResult {
     /// Name of the symbol.
     pub name: String,
@@ -478,7 +478,7 @@ pub struct CallHierarchyItemResult {
 }
 
 /// Result of call hierarchy prepare request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CallHierarchyPrepareResult {
     /// List of callable items at the position.
     pub items: Vec<CallHierarchyItemResult>,
@@ -495,7 +495,7 @@ pub struct CallHierarchyPrepareResult {
 }
 
 /// An incoming call (caller of the current item).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IncomingCall {
     /// The item that calls the current item.
     pub from: CallHierarchyItemResult,
@@ -504,7 +504,7 @@ pub struct IncomingCall {
 }
 
 /// Result of incoming calls request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IncomingCallsResult {
     /// List of incoming calls.
     pub calls: Vec<IncomingCall>,
@@ -521,7 +521,7 @@ pub struct IncomingCallsResult {
 }
 
 /// An outgoing call (callee from the current item).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OutgoingCall {
     /// The item being called.
     pub to: CallHierarchyItemResult,
@@ -530,7 +530,7 @@ pub struct OutgoingCall {
 }
 
 /// Result of outgoing calls request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OutgoingCallsResult {
     /// List of outgoing calls.
     pub calls: Vec<OutgoingCall>,
@@ -547,21 +547,21 @@ pub struct OutgoingCallsResult {
 }
 
 /// Result of server logs request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServerLogsResult {
     /// List of log entries.
     pub logs: Vec<crate::bridge::notifications::LogEntry>,
 }
 
 /// Result of server messages request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServerMessagesResult {
     /// List of server messages.
     pub messages: Vec<crate::bridge::notifications::ServerMessage>,
 }
 
 /// A single parameter in a signature.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignatureParameter {
     /// Label of the parameter, or `None` when the server gave an offset pair
     /// into the signature label that does not resolve to a substring of it
@@ -574,7 +574,7 @@ pub struct SignatureParameter {
 }
 
 /// A single signature overload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignatureInfo {
     /// Full label of the signature.
     pub label: String,
@@ -586,7 +586,7 @@ pub struct SignatureInfo {
 }
 
 /// Result of a signature help request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignatureHelpResult {
     /// Available signatures.
     pub signatures: Vec<SignatureInfo>,
@@ -604,7 +604,7 @@ pub struct SignatureHelpResult {
 }
 
 /// Result of a go-to-implementation or go-to-type-definition request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LocationsResult {
     /// Locations found.
     pub locations: Vec<Location>,
@@ -622,7 +622,7 @@ pub struct LocationsResult {
 }
 
 /// A single inlay hint entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InlayHintEntry {
     /// Position of the hint (1-based MCP).
     pub position: Position2D,
@@ -644,7 +644,7 @@ pub struct InlayHintEntry {
 }
 
 /// Result of an inlay hints request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InlayHintsResult {
     /// List of inlay hints.
     pub hints: Vec<InlayHintEntry>,
