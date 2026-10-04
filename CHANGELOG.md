@@ -9,13 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- HTTP sessions now receive `resources/updated` on their GET stream for the resources they subscribed to; `subscriptions/listen` for 2026-07-28 clients is tracked in #522. (#525)
+- HTTP sessions now receive `resources/updated` on their GET stream for the resources they subscribed to. (#525)
 - `get_diagnostics` now reports `push_notifications_degraded`, sampled before and after the pull so a restart triggered by the call itself is caught. (#520)
 - Completions and signature help now report `positions_degraded`. (#520)
+- `subscriptions/listen` delivers diagnostics `resources/updated` to 2026-07-28 clients; new retryable error `-32053`. (#PR)
 - Install and PATH guidance in the error for a missing LSP server executable, with a per-server install hint for the six builtin servers (`BuiltinServer`). (#530)
 
 ### Changed
 
+- Bump rmcp to 3.5.0. (#PR)
+- **Breaking:** `RetryableErrorData` gains a `ListenStreamsExhausted` variant. (#PR)
 - **Breaking:** `NotificationCache`/`DocumentTracker`/`DocumentState` internals are no longer public; removed `NotificationCache::{clear_diagnostics, clear_all_diagnostics, clear_logs, clear_messages}` and `DocumentTracker::{update, close_all}`. (#512)
 - **Breaking:** `workspace.heuristics_max_depth` is now bounded by `MAX_HEURISTICS_DEPTH` (64); larger values fail config validation. (#512)
 - **Breaking:** `SubscriptionRegistry` moved from `mcpls_core::bridge` to `mcpls_core::mcp`; its `register`, `any_contains` and `is_all_empty` methods are removed, and `ResourceSubscriptions` and `SubscriptionError` are no longer public. (#525)
@@ -31,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Abandoned HTTP sessions now expire after 5 min without client activity instead of living on while subscribed files change. (#PR)
 - Columns past the end of a line now clamp to the line length, and column 1 or the empty line after a final newline no longer raise a false `positions_degraded`. (#520)
 - Call-hierarchy, inlay-hint, code-action, and rename handlers now cap normalized items with one shared budget, reporting overflow via `truncated` / `dropped.exceeds_item_cap`. (#487, #519)
 - Workspace-edit conversion now tallies `documentChanges` entries shadowed by a non-empty `changes` map and no longer lists a file whose edits were all dropped. (#498, #519)

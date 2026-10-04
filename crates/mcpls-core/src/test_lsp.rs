@@ -283,3 +283,17 @@ pub fn spawn_test_pump(
     });
     (tx, cancel_tx)
 }
+
+/// A temp workspace holding `main.rs`: the guard, the canonical root and the file.
+pub fn workspace_with_main_rs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let file = root.join("main.rs");
+    std::fs::write(&file, "fn main() {}").unwrap();
+    (dir, root, file)
+}
+
+/// A diagnostics resource URI built from a literal, bypassing resolution.
+pub fn diagnostics_uri(uri: &str) -> crate::bridge::resources::DiagnosticsResourceUri {
+    crate::bridge::resources::DiagnosticsResourceUri::for_test(uri)
+}

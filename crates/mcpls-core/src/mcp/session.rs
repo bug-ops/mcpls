@@ -15,19 +15,23 @@
 //! guarded subscribe binds delivery, so stateless per-request instances can
 //! never become a delivery target.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use rmcp::model::{ErrorCode, ResourceUpdatedNotificationParam};
-use rmcp::service::RequestContext;
+use rmcp::service::{RequestContext, SubscriptionSink};
 use rmcp::{ErrorData as McpError, Peer, RoleServer};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, warn};
 
 use crate::bridge::lock_std;
-use crate::bridge::resources::{MAX_SUBSCRIPTIONS, ResourceSubscriptions, SubscriptionError};
+use crate::bridge::resources::{
+    DiagnosticsResourceUri, MAX_LISTEN_STREAMS, MAX_SUBSCRIPTIONS, ResourceSubscriptions,
+    SubscriptionError, parse_uri,
+};
 
 /// Whether `meta` carries rmcp's discover-lifecycle keys -- the same test
 /// `tower.rs::is_legacy_request` uses to route a request through its
@@ -95,23 +99,49 @@ struct TargetClosed;
 pub enum Target {
     /// The session's real MCP peer.
     Peer(Peer<RoleServer>),
+    /// A `subscriptions/listen` stream: one notification per raw URI the
+    /// client listed for the published resource.
+    Sink {
+        /// Filter-enforcing sink of the listen request.
+        sink: SubscriptionSink,
+        /// Maps each canonical URI to the raw URIs the client asked for.
+        uris: Arc<ListenUris>,
+    },
     /// In-memory sink so tests run the production coalescing loop.
     #[cfg(test)]
     Channel(mpsc::Sender<String>),
 }
 
 impl Target {
-    async fn send(&self, uri: String) -> Result<(), TargetClosed> {
+    async fn send(&self, uri: &DiagnosticsResourceUri) -> Result<(), TargetClosed> {
         match self {
             Self::Peer(peer) => peer
-                .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri.as_str()))
                 .await
                 .map_err(|e| {
                     debug!("peer closed while delivering resources/updated: {e}");
                     TargetClosed
                 }),
+            Self::Sink { sink, uris } => {
+                for raw in uris.raw_for(uri) {
+                    match sink.notify_resource_updated(raw).await {
+                        Ok(()) => {}
+                        Err(rmcp::service::SubscriptionSendError::NotificationNotAccepted(_)) => {
+                            warn!("listen sink rejected {raw}: not in its accepted set");
+                        }
+                        Err(e) => {
+                            debug!("listen stream closed while delivering resources/updated: {e}");
+                            return Err(TargetClosed);
+                        }
+                    }
+                }
+                Ok(())
+            }
             #[cfg(test)]
-            Self::Channel(tx) => tx.send(uri).await.map_err(|_| TargetClosed),
+            Self::Channel(tx) => tx
+                .send(uri.as_str().to_owned())
+                .await
+                .map_err(|_| TargetClosed),
         }
     }
 }
@@ -122,25 +152,24 @@ impl Target {
 /// update per URI is never lost and the publisher never awaits the peer.
 #[derive(Debug)]
 struct Delivery {
-    pending: Arc<StdMutex<HashSet<String>>>,
+    pending: Arc<StdMutex<HashSet<DiagnosticsResourceUri>>>,
     doorbell: mpsc::Sender<()>,
     cap_warned: AtomicBool,
 }
 
-// TODO(#521): stop delivery once the session has had no inbound client activity for rmcp keep_alive, else abandoned subscribed HTTP sessions never expire
 /// Drains `pending` on every doorbell ring and forwards each URI to `target`.
 ///
 /// Exits when the doorbell closes (the owning [`SessionState`] was dropped) or
 /// the first send fails (the transport is gone).
 async fn run_delivery(
     target: Target,
-    pending: Arc<StdMutex<HashSet<String>>>,
+    pending: Arc<StdMutex<HashSet<DiagnosticsResourceUri>>>,
     mut doorbell: mpsc::Receiver<()>,
 ) {
     while doorbell.recv().await.is_some() {
         let batch = std::mem::take(&mut *lock_std(&pending));
         for uri in batch {
-            if target.send(uri).await.is_err() {
+            if target.send(&uri).await.is_err() {
                 return;
             }
         }
@@ -161,7 +190,7 @@ impl SessionState {
     }
 
     /// Queues `uri` for delivery to this session only if it is subscribed to it.
-    pub(crate) async fn publish_if_subscribed(&self, uri: &str) {
+    pub(crate) async fn publish_if_subscribed(&self, uri: &DiagnosticsResourceUri) {
         if !self.subs.contains(uri).await {
             return;
         }
@@ -183,7 +212,7 @@ impl SessionState {
                     }
                     return;
                 }
-                pending.insert(uri.to_owned());
+                pending.insert(uri.clone());
             }
         }
         match delivery.doorbell.try_send(()) {
@@ -194,14 +223,18 @@ impl SessionState {
         }
     }
 
-    async fn subscribe(&self, canonical: String, raw: String) -> Result<bool, SubscriptionError> {
+    async fn subscribe(
+        &self,
+        canonical: DiagnosticsResourceUri,
+        raw: String,
+    ) -> Result<bool, SubscriptionError> {
         let newly_subscribed = self.subs.subscribe(canonical.clone()).await?;
-        self.subs.record_alias(raw, canonical).await;
+        self.subs.record_alias(raw, &canonical).await;
         Ok(newly_subscribed)
     }
 
-    async fn unsubscribe(&self, key: &str) -> bool {
-        let Some(canonical) = self.subs.unsubscribe(key).await else {
+    async fn unsubscribe(&self, canonical: Option<&DiagnosticsResourceUri>, raw: &str) -> bool {
+        let Some(canonical) = self.subs.unsubscribe(canonical, raw).await else {
             return false;
         };
         if let Some(delivery) = self.delivery.get() {
@@ -209,6 +242,109 @@ impl SessionState {
         }
         true
     }
+}
+
+/// The resource URIs of one `subscriptions/listen` request, resolved against
+/// the workspace roots.
+///
+/// Immutable once built: the canonical subscription set and the raw URIs
+/// echoed back to the client are both derived from it, so they cannot
+/// disagree.
+#[derive(Debug)]
+pub struct ListenUris(HashMap<DiagnosticsResourceUri, ListenEntry>);
+
+#[derive(Debug)]
+struct ListenEntry {
+    raw: BTreeSet<String>,
+    lsp_uri: lsp_types::Uri,
+}
+
+/// Upper bound on the summed byte length of the URIs one listen request may
+/// name, keeping rmcp's quadratic filter intersections cheap however long
+/// each URI is.
+const MAX_LISTEN_REQUEST_BYTES: usize = 256 * 1024;
+
+impl ListenUris {
+    /// The subset of `requested` worth acknowledging: deduplicated, and
+    /// syntactically valid `lsp-diagnostics:///` URIs. Touches no filesystem.
+    ///
+    /// Returns `None` when `requested` exceeds the size budget, so rmcp's
+    /// quadratic intersection never sees an oversized list.
+    pub(crate) fn syntactic_filter(requested: &[String]) -> Option<Vec<String>> {
+        if Self::exceeds_budget(requested) {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        Some(
+            requested
+                .iter()
+                .filter(|raw| seen.insert(raw.as_str()) && parse_uri(raw).is_ok())
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Whether `requested` names more than [`MAX_SUBSCRIPTIONS`] URIs or more
+    /// than [`MAX_LISTEN_REQUEST_BYTES`] bytes of them.
+    pub(crate) fn exceeds_budget(requested: &[String]) -> bool {
+        requested.len() > MAX_SUBSCRIPTIONS
+            || requested.iter().map(String::len).sum::<usize>() > MAX_LISTEN_REQUEST_BYTES
+    }
+
+    /// Resolves the acknowledged `accepted` URIs, grouping raw spellings of
+    /// one file under its canonical URI. URIs that no longer resolve inside
+    /// `roots` (the acknowledgment is advisory) are dropped.
+    ///
+    /// Touches the filesystem; call from a blocking context.
+    pub(crate) fn resolve(accepted: &[String], roots: &[PathBuf]) -> Self {
+        let mut map: HashMap<DiagnosticsResourceUri, ListenEntry> = HashMap::new();
+        let mut dropped = 0_usize;
+        for raw in accepted {
+            let resolved = DiagnosticsResourceUri::resolve(raw, roots).ok();
+            let Some((resolved, lsp_uri)) = resolved.and_then(|resolved| {
+                let lsp_uri = crate::bridge::try_path_to_uri(&resolved.path)?;
+                Some((resolved, lsp_uri))
+            }) else {
+                dropped += 1;
+                continue;
+            };
+            map.entry(resolved.uri)
+                .or_insert_with(|| ListenEntry {
+                    raw: BTreeSet::new(),
+                    lsp_uri,
+                })
+                .raw
+                .insert(raw.clone());
+        }
+        if dropped > 0 {
+            debug!("subscriptions/listen dropped {dropped} URIs that no longer resolve");
+        }
+        Self(map)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn raw_for(&self, uri: &DiagnosticsResourceUri) -> impl Iterator<Item = &str> {
+        self.0
+            .get(uri)
+            .into_iter()
+            .flat_map(|entry| entry.raw.iter().map(String::as_str))
+    }
+
+    /// Each canonical URI with the LSP URI of its file, for cache lookups.
+    pub(crate) fn canonical(
+        &self,
+    ) -> impl Iterator<Item = (&DiagnosticsResourceUri, &lsp_types::Uri)> {
+        self.0.iter().map(|(uri, entry)| (uri, &entry.lsp_uri))
+    }
+}
+
+#[derive(Debug)]
+struct RegistryInner {
+    sessions: StdMutex<Vec<Weak<SessionState>>>,
+    listen_permits: Arc<Semaphore>,
 }
 
 /// Tracks every session that has bound delivery, for the diagnostics pump.
@@ -220,7 +356,10 @@ impl SessionState {
 /// A session registers lazily, on its first guarded subscribe. Instances rmcp
 /// builds per request on its stateless HTTP path (#482) never subscribe and so
 /// never register, which keeps this bounded under any amount of stateless
-/// traffic.
+/// traffic. The one exception is a `subscriptions/listen` request, which
+/// registers request-scoped state for exactly the lifetime of the stream; the
+/// number of such streams is capped at `MAX_LISTEN_STREAMS` (100), shared by
+/// all transports and independent of `max_concurrent_sessions`.
 ///
 /// # Examples
 ///
@@ -245,27 +384,51 @@ impl SessionState {
 /// );
 /// let _session = server.for_new_session();
 /// ```
-#[derive(Debug, Default, Clone)]
-pub struct SubscriptionRegistry(Arc<StdMutex<Vec<Weak<SessionState>>>>);
+#[derive(Debug, Clone)]
+pub struct SubscriptionRegistry(Arc<RegistryInner>);
+
+impl Default for SubscriptionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SubscriptionRegistry {
     /// Create an empty registry.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self(Arc::new(RegistryInner {
+            sessions: StdMutex::new(Vec::new()),
+            listen_permits: Arc::new(Semaphore::new(MAX_LISTEN_STREAMS)),
+        }))
     }
 
     fn register(&self, state: &Arc<SessionState>) {
-        let mut guard = lock_std(&self.0);
+        let mut guard = lock_std(&self.0.sessions);
         guard.retain(|weak| weak.strong_count() > 0);
         guard.push(Arc::downgrade(state));
     }
 
     /// Upgrade every still-live entry, pruning dead ones along the way.
     pub(crate) fn live_sessions(&self) -> Vec<Arc<SessionState>> {
-        let mut guard = lock_std(&self.0);
+        let mut guard = lock_std(&self.0.sessions);
         guard.retain(|weak| weak.strong_count() > 0);
         guard.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Reserves one of the [`MAX_LISTEN_STREAMS`] listen slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::ListenLimitReached`] when all are taken.
+    pub(crate) fn try_reserve_listen(&self) -> Result<ListenPermit, SubscriptionError> {
+        let permit = Arc::clone(&self.0.listen_permits)
+            .try_acquire_owned()
+            .map_err(|_| SubscriptionError::ListenLimitReached)?;
+        Ok(ListenPermit {
+            registry: self.clone(),
+            permit,
+        })
     }
 
     /// Raw entry count, dead or alive, without pruning.
@@ -274,8 +437,75 @@ impl SubscriptionRegistry {
     /// growth regression this exists to catch.
     #[cfg(test)]
     pub(crate) fn raw_len(&self) -> usize {
-        lock_std(&self.0).len()
+        lock_std(&self.0.sessions).len()
     }
+}
+
+/// A reserved listen slot, held before any filesystem work so a flood of
+/// listen requests cannot trigger unbounded canonicalization.
+#[derive(Debug)]
+pub struct ListenPermit {
+    registry: SubscriptionRegistry,
+    permit: OwnedSemaphorePermit,
+}
+
+impl ListenPermit {
+    /// Registers request-scoped delivery for `uris` and ties the slot to the
+    /// returned registration.
+    ///
+    /// `target` receives the same `uris` the subscription set is derived
+    /// from, so the delivery map and the set cannot diverge.
+    pub(crate) fn register(
+        self,
+        uris: Arc<ListenUris>,
+        target: impl FnOnce(Arc<ListenUris>) -> Target,
+    ) -> ListenRegistration {
+        let state = Arc::new(SessionState {
+            subs: ResourceSubscriptions::from_canonical(
+                uris.canonical().map(|(uri, _)| uri.clone()),
+            ),
+            delivery: OnceLock::new(),
+        });
+        bind_delivery(&state, &self.registry, || target(uris));
+        ListenRegistration {
+            state,
+            _permit: self.permit,
+        }
+    }
+}
+
+/// Live delivery of one `subscriptions/listen` stream; dropping it stops
+/// delivery and frees the listen slot.
+#[derive(Debug)]
+pub struct ListenRegistration {
+    state: Arc<SessionState>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ListenRegistration {
+    /// Queues `uri` for delivery, e.g. to replay already cached diagnostics.
+    pub(crate) async fn publish(&self, uri: &DiagnosticsResourceUri) {
+        self.state.publish_if_subscribed(uri).await;
+    }
+}
+
+/// Creates `state`'s delivery task and registers it, exactly once.
+fn bind_delivery(
+    state: &Arc<SessionState>,
+    registry: &SubscriptionRegistry,
+    target: impl FnOnce() -> Target,
+) {
+    state.delivery.get_or_init(|| {
+        let (doorbell, rx) = mpsc::channel(1);
+        let pending = Arc::new(StdMutex::new(HashSet::new()));
+        tokio::spawn(run_delivery(target(), Arc::clone(&pending), rx));
+        registry.register(state);
+        Delivery {
+            pending,
+            doorbell,
+            cap_warned: AtomicBool::new(false),
+        }
+    });
 }
 
 /// Owner of one session's [`SessionState`].
@@ -299,7 +529,6 @@ impl SessionHandle {
         Self::new(self.registry.clone())
     }
 
-    #[cfg(test)]
     pub(crate) fn registry(&self) -> SubscriptionRegistry {
         self.registry.clone()
     }
@@ -327,19 +556,8 @@ impl SessionHandle {
         })
     }
 
-    /// Creates the delivery task and registers the session, exactly once.
     fn ensure_delivery(&self, target: impl FnOnce() -> Target) {
-        self.state.delivery.get_or_init(|| {
-            let (doorbell, rx) = mpsc::channel(1);
-            let pending = Arc::new(StdMutex::new(HashSet::new()));
-            tokio::spawn(run_delivery(target(), Arc::clone(&pending), rx));
-            self.registry.register(&self.state);
-            Delivery {
-                pending,
-                doorbell,
-                cap_warned: AtomicBool::new(false),
-            }
-        });
+        bind_delivery(&self.state, &self.registry, target);
     }
 
     /// Subscribes `canonical` through the production binding path with a
@@ -347,11 +565,11 @@ impl SessionHandle {
     #[cfg(test)]
     pub(crate) async fn subscribe_for_test(
         &self,
-        canonical: &str,
+        canonical: &DiagnosticsResourceUri,
         target: Target,
     ) -> Result<bool, SubscriptionError> {
         self.ensure_delivery(|| target);
-        self.state.subs.subscribe(canonical.to_owned()).await
+        self.state.subs.subscribe(canonical.clone()).await
     }
 }
 
@@ -372,7 +590,7 @@ impl StatefulSession<'_> {
     /// Returns whether the URI was newly subscribed.
     pub(crate) async fn subscribe(
         &self,
-        canonical: String,
+        canonical: DiagnosticsResourceUri,
         raw: String,
     ) -> Result<bool, SubscriptionError> {
         self.handle
@@ -380,20 +598,22 @@ impl StatefulSession<'_> {
         self.handle.state.subscribe(canonical, raw).await
     }
 
-    /// Removes the subscription `key` resolves to (canonical URI or recorded
-    /// raw alias), also dropping it from the pending set. Returns whether one
-    /// was found.
+    /// Removes the subscription `canonical` or the recorded alias `raw`
+    /// resolves to, also dropping it from the pending set. Returns whether
+    /// one was found.
     ///
     /// Two benign races can still deliver one stale `resources/updated` for
     /// the URI to this same session afterwards: a publish that passed the
     /// subscription check before this call, and a batch the delivery task
     /// already took. Neither crosses sessions.
-    pub(crate) async fn unsubscribe(&self, key: &str) -> bool {
-        self.handle.state.unsubscribe(key).await
+    pub(crate) async fn unsubscribe(
+        &self,
+        canonical: Option<&DiagnosticsResourceUri>,
+        raw: &str,
+    ) -> bool {
+        self.handle.state.unsubscribe(canonical, raw).await
     }
 }
-
-// TODO(#522): request-scoped SessionState for subscriptions/listen (2026-07-28); echo raw URIs
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -551,29 +771,29 @@ mod tests {
     async fn test_unsubscribe_via_alias_purges_canonical_from_pending() {
         let handle = SessionHandle::new(SubscriptionRegistry::new());
         let (tx, _rx) = mpsc::channel(1);
-        let canonical = "lsp-diagnostics:///private/a.rs";
+        let canonical = DiagnosticsResourceUri::for_test("lsp-diagnostics:///private/a.rs");
         handle
-            .subscribe_for_test(canonical, Target::Channel(tx))
+            .subscribe_for_test(&canonical, Target::Channel(tx))
             .await
             .unwrap();
         let state = &handle.state;
         state
             .subs
-            .record_alias("lsp-diagnostics:///a.rs".to_owned(), canonical.to_owned())
+            .record_alias("lsp-diagnostics:///a.rs".to_owned(), &canonical)
             .await;
         let delivery = state.delivery.get().unwrap();
-        lock_std(&delivery.pending).insert(canonical.to_owned());
+        lock_std(&delivery.pending).insert(canonical);
 
-        assert!(state.unsubscribe("lsp-diagnostics:///a.rs").await);
+        assert!(state.unsubscribe(None, "lsp-diagnostics:///a.rs").await);
 
         assert!(lock_std(&delivery.pending).is_empty());
-        assert!(!state.unsubscribe("lsp-diagnostics:///a.rs").await);
+        assert!(!state.unsubscribe(None, "lsp-diagnostics:///a.rs").await);
     }
 
     #[tokio::test]
     async fn test_subscribe_records_alias_for_later_unsubscribe() {
         let state = SessionState::default();
-        let canonical = "lsp-diagnostics:///private/a.rs".to_owned();
+        let canonical = DiagnosticsResourceUri::for_test("lsp-diagnostics:///private/a.rs");
         let raw = "lsp-diagnostics:///a.rs".to_owned();
         assert!(
             state
@@ -582,7 +802,7 @@ mod tests {
                 .unwrap()
         );
         assert!(!state.subscribe(canonical, raw.clone()).await.unwrap());
-        assert!(state.unsubscribe(&raw).await);
+        assert!(state.unsubscribe(None, &raw).await);
         assert!(state.is_empty().await);
     }
 
@@ -592,25 +812,25 @@ mod tests {
 
         let handle = SessionHandle::new(SubscriptionRegistry::new());
         let (tx, _rx) = mpsc::channel(1);
+        let x = DiagnosticsResourceUri::for_test("lsp-diagnostics:///x.rs");
         handle
-            .subscribe_for_test("lsp-diagnostics:///x.rs", Target::Channel(tx))
+            .subscribe_for_test(&x, Target::Channel(tx))
             .await
             .unwrap();
         let delivery = handle.state.delivery.get().unwrap();
-        lock_std(&delivery.pending)
-            .extend((0..MAX_SUBSCRIPTIONS).map(|i| format!("lsp-diagnostics:///p{i}.rs")));
+        lock_std(&delivery.pending).extend(
+            (0..MAX_SUBSCRIPTIONS)
+                .map(|i| DiagnosticsResourceUri::for_test(&format!("lsp-diagnostics:///p{i}.rs"))),
+        );
 
         let captured = crate::test_lsp::CapturedLogs::default();
         let guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
-        handle
-            .state
-            .publish_if_subscribed("lsp-diagnostics:///x.rs")
-            .await;
+        handle.state.publish_if_subscribed(&x).await;
         drop(guard);
 
         assert_eq!(lock_std(&delivery.pending).len(), MAX_SUBSCRIPTIONS);
-        assert!(!lock_std(&delivery.pending).contains("lsp-diagnostics:///x.rs"));
+        assert!(!lock_std(&delivery.pending).contains(&x));
         assert!(
             captured
                 .messages()
@@ -626,7 +846,10 @@ mod tests {
         let registry = handle.registry();
         let (tx, mut rx) = mpsc::channel(1);
         handle
-            .subscribe_for_test("lsp-diagnostics:///a.rs", Target::Channel(tx))
+            .subscribe_for_test(
+                &DiagnosticsResourceUri::for_test("lsp-diagnostics:///a.rs"),
+                Target::Channel(tx),
+            )
             .await
             .unwrap();
         assert_eq!(registry.live_sessions().len(), 1);
@@ -647,14 +870,14 @@ mod tests {
         const PUBLISHES: usize = 20;
 
         let handle = SessionHandle::new(SubscriptionRegistry::new());
-        let uri = "lsp-diagnostics:///a.rs";
+        let uri = DiagnosticsResourceUri::for_test("lsp-diagnostics:///a.rs");
         let (tx, mut rx) = mpsc::channel(1);
         handle
-            .subscribe_for_test(uri, Target::Channel(tx))
+            .subscribe_for_test(&uri, Target::Channel(tx))
             .await
             .unwrap();
         for _ in 0..PUBLISHES {
-            handle.state.publish_if_subscribed(uri).await;
+            handle.state.publish_if_subscribed(&uri).await;
             tokio::task::yield_now().await;
         }
 
@@ -662,12 +885,130 @@ mod tests {
         while let Ok(Some(received)) =
             tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
         {
-            assert_eq!(received, uri);
+            assert_eq!(received, uri.as_str());
             delivered += 1;
         }
         assert!(
             (1..=3).contains(&delivered),
             "delivered {delivered} updates"
         );
+    }
+
+    use crate::test_lsp::{diagnostics_uri as u, workspace_with_main_rs as workspace_file};
+
+    #[test]
+    fn test_syntactic_filter_dedupes_and_drops_invalid_keeping_raw_verbatim() {
+        let requested = vec![
+            "lsp-diagnostics:///a.rs".to_owned(),
+            "lsp-diagnostics:///%61.rs".to_owned(),
+            "lsp-diagnostics:///a.rs".to_owned(),
+            "file:///b.rs".to_owned(),
+            "lsp-diagnostics://host/c.rs".to_owned(),
+        ];
+        assert_eq!(
+            ListenUris::syntactic_filter(&requested),
+            Some(vec![
+                "lsp-diagnostics:///a.rs".to_owned(),
+                "lsp-diagnostics:///%61.rs".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_syntactic_filter_rejects_oversized_list_without_inspecting_it() {
+        let requested = vec!["lsp-diagnostics:///a.rs".to_owned(); MAX_SUBSCRIPTIONS + 1];
+        assert_eq!(ListenUris::syntactic_filter(&requested), None);
+        assert!(ListenUris::syntactic_filter(&requested[..MAX_SUBSCRIPTIONS]).is_some());
+    }
+
+    #[test]
+    fn test_syntactic_filter_rejects_oversized_total_bytes() {
+        let long = format!("lsp-diagnostics:///{}", "a".repeat(4096));
+        let requested: Vec<String> = (0..100).map(|i| format!("{long}{i}")).collect();
+        assert!(requested.len() <= MAX_SUBSCRIPTIONS);
+        assert_eq!(ListenUris::syntactic_filter(&requested), None);
+        assert!(ListenUris::syntactic_filter(&requested[..50]).is_some());
+    }
+
+    #[test]
+    fn test_listen_uris_group_raw_aliases_under_one_canonical() {
+        let (_dir, root, file) = workspace_file();
+        let canonical = crate::bridge::resources::make_uri(&file).unwrap();
+        let alias = canonical.replace("main.rs", "%6Dain.rs");
+        let (_other_dir, _other_root, outside) = workspace_file();
+        let outside = crate::bridge::resources::make_uri(&outside).unwrap();
+
+        let uris = ListenUris::resolve(&[canonical.clone(), alias.clone(), outside], &[root]);
+
+        let entries: Vec<_> = uris.canonical().collect();
+        assert_eq!(entries.len(), 1, "the outside URI must be dropped");
+        let (uri, lsp_uri) = entries[0];
+        assert_eq!(uri.as_str(), canonical);
+        assert_eq!(lsp_uri, &crate::bridge::path_to_uri(&file).unwrap());
+        let mut expected = [canonical.as_str(), alias.as_str()];
+        expected.sort_unstable();
+        assert_eq!(uris.raw_for(uri).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn test_listen_uris_resolve_to_nothing_is_empty() {
+        let (_dir, root, _file) = workspace_file();
+        let uris = ListenUris::resolve(&["lsp-diagnostics:///no/such/file.rs".to_owned()], &[root]);
+        assert!(uris.is_empty());
+    }
+
+    #[test]
+    fn test_listen_slots_are_capped_and_freed_on_drop() {
+        let registry = SubscriptionRegistry::new();
+        let permits: Vec<_> = (0..MAX_LISTEN_STREAMS)
+            .map(|_| registry.try_reserve_listen().unwrap())
+            .collect();
+        assert_eq!(
+            registry.try_reserve_listen().unwrap_err(),
+            SubscriptionError::ListenLimitReached
+        );
+        drop(permits);
+        assert!(registry.try_reserve_listen().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_listen_registration_delivers_then_unregisters_and_frees_slot() {
+        let (_dir, root, file) = workspace_file();
+        let raw = crate::bridge::resources::make_uri(&file).unwrap();
+        let uris = Arc::new(ListenUris::resolve(std::slice::from_ref(&raw), &[root]));
+        let canonical = uris.canonical().next().unwrap().0.clone();
+
+        let registry = SubscriptionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let registration = registry
+            .try_reserve_listen()
+            .unwrap()
+            .register(uris, |_| Target::Channel(tx));
+        assert_eq!(registry.live_sessions().len(), 1);
+
+        for session in registry.live_sessions() {
+            session.publish_if_subscribed(&canonical).await;
+        }
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(received.as_deref(), Some(raw.as_str()));
+
+        registration
+            .publish(&u("lsp-diagnostics:///unwatched.rs"))
+            .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let held: Vec<_> = (1..MAX_LISTEN_STREAMS)
+            .map(|_| registry.try_reserve_listen().unwrap())
+            .collect();
+        assert!(registry.try_reserve_listen().is_err());
+        drop(registration);
+        assert!(registry.live_sessions().is_empty());
+        assert!(registry.try_reserve_listen().is_ok());
+        drop(held);
     }
 }
