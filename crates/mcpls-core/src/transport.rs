@@ -100,6 +100,8 @@ pub struct HttpConfig {
     /// [`HttpConfig::DEFAULT_MAX_CONCURRENT_SESSIONS`]. A value of `0`
     /// rejects every session.
     pub max_concurrent_sessions: usize,
+    /// How long a session may go without client activity before it is closed.
+    pub(crate) session_idle_timeout: IdleTimeout,
 }
 
 #[cfg(feature = "transport-http")]
@@ -125,6 +127,7 @@ impl HttpConfig {
             path: path.into(),
             max_request_body_bytes: Self::DEFAULT_MAX_REQUEST_BODY_BYTES,
             max_concurrent_sessions: Self::DEFAULT_MAX_CONCURRENT_SESSIONS,
+            session_idle_timeout: IdleTimeout::DEFAULT,
         }
     }
 
@@ -143,17 +146,23 @@ impl HttpConfig {
     }
 }
 
+#[cfg(feature = "transport-http")]
+use std::sync::Mutex as StdMutex;
+
 use rmcp::ServiceExt as _;
 #[cfg(feature = "transport-http")]
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 #[cfg(feature = "transport-http")]
 use rmcp::transport::streamable_http_server::session::local::{
-    LocalSessionManager, LocalSessionManagerError,
+    LocalSessionManager, LocalSessionManagerError, SessionConfig,
 };
 #[cfg(feature = "transport-http")]
 use rmcp::transport::streamable_http_server::session::{
     ServerSseMessage, SessionId, SessionManager,
 };
+
+#[cfg(feature = "transport-http")]
+use crate::bridge::lock_std;
 
 /// A registered handle for waiting on a shutdown signal: `SIGTERM`/`SIGINT`
 /// on Unix (as sent by containers, systemd, and `Ctrl-C`) or `Ctrl-C` on
@@ -367,12 +376,21 @@ pub(crate) async fn run_stdio(
 /// duplicates. A second GET opened while the first is still considered alive
 /// receives no notifications until the first is detected dead.
 ///
-/// A session that sends no requests expires after rmcp's 5-minute idle
-/// `keep_alive` only while no server-initiated notifications flow: each
-/// `resources/updated` re-arms that timer. An abandoned but subscribed session
-/// therefore stays alive, holding one `max_concurrent_sessions` permit, for as
-/// long as its files keep receiving diagnostics (#521). Clients should send `DELETE`
-/// on shutdown; after an expiry they must re-initialize and re-subscribe.
+/// A session is closed, freeing its `max_concurrent_sessions` permit, once it
+/// has had no inbound client activity and no open response stream (POST or
+/// GET) for [`IdleTimeout::DEFAULT`] (5 minutes), swept every fifth of that.
+/// Outbound `resources/updated` notifications do not count as activity, unlike
+/// rmcp's own `keep_alive` timer, which each one re-arms (#521). The idle clock
+/// starts at the later of the last inbound request and the moment the last
+/// stream closed. A client that closes its connections cleanly is noticed on
+/// the next write, at most one SSE keep-alive (15 s) later. A silently vanished
+/// peer (half-open TCP: sleeping laptop, dropped NAT mapping) keeps its stream,
+/// and with it the session, open until the OS gives up retransmitting
+/// (roughly 15-30 minutes on Linux) -- bounded, but not by the idle timeout
+/// (see #531). A client with a GET stream open is never reaped by mcpls, but
+/// rmcp's own 5-minute `keep_alive` still ends a session that sees no event at
+/// all in that time (SSE pings do not count). Clients should send `DELETE` on
+/// shutdown; after an expiry they must re-initialize and re-subscribe.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
 /// "one instance per request"; `resources/subscribe`/`unsubscribe` detect
@@ -443,7 +461,11 @@ pub(crate) async fn run_http(
     };
     use tokio_util::sync::CancellationToken;
 
-    let session_manager = Arc::new(CappedSessionManager::new(cfg.max_concurrent_sessions));
+    let session_manager = Arc::new(CappedSessionManager::new(
+        cfg.max_concurrent_sessions,
+        cfg.session_idle_timeout,
+    ));
+    let reaper_manager = Arc::clone(&session_manager);
     let cancel = CancellationToken::new();
 
     // `mcp_server` is moved (not cloned): `McplsServer` is deliberately not
@@ -473,9 +495,15 @@ pub(crate) async fn run_http(
         .route_service("/", service)
         .layer(axum::middleware::from_fn(enforce_session_cap));
 
+    // TODO(#531): bound half-open GET/listen streams via TCP_USER_TIMEOUT
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
+
+    let reaper_cancel = cancel.child_token();
+    // Stops the reaper on every return path below, not only on shutdown.
+    let _reaper_guard = reaper_cancel.clone().drop_guard();
+    tokio::spawn(run_idle_reaper(reaper_manager, reaper_cancel));
 
     tracing::info!(addr = %cfg.bind, path = %cfg.path, "MCP HTTP transport listening");
     if !cfg.bind.ip().is_loopback() {
@@ -561,8 +589,12 @@ const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration:
 ///
 /// A [`tokio::sync::Semaphore`] permit is acquired atomically inside
 /// [`create_session`](SessionManager::create_session) — before delegating to
-/// the inner manager — and held for the session's lifetime, released in
-/// [`close_session`](SessionManager::close_session). This makes the cap a
+/// the inner manager — and held in a [`SessionSlot`], next to the session's
+/// inbound-activity record, for the session's lifetime. The slot is removed,
+/// releasing the permit, by [`close_session`](SessionManager::close_session)
+/// or by the idle reaper ([`run_idle_reaper`]). Every response stream the
+/// session hands out (POST, GET, resume) carries a [`StreamGuard`], so a
+/// session with an open stream is never reaped. This makes the cap a
 /// true hard bound: the check and the reservation happen as one step, so no
 /// number of concurrent requests can observe spare capacity and all proceed
 /// past it (a "check-then-create" race that a separate read of the session
@@ -592,19 +624,203 @@ const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration:
 /// defaults; overriding them to delegate is not a bug fix.
 #[cfg(feature = "transport-http")]
 struct CappedSessionManager {
-    inner: LocalSessionManager,
+    inner: std::sync::Arc<LocalSessionManager>,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
-    permits:
-        tokio::sync::Mutex<std::collections::HashMap<SessionId, tokio::sync::OwnedSemaphorePermit>>,
+    slots: StdMutex<std::collections::HashMap<SessionId, SessionSlot>>,
+    idle: IdleTimeout,
 }
 
 #[cfg(feature = "transport-http")]
 impl CappedSessionManager {
-    fn new(max_sessions: usize) -> Self {
+    fn new(max_sessions: usize, idle: IdleTimeout) -> Self {
         Self {
-            inner: LocalSessionManager::default(),
+            inner: std::sync::Arc::new(LocalSessionManager::default()),
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_sessions)),
-            permits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            slots: StdMutex::new(std::collections::HashMap::new()),
+            idle,
+        }
+    }
+
+    fn activity(&self, id: &SessionId) -> Option<std::sync::Arc<SessionActivity>> {
+        lock_std(&self.slots)
+            .get(id)
+            .map(|slot| std::sync::Arc::clone(&slot.activity))
+    }
+
+    fn touch(&self, id: &SessionId) {
+        if let Some(activity) = self.activity(id) {
+            activity.touch();
+        }
+    }
+
+    /// Counts a response stream about to open on `id` as activity; `None` for
+    /// an unknown session.
+    fn open_guard(&self, id: &SessionId) -> Option<StreamGuard> {
+        self.activity(id).map(|activity| activity.open_stream())
+    }
+
+    /// Wraps `stream` so the session counts as active until it is dropped.
+    ///
+    /// The guard is taken before the inner call so a sweep cannot slip in
+    /// between the call and the stream existing.
+    fn guarded<S: futures::Stream>(
+        guard: Option<StreamGuard>,
+        stream: S,
+    ) -> impl futures::Stream<Item = S::Item> {
+        use futures::StreamExt as _;
+
+        stream.map(move |message| {
+            let _keep_open = &guard;
+            message
+        })
+    }
+
+    /// Removes every session idle at `now` (freeing its permit at once) and
+    /// closes it in the inner manager on a detached task, so one wedged
+    /// session worker cannot stall the sweep. Returns how many were reaped.
+    ///
+    /// Benign race: a request touching or opening a stream on a session between
+    /// its idle check and its removal here is not seen, so that session is
+    /// reaped anyway. It had been idle for the whole timeout, and the client
+    /// gets a 404 on its next call and re-initializes.
+    fn reap_idle(&self, now: tokio::time::Instant) -> usize {
+        let idle_ids: Vec<SessionId> = {
+            let mut slots = lock_std(&self.slots);
+            let ids: Vec<_> = slots
+                .iter()
+                .filter(|(_, slot)| slot.activity.is_idle(now, self.idle))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                slots.remove(id);
+            }
+            ids
+        };
+        for id in &idle_ids {
+            tracing::debug!(session = %id, "closing idle HTTP session");
+            let inner = std::sync::Arc::clone(&self.inner);
+            let id = id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = inner.close_session(&id).await {
+                    tracing::debug!(session = %id, "closing idle HTTP session failed: {e}");
+                }
+            });
+        }
+        idle_ids.len()
+    }
+}
+
+/// Non-zero duration after which a session without inbound client activity
+/// or open response stream is closed by [`run_idle_reaper`].
+///
+/// Deliberately separate from rmcp's own `keep_alive`, which measures any
+/// event on the session -- including outbound notifications -- and so never
+/// fires for an abandoned but subscribed session (#521).
+#[cfg(feature = "transport-http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdleTimeout(std::time::Duration);
+
+#[cfg(feature = "transport-http")]
+impl IdleTimeout {
+    /// Matches rmcp's default `keep_alive` (5 minutes).
+    pub(crate) const DEFAULT: Self = match Self::new(SessionConfig::DEFAULT_KEEP_ALIVE) {
+        Some(timeout) => timeout,
+        None => panic!("the default idle timeout must be non-zero"),
+    };
+
+    /// `None` for a zero duration, which would make every session instantly
+    /// idle.
+    pub(crate) const fn new(timeout: std::time::Duration) -> Option<Self> {
+        if timeout.is_zero() {
+            None
+        } else {
+            Some(Self(timeout))
+        }
+    }
+
+    /// A fifth of the timeout, so an idle session closes within 1.2x of it;
+    /// never zero, which `tokio::time::interval` rejects.
+    fn sweep_interval(self) -> std::time::Duration {
+        (self.0 / 5).max(std::time::Duration::from_millis(1))
+    }
+}
+
+#[cfg(feature = "transport-http")]
+#[derive(Debug)]
+struct ActivityState {
+    open_streams: usize,
+    idle_since: tokio::time::Instant,
+}
+
+/// Inbound-activity record of one session: how many response streams are
+/// open and since when none has been.
+#[cfg(feature = "transport-http")]
+#[derive(Debug)]
+struct SessionActivity(StdMutex<ActivityState>);
+
+#[cfg(feature = "transport-http")]
+impl SessionActivity {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(StdMutex::new(ActivityState {
+            open_streams: 0,
+            idle_since: tokio::time::Instant::now(),
+        })))
+    }
+
+    fn touch(&self) {
+        lock_std(&self.0).idle_since = tokio::time::Instant::now();
+    }
+
+    fn open_stream(self: &std::sync::Arc<Self>) -> StreamGuard {
+        lock_std(&self.0).open_streams += 1;
+        StreamGuard(std::sync::Arc::clone(self))
+    }
+
+    fn is_idle(&self, now: tokio::time::Instant, timeout: IdleTimeout) -> bool {
+        let state = lock_std(&self.0);
+        state.open_streams == 0 && now.saturating_duration_since(state.idle_since) >= timeout.0
+    }
+}
+
+/// Keeps a session non-idle while one of its response streams is open;
+/// dropping it restarts the idle clock.
+#[cfg(feature = "transport-http")]
+#[derive(Debug)]
+struct StreamGuard(std::sync::Arc<SessionActivity>);
+
+#[cfg(feature = "transport-http")]
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let mut state = lock_std(&self.0.0);
+        state.open_streams = state.open_streams.saturating_sub(1);
+        state.idle_since = tokio::time::Instant::now();
+    }
+}
+
+/// One live session's cap permit and activity record, kept together so the
+/// two cannot diverge.
+#[cfg(feature = "transport-http")]
+#[derive(Debug)]
+struct SessionSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    activity: std::sync::Arc<SessionActivity>,
+}
+
+/// Periodically closes the sessions of `manager` that are idle, until
+/// `cancel` fires.
+#[cfg(feature = "transport-http")]
+async fn run_idle_reaper(
+    manager: std::sync::Arc<CappedSessionManager>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(manager.idle.sweep_interval());
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            _ = ticker.tick() => {
+                manager.reap_idle(tokio::time::Instant::now());
+            }
         }
     }
 }
@@ -646,7 +862,13 @@ impl SessionManager for CappedSessionManager {
             .try_acquire_owned()
             .map_err(|_| CappedSessionManagerError::CapReached)?;
         let (id, transport) = self.inner.create_session().await?;
-        self.permits.lock().await.insert(id.clone(), permit);
+        lock_std(&self.slots).insert(
+            id.clone(),
+            SessionSlot {
+                _permit: permit,
+                activity: SessionActivity::new(),
+            },
+        );
         Ok((id, transport))
     }
 
@@ -655,6 +877,7 @@ impl SessionManager for CappedSessionManager {
         id: &SessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        self.touch(id);
         Ok(self.inner.initialize_session(id, message).await?)
     }
 
@@ -668,7 +891,7 @@ impl SessionManager for CappedSessionManager {
         // the session from its own table (see `LocalSessionManager::close_session`),
         // so skipping the removal here would leak the permit permanently and
         // monotonically shrink capacity.
-        self.permits.lock().await.remove(id);
+        lock_std(&self.slots).remove(id);
         self.inner.close_session(id).await?;
         Ok(())
     }
@@ -679,7 +902,9 @@ impl SessionManager for CappedSessionManager {
         message: ClientJsonRpcMessage,
     ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>
     {
-        Ok(self.inner.create_stream(id, message).await?)
+        let guard = self.open_guard(id);
+        let stream = self.inner.create_stream(id, message).await?;
+        Ok(Self::guarded(guard, stream))
     }
 
     async fn accept_message(
@@ -687,6 +912,7 @@ impl SessionManager for CappedSessionManager {
         id: &SessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<(), Self::Error> {
+        self.touch(id);
         Ok(self.inner.accept_message(id, message).await?)
     }
 
@@ -695,7 +921,9 @@ impl SessionManager for CappedSessionManager {
         id: &SessionId,
     ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>
     {
-        Ok(self.inner.create_standalone_stream(id).await?)
+        let guard = self.open_guard(id);
+        let stream = self.inner.create_standalone_stream(id).await?;
+        Ok(Self::guarded(guard, stream))
     }
 
     async fn resume(
@@ -704,7 +932,9 @@ impl SessionManager for CappedSessionManager {
         last_event_id: String,
     ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>
     {
-        Ok(self.inner.resume(id, last_event_id).await?)
+        let guard = self.open_guard(id);
+        let stream = self.inner.resume(id, last_event_id).await?;
+        Ok(Self::guarded(guard, stream))
     }
 }
 
@@ -887,7 +1117,12 @@ mod tests {
     mod http_tests {
         use std::net::SocketAddr;
 
-        use super::super::{HttpConfig, Transport};
+        use rmcp::model::ClientJsonRpcMessage;
+
+        use super::super::{
+            CappedSessionManager, CappedSessionManagerError, HttpConfig, IdleTimeout,
+            SessionActivity, SessionManager as _, Transport, run_idle_reaper,
+        };
         use crate::test_lsp::CapturedLogs;
 
         #[test]
@@ -1239,7 +1474,8 @@ mod tests {
         async fn test_capped_session_manager_enforces_hard_bound() {
             use rmcp::transport::streamable_http_server::session::SessionManager as _;
 
-            let manager = super::super::CappedSessionManager::new(1);
+            let manager =
+                super::super::CappedSessionManager::new(1, super::super::IdleTimeout::DEFAULT);
 
             let (first_id, _transport) = manager.create_session().await.unwrap();
 
@@ -1274,8 +1510,10 @@ mod tests {
             const MAX_SESSIONS: usize = 5;
             const CONCURRENT_ATTEMPTS: usize = 25;
 
-            let manager =
-                std::sync::Arc::new(super::super::CappedSessionManager::new(MAX_SESSIONS));
+            let manager = std::sync::Arc::new(super::super::CappedSessionManager::new(
+                MAX_SESSIONS,
+                super::super::IdleTimeout::DEFAULT,
+            ));
 
             let mut tasks = tokio::task::JoinSet::new();
             for _ in 0..CONCURRENT_ATTEMPTS {
@@ -1712,13 +1950,39 @@ mod tests {
             /// `200` response headers have arrived, so nothing published
             /// afterwards can race the stream's registration.
             async fn open(addr: SocketAddr, session_id: &str) -> Self {
-                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
                 let request = format!(
                     "GET /mcp HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {session_id}\r\n\r\n"
                 );
-                stream.write_all(request.as_bytes()).await.unwrap();
+                Self::send(addr, request.as_bytes()).await
+            }
+
+            /// Opens a stateless 2026-07-28 `subscriptions/listen` stream.
+            async fn open_listen(addr: SocketAddr, notifications: &serde_json::Value) -> Self {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "subscriptions/listen",
+                    "params": {
+                        "notifications": notifications,
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    },
+                })
+                .to_string();
+                let request = format!(
+                    "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                Self::send(addr, request.as_bytes()).await
+            }
+
+            async fn send(addr: SocketAddr, request: &[u8]) -> Self {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream.write_all(request).await.unwrap();
 
                 let mut head = String::new();
                 let mut chunk = [0u8; 4096];
@@ -1744,10 +2008,9 @@ mod tests {
                 }
             }
 
-            /// Next `notifications/resources/updated` URI on the stream,
-            /// skipping `retry:` priming events, keep-alive comments and
-            /// chunked-encoding framing.
-            async fn next_resource_update(&mut self) -> String {
+            /// Next JSON-RPC message on the stream, skipping `retry:` priming
+            /// events, keep-alive comments and chunked-encoding framing.
+            async fn next_message(&mut self) -> serde_json::Value {
                 use tokio::io::AsyncReadExt as _;
 
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1757,23 +2020,38 @@ mod tests {
                             let Some(data) = line.trim().strip_prefix("data:") else {
                                 continue;
                             };
-                            let Ok(message) =
+                            if let Ok(message) =
                                 serde_json::from_str::<serde_json::Value>(data.trim())
-                            else {
-                                continue;
-                            };
-                            if message["method"] == "notifications/resources/updated" {
-                                return message["params"]["uri"].as_str().unwrap().to_owned();
+                            {
+                                return message;
                             }
                         }
                         let mut chunk = [0u8; 4096];
                         let n = self.stream.read(&mut chunk).await.unwrap();
-                        assert!(n > 0, "GET stream closed before the expected update");
+                        assert!(n > 0, "stream closed before the expected message");
                         self.buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
                     }
                 })
                 .await
-                .unwrap_or_else(|_| panic!("no resources/updated on the GET stream within 5 s"))
+                .unwrap_or_else(|_| panic!("no message on the stream within 5 s"))
+            }
+
+            /// Next `notifications/resources/updated` message.
+            async fn next_resource_update_message(&mut self) -> serde_json::Value {
+                loop {
+                    let message = self.next_message().await;
+                    if message["method"] == "notifications/resources/updated" {
+                        return message;
+                    }
+                }
+            }
+
+            /// Next `notifications/resources/updated` URI on the stream.
+            async fn next_resource_update(&mut self) -> String {
+                self.next_resource_update_message().await["params"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
             }
         }
 
@@ -1870,6 +2148,552 @@ mod tests {
             assert_eq!(stream_a.next_resource_update().await, uri_y);
 
             server_task.abort();
+        }
+
+        const TEST_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+        const E2E_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+        #[test]
+        fn test_idle_timeout_rejects_zero() {
+            assert_eq!(IdleTimeout::new(std::time::Duration::ZERO), None);
+            assert!(IdleTimeout::new(std::time::Duration::from_nanos(1)).is_some());
+        }
+
+        #[test]
+        fn test_idle_timeout_sweep_interval_is_never_zero() {
+            let tiny = IdleTimeout::new(std::time::Duration::from_nanos(1)).unwrap();
+            assert!(!tiny.sweep_interval().is_zero());
+            assert_eq!(
+                IdleTimeout::new(std::time::Duration::from_secs(10))
+                    .unwrap()
+                    .sweep_interval(),
+                std::time::Duration::from_secs(2)
+            );
+        }
+
+        fn idle_secs(secs: u64) -> IdleTimeout {
+            IdleTimeout::new(std::time::Duration::from_secs(secs)).unwrap()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_session_with_open_stream_is_never_idle() {
+            let activity = SessionActivity::new();
+            let guard = activity.open_stream();
+            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+            assert!(!activity.is_idle(tokio::time::Instant::now(), idle_secs(5)));
+
+            drop(guard);
+            assert!(
+                !activity.is_idle(tokio::time::Instant::now(), idle_secs(5)),
+                "closing the last stream restarts the idle clock"
+            );
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            assert!(activity.is_idle(tokio::time::Instant::now(), idle_secs(5)));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_touch_restarts_idle_clock() {
+            let activity = SessionActivity::new();
+            tokio::time::advance(std::time::Duration::from_secs(4)).await;
+            activity.touch();
+            tokio::time::advance(std::time::Duration::from_secs(4)).await;
+            assert!(!activity.is_idle(tokio::time::Instant::now(), idle_secs(5)));
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            assert!(activity.is_idle(tokio::time::Instant::now(), idle_secs(5)));
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_reap_idle_frees_permit_and_spares_touched_sessions() {
+            let manager = CappedSessionManager::new(2, idle_secs(10));
+            let (idle_id, _idle_transport) = manager.create_session().await.unwrap();
+            let (busy_id, _busy_transport) = manager.create_session().await.unwrap();
+            assert!(matches!(
+                manager.create_session().await,
+                Err(CappedSessionManagerError::CapReached)
+            ));
+
+            tokio::time::advance(std::time::Duration::from_secs(6)).await;
+            manager.touch(&busy_id);
+            tokio::time::advance(std::time::Duration::from_secs(6)).await;
+
+            assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 1);
+            assert_eq!(manager.semaphore.available_permits(), 1);
+            assert!(manager.activity(&idle_id).is_none());
+            assert!(manager.activity(&busy_id).is_some());
+            assert!(manager.create_session().await.is_ok());
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_run_idle_reaper_closes_idle_session_and_stops_on_cancel() {
+            let manager = std::sync::Arc::new(CappedSessionManager::new(1, idle_secs(10)));
+            let (id, _transport) = manager.create_session().await.unwrap();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let reaper = tokio::spawn(run_idle_reaper(
+                std::sync::Arc::clone(&manager),
+                cancel.clone(),
+            ));
+
+            tokio::time::sleep(std::time::Duration::from_secs(13)).await;
+            assert!(manager.activity(&id).is_none());
+            assert_eq!(manager.semaphore.available_permits(), 1);
+            assert!(!manager.has_session(&id).await.unwrap());
+
+            cancel.cancel();
+            tokio::time::timeout(std::time::Duration::from_secs(1), reaper)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        /// Creates a session and serves an initialized MCP server on it, since
+        /// the session worker answers stream requests only after the handshake.
+        async fn initialized_session(
+            manager: &CappedSessionManager,
+        ) -> (
+            rmcp::transport::streamable_http_server::session::SessionId,
+            tokio::task::JoinHandle<()>,
+        ) {
+            use rmcp::ServiceExt as _;
+
+            let (id, transport) = manager.create_session().await.unwrap();
+            let serving = tokio::spawn(async move {
+                if let Ok(running) = test_server().serve(transport).await {
+                    running.waiting().await.ok();
+                }
+            });
+            let initialize: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"},
+                },
+            }))
+            .unwrap();
+            manager.initialize_session(&id, initialize).await.unwrap();
+            let initialized: ClientJsonRpcMessage = serde_json::from_value(
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .unwrap();
+            manager.accept_message(&id, initialized).await.unwrap();
+            (id, serving)
+        }
+
+        /// Holds `stream` (a response stream of the manager's only session)
+        /// unpolled past the idle timeout and checks it keeps the session from
+        /// being reaped until it is dropped.
+        async fn assert_open_stream_blocks_reaping<S>(manager: &CappedSessionManager, stream: S) {
+            tokio::time::advance(std::time::Duration::from_secs(30)).await;
+            assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 0);
+
+            drop(stream);
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            assert_eq!(manager.reap_idle(tokio::time::Instant::now()), 1);
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_open_resume_stream_blocks_reaping() {
+            let manager = CappedSessionManager::new(1, idle_secs(10));
+            let (id, serving) = initialized_session(&manager).await;
+            let stream = manager.resume(&id, "0".to_owned()).await.unwrap();
+            assert_open_stream_blocks_reaping(&manager, stream).await;
+            serving.abort();
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_open_post_stream_blocks_reaping() {
+            let manager = CappedSessionManager::new(1, idle_secs(10));
+            let (id, serving) = initialized_session(&manager).await;
+            let ping: ClientJsonRpcMessage = serde_json::from_value(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            )
+            .unwrap();
+            let stream = manager.create_stream(&id, ping).await.unwrap();
+            assert_open_stream_blocks_reaping(&manager, stream).await;
+            serving.abort();
+        }
+
+        // `manager` lives to the end of the test.
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test(start_paused = true)]
+        async fn test_open_standalone_stream_blocks_reaping() {
+            let manager = CappedSessionManager::new(1, idle_secs(10));
+            let (id, serving) = initialized_session(&manager).await;
+            let stream = manager.create_standalone_stream(&id).await.unwrap();
+            assert_open_stream_blocks_reaping(&manager, stream).await;
+            serving.abort();
+        }
+
+        /// Starts `run_http` with the e2e idle timeout and a session cap of
+        /// `max_sessions`.
+        async fn spawn_idle_test_server(
+            max_sessions: usize,
+            server: crate::mcp::McplsServer,
+        ) -> (
+            SocketAddr,
+            tokio::task::JoinHandle<Result<(), crate::Error>>,
+        ) {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+            let mut cfg = HttpConfig::new(addr, "/mcp").with_max_concurrent_sessions(max_sessions);
+            cfg.session_idle_timeout = IdleTimeout::new(TEST_IDLE).unwrap();
+            let task = tokio::spawn(super::super::run_http(
+                server,
+                cfg,
+                super::super::ShutdownSignal::new(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            (addr, task)
+        }
+
+        fn publish_notification(file: &std::path::Path) -> crate::lsp::LspNotification {
+            crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+                uri: crate::bridge::path_to_uri(file).unwrap(),
+                diagnostics: vec![],
+                version: None,
+            })
+        }
+
+        /// #521: a subscribed session whose client vanished must still
+        /// expire, even though its files keep producing notifications.
+        /// Keeps publishing until a fresh `initialize` finds the sole slot
+        /// free, since releasing the dead stream needs a failed write.
+        #[tokio::test]
+        async fn test_abandoned_subscribed_session_expires_despite_notifications() {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let file = root.join("main.rs");
+            std::fs::write(&file, "fn main() {}").unwrap();
+            let uri = crate::bridge::resources::make_uri(&file).unwrap();
+
+            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let registry = server.subscription_registry();
+            let (addr, server_task) = spawn_idle_test_server(1, server).await;
+
+            let (session, stream) = establish_session(addr).await;
+            subscribe_in_session(addr, &session, &uri).await;
+            drop(stream);
+
+            let (tx, _cancel_tx) =
+                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+            let accept_headers =
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
+            let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+            let deadline = tokio::time::Instant::now() + E2E_DEADLINE;
+            loop {
+                tx.send(publish_notification(&file)).await.unwrap();
+                let response = raw_http_post(addr, "/mcp", accept_headers, initialize).await;
+                if response.starts_with("HTTP/1.1 200") {
+                    break;
+                }
+                assert!(
+                    response.starts_with("HTTP/1.1 429"),
+                    "unexpected response while waiting for expiry: {response}"
+                );
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "abandoned session still holds its slot after {E2E_DEADLINE:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            server_task.abort();
+        }
+
+        /// #521 non-regression: a healthy session that only listens on its
+        /// GET stream (no POSTs) is never reaped, and keeps receiving updates.
+        #[tokio::test]
+        async fn test_healthy_get_only_listener_is_not_reaped() {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let file = root.join("main.rs");
+            std::fs::write(&file, "fn main() {}").unwrap();
+            let uri = crate::bridge::resources::make_uri(&file).unwrap();
+
+            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let registry = server.subscription_registry();
+            let (addr, server_task) = spawn_idle_test_server(1, server).await;
+
+            let (session, mut stream) = establish_session(addr).await;
+            subscribe_in_session(addr, &session, &uri).await;
+            let (tx, _cancel_tx) =
+                crate::test_lsp::spawn_test_pump(registry, std::sync::Arc::from(vec![root]));
+
+            let started = tokio::time::Instant::now();
+            while started.elapsed() < TEST_IDLE * 3 {
+                tx.send(publish_notification(&file)).await.unwrap();
+                assert_eq!(stream.next_resource_update().await, uri);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            let ping = post_in_session(
+                addr,
+                &session,
+                r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#,
+            )
+            .await;
+            assert!(
+                ping.starts_with("HTTP/1.1 200"),
+                "session with an open GET stream must survive 3x the idle timeout, got: {ping}"
+            );
+
+            server_task.abort();
+        }
+
+        const SUBSCRIPTION_ID_KEY: &str = "io.modelcontextprotocol/subscriptionId";
+
+        /// Binds `run_http` over a fresh workspace holding `main.rs` and returns
+        /// what the listen tests need.
+        struct ListenFixture {
+            addr: SocketAddr,
+            registry: crate::mcp::SubscriptionRegistry,
+            root: std::path::PathBuf,
+            file: std::path::PathBuf,
+            uri: String,
+            server_task: tokio::task::JoinHandle<Result<(), crate::Error>>,
+            _workspace: tempfile::TempDir,
+        }
+
+        async fn spawn_listen_fixture() -> ListenFixture {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(workspace.path()).unwrap();
+            let file = root.join("main.rs");
+            std::fs::write(&file, "fn main() {}").unwrap();
+            let uri = crate::bridge::resources::make_uri(&file).unwrap();
+            let server = test_server_with_roots(std::sync::Arc::from(vec![root.clone()]));
+            let registry = server.subscription_registry();
+            let (addr, server_task) = spawn_idle_test_server(1, server).await;
+            ListenFixture {
+                addr,
+                registry,
+                root,
+                file,
+                uri,
+                server_task,
+                _workspace: workspace,
+            }
+        }
+
+        /// Polls until `registry` holds no live session, or fails after the
+        /// e2e deadline.
+        async fn assert_registry_empties(registry: &crate::mcp::SubscriptionRegistry) {
+            let deadline = tokio::time::Instant::now() + E2E_DEADLINE;
+            while !registry.live_sessions().is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "listen registration outlived its connection"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        /// #522: a stateless `subscriptions/listen` stream acknowledges only
+        /// syntactically valid URIs and then delivers one `resources/updated`
+        /// per raw spelling of a published file, tagged with the subscription id.
+        #[tokio::test]
+        async fn test_http_listen_delivers_one_update_per_raw_uri() {
+            let fx = spawn_listen_fixture().await;
+            let alias = fx.uri.replace("main.rs", "%6Dain.rs");
+            let other = tempfile::TempDir::new().unwrap();
+            let outside = crate::bridge::resources::make_uri(
+                &dunce::canonicalize(other.path()).unwrap().join("x.rs"),
+            )
+            .unwrap();
+            let requested = [
+                &fx.uri,
+                &alias,
+                &outside,
+                &"file:///not-a-diagnostics-uri".to_owned(),
+            ];
+            let mut stream = SseStream::open_listen(
+                fx.addr,
+                &serde_json::json!({"resourceSubscriptions": requested}),
+            )
+            .await;
+
+            let ack = loop {
+                let message = stream.next_message().await;
+                if message["method"] == "notifications/subscriptions/acknowledged" {
+                    break message;
+                }
+            };
+            assert_eq!(
+                ack["params"]["notifications"]["resourceSubscriptions"],
+                serde_json::json!([fx.uri, alias, outside])
+            );
+
+            // The acknowledgment precedes registration; a publish before it is
+            // only recovered by cache replay, which this pump's own cache lacks.
+            let deadline = tokio::time::Instant::now() + E2E_DEADLINE;
+            while fx.registry.live_sessions().is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "listen never registered"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
+                fx.registry.clone(),
+                std::sync::Arc::from(vec![fx.root.clone()]),
+            );
+            tx.send(publish_notification(&fx.file)).await.unwrap();
+
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..2 {
+                let update = stream.next_resource_update_message().await;
+                assert_eq!(update["params"]["_meta"][SUBSCRIPTION_ID_KEY], 7);
+                seen.insert(update["params"]["uri"].as_str().unwrap().to_owned());
+            }
+            assert_eq!(seen, [fx.uri.clone(), alias].into_iter().collect());
+
+            drop(stream);
+            assert_registry_empties(&fx.registry).await;
+            fx.server_task.abort();
+        }
+
+        /// #522: once all listen slots are taken, the next listen is
+        /// acknowledged and then fails with the retryable `-32053`.
+        #[tokio::test]
+        async fn test_http_listen_beyond_slot_limit_fails_with_retryable_error() {
+            let fx = spawn_listen_fixture().await;
+            let notifications = serde_json::json!({"resourceSubscriptions": [fx.uri]});
+            let mut streams = Vec::new();
+            for _ in 0..crate::bridge::resources::MAX_LISTEN_STREAMS {
+                streams.push(SseStream::open_listen(fx.addr, &notifications).await);
+            }
+            let deadline = tokio::time::Instant::now() + E2E_DEADLINE;
+            while fx.registry.live_sessions().len() < streams.len() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "listen streams never all registered"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            let mut refused = SseStream::open_listen(fx.addr, &notifications).await;
+            let error = loop {
+                let message = refused.next_message().await;
+                if message["error"].is_object() {
+                    break message["error"].clone();
+                }
+            };
+            assert_eq!(
+                error["code"],
+                crate::error::LISTEN_STREAMS_EXHAUSTED_ERROR_CODE
+            );
+            assert_eq!(
+                error["data"]["max_listen_streams"],
+                crate::bridge::resources::MAX_LISTEN_STREAMS
+            );
+
+            drop(streams);
+            assert_registry_empties(&fx.registry).await;
+            fx.server_task.abort();
+        }
+
+        /// #522: diagnostics already cached when the stream opens are replayed
+        /// right after the acknowledgment.
+        #[tokio::test]
+        async fn test_http_listen_replays_cached_diagnostics() {
+            let (_workspace, root, file) = crate::test_lsp::workspace_with_main_rs();
+            let uri = crate::bridge::resources::make_uri(&file).unwrap();
+            let cache = std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::bridge::NotificationCache::new(),
+            ));
+            cache.lock().await.store_diagnostics(
+                &crate::config::ServerId::from("rust"),
+                &crate::bridge::path_to_uri(&file).unwrap(),
+                None,
+                vec![],
+            );
+            let server = crate::mcp::McplsServer::new(
+                std::sync::Arc::new(crate::bridge::Translator::new()),
+                cache,
+                std::sync::Arc::from(vec![root]),
+                crate::mcp::SubscriptionRegistry::new(),
+                false,
+                crate::config::McpConfig::default(),
+            );
+            let registry = server.subscription_registry();
+            let (addr, server_task) = spawn_idle_test_server(1, server).await;
+
+            let mut stream =
+                SseStream::open_listen(addr, &serde_json::json!({"resourceSubscriptions": [uri]}))
+                    .await;
+            assert_eq!(stream.next_resource_update().await, uri);
+
+            drop(stream);
+            assert_registry_empties(&registry).await;
+            server_task.abort();
+        }
+
+        /// #522: a listen whose URIs all fall outside the workspace is
+        /// acknowledged and then fails with invalid-params, holding no slot.
+        #[tokio::test]
+        async fn test_http_listen_with_only_unresolvable_uris_fails() {
+            let fx = spawn_listen_fixture().await;
+            let other = tempfile::TempDir::new().unwrap();
+            let outside = crate::bridge::resources::make_uri(
+                &dunce::canonicalize(other.path()).unwrap().join("x.rs"),
+            )
+            .unwrap();
+            let mut stream = SseStream::open_listen(
+                fx.addr,
+                &serde_json::json!({"resourceSubscriptions": [outside]}),
+            )
+            .await;
+
+            let error = loop {
+                let message = stream.next_message().await;
+                if message["error"].is_object() {
+                    break message["error"].clone();
+                }
+            };
+            assert_eq!(error["code"], -32602);
+            assert!(fx.registry.live_sessions().is_empty());
+            fx.server_task.abort();
+        }
+
+        /// #522: more URIs than a stream may watch yields an empty
+        /// acknowledgment followed by an invalid-params error.
+        #[tokio::test]
+        async fn test_http_listen_oversized_request_is_rejected() {
+            let fx = spawn_listen_fixture().await;
+            let uris: Vec<String> = (0..=crate::bridge::resources::MAX_SUBSCRIPTIONS)
+                .map(|i| format!("lsp-diagnostics:///f{i}.rs"))
+                .collect();
+            let mut stream = SseStream::open_listen(
+                fx.addr,
+                &serde_json::json!({"resourceSubscriptions": uris}),
+            )
+            .await;
+
+            let mut acknowledged = false;
+            let error = loop {
+                let message = stream.next_message().await;
+                if message["method"] == "notifications/subscriptions/acknowledged" {
+                    assert!(
+                        message["params"]["notifications"]["resourceSubscriptions"].is_null(),
+                        "oversized request must not echo any URI: {message}"
+                    );
+                    acknowledged = true;
+                }
+                if message["error"].is_object() {
+                    break message["error"].clone();
+                }
+            };
+            assert!(acknowledged);
+            assert_eq!(error["code"], -32602);
+            fx.server_task.abort();
         }
 
         /// #233: binding to a non-loopback address must log a warning that

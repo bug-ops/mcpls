@@ -54,7 +54,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bridge::resources::make_uri;
+use bridge::resources::DiagnosticsResourceUri;
 use bridge::{NotificationCache, Translator};
 pub use config::{ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
@@ -214,8 +214,9 @@ pub(crate) async fn diagnostics_pump(
                             continue;
                         }
 
-                        let Some(path) = bridge::uri_to_path(&p.uri) else { continue };
-                        let Ok(mcp_uri) = make_uri(&path) else { continue };
+                        let Some(mcp_uri) = DiagnosticsResourceUri::for_published(&p.uri) else {
+                            continue;
+                        };
 
                         for session in &sessions {
                             session.publish_if_subscribed(&mcp_uri).await;
@@ -2471,8 +2472,8 @@ mod tests {
 
         use crate::test_lsp::spawn_test_pump;
 
-        fn test_mcp_uri(file: &str) -> String {
-            make_uri(&bridge::uri_to_path(&test_uri(file)).unwrap()).unwrap()
+        fn test_mcp_uri(file: &str) -> DiagnosticsResourceUri {
+            DiagnosticsResourceUri::for_published(&test_uri(file)).unwrap()
         }
 
         fn publish(file: &str) -> LspNotification {
@@ -2516,7 +2517,7 @@ mod tests {
 
             let (tx, _cancel_tx) = spawn_test_pump(subs, test_workspace_roots());
             tx.send(publish("x.rs")).await.unwrap();
-            assert_eq!(recv_within(&mut rx_a).await, x);
+            assert_eq!(recv_within(&mut rx_a).await, x.as_str());
             // Gives a wrongly queued X time to reach B before Y exists.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             assert!(
@@ -2525,8 +2526,8 @@ mod tests {
             );
 
             tx.send(publish("y.rs")).await.unwrap();
-            assert_eq!(recv_within(&mut rx_b).await, y);
-            assert_eq!(recv_within(&mut rx_a).await, y);
+            assert_eq!(recv_within(&mut rx_b).await, y.as_str());
+            assert_eq!(recv_within(&mut rx_a).await, y.as_str());
         }
 
         /// #468: a session whose peer stopped reading neither blocks the pump
@@ -2542,7 +2543,7 @@ mod tests {
             let healthy = SessionHandle::new(subs.clone());
             let (tx_stalled, mut rx_stalled) = mpsc::channel(1);
             let (tx_healthy, mut rx_healthy) = mpsc::channel(URI_COUNT);
-            let expected: HashSet<String> = (0..URI_COUNT)
+            let expected: HashSet<DiagnosticsResourceUri> = (0..URI_COUNT)
                 .map(|i| test_mcp_uri(&format!("f{i}.rs")))
                 .collect();
             for uri in &expected {
@@ -2563,13 +2564,17 @@ mod tests {
 
             let mut healthy_received = HashSet::new();
             for _ in 0..URI_COUNT {
-                healthy_received.insert(recv_within(&mut rx_healthy).await);
+                healthy_received.insert(DiagnosticsResourceUri::for_test(
+                    &recv_within(&mut rx_healthy).await,
+                ));
             }
             assert_eq!(healthy_received, expected);
 
             let mut stalled_received = HashSet::new();
             for _ in 0..URI_COUNT {
-                stalled_received.insert(recv_within(&mut rx_stalled).await);
+                stalled_received.insert(DiagnosticsResourceUri::for_test(
+                    &recv_within(&mut rx_stalled).await,
+                ));
             }
             assert_eq!(stalled_received, expected);
         }
@@ -2610,7 +2615,7 @@ mod tests {
             let root = dunce::canonicalize(workspace.path()).unwrap();
             let file = root.join("main.rs");
             std::fs::write(&file, "fn main() {}").unwrap();
-            let canonical_uri = make_uri(&file).unwrap();
+            let canonical_uri = bridge::resources::make_uri(&file).unwrap();
 
             let subs = make_subs();
             let server = mcp::McplsServer::new(

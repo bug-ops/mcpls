@@ -338,6 +338,26 @@ pub enum Error {
         max: usize,
     },
 
+    /// Too many concurrent `subscriptions/listen` streams are open.
+    ///
+    /// Transient: a stream closing frees a slot, so it is classified as
+    /// retryable (see [`Error::mcp_error_kind`]).
+    #[error("listen stream limit of {max} reached; retry once another stream closes")]
+    ListenStreamsExhausted {
+        /// Maximum number of concurrent listen streams.
+        max: usize,
+    },
+
+    /// A `subscriptions/listen` request asked for more resource URIs than a
+    /// single stream may watch.
+    #[error(
+        "subscriptions/listen request exceeds the limit of {max} resource URIs or their total size budget"
+    )]
+    ListenFilterTooLarge {
+        /// Maximum number of resource URIs per listen stream.
+        max: usize,
+    },
+
     /// File size limit exceeded.
     #[error(
         "file size limit exceeded: {size} bytes, max {max} bytes (raise workspace.max_file_size in config to increase this)"
@@ -452,6 +472,23 @@ pub const SERVER_INITIALIZING_ERROR_CODE: i32 = -32051;
 /// ```
 pub const STATELESS_SUBSCRIPTION_ERROR_CODE: i32 = -32052;
 
+/// Bespoke JSON-RPC code for [`Error::ListenStreamsExhausted`].
+///
+/// Same convention range as [`WORKSPACE_INDEXING_ERROR_CODE`], next unused
+/// slot after [`STATELESS_SUBSCRIPTION_ERROR_CODE`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::{
+///     LISTEN_STREAMS_EXHAUSTED_ERROR_CODE, STATELESS_SUBSCRIPTION_ERROR_CODE,
+/// };
+///
+/// assert_eq!(LISTEN_STREAMS_EXHAUSTED_ERROR_CODE, -32053);
+/// assert_ne!(LISTEN_STREAMS_EXHAUSTED_ERROR_CODE, STATELESS_SUBSCRIPTION_ERROR_CODE);
+/// ```
+pub const LISTEN_STREAMS_EXHAUSTED_ERROR_CODE: i32 = -32053;
+
 /// Structured `data` payload of a retryable JSON-RPC error.
 ///
 /// Each variant pairs a bespoke error code ([`Self::code`]) with its own
@@ -493,6 +530,11 @@ pub enum RetryableErrorData {
     /// could be narrowed down, so there is no server to name. The braces
     /// keep the wire value an empty object rather than `null`.
     WorkspaceServersInitializing {},
+    /// The concurrent `subscriptions/listen` stream limit is reached.
+    ListenStreamsExhausted {
+        /// Maximum number of concurrent listen streams.
+        max_listen_streams: usize,
+    },
 }
 
 impl RetryableErrorData {
@@ -504,6 +546,7 @@ impl RetryableErrorData {
             Self::ServerInitializing { .. } | Self::WorkspaceServersInitializing {} => {
                 SERVER_INITIALIZING_ERROR_CODE
             }
+            Self::ListenStreamsExhausted { .. } => LISTEN_STREAMS_EXHAUSTED_ERROR_CODE,
         }
     }
 }
@@ -567,8 +610,16 @@ impl Error {
             | Self::PathOutsideWorkspace(_)
             | Self::NotARegularFile(_)
             | Self::InvalidUri(_)
+            | Self::ListenFilterTooLarge { .. }
             | Self::DocumentNotFound(_)
             | Self::FileSizeLimitExceeded { .. } => McpErrorKind::InvalidParams,
+
+            // Frees up as soon as another listen stream closes.
+            Self::ListenStreamsExhausted { max } => {
+                McpErrorKind::Retryable(RetryableErrorData::ListenStreamsExhausted {
+                    max_listen_streams: *max,
+                })
+            }
 
             // A path that doesn't exist -- whether freshly supplied in this
             // request or tracked from an earlier request and then
@@ -1033,6 +1084,7 @@ mod tests {
             Error::InvalidUri("not a uri".to_string()),
             Error::DocumentNotFound(PathBuf::from("/missing.rs")),
             Error::FileSizeLimitExceeded { size: 100, max: 10 },
+            Error::ListenFilterTooLarge { max: 1000 },
         ];
 
         for err in caller_fault_errors {
@@ -1122,11 +1174,33 @@ mod tests {
                 SERVER_INITIALIZING_ERROR_CODE,
                 serde_json::json!({}),
             ),
+            (
+                RetryableErrorData::ListenStreamsExhausted {
+                    max_listen_streams: 100,
+                },
+                LISTEN_STREAMS_EXHAUSTED_ERROR_CODE,
+                serde_json::json!({"max_listen_streams": 100}),
+            ),
         ];
         for (data, code, wire) in cases {
             assert_eq!(data.code(), code);
             assert_eq!(serde_json::to_value(&data).unwrap(), wire);
         }
+    }
+
+    #[test]
+    fn test_mcp_error_kind_listen_streams_exhausted_is_retryable() {
+        let err = Error::ListenStreamsExhausted { max: 100 };
+        let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
+            panic!("expected ListenStreamsExhausted to classify as Retryable");
+        };
+        assert_eq!(data.code(), LISTEN_STREAMS_EXHAUSTED_ERROR_CODE);
+        assert_eq!(
+            data,
+            RetryableErrorData::ListenStreamsExhausted {
+                max_listen_streams: 100
+            }
+        );
     }
 
     #[test]

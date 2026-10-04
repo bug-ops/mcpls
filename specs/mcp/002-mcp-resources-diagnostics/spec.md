@@ -64,6 +64,7 @@ SO THAT my implementation can be event-driven rather than polling-based.
 | FR-005 | Existing `get_cached_diagnostics` tool must remain for clients that do not support resources | must |
 | FR-006 | `notifications/resources/updated` must be delivered per session: a session receives it only for URIs that session itself subscribed to, and a stalled session must not delay or lose updates for any other session (#468) | must |
 | FR-007 | Over HTTP, `notifications/resources/updated` must be sent on the session's standalone GET (SSE) stream; subscriptions require a session established via the `initialize` handshake (#468, #482) | must |
+| FR-008 | Over HTTP, a session is closed (freeing its session-cap slot) once it has had no inbound client request and no open response stream for 5 minutes; outbound `resources/updated` does not count as activity. The clock starts at the later of the last request and the last stream close; a cleanly closed stream is noticed on the next write (at most one 15 s SSE keep-alive later), while a silently vanished peer (half-open TCP) holds its stream until the OS drops the connection (about 15-30 minutes on Linux, #531). A client with an open GET stream is never closed by this rule, though rmcp's own 5-minute `keep_alive` still ends a session that sees no event at all (SSE pings do not count) (#521) | must |
 
 ## 4. Non-Functional Requirements
 
