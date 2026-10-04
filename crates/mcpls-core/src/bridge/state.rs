@@ -1366,8 +1366,8 @@ impl Decision {
 /// Prefer `try_path_to_uri` on paths that come from configuration or
 /// otherwise untrusted input; this wrapper exists for the common case of an
 /// already-canonicalized path, where the conversion is not expected to fail
-/// but must still surface as an error rather than a panic to keep the
-/// `panic = "abort"` release profile safe against unforeseen inputs.
+/// but must still surface as an error rather than a panic on unforeseen
+/// inputs.
 ///
 /// # Errors
 ///

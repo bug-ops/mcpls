@@ -298,6 +298,9 @@ pub(crate) struct RegisteredServers {
     /// here, right after the rebind, so it always reflects the post-rebind
     /// router rather than a stale pre-rebind view.
     pub(crate) diagnostics_flags: HashMap<ServerId, bool>,
+    /// Workspace-indexing policy each server was configured with, taken from
+    /// the config it was spawned from.
+    pub(crate) indexing_policies: HashMap<ServerId, bridge::IndexingPolicy>,
 }
 
 /// Register initialized LSP servers with the translator, rebind the router to
@@ -309,14 +312,9 @@ pub(crate) struct RegisteredServers {
 /// so no external synchronization is required here; the rebind that follows
 /// relies only on all of *this* function's inserts having completed, which
 /// the sequential code below guarantees.
-///
-/// `configs` supplies the `ServerInitConfig` each surviving server was
-/// spawned from, keyed by routing identity, so the translator can respawn it
-/// later if its process dies (see `Translator::respawn_if_dead`).
 pub(crate) fn register_servers(
     mut result: lsp::ServerInitResult,
     translator: &bridge::Translator,
-    configs: &HashMap<ServerId, ServerInitConfig>,
 ) -> RegisteredServers {
     let mut receivers = HashMap::new();
     for (id, server) in &mut result.servers {
@@ -329,23 +327,11 @@ pub(crate) fn register_servers(
     let registered: HashSet<ServerId> = result.servers.keys().cloned().collect();
 
     let mut language_by_id = HashMap::new();
+    let mut indexing_policies = HashMap::new();
     for (id, server) in result.servers {
-        let client = server.client().clone();
-        language_by_id.insert(id.clone(), client.language_id().to_string());
-        translator.register_client(id.clone(), client);
-        if let Some(config) = configs.get(&id) {
-            translator.register_server_config(id.clone(), config.clone());
-        } else {
-            // Would silently turn auto-respawn into a no-op for this server
-            // (surfacing as `Error::ServerUnavailable` instead of actually
-            // recovering) -- the keys are derived identically on both sides
-            // (`LspServerConfig::id()`), so this should never happen; warn
-            // rather than fail, since the server is otherwise usable.
-            warn!(
-                "No respawn config registered for LSP server '{id}'; auto-respawn on crash will be unavailable for it"
-            );
-        }
-        translator.register_server(id, server);
+        language_by_id.insert(id.clone(), server.client().language_id().to_string());
+        indexing_policies.insert(id, server.init_config().server_config.indexing);
+        translator.register_server_complete(server);
     }
 
     translator.rebind_router(&registered);
@@ -361,6 +347,7 @@ pub(crate) fn register_servers(
     RegisteredServers {
         receivers,
         diagnostics_flags,
+        indexing_policies,
     }
 }
 
@@ -862,12 +849,11 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// does *not* reopen a window where a repeat signal could hit the OS's
 /// default disposition. What it does instead: with no live [`ShutdownSignal`]
 /// subscribed, a signal delivered during `shutdown_servers`/
-/// `await_lsp_init_handle` (bounded by [`Translator::shutdown_servers`]'s own
-/// per-server timeout and [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst
-/// case) is recorded and then silently discarded — there is no receiver to
-/// broadcast it to. Before this fix, that made cleanup **uninterruptible**:
-/// an operator's repeat `Ctrl-C`/`SIGTERM` during that window was a no-op
-/// short of `SIGKILL`.
+/// `await_lsp_init_handle` (bounded by [`lsp::SHUTDOWN_TIMEOUT`] and
+/// [`LSP_INIT_TASK_SHUTDOWN_TIMEOUT`], ~15s worst case) is recorded and then
+/// silently discarded — there is no receiver to broadcast it to. Before this
+/// fix, that made cleanup **uninterruptible**: an operator's repeat
+/// `Ctrl-C`/`SIGTERM` during that window was a no-op short of `SIGKILL`.
 ///
 /// This function re-registers a fresh `ShutdownSignal` first thing to give
 /// cleanup a listener again, restoring the ability to force-quit a stuck
@@ -884,11 +870,10 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// in the re-registration gap above is silently dropped rather than
 /// counted, requiring a second repeat before acting would let an unlucky
 /// operator's second press go unnoticed too. `exit(1)` skips unwinding, so
-/// it forfeits `Drop` (`kill_on_drop` on any still-running LSP child)
-/// exactly like the pre-existing panic/abort gap documented on
-/// [`Translator::shutdown_servers`]'s "Limitations" section — an explicit
-/// trade the operator is asking for, not a case this fix silently
-/// regresses.
+/// it forfeits `Drop` (`kill_on_drop` on any still-running LSP child), one of
+/// the gaps documented on [`Translator::shutdown_servers`]'s "Limitations"
+/// section — an explicit trade the operator is asking for, not a case this
+/// fix silently regresses.
 async fn shutdown(
     cancel_tx: &tokio::sync::watch::Sender<bool>,
     translator: &Translator,
@@ -909,10 +894,9 @@ async fn shutdown(
         }
     });
     // Aborts `force_exit_on_signal` on every exit from this scope, including
-    // an unwind out of `shutdown_servers().await` below (debug builds only;
-    // release uses `panic = "abort"`) — otherwise that path would merely
-    // detach the task instead of stopping it, unlike the equivalent
-    // abort-on-timeout handling in `await_lsp_init_handle`.
+    // an unwind out of `shutdown_servers().await` below — otherwise that path
+    // would merely detach the task instead of stopping it, unlike the
+    // equivalent abort-on-timeout handling in `await_lsp_init_handle`.
     let _abort_force_exit_on_signal = AbortOnDrop(&force_exit_on_signal);
 
     info!("Shutting down LSP servers...");
@@ -948,10 +932,6 @@ fn spawn_lsp_servers_background(
     workspace_roots: Arc<[PathBuf]>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let configs_by_id: HashMap<ServerId, ServerInitConfig> = applicable_configs
-            .iter()
-            .map(|c| (c.server_config.id(), c.clone()))
-            .collect();
         let result = LspServer::spawn_batch(&applicable_configs).await;
 
         if result.all_failed() {
@@ -985,7 +965,7 @@ fn spawn_lsp_servers_background(
         }
 
         let server_count = result.server_count();
-        let registered = register_servers(result, &translator, &configs_by_id);
+        let registered = register_servers(result, &translator);
         // Background initialization has completed; stop reporting "still
         // initializing" (especially for servers that failed to spawn on
         // partial success, which would otherwise return ServerInitializing
@@ -1005,10 +985,8 @@ fn spawn_lsp_servers_background(
             let mut cache = notification_cache.lock().await;
             cache.set_diagnostics_route_count(diagnostics_route_count);
             // Apply each server's IndexingPolicy (P4) before any pump starts, pinning Disabled to Unknown.
-            for id in registered.receivers.keys() {
-                if let Some(config) = configs_by_id.get(id) {
-                    cache.set_indexing_policy(id.clone(), config.server_config.indexing);
-                }
+            for (id, policy) in &registered.indexing_policies {
+                cache.set_indexing_policy(id.clone(), *policy);
             }
         }
 

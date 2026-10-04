@@ -8,7 +8,7 @@ tags:
   - research
   - lsp-bridge
 created: 2026-09-21
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
 ---
@@ -26,9 +26,8 @@ related:
 mcpls auto-discovers LSP servers via project-marker heuristics
 (`crates/mcpls-core/src/config/`, e.g. `Cargo.toml` → `rust-analyzer`,
 `package.json` → `typescript-language-server`) and auto-generates a default
-config with roughly 30 language → server mappings (the builtin server table
-in `crates/mcpls-core/src/config/server.rs`, ~line 545 comment: "~30 builtin
-server entries") on first run. But mcpls never checks whether the resulting
+config with 6 language → server mappings (the `BuiltinServer` table in
+`crates/mcpls-core/src/config/server.rs`) on first run. But mcpls never checks whether the resulting
 server binary is actually present on `PATH` before trying to spawn it, and it
 does not maintain any "how to install this server" hint table.
 
@@ -62,7 +61,7 @@ server configuration. A bare OS errno at the point of first use undercuts
 that promise: the user has done everything right (opened a project mcpls
 correctly recognized), but the failure message gives them no path forward
 other than researching, outside of mcpls, which package manager or installer
-provides `rust-analyzer` (or any of the other ~30 mapped servers).
+provides `rust-analyzer` (or any of the other 5 builtin servers).
 
 ### Goal
 
@@ -140,10 +139,10 @@ AND the error text or structure indicates the failure was not a
 | FR-001 | THE SYSTEM SHALL maintain a table mapping well-known LSP server command names (the same set covered by the builtin server table in `config/server.rs`) to a human-readable install hint (command or instruction) | must |
 | FR-002 | WHEN `LspServer::spawn` receives a `std::io::Error` from `Command::spawn()` whose `kind()` is `io::ErrorKind::NotFound` THE SYSTEM SHALL classify the failure as "binary not on PATH" | must |
 | FR-003 | WHEN a spawn failure is classified as "binary not on PATH" (FR-002) AND the failing command name matches an entry in the install-hint table (FR-001) THE SYSTEM SHALL include that hint in the error surfaced to the caller | must |
-| FR-004 | WHEN a spawn failure is classified as "binary not on PATH" (FR-002) AND the failing command name does NOT match any entry in the install-hint table THE SYSTEM SHALL surface the existing `Error::ServerSpawnFailed` behavior unchanged (command name + raw OS error), with no install hint fabricated | must |
+| FR-004 | WHEN a spawn failure is classified as "binary not on PATH" (FR-002) AND the failing command name does NOT match any entry in the install-hint table THE SYSTEM SHALL surface `Error::ServerNotFound` with the command name, the raw OS error, and PATH guidance, with no install hint fabricated | must |
 | FR-005 | WHEN a spawn failure's `io::ErrorKind` is anything other than `NotFound` (e.g. `PermissionDenied`) THE SYSTEM SHALL NOT include an install hint in the surfaced error | must |
-| FR-006 | THE SYSTEM SHALL surface the install hint (when present) through whatever channel `Error::ServerSpawnFailed` already reaches today [NEEDS CLARIFICATION: is an enriched `Display` string on the existing error variant sufficient, or does this warrant a new structured field / error variant so MCP clients can render the hint distinctly from the raw OS error text? See Open Questions] | must |
-| FR-007 | THE SYSTEM SHALL cover, at minimum, install hints for every server already present in the builtin default-config table in `config/server.rs` (~30 entries) | should |
+| FR-006 | THE SYSTEM SHALL surface the install hint (when present) through the `Display` text of the new `Error::ServerNotFound` variant (see Open Questions for delivery) | must |
+| FR-007 | THE SYSTEM SHALL cover, at minimum, install hints for every server already present in the builtin default-config table in `config/server.rs` (6 entries, `BuiltinServer`) | should |
 
 ## 4. Non-Functional Requirements
 
@@ -180,17 +179,16 @@ table and enriches an existing error path.
 |----|--------|--------|
 | SC-001 | Spawn failure for a well-known missing server includes a non-empty install hint distinct from the raw OS error text | 100% of builtin-table servers covered (FR-007) |
 | SC-002 | Spawn failure for a non-`NotFound` `io::ErrorKind` never includes an install hint | 0 false-positive hints in test coverage of `PermissionDenied`-style failures |
-| SC-003 | Spawn failure for an unlisted/custom command falls back to today's exact error text (no behavior regression) | Existing `test_server_spawn_failure_display`-style test(s) continue to pass unmodified in intent |
+| SC-003 | Spawn failure for an unlisted/custom command carries the raw error plus PATH guidance, but no install hint | Covered by `test_server_not_found_bare_unknown_has_no_install_hint` |
 
 ## 8. Agent Boundaries
 
 ### Always (without asking)
 - Run the full check suite before considering this done: `cargo +nightly fmt --check`, `cargo clippy --all-targets --all-features --workspace -- -D warnings`, `cargo nextest run --workspace --all-features --lib --bins`, rustdoc gate
 - Keep the install-hint table's server list in sync with the builtin table in `config/server.rs` when either changes
-- Preserve existing `Error::ServerSpawnFailed` behavior for unlisted commands (FR-004)
+- Keep `Error::ServerSpawnFailed` for non-`NotFound` spawn errors (FR-005)
 
 ### Ask First
-- Introducing a new `Error` variant vs. enriching `ServerSpawnFailed`'s existing `Display`/fields (FR-006) — this changes a public-ish error surface
 - Adding a new CLI subcommand (e.g. a "doctor" command) as the delivery surface for hints, if the plan phase concludes that's preferable to error-message enrichment alone
 
 ### Never
@@ -200,8 +198,8 @@ table and enriches an existing error path.
 
 ## 9. Open Questions
 
-- [NEEDS CLARIFICATION: Should the install hint be delivered by enriching `Error::ServerSpawnFailed`'s `Display` output (simplest, no new API surface) or by adding a new field/variant so MCP clients can render the hint separately from the raw OS error (more structured, but changes the error type's shape)? FR-006 depends on this.]
-- [NEEDS CLARIFICATION: Should install hints vary by host OS/package manager (e.g. `rustup component add rust-analyzer` vs. a Homebrew/apt package), and if so, how is the current OS detected — `std::env::consts::OS` or an existing platform-detection utility already used elsewhere in the codebase?]
+- [RESOLVED] Delivery: a new `Error::ServerNotFound` variant (typed ENOENT) whose `Display` carries the guidance. It reaches stderr logs and the respawn-path error returned to the MCP client. An initial-spawn failure still surfaces to the client as `NoServerForLanguage`; surfacing it there is a follow-up.
+- [RESOLVED] Hints are static, one per `BuiltinServer`, with no OS detection; the Windows `.cmd` note is added only for npm-distributed builtins.
 - [NEEDS CLARIFICATION: Is a pre-flight `PATH` check before spawn (proactively warning at config-load or server-registration time, rather than only reactively on spawn failure) in scope for this spec, or is that a follow-up enhancement? The finding's reproduction is reactive (spawn-time) only.]
 - [NEEDS CLARIFICATION: Should this feature also cover a `doctor`/diagnostic-style MCP tool or CLI subcommand that reports install status for all configured servers up front, as `squiggles init` does (see below), or is reactive error enrichment sufficient for a first iteration?]
 - [NEEDS CLARIFICATION: The competitive signal (`carldaws/squiggles`) is currently a single-reference-project signal, not yet corroborated by a second reference project, per the original P3 finding — confirm this remains P3 rather than being reprioritized once/if a second reference project ships similar behavior.]
@@ -211,9 +209,9 @@ table and enriches an existing error path.
 - [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - [[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001-lsp-server-lifecycle-and-respawn]] — existing spawn/respawn lifecycle this feature extends, not replaces
-- [[config/001-config-discovery-and-heuristics/spec|config/001-config-discovery-and-heuristics]] — the project-marker heuristics and auto-generated default config that produce the ~30 language → server mappings referenced here
+- [[config/001-config-discovery-and-heuristics/spec|config/001-config-discovery-and-heuristics]] — the project-marker heuristics and auto-generated default config that produce the 6 language → server mappings referenced here
 - `crates/mcpls-core/src/lsp/lifecycle.rs:398` — `LspServer::spawn`, where `Command::spawn()` is called and `Error::ServerSpawnFailed` is constructed
 - `crates/mcpls-core/src/error.rs:181-189` — `Error::ServerSpawnFailed { command, source }` variant and its `Display` impl
-- `crates/mcpls-core/src/config/server.rs` (~line 545) — builtin default-server table (~30 entries) that this feature's install-hint table should stay in sync with
+- `crates/mcpls-core/src/config/server.rs` — `BuiltinServer`, the single source of the 6 builtin commands and their install hints
 - `crates/mcpls-core/src/config/language.rs` — related config-module code (React-variant language-id mapping); cited in the originating finding as part of the `config/` marker/mapping surface this feature sits alongside
 - [`carldaws/squiggles`](https://github.com/carldaws/squiggles) — reference project; release 1.1.0 (2026-09-21) added a `squiggles init` command that detects project languages via marker heuristics, writes a config, and prints the install command for every LSP server binary its presets reference; commits `79a1080` and `b83f056`

@@ -137,11 +137,6 @@ pub struct Translator {
     indexing_ready_timeout: std::time::Duration,
 }
 
-/// Upper bound on how long [`Translator::shutdown_servers`] waits for a
-/// single LSP server's graceful `shutdown`/`exit` handshake before giving up
-/// and letting `kill_on_drop` terminate it instead.
-const SERVER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 impl Translator {
     /// Create a new translator.
     ///
@@ -344,25 +339,49 @@ impl Translator {
 
     /// Register an LSP client under its routing identity.
     ///
-    /// Only called once per server, from `register_servers` during initial
-    /// background init. The respawn path does not reuse this method: it
+    /// Used by [`Self::register_server_complete`] during initial background
+    /// init, and directly by tests. The respawn path does not reuse this method: it
     /// needs the previous client back (to fail its pending requests) and
     /// must also reset `document_tracker` for the swapped-in server, neither
     /// of which this method does.
-    pub fn register_client(&self, id: impl Into<ServerId>, client: LspClient) {
+    pub(crate) fn register_client(&self, id: impl Into<ServerId>, client: LspClient) {
         lock_std(&self.lsp_clients).insert(id.into(), client);
     }
 
     /// Register an LSP server under its routing identity.
-    pub fn register_server(&self, id: impl Into<ServerId>, server: LspServer) {
+    pub(crate) fn register_server(&self, id: impl Into<ServerId>, server: LspServer) {
         lock_std(&self.lsp_servers).insert(id.into(), server);
+    }
+
+    /// Register a spawned server in every map that needs it: its routing
+    /// client, the server itself, and the config used to respawn it.
+    ///
+    /// The routing identity, client and respawn config are all derived from
+    /// `server` itself, so they cannot be registered out of sync.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use mcpls_core::bridge::Translator;
+    /// use mcpls_core::lsp::LspServer;
+    ///
+    /// fn register(translator: &Translator, server: LspServer) {
+    ///     translator.register_server_complete(server);
+    /// }
+    /// ```
+    pub fn register_server_complete(&self, server: LspServer) {
+        let config = server.init_config().clone();
+        let id = config.server_config.id();
+        self.register_client(id.clone(), server.client().clone());
+        self.register_server_config(id.clone(), config);
+        self.register_server(id, server);
     }
 
     /// Store the config needed to respawn `id` if its process dies later.
     ///
-    /// Called once per server, right after a successful spawn (see the
-    /// crate-root `register_servers`); [`Self::respawn_if_dead`] is the only
-    /// reader.
+    /// Called once per server, right after a successful spawn (via
+    /// [`Self::register_server_complete`]); [`Self::respawn_if_dead`] is the
+    /// only reader.
     pub(crate) fn register_server_config(&self, id: impl Into<ServerId>, config: ServerInitConfig) {
         lock_std(&self.server_configs).insert(id.into(), config);
     }
@@ -403,8 +422,8 @@ impl Translator {
     ///
     /// Drains the registered LSP servers and, for each one concurrently,
     /// sends the LSP `shutdown` request and `exit` notification via
-    /// [`LspServer::shutdown`], bounded by a fixed per-server timeout. A
-    /// server that errors or fails to respond in time is simply dropped
+    /// [`LspServer::shutdown`], which is bounded by [`crate::lsp::SHUTDOWN_TIMEOUT`].
+    /// A server that errors or fails to respond in time is simply dropped
     /// instead: its child process handle is `kill_on_drop(true)`, so the
     /// process is killed rather than left running. Call this once, from the
     /// top-level shutdown path, after the MCP transport has stopped
@@ -413,14 +432,14 @@ impl Translator {
     /// # Limitations
     ///
     /// This only runs on the normal shutdown path (stdio EOF, `SIGTERM`/
-    /// `SIGINT`, or the HTTP transport's own graceful shutdown). This crate's
-    /// workspace `[profile.release]` builds with `panic = "abort"`, so a
-    /// panic reachable from a request handler or background pump task in a
-    /// release build still terminates the process without unwinding — this
-    /// method never runs, and spawned LSP children are orphaned exactly as
-    /// before this fix. Making that path safe would need process-group
-    /// isolation (`kill_on_drop` alone doesn't help, since no `Drop` runs
-    /// either); tracked separately, out of scope here.
+    /// `SIGINT`, or the HTTP transport's own graceful shutdown). A panic is
+    /// covered separately: release builds unwind, and the binary's `main`
+    /// shuts the runtime down so every task, and with it every LSP child
+    /// (`kill_on_drop`), is dropped. LSP children can still outlive mcpls
+    /// when no Rust code runs: the parent killed by `SIGKILL` or the OOM
+    /// killer, the forced `exit(1)` on a second signal during shutdown, or a
+    /// panic inside a `Drop` during unwinding. Compliant servers also exit
+    /// on stdin EOF or when their `processId` dies.
     ///
     /// `pub(crate)` rather than `pub`: this is meant for exactly one call
     /// site (`serve_with`'s post-transport shutdown sequence), after the MCP
@@ -435,22 +454,35 @@ impl Translator {
         }
 
         let mut tasks = tokio::task::JoinSet::new();
+        let mut ids = HashMap::new();
         for (id, server) in servers {
-            tasks.spawn(async move {
-                match tokio::time::timeout(SERVER_SHUTDOWN_TIMEOUT, server.shutdown()).await {
-                    Ok(Ok(())) => tracing::debug!(%id, "LSP server shut down gracefully"),
-                    Ok(Err(e)) => tracing::warn!(
+            let task_id = id.clone();
+            let handle = tasks.spawn(async move {
+                match server.shutdown().await {
+                    Ok(()) => tracing::debug!(%id, "LSP server shut down gracefully"),
+                    Err(e) => tracing::warn!(
                         %id, error = %e,
-                        "LSP server shutdown handshake failed, killing process instead"
-                    ),
-                    Err(_) => tracing::warn!(
-                        %id, timeout = ?SERVER_SHUTDOWN_TIMEOUT,
-                        "LSP server did not shut down in time, killing process instead"
+                        "LSP server shutdown failed, killing process instead"
                     ),
                 }
             });
+            ids.insert(handle.id(), task_id);
         }
-        tasks.join_all().await;
+        join_shutdown_tasks(tasks, &ids).await;
+    }
+}
+
+/// Awaits every shutdown task, logging a panicked or cancelled one with its
+/// server id instead of re-raising it into the caller.
+async fn join_shutdown_tasks(
+    mut tasks: tokio::task::JoinSet<()>,
+    ids: &HashMap<tokio::task::Id, ServerId>,
+) {
+    while let Some(joined) = tasks.join_next_with_id().await {
+        if let Err(e) = joined {
+            let id = ids.get(&e.id()).map_or("unknown", ServerId::as_str);
+            tracing::error!(%id, error = %e, "LSP server shutdown task failed");
+        }
     }
 }
 
@@ -477,6 +509,30 @@ mod tests {
     use crate::config::{ServerId, ToolKind, ToolRouter};
     use crate::error::Error;
     use crate::test_lsp::fake_lsp_client;
+
+    #[tokio::test]
+    async fn test_register_server_complete_fills_all_maps_under_init_config_id() {
+        let translator = Translator::new();
+        let config = crate::config::LspServerConfig::rust_analyzer();
+        let id = config.id();
+        translator.register_server_complete(crate::lsp::fake_lsp_server_with_config(config));
+
+        assert!(lock_std(&translator.lsp_clients).contains_key(&id));
+        assert!(lock_std(&translator.lsp_servers).contains_key(&id));
+        assert!(lock_std(&translator.server_configs).contains_key(&id));
+    }
+
+    /// A panicking shutdown task must be logged, not re-raised into the caller.
+    #[tokio::test]
+    async fn test_join_shutdown_tasks_survives_panicking_task() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let handle = tasks.spawn(async { panic!("shutdown task boom") });
+        let mut ids = HashMap::new();
+        ids.insert(handle.id(), ServerId::from("rust"));
+        tasks.spawn(async {});
+
+        join_shutdown_tasks(tasks, &ids).await;
+    }
 
     #[test]
     fn test_translator_new() {
@@ -540,7 +596,7 @@ mod tests {
         translator.register_server("server-b", crate::lsp::fake_lsp_server());
         assert_eq!(lock_std(&translator.lsp_servers).len(), 2);
 
-        // Bounded well above `SERVER_SHUTDOWN_TIMEOUT` (10s) so a genuine
+        // Bounded well above `lsp::SHUTDOWN_TIMEOUT` (10s) so a genuine
         // regression (a hang) still fails the test instead of the harness
         // itself timing out ambiguously.
         let result =

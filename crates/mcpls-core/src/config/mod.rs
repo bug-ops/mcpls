@@ -15,8 +15,8 @@ pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
-    DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_HEURISTICS_DEPTH, MAX_TIMEOUT_SECONDS,
-    ServerHeuristics,
+    BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_HEURISTICS_DEPTH,
+    MAX_TIMEOUT_SECONDS, ServerHeuristics,
 };
 
 use crate::bridge::{
@@ -1246,6 +1246,41 @@ mod tests {
 
     fn toml_path_literal(path: &Path) -> String {
         toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+    }
+
+    #[test]
+    fn test_default_commands_match_builtin_servers() {
+        let config = ServerConfig::default();
+        let defaults: HashSet<&str> = config
+            .lsp_servers
+            .iter()
+            .map(|s| s.command.as_str())
+            .collect();
+        let builtins: HashSet<&str> = BuiltinServer::ALL.iter().map(|b| b.command()).collect();
+        assert_eq!(defaults, builtins);
+    }
+
+    #[test]
+    fn test_builtin_server_npm_table() {
+        let npm: Vec<_> = BuiltinServer::ALL
+            .into_iter()
+            .filter(|b| b.is_npm_package())
+            .collect();
+        assert_eq!(
+            npm,
+            [
+                BuiltinServer::Pyright,
+                BuiltinServer::TypescriptLanguageServer
+            ]
+        );
+    }
+
+    #[test]
+    fn test_builtin_server_roundtrip_and_hint() {
+        for b in BuiltinServer::ALL {
+            assert_eq!(BuiltinServer::from_command(b.command()), Some(b));
+            assert_ne!(b.install_hint(), "");
+        }
     }
 
     #[test]
