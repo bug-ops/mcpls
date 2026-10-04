@@ -14,7 +14,7 @@ use super::Translator;
 use crate::bridge::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
-use crate::lsp::LspServer;
+use crate::lsp::{LspServer, ServerInitConfig};
 
 /// Tracks respawn attempts for one server, so [`Translator::respawn_if_dead`]
 /// can back off a crash-looping process instead of retrying it on every
@@ -47,21 +47,24 @@ const RESPAWN_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 impl Translator {
-    /// Whether the server tracked under `id` is registered and dead: its
-    /// process has exited, or its message loop has stopped while the process
-    /// is still running.
+    /// The respawn config of the server tracked under `id`, if it is
+    /// registered and dead: its process has exited, or its message loop has
+    /// stopped while the process is still running.
     ///
-    /// Returns `false` ("not dead") for an `id` that isn't registered at
-    /// all -- that's the separate `ServerInitializing`/`NoServerForTool`
-    /// concern callers already handle, not something the respawn path
-    /// should react to -- and for any `try_wait` error, on the conservative
-    /// assumption that a health check that itself failed should not trigger
-    /// a respawn.
-    fn is_server_dead(&self, id: &ServerId) -> bool {
-        lock_std(&self.lsp_servers)
-            .get_mut(id)
-            .and_then(|server| server.is_dead().ok())
-            .unwrap_or(false)
+    /// The config is read from the registered [`LspServer`] itself, under the
+    /// same `lsp_servers` lock as the liveness check, so the two cannot
+    /// disagree. Returns `None` ("not dead") for an `id` that isn't
+    /// registered at all -- that's the separate `ServerInitializing`/
+    /// `NoServerForTool` concern callers already handle, not something the
+    /// respawn path should react to -- and for any `try_wait` error, on the
+    /// conservative assumption that a health check that itself failed should
+    /// not trigger a respawn.
+    fn dead_server_config(&self, id: &ServerId) -> Option<ServerInitConfig> {
+        let mut servers = lock_std(&self.lsp_servers);
+        let server = servers.get_mut(id)?;
+        let config = server.is_dead().ok()?.then(|| server.init_config().clone());
+        drop(servers);
+        config
     }
 
     /// Return the shared single-flight lock for `id`, creating it on first
@@ -263,13 +266,12 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ServerUnavailable`] if no respawn config was ever
-    /// registered for `id`, or if it is currently within its backoff
-    /// window. Returns whatever error `LspServer::spawn` produced (e.g. its
+    /// Returns [`Error::ServerUnavailable`] if `id` is currently within its
+    /// backoff window. Returns whatever error `LspServer::spawn` produced (e.g. its
     /// command is no longer on `PATH`, or `initialize` fails again) if an
     /// actual respawn attempt failed.
     pub(crate) async fn respawn_if_dead(&self, id: &ServerId) -> Result<()> {
-        if !self.is_server_dead(id) {
+        if self.dead_server_config(id).is_none() {
             return Ok(());
         }
 
@@ -277,9 +279,9 @@ impl Translator {
         let _guard = lock.lock().await;
 
         // Another caller may have already respawned it while we waited.
-        if !self.is_server_dead(id) {
+        let Some(config) = self.dead_server_config(id) else {
             return Ok(());
-        }
+        };
 
         // A panicked message loop never drains its own pending requests.
         let dead_client = lock_std(&self.lsp_clients).get(id).cloned();
@@ -296,17 +298,10 @@ impl Translator {
             );
             return Err(Error::ServerUnavailable {
                 server_id: id.clone(),
-                reason: format!("crash-looping, retry in {remaining:?}"),
+                retry_in: remaining,
             });
         }
 
-        // TODO(#529): source this from `LspServer::init_config` and drop `server_configs`.
-        let Some(config) = lock_std(&self.server_configs).get(id).cloned() else {
-            return Err(Error::ServerUnavailable {
-                server_id: id.clone(),
-                reason: "no respawn config registered for this server".to_string(),
-            });
-        };
         let language_id = config.server_config.language_id.clone();
 
         tracing::warn!("LSP server '{id}' has crashed, respawning");
@@ -351,6 +346,9 @@ impl Translator {
         };
         lock_std(&self.lifecycle_forwarders).insert(id.clone(), forwarder.abort_handle());
 
+        // `forget_server` must follow the swap: before it, a caller still using the old
+        // client would record sync against the new generation. A flush in the gap can send
+        // the new process a harmless `didClose` for a document it never opened.
         let old_client = lock_std(&self.lsp_clients).insert(id.clone(), new_client);
         let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
         drop(old_server); // dropped after the `lsp_servers` guard, not under it
@@ -486,9 +484,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_server_dead_false_when_not_registered() {
+    fn test_dead_server_config_none_when_not_registered() {
         let translator = Translator::new();
-        assert!(!translator.is_server_dead(&ServerId::from("rust")));
+        assert!(
+            translator
+                .dead_server_config(&ServerId::from("rust"))
+                .is_none()
+        );
     }
 
     // Gated `#[cfg(unix)]`: this module's fake-LSP-server test double is a
@@ -581,12 +583,21 @@ sleep __SLEEP__
             }
         }
 
-        /// Polls `is_server_dead` until it reports `true`, bounding the wait
+        /// Replaces the registered server's `init_config`, i.e. the config
+        /// the next respawn will use.
+        fn set_respawn_config(translator: &Translator, id: &ServerId, config: ServerInitConfig) {
+            lock_std(&translator.lsp_servers)
+                .get_mut(id)
+                .unwrap()
+                .set_init_config(config);
+        }
+
+        /// Polls `dead_server_config` until it reports a dead server, bounding the wait
         /// so a broken script fails the test instead of hanging it.
         async fn wait_until_dead(translator: &Translator, id: &ServerId) {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if translator.is_server_dead(id) {
+                    if translator.dead_server_config(id).is_some() {
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -605,14 +616,9 @@ sleep __SLEEP__
 
             let server = LspServer::spawn(config).await.unwrap();
             let translator = Translator::new();
-            translator.register_client(id.clone(), server.client().clone());
-            translator.register_server(id.clone(), server);
-            // Deliberately no `register_server_config`: if a respawn were
-            // (wrongly) attempted despite the server being alive, the
-            // missing config would surface as `Error::ServerUnavailable`
-            // instead of quietly succeeding -- so `Ok(())` here is proof
-            // the alive fast path skipped respawning entirely.
+            translator.register_server_complete(server);
 
+            assert!(translator.dead_server_config(&id).is_none());
             assert!(translator.respawn_if_dead(&id).await.is_ok());
         }
 
@@ -629,32 +635,32 @@ sleep __SLEEP__
             let translator = Translator::new();
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
-            translator.register_server_config(id.clone(), stub_server_config("rust", &script));
+            set_respawn_config(&translator, &id, stub_server_config("rust", &script));
             wait_until_dead(&translator, &id).await;
 
             translator.respawn_if_dead(&id).await.unwrap();
 
-            assert!(!translator.is_server_dead(&id));
+            assert!(translator.dead_server_config(&id).is_none());
         }
 
+        /// #529: the respawn config is the registered server's own
+        /// `init_config`, with no separately stored copy.
         #[tokio::test]
-        async fn test_respawn_if_dead_errors_when_no_config_registered() {
+        async fn test_respawn_if_dead_uses_config_of_registered_server() {
             let dir = TempDir::new().unwrap();
             let script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
             let config = stub_server_config("rust", &script);
 
-            let server = LspServer::spawn(config).await.unwrap();
+            let server = LspServer::spawn(config.clone()).await.unwrap();
             let translator = Translator::new();
-            translator.register_client(id.clone(), server.client().clone());
-            translator.register_server(id.clone(), server);
+            translator.register_server_complete(server);
             wait_until_dead(&translator, &id).await;
 
-            let err = translator.respawn_if_dead(&id).await.unwrap_err();
-            assert!(
-                matches!(err, Error::ServerUnavailable { .. }),
-                "got {err:?}"
-            );
+            let dead = translator.dead_server_config(&id).unwrap();
+            assert_eq!(dead.server_config.args, config.server_config.args);
+
+            translator.respawn_if_dead(&id).await.unwrap();
         }
 
         #[tokio::test]
@@ -672,7 +678,7 @@ sleep __SLEEP__
 
             let mut broken = stub_server_config("rust", &script);
             broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
-            translator.register_server_config(id.clone(), broken);
+            set_respawn_config(&translator, &id, broken);
 
             let err = translator.respawn_if_dead(&id).await.unwrap_err();
             assert!(matches!(err, Error::ServerNotFound { .. }), "got {err:?}");
@@ -723,7 +729,7 @@ fi
             let translator = Arc::new(Translator::new());
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
-            translator.register_server_config(id.clone(), config);
+            set_respawn_config(&translator, &id, config);
             wait_until_dead(&translator, &id).await;
 
             let (t1, id1) = (Arc::clone(&translator), id.clone());
@@ -768,7 +774,7 @@ fi
 
             let mut broken = stub_server_config("rust", &seed_script);
             broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
-            translator.register_server_config(id.clone(), broken);
+            set_respawn_config(&translator, &id, broken);
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
             assert!(
@@ -805,7 +811,7 @@ fi
 
             let mut broken = stub_server_config("rust", &seed_script);
             broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
-            translator.register_server_config(id.clone(), broken);
+            set_respawn_config(&translator, &id, broken);
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
             assert!(
@@ -823,8 +829,11 @@ fi
             // config that will actually succeed this time.
             clock.advance(RESPAWN_BACKOFF_MAX);
             let working_script = write_crash_after_init_script(dir.path());
-            translator
-                .register_server_config(id.clone(), stub_server_config("rust", &working_script));
+            set_respawn_config(
+                &translator,
+                &id,
+                stub_server_config("rust", &working_script),
+            );
 
             let result = translator.respawn_if_dead(&id).await;
             assert!(
@@ -858,7 +867,7 @@ fi
             // Reuse the same crash-after-init script as the respawn target:
             // every attempt completes `initialize` successfully, then dies
             // ~0.3s later -- a post-init crash loop, not a spawn failure.
-            translator.register_server_config(id.clone(), stub_server_config("rust", &seed_script));
+            set_respawn_config(&translator, &id, stub_server_config("rust", &seed_script));
 
             translator
                 .respawn_if_dead(&id)
@@ -932,8 +941,11 @@ fi
             wait_until_dead(&translator, &id).await;
 
             let respawn_script = write_responder_script(dir.path(), 1);
-            translator
-                .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
+            set_respawn_config(
+                &translator,
+                &id,
+                stub_server_config("rust", &respawn_script),
+            );
 
             translator.respawn_if_dead(&id).await.unwrap();
 
@@ -1004,8 +1016,11 @@ fi
             wait_until_dead(&translator, &id).await;
 
             let respawn_script = write_responder_script(dir.path(), 1);
-            translator
-                .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
+            set_respawn_config(
+                &translator,
+                &id,
+                stub_server_config("rust", &respawn_script),
+            );
 
             translator.respawn_if_dead(&id).await.unwrap();
 
@@ -1061,8 +1076,9 @@ sleep 1
 "#,
             );
             fs::write(&respawn_script_path, respawn_script_body).unwrap();
-            translator.register_server_config(
-                id.clone(),
+            set_respawn_config(
+                &translator,
+                &id,
                 stub_server_config("rust", &respawn_script_path),
             );
 
@@ -1114,8 +1130,11 @@ sleep 1
                 .insert(id.clone(), never_completes.abort_handle());
 
             let respawn_script = write_responder_script(dir.path(), 1);
-            translator
-                .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
+            set_respawn_config(
+                &translator,
+                &id,
+                stub_server_config("rust", &respawn_script),
+            );
             translator.respawn_if_dead(&id).await.unwrap();
 
             let outcome = tokio::time::timeout(Duration::from_secs(2), never_completes)
@@ -1210,7 +1229,7 @@ sleep 1
             // means to exercise, which would pass for the wrong reason.
             let mut respawn_config = stub_server_config("hover-only", &respawn_script);
             respawn_config.server_config.language_id = "rust".to_string();
-            translator.register_server_config(hover_id.clone(), respawn_config);
+            set_respawn_config(&translator, &hover_id, respawn_config);
 
             translator.respawn_if_dead(&hover_id).await.unwrap();
 
@@ -1234,7 +1253,7 @@ sleep 1
         /// dead-server branch is actually reached through the shared
         /// entry point every public tool handler (`handle_hover`,
         /// `handle_definition`, ...) funnels through -- not just through
-        /// the private `respawn_if_dead`/`is_server_dead` calls the other
+        /// the private `respawn_if_dead`/`dead_server_config` calls the other
         /// tests in this module make directly.
         #[tokio::test]
         async fn test_prepare_document_respawns_dead_server_through_shared_entry_point() {
@@ -1257,8 +1276,11 @@ sleep 1
             wait_until_dead(&translator, &id).await;
 
             let respawn_script = write_responder_script(dir.path(), 1);
-            translator
-                .register_server_config(id.clone(), stub_server_config("rust", &respawn_script));
+            set_respawn_config(
+                &translator,
+                &id,
+                stub_server_config("rust", &respawn_script),
+            );
 
             let result = translator
                 .prepare_document(&file_path.to_string_lossy(), ToolKind::Hover)
@@ -1266,7 +1288,7 @@ sleep 1
             assert!(result.is_ok(), "got {result:?}");
 
             assert!(
-                !translator.is_server_dead(&id),
+                translator.dead_server_config(&id).is_none(),
                 "the respawned replacement should be alive"
             );
         }

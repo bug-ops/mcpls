@@ -50,6 +50,7 @@ mod util;
 mod test_lsp;
 
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +60,7 @@ use bridge::{NotificationCache, Translator};
 pub use config::{ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
+use futures::FutureExt as _;
 use lsp::{LspNotification, LspServer, ServerInitConfig};
 use lsp_types::Uri;
 use mcp::SubscriptionRegistry;
@@ -454,7 +456,6 @@ fn join_relative_root(base_dir: &Path, root: &Path) -> PathBuf {
 /// # Errors
 ///
 /// Returns an error if:
-/// - All LSP servers fail to initialize
 /// - MCP server setup fails
 /// - Configuration is invalid
 ///
@@ -462,7 +463,7 @@ fn join_relative_root(base_dir: &Path, root: &Path) -> PathBuf {
 ///
 /// - **All servers succeed**: Service runs normally
 /// - **Partial success**: Logs warnings for failures, continues with available servers
-/// - **All servers fail**: Returns `Error::AllServersFailedToInit` with details
+/// - **All servers fail**: Keeps serving; tools for the affected languages return `Error::ServerFailedToStart` with the spawn failure
 ///
 /// # Shutdown
 ///
@@ -482,7 +483,6 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns an error if:
-/// - All LSP servers fail to initialize
 /// - The MCP server or transport fails to start
 /// - Configuration is invalid, including two applicable `[[lsp_servers]]`
 ///   entries whose per-tool routing is ambiguous in this workspace (shared
@@ -885,13 +885,12 @@ async fn shutdown(
 /// servers (e.g. `OmniSharp` on a large Unity solution, which can take minutes to
 /// load) finish initializing. Tool calls that arrive before a server has
 /// registered return a `ServerInitializing` error telling the caller to wait and
-/// retry. If every server fails, the "expected servers" set is cleared so those
-/// calls fall back to a plain "no server configured" error instead.
+/// retry. Once initialization settles, servers that failed to start are
+/// reported through `Error::ServerFailedToStart` instead.
 ///
-/// Returns the task's `JoinHandle` so [`shutdown`] can await it: previously
-/// this handle was dropped, silently swallowing panics from
-/// `LspServer::spawn_batch`, `register_servers`, or a diagnostics pump task
-/// (see #196).
+/// Returns the task's `JoinHandle` so [`shutdown`] can await it. A panic in the
+/// task is contained by [`run_init_supervised`] rather than leaving every
+/// affected tool on `ServerInitializing` forever (#528).
 fn spawn_lsp_servers_background(
     applicable_configs: Vec<ServerInitConfig>,
     translator: Arc<Translator>,
@@ -901,88 +900,167 @@ fn spawn_lsp_servers_background(
     workspace_roots: Arc<[PathBuf]>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let result = LspServer::spawn_batch(&applicable_configs).await;
-
-        if result.all_failed() {
-            error!(
-                "All {} configured LSP server(s) failed to initialize",
-                result.failure_count()
-            );
-            for failure in &result.failures {
-                error!("Server initialization failed: {}", failure);
-            }
-            // No server will register: rebind against an empty registered
-            // set so every route drops (one rule, no special case -- see
-            // `ToolRouter::rebind_to_registered`), then stop reporting
-            // "still initializing". This path returns before
-            // `register_servers` ever runs, so it needs its own rebind call;
-            // skipping it would leave every route pointed at a dead server.
-            translator.rebind_router(&HashSet::new());
-            translator.clear_expected_servers();
-            return;
-        }
-
-        if result.partial_success() {
-            warn!(
-                "Partial server initialization: {} succeeded, {} failed",
-                result.server_count(),
-                result.failure_count()
-            );
-            for failure in &result.failures {
-                error!("Server initialization failed: {}", failure);
-            }
-        }
-
-        let server_count = result.server_count();
-        let registered = register_servers(result, &translator);
-        // Background initialization has completed; stop reporting "still
-        // initializing" (especially for servers that failed to spawn on
-        // partial success, which would otherwise return ServerInitializing
-        // forever instead of NoServerForLanguage/Tool).
-        translator.clear_expected_servers();
-        info!("Proceeding with {} LSP server(s)", server_count);
-
-        // Give each diagnostics-route server a fair share of the shared
-        // diagnostics cache budget now that the full set is known -- see
-        // `NotificationCache::set_diagnostics_route_count` (#266).
-        let diagnostics_route_count = registered
-            .diagnostics_flags
-            .values()
-            .filter(|&&is_route| is_route)
-            .count();
-        {
-            let mut cache = notification_cache.lock().await;
-            cache.set_diagnostics_route_count(diagnostics_route_count);
-            // Apply each server's IndexingPolicy (P4) before any pump starts, pinning Disabled to Unknown.
-            for (id, policy) in &registered.indexing_policies {
-                cache.set_indexing_policy(id.clone(), *policy);
-            }
-        }
-
-        // Start diagnostics pump tasks now that servers are registered.
-        let pump_shared = PumpShared {
+        let body = init_lsp_servers(
+            &applicable_configs,
+            &translator,
             notification_cache,
-            subs: subscription_registry,
+            subscription_registry,
+            cancel_rx,
             workspace_roots,
-        };
-        let mut pumps: JoinSet<()> = JoinSet::new();
-        for (id, (rx, lifecycle_rx)) in registered.receivers {
-            let caches_diagnostics = registered
-                .diagnostics_flags
-                .get(&id)
-                .copied()
-                .unwrap_or(false);
-            pumps.spawn(diagnostics_pump(
-                id,
-                rx,
-                lifecycle_rx,
-                cancel_rx.clone(),
-                caches_diagnostics,
-                pump_shared.clone(),
-            ));
-        }
-        while pumps.join_next().await.is_some() {}
+        );
+        run_init_supervised(&translator, &applicable_configs, body).await;
     })
+}
+
+/// Best-effort text of a panic payload, for logging.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+/// Drives `body` (the LSP init sequence) to completion on the current task,
+/// turning a panic in it into a settled translator state.
+///
+/// The body runs on the same task rather than an inner spawn so that aborting
+/// the outer task (see [`await_lsp_init_handle`]) still drops every
+/// not-yet-registered `Child` it owns. On a panic, every config that never
+/// registered is recorded as `StartupFailure::InitTaskPanicked` and the
+/// router and expected-server set are settled, so tools return a terminal
+/// error instead of `ServerInitializing` indefinitely.
+async fn run_init_supervised(
+    translator: &Translator,
+    configs: &[ServerInitConfig],
+    body: impl std::future::Future<Output = ()>,
+) {
+    if let Err(payload) = AssertUnwindSafe(body).catch_unwind().await {
+        error!(
+            "Background LSP initialization task panicked: {}",
+            panic_message(payload.as_ref())
+        );
+        translator.settle_after_init_panic(configs).await;
+    }
+}
+
+/// Spawns `configs`, registers the servers that came up, and runs their
+/// diagnostics pumps until shutdown.
+async fn init_lsp_servers(
+    configs: &[ServerInitConfig],
+    translator: &Translator,
+    notification_cache: Arc<Mutex<NotificationCache>>,
+    subscription_registry: SubscriptionRegistry,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    workspace_roots: Arc<[PathBuf]>,
+) {
+    let result = LspServer::spawn_batch(configs).await;
+    translator.record_startup_failures(&result.failures);
+
+    if result.all_failed() {
+        error!(
+            "All {} configured LSP server(s) failed to initialize",
+            result.failure_count()
+        );
+        for failure in &result.failures {
+            error!("Server initialization failed: {}", failure);
+        }
+        // No server will register: rebind against an empty registered
+        // set so every route drops (one rule, no special case -- see
+        // `ToolRouter::rebind_to_registered`), then stop reporting
+        // "still initializing". This path returns before
+        // `register_servers` ever runs, so it needs its own rebind call;
+        // skipping it would leave every route pointed at a dead server.
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+        return;
+    }
+
+    if result.partial_success() {
+        warn!(
+            "Partial server initialization: {} succeeded, {} failed",
+            result.server_count(),
+            result.failure_count()
+        );
+        for failure in &result.failures {
+            error!("Server initialization failed: {}", failure);
+        }
+    }
+
+    let server_count = result.server_count();
+    let registered = register_servers(result, translator);
+    // Background initialization has completed; stop reporting "still
+    // initializing" (especially for servers that failed to spawn on
+    // partial success, which would otherwise return ServerInitializing
+    // forever instead of the recorded startup failure).
+    translator.clear_expected_servers();
+    info!("Proceeding with {} LSP server(s)", server_count);
+
+    // Give each diagnostics-route server a fair share of the shared
+    // diagnostics cache budget now that the full set is known -- see
+    // `NotificationCache::set_diagnostics_route_count` (#266).
+    let diagnostics_route_count = registered
+        .diagnostics_flags
+        .values()
+        .filter(|&&is_route| is_route)
+        .count();
+    {
+        let mut cache = notification_cache.lock().await;
+        cache.set_diagnostics_route_count(diagnostics_route_count);
+        // Apply each server's IndexingPolicy (P4) before any pump starts, pinning Disabled to Unknown.
+        for (id, policy) in &registered.indexing_policies {
+            cache.set_indexing_policy(id.clone(), *policy);
+        }
+    }
+
+    // Start diagnostics pump tasks now that servers are registered.
+    let pump_shared = PumpShared {
+        notification_cache: Arc::clone(&notification_cache),
+        subs: subscription_registry,
+        workspace_roots,
+    };
+    let mut pumps: JoinSet<()> = JoinSet::new();
+    let mut pump_servers = HashMap::new();
+    for (id, (rx, lifecycle_rx)) in registered.receivers {
+        let caches_diagnostics = registered
+            .diagnostics_flags
+            .get(&id)
+            .copied()
+            .unwrap_or(false);
+        let pump = pumps.spawn(diagnostics_pump(
+            id.clone(),
+            rx,
+            lifecycle_rx,
+            cancel_rx.clone(),
+            caches_diagnostics,
+            pump_shared.clone(),
+        ));
+        pump_servers.insert(pump.id(), id);
+    }
+    drain_pumps(pumps, &pump_servers, &notification_cache).await;
+}
+
+/// Awaits every pump in `pumps`. A pump that panicked has stopped caching
+/// pushes for its server, so that server is marked push-degraded and its
+/// indexing state is reset instead of freezing at its last value.
+async fn drain_pumps(
+    mut pumps: JoinSet<()>,
+    pump_servers: &HashMap<tokio::task::Id, ServerId>,
+    notification_cache: &Mutex<NotificationCache>,
+) {
+    while let Some(joined) = pumps.join_next_with_id().await {
+        let Err(join_error) = joined else { continue };
+        if !join_error.is_panic() {
+            continue;
+        }
+        let Some(server_id) = pump_servers.get(&join_error.id()) else {
+            continue;
+        };
+        error!("Diagnostics pump for LSP server '{server_id}' panicked: {join_error}");
+        let mut cache = notification_cache.lock().await;
+        cache.mark_push_degraded(server_id);
+        cache.reset_indexing_state(server_id);
+    }
 }
 
 /// Shared by any `#[cfg(test)]` module in this crate that needs to mutate
@@ -1461,7 +1539,7 @@ mod tests {
     // Tests for graceful degradation behavior
     mod graceful_degradation_tests {
         use super::*;
-        use crate::error::ServerSpawnFailure;
+        use crate::error::{ServerSpawnFailure, StartupFailure};
         use crate::lsp::ServerInitResult;
 
         #[test]
@@ -1471,13 +1549,13 @@ mod tests {
                 server_id: ServerId::from("rust"),
                 language_id: "rust".to_string(),
                 command: "rust-analyzer".to_string(),
-                message: "not found".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
             });
             result.add_failure(ServerSpawnFailure {
                 server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
-                message: "not found".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
             });
 
             assert!(result.all_failed());
@@ -1496,7 +1574,7 @@ mod tests {
                 server_id: ServerId::from("python"),
                 language_id: "python".to_string(),
                 command: "pyright".to_string(),
-                message: "not found".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
             });
 
             // Without actual servers, we can verify the failure was recorded
@@ -1523,24 +1601,22 @@ mod tests {
                     server_id: ServerId::from("rust"),
                     language_id: "rust".to_string(),
                     command: "rust-analyzer".to_string(),
-                    message: "command not found".to_string(),
+                    reason: StartupFailure::InitTaskPanicked,
                 },
                 ServerSpawnFailure {
                     server_id: ServerId::from("python"),
                     language_id: "python".to_string(),
                     command: "pyright".to_string(),
-                    message: "permission denied".to_string(),
+                    reason: StartupFailure::InitTaskPanicked,
                 },
             ];
 
-            let err = Error::AllServersFailedToInit { count: 2, failures };
+            let err = Error::AllServersFailedToInit { failures };
 
             assert!(err.to_string().contains("all LSP servers failed"));
-            assert!(err.to_string().contains("2 configured"));
 
             // Verify failures are preserved
-            if let Error::AllServersFailedToInit { count, failures: f } = err {
-                assert_eq!(count, 2);
+            if let Error::AllServersFailedToInit { failures: f } = err {
                 assert_eq!(f.len(), 2);
                 assert_eq!(f[0].language_id, "rust");
                 assert_eq!(f[1].language_id, "python");
@@ -1567,13 +1643,13 @@ mod tests {
                 server_id: ServerId::from("typescript"),
                 language_id: "typescript".to_string(),
                 command: "tsserver".to_string(),
-                message: "executable not found in PATH".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
             };
 
             let display = failure.to_string();
             assert!(display.contains("typescript"));
             assert!(display.contains("tsserver"));
-            assert!(display.contains("executable not found"));
+            assert!(display.contains("panicked"));
         }
 
         #[test]
@@ -1590,7 +1666,7 @@ mod tests {
                 server_id: ServerId::from("go"),
                 language_id: "go".to_string(),
                 command: "gopls".to_string(),
-                message: "error".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
             });
 
             assert!(result.all_failed());
@@ -1603,7 +1679,7 @@ mod tests {
             use crate::config::{LspServerConfig, WorkspaceConfig};
 
             // A configured server whose command cannot spawn used to make serve()
-            // fail synchronously with NoServersAvailable / AllServersFailedToInit.
+            // fail synchronously with AllServersFailedToInit.
             // LSP initialization now runs in a background task so the MCP
             // `initialize` handshake is never blocked, which means the spawn
             // failure is handled in the background instead: serve() starts the MCP
@@ -1653,8 +1729,7 @@ mod tests {
                 Ok(Ok(())) => {}
                 // It returned an error: it must not be a fail-fast availability error.
                 Ok(Err(err)) => assert!(
-                    !matches!(err, Error::NoServersAvailable(_))
-                        && !matches!(err, Error::AllServersFailedToInit { .. }),
+                    !matches!(err, Error::AllServersFailedToInit { .. }),
                     "serve() must not fail fast now that LSP init is backgrounded; got: {err:?}"
                 ),
             }
@@ -1666,7 +1741,7 @@ mod tests {
 
             // Server starts in protocol-only mode when no LSP servers are configured.
             // serve() blocks until the MCP transport closes, so it will error with a
-            // connection/transport error — not NoServersAvailable.
+            // connection/transport error — not AllServersFailedToInit.
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
@@ -1685,11 +1760,11 @@ mod tests {
             let result = serve(config).await;
 
             // serve() may succeed or fail with a transport error, but must NOT
-            // return NoServersAvailable when the config simply has no servers.
+            // return AllServersFailedToInit when the config simply has no servers.
             if let Err(ref err) = result {
                 assert!(
-                    !matches!(err, Error::NoServersAvailable(_)),
-                    "serve() must not return NoServersAvailable for empty lsp_servers config"
+                    !matches!(err, Error::AllServersFailedToInit { .. }),
+                    "serve() must not return AllServersFailedToInit for empty lsp_servers config"
                 );
             }
         }
@@ -1977,6 +2052,130 @@ mod tests {
     // ------------------------------------------------------------------
     // diagnostics_pump unit tests
     // ------------------------------------------------------------------
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod init_supervision_tests {
+        use super::*;
+        use crate::bridge::IndexingState;
+        use crate::config::LspServerConfig;
+        use crate::error::StartupFailure;
+
+        fn mark_ready(cache: &mut NotificationCache, id: &ServerId) {
+            cache.observe_indexing_signal(
+                id,
+                "experimental/serverStatus",
+                Some(&serde_json::json!({"quiescent": true})),
+            );
+            assert_eq!(cache.indexing_state(id), IndexingState::Ready);
+        }
+
+        #[tokio::test]
+        async fn test_run_init_supervised_records_panic_for_unregistered_servers() {
+            let translator = Translator::new();
+            let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+            let id = config.server_config.id();
+
+            run_init_supervised(&translator, &[config], async {
+                panic!("init boom");
+            })
+            .await;
+
+            let failure = translator.startup_failure(&id).unwrap();
+            assert!(matches!(failure.reason, StartupFailure::InitTaskPanicked));
+        }
+
+        #[tokio::test]
+        async fn test_run_init_supervised_leaves_translator_alone_without_panic() {
+            let translator = Translator::new();
+            let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+            let id = config.server_config.id();
+
+            run_init_supervised(&translator, &[config], async {}).await;
+
+            assert!(translator.startup_failure(&id).is_none());
+        }
+
+        #[tokio::test]
+        async fn test_run_init_supervised_keeps_existing_spawn_failure() {
+            let translator = Translator::new();
+            let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+            let id = config.server_config.id();
+            translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
+                server_id: id.clone(),
+                language_id: "rust".to_string(),
+                command: "rust-analyzer".to_string(),
+                reason: StartupFailure::Spawn(Arc::new(Error::ServerTerminated)),
+            }]);
+
+            run_init_supervised(&translator, &[config], async {
+                panic!("init boom");
+            })
+            .await;
+
+            let failure = translator.startup_failure(&id).unwrap();
+            assert!(matches!(failure.reason, StartupFailure::Spawn(_)));
+        }
+
+        #[tokio::test]
+        async fn test_run_init_supervised_degrades_registered_servers_after_panic() {
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let translator = Translator::new().with_notification_cache(Arc::clone(&cache));
+            let server_config = LspServerConfig::rust_analyzer();
+            let id = server_config.id();
+            translator.register_server_complete(crate::lsp::fake_lsp_server_with_config(
+                server_config.clone(),
+            ));
+            mark_ready(&mut *cache.lock().await, &id);
+
+            run_init_supervised(
+                &translator,
+                &[crate::test_lsp::init_config_for(server_config)],
+                async {
+                    panic!("init boom");
+                },
+            )
+            .await;
+
+            let guard = cache.lock().await;
+            assert!(guard.is_push_degraded(&id));
+            assert_eq!(guard.indexing_state(&id), IndexingState::Unknown);
+            drop(guard);
+            assert!(translator.startup_failure(&id).is_none());
+        }
+
+        #[tokio::test]
+        async fn test_drain_pumps_degrades_server_of_panicked_pump() {
+            let cache = Mutex::new(NotificationCache::new());
+            let id = ServerId::from("rust");
+            mark_ready(&mut *cache.lock().await, &id);
+
+            let mut pumps = JoinSet::new();
+            let pump = pumps.spawn(async {
+                panic!("pump boom");
+            });
+            let pump_servers = HashMap::from([(pump.id(), id.clone())]);
+
+            drain_pumps(pumps, &pump_servers, &cache).await;
+
+            let guard = cache.lock().await;
+            assert!(guard.is_push_degraded(&id));
+            assert_eq!(guard.indexing_state(&id), IndexingState::Unknown);
+        }
+
+        #[tokio::test]
+        async fn test_drain_pumps_ignores_pump_that_finished_normally() {
+            let cache = Mutex::new(NotificationCache::new());
+            let id = ServerId::from("rust");
+
+            let mut pumps = JoinSet::new();
+            let pump = pumps.spawn(async {});
+            let pump_servers = HashMap::from([(pump.id(), id.clone())]);
+
+            drain_pumps(pumps, &pump_servers, &cache).await;
+
+            assert!(!cache.lock().await.is_push_degraded(&id));
+        }
+    }
 
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     mod pump_tests {

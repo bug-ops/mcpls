@@ -242,13 +242,10 @@ impl Translator {
     ) -> DiagnosticsResult {
         match diag_info {
             Some(diag_info) => {
-                let ctx = EncodingCtx {
-                    encoding,
-                    tracker: tracker.clone(),
-                    // Never read here -- see `EMPTY_WORKSPACE_ROOTS`'s doc.
-                    workspace_roots: EMPTY_WORKSPACE_ROOTS.clone(),
-                    line_cache: super::encoding_ctx::new_line_cache(),
-                };
+                // Workspace roots are never read here -- see
+                // `EMPTY_WORKSPACE_ROOTS`'s doc.
+                let ctx =
+                    EncodingCtx::new(encoding, tracker.clone(), EMPTY_WORKSPACE_ROOTS.clone());
                 let mut result = Vec::with_capacity(diag_info.diagnostics.len());
                 for d in &diag_info.diagnostics {
                     result.push(diagnostic_to_mcp(d, &ctx, &diag_info.uri).await);

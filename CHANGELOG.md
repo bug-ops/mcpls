@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`LspClient::shutdown`/`LspServer::shutdown`** — Breaking change: now has an overall deadline of `lsp::SHUTDOWN_TIMEOUT` and may return the new `Error::ShutdownTimeout`; a wedged message loop is aborted and its pending requests failed. (#530)
 - **`Error::ServerNotFound`** — Breaking change: a missing server binary now yields this variant instead of `Error::ServerSpawnFailed`. (#530)
 - Breaking: `DroppedEdits` gains public `exceeds_item_cap` and `shadowed_by_changes` fields. (#487, #498, #519)
+- **Breaking:** a language whose server failed to start now yields `Error::ServerFailedToStart` (typed `StartupFailure`, incl. install guidance) instead of `NoServerForLanguage`; `ServerSpawnFailure.message` is now `reason`, `AllServersFailedToInit.count` and `Error::NoServersAvailable` are removed, `ServerUnavailable.reason` is now `retry_in`, and `Translator::register_server_config` is removed. (#527, #529, #537)
+- Added `Error::ServerExitedDuringInit` (with a rust-analyzer rustup hint via `BuiltinServer::early_exit_hint`) and the public `StartupFailure` enum. (#527, #537)
+- **Breaking:** `workspace.max_file_size` is capped at 1 GiB (`MAX_FILE_SIZE_LIMIT`), and the per-response disk-read budget now derives from it (4x, at most 256 MiB). (#489, #537)
+- **Breaking:** a lone `\r` now ends a line in tracked and on-disk documents, following the LSP line model. (#513, #537)
+- **Breaking:** `SignatureParameter.label` is now `Option<String>` holding the label text for tuple labels, and `CallHierarchyPrepareResult` gains `truncated`; `DocumentTracker::take_evicted` and `EvictedDocument` are removed and `apply_lifecycle_notification` is now public. (#511, #516, #515, #517, #537)
 
 ### Fixed
 
@@ -44,6 +49,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DocumentTracker` LRU eviction now skips a document whose handler is still awaiting its LSP response, returning `DocumentLimitExceeded` when no safe candidate exists. (#503, #519)
 - Test-only `raw_len` and `subscription_registry` helpers no longer trigger dead-code lints without the `transport-http` feature. (#491, #519)
 - `test_timeout_handling` now cancels the handler after a single poll and `test_diagnostics_with_error` a bounded retry, mitigating CI flakiness that was not reproduced locally. (#473, #466, #519)
+- A panic in the background LSP init task, a diagnostics pump, or an MCP request handler is now contained and reported instead of leaving tools stuck on `ServerInitializing` or a request unanswered. (#528, #537)
+- Respawn reads the server config from the registered `LspServer`, removing the duplicate map. (#529, #537)
+- A stale `didClose` is no longer sent after an evicted document is reopened. (#515, #537)
+- Call-hierarchy prepare results are capped by the shared item budget. (#516, #537)
+- Tuple signature-parameter labels are returned as label text instead of raw server-encoding offsets. (#511, #537)
+- Tracker line lookups use a sparse line index instead of an O(offset) scan under the global mutex. (#488, #537)
+- HTTP transport tests bind their own listener and no longer sleep, the timeout test is replaced by deterministic paused-clock tests, and the diagnostics test polls only while indexing. (#524, #518, #517, #537)
 
 ## [0.6.0] - 2026-09-21
 

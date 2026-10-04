@@ -149,7 +149,8 @@ impl Translator {
         // see `lsp_locations_to_mcp`'s doc comment in `navigation.rs` for why
         // a read-only location outside the workspace (stdlib, a dependency)
         // is normal, expected navigation rather than something to drop.
-        let lsp_items = response.unwrap_or_default();
+        let mut budget = ItemBudget::new();
+        let lsp_items = budget.admit(response.unwrap_or_default());
         let mut items = Vec::with_capacity(lsp_items.len());
         for item in lsp_items {
             items.push(convert_call_hierarchy_item(item, &ctx).await);
@@ -157,6 +158,7 @@ impl Translator {
 
         Ok(CallHierarchyPrepareResult {
             items,
+            truncated: budget.truncated(),
             positions_degraded: ctx.positions_degraded(),
         })
     }
@@ -1449,5 +1451,70 @@ mod tests {
         .await;
 
         assert!(result.get("truncated").is_none());
+    }
+
+    /// #516: a prepare response past `MAX_NORMALIZED_LOCATIONS` is cut and
+    /// flagged, one within it is not.
+    #[tokio::test]
+    async fn test_handle_call_hierarchy_prepare_caps_items_and_reports_truncation() {
+        use crate::bridge::translator::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        for (count, truncated) in [
+            (MAX_NORMALIZED_LOCATIONS + 10, true),
+            (MAX_NORMALIZED_LOCATIONS, false),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let server_id = ServerId::from("rust");
+            let caps = lsp_types::ServerCapabilities {
+                call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
+                ..Default::default()
+            };
+            let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+            let path = dir.path().join("queried.rs");
+            fs::write(&path, "fn queried() {}").unwrap();
+            let uri = Url::from_file_path(&path).unwrap().to_string();
+
+            let translator = Arc::new(translator);
+            let handle = {
+                let translator = Arc::clone(&translator);
+                let path = path.to_string_lossy().into_owned();
+                tokio::spawn(async move {
+                    translator
+                        .handle_call_hierarchy_prepare(path, pos(1, 1))
+                        .await
+                })
+            };
+
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            let opened = read_framed_message(&mut wire).await;
+            assert_eq!(opened["method"], "textDocument/didOpen");
+            let request = read_framed_message(&mut wire).await;
+            assert_eq!(request["method"], "textDocument/prepareCallHierarchy");
+
+            let range = serde_json::json!({
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1}
+            });
+            let item = serde_json::json!({
+                "name": "f", "kind": 12, "uri": uri,
+                "range": range, "selectionRange": range
+            });
+            write_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::Value::Array(vec![item; count]),
+            )
+            .await;
+
+            let result = timeout(Duration::from_secs(30), handle)
+                .await
+                .expect("handler call should not hang")
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.items.len(), MAX_NORMALIZED_LOCATIONS);
+            assert_eq!(result.truncated, truncated);
+            let wire = serde_json::to_value(&result).unwrap();
+            assert_eq!(wire.get("truncated").is_some(), truncated);
+        }
     }
 }

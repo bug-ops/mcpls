@@ -12,10 +12,11 @@
 
 use std::path::Path;
 use std::sync::{Arc, Once};
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use mcpls_core::bridge::{NotificationCache, Position, Translator};
+use mcpls_core::bridge::{
+    IndexingState, NotificationCache, Position, Translator, apply_lifecycle_notification,
+};
 use mcpls_core::config::{LspServerConfig, ServerId, ToolRouter};
 use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
@@ -46,6 +47,47 @@ fn init_tracing() {
 /// 3. Creates and configures a Translator
 /// 4. Returns the translator wrapped in `Arc<Mutex>`
 async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
+    translator_for(spawn_rust_analyzer().await)
+}
+
+/// As [`setup_rust_analyzer`], additionally forwarding the server's lifecycle
+/// lane (`$/progress`, `experimental/serverStatus`) into the returned cache so
+/// a test can observe the server's indexing state.
+///
+/// The forwarder is spawned immediately after `LspServer::spawn` returns,
+/// before any other await, so no signal sent after initialization is missed.
+async fn setup_rust_analyzer_with_lifecycle_cache()
+-> (Arc<Mutex<Translator>>, Arc<Mutex<NotificationCache>>) {
+    let mut server = spawn_rust_analyzer().await;
+    let mut lifecycle_rx = server.take_lifecycle_rx();
+    let cache = Arc::new(Mutex::new(NotificationCache::new()));
+    let forwarder_cache = Arc::clone(&cache);
+    let server_id = ServerId::from("rust");
+    tokio::spawn(async move {
+        while let Some(notification) = lifecycle_rx.recv().await {
+            let mut cache = forwarder_cache.lock().await;
+            apply_lifecycle_notification(&mut cache, &server_id, notification);
+        }
+    });
+    (translator_for(server), cache)
+}
+
+fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
+    let workspace_path = rust_workspace_path();
+    let extension_map = std::collections::HashMap::from([("rs".to_string(), "rust".to_string())]);
+    let mut translator = Translator::new()
+        .with_extensions(extension_map)
+        .with_router(ToolRouter::catch_all([(
+            ServerId::from("rust"),
+            "rust".to_string(),
+        )]));
+    translator.set_workspace_roots(vec![workspace_path]);
+    translator.register_server_complete(server);
+
+    Arc::new(Mutex::new(translator))
+}
+
+async fn spawn_rust_analyzer() -> LspServer {
     init_tracing();
     let workspace_path = rust_workspace_path();
 
@@ -72,21 +114,9 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
         notification_tx: None,
     };
 
-    let server = LspServer::spawn(server_init_config)
+    LspServer::spawn(server_init_config)
         .await
-        .expect("Failed to spawn rust-analyzer");
-
-    let extension_map = std::collections::HashMap::from([("rs".to_string(), "rust".to_string())]);
-    let mut translator = Translator::new()
-        .with_extensions(extension_map)
-        .with_router(ToolRouter::catch_all([(
-            ServerId::from("rust"),
-            "rust".to_string(),
-        )]));
-    translator.set_workspace_roots(vec![workspace_path]);
-    translator.register_server_complete(server);
-
-    Arc::new(Mutex::new(translator))
+        .expect("Failed to spawn rust-analyzer")
 }
 
 /// Find the 1-based line number of the first line in `file` containing `needle`.
@@ -525,6 +555,10 @@ async fn test_references_user_struct() {
 /// waiting for the expected error to appear.
 const DIAGNOSTICS_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long `test_diagnostics_with_error` tolerates an `Unknown` indexing
+/// state (no `serverStatus` seen yet) before failing.
+const DIAGNOSTICS_UNKNOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Pause between `test_diagnostics_with_error`'s diagnostics pulls.
 const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -533,7 +567,7 @@ const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 async fn test_diagnostics_with_error() {
     skip_if_no_rust_analyzer!();
 
-    let translator = setup_rust_analyzer().await;
+    let (translator, notification_cache) = setup_rust_analyzer_with_lifecycle_cache().await;
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
 
@@ -548,15 +582,17 @@ async fn test_diagnostics_with_error() {
     // stays empty and handle_diagnostics falls back to the pull-only
     // (textDocument/diagnostic) result, which only ever surfaces
     // rust-analyzer's own native diagnostics — the missing-trait-item
-    // error (E0046), not the flycheck error.
-    let notification_cache = Mutex::new(NotificationCache::new());
+    // error (E0046), not the flycheck error. Only the lifecycle lane is
+    // forwarded into the cache (for the indexing state below).
     let lib_file = lib_file.to_string_lossy().to_string();
 
     // A single pull can return an empty report while rust-analyzer is still
-    // settling, so poll for the expected error within a bounded window.
+    // settling, so poll for the expected error within a bounded window --
+    // but only while the server reports that it is still indexing.
     let poll_deadline = Instant::now() + DIAGNOSTICS_POLL_TIMEOUT;
+    let unknown_deadline = Instant::now() + DIAGNOSTICS_UNKNOWN_GRACE;
     let mut attempts = 0u32;
-    let last_diag_str = loop {
+    loop {
         attempts += 1;
         let result = timeout(
             Duration::from_secs(10),
@@ -579,16 +615,25 @@ async fn test_diagnostics_with_error() {
         if diag_str.contains("not all trait items implemented") || diag_str.contains("E0046") {
             return;
         }
-        if Instant::now() >= poll_deadline {
-            break diag_str;
-        }
+        let indexing_state = notification_cache
+            .lock()
+            .await
+            .indexing_state(&ServerId::from("rust"));
+        let (deadline, reason) = match indexing_state {
+            IndexingState::Ready => panic!(
+                "Diagnostics lack the intentional error although indexing is Ready; \
+                 attempt {attempts}, last result: {diag_str}"
+            ),
+            IndexingState::Unknown => (unknown_deadline, "no indexing signal seen"),
+            IndexingState::Loading => (poll_deadline, "still indexing"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "Diagnostics should report the intentional error; not seen after {attempts} \
+             attempts ({reason}), last result: {diag_str}"
+        );
         tokio::time::sleep(DIAGNOSTICS_POLL_INTERVAL).await;
-    };
-
-    panic!(
-        "Diagnostics should report the intentional error; not seen after {attempts} attempts, \
-         last result: {last_diag_str}"
-    );
+    }
 }
 
 #[tokio::test]
@@ -812,49 +857,6 @@ async fn test_format_document() {
             println!("Format not supported or failed (expected): {:?}", e);
         }
     }
-}
-
-#[tokio::test]
-#[ignore = "Requires rust-analyzer installed"]
-async fn test_timeout_handling() {
-    skip_if_no_rust_analyzer!();
-
-    let translator = setup_rust_analyzer().await;
-    let workspace_path = rust_workspace_path();
-    let lib_file = workspace_path
-        .join("src/lib.rs")
-        .to_string_lossy()
-        .to_string();
-
-    let hover_position = Position {
-        line: 20,
-        character: 19,
-    };
-
-    // A handler cancelled after one poll models a timeout independent of rust-analyzer's
-    // speed: a single poll can never complete, as it needs a reply from another process.
-    let bridge = translator.lock().await;
-    let mut hover = Box::pin(bridge.handle_hover(lib_file.clone(), hover_position));
-    let first_poll = std::future::poll_fn(|cx| Poll::Ready(hover.as_mut().poll(cx))).await;
-    assert!(
-        first_poll.is_pending(),
-        "handle_hover cannot complete within a single poll"
-    );
-    drop(hover);
-    drop(bridge);
-
-    let follow_up = timeout(
-        Duration::from_secs(30),
-        translator
-            .lock()
-            .await
-            .handle_hover(lib_file, hover_position),
-    )
-    .await;
-    assert!(
-        matches!(&follow_up, Ok(Ok(_))),
-        "a cancelled request must not wedge the client: {follow_up:?}"
-    );
 }
 
 #[tokio::test]

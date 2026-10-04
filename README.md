@@ -281,7 +281,7 @@ tool_prefix = "optics"
 roots = ["/path/to/project"]
 heuristics_max_depth = 10
 max_documents = 100    # 0 = unlimited
-max_file_size = 10485760  # bytes, 0 = unlimited
+max_file_size = 10485760  # bytes, 0 = unlimited, max 1073741824 (1 GiB)
 
 [[lsp_servers]]
 language_id = "rust"

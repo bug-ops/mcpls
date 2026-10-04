@@ -4,16 +4,21 @@
 //! as MCP tools using the rmcp SDK.
 
 use std::borrow::Cow;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::FutureExt as _;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
-    ErrorCode, Implementation, ListResourcesResult, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
-    ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig as RmcpServerConfig,
-    SubscribeRequestParams, SubscriptionFilter, ToolAnnotations, UnsubscribeRequestParams,
+    CallToolRequestParams, CallToolResponse, ErrorCode, Implementation, ListResourcesResult,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities,
+    ServerConfig as RmcpServerConfig, SubscribeRequestParams, SubscriptionFilter, ToolAnnotations,
+    UnsubscribeRequestParams,
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -781,7 +786,7 @@ impl McplsServer {
 
     /// Prepare call hierarchy at a position.
     #[tool(
-        description = concat!("Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis. ", positions_note_request!()),
+        description = concat!("Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
         title = "Prepare Call Hierarchy"
     )]
     async fn prepare_call_hierarchy(
@@ -1062,6 +1067,45 @@ impl McplsServer {
             DiagnosticsRouteSignals::sample(&cache, route_id.as_ref()),
         ))
     }
+
+    /// Body of `read_resource`, kept separate so it can run under
+    /// [`contain_panic`].
+    async fn read_resource_inner(
+        &self,
+        request: ReadResourceRequestParams,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let path =
+            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let response = self.resource_diagnostics_response(&path).await?;
+
+        let json = serde_json::to_string(&response)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
+
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into())
+    }
+}
+
+/// Runs `handler`, turning a panic in it into an internal MCP error.
+///
+/// Without this, a panicking request handler sends no response and the client
+/// waits for its own timeout (#528).
+async fn contain_panic<T>(
+    handler: impl Future<Output = Result<T, McpError>>,
+    operation: &'static str,
+) -> Result<T, McpError> {
+    match AssertUnwindSafe(handler).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            tracing::error!(
+                "{operation} handler panicked: {}",
+                crate::panic_message(payload.as_ref())
+            );
+            Err(McpError::internal_error(
+                format!("{operation} handler panicked"),
+                None,
+            ))
+        }
+    }
 }
 
 impl McplsServer {
@@ -1122,43 +1166,49 @@ impl ServerHandler for McplsServer {
         request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        let mut open_paths = self.context.translator.open_document_paths();
-        // `open_document_paths()` is backed by a `HashMap`; sort so pagination
-        // cursors resume at a stable, deterministic position across calls.
-        open_paths.sort();
+        contain_panic(
+            async {
+                let mut open_paths = self.context.translator.open_document_paths();
+                // `open_document_paths()` is backed by a `HashMap`; sort so pagination
+                // cursors resume at a stable, deterministic position across calls.
+                open_paths.sort();
 
-        let cursor = request.and_then(|r| r.cursor);
-        let (page, next_cursor) =
-            paginate_resource_paths(&open_paths, cursor.as_deref(), RESOURCE_PAGE_SIZE)?;
+                let cursor = request.and_then(|r| r.cursor);
+                let (page, next_cursor) =
+                    paginate_resource_paths(&open_paths, cursor.as_deref(), RESOURCE_PAGE_SIZE)?;
 
-        let resources: Vec<_> = page
-            .iter()
-            .filter_map(|path| {
-                let uri = make_uri(path)
-                    .inspect_err(|e| {
-                        tracing::warn!(
-                            "Skipping path in list_resources (make_uri failed): {}: {e}",
-                            path.display()
-                        );
+                let resources: Vec<_> = page
+                    .iter()
+                    .filter_map(|path| {
+                        let uri = make_uri(path)
+                            .inspect_err(|e| {
+                                tracing::warn!(
+                                    "Skipping path in list_resources (make_uri failed): {}: {e}",
+                                    path.display()
+                                );
+                            })
+                            .ok()?;
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        Some(
+                            Resource::new(uri, name)
+                                .with_mime_type("application/json")
+                                .with_description("LSP diagnostics for this file"),
+                        )
                     })
-                    .ok()?;
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                Some(
-                    Resource::new(uri, name)
-                        .with_mime_type("application/json")
-                        .with_description("LSP diagnostics for this file"),
-                )
-            })
-            .collect();
+                    .collect();
 
-        Ok(ListResourcesResult {
-            next_cursor,
-            ..ListResourcesResult::with_all_items(resources)
-        })
+                Ok(ListResourcesResult {
+                    next_cursor,
+                    ..ListResourcesResult::with_all_items(resources)
+                })
+            },
+            "list_resources",
+        )
+        .await
     }
 
     async fn read_resource(
@@ -1166,14 +1216,16 @@ impl ServerHandler for McplsServer {
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
-        let path =
-            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let response = self.resource_diagnostics_response(&path).await?;
+        contain_panic(self.read_resource_inner(request), "read_resource").await
+    }
 
-        let json = serde_json::to_string(&response)
-            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
-
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into())
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let tcc = ToolCallContext::new(self, request, context);
+        contain_panic(self.tool_router.call(tcc), "tool call").await
     }
 
     /// When cached diagnostics exist, the replay notification is sent to the client
@@ -1187,53 +1239,62 @@ impl ServerHandler for McplsServer {
         request: SubscribeRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        let session = self.context.session.require_stateful(&context)?;
+        contain_panic(
+            async {
+                let session = self.context.session.require_stateful(&context)?;
 
-        // Keyed by the canonical URI: the pump publishes canonical paths only.
-        let ResolvedResource {
-            path: validated_path,
-            uri: canonical_uri,
-        } = DiagnosticsResourceUri::resolve(&request.uri, &self.context.workspace_roots)
-            .map_err(map_bridge_error)?;
+                // Keyed by the canonical URI: the pump publishes canonical paths only.
+                let ResolvedResource {
+                    path: validated_path,
+                    uri: canonical_uri,
+                } = DiagnosticsResourceUri::resolve(&request.uri, &self.context.workspace_roots)
+                    .map_err(map_bridge_error)?;
 
-        // Record the subscription *before* checking the cache. This closes the race where
-        // a PublishDiagnostics notification lands between the cache check and the
-        // subscription being recorded: if diagnostics arrive before this point, the check
-        // below catches them; if they arrive after, `diagnostics_pump`'s own
-        // `subs.contains` check already sees this URI as subscribed and delivers the
-        // update through the normal push path.
-        //
-        // The raw request URI is recorded as an alias of the canonical one so a later
-        // `unsubscribe` for the same raw URI still resolves even if canonicalizing it then
-        // fails, e.g. because the file was deleted since subscribing (#499).
-        let newly_subscribed = session
-            .subscribe(canonical_uri.clone(), request.uri.clone())
-            .await
-            .map_err(|e| map_bridge_error(e.into()))?;
-        if !newly_subscribed {
-            tracing::debug!("client re-subscribed to already-subscribed resource {canonical_uri}");
-        }
+                // Record the subscription *before* checking the cache. This closes the race where
+                // a PublishDiagnostics notification lands between the cache check and the
+                // subscription being recorded: if diagnostics arrive before this point, the check
+                // below catches them; if they arrive after, `diagnostics_pump`'s own
+                // `subs.contains` check already sees this URI as subscribed and delivers the
+                // update through the normal push path.
+                //
+                // The raw request URI is recorded as an alias of the canonical one so a later
+                // `unsubscribe` for the same raw URI still resolves even if canonicalizing it then
+                // fails, e.g. because the file was deleted since subscribing (#499).
+                let newly_subscribed = session
+                    .subscribe(canonical_uri.clone(), request.uri.clone())
+                    .await
+                    .map_err(|e| map_bridge_error(e.into()))?;
+                if !newly_subscribed {
+                    tracing::debug!(
+                        "client re-subscribed to already-subscribed resource {canonical_uri}"
+                    );
+                }
 
-        // Build the URI from the canonicalized path, matching `read_resource` and
-        // what `diagnostics_pump` stores from LSP notifications.
-        let lsp_uri = crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
-        let has_cached_diagnostics = {
-            let cache = self.context.notification_cache.lock().await;
-            cache.diagnostics(lsp_uri.as_ref()).is_some()
-        };
+                // Build the URI from the canonicalized path, matching `read_resource` and
+                // what `diagnostics_pump` stores from LSP notifications.
+                let lsp_uri =
+                    crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
+                let has_cached_diagnostics = {
+                    let cache = self.context.notification_cache.lock().await;
+                    cache.diagnostics(lsp_uri.as_ref()).is_some()
+                };
 
-        if has_cached_diagnostics
-            && let Err(e) = context
-                .peer
-                .notify_resource_updated(ResourceUpdatedNotificationParam::new(
-                    canonical_uri.as_str(),
-                ))
-                .await
-        {
-            tracing::warn!("Failed to replay cached diagnostics for {canonical_uri}: {e}");
-        }
+                if has_cached_diagnostics
+                    && let Err(e) = context
+                        .peer
+                        .notify_resource_updated(ResourceUpdatedNotificationParam::new(
+                            canonical_uri.as_str(),
+                        ))
+                        .await
+                {
+                    tracing::warn!("Failed to replay cached diagnostics for {canonical_uri}: {e}");
+                }
 
-        Ok(())
+                Ok(())
+            },
+            "subscribe",
+        )
+        .await
     }
 
     async fn unsubscribe(
@@ -1241,23 +1302,31 @@ impl ServerHandler for McplsServer {
         request: UnsubscribeRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        let session = self.context.session.require_stateful(&context)?;
+        contain_panic(
+            async {
+                let session = self.context.session.require_stateful(&context)?;
 
-        // Only a malformed URI errors; a deleted file resolves via its alias (#499).
-        let canonical =
-            match DiagnosticsResourceUri::resolve(&request.uri, &self.context.workspace_roots) {
-                Ok(resolved) => Some(resolved.uri),
-                Err(e @ crate::error::Error::InvalidUri(_)) => return Err(map_bridge_error(e)),
-                Err(_) => None,
-            };
+                // Only a malformed URI errors; a deleted file resolves via its alias (#499).
+                let canonical = match DiagnosticsResourceUri::resolve(
+                    &request.uri,
+                    &self.context.workspace_roots,
+                ) {
+                    Ok(resolved) => Some(resolved.uri),
+                    Err(e @ crate::error::Error::InvalidUri(_)) => return Err(map_bridge_error(e)),
+                    Err(_) => None,
+                };
 
-        if !session.unsubscribe(canonical.as_ref(), &request.uri).await {
-            tracing::debug!(
-                "client unsubscribed from resource with no matching subscription: {}",
-                request.uri
-            );
-        }
-        Ok(())
+                if !session.unsubscribe(canonical.as_ref(), &request.uri).await {
+                    tracing::debug!(
+                        "client unsubscribed from resource with no matching subscription: {}",
+                        request.uri
+                    );
+                }
+                Ok(())
+            },
+            "unsubscribe",
+        )
+        .await
     }
 
     /// Syntax-only: no filesystem access and no capacity check, so an
@@ -1518,6 +1587,63 @@ mod tests {
                 "expected {debug} to map onto INVALID_PARAMS"
             );
         }
+    }
+
+    /// #527: a startup failure reaches the client as an internal error that
+    /// still carries the spawn failure's install guidance.
+    #[test]
+    fn test_map_bridge_error_startup_failure_carries_guidance() {
+        let error =
+            crate::error::Error::ServerFailedToStart(Box::new(crate::error::ServerSpawnFailure {
+                server_id: crate::config::ServerId::from("rust"),
+                language_id: "rust".to_string(),
+                command: "rust-analyzer".to_string(),
+                reason: crate::error::StartupFailure::Spawn(Arc::new(
+                    crate::error::Error::ServerNotFound {
+                        command: "rust-analyzer".to_string(),
+                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                    },
+                )),
+            }));
+
+        let mapped = map_bridge_error(error);
+
+        assert_eq!(mapped.code, ErrorCode::INTERNAL_ERROR);
+        assert!(
+            mapped
+                .message
+                .contains("rustup component add rust-analyzer"),
+            "{}",
+            mapped.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_contain_panic_turns_panic_into_internal_error() {
+        let result: Result<(), McpError> = contain_panic(
+            async {
+                panic!("handler boom");
+            },
+            "tool call",
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert!(error.message.contains("tool call handler panicked"));
+    }
+
+    #[tokio::test]
+    async fn test_contain_panic_passes_through_handler_result() {
+        let ok = contain_panic(async { Ok(7) }, "read_resource").await;
+        assert_eq!(ok.unwrap(), 7);
+
+        let err: Result<(), McpError> = contain_panic(
+            async { Err(McpError::invalid_params("bad", None)) },
+            "read_resource",
+        )
+        .await;
+        assert_eq!(err.unwrap_err().code, ErrorCode::INVALID_PARAMS);
     }
 
     /// #479 follow-up: `WorkspaceServersInitializing` (the no-single-server
@@ -2928,7 +3054,7 @@ sleep 0.3
             notification_tx: None,
         };
 
-        let seed = LspServer::spawn(config.clone()).await.unwrap();
+        let seed = LspServer::spawn(config).await.unwrap();
 
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let translator = Arc::new(
@@ -2937,9 +3063,7 @@ sleep 0.3
                 .with_notification_cache(Arc::clone(&notification_cache))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
-        translator.register_client(id.clone(), seed.client().clone());
-        translator.register_server(id.clone(), seed);
-        translator.register_server_config(id.clone(), config);
+        translator.register_server_complete(seed);
 
         let server = McplsServer::new(
             Arc::clone(&translator),

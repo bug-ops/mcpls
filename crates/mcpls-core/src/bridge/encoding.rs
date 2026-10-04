@@ -210,6 +210,77 @@ fn exact_byte_offset(
     (round_trip == character_offset).then_some(byte_offset)
 }
 
+/// Byte offsets for a chosen set of code-unit offsets into one label,
+/// resolved in a single pass over the label.
+///
+/// Resolves signature-help parameter labels given as offset pairs
+/// (`ParameterInformationLabel::Tuple`) in the negotiated encoding's units.
+/// Per-pair scans would cost O(label) each, which a server naming many
+/// parameters could amplify; a full per-unit table would cost memory
+/// proportional to the label. This keeps one entry per distinct requested
+/// offset.
+#[derive(Debug)]
+pub struct LabelOffsets<'a> {
+    label: &'a str,
+    /// `(unit offset, byte offset)` sorted by unit; the byte offset is `None`
+    /// for an offset out of range or inside a multi-unit character.
+    resolved: Vec<(u32, Option<usize>)>,
+}
+
+impl<'a> LabelOffsets<'a> {
+    /// Resolves each of `offsets` (code units in `encoding`) against `label`.
+    #[must_use]
+    pub fn new(
+        label: &'a str,
+        offsets: impl IntoIterator<Item = u32>,
+        encoding: PositionEncoding,
+    ) -> Self {
+        let mut wanted: Vec<u32> = offsets.into_iter().collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        let mut resolved = Vec::with_capacity(wanted.len());
+        let mut next = 0;
+        let mut settle = |unit: usize, byte: usize| {
+            while let Some(&offset) = wanted.get(next) {
+                if offset as usize > unit {
+                    break;
+                }
+                resolved.push((offset, (offset as usize == unit).then_some(byte)));
+                next += 1;
+            }
+        };
+        let mut unit = 0;
+        for (byte, ch) in label.char_indices() {
+            settle(unit, byte);
+            unit += match encoding {
+                PositionEncoding::Utf8 => ch.len_utf8(),
+                PositionEncoding::Utf16 => ch.len_utf16(),
+                PositionEncoding::Utf32 => 1,
+            };
+        }
+        settle(unit, label.len());
+        resolved.extend(wanted[next..].iter().map(|&offset| (offset, None)));
+        Self { label, resolved }
+    }
+
+    /// The substring of the indexed label between
+    /// `start` (inclusive) and `end` (exclusive) code units. `None` when
+    /// either offset was not among those requested, is out of range or inside
+    /// a multi-unit character, or `start > end`.
+    #[must_use]
+    pub fn substring(&self, start: u32, end: u32) -> Option<&'a str> {
+        let at = |unit: u32| {
+            let index = self
+                .resolved
+                .binary_search_by_key(&unit, |&(offset, _)| offset)
+                .ok()?;
+            self.resolved[index].1
+        };
+        self.label.get(at(start)?..at(end)?)
+    }
+}
+
 /// Position encoding converter for handling UTF-8/UTF-16/UTF-32 conversions.
 ///
 /// Different LSP servers may use different character encodings. This converter
@@ -339,6 +410,44 @@ impl EncodingConverter {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn label_substring(
+        label: &str,
+        start: u32,
+        end: u32,
+        encoding: PositionEncoding,
+    ) -> Option<&str> {
+        LabelOffsets::new(label, [start, end], encoding).substring(start, end)
+    }
+
+    #[test]
+    fn test_label_substring_resolves_offsets_per_encoding() {
+        let label = "é𝄞xy";
+        for (encoding, start, end) in [
+            (PositionEncoding::Utf8, 6, 8),
+            (PositionEncoding::Utf16, 3, 5),
+            (PositionEncoding::Utf32, 2, 4),
+        ] {
+            assert_eq!(
+                label_substring(label, start, end, encoding),
+                Some("xy"),
+                "{encoding:?}"
+            );
+            assert_eq!(label_substring(label, 0, 0, encoding), Some(""));
+        }
+    }
+
+    #[test]
+    fn test_label_substring_rejects_invalid_offsets() {
+        let label = "é𝄞x";
+        assert_eq!(label_substring(label, 0, 99, PositionEncoding::Utf16), None);
+        assert_eq!(label_substring(label, 0, 99, PositionEncoding::Utf8), None);
+        assert_eq!(label_substring(label, 3, 1, PositionEncoding::Utf16), None);
+        assert_eq!(label_substring(label, 4, 3, PositionEncoding::Utf8), None);
+        // Mid-character: inside `é` (UTF-8) and inside the surrogate pair (UTF-16).
+        assert_eq!(label_substring(label, 1, 2, PositionEncoding::Utf8), None);
+        assert_eq!(label_substring(label, 0, 2, PositionEncoding::Utf16), None);
+    }
 
     fn lsp_at(
         line: u32,

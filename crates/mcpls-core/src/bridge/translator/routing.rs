@@ -7,7 +7,7 @@ use super::Translator;
 use crate::bridge::state::detect_language;
 use crate::bridge::{InFlightGuard, lock_std};
 use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
 
 /// Maximum allowed position value for validation.
@@ -15,6 +15,9 @@ pub(super) const MAX_POSITION_VALUE: u32 = 1_000_000;
 
 /// Maximum allowed range size in lines.
 pub(super) const MAX_RANGE_LINES: u32 = 10_000;
+
+/// Total time `Translator::flush_pending_closes` may spend per call.
+const FLUSH_PENDING_CLOSES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A document opened for a handler's LSP round-trip, together with the
 /// routed server and client.
@@ -592,6 +595,9 @@ impl Translator {
                 })
             }
             RouteLookup::Unrouted => {
+                if let Some(failure) = self.startup_failure_for_candidates(&candidates, tool) {
+                    return Err(Error::ServerFailedToStart(Box::new(failure)));
+                }
                 let has_language = {
                     let router = lock_std(&self.router);
                     candidates.iter().any(|lang| router.has_language(lang))
@@ -614,6 +620,22 @@ impl Translator {
         LanguageCandidates::new(detect_language(path, &self.extension_map))
     }
 
+    /// The startup failure of the server the pre-rebind routing table would
+    /// have used for `tool` in the first of `languages` that has one.
+    ///
+    /// Only consulted once no live route exists: a surviving catch-all
+    /// still serves the request, so a failed explicit server never masks it.
+    fn startup_failure_for_candidates(
+        &self,
+        candidates: &LanguageCandidates,
+        tool: ToolKind,
+    ) -> Option<ServerSpawnFailure> {
+        candidates.iter().find_map(|lang| {
+            let id = self.configured_router.resolve(lang, tool)?;
+            self.startup_failure(id)
+        })
+    }
+
     /// Resolve the routing identity of the diagnostics-route server for
     /// `path`'s detected language, without requiring that server to be
     /// currently registered.
@@ -628,6 +650,7 @@ impl Translator {
     /// unlike `NotificationCache::diagnostics_owner`, which a respawn clears
     /// along with the crashed server's stale entries.
     #[must_use]
+    // TODO(#535): diagnostics tools return an empty list for a server that failed to start.
     pub(crate) fn diagnostics_route_id_for_path(&self, path: &Path) -> Option<ServerId> {
         let candidates = self.language_candidates(path);
         let router = lock_std(&self.router);
@@ -720,7 +743,7 @@ impl Translator {
             .document_tracker
             .ensure_open(validated_path, &server_id, &client)
             .await;
-        self.notify_evicted_documents().await;
+        self.flush_pending_closes().await;
         let uri = result?;
         Ok(PreparedDocument {
             server_id,
@@ -805,56 +828,69 @@ impl Translator {
         self.open_prepared(server_id, client, &validated_path).await
     }
 
-    /// Sends `textDocument/didClose` to every server that had a document
-    /// [`DocumentTracker::open`]'s LRU eviction just reclaimed (#495), so a
-    /// server's own open-document set does not keep growing even though
-    /// mcpls's own tracking has stopped counting it.
+    /// Sends the `textDocument/didClose` notifications still owed after
+    /// [`DocumentTracker::open`]'s LRU eviction (#495), so a server's own
+    /// open-document set does not keep growing even though mcpls's own
+    /// tracking has stopped counting the document.
     ///
     /// `DocumentTracker` has no access to any server's [`LspClient`] --
     /// `self.lsp_clients` is the registry for that, kept one layer up in
-    /// `Translator` -- so this is the chokepoint that reconciles
-    /// [`DocumentTracker::take_evicted`]'s queue against it. Called after
-    /// every `ensure_open` that could have triggered eviction (both
-    /// `prepare_document` and `finish_prepare_gated_document`) --
-    /// unconditionally, even when `ensure_open` itself returned an error, so
-    /// a different, already-evicted document's queued close is never lost
-    /// on that path (#495 S5).
+    /// `Translator` -- so this is the chokepoint that reconciles its pending
+    /// closes against it. Called after every `ensure_open` that could have
+    /// triggered eviction, unconditionally, even when `ensure_open` itself
+    /// returned an error, so a different, already-evicted document's close
+    /// is never lost on that path (#495 S5).
     ///
-    /// Best-effort: a failed notify is logged and otherwise ignored, exactly
-    /// like `sync_phase`'s own `didOpen`/`didChange` failures are handled
-    /// one layer down -- the request that triggered the eviction must not
-    /// fail just because a *different*, already-evicted document's close
-    /// notification could not be delivered. A failure here does leave a
-    /// residual desync, though: mcpls has already forgotten the document
-    /// (it's out of `document_tracker`), but the server never learned it
-    /// was closed, so a later `ensure_open` for the same path sends a fresh
-    /// `didOpen` for a document the server (as far as it knows) already has
-    /// open. In practice this self-heals whenever that server is later
-    /// respawned (`forget_server` clears its whole sync history).
-    async fn notify_evicted_documents(&self) {
-        for doc in self.document_tracker.take_evicted() {
-            for server_id in &doc.synced_servers {
-                let Some(client) = lock_std(&self.lsp_clients).get(server_id).cloned() else {
+    /// Claims, notifies and releases one path at a time, so a busy path is
+    /// skipped (it stays pending) and no claim outlives its own notifies.
+    /// The whole flush shares one [`FLUSH_PENDING_CLOSES_DEADLINE`]: it runs
+    /// inline on the request path, so a wedged server must not add latency to
+    /// unrelated calls. Paths not reached before the deadline stay pending.
+    ///
+    /// Best-effort: a failed close is logged and its debt dropped, never
+    /// failing the request that triggered the eviction. A wedged or dead
+    /// server is respawned, and `forget_server` clears its history anyway. A
+    /// server that is no longer registered is dropped the same way.
+    async fn flush_pending_closes(&self) {
+        let flush = async {
+            for path in self.document_tracker.pending_close_paths() {
+                let Some(claim) = self.document_tracker.try_claim_pending_close(&path) else {
                     continue;
                 };
-                if let Err(err) = client
-                    .notify_typed::<lsp_types::DidCloseTextDocumentNotification>(
-                        lsp_types::DidCloseTextDocumentParams {
-                            text_document: lsp_types::TextDocumentIdentifier {
-                                uri: doc.uri.clone(),
+                for server_id in &claim.servers {
+                    let Some(client) = lock_std(&self.lsp_clients).get(server_id).cloned() else {
+                        continue;
+                    };
+                    if let Err(err) = client
+                        .notify_typed::<lsp_types::DidCloseTextDocumentNotification>(
+                            lsp_types::DidCloseTextDocumentParams {
+                                text_document: lsp_types::TextDocumentIdentifier {
+                                    uri: claim.uri.clone(),
+                                },
                             },
-                        },
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        %server_id,
-                        path = %doc.path.display(),
-                        error = %err,
-                        "failed to notify evicted document's server of textDocument/didClose"
-                    );
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            %server_id,
+                            path = %claim.path.display(),
+                            error = %err,
+                            "failed to notify evicted document's server of textDocument/didClose; \
+                             dropping the close"
+                        );
+                    }
                 }
             }
+        };
+        if tokio::time::timeout(FLUSH_PENDING_CLOSES_DEADLINE, flush)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                deadline = ?FLUSH_PENDING_CLOSES_DEADLINE,
+                "flushing evicted documents' didClose notifications hit the deadline; paths not yet \
+                 reached stay pending, the in-flight path's remaining closes are dropped"
+            );
         }
     }
 
@@ -1005,6 +1041,174 @@ mod tests {
             .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
         assert!(matches!(err, Error::NoServerForLanguage(ref l) if *l == lang));
+    }
+
+    use crate::test_lsp::test_extensions;
+
+    fn not_found_failure(id: &ServerId, language: &str, command: &str) -> ServerSpawnFailure {
+        ServerSpawnFailure {
+            server_id: id.clone(),
+            language_id: language.to_string(),
+            command: command.to_string(),
+            reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
+                command: command.to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })),
+        }
+    }
+
+    fn router_config(
+        language: &str,
+        name: &str,
+        handles: Option<Vec<ToolKind>>,
+    ) -> LspServerConfig {
+        LspServerConfig {
+            language_id: language.to_string(),
+            command: "sh".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            file_patterns: vec![],
+            initialization_options: None,
+            timeout_seconds: 5,
+            request_timeout_seconds: 5,
+            heuristics: None,
+            name: Some(name.to_string()),
+            handles,
+            indexing: crate::bridge::IndexingPolicy::Auto,
+        }
+    }
+
+    /// #527: the sole server for a language failed to spawn, so the routing
+    /// error carries the spawn failure and its install guidance instead of
+    /// "no LSP server configured".
+    #[test]
+    fn test_client_for_file_reports_startup_failure_of_sole_server() {
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.record_startup_failures(&[not_found_failure(&id, "rust", "rust-analyzer")]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        let err = translator
+            .client_for_file(Path::new("/ws/main.rs"), ToolKind::Hover)
+            .unwrap_err();
+
+        let Error::ServerFailedToStart(failure) = &err else {
+            panic!("expected ServerFailedToStart, got {err:?}");
+        };
+        assert_eq!(failure.server_id, id);
+        let message = err.to_string();
+        assert!(
+            message.contains("rustup component add rust-analyzer"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_client_for_file_ignores_startup_failure_of_other_language() {
+        let id = ServerId::from("rust");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.record_startup_failures(&[not_found_failure(&id, "rust", "rust-analyzer")]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        let err = translator
+            .client_for_file(Path::new("/ws/script.py"), ToolKind::Hover)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::NoServerForLanguage(_)), "got {err:?}");
+    }
+
+    /// A failed explicit server must not mask a live catch-all it was
+    /// rebound to.
+    #[tokio::test]
+    async fn test_client_for_file_live_catch_all_wins_over_failed_explicit_server() {
+        let configs = [
+            router_config("rust", "hover-only", Some(vec![ToolKind::Hover])),
+            router_config("rust", "catch-all", None),
+        ];
+        let router = ToolRouter::from_configs(configs.iter()).unwrap();
+        let hover_id = ServerId::from("hover-only");
+        let live_id = ServerId::from("catch-all");
+
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(router);
+        let (client, _server) = fake_lsp_client();
+        translator.register_client(live_id.clone(), client);
+        translator.record_startup_failures(&[not_found_failure(&hover_id, "rust", "sh")]);
+        translator.rebind_router(&HashSet::from([live_id.clone()]));
+        translator.clear_expected_servers();
+
+        let (id, _client) = translator
+            .client_for_file(Path::new("/ws/main.rs"), ToolKind::Hover)
+            .unwrap();
+
+        assert_eq!(id, live_id);
+    }
+
+    /// A failed catch-all is reported for a tool the live explicit server
+    /// does not claim.
+    #[tokio::test]
+    async fn test_client_for_file_reports_failed_catch_all_for_unclaimed_tool() {
+        let configs = [
+            router_config("rust", "hover-only", Some(vec![ToolKind::Hover])),
+            router_config("rust", "catch-all", None),
+        ];
+        let router = ToolRouter::from_configs(configs.iter()).unwrap();
+        let hover_id = ServerId::from("hover-only");
+        let failed_id = ServerId::from("catch-all");
+
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(router);
+        let (client, _server) = fake_lsp_client();
+        translator.register_client(hover_id.clone(), client);
+        translator.record_startup_failures(&[not_found_failure(&failed_id, "rust", "sh")]);
+        translator.rebind_router(&HashSet::from([hover_id]));
+        translator.clear_expected_servers();
+
+        let err = translator
+            .client_for_file(Path::new("/ws/main.rs"), ToolKind::Definition)
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == failed_id),
+            "got {err:?}"
+        );
+    }
+
+    /// `.tsx` resolves through its `typescript` base language, so a failure
+    /// of the `typescript` server is reported for it too.
+    #[test]
+    fn test_client_for_file_reports_startup_failure_through_react_base_language() {
+        let id = ServerId::from("typescript");
+        let translator = Translator::new()
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                "typescript".to_string(),
+            )]));
+        translator.record_startup_failures(&[not_found_failure(
+            &id,
+            "typescript",
+            "typescript-language-server",
+        )]);
+        translator.rebind_router(&HashSet::new());
+        translator.clear_expected_servers();
+
+        let err = translator
+            .client_for_file(Path::new("/ws/app.tsx"), ToolKind::Hover)
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::ServerFailedToStart(f) if f.server_id == id),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1371,12 +1575,12 @@ mod tests {
         assert_eq!(extension_map.get("rs"), Some(&"rust".to_string()));
 
         // serve() starts in protocol-only mode when no LSP servers are configured;
-        // it may return a transport error but must not return NoServersAvailable.
+        // it may return a transport error but must not report a startup failure.
         let result = crate::serve(config).await;
         if let Err(ref err) = result {
             assert!(
-                !matches!(err, crate::error::Error::NoServersAvailable(_)),
-                "serve() must not return NoServersAvailable for empty lsp_servers config"
+                !matches!(err, crate::error::Error::AllServersFailedToInit { .. }),
+                "serve() must not report init failures for empty lsp_servers config"
             );
         }
     }
@@ -1580,11 +1784,60 @@ mod tests {
         (translator, server)
     }
 
+    /// #515: a close that fails for one server must not stop the other
+    /// server's close, and the failed debt is dropped, not re-owed.
+    #[tokio::test]
+    async fn test_flush_pending_closes_drops_failed_servers_debt() {
+        let dir = TempDir::new().unwrap();
+        let (translator, mut server_a) = single_document_translator(&dir);
+        let (client_d, _server_d) = fake_lsp_client();
+
+        let tracker = &translator.document_tracker;
+        let path = dir.path().join("p.aa");
+        std::fs::write(&path, "p").unwrap();
+        let other = dir.path().join("q.aa");
+        std::fs::write(&other, "q").unwrap();
+        let client_a = lock_std(&translator.lsp_clients)
+            .get(&ServerId::from("lang_a"))
+            .cloned()
+            .unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("lang_a"), &client_a)
+            .await
+            .unwrap();
+        tracker
+            .ensure_open(&path, &ServerId::from("lang_d"), &client_d)
+            .await
+            .unwrap();
+        tracker
+            .ensure_open(&other, &ServerId::from("lang_a"), &client_a)
+            .await
+            .unwrap();
+
+        translator.register_client("lang_d".to_string(), client_d.clone());
+        client_d.shutdown().await.unwrap();
+
+        translator.flush_pending_closes().await;
+
+        let mut wire = tokio::io::BufReader::new(&mut server_a.write_stdout);
+        for method in [
+            "textDocument/didOpen",
+            "textDocument/didOpen",
+            "textDocument/didClose",
+        ] {
+            assert_eq!(read_framed_message(&mut wire).await["method"], method);
+        }
+        assert!(
+            tracker.pending_close_paths().is_empty(),
+            "a failed close is dropped, not re-owed"
+        );
+    }
+
     /// #495: once `DocumentTracker::open`'s LRU eviction reclaims a document
     /// to make room under `max_documents`, `prepare_document` must notify
     /// that document's server with `textDocument/didClose` -- `DocumentTracker`
     /// itself has no `LspClient` access to do this, so it's `Translator`'s
-    /// job (`notify_evicted_documents`) once `ensure_open` returns.
+    /// job (`flush_pending_closes`) once `ensure_open` returns.
     #[tokio::test]
     async fn test_prepare_document_sends_didclose_for_evicted_document() {
         let dir = TempDir::new().unwrap();
@@ -1739,7 +1992,7 @@ mod tests {
     /// opened (here: its own `didOpen` notify fails), a `didClose` already
     /// queued for a *different* document evicted earlier in that same call
     /// must still be sent -- `prepare_document` must not lose it by
-    /// returning early via `?` before draining `take_evicted`. Uses two
+    /// returning early via `?` before flushing pending closes. Uses two
     /// separate servers (`lang_a` stays healthy, `lang_b`'s connection is
     /// broken) so the evicted document's own `didClose` delivery can be
     /// observed independently of the failure that aborts this call.

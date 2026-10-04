@@ -1064,18 +1064,42 @@ impl NotificationCache {
     }
 }
 
-/// Applies one lifecycle-lane notification (`$/progress` or the generic
-/// `Other` variant, which carries e.g. rust-analyzer's
-/// `experimental/serverStatus`) to `cache` -- the only two variants that
-/// lane ever carries, since the notification lane handles
-/// diagnostics/log/showMessage instead (see
-/// `LspClient::message_loop_inner`'s routing).
+/// Applies one lifecycle-lane notification to `cache`.
+///
+/// Only `$/progress` and the generic `Other` variant (which carries e.g.
+/// rust-analyzer's `experimental/serverStatus`) ever travel on that lane,
+/// since the notification lane handles diagnostics/log/showMessage instead
+/// (see `LspClient::message_loop_inner`'s routing).
 ///
 /// Shared by `diagnostics_pump`'s lifecycle-lane arm (wiring a freshly
 /// spawned server's own pump) and `Translator::respawn_if_dead`'s
 /// lifecycle-lane forwarding task (wiring a respawned server's replacement
 /// process), so the two can't silently drift apart on which notification
 /// variants feed which `NotificationCache` method.
+///
+/// Public because [`LspServer::take_lifecycle_rx`](crate::lsp::LspServer::take_lifecycle_rx)
+/// is: whoever drains that receiver needs this as the sink that feeds the
+/// indexing state.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{IndexingState, NotificationCache, apply_lifecycle_notification};
+/// use mcpls_core::config::ServerId;
+/// use mcpls_core::lsp::LspNotification;
+///
+/// let mut cache = NotificationCache::new();
+/// let server_id = ServerId::from("rust");
+/// apply_lifecycle_notification(
+///     &mut cache,
+///     &server_id,
+///     LspNotification::Other {
+///         method: "experimental/serverStatus".into(),
+///         params: Some(serde_json::json!({"quiescent": true})),
+///     },
+/// );
+/// assert_eq!(cache.indexing_state(&server_id), IndexingState::Ready);
+/// ```
 pub fn apply_lifecycle_notification(
     cache: &mut NotificationCache,
     server_id: &ServerId,

@@ -315,7 +315,9 @@ Raising this limit increases mcpls's steady-state memory usage, since each open 
 **Type**: Integer (bytes)
 **Default**: `10485760` (10MB)
 
-Maximum size, in bytes, of a single file mcpls will open. A file larger than this fails with a "file size limit exceeded" error. Set to `0` to disable the limit.
+Maximum size, in bytes, of a single file mcpls will open. A file larger than this fails with a "file size limit exceeded" error. Set to `0` to disable the limit. Values above 1 GiB (`1073741824`) are rejected at startup with an `InvalidConfig` error; use a lower value, or `0`.
+
+The limit also derives the per-response disk-read budget used for position conversion with non-UTF-16 servers: 4 times the limit (4 times the default when `0`), at most 256 MiB.
 
 ```toml
 [workspace]
