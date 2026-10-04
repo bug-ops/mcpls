@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use lsp_types::{
     ClientCapabilities, ClientInfo, ExitNotification, GeneralClientCapabilities, InitializeParams,
@@ -17,14 +18,14 @@ use lsp_types::{
     PositionEncodingKind, Request, ServerCapabilities, ShutdownRequest, StaleRequestSupportOptions,
     SymbolKind, WorkspaceFolder,
 };
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant, timeout_at};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, ServerId};
-use crate::error::{Error, Result, ServerSpawnFailure};
+use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 use crate::lsp::transport::LspTransport;
@@ -48,6 +49,10 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 /// its own after sending the LSP `exit` notification, before falling back to
 /// `kill_on_drop`.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a failed `initialize` waits for the child to be reaped before
+/// concluding it is still running and keeping the original error.
+const EARLY_EXIT_PROBE: Duration = Duration::from_millis(500);
 
 /// Capacity of the diagnostics/log/showMessage notification channel (P3).
 ///
@@ -338,6 +343,12 @@ impl LspServer {
         &self.init_config
     }
 
+    /// Replace the config a respawn of this server would use.
+    #[cfg(test)]
+    pub(crate) fn set_init_config(&mut self, config: ServerInitConfig) {
+        self.init_config = config;
+    }
+
     /// Take the notification receiver out of this server, replacing it with a dummy channel.
     ///
     /// Use this to extract the receiver for a background pump task before registering
@@ -427,7 +438,16 @@ impl LspServer {
             lifecycle_tx,
         );
 
-        let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
+        let (capabilities, position_encoding) = match Self::initialize(&client, &config).await {
+            Ok(negotiated) => negotiated,
+            Err(init_error) if is_connection_loss(&init_error) => {
+                let early_exit = early_exit_error(&mut child, &config.server_config.command).await;
+                return Err(early_exit.unwrap_or_else(|| Error::LspInitFailed {
+                    message: format!("Initialize request failed: {init_error}"),
+                }));
+            }
+            Err(init_error) => return Err(init_error),
+        };
 
         info!("LSP server initialized successfully");
 
@@ -474,6 +494,7 @@ impl LspServer {
             .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            // TODO(#534): capture a bounded stderr tail during initialize
             .stderr(Stdio::null())
             .kill_on_drop(true);
 
@@ -627,8 +648,14 @@ impl LspServer {
                 ),
             )
             .await
-            .map_err(|e| Error::LspInitFailed {
-                message: format!("Initialize request failed: {e}"),
+            .map_err(|e| {
+                if is_connection_loss(&e) {
+                    e
+                } else {
+                    Error::LspInitFailed {
+                        message: format!("Initialize request failed: {e}"),
+                    }
+                }
             })?;
 
         let position_encoding = result
@@ -850,7 +877,7 @@ impl LspServer {
                         server_id,
                         language_id,
                         command,
-                        message: e.to_string(),
+                        reason: StartupFailure::Spawn(Arc::new(e)),
                     });
                 }
             }
@@ -888,6 +915,22 @@ fn resolve_position_encodings(configured: &[String]) -> Vec<PositionEncodingKind
     } else {
         encodings
     }
+}
+
+/// Whether `error` means the connection to the server is gone, as opposed to
+/// the server answering with a failure of its own.
+const fn is_connection_loss(error: &Error) -> bool {
+    matches!(error, Error::ServerTerminated | Error::Transport(_))
+}
+
+/// [`Error::ServerExitedDuringInit`] if `child` has exited (or does so within
+/// [`EARLY_EXIT_PROBE`]), `None` if it is still running.
+async fn early_exit_error(child: &mut Child, command: &str) -> Option<Error> {
+    let status = timeout(EARLY_EXIT_PROBE, child.wait()).await.ok()?.ok()?;
+    Some(Error::ServerExitedDuringInit {
+        command: command.to_string(),
+        exit_code: status.code(),
+    })
 }
 
 /// Classify a spawn failure: a missing executable gets its own variant so the
@@ -952,7 +995,7 @@ pub fn fake_lsp_server_with_config(server_config: LspServerConfig) -> LspServer 
         notification_rx: mock_notification_rx,
         lifecycle_rx: mock_lifecycle_rx,
         child: None,
-        init_config: test_init_config(server_config),
+        init_config: crate::test_lsp::init_config_for(server_config),
     }
 }
 
@@ -968,18 +1011,6 @@ pub fn fake_lsp_server_with_dead_loop_and_live_child() -> LspServer {
     let mut server = fake_lsp_server();
     server.child = Some(child);
     server
-}
-
-/// Minimal [`ServerInitConfig`] around `server_config` for test fixtures.
-#[cfg(test)]
-const fn test_init_config(server_config: LspServerConfig) -> ServerInitConfig {
-    ServerInitConfig {
-        server_config,
-        workspace_roots: vec![],
-        initialization_options: None,
-        position_encodings: vec![],
-        notification_tx: None,
-    }
 }
 
 #[cfg(test)]
@@ -1018,7 +1049,7 @@ impl LspServer {
             notification_rx,
             lifecycle_rx,
             child: None,
-            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         }
     }
 }
@@ -1311,7 +1342,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: Some(mock_child),
-            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
 
         assert!(
@@ -1362,7 +1393,7 @@ mod tests {
             notification_rx,
             lifecycle_rx,
             child: None,
-            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
 
         let started = Instant::now();
@@ -1396,7 +1427,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: None,
-            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -1433,14 +1464,14 @@ mod tests {
             server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
-            message: "not found".to_string(),
+            reason: StartupFailure::InitTaskPanicked,
         });
 
         result.add_failure(ServerSpawnFailure {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
-            message: "permission denied".to_string(),
+            reason: StartupFailure::InitTaskPanicked,
         });
 
         assert!(!result.has_servers());
@@ -1466,7 +1497,7 @@ mod tests {
             notification_rx: mock_notification_rx1,
             lifecycle_rx: mock_lifecycle_rx1,
             child: None,
-            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1494,7 +1525,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: None,
-            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server);
@@ -1503,7 +1534,7 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
-            message: "not found".to_string(),
+            reason: StartupFailure::InitTaskPanicked,
         });
 
         assert!(result.has_servers());
@@ -1537,7 +1568,7 @@ mod tests {
                 notification_rx: mock_notification_rx,
                 lifecycle_rx: mock_lifecycle_rx,
                 child: None,
-                init_config: test_init_config(config.clone()),
+                init_config: crate::test_lsp::init_config_for(config.clone()),
             };
 
             result.add_server(config.language_id, server);
@@ -1566,7 +1597,7 @@ mod tests {
             notification_rx: mock_notification_rx1,
             lifecycle_rx: mock_lifecycle_rx1,
             child: None,
-            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1584,7 +1615,7 @@ mod tests {
             notification_rx: mock_notification_rx2,
             lifecycle_rx: mock_lifecycle_rx2,
             child: None,
-            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server2);
@@ -1599,7 +1630,7 @@ mod tests {
             server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
-            message: "not found".to_string(),
+            reason: StartupFailure::InitTaskPanicked,
         });
 
         let debug_str = format!("{result:?}");
@@ -1614,14 +1645,14 @@ mod tests {
             server_id: ServerId::from("python"),
             language_id: "python".to_string(),
             command: "pyright".to_string(),
-            message: "not found".to_string(),
+            reason: StartupFailure::InitTaskPanicked,
         });
 
         result.add_failure(ServerSpawnFailure {
             server_id: ServerId::from("typescript"),
             language_id: "typescript".to_string(),
             command: "tsserver".to_string(),
-            message: "command not found".to_string(),
+            reason: StartupFailure::InitTaskPanicked,
         });
 
         assert_eq!(result.failure_count(), 2);
@@ -1701,7 +1732,82 @@ mod tests {
         let failure = &result.failures[0];
         assert_eq!(failure.language_id, "rust");
         assert_eq!(failure.command, "nonexistent-command-12345");
-        assert!(failure.message.contains("spawn"));
+        assert!(
+            matches!(&failure.reason, StartupFailure::Spawn(e) if matches!(**e, Error::ServerNotFound { .. })),
+            "got {:?}",
+            failure.reason
+        );
+        assert!(failure.to_string().contains("failed to spawn"));
+    }
+
+    #[test]
+    fn test_is_connection_loss_excludes_server_replies() {
+        assert!(is_connection_loss(&Error::ServerTerminated));
+        assert!(is_connection_loss(&Error::Transport("eof".to_string())));
+        assert!(!is_connection_loss(&Error::LspServerError {
+            code: -32603,
+            message: "bad".to_string(),
+            data: None,
+        }));
+    }
+
+    /// A server that answers `initialize` with an error and then exits keeps
+    /// its own error instead of being reported as an early exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_keeps_servers_own_initialize_error_when_it_exits_afterwards() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            &crate::test_lsp::with_read_preamble(
+                r#"body='{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"rejected by server"}}'
+printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
+"#,
+            ),
+        );
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::LspInitFailed { message } if message.contains("rejected by server")),
+            "got {err:?}"
+        );
+    }
+
+    /// Connection lost while the child is still running: the error keeps the
+    /// "initialize failed" context rather than a bare transport error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_connection_loss_with_live_child_is_lsp_init_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::test_lsp::sh_script_init_config(dir.path(), "exec 1>&-\nsleep 5\n");
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::LspInitFailed { message } if message.contains("Initialize request failed")),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_exiting_before_initialize_reply_is_server_exited_during_init() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::test_lsp::sh_script_init_config(dir.path(), "exit 1\n");
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                Error::ServerExitedDuringInit {
+                    exit_code: Some(1),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

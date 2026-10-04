@@ -187,7 +187,7 @@ fn describe_entry(cfg: &LspServerConfig) -> String {
 }
 
 /// Per-language routing table: which server handles which tool.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct LanguageRoutes {
     /// Tools explicitly claimed via a server's `handles` list.
     explicit: HashMap<ToolKind, ServerId>,
@@ -220,7 +220,7 @@ pub enum NoServerReason {
 /// (post-heuristics) server configs, then rebound once at registration time
 /// by [`Self::rebind_to_registered`] so that no route ever points at a
 /// server that failed to spawn.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolRouter {
     by_language: HashMap<String, LanguageRoutes>,
     /// Config declaration order, used by `resolve_any` for a deterministic

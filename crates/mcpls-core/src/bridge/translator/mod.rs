@@ -19,6 +19,7 @@ use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, lock_std};
 use crate::config::{ServerId, ToolKind, ToolRouter};
+use crate::error::{ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
 mod assist;
@@ -86,11 +87,15 @@ pub struct Translator {
     /// task once registration completes) never contends with an in-flight
     /// LSP round trip.
     router: Arc<StdMutex<ToolRouter>>,
-    /// Configs needed to respawn a server if its process dies later, keyed
-    /// by routing identity. Populated once per server right after a
-    /// successful spawn (see [`Self::register_server_config`]); the respawn
-    /// path ([`Self::respawn_if_dead`]) is the only reader.
-    server_configs: Arc<StdMutex<HashMap<ServerId, ServerInitConfig>>>,
+    /// The routing table as installed by [`Self::with_router`], before
+    /// `rebind_router` drops routes to servers that failed to start. Read-only
+    /// afterwards: lets a failed lookup be traced back to the server that
+    /// would have served it, to report that server's [`StartupFailure`].
+    configured_router: Arc<ToolRouter>,
+    /// Why each configured server that never registered failed to start,
+    /// keyed by routing identity. Written once, when initialization settles
+    /// (see [`Self::record_startup_failures`]).
+    startup_failures: Arc<StdMutex<HashMap<ServerId, ServerSpawnFailure>>>,
     /// Per-server single-flight lock so concurrent callers that both observe
     /// a dead process don't race to respawn it independently -- the loser
     /// waits for the winner's attempt to finish (success or failure) and
@@ -161,7 +166,8 @@ impl Translator {
             extension_map: Arc::new(HashMap::new()),
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(ToolRouter::default())),
-            server_configs: Arc::new(StdMutex::new(HashMap::new())),
+            configured_router: Arc::new(ToolRouter::default()),
+            startup_failures: Arc::new(StdMutex::new(HashMap::new())),
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
@@ -239,8 +245,72 @@ impl Translator {
     /// shared, so this replaces the `Arc`-wrapped router wholesale.
     #[must_use]
     pub fn with_router(mut self, router: ToolRouter) -> Self {
+        self.configured_router = Arc::new(router.clone());
         self.router = Arc::new(StdMutex::new(router));
         self
+    }
+
+    /// Remember why each of `failures` never registered, so later tool calls
+    /// can report it instead of a generic "no server configured".
+    pub(crate) fn record_startup_failures(&self, failures: &[ServerSpawnFailure]) {
+        lock_std(&self.startup_failures).extend(
+            failures
+                .iter()
+                .map(|failure| (failure.server_id.clone(), failure.clone())),
+        );
+    }
+
+    /// The recorded startup failure of the server `id`, if it failed to start.
+    pub(crate) fn startup_failure(&self, id: &ServerId) -> Option<ServerSpawnFailure> {
+        lock_std(&self.startup_failures).get(id).cloned()
+    }
+
+    /// Every recorded startup failure, ordered by routing identity.
+    pub(crate) fn startup_failures(&self) -> Vec<ServerSpawnFailure> {
+        let mut failures: Vec<_> = lock_std(&self.startup_failures).values().cloned().collect();
+        failures.sort_by(|a, b| a.server_id.as_str().cmp(b.server_id.as_str()));
+        failures
+    }
+
+    /// Settle the translator after the background init task panicked.
+    ///
+    /// Every config that never registered is recorded as
+    /// [`StartupFailure::InitTaskPanicked`] (unless it already has a recorded
+    /// failure), the router is rebound to what did register, and the
+    /// expected-server set is cleared, so tools return a terminal error
+    /// instead of `ServerInitializing` forever. The notification receivers and
+    /// pumps of registered servers died with the task, so those servers are
+    /// marked push-degraded and their indexing state is reset.
+    pub(crate) async fn settle_after_init_panic(&self, configs: &[ServerInitConfig]) {
+        let registered: HashSet<ServerId> = lock_std(&self.lsp_clients).keys().cloned().collect();
+        {
+            let mut failures = lock_std(&self.startup_failures);
+            for config in configs {
+                let server_config = &config.server_config;
+                let id = server_config.id();
+                if registered.contains(&id) {
+                    continue;
+                }
+                failures
+                    .entry(id.clone())
+                    .or_insert_with(|| ServerSpawnFailure {
+                        server_id: id,
+                        language_id: server_config.language_id.clone(),
+                        command: server_config.command.clone(),
+                        reason: StartupFailure::InitTaskPanicked,
+                    });
+            }
+        }
+        self.rebind_router(&registered);
+        self.clear_expected_servers();
+
+        if let Some(cache) = &self.notification_cache {
+            let mut cache = cache.lock().await;
+            for id in &registered {
+                cache.mark_push_degraded(id);
+                cache.reset_indexing_state(id);
+            }
+        }
     }
 
     /// Rebind the routing table to the set of servers that actually
@@ -280,12 +350,11 @@ impl Translator {
     /// Build the [`EncodingCtx`] for converting positions/ranges in
     /// responses from the registered server `id`.
     fn encoding_ctx(&self, server_id: &ServerId) -> EncodingCtx {
-        EncodingCtx {
-            encoding: self.position_encoding_for(server_id),
-            tracker: self.document_tracker.clone(),
-            workspace_roots: self.workspace_roots.clone(),
-            line_cache: encoding_ctx::new_line_cache(),
-        }
+        EncodingCtx::new(
+            self.position_encoding_for(server_id),
+            self.document_tracker.clone(),
+            self.workspace_roots.clone(),
+        )
     }
 
     /// Rebuilds `document_tracker` from `self.resource_limits` and
@@ -354,10 +423,11 @@ impl Translator {
     }
 
     /// Register a spawned server in every map that needs it: its routing
-    /// client, the server itself, and the config used to respawn it.
+    /// client and the server itself.
     ///
-    /// The routing identity, client and respawn config are all derived from
-    /// `server` itself, so they cannot be registered out of sync.
+    /// The routing identity and client are both derived from `server`
+    /// itself, so they cannot be registered out of sync. The server also owns
+    /// the config a respawn would use.
     ///
     /// # Examples
     ///
@@ -370,20 +440,9 @@ impl Translator {
     /// }
     /// ```
     pub fn register_server_complete(&self, server: LspServer) {
-        let config = server.init_config().clone();
-        let id = config.server_config.id();
+        let id = server.init_config().server_config.id();
         self.register_client(id.clone(), server.client().clone());
-        self.register_server_config(id.clone(), config);
         self.register_server(id, server);
-    }
-
-    /// Store the config needed to respawn `id` if its process dies later.
-    ///
-    /// Called once per server, right after a successful spawn (via
-    /// [`Self::register_server_complete`]); [`Self::respawn_if_dead`] is the
-    /// only reader.
-    pub(crate) fn register_server_config(&self, id: impl Into<ServerId>, config: ServerInitConfig) {
-        lock_std(&self.server_configs).insert(id.into(), config);
     }
 
     /// Number of currently registered LSP servers.
@@ -519,7 +578,85 @@ mod tests {
 
         assert!(lock_std(&translator.lsp_clients).contains_key(&id));
         assert!(lock_std(&translator.lsp_servers).contains_key(&id));
-        assert!(lock_std(&translator.server_configs).contains_key(&id));
+    }
+
+    /// #528: after an init-task panic, a configured server that never
+    /// registered gets a terminal `ServerFailedToStart` instead of
+    /// `ServerInitializing` forever.
+    #[tokio::test]
+    async fn test_settle_after_init_panic_turns_initializing_into_startup_failure() {
+        let config = crate::config::LspServerConfig::rust_analyzer();
+        let id = config.id();
+        let translator = Translator::new()
+            .with_extensions(crate::test_lsp::test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.set_expected_servers(HashSet::from([id.clone()]));
+        let path = PathBuf::from("/ws/main.rs");
+        let before = translator
+            .client_for_file(&path, ToolKind::Hover)
+            .unwrap_err();
+        assert!(
+            matches!(before, Error::ServerInitializing { .. }),
+            "got {before:?}"
+        );
+
+        translator
+            .settle_after_init_panic(&[crate::test_lsp::init_config_for(config)])
+            .await;
+
+        let after = translator
+            .client_for_file(&path, ToolKind::Hover)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &after,
+                Error::ServerFailedToStart(f)
+                    if f.server_id == id && matches!(f.reason, StartupFailure::InitTaskPanicked)
+            ),
+            "got {after:?}"
+        );
+    }
+
+    /// A server that registered before the panic keeps serving.
+    #[tokio::test]
+    async fn test_settle_after_init_panic_keeps_registered_server_routable() {
+        let config = crate::config::LspServerConfig::rust_analyzer();
+        let id = config.id();
+        let translator = Translator::new()
+            .with_extensions(crate::test_lsp::test_extensions())
+            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+        translator.set_expected_servers(HashSet::from([id.clone()]));
+        translator
+            .register_server_complete(crate::lsp::fake_lsp_server_with_config(config.clone()));
+
+        translator
+            .settle_after_init_panic(&[crate::test_lsp::init_config_for(config)])
+            .await;
+
+        let (routed, _client) = translator
+            .client_for_file(Path::new("/ws/main.rs"), ToolKind::Hover)
+            .unwrap();
+        assert_eq!(routed, id);
+        assert!(translator.startup_failure(&id).is_none());
+    }
+
+    #[test]
+    fn test_record_startup_failures_orders_listing_by_server_id() {
+        let translator = Translator::new();
+        let failure = |id: &str| ServerSpawnFailure {
+            server_id: ServerId::from(id),
+            language_id: id.to_string(),
+            command: id.to_string(),
+            reason: StartupFailure::InitTaskPanicked,
+        };
+        translator.record_startup_failures(&[failure("zls"), failure("clangd"), failure("gopls")]);
+
+        let ids: Vec<_> = translator
+            .startup_failures()
+            .into_iter()
+            .map(|f| f.server_id.as_str().to_string())
+            .collect();
+        assert_eq!(ids, ["clangd", "gopls", "zls"]);
     }
 
     /// A panicking shutdown task must be logged, not re-raised into the caller.

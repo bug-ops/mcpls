@@ -9,42 +9,57 @@ use super::dto::{Position, Position2D, PositionDegradation, Range};
 use crate::bridge::encoding::{
     ColumnFidelity, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position,
 };
-use crate::bridge::state::{DEFAULT_MAX_FILE_SIZE, uri_to_path};
+use crate::bridge::state::{DEFAULT_MAX_FILE_SIZE, ResourceLimits, uri_to_path};
 use crate::bridge::{DocumentTracker, lock_std};
 
-/// Total bytes [`read_line_text`]'s disk-read fallback (via
-/// [`DocumentTracker::read_line_checked`]) may scan across one
-/// `EncodingCtx`'s whole lifetime (one MCP response), independent of how
-/// many distinct `(path, line)` lookups that spans.
+/// Multiple of `ResourceLimits::max_file_size` that [`read_line_text`]'s
+/// disk-read fallback (via [`DocumentTracker::read_line_checked`]) may scan
+/// across one `EncodingCtx`'s whole lifetime (one MCP response), independent
+/// of how many distinct `(path, line)` lookups that spans.
 ///
 /// [`LineCacheState::entries`] alone caps repeats of the *same* line, but a
-/// response naming enough distinct lines (e.g. `references` results spread
-/// across a large file, or several call-hierarchy/inlay-hint/workspace-edit
-/// locations) could still add up to an unbounded amount of scanning even
-/// with that cache and [`super::navigation::MAX_NORMALIZED_LOCATIONS`]'s
-/// count cap in place (see #474's follow-up). Every conversion that reaches
-/// disk goes through [`read_line_text`], so charging this single budget
-/// there caps every `EncodingCtx`-mediated handler uniformly -- `to_lsp`,
-/// `to_mcp`, `normalize_range`, `denormalize_range` -- with no per-handler
-/// cap needed.
+/// response naming enough distinct lines could still add up to an unbounded
+/// amount of scanning even with that cache and
+/// [`super::navigation::MAX_NORMALIZED_LOCATIONS`]'s count cap in place (see
+/// #474). Every conversion that reaches disk goes through [`read_line_text`],
+/// so charging one budget there caps every `EncodingCtx`-mediated handler
+/// uniformly.
 ///
-/// Set to four times the default single-file read bound: enough slack for a
-/// legitimate response touching a handful of large files, while still
-/// bounding a hostile response to double-digit MiB of I/O rather than the
-/// unbounded (or count-cap x `max_file_size`) amount possible without it.
-/// This is a fixed constant, not derived from the tracker's *configured*
-/// `ResourceLimits::max_file_size` -- deliberately: `read_line_checked`'s
-/// `budget` parameter always caps an individual read to
-/// `min(bounded_read_cap(configured_max_file_size), remaining_budget)`, so a
-/// larger configured `max_file_size` (including `0`, meaning unlimited)
-/// only widens what *one* read is theoretically allowed to scan before
-/// finding its line, never what it can actually charge against this
-/// response-wide budget -- the physical cap always wins.
-const MAX_LINE_READ_BYTES_PER_RESPONSE: u64 = 4 * DEFAULT_MAX_FILE_SIZE;
+/// The budget covers disk I/O only. A tracked document's lookups never touch
+/// it: they are bounded by `DocumentText`'s line checkpoints (#488).
+const LINE_READ_BUDGET_FILE_MULTIPLE: u64 = 4;
+
+/// Absolute ceiling of the per-response disk-read budget (256 MiB),
+/// whatever `max_file_size` is configured to.
+const LINE_READ_BUDGET_CEILING: u64 = 256 * 1024 * 1024;
+
+/// Per-response disk-read budget derived from the tracker's configured
+/// limits (#489): [`LINE_READ_BUDGET_FILE_MULTIPLE`] times
+/// `max_file_size`, so a deployment that raises the single-file limit gets a
+/// proportionally larger budget, up to [`LINE_READ_BUDGET_CEILING`]. Above
+/// `ceiling / multiple` (64 MiB) a single maximal file read can exceed the
+/// budget; such a read is then reported as unconverted, not unbounded.
+///
+/// `max_file_size == 0` disables the per-file limit, not the I/O budget: it
+/// falls back to the multiple of [`DEFAULT_MAX_FILE_SIZE`]. The result never
+/// exceeds [`LINE_READ_BUDGET_CEILING`].
+const fn line_read_budget(limits: ResourceLimits) -> u64 {
+    let basis = if limits.max_file_size == 0 {
+        DEFAULT_MAX_FILE_SIZE
+    } else {
+        limits.max_file_size
+    };
+    let budget = basis.saturating_mul(LINE_READ_BUDGET_FILE_MULTIPLE);
+    if budget > LINE_READ_BUDGET_CEILING {
+        LINE_READ_BUDGET_CEILING
+    } else {
+        budget
+    }
+}
 
 /// [`EncodingCtx::line_cache`]'s guarded state: the per-`(path, line)`
 /// memoization table plus the shared disk-read byte budget both are checked
-/// and charged against (see [`MAX_LINE_READ_BYTES_PER_RESPONSE`]).
+/// and charged against (see [`line_read_budget`]).
 #[derive(Debug)]
 pub(super) struct LineCacheState {
     /// Memoized line text keyed by `(path, 0-based line)`, `None` meaning
@@ -52,7 +67,7 @@ pub(super) struct LineCacheState {
     /// disk-read paths (see [`read_line_text`]).
     pub(super) entries: HashMap<(PathBuf, u32), Option<String>>,
     /// Remaining disk-read byte allowance for this response; see
-    /// [`MAX_LINE_READ_BYTES_PER_RESPONSE`].
+    /// [`line_read_budget`].
     bytes_remaining: u64,
     /// Whether the once-per-response budget-exhausted warning has already
     /// been logged, so a response with many post-exhaustion lookups logs
@@ -78,10 +93,10 @@ pub(super) struct LineCacheState {
 }
 
 impl LineCacheState {
-    fn new() -> Self {
+    fn new(budget: u64) -> Self {
         Self {
             entries: HashMap::new(),
-            bytes_remaining: MAX_LINE_READ_BYTES_PER_RESPONSE,
+            bytes_remaining: budget,
             budget_exhausted_logged: false,
             positions_degraded: None,
         }
@@ -91,11 +106,10 @@ impl LineCacheState {
 /// [`EncodingCtx::line_cache`]'s field type.
 type LineCache = Arc<StdMutex<LineCacheState>>;
 
-/// Builds a fresh, empty [`LineCache`] for a new [`EncodingCtx`] -- used by
-/// every construction site so the budget/cache initialization can't drift
-/// between them.
-pub(super) fn new_line_cache() -> LineCache {
-    Arc::new(StdMutex::new(LineCacheState::new()))
+/// Builds a fresh, empty [`LineCache`] holding `budget` bytes of disk-read
+/// allowance.
+fn new_line_cache(budget: u64) -> LineCache {
+    Arc::new(StdMutex::new(LineCacheState::new(budget)))
 }
 
 /// Per-response encoding context: the negotiated [`PositionEncoding`] of the
@@ -135,7 +149,7 @@ pub(super) struct EncodingCtx {
 
 /// Text of the 0-based `line`'th line of the file at `uri`, or `None` if it
 /// cannot be resolved to a path, read, has no such line, or the response's
-/// disk-read budget ([`MAX_LINE_READ_BYTES_PER_RESPONSE`]) is exhausted.
+/// disk-read budget ([`line_read_budget`]) is exhausted.
 ///
 /// Only ever consulted when the negotiated encoding is not UTF-16 (see
 /// [`EncodingCtx::to_lsp`]/[`EncodingCtx::to_mcp`]). Every outcome --
@@ -175,7 +189,7 @@ async fn read_line_text(uri: &lsp_types::Uri, line: u32, ctx: &EncodingCtx) -> O
 
 /// [`read_line_text`]'s disk-read fallback, charging the bytes
 /// [`DocumentTracker::read_line_checked`] scans against `ctx.line_cache`'s
-/// shared [`MAX_LINE_READ_BYTES_PER_RESPONSE`] budget. Once exhausted, no
+/// shared [`line_read_budget`] budget. Once exhausted, no
 /// further disk reads are attempted for the rest of this response -- every
 /// subsequent budget-gated lookup returns `None` immediately, logging a
 /// single `warn!` the first time that happens.
@@ -206,7 +220,7 @@ async fn disk_read_line_budgeted(path: &Path, line: u32, ctx: &EncodingCtx) -> O
             if !already_logged {
                 tracing::warn!(
                     path = %path.display(),
-                    budget_bytes = MAX_LINE_READ_BYTES_PER_RESPONSE,
+                    budget_bytes = line_read_budget(ctx.tracker.limits()),
                     "per-response disk-read budget exhausted; further position conversions \
                      requiring a disk read in this response will pass columns through \
                      unconverted"
@@ -230,6 +244,22 @@ async fn disk_read_line_budgeted(path: &Path, line: u32, ctx: &EncodingCtx) -> O
 }
 
 impl EncodingCtx {
+    /// Builds a context for one MCP response, deriving the disk-read budget
+    /// from `tracker`'s configured limits (see [`line_read_budget`]).
+    pub(super) fn new(
+        encoding: PositionEncoding,
+        tracker: Arc<DocumentTracker>,
+        workspace_roots: Arc<Vec<PathBuf>>,
+    ) -> Self {
+        let line_cache = new_line_cache(line_read_budget(tracker.limits()));
+        Self {
+            encoding,
+            tracker,
+            workspace_roots,
+            line_cache,
+        }
+    }
+
     /// Whether `uri` is *not provably* inside any configured workspace root.
     ///
     /// Advisory only, for a read-only navigation handler to annotate a
@@ -486,18 +516,17 @@ mod tests {
         fs::write(&path, "a".repeat(200)).unwrap();
         let uri = path_to_uri(&path).unwrap();
 
-        let ctx = EncodingCtx {
-            encoding: PositionEncoding::Utf8,
-            tracker: Arc::new(DocumentTracker::new(
+        let ctx = EncodingCtx::new(
+            PositionEncoding::Utf8,
+            Arc::new(DocumentTracker::new(
                 ResourceLimits {
                     max_documents: 100,
                     max_file_size: 50,
                 },
                 HashMap::new(),
             )),
-            workspace_roots: Arc::new(Vec::new()),
-            line_cache: new_line_cache(),
-        };
+            Arc::new(Vec::new()),
+        );
         assert!(
             read_line_text(&uri, 0, &ctx).await.is_none(),
             "must refuse to return content from a file over max_file_size"
@@ -524,12 +553,7 @@ mod tests {
         ));
         let uri = tracker.open(path.clone(), "héllo".to_string()).unwrap(); // live: accent
 
-        let ctx = EncodingCtx {
-            encoding: PositionEncoding::Utf8,
-            tracker,
-            workspace_roots: Arc::new(Vec::new()),
-            line_cache: new_line_cache(),
-        };
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::new(Vec::new()));
         let lsp_pos = ctx
             .to_lsp(
                 &uri,
@@ -812,12 +836,7 @@ mod tests {
             HashMap::new(),
         ));
         let uri = tracker.open(path, content.to_string()).unwrap();
-        let ctx = EncodingCtx {
-            encoding: PositionEncoding::Utf8,
-            tracker,
-            workspace_roots: Arc::new(Vec::new()),
-            line_cache: new_line_cache(),
-        };
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::new(Vec::new()));
         (ctx, uri, dir)
     }
 
@@ -881,7 +900,7 @@ mod tests {
         assert_eq!(read_line_text(&uri, 0, &ctx).await, None);
         assert_eq!(
             lock_std(&ctx.line_cache).bytes_remaining,
-            MAX_LINE_READ_BYTES_PER_RESPONSE - content.len() as u64,
+            line_read_budget(ResourceLimits::default()) - content.len() as u64,
             "the budget must be charged for the bytes scanned even though the line was not \
              valid UTF-8"
         );
@@ -904,8 +923,62 @@ mod tests {
         assert_eq!(read_line_text(&uri, 0, &ctx).await, None);
         assert_eq!(
             lock_std(&ctx.line_cache).bytes_remaining,
-            MAX_LINE_READ_BYTES_PER_RESPONSE - crate::bridge::state::OPEN_FAILURE_CHARGE_BYTES,
+            line_read_budget(ResourceLimits::default())
+                - crate::bridge::state::OPEN_FAILURE_CHARGE_BYTES,
             "a nonexistent path must charge only the small nominal amount, not the whole budget"
         );
+    }
+
+    #[test]
+    fn test_line_read_budget_scales_with_max_file_size() {
+        let budget = |max_file_size| {
+            line_read_budget(ResourceLimits {
+                max_documents: 1,
+                max_file_size,
+            })
+        };
+        assert_eq!(budget(1000), 4000);
+        assert_eq!(budget(1000 * 1024), 4 * 1000 * 1024);
+    }
+
+    #[test]
+    fn test_line_read_budget_is_capped_at_ceiling() {
+        let budget = |max_file_size| {
+            line_read_budget(ResourceLimits {
+                max_documents: 1,
+                max_file_size,
+            })
+        };
+        assert_eq!(
+            budget(crate::config::MAX_FILE_SIZE_LIMIT),
+            LINE_READ_BUDGET_CEILING
+        );
+        assert_eq!(budget(u64::MAX), LINE_READ_BUDGET_CEILING);
+        assert_eq!(
+            budget(LINE_READ_BUDGET_CEILING / 4),
+            LINE_READ_BUDGET_CEILING
+        );
+    }
+
+    #[test]
+    fn test_line_read_budget_zero_limit_falls_back_to_default() {
+        let budget = line_read_budget(ResourceLimits {
+            max_documents: 1,
+            max_file_size: 0,
+        });
+        assert_eq!(budget, 4 * DEFAULT_MAX_FILE_SIZE);
+    }
+
+    #[test]
+    fn test_encoding_ctx_new_derives_budget_from_tracker_limits() {
+        let tracker = Arc::new(DocumentTracker::new(
+            ResourceLimits {
+                max_documents: 1,
+                max_file_size: 4096,
+            },
+            HashMap::new(),
+        ));
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::new(Vec::new()));
+        assert_eq!(lock_std(&ctx.line_cache).bytes_remaining, 4 * 4096);
     }
 }

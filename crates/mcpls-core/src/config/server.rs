@@ -333,6 +333,26 @@ impl BuiltinServer {
         }
     }
 
+    /// Likely cause of this server exiting before completing the `initialize`
+    /// handshake, if one is known.
+    ///
+    /// Only rust-analyzer has one: `rustup` installs a `rust-analyzer` proxy
+    /// even when the component is not installed, and the proxy exits at once.
+    #[must_use]
+    pub const fn early_exit_hint(self) -> Option<&'static str> {
+        match self {
+            Self::RustAnalyzer => Some(
+                "the `rust-analyzer` found on PATH may be a rustup proxy without the component \
+                 installed -- run `rustup component add rust-analyzer`",
+            ),
+            Self::Pyright
+            | Self::TypescriptLanguageServer
+            | Self::Gopls
+            | Self::Clangd
+            | Self::Zls => None,
+        }
+    }
+
     /// Whether this server is distributed through npm, and so is installed
     /// as a `.cmd` shim on Windows.
     #[must_use]
@@ -498,6 +518,17 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn test_early_exit_hint_only_for_rust_analyzer() {
+        for builtin in BuiltinServer::ALL {
+            assert_eq!(
+                builtin.early_exit_hint().is_some(),
+                builtin == BuiltinServer::RustAnalyzer,
+                "{builtin:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_rust_analyzer_defaults() {

@@ -5,6 +5,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -92,6 +94,36 @@ fn sanitize_lsp_server_message(message: &str) -> String {
     }
 }
 
+/// Why a configured LSP server never registered during startup.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::StartupFailure;
+///
+/// assert!(StartupFailure::InitTaskPanicked.to_string().contains("panicked"));
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum StartupFailure {
+    /// Spawning or initializing the server failed.
+    Spawn(Arc<Error>),
+    /// The background initialization task panicked before the server
+    /// registered.
+    InitTaskPanicked,
+}
+
+impl fmt::Display for StartupFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn(error) => error.fmt(f),
+            Self::InitTaskPanicked => {
+                f.write_str("the initialization task panicked (see the mcpls log)")
+            }
+        }
+    }
+}
+
 /// Details of a single server spawn failure.
 #[derive(Debug, Clone)]
 pub struct ServerSpawnFailure {
@@ -101,17 +133,49 @@ pub struct ServerSpawnFailure {
     pub language_id: String,
     /// Command that was attempted.
     pub command: String,
-    /// Error message describing the failure.
-    pub message: String,
+    /// Why the server never registered.
+    pub reason: StartupFailure,
 }
 
-impl std::fmt::Display for ServerSpawnFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ServerSpawnFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{} [{}] ({}): {}",
-            self.server_id, self.language_id, self.command, self.message
+            self.server_id, self.language_id, self.command, self.reason
         )
+    }
+}
+
+/// `Display` adapter listing every failure, separated by `; `.
+struct FailureList<'a>(&'a [ServerSpawnFailure]);
+
+impl fmt::Display for FailureList<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, failure) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str("; ")?;
+            }
+            failure.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+/// `Display` suffix for [`Error::ServerExitedDuringInit`] carrying the exit
+/// status and, for builtin servers with a known early-exit cause, a hint.
+struct EarlyExitDetail<'a>(&'a str, Option<i32>);
+
+impl fmt::Display for EarlyExitDetail<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(command, exit_code) = *self;
+        match exit_code {
+            Some(code) => write!(f, " with exit code {code}")?,
+            None => f.write_str(" (terminated by a signal)")?,
+        }
+        BuiltinServer::from_command(command)
+            .and_then(BuiltinServer::early_exit_hint)
+            .map_or(Ok(()), |hint| write!(f, "; {hint}"))
     }
 }
 
@@ -167,6 +231,17 @@ pub enum Error {
         /// Tool that no server claims.
         tool: ToolKind,
     },
+
+    /// The server configured for this request failed to start and, because
+    /// startup failures are never retried, will not become available until
+    /// mcpls is restarted.
+    ///
+    /// Boxed to keep [`Error`] small.
+    #[error(
+        "LSP server '{}' for language '{}' failed to start: {}; restart mcpls after fixing it (startup failures are not retried)",
+        .0.server_id, .0.language_id, .0.reason
+    )]
+    ServerFailedToStart(Box<ServerSpawnFailure>),
 
     /// LSP server for the language is configured but still initializing.
     #[error(
@@ -272,18 +347,31 @@ pub enum Error {
     #[error("LSP server shutdown did not complete before its deadline")]
     ShutdownTimeout,
 
+    /// LSP server process exited before completing the `initialize`
+    /// handshake.
+    #[error("LSP server '{command}' exited during initialization{}", EarlyExitDetail(.command, *.exit_code))]
+    ServerExitedDuringInit {
+        /// Command that was spawned.
+        command: String,
+        /// Exit code, or `None` if the process was terminated by a signal.
+        exit_code: Option<i32>,
+    },
+
     /// A crashed server could not be automatically respawned.
     ///
     /// Distinct from [`Self::ServerTerminated`] so a caller (or a log
     /// reader) can tell "the connection just died" apart from "mcpls tried
-    /// to bring it back and could not" -- e.g. no respawn config was ever
-    /// registered for it, or it is crash-looping and is being backed off.
-    #[error("LSP server '{server_id}' is unavailable: {reason}")]
+    /// to bring it back and could not" -- it is crash-looping and is being
+    /// backed off.
+    #[error(
+        "LSP server '{server_id}' is unavailable: crash-looping, retry in {:.1}s",
+        .retry_in.as_secs_f64()
+    )]
     ServerUnavailable {
         /// Routing identity of the server that could not be respawned.
         server_id: ServerId,
-        /// Human-readable reason the respawn did not proceed.
-        reason: String,
+        /// Remaining backoff before the next respawn attempt.
+        retry_in: Duration,
     },
 
     /// Invalid tool parameters provided.
@@ -382,17 +470,11 @@ pub enum Error {
     NotARegularFile(PathBuf),
 
     /// All configured LSP servers failed to initialize.
-    #[error("all LSP servers failed to initialize ({count} configured)")]
+    #[error("all LSP servers failed to initialize: {}", FailureList(failures))]
     AllServersFailedToInit {
-        /// Number of servers that were configured.
-        count: usize,
         /// Details of each failure.
         failures: Vec<ServerSpawnFailure>,
     },
-
-    /// No LSP servers available (none configured or all failed).
-    #[error("{0}")]
-    NoServersAvailable(String),
 
     /// The server routed for this request does not advertise support for the
     /// requested LSP capability (e.g. no `renameProvider` in its
@@ -688,6 +770,8 @@ impl Error {
             | Self::ServerTerminated
             | Self::ShutdownTimeout
             | Self::ServerUnavailable { .. }
+            | Self::ServerFailedToStart(_)
+            | Self::ServerExitedDuringInit { .. }
             | Self::NoWorkspaceRoots(_)
             // Unlike `FileSizeLimitExceeded`, this fires on aggregate tracker
             // state, not this request's params -- it can succeed unchanged
@@ -698,7 +782,6 @@ impl Error {
             // variant's doc comment.
             | Self::SubscriptionLimitReached { .. }
             | Self::AllServersFailedToInit { .. }
-            | Self::NoServersAvailable(_)
             | Self::CapabilityNotSupported { .. } => McpErrorKind::Internal,
         }
     }
@@ -955,98 +1038,142 @@ mod tests {
         assert!(source.is_some());
     }
 
+    fn spawn_failure(id: &str, command: &str, error: Error) -> ServerSpawnFailure {
+        ServerSpawnFailure {
+            server_id: ServerId::from(id),
+            language_id: id.to_string(),
+            command: command.to_string(),
+            reason: StartupFailure::Spawn(Arc::new(error)),
+        }
+    }
+
     #[test]
     fn test_server_spawn_failure_display() {
-        let failure = ServerSpawnFailure {
+        let failure = spawn_failure(
+            "rust",
+            "rust-analyzer",
+            Error::LspInitFailed {
+                message: "boom".to_string(),
+            },
+        );
+        assert_eq!(
+            failure.to_string(),
+            "rust [rust] (rust-analyzer): LSP server initialization failed: boom"
+        );
+    }
+
+    #[test]
+    fn test_server_spawn_failure_clone_shares_reason() {
+        let failure = spawn_failure("python", "pyright", not_found("pyright"));
+        let cloned = failure.clone();
+        assert_eq!(failure.language_id, cloned.language_id);
+        assert_eq!(failure.to_string(), cloned.to_string());
+    }
+
+    #[test]
+    fn test_server_failed_to_start_display_carries_not_found_guidance() {
+        let err = Error::ServerFailedToStart(Box::new(spawn_failure(
+            "rust",
+            "rust-analyzer",
+            not_found("rust-analyzer"),
+        )));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'rust' for language 'rust' failed to start"),
+            "{msg}"
+        );
+        assert!(msg.contains("not on the PATH"), "{msg}");
+        assert!(msg.contains("rustup component add rust-analyzer"), "{msg}");
+        assert!(msg.contains("restart mcpls"), "{msg}");
+    }
+
+    #[test]
+    fn test_server_failed_to_start_init_task_panicked_display() {
+        let err = Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
             server_id: ServerId::from("rust"),
             language_id: "rust".to_string(),
             command: "rust-analyzer".to_string(),
-            message: "No such file or directory".to_string(),
-        };
-        assert_eq!(
-            failure.to_string(),
-            "rust [rust] (rust-analyzer): No such file or directory"
-        );
+            reason: StartupFailure::InitTaskPanicked,
+        }));
+        assert!(err.to_string().contains("initialization task panicked"));
     }
 
     #[test]
-    fn test_server_spawn_failure_debug() {
-        let failure = ServerSpawnFailure {
-            server_id: ServerId::from("python"),
-            language_id: "python".to_string(),
-            command: "pyright".to_string(),
-            message: "command not found".to_string(),
-        };
-        let debug_str = format!("{failure:?}");
-        assert!(debug_str.contains("python"));
-        assert!(debug_str.contains("pyright"));
-        assert!(debug_str.contains("command not found"));
-    }
-
-    #[test]
-    fn test_server_spawn_failure_clone() {
-        let failure = ServerSpawnFailure {
-            server_id: ServerId::from("typescript"),
-            language_id: "typescript".to_string(),
-            command: "tsserver".to_string(),
-            message: "failed to start".to_string(),
-        };
-        let cloned = failure.clone();
-        assert_eq!(failure.language_id, cloned.language_id);
-        assert_eq!(failure.command, cloned.command);
-        assert_eq!(failure.message, cloned.message);
-    }
-
-    #[test]
-    fn test_error_display_all_servers_failed_to_init() {
-        let err = Error::AllServersFailedToInit {
-            count: 2,
-            failures: vec![],
-        };
-        assert_eq!(
-            err.to_string(),
-            "all LSP servers failed to initialize (2 configured)"
-        );
-    }
-
-    #[test]
-    fn test_error_all_servers_failed_with_failures() {
-        let failures = vec![
-            ServerSpawnFailure {
+    fn test_startup_errors_map_to_internal() {
+        let failure = spawn_failure("rust", "rust-analyzer", not_found("rust-analyzer"));
+        for err in [
+            Error::ServerFailedToStart(Box::new(failure.clone())),
+            Error::AllServersFailedToInit {
+                failures: vec![failure],
+            },
+            Error::ServerExitedDuringInit {
+                command: "x".to_string(),
+                exit_code: Some(1),
+            },
+            Error::ServerUnavailable {
                 server_id: ServerId::from("rust"),
-                language_id: "rust".to_string(),
-                command: "rust-analyzer".to_string(),
-                message: "not found".to_string(),
+                retry_in: Duration::from_secs(1),
             },
-            ServerSpawnFailure {
-                server_id: ServerId::from("python"),
-                language_id: "python".to_string(),
-                command: "pyright".to_string(),
-                message: "permission denied".to_string(),
-            },
-        ];
-
-        let err = Error::AllServersFailedToInit { count: 2, failures };
-
-        assert!(err.to_string().contains("all LSP servers failed"));
-        assert!(err.to_string().contains("2 configured"));
+        ] {
+            assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal, "{err:?}");
+        }
     }
 
     #[test]
-    fn test_error_display_no_servers_available() {
-        let err =
-            Error::NoServersAvailable("none configured or all failed to initialize".to_string());
+    fn test_server_exited_during_init_display_hints_only_for_rust_analyzer() {
+        let hinted = Error::ServerExitedDuringInit {
+            command: "rust-analyzer".to_string(),
+            exit_code: Some(1),
+        }
+        .to_string();
+        assert!(hinted.contains("exit code 1"), "{hinted}");
+        assert!(
+            hinted.contains("rustup component add rust-analyzer"),
+            "{hinted}"
+        );
+
+        let plain = Error::ServerExitedDuringInit {
+            command: "gopls".to_string(),
+            exit_code: None,
+        }
+        .to_string();
+        assert!(plain.contains("terminated by a signal"), "{plain}");
+        assert!(!plain.contains("rustup"), "{plain}");
+    }
+
+    #[test]
+    fn test_server_unavailable_display_names_retry_delay() {
+        let err = Error::ServerUnavailable {
+            server_id: ServerId::from("rust"),
+            retry_in: Duration::from_secs(2),
+        };
         assert_eq!(
             err.to_string(),
-            "none configured or all failed to initialize"
+            "LSP server 'rust' is unavailable: crash-looping, retry in 2.0s"
         );
     }
 
     #[test]
-    fn test_error_no_servers_available_with_custom_message() {
-        let custom_msg = "none configured or all failed to initialize";
-        let err = Error::NoServersAvailable(custom_msg.to_string());
-        assert_eq!(err.to_string(), custom_msg);
+    fn test_error_display_all_servers_failed_lists_each_failure() {
+        let err = Error::AllServersFailedToInit {
+            failures: vec![
+                spawn_failure("rust", "rust-analyzer", not_found("rust-analyzer")),
+                spawn_failure(
+                    "python",
+                    "pyright",
+                    Error::LspInitFailed {
+                        message: "denied".to_string(),
+                    },
+                ),
+            ],
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("all LSP servers failed to initialize: "),
+            "{msg}"
+        );
+        assert!(msg.contains("rust [rust] (rust-analyzer)"), "{msg}");
+        assert!(msg.contains("python [python] (pyright)"), "{msg}");
     }
 
     #[test]
