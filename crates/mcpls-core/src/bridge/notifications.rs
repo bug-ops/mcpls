@@ -153,11 +153,104 @@ const MAX_SOURCES_PER_FILE: usize = 8;
 /// Maximum number of server messages to store.
 const MAX_SERVER_MESSAGES: usize = 50;
 
-/// Most empty-entry removals remembered for replay on `subscriptions/listen`.
-const MAX_RECENT_EVICTIONS: usize = 256;
+/// Most empty-entry removals remembered for replay on `subscriptions/listen`:
+/// as many as the cache can hold entries, so a full cache cleared at once
+/// (e.g. a server restart) loses no replayable clear.
+const MAX_RECENT_EVICTIONS: usize = MAX_DIAGNOSTIC_ENTRIES;
 
 /// How long an empty-entry removal stays replayable.
 const EVICTION_REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// File keys of empty entries removed within `EVICTION_REPLAY_WINDOW`.
+///
+/// `at` is the source of truth; `order` is an expiry queue over it in which an
+/// item whose instant differs from `at`'s is stale (the key was re-recorded or
+/// dropped) and is skipped. Re-recording a key adds an order item, so `order`
+/// is rebuilt from `at` once it exceeds twice `at`'s size, keeping both
+/// bounded under churn on few keys. Over `MAX_RECENT_EVICTIONS` the oldest
+/// record is forgotten and logged once per window.
+#[derive(Debug, Default)]
+struct EvictionRecord {
+    at: HashMap<DiagnosticsKey, std::time::Instant>,
+    order: VecDeque<(DiagnosticsKey, std::time::Instant)>,
+    overflow_warned_at: Option<std::time::Instant>,
+}
+
+impl EvictionRecord {
+    fn record(&mut self, file: DiagnosticsKey, now: std::time::Instant) {
+        self.prune_expired(now);
+        self.at.insert(file.clone(), now);
+        self.order.push_back((file, now));
+        while self.at.len() > MAX_RECENT_EVICTIONS {
+            self.forget_oldest(now);
+        }
+        if self.order.len() > self.at.len().saturating_mul(2) {
+            self.compact();
+        }
+    }
+
+    fn contains(&self, key: &DiagnosticsKey, now: std::time::Instant) -> bool {
+        self.at
+            .get(key)
+            .is_some_and(|at| now.saturating_duration_since(*at) <= EVICTION_REPLAY_WINDOW)
+    }
+
+    fn is_live(&self, key: &DiagnosticsKey, at: std::time::Instant) -> bool {
+        self.at.get(key) == Some(&at)
+    }
+
+    fn prune_expired(&mut self, now: std::time::Instant) {
+        while let Some((key, at)) = self.order.front() {
+            if now.saturating_duration_since(*at) <= EVICTION_REPLAY_WINDOW {
+                break;
+            }
+            if self.is_live(key, *at) {
+                self.at.remove(key);
+            }
+            self.order.pop_front();
+        }
+    }
+
+    fn forget_oldest(&mut self, now: std::time::Instant) {
+        while let Some((key, at)) = self.order.pop_front() {
+            if self.is_live(&key, at) {
+                self.at.remove(&key);
+                self.warn_overflow(now);
+                return;
+            }
+        }
+    }
+
+    fn warn_overflow(&mut self, now: std::time::Instant) {
+        let due = self
+            .overflow_warned_at
+            .is_none_or(|at| now.saturating_duration_since(at) > EVICTION_REPLAY_WINDOW);
+        if due {
+            self.overflow_warned_at = Some(now);
+            warn!(
+                "more than {MAX_RECENT_EVICTIONS} diagnostics clears evicted within {}s, \
+                 forgetting the oldest; a re-attaching listen may miss them",
+                EVICTION_REPLAY_WINDOW.as_secs()
+            );
+        }
+    }
+
+    fn compact(&mut self) {
+        let mut live: Vec<_> = self.at.iter().map(|(k, at)| (k.clone(), *at)).collect();
+        live.sort_by_key(|(_, at)| *at);
+        self.order = live.into();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.at.is_empty()
+    }
+}
 
 /// Conservative fixed-field/JSON-structure overhead assumed per diagnostic
 /// (`range`, `severity`, and object/field-name punctuation) by
@@ -682,13 +775,13 @@ pub struct NotificationCache {
     /// `is_empty_entry`), not by mirroring membership here. Maintained only
     /// by `insert_entry`/`take_entry`.
     empty_diagnostics_count: usize,
-    /// File keys of empty entries removed within `EVICTION_REPLAY_WINDOW`,
-    /// oldest first and bounded by `MAX_RECENT_EVICTIONS`. Only empty entries
-    /// are recorded: a clear lost to eviction is what a listen re-attaching
-    /// after its lease gap must still replay, while replaying a removed
-    /// non-empty entry would make clients re-read "not published" and drop
-    /// valid errors. Written only by `evict_entry`, never by publishers.
-    recent_evictions: VecDeque<(DiagnosticsKey, std::time::Instant)>,
+    /// Empty entries removed within `EVICTION_REPLAY_WINDOW`. Only empty
+    /// entries are recorded: a clear lost to eviction is what a listen
+    /// re-attaching after its lease gap must still replay, while replaying a
+    /// removed non-empty entry would make clients re-read "not published" and
+    /// drop valid errors, so a non-empty entry evicted by capacity is never
+    /// replayed. Written only by `evict_entry`, never by publishers.
+    recent_evictions: EvictionRecord,
     /// Recent log entries (FIFO queue with max size).
     logs: VecDeque<LogEntry>,
     /// Recent server messages (FIFO queue with max size).
@@ -729,7 +822,7 @@ impl NotificationCache {
             next_diagnostic_seq: 0,
             diagnostics_route_count: None,
             empty_diagnostics_count: 0,
-            recent_evictions: VecDeque::new(),
+            recent_evictions: EvictionRecord::default(),
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
             push_degraded: HashSet::new(),
@@ -1109,29 +1202,14 @@ impl NotificationCache {
     }
 
     fn record_empty_eviction(&mut self, file: DiagnosticsKey, now: std::time::Instant) {
-        while self
-            .recent_evictions
-            .front()
-            .is_some_and(|(_, at)| now.saturating_duration_since(*at) > EVICTION_REPLAY_WINDOW)
-        {
-            self.recent_evictions.pop_front();
-        }
-        self.recent_evictions
-            .retain(|(recorded, _)| *recorded != file);
-        if self.recent_evictions.len() >= MAX_RECENT_EVICTIONS {
-            self.recent_evictions.pop_front();
-        }
-        self.recent_evictions.push_back((file, now));
+        self.recent_evictions.record(file, now);
     }
 
     /// Whether `uri` had an empty entry removed within the replay window and
     /// has not been cached again since.
     fn was_recently_evicted(&self, uri: &Uri, now: std::time::Instant) -> bool {
         let key = DiagnosticsKey::of(uri);
-        !self.has_diagnostics(uri)
-            && self.recent_evictions.iter().any(|(evicted, at)| {
-                *evicted == key && now.saturating_duration_since(*at) <= EVICTION_REPLAY_WINDOW
-            })
+        !self.has_diagnostics(uri) && self.recent_evictions.contains(&key, now)
     }
 
     /// Whether a `subscriptions/listen` attaching now must be told about
@@ -3483,21 +3561,120 @@ mod tests {
     }
 
     #[test]
-    fn test_eviction_ring_is_bounded_and_keeps_the_newest() {
+    fn test_eviction_record_is_bounded_and_keeps_the_newest() {
         let mut cache = NotificationCache::new();
         let now = std::time::Instant::now();
         for i in 0..MAX_RECENT_EVICTIONS + 44 {
             let gone = Uri::from(format!("file:///gone{i}.rs"));
-            cache.record_empty_eviction(DiagnosticsKey::of(&gone), now);
+            cache.record_empty_eviction(
+                DiagnosticsKey::of(&gone),
+                now + std::time::Duration::from_millis(u64::try_from(i).unwrap()),
+            );
         }
         assert_eq!(cache.recent_evictions.len(), MAX_RECENT_EVICTIONS);
-        assert!(!cache.was_recently_evicted(&Uri::from("file:///gone0.rs"), now));
+        let at = now + std::time::Duration::from_secs(1);
+        assert!(!cache.was_recently_evicted(&Uri::from("file:///gone0.rs"), at));
+        assert!(!cache.was_recently_evicted(&Uri::from("file:///gone43.rs"), at));
+        assert!(cache.was_recently_evicted(&Uri::from("file:///gone44.rs"), at));
         let newest = MAX_RECENT_EVICTIONS + 43;
-        assert!(cache.was_recently_evicted(&Uri::from(format!("file:///gone{newest}.rs")), now));
+        assert!(cache.was_recently_evicted(&Uri::from(format!("file:///gone{newest}.rs")), at));
     }
 
     #[test]
-    fn test_eviction_ring_deduplicates_and_prunes_expired_entries() {
+    fn test_clearing_a_full_cache_keeps_every_empty_clear_replayable() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        let uris: Vec<Uri> = (0..MAX_DIAGNOSTIC_ENTRIES)
+            .map(|i| Uri::from(format!("file:///clean{i}.rs")))
+            .collect();
+        for uri in &uris {
+            cache.store_diagnostics(&server, uri, None, vec![]);
+        }
+
+        cache.clear_server_diagnostics(&server);
+
+        assert!(uris.iter().all(|uri| cache.is_listen_replayable(uri)));
+    }
+
+    #[test]
+    fn test_eviction_order_stays_within_twice_the_record_under_churn() {
+        let mut cache = NotificationCache::new();
+        let now = std::time::Instant::now();
+        let keys: Vec<DiagnosticsKey> = (0..3)
+            .map(|i| DiagnosticsKey::of(&Uri::from(format!("file:///hot{i}.rs"))))
+            .collect();
+        for tick in 0..10_000u64 {
+            let key = keys[usize::try_from(tick % 3).unwrap()].clone();
+            cache.record_empty_eviction(key, now + std::time::Duration::from_micros(tick));
+            let record = &cache.recent_evictions;
+            assert!(record.at.len() <= MAX_RECENT_EVICTIONS);
+            assert!(record.order.len() <= 2 * record.at.len());
+        }
+        assert_eq!(cache.recent_evictions.len(), 3);
+    }
+
+    #[test]
+    fn test_eviction_record_stays_bounded_under_churn_past_the_cap() {
+        const KEYS: usize = MAX_RECENT_EVICTIONS + 300;
+        let mut cache = NotificationCache::new();
+        let now = std::time::Instant::now();
+        let keys: Vec<DiagnosticsKey> = (0..KEYS)
+            .map(|i| DiagnosticsKey::of(&Uri::from(format!("file:///churn{i}.rs"))))
+            .collect();
+        for tick in 0..KEYS * 8 {
+            let key = keys[tick % KEYS].clone();
+            let at = now + std::time::Duration::from_micros(u64::try_from(tick).unwrap());
+            cache.record_empty_eviction(key, at);
+            let record = &cache.recent_evictions;
+            assert!(record.at.len() <= MAX_RECENT_EVICTIONS);
+            assert!(record.order.len() <= 2 * record.at.len() + 1);
+        }
+        assert_eq!(cache.recent_evictions.len(), MAX_RECENT_EVICTIONS);
+    }
+
+    #[test]
+    fn test_compaction_keeps_the_oldest_first_expiry_order() {
+        let mut record = EvictionRecord::default();
+        let now = std::time::Instant::now();
+        let a = DiagnosticsKey::of(&Uri::from("file:///a.rs"));
+        let b = DiagnosticsKey::of(&Uri::from("file:///b.rs"));
+        record.record(a.clone(), now);
+        record.record(b.clone(), now + std::time::Duration::from_secs(1));
+        record.record(a.clone(), now + std::time::Duration::from_secs(2));
+        record.record(b.clone(), now + std::time::Duration::from_secs(3));
+        record.compact();
+        let order: Vec<_> = record.order.iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(order, vec![a, b]);
+    }
+
+    #[test]
+    fn test_eviction_record_overflow_warns_once_per_window() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let mut record = EvictionRecord::default();
+        let now = std::time::Instant::now();
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        for i in 0..MAX_RECENT_EVICTIONS + 10 {
+            let key = DiagnosticsKey::of(&Uri::from(format!("file:///gone{i}.rs")));
+            record.record(
+                key,
+                now + std::time::Duration::from_millis(u64::try_from(i).unwrap()),
+            );
+        }
+        drop(guard);
+
+        let warnings = captured
+            .messages()
+            .iter()
+            .filter(|m| m.contains("diagnostics clears evicted"))
+            .count();
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn test_eviction_record_deduplicates_and_prunes_expired_entries() {
         let mut cache = NotificationCache::new();
         let now = std::time::Instant::now();
         let a = DiagnosticsKey::of(&Uri::from("file:///a.rs"));

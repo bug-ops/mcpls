@@ -18,12 +18,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::time::Duration;
 
 use rmcp::model::{ErrorCode, ResourceUpdatedNotificationParam};
 use rmcp::service::{RequestContext, SubscriptionSink};
 use rmcp::{ErrorData as McpError, Peer, RoleServer};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::bridge::resources::{
@@ -109,10 +111,126 @@ pub enum Target {
     /// In-memory sink so tests run the production coalescing loop.
     #[cfg(test)]
     Channel(mpsc::Sender<String>),
+    /// In-memory stand-in for `Sink` (not constructible without a live rmcp
+    /// stream) that runs the same [`Spellings`] fan-out.
+    #[cfg(test)]
+    RawChannel {
+        /// Receives each raw URI notification.
+        tx: mpsc::Sender<String>,
+        /// Maps each canonical URI to the raw URIs to notify.
+        uris: Arc<ListenUris>,
+    },
+}
+
+/// Notifications a listen stream may receive back to back before pacing starts.
+const LISTEN_BURST: u32 = 32;
+
+/// Spacing between notifications once the burst is spent (320 per second).
+const LISTEN_REFILL_INTERVAL: Duration = Duration::from_micros(3_125);
+
+/// Time the bucket needs to refill completely.
+const LISTEN_BURST_SPAN: Duration = LISTEN_REFILL_INTERVAL.saturating_mul(LISTEN_BURST);
+
+/// Token bucket spacing the notifications of one listen stream.
+///
+/// Pacing is a best-effort mitigation: rmcp's client `try_send`s every
+/// notification into its subscription buffer whatever its consumer is doing,
+/// so a transport stall can still compress the spacing into a burst. The
+/// supported guarantee is client-side: a buffer of at least
+/// [`MAX_SUBSCRIPTIONS`] slots cannot lag on a replay alone.
+#[derive(Debug)]
+struct ListenPacer {
+    next_free: Instant,
+}
+
+impl ListenPacer {
+    fn new() -> Self {
+        Self {
+            next_free: Instant::now(),
+        }
+    }
+
+    /// Waits until one more notification fits the bucket, then charges it.
+    async fn admit(&mut self) {
+        let base = self.next_free.max(Instant::now());
+        let next_free = base.checked_add(LISTEN_REFILL_INTERVAL).unwrap_or(base);
+        if let Some(ready_at) = next_free.checked_sub(LISTEN_BURST_SPAN) {
+            tokio::time::sleep_until(ready_at).await;
+        }
+        self.next_free = next_free;
+    }
+}
+
+/// Whether a URI is still subscribed when its next raw notification is due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Subscription {
+    Active,
+    Dropped,
+}
+
+/// Pacing and liveness of one delivery task, consulted between notifications.
+///
+/// Owns the doorbell receiver so a wait for the next pacing slot also notices
+/// the owning session going away, instead of sleeping on and then sending
+/// stale notifications.
+#[derive(Debug)]
+struct Gate {
+    pacer: Option<ListenPacer>,
+    doorbell: mpsc::Receiver<()>,
+    state: Weak<SessionState>,
+}
+
+impl Gate {
+    /// Waits for the next pacing slot; fails once the session is dropped.
+    ///
+    /// Rings arriving meanwhile are absorbed: the caller re-reads `pending`
+    /// after every slot, so the update they announce is not lost.
+    async fn pace(&mut self) -> Result<(), TargetClosed> {
+        let Some(pacer) = self.pacer.as_mut() else {
+            return Ok(());
+        };
+        let admit = pacer.admit();
+        tokio::pin!(admit);
+        loop {
+            tokio::select! {
+                () = &mut admit => return Ok(()),
+                ring = self.doorbell.recv() => {
+                    if ring.is_none() {
+                        return Err(TargetClosed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`pace`](Self::pace)s, then re-checks that `uri` is still subscribed.
+    async fn pace_subscribed(
+        &mut self,
+        uri: &DiagnosticsResourceUri,
+    ) -> Result<Subscription, TargetClosed> {
+        self.pace().await?;
+        let state = self.state.upgrade().ok_or(TargetClosed)?;
+        Ok(if state.subs.contains(uri).await {
+            Subscription::Active
+        } else {
+            Subscription::Dropped
+        })
+    }
 }
 
 impl Target {
-    async fn send(&self, uri: &DiagnosticsResourceUri) -> Result<(), TargetClosed> {
+    /// Whether notifications to this target go through a [`ListenPacer`].
+    const fn is_paced(&self) -> bool {
+        !matches!(self, Self::Peer(_))
+    }
+
+    /// Sends `uri`; the caller already paced its first raw notification, and
+    /// every further one waits for `gate` and a fresh subscription check.
+    async fn send(
+        &self,
+        uri: &DiagnosticsResourceUri,
+        gate: &mut Gate,
+    ) -> Result<(), TargetClosed> {
         match self {
             Self::Peer(peer) => peer
                 .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri.as_str()))
@@ -122,7 +240,8 @@ impl Target {
                     TargetClosed
                 }),
             Self::Sink { sink, uris } => {
-                for raw in uris.raw_for(uri) {
+                let mut spellings = Spellings::of(uris, uri);
+                while let Some(raw) = spellings.next(gate).await? {
                     match sink.notify_resource_updated(raw).await {
                         Ok(()) => {}
                         Err(rmcp::service::SubscriptionSendError::NotificationNotAccepted(_)) => {
@@ -141,7 +260,49 @@ impl Target {
                 .send(uri.as_str().to_owned())
                 .await
                 .map_err(|_| TargetClosed),
+            #[cfg(test)]
+            Self::RawChannel { tx, uris } => {
+                let mut spellings = Spellings::of(uris, uri);
+                while let Some(raw) = spellings.next(gate).await? {
+                    tx.send(raw.to_owned()).await.map_err(|_| TargetClosed)?;
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+/// The raw spellings of one canonical URI still to be notified, in order.
+///
+/// Owns the pacing and liveness rules of the fan-out so every listen target
+/// shares them: the first spelling was already paced by the caller; each
+/// further one waits for a pacing slot and ends the sequence if the URI was
+/// unsubscribed meanwhile.
+struct Spellings<'a> {
+    uri: &'a DiagnosticsResourceUri,
+    raws: std::vec::IntoIter<&'a str>,
+    started: bool,
+}
+
+impl<'a> Spellings<'a> {
+    fn of(uris: &'a ListenUris, uri: &'a DiagnosticsResourceUri) -> Self {
+        Self {
+            uri,
+            raws: uris.raw_for(uri).collect::<Vec<_>>().into_iter(),
+            started: false,
+        }
+    }
+
+    async fn next(&mut self, gate: &mut Gate) -> Result<Option<&'a str>, TargetClosed> {
+        if self.raws.as_slice().is_empty() {
+            return Ok(None);
+        }
+        if self.started && gate.pace_subscribed(self.uri).await? == Subscription::Dropped {
+            self.raws = Vec::new().into_iter();
+            return Ok(None);
+        }
+        self.started = true;
+        Ok(self.raws.next())
     }
 }
 
@@ -156,23 +317,52 @@ struct Delivery {
     cap_warned: AtomicBool,
 }
 
-/// Drains `pending` on every doorbell ring and forwards each URI to `target`.
+/// Drains `pending` on every doorbell ring and forwards its URIs to `target`
+/// one at a time.
 ///
-/// Exits when the doorbell closes (the owning [`SessionState`] was dropped) or
-/// the first send fails (the transport is gone).
+/// Listen targets are paced per raw notification (see [`ListenPacer`]); the
+/// session peer is not. A URI leaves `pending` only after its pacing slot is
+/// won, so an unsubscribe or a repeated update arriving while the task waits
+/// is applied to the still-pending entry instead of producing a stale or
+/// duplicate notification.
+///
+/// Exits when the doorbell closes (the owning [`SessionState`] was dropped,
+/// also while waiting for a pacing slot) or the first send fails (the
+/// transport is gone).
 async fn run_delivery(
     target: Target,
     pending: Arc<StdMutex<HashSet<DiagnosticsResourceUri>>>,
-    mut doorbell: mpsc::Receiver<()>,
+    doorbell: mpsc::Receiver<()>,
+    state: Weak<SessionState>,
 ) {
-    while doorbell.recv().await.is_some() {
-        let batch = std::mem::take(&mut *lock_std(&pending));
-        for uri in batch {
-            if target.send(&uri).await.is_err() {
+    let mut gate = Gate {
+        pacer: target.is_paced().then(ListenPacer::new),
+        doorbell,
+        state,
+    };
+    while gate.doorbell.recv().await.is_some() {
+        while !lock_std(&pending).is_empty() {
+            if gate.pace().await.is_err() {
+                return;
+            }
+            let Some(uri) = take_one(&pending) else {
+                continue;
+            };
+            if target.send(&uri, &mut gate).await.is_err() {
                 return;
             }
         }
     }
+}
+
+fn take_one(pending: &StdMutex<HashSet<DiagnosticsResourceUri>>) -> Option<DiagnosticsResourceUri> {
+    let mut pending = lock_std(pending);
+    let uri = pending.iter().next().cloned();
+    if let Some(uri) = &uri {
+        pending.remove(uri);
+    }
+    drop(pending);
+    uri
 }
 
 /// Subscription set and delivery channel of one MCP session.
@@ -524,7 +714,12 @@ fn bind_delivery(
     state.delivery.get_or_init(|| {
         let (doorbell, rx) = mpsc::channel(1);
         let pending = Arc::new(StdMutex::new(HashSet::new()));
-        tokio::spawn(run_delivery(target(), Arc::clone(&pending), rx));
+        tokio::spawn(run_delivery(
+            target(),
+            Arc::clone(&pending),
+            rx,
+            Arc::downgrade(state),
+        ));
         registry.register(state);
         Delivery {
             pending,
@@ -1102,5 +1297,177 @@ mod tests {
         assert!(registry.live_sessions().is_empty());
         assert!(registry.try_reserve_listen().is_ok());
         drop(held);
+    }
+
+    async fn subscribed_to(count: usize) -> (Arc<SessionState>, Vec<DiagnosticsResourceUri>) {
+        let state = Arc::new(SessionState::default());
+        let mut uris = Vec::with_capacity(count);
+        for i in 0..count {
+            let uri = DiagnosticsResourceUri::for_test(&format!("lsp-diagnostics:///f{i}.rs"));
+            state.subs.subscribe(uri.clone()).await.unwrap();
+            uris.push(uri);
+        }
+        (state, uris)
+    }
+
+    fn bind(state: &Arc<SessionState>, target: Target) {
+        bind_delivery(state, &SubscriptionRegistry::new(), || target);
+    }
+
+    async fn publish_all(state: &SessionState, uris: &[DiagnosticsResourceUri]) {
+        for uri in uris {
+            state.publish_if_subscribed(uri).await;
+        }
+    }
+
+    async fn recv_n(rx: &mut mpsc::Receiver<String>, n: usize) -> Vec<String> {
+        let mut got = Vec::with_capacity(n);
+        for _ in 0..n {
+            got.push(rx.recv().await.unwrap());
+        }
+        got
+    }
+
+    /// #593: a replay through `run_delivery` bursts at most `LISTEN_BURST`
+    /// notifications and then runs at the refill rate.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_delivery_paces_a_replay_burst() {
+        const TOTAL: usize = 100;
+        let (state, uris) = subscribed_to(TOTAL).await;
+        let (tx, mut rx) = mpsc::channel(TOTAL);
+        bind(&state, Target::Channel(tx));
+        let start = Instant::now();
+        publish_all(&state, &uris).await;
+
+        let mut arrivals = Vec::with_capacity(TOTAL);
+        for _ in 0..TOTAL {
+            rx.recv().await.unwrap();
+            arrivals.push(Instant::now() - start);
+        }
+
+        let burst = LISTEN_BURST as usize;
+        assert!(arrivals[..burst].iter().all(Duration::is_zero));
+        assert!(!arrivals[burst].is_zero());
+        let paced_span = LISTEN_REFILL_INTERVAL * u32::try_from(TOTAL - burst).unwrap();
+        assert!(arrivals[TOTAL - 1] >= paced_span);
+        assert!(arrivals[TOTAL - 1] <= paced_span + LISTEN_REFILL_INTERVAL);
+    }
+
+    /// #593: one canonical URI listed under many raw spellings is paced per
+    /// spelling, not once per URI.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_delivery_charges_every_raw_spelling_of_one_uri() {
+        let (_dir, root, file) = workspace_file();
+        let canonical = crate::bridge::resources::make_uri(&file).unwrap();
+        let raws: Vec<String> = (0..128_u32)
+            .map(|mask| {
+                let name: String = "main.rs"
+                    .chars()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if c != '.' && (mask >> i) & 1 == 1 {
+                            format!("%{:02X}", u32::from(c))
+                        } else {
+                            c.to_string()
+                        }
+                    })
+                    .collect();
+                canonical.replace("main.rs", &name)
+            })
+            .collect();
+        let uris = Arc::new(ListenUris::resolve(
+            &raws,
+            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+        ));
+        let key = uris.canonical().next().unwrap().0.clone();
+        let spellings = uris.raw_for(&key).count();
+        assert!(spellings > LISTEN_BURST as usize);
+
+        let state = Arc::new(SessionState::default());
+        state.subs.subscribe(key.clone()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(spellings);
+        bind(&state, Target::RawChannel { tx, uris });
+        let start = Instant::now();
+        state.publish_if_subscribed(&key).await;
+
+        recv_n(&mut rx, spellings).await;
+
+        let paced = u32::try_from(spellings).unwrap() - LISTEN_BURST;
+        assert!(Instant::now() - start >= LISTEN_REFILL_INTERVAL * paced);
+    }
+
+    /// An idle stream refills its bucket: a second small replay after a quiet
+    /// period is delivered as an unpaced burst again.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_delivery_refills_while_idle() {
+        let (state, uris) = subscribed_to(200).await;
+        let (tx, mut rx) = mpsc::channel(256);
+        bind(&state, Target::Channel(tx));
+        publish_all(&state, &uris).await;
+        recv_n(&mut rx, 200).await;
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        publish_all(&state, &uris[..32]).await;
+        let resumed = Instant::now();
+        recv_n(&mut rx, 32).await;
+        assert_eq!(Instant::now(), resumed);
+    }
+
+    /// Dropping the session while the task waits for a pacing slot ends the
+    /// task at once instead of sending the rest of the replay.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_delivery_stops_when_the_session_drops_during_pacing() {
+        let (state, uris) = subscribed_to(100).await;
+        let (tx, mut rx) = mpsc::channel(100);
+        bind(&state, Target::Channel(tx));
+        publish_all(&state, &uris).await;
+        recv_n(&mut rx, LISTEN_BURST as usize).await;
+
+        drop(state);
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// A URI unsubscribed while the task waits for a pacing slot is never sent.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_delivery_skips_uris_unsubscribed_during_pacing() {
+        let (state, uris) = subscribed_to(100).await;
+        let (tx, mut rx) = mpsc::channel(100);
+        bind(&state, Target::Channel(tx));
+        publish_all(&state, &uris).await;
+        recv_n(&mut rx, LISTEN_BURST as usize).await;
+
+        for uri in &uris {
+            state.unsubscribe(Some(uri), uri.as_str()).await;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    /// A URI updated again while still pending coalesces: each pending URI is
+    /// delivered exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_delivery_does_not_duplicate_a_uri_updated_mid_replay() {
+        const TOTAL: usize = 100;
+        let (state, uris) = subscribed_to(TOTAL).await;
+        let (tx, mut rx) = mpsc::channel(2 * TOTAL);
+        bind(&state, Target::Channel(tx));
+        publish_all(&state, &uris).await;
+        let mut delivered = recv_n(&mut rx, LISTEN_BURST as usize).await;
+
+        let unsent: Vec<_> = uris
+            .iter()
+            .filter(|uri| !delivered.iter().any(|sent| sent == uri.as_str()))
+            .cloned()
+            .collect();
+        publish_all(&state, &unsent).await;
+        delivered.extend(recv_n(&mut rx, TOTAL - LISTEN_BURST as usize).await);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        let distinct: HashSet<_> = delivered.iter().collect();
+        assert_eq!(distinct.len(), TOTAL);
+        assert_eq!(delivered.len(), TOTAL);
     }
 }

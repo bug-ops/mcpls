@@ -11,6 +11,7 @@ use serde::{Serialize, Serializer};
 
 use crate::bridge::{Capability, RouteSupport, ToolSupportSnapshot};
 use crate::config::{ToolKind, ToolPrefix};
+use crate::redaction::{Redactions, ServerText};
 
 /// Where a tool's request is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +383,16 @@ impl ToolSupportReport {
             })
             .collect();
         Self { languages, tools }
+    }
+}
+
+// Languages and tool names come from configuration, not from a server.
+impl ServerText for ToolSupportReport {
+    fn redact_server_text(&mut self, _redactions: &Redactions) {
+        let Self {
+            languages: _,
+            tools: _,
+        } = self;
     }
 }
 

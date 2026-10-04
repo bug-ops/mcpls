@@ -20,6 +20,7 @@ use crate::bridge::ClientPath;
 use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
 use crate::bridge::state::uri_to_path;
 use crate::error::{Error, Result, SymbolCandidate, SymbolResolutionData};
+use crate::redaction::{Redactions, ServerText};
 
 /// Longest accepted symbol name, container or kind text, in bytes.
 pub const MAX_SYMBOL_NAME_BYTES: usize = 256;
@@ -688,6 +689,33 @@ impl Translator {
             result,
             resolved_symbol: resolved.resolved,
         })
+    }
+}
+
+impl ServerText for ResolvedSymbol {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            name,
+            kind: _,
+            container,
+            position: _,
+            position_source: _,
+        } = self;
+        redactions.note_payload(name);
+        if let Some(container) = container {
+            redactions.note_payload(container);
+        }
+    }
+}
+
+impl<T: ServerText> ServerText for Addressed<T> {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            result,
+            resolved_symbol,
+        } = self;
+        result.redact_server_text(redactions);
+        resolved_symbol.redact_server_text(redactions);
     }
 }
 
@@ -1425,5 +1453,43 @@ mod resolver_tests {
             .unwrap_err();
 
         assert_matches!(err, Error::PathOutsideWorkspace(_), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod server_text_tests {
+    use super::*;
+    use crate::bridge::translator::dto::HoverResult;
+
+    const SECRET: &str = "SuperSecretValue123";
+
+    #[test]
+    fn test_resolved_symbol_identifiers_pass_through_and_result_is_redacted() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut addressed = Addressed {
+            result: HoverResult {
+                contents: format!("doc {SECRET}"),
+                range: None,
+                positions_degraded: None,
+            },
+            resolved_symbol: Some(ResolvedSymbol {
+                name: format!("sym_{SECRET}"),
+                kind: 12,
+                container: Some(format!("c_{SECRET}")),
+                position: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                position_source: PositionSource::SelectionRange,
+            }),
+        };
+
+        addressed.redact_server_text(&set);
+
+        assert_eq!(addressed.result.contents, "doc [redacted:API_TOKEN]");
+        let symbol = addressed.resolved_symbol.unwrap();
+        assert_eq!(symbol.name, format!("sym_{SECRET}"));
+        assert_eq!(symbol.container, Some(format!("c_{SECRET}")));
     }
 }

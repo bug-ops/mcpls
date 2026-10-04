@@ -26,6 +26,7 @@ use crate::bridge::{DiagnosticsKey, IndexingState, lock_std};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::{ExitGrace, LspClient, LspNotification, LspServer, ServerInitConfig};
+use crate::redaction::{Redactions, ServerText};
 
 /// Minimum interval between two manual restart attempts of the same server.
 const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
@@ -694,6 +695,50 @@ impl Translator {
         {
             tracing::warn!(%id, %error, "replacement LSP server shutdown failed");
         }
+    }
+}
+
+impl ServerText for RestartFailure {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        match self {
+            Self::SpawnFailed { message } | Self::InitializeFailed { message } => {
+                redactions.redact_in_place(message);
+            }
+            Self::ShuttingDown => {}
+        }
+    }
+}
+
+impl ServerText for RestartOutcome {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        match self {
+            Self::Restarted {
+                coalesced: _,
+                indexing_state: _,
+                push_notifications_degraded: _,
+            }
+            | Self::Throttled { retry_in_ms: _ }
+            | Self::Initializing => {}
+            Self::Failed { reason } => reason.redact_server_text(redactions),
+            Self::NotRunning { message } => redactions.redact_in_place(message),
+        }
+    }
+}
+
+impl ServerText for ServerRestartEntry {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            server_id: _,
+            outcome,
+        } = self;
+        outcome.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for RestartServerResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self { servers } = self;
+        servers.redact_server_text(redactions);
     }
 }
 
@@ -1647,5 +1692,49 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod server_text_tests {
+    use super::*;
+
+    #[test]
+    fn test_restart_messages_are_redacted() {
+        let secret = "SuperSecretValue123";
+        let set = Redactions::new([("API_TOKEN".to_owned(), secret.to_owned())]);
+        let mut result = RestartServerResult {
+            servers: vec![
+                ServerRestartEntry {
+                    server_id: ServerId::from("a"),
+                    outcome: RestartOutcome::Failed {
+                        reason: RestartFailure::SpawnFailed {
+                            message: format!("spawn {secret}"),
+                        },
+                    },
+                },
+                ServerRestartEntry {
+                    server_id: ServerId::from("b"),
+                    outcome: RestartOutcome::Failed {
+                        reason: RestartFailure::InitializeFailed {
+                            message: format!("init {secret}"),
+                        },
+                    },
+                },
+                ServerRestartEntry {
+                    server_id: ServerId::from("c"),
+                    outcome: RestartOutcome::NotRunning {
+                        message: format!("gone {secret}"),
+                    },
+                },
+            ],
+        };
+
+        result.redact_server_text(&set);
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains(secret), "{json}");
+        assert_eq!(json.matches("[redacted:API_TOKEN]").count(), 3, "{json}");
     }
 }

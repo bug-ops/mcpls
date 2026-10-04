@@ -26,6 +26,7 @@ const MAX_LABEL_CHARS: usize = 64;
 
 /// Upper-case substrings that make an environment variable, flag or JSON key
 /// name denote a secret.
+// TODO(#611): exclude well-known non-secret env names that match AUTH/KEY (GIT_AUTHOR_*, SSH_AUTH_SOCK, XAUTHORITY); they over-redact tool display text
 const SECRET_NAME_PATTERNS: [&str; 6] = ["TOKEN", "KEY", "SECRET", "PASSW", "CRED", "AUTH"];
 
 /// Whether `name` (an environment variable, a flag without its dashes, or a
@@ -62,6 +63,37 @@ impl RedactedText {
 impl std::fmt::Display for RedactedText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// A tool result whose server-supplied display prose can be scrubbed of
+/// configured secrets before it reaches the MCP client.
+///
+/// Implementors destructure `Self` exhaustively so a new field must be
+/// classified: prose goes through [`Redactions::redact_in_place`], payload
+/// the client reuses verbatim (edits, locations, identifiers, round-trip
+/// items, command arguments) through [`Redactions::note_payload`], nested
+/// results through their own `redact_server_text`, and non-text fields are
+/// skipped. A string already redacted upstream (cached diagnostics, logs and
+/// messages) is not redacted again.
+pub trait ServerText {
+    /// Redacts the prose fields of `self` in place.
+    fn redact_server_text(&mut self, redactions: &Redactions);
+}
+
+impl<T: ServerText> ServerText for Vec<T> {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        for item in self {
+            item.redact_server_text(redactions);
+        }
+    }
+}
+
+impl<T: ServerText> ServerText for Option<T> {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        if let Some(inner) = self {
+            inner.redact_server_text(redactions);
+        }
     }
 }
 
@@ -128,13 +160,68 @@ impl Redactions {
                 .then_with(|| a.label.cmp(&b.label))
         });
         secrets.dedup_by(|a, b| a.value == b.value);
+        let markers: Vec<String> = secrets.iter().map(Secret::marker).collect();
+        secrets.retain(|secret| {
+            let inside_marker = markers.iter().any(|marker| marker.contains(&secret.value));
+            if inside_marker {
+                tracing::warn!(
+                    "secret {} is not redacted: its value occurs inside a redaction marker",
+                    secret.marker()
+                );
+            }
+            !inside_marker
+        });
         Self(secrets)
+    }
+
+    /// The set hiding every secret of `sets`, rebuilt through [`Self::new`]
+    /// so its marker-substring filter runs over the merged labels.
+    pub(crate) fn union<'a>(sets: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut sets = sets.into_iter().filter(|set| !set.is_empty());
+        let Some(first) = sets.next() else {
+            return Self::default();
+        };
+        let Some(second) = sets.next() else {
+            return first.clone();
+        };
+        Self::new(
+            [first, second]
+                .into_iter()
+                .chain(sets)
+                .flat_map(|set| set.0.iter())
+                .map(|secret| (secret.label.clone(), secret.value.clone())),
+        )
+    }
+
+    /// Records, at debug level and by label only, that `text` -- a payload the
+    /// client applies verbatim and so is left unmodified -- holds a secret.
+    pub(crate) fn note_payload(&self, text: &str) {
+        if self.is_empty() || !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        for secret in &self.0 {
+            if secret.spellings().any(|spelling| text.contains(spelling)) {
+                tracing::debug!(
+                    "tool result payload holds configured secret {}; left unmodified",
+                    secret.marker()
+                );
+            }
+        }
+    }
+
+    /// [`Self::note_payload`] for a JSON payload.
+    pub(crate) fn note_payload_json(&self, value: &serde_json::Value) {
+        if self.is_empty() || !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        self.note_payload(&value.to_string());
     }
 
     /// The secrets a launched server can leak: values of `config.env` and of
     /// the `inherited` environment whose names look secret, the value of a
     /// secret-named `--flag=value` or `--flag value` argument, and string
-    /// leaves of `initialization_options` under a secret-named key.
+    /// leaves of `initialization_options` and `settings` under a secret-named
+    /// key.
     pub(crate) fn for_server(
         config: &LspServerConfig,
         inherited: impl IntoIterator<Item = (String, String)>,
@@ -149,6 +236,9 @@ impl Redactions {
         collect_secret_args(&config.args, &mut candidates);
         if let Some(options) = &config.initialization_options {
             collect_secret_json(options, None, &mut candidates);
+        }
+        if let Some(settings) = &config.settings {
+            collect_secret_json(&settings.to_value(), None, &mut candidates);
         }
         Self::new(candidates)
     }
@@ -361,6 +451,85 @@ mod tests {
         config.args = Vec::new();
         config.initialization_options = None;
         config
+    }
+
+    #[test]
+    fn test_new_drops_value_contained_in_a_marker() {
+        let set = redactions(&[("API_TOKEN", "redacted:API_TOKEN"), ("OTHER_KEY", SECRET)]);
+        assert_eq!(set.apply("redacted:API_TOKEN"), "redacted:API_TOKEN");
+        assert_eq!(set.apply(SECRET), "[redacted:OTHER_KEY]");
+    }
+
+    #[test]
+    fn test_union_merges_sets_and_reruns_the_marker_filter() {
+        let a = redactions(&[("A_TOKEN", "alpha-secret-111")]);
+        let b = redactions(&[("B_TOKEN", "A_TOKEN]-beta-2")]);
+        let merged = Redactions::union([&a, &b, &Redactions::default()]);
+        assert_eq!(merged.apply("alpha-secret-111"), "[redacted:A_TOKEN]");
+        assert_eq!(merged.apply("A_TOKEN]-beta-2"), "[redacted:B_TOKEN]");
+        assert!(Redactions::union([&Redactions::default()]).is_empty());
+        assert_eq!(Redactions::union([&a]), a);
+    }
+
+    fn captured(level: tracing_subscriber::filter::LevelFilter, run: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::prelude::*;
+
+        let logs = crate::test_lsp::CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(level)
+            .with(logs.clone());
+        tracing::subscriber::with_default(subscriber, run);
+        logs.messages()
+    }
+
+    #[test]
+    fn test_note_payload_logs_label_only_at_debug_and_is_silent_at_info() {
+        use tracing_subscriber::filter::LevelFilter;
+
+        let set = redactions(&[("API_TOKEN", SECRET)]);
+
+        let debug = captured(LevelFilter::DEBUG, || {
+            set.note_payload(&format!("let k = {SECRET};"));
+            set.note_payload("clean text");
+        });
+        assert_eq!(debug.len(), 1, "{debug:?}");
+        assert!(debug[0].contains("[redacted:API_TOKEN]"), "{debug:?}");
+        assert!(!debug[0].contains(SECRET), "{debug:?}");
+
+        let info = captured(LevelFilter::INFO, || {
+            set.note_payload(&format!("let k = {SECRET};"));
+        });
+        assert!(info.is_empty(), "{info:?}");
+    }
+
+    #[test]
+    fn test_new_warns_with_label_only_when_a_value_is_dropped() {
+        use tracing_subscriber::filter::LevelFilter;
+
+        let warnings = captured(LevelFilter::WARN, || {
+            let _ = redactions(&[("API_TOKEN", "redacted:API_TOKEN")]);
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[redacted:API_TOKEN]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn test_for_server_collects_secret_named_settings_leaves() {
+        let mut config = server_config();
+        config.settings = Some(
+            serde_json::from_value(serde_json::json!({
+                "tool.apiToken": "settings-secret-123",
+                "tool.theme": "plain-visible-value"
+            }))
+            .unwrap(),
+        );
+
+        let set = Redactions::for_server(&config, []);
+
+        assert_eq!(
+            set.apply("settings-secret-123 plain-visible-value"),
+            "[redacted:apiToken] plain-visible-value"
+        );
     }
 
     #[test]

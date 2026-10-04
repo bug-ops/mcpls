@@ -84,9 +84,10 @@ use transport::run_http;
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 pub use transport::{
-    AllowedOrigin, ConnectionLimit, HeaderReadTimeout, HttpConfig, HttpPath, InvalidAllowedOrigin,
-    InvalidHttpPath, LeaseWindow, ListenLease, ProbeDeadline, ProbeInterval, RequestBodyLimit,
-    ResponseStreamDeadline, SessionLimit, StreamLiveness,
+    AllowedHost, AllowedOrigin, ConnectionLimit, HeaderReadTimeout, HttpConfig, HttpPath,
+    InvalidAllowedHost, InvalidAllowedOrigin, InvalidHttpPath, LeaseWindow, ListenLease,
+    ProbeDeadline, ProbeInterval, RequestBodyLimit, ResponseStreamDeadline, SessionLimit,
+    StreamLiveness, WriteStallTimeout,
 };
 use transport::{ShutdownSignal, run_stdio};
 pub use util::{escape_control, needs_control_escape};

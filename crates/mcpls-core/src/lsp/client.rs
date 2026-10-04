@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, error, trace, warn};
 
-use crate::config::{LspServerConfig, ServerId};
+use crate::config::{LspServerConfig, LspSettings, ServerId};
 use crate::error::{Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader};
 use crate::lsp::types::{
@@ -320,6 +320,7 @@ impl LspClient {
             None,
             None,
             Arc::default(),
+            Self::shared_settings(&config),
         ));
 
         Self {
@@ -364,6 +365,7 @@ impl LspClient {
             Some(notification_tx),
             Some(lifecycle_tx),
             Arc::clone(&redactions),
+            Self::shared_settings(&config),
         ));
 
         Self {
@@ -378,8 +380,13 @@ impl LspClient {
         }
     }
 
+    /// The configured settings, shared with the message loop.
+    fn shared_settings(config: &LspServerConfig) -> Option<Arc<LspSettings>> {
+        config.settings.clone().map(Arc::new)
+    }
+
     /// Secrets this client hides from text derived from server output.
-    pub(crate) fn redactions(&self) -> &Redactions {
+    pub(crate) const fn redactions(&self) -> &Arc<Redactions> {
         &self.redactions
     }
 
@@ -867,6 +874,10 @@ impl LspClient {
     /// - Outbound requests and notifications
     /// - Inbound responses and server notifications
     /// - Matching responses to pending requests
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one-to-one with the spawned loop's channels and shared state"
+    )]
     async fn message_loop(
         transport: (LspTransport, LspTransportReader),
         mut command_rx: mpsc::Receiver<ClientCommand>,
@@ -875,6 +886,7 @@ impl LspClient {
         notification_tx: Option<mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<mpsc::Sender<LspNotification>>,
         redactions: Arc<Redactions>,
+        settings: Option<Arc<LspSettings>>,
     ) -> Result<()> {
         debug!("Message loop started");
         let (mut transport, reader) = transport;
@@ -890,6 +902,7 @@ impl LspClient {
                 notification_tx.as_ref(),
                 lifecycle_tx.as_ref(),
                 &redactions,
+                settings.as_deref(),
             )
             .await
         };
@@ -976,7 +989,11 @@ impl LspClient {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "one select loop over the transport, channels and shared state"
+    )]
     async fn message_loop_inner(
         transport: &mut LspTransport,
         msg_rx: &mut mpsc::Receiver<Result<InboundMessage>>,
@@ -985,6 +1002,7 @@ impl LspClient {
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
         redactions: &Redactions,
+        settings: Option<&LspSettings>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -1017,6 +1035,7 @@ impl LspClient {
                                             notification_tx,
                                             lifecycle_tx,
                                             redactions,
+                                            settings,
                                         )
                                         .await?;
                                     }
@@ -1052,6 +1071,7 @@ impl LspClient {
                         notification_tx,
                         lifecycle_tx,
                         redactions,
+                        settings,
                     )
                     .await?;
                 }
@@ -1073,6 +1093,7 @@ impl LspClient {
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
         redactions: &Redactions,
+        settings: Option<&LspSettings>,
     ) -> Result<()> {
         match message {
             InboundMessage::Response(response) => {
@@ -1130,7 +1151,7 @@ impl LspClient {
                     "Received server request: {} (id={:?})",
                     request.method, request.id
                 );
-                let response = Self::server_request_response(request);
+                let response = Self::server_request_response(request, settings);
                 let value = serde_json::to_value(&response)?;
                 transport.send(&value).await?;
             }
@@ -1197,8 +1218,11 @@ impl LspClient {
         }
     }
 
-    fn server_request_response(request: JsonRpcRequest) -> JsonRpcResponse {
-        match Self::server_request_result(&request.method, request.params.as_ref()) {
+    fn server_request_response(
+        request: JsonRpcRequest,
+        settings: Option<&LspSettings>,
+    ) -> JsonRpcResponse {
+        match Self::server_request_result(&request.method, request.params.as_ref(), settings) {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: request.id,
@@ -1217,6 +1241,7 @@ impl LspClient {
     fn server_request_result(
         method: &str,
         params: Option<&Value>,
+        settings: Option<&LspSettings>,
     ) -> std::result::Result<Value, JsonRpcError> {
         match method {
             "client/registerCapability"
@@ -1228,7 +1253,7 @@ impl LspClient {
             | "workspace/codeLens/refresh"
             | "window/showMessageRequest"
             | "window/workDoneProgress/create" => Ok(Value::Null),
-            "workspace/configuration" => Ok(Self::workspace_configuration_result(params)),
+            "workspace/configuration" => Self::workspace_configuration_result(params, settings),
             "workspace/applyEdit" => Ok(serde_json::json!({ "applied": false })),
             _ => Err(JsonRpcError {
                 code: -32601,
@@ -1238,13 +1263,37 @@ impl LspClient {
         }
     }
 
-    fn workspace_configuration_result(params: Option<&Value>) -> Value {
-        let item_count = params
-            .and_then(|value| value.get("items"))
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-
-        Value::Array(vec![Value::Null; item_count])
+    /// Answers `workspace/configuration`: one entry per requested item.
+    ///
+    /// Without settings every item gets `Null`, whatever its shape and even
+    /// when `items` is absent (the reply before settings existed). With
+    /// settings an item gets its section (the whole object when `section` is
+    /// absent, `Null` when it is unknown or not a string); only a missing
+    /// `items` list is answered with `-32602`. `scopeUri` is never read.
+    fn workspace_configuration_result(
+        params: Option<&Value>,
+        settings: Option<&LspSettings>,
+    ) -> std::result::Result<Value, JsonRpcError> {
+        let items = params
+            .and_then(|params| params.get("items"))
+            .and_then(Value::as_array);
+        let Some(settings) = settings else {
+            return Ok(Value::Array(vec![Value::Null; items.map_or(0, Vec::len)]));
+        };
+        let items = items.ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Invalid params for workspace/configuration".to_owned(),
+            data: None,
+        })?;
+        let sections = items
+            .iter()
+            .map(|item| match item.get("section") {
+                None | Some(Value::Null) => settings.section(None),
+                Some(Value::String(section)) => settings.section(Some(section)),
+                Some(_) => Value::Null,
+            })
+            .collect();
+        Ok(Value::Array(sections))
     }
 }
 
@@ -1287,6 +1336,7 @@ mod tests {
             None,
             Some(&lifecycle_tx),
             &redactions,
+            None,
         )
         .await
         .unwrap();
@@ -1482,7 +1532,7 @@ mod tests {
             params: Some(serde_json::json!({ "registrations": [] })),
         };
 
-        let response = LspClient::server_request_response(request);
+        let response = LspClient::server_request_response(request, None);
 
         assert_eq!(response.id, RequestId::String("ts1".to_string()));
         assert_eq!(response.result, Some(Value::Null));
@@ -1490,12 +1540,131 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_configuration_request_returns_null_per_item() {
-        let result = LspClient::workspace_configuration_result(Some(&serde_json::json!({
-            "items": [{ "section": "typescript" }, { "section": "editor" }]
-        })));
+    fn test_workspace_configuration_request_returns_null_per_item_without_settings() {
+        let result = LspClient::workspace_configuration_result(
+            Some(&serde_json::json!({
+                "items": [{ "section": "typescript" }, { "section": "editor" }]
+            })),
+            None,
+        );
 
-        assert_eq!(result, serde_json::json!([null, null]));
+        assert_eq!(result.unwrap(), serde_json::json!([null, null]));
+    }
+
+    fn sample_settings() -> LspSettings {
+        serde_json::from_value(serde_json::json!({
+            "python.analysis.typeCheckingMode": "strict",
+            "gopls": { "ui.semanticTokens": true }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_workspace_configuration_serves_settings_sections() {
+        let settings = sample_settings();
+        let result = LspClient::workspace_configuration_result(
+            Some(&serde_json::json!({
+                "items": [
+                    { "section": "python.analysis" },
+                    { "section": "gopls", "scopeUri": "file:///ignored" },
+                    { "section": "missing" },
+                    {}
+                ]
+            })),
+            Some(&settings),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!([
+                { "typeCheckingMode": "strict" },
+                { "ui.semanticTokens": true },
+                null,
+                settings.to_value()
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_loop_answers_workspace_configuration_from_settings() {
+        use tokio::io::BufReader;
+
+        use crate::test_lsp::{fake_lsp_client_with_config, read_framed_message, write_request};
+
+        let mut config = LspServerConfig::rust_analyzer();
+        config.settings = Some(sample_settings());
+        let (_client, mut server) = fake_lsp_client_with_config(config);
+
+        write_request(
+            &mut server.read_half_stdin,
+            &serde_json::json!(7),
+            "workspace/configuration",
+            serde_json::json!({ "items": [{ "section": "python.analysis", "scopeUri": 1 }] }),
+        )
+        .await;
+        let mut reader = BufReader::new(&mut server.write_stdout);
+        let response = read_framed_message(&mut reader).await;
+
+        assert_eq!(response["id"], 7);
+        assert_eq!(
+            response["result"],
+            serde_json::json!([{ "typeCheckingMode": "strict" }])
+        );
+    }
+
+    #[test]
+    fn test_workspace_configuration_is_lenient_about_item_shape() {
+        let settings = sample_settings();
+        let params = serde_json::json!({
+            "items": [
+                { "section": 5 },
+                { "section": null },
+                3,
+                { "section": "gopls", "scopeUri": 42 }
+            ]
+        });
+
+        let with = LspClient::workspace_configuration_result(Some(&params), Some(&settings));
+        let without = LspClient::workspace_configuration_result(Some(&params), None);
+
+        assert_eq!(
+            with.unwrap(),
+            serde_json::json!([
+                null,
+                settings.to_value(),
+                settings.to_value(),
+                { "ui.semanticTokens": true }
+            ])
+        );
+        assert_eq!(
+            without.unwrap(),
+            serde_json::json!([null, null, null, null])
+        );
+    }
+
+    #[test]
+    fn test_workspace_configuration_without_settings_matches_the_old_reply_for_bad_params() {
+        for params in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({ "items": "x" })),
+        ] {
+            let result = LspClient::workspace_configuration_result(params.as_ref(), None);
+            assert_eq!(result.unwrap(), serde_json::json!([]));
+        }
+    }
+
+    #[test]
+    fn test_workspace_configuration_with_settings_rejects_missing_items() {
+        for params in [None, Some(serde_json::json!({ "items": "nope" }))] {
+            let error = LspClient::workspace_configuration_result(
+                params.as_ref(),
+                Some(&sample_settings()),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, -32602);
+        }
     }
 
     /// P1: without this, no spec-compliant LSP server may ever initiate
@@ -1511,7 +1680,7 @@ mod tests {
             params: Some(serde_json::json!({ "token": "indexing" })),
         };
 
-        let response = LspClient::server_request_response(request);
+        let response = LspClient::server_request_response(request, None);
 
         assert_eq!(response.result, Some(Value::Null));
         assert!(response.error.is_none());
@@ -1608,7 +1777,7 @@ mod tests {
             params: None,
         };
 
-        let response = LspClient::server_request_response(request);
+        let response = LspClient::server_request_response(request, None);
 
         assert!(response.result.is_none());
         match response.error {
@@ -2717,6 +2886,7 @@ mod tests {
                 None,
                 None,
                 &Redactions::default(),
+                None,
             )
             .await;
 
@@ -2758,6 +2928,7 @@ mod tests {
                 None,
                 None,
                 &Redactions::default(),
+                None,
             )
             .await;
             assert_matches!(result, Err(Error::ServerTerminated), "got {result:?}");
@@ -2811,6 +2982,7 @@ mod tests {
                 None,
                 None,
                 &Redactions::default(),
+                None,
             )
             .await;
 
@@ -2853,6 +3025,7 @@ mod tests {
                 None,
                 None,
                 Arc::default(),
+                None,
             )
             .await;
 
@@ -2912,6 +3085,7 @@ mod tests {
                 None,
                 None,
                 &Redactions::default(),
+                None,
             )
             .await;
             assert!(inner_result.is_ok(), "got {inner_result:?}");

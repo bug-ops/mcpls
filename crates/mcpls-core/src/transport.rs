@@ -31,6 +31,10 @@
 /// }
 /// ```
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one `Transport` is built per process; boxing the HTTP variant would only break `Transport::Http(cfg)`"
+)]
 pub enum Transport {
     /// Standard I/O transport (default).
     ///
@@ -56,10 +60,13 @@ pub enum Transport {
 /// # Note on DNS rebinding
 ///
 /// `rmcp`'s `StreamableHttpService` validates the `Host` header against an
-/// allow-list that defaults to loopback addresses only (`localhost`,
-/// `127.0.0.1`, `::1`). If you bind to `0.0.0.0` or a non-loopback address,
-/// clients must send requests with a `Host` that matches the allow-list, or
-/// use a reverse proxy that rewrites the `Host` header.
+/// allow-list. mcpls builds it from the loopback names (`localhost`,
+/// `127.0.0.1`, `::1`, any port), the bound address when it is a specific
+/// non-loopback IP literal (any port), and
+/// [`HttpConfig::allowed_hosts`]. There is no wildcard: a bind to `0.0.0.0`
+/// or `[::]` allows only the loopback names and the configured hosts, so
+/// clients must send a `Host` that matches one of them, or use a reverse
+/// proxy that rewrites the `Host` header.
 ///
 /// A request carrying an `Origin` header is accepted only when it names a
 /// loopback origin (`localhost`, `127.0.0.1`, `[::1]`) on the bound port or
@@ -68,9 +75,9 @@ pub enum Transport {
 /// non-browser client) is unaffected.
 ///
 /// [`HttpConfig::allowed_origins`] serves browser pages whose requests reach
-/// mcpls with a loopback `Host`, through a tunnel or a reverse proxy that
-/// rewrites `Host`. It does not make a non-loopback `Host` acceptable: that
-/// check runs first and stays loopback-only.
+/// mcpls with an allowed `Host`, through a tunnel or a reverse proxy. It does
+/// not make a `Host` acceptable: the `Host` check runs first, so a deployment
+/// behind a non-loopback name needs [`HttpConfig::allowed_hosts`] as well.
 ///
 /// # Examples
 ///
@@ -144,6 +151,9 @@ pub struct HttpConfig {
     /// Browser origins accepted in addition to the loopback origins on the
     /// bound port. Empty by default.
     pub allowed_origins: Box<[AllowedOrigin]>,
+    /// `Host` header values accepted in addition to the loopback names and
+    /// the bound IP literal. Empty by default.
+    pub allowed_hosts: Box<[AllowedHost]>,
     /// Longest a POST or request-wise resume response stream stays open,
     /// counted from when it opens.
     ///
@@ -151,10 +161,18 @@ pub struct HttpConfig {
     /// elapses however much it is still sending, which releases its hold on
     /// the session so the idle reaper can expire it. While the connection's
     /// write to a peer that stopped reading is stuck the body is not polled,
-    /// so the cut cannot fire and the session slot and the
-    /// [`HttpConfig::max_concurrent_connections`] permit wait for TCP (#600).
+    /// so the cut cannot fire; [`HttpConfig::write_stall_timeout`] closes the
+    /// connection and frees its [`HttpConfig::max_concurrent_connections`]
+    /// permit, and the session slot is freed after the idle timeout.
     /// Defaults to [`ResponseStreamDeadline::DEFAULT`].
     pub response_stream_deadline: ResponseStreamDeadline,
+    /// Longest a write to the peer may make no progress before the
+    /// connection is closed.
+    ///
+    /// Frees the connection permit of a peer that stops reading a response.
+    /// A peer that drains one send buffer per timeout window is not
+    /// detected. Defaults to [`WriteStallTimeout::DEFAULT`].
+    pub write_stall_timeout: WriteStallTimeout,
 }
 
 #[cfg(feature = "transport-http")]
@@ -184,7 +202,9 @@ impl HttpConfig {
             stream_liveness: StreamLiveness::DEFAULT,
             listen_lease: None,
             allowed_origins: Box::default(),
+            allowed_hosts: Box::default(),
             response_stream_deadline: ResponseStreamDeadline::DEFAULT,
+            write_stall_timeout: WriteStallTimeout::DEFAULT,
         }
     }
 
@@ -261,6 +281,45 @@ impl HttpConfig {
         origins: impl IntoIterator<Item = AllowedOrigin>,
     ) -> Self {
         self.allowed_origins = origins.into_iter().collect();
+        self
+    }
+
+    /// Accept requests whose `Host` is one of `hosts` in addition to the
+    /// loopback names and the bound IP literal.
+    ///
+    /// Clients and proxies omit the default port from `Host`, so never pin
+    /// `:80` or `:443`: list the host without a port, which matches any port.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::{AllowedHost, HttpConfig};
+    ///
+    /// let cfg = HttpConfig::new("0.0.0.0:3000".parse().unwrap())
+    ///     .with_allowed_hosts(["mcp.example.com".parse::<AllowedHost>().unwrap()]);
+    /// assert_eq!(cfg.allowed_hosts.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn with_allowed_hosts(mut self, hosts: impl IntoIterator<Item = AllowedHost>) -> Self {
+        self.allowed_hosts = hosts.into_iter().collect();
+        self
+    }
+
+    /// Override how long a write may stall before the connection is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::{HttpConfig, WriteStallTimeout};
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap())
+    ///     .with_write_stall_timeout(WriteStallTimeout::new(Duration::from_secs(10)).unwrap());
+    /// assert_eq!(cfg.write_stall_timeout.get(), Duration::from_secs(10));
+    /// ```
+    #[must_use]
+    pub const fn with_write_stall_timeout(mut self, timeout: WriteStallTimeout) -> Self {
+        self.write_stall_timeout = timeout;
         self
     }
 
@@ -742,17 +801,212 @@ impl std::str::FromStr for AllowedOrigin {
         if host.is_empty() {
             return Err(InvalidAllowedOrigin::MissingHost);
         }
-        let port = match authority.as_str().get(host.len()..) {
-            Some("" | ":") => scheme.default_port(),
-            Some(suffix) => suffix
-                .strip_prefix(':')
-                .filter(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|digits| digits.parse().ok())
-                .ok_or(InvalidAllowedOrigin::Malformed)?,
-            None => return Err(InvalidAllowedOrigin::Malformed),
+        let port = match AuthorityPort::of(authority).ok_or(InvalidAllowedOrigin::Malformed)? {
+            AuthorityPort::Absent | AuthorityPort::Empty => scheme.default_port(),
+            AuthorityPort::Number(port) => port,
         };
         Ok(Self {
             scheme,
+            host: host.to_ascii_lowercase().into(),
+            port,
+        })
+    }
+}
+
+/// The port part of an [`axum::http::uri::Authority`].
+#[cfg(feature = "transport-http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityPort {
+    /// No `:` after the host.
+    Absent,
+    /// A `:` with no digits after it.
+    Empty,
+    /// A decimal port that fits in `u16`.
+    Number(u16),
+}
+
+#[cfg(feature = "transport-http")]
+impl AuthorityPort {
+    /// `None` when the text after the host is not `:` followed by decimal
+    /// digits of a `u16`.
+    fn of(authority: &axum::http::uri::Authority) -> Option<Self> {
+        match authority.as_str().get(authority.host().len()..)? {
+            "" => Some(Self::Absent),
+            ":" => Some(Self::Empty),
+            suffix => suffix
+                .strip_prefix(':')
+                .filter(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|digits| digits.parse().ok())
+                .map(Self::Number),
+        }
+    }
+}
+
+/// Why a string is not a valid [`AllowedHost`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::{AllowedHost, InvalidAllowedHost};
+///
+/// assert_eq!("*".parse::<AllowedHost>(), Err(InvalidAllowedHost::Wildcard));
+/// assert_eq!("example.com:".parse::<AllowedHost>(), Err(InvalidAllowedHost::InvalidPort));
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidAllowedHost {
+    /// The string is not a host with an optional port (an IPv6 host needs
+    /// brackets), or carries a scheme or path.
+    #[error("not a valid host")]
+    Malformed,
+    /// A wildcard such as `*` or `*.example.com`.
+    #[error("wildcards are not allowed")]
+    Wildcard,
+    /// The authority carries `user:password@`.
+    #[error("user information is not allowed")]
+    UserInfo,
+    /// The host is empty.
+    #[error("the host is missing")]
+    MissingHost,
+    /// The port is empty (`host:`) or is not a number up to 65535.
+    #[error("the port must be a number up to 65535")]
+    InvalidPort,
+    /// The string has a non-ASCII character; `Host` carries the punycode
+    /// (`xn--`) form of an internationalized name.
+    #[error("only ASCII is allowed; write an internationalized name in punycode (`xn--...`)")]
+    NonAscii,
+    /// The host ends with a `.` (a fully qualified name). `rmcp` compares
+    /// hosts as plain lowercase strings, so the dotted and undotted forms
+    /// are different hosts; list the form clients send, without the dot.
+    #[error("a trailing dot is not allowed; list the name without it")]
+    TrailingDot,
+}
+
+/// A `Host` header value allowed to reach the HTTP transport, validated so it
+/// round-trips through `rmcp`'s allowlist.
+///
+/// `rmcp` falls back to matching an entry it cannot parse as a raw host name,
+/// so an invalid string would leave the host blocked with no error. This type
+/// is a host with an optional port, nothing else: no wildcard, userinfo,
+/// scheme or path. The host is lowercased and IPv6 hosts keep their brackets.
+/// `rmcp` compares hosts as plain strings, so a trailing dot and non-ASCII
+/// (use punycode) are rejected rather than normalized. Without a port, any
+/// port matches; with one, only that port does, and a request that omits the
+/// port (clients and proxies omit `:80` and `:443`) does not match, so list
+/// the host without a port unless a non-default port is really meant.
+/// Surrounding whitespace is ignored.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::AllowedHost;
+///
+/// let any_port: AllowedHost = "MCP.Example.com".parse().unwrap();
+/// assert_eq!(any_port.to_string(), "mcp.example.com");
+/// assert_eq!(any_port.port(), None);
+///
+/// let pinned: AllowedHost = "[::1]:8080".parse().unwrap();
+/// assert_eq!(pinned.to_string(), "[::1]:8080");
+/// assert_eq!(pinned.port(), Some(8080));
+/// assert!("https://example.com".parse::<AllowedHost>().is_err());
+/// ```
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedHost {
+    host: Box<str>,
+    port: Option<u16>,
+}
+
+#[cfg(feature = "transport-http")]
+impl AllowedHost {
+    /// The loopback names `localhost`, `127.0.0.1` and `[::1]`, on any port.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::AllowedHost;
+    ///
+    /// assert_eq!(AllowedHost::loopback()[1].to_string(), "127.0.0.1");
+    /// ```
+    #[must_use]
+    pub fn loopback() -> [Self; 3] {
+        ["localhost", "127.0.0.1", "[::1]"].map(|host| Self {
+            host: host.into(),
+            port: None,
+        })
+    }
+
+    /// The host name or IP literal, lowercased; an IPv6 literal keeps its
+    /// brackets.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The port the host is pinned to, or `None` for any port.
+    #[must_use]
+    pub const fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// An IP literal on any port: a client reaching a `:80` or `:443` bind
+    /// sends no port in `Host`.
+    fn ip_literal(ip: std::net::IpAddr) -> Self {
+        let host = match ip {
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        Self {
+            host: host.into(),
+            port: None,
+        }
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl std::fmt::Display for AllowedHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.port {
+            Some(port) => write!(f, "{}:{port}", self.host),
+            None => f.write_str(&self.host),
+        }
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl std::str::FromStr for AllowedHost {
+    type Err = InvalidAllowedHost;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use axum::http::uri::Authority;
+
+        let s = s.trim();
+        if s.contains('*') {
+            return Err(InvalidAllowedHost::Wildcard);
+        }
+        if s.contains('@') {
+            return Err(InvalidAllowedHost::UserInfo);
+        }
+        if !s.is_ascii() {
+            return Err(InvalidAllowedHost::NonAscii);
+        }
+        let authority = Authority::try_from(s).map_err(|_| InvalidAllowedHost::Malformed)?;
+        let host = authority.host();
+        if host.is_empty() {
+            return Err(InvalidAllowedHost::MissingHost);
+        }
+        if host.ends_with('.') {
+            return Err(InvalidAllowedHost::TrailingDot);
+        }
+        let port = match AuthorityPort::of(&authority).ok_or(InvalidAllowedHost::InvalidPort)? {
+            AuthorityPort::Absent => None,
+            AuthorityPort::Empty => return Err(InvalidAllowedHost::InvalidPort),
+            AuthorityPort::Number(port) => Some(port),
+        };
+        Ok(Self {
             host: host.to_ascii_lowercase().into(),
             port,
         })
@@ -788,8 +1042,9 @@ pub enum StreamLiveness {
     /// Never probe; a vanished peer is noticed only when the OS gives up on
     /// the connection. A POST or resume stream is still cut once it has been
     /// open for [`ResponseStreamDeadline`]; a peer that stopped reading a
-    /// response keeps its session slot and connection permit until TCP gives
-    /// up (#600), which no probe could free either. Without proof of life an
+    /// response loses its connection after [`HttpConfig::write_stall_timeout`]
+    /// and its session slot after the idle timeout, which no probe could
+    /// free sooner either. Without proof of life an
     /// open GET stream does not keep its session alive: the session expires
     /// after the idle timeout (5 minutes) without inbound requests, even while
     /// the stream receives notifications.
@@ -837,6 +1092,26 @@ non_zero_duration! {
     /// assert_eq!(timeout.get(), Duration::from_secs(10));
     /// ```
     pub HeaderReadTimeout, 30, "30 seconds."
+}
+
+#[cfg(feature = "transport-http")]
+non_zero_duration! {
+    /// Non-zero time a write to the peer may make no progress before the
+    /// connection is closed, for [`HttpConfig::write_stall_timeout`].
+    ///
+    /// A zero timeout would close every connection that cannot flush at once,
+    /// so it is unrepresentable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::WriteStallTimeout;
+    ///
+    /// assert!(WriteStallTimeout::new(Duration::ZERO).is_none());
+    /// assert_eq!(WriteStallTimeout::DEFAULT.get(), Duration::from_secs(30));
+    /// ```
+    pub WriteStallTimeout, 30, "30 seconds."
 }
 
 #[cfg(feature = "transport-http")]
@@ -929,9 +1204,13 @@ use rmcp::transport::streamable_http_server::session::{
 use crate::bridge::lock_std;
 
 #[cfg(feature = "transport-http")]
+mod connection_io;
+#[cfg(feature = "transport-http")]
 mod lease;
 #[cfg(feature = "transport-http")]
 mod liveness;
+#[cfg(feature = "transport-http")]
+use connection_io::ConnectionIo;
 #[cfg(feature = "transport-http")]
 pub(crate) use lease::ListenLeaseSlot;
 #[cfg(feature = "transport-http")]
@@ -1225,10 +1504,9 @@ pub(crate) async fn run_stdio(
 /// stops holding the session open and the reaper expires the session after the
 /// idle timeout, so a vanished peer no longer pins its slot for good. While
 /// hyper's write of a response to a peer that stopped reading is stuck, the
-/// body is not polled and the cut cannot fire: the session slot and the
-/// `max_concurrent_connections` permit wait for TCP to give up (the
-/// `TCP_USER_TIMEOUT` above on Linux and Android, the OS default elsewhere, or
-/// the reverse proxy's timeout; #600). Clients should send `DELETE` on
+/// body is not polled and the cut cannot fire: `write_stall_timeout` closes
+/// the connection and frees its `max_concurrent_connections` permit, and the
+/// session slot is freed after the idle timeout. Clients should send `DELETE` on
 /// shutdown; after an expiry they must re-initialize and re-subscribe.
 ///
 /// On rmcp's stateless request path, "one instance per session" narrows to
@@ -1297,6 +1575,55 @@ pub(crate) async fn run_http(
     serve_http(listener, mcp_server, cfg, shutdown_signal).await
 }
 
+/// The `Host` values the server accepts: the loopback names, the bound IP
+/// literal when it is neither unspecified nor loopback, and `configured`.
+///
+/// The bound IP literal is safe to allow because DNS rebinding needs a
+/// hostname, and it is allowed on any port because a client reaching a `:80`
+/// or `:443` bind omits the port from `Host`.
+#[cfg(feature = "transport-http")]
+fn effective_allowed_hosts(
+    local_addr: std::net::SocketAddr,
+    configured: &[AllowedHost],
+) -> Vec<AllowedHost> {
+    let ip = local_addr.ip();
+    let bound_ip = (!ip.is_unspecified() && !ip.is_loopback()).then(|| AllowedHost::ip_literal(ip));
+    AllowedHost::loopback()
+        .into_iter()
+        .chain(bound_ip)
+        .chain(configured.iter().cloned())
+        .collect()
+}
+
+/// The `rmcp` service configuration for `cfg` served on `local_addr`.
+///
+/// `rmcp` accepts a request without `Origin`, so non-browser clients are
+/// unaffected; a browser page on any origin outside the allowlist gets `403`.
+#[cfg(feature = "transport-http")]
+fn rmcp_service_config(
+    local_addr: std::net::SocketAddr,
+    cfg: &HttpConfig,
+    cancel: tokio_util::sync::CancellationToken,
+) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
+    use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
+
+    let allowed_origins = AllowedOrigin::loopback(local_addr.port())
+        .into_iter()
+        .chain(cfg.allowed_origins.iter().cloned())
+        .map(|origin| origin.to_string());
+    let allowed_hosts = effective_allowed_hosts(local_addr, &cfg.allowed_hosts)
+        .into_iter()
+        .map(|host| host.to_string());
+    // `StreamableHttpServerConfig` is `#[non_exhaustive]`: construct via Default, then mutate.
+    let mut http_cfg = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(allowed_hosts)
+        .with_allowed_origins(allowed_origins)
+        .enforce_origin_validation();
+    http_cfg.cancellation_token = cancel;
+    http_cfg.max_request_body_bytes = cfg.max_request_body.get();
+    http_cfg
+}
+
 /// Serves the MCP HTTP transport on an already-bound `listener`.
 ///
 /// Split out of [`run_http`] so callers (tests in particular) can bind the
@@ -1317,9 +1644,7 @@ pub(crate) async fn serve_http(
 ) -> Result<(), crate::Error> {
     use std::sync::Arc;
 
-    use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService,
-    };
+    use rmcp::transport::streamable_http_server::StreamableHttpService;
     use tokio_util::sync::CancellationToken;
 
     let session_manager = Arc::new(
@@ -1336,19 +1661,7 @@ pub(crate) async fn serve_http(
     // accidentally hand to multiple sessions.
     let mcp_for_factory = mcp_server;
     let local_addr = listener.local_addr()?;
-    // StreamableHttpServerConfig is #[non_exhaustive]; construct via Default then mutate.
-    // rmcp accepts a request without `Origin`, so non-browser clients are
-    // unaffected; a browser page on any origin outside this list gets `403`.
-    // TODO(#597): `allowed_hosts` stays loopback-only and is checked before `Origin`
-    let allowed_origins = AllowedOrigin::loopback(local_addr.port())
-        .into_iter()
-        .chain(cfg.allowed_origins.iter().cloned())
-        .map(|origin| origin.to_string());
-    let mut http_cfg = StreamableHttpServerConfig::default()
-        .with_allowed_origins(allowed_origins)
-        .enforce_origin_validation();
-    http_cfg.cancellation_token = cancel.clone();
-    http_cfg.max_request_body_bytes = cfg.max_request_body.get();
+    let http_cfg = rmcp_service_config(local_addr, &cfg, cancel.clone());
 
     // `for_new_session`, not `.clone()`: every session must get its own
     // subscription state (#478) rather than sharing `mcp_for_factory`'s, while
@@ -1386,10 +1699,11 @@ pub(crate) async fn serve_http(
             addr = %local_addr,
             "binding to a non-loopback address: mcpls performs no authentication of its own on \
              any transport — place this endpoint behind a reverse proxy that enforces \
-             authentication. mcpls itself enforces only a header-read/idle timeout and a connection \
-             cap. The proxy must also rewrite the Host header, since rmcp's Host validation \
-             allows only localhost/127.0.0.1/::1 by default, and browser clients may use only \
-             loopback origins on the bound port or the configured allowed origins"
+             authentication. mcpls itself enforces only a header-read/idle timeout, a write-stall \
+             timeout and a connection cap. The Host header must be localhost, 127.0.0.1, ::1, \
+             the bound IP or one of the configured allowed hosts (a proxy can rewrite it), and \
+             browser clients may use only loopback origins on the bound port or the \
+             configured allowed origins"
         );
     }
 
@@ -1411,6 +1725,7 @@ pub(crate) async fn serve_http(
                 app,
                 cancel_for_serve,
                 cfg.header_read_timeout,
+                cfg.write_stall_timeout,
                 cfg.max_concurrent_connections,
             ),
             signal
@@ -1476,13 +1791,18 @@ pub(crate) async fn serve_http(
 /// stalls would hold it (and, with the cap, a permit) forever. A permit is
 /// taken before `accept` so a full house leaves new connections queued in
 /// the kernel rather than accepted-and-idle.
+///
+/// Every stream goes through [`ConnectionIo`]: a write that makes no progress
+/// for `write_stall` closes the connection, and a clean close lingers to
+/// discard the unread request body.
 #[cfg(feature = "transport-http")]
-// TODO(#600): a peer that stops reading holds its connection permit and session slot
+// TODO(#613): a peer trickling one read or body chunk per timeout window holds its permit indefinitely; needs a minimum-rate bound
 async fn serve_http1(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     cancel: tokio_util::sync::CancellationToken,
     header_read_timeout: HeaderReadTimeout,
+    write_stall: WriteStallTimeout,
     max_connections: ConnectionLimit,
 ) {
     use std::sync::Arc;
@@ -1526,8 +1846,13 @@ async fn serve_http1(
         #[cfg(any(target_os = "linux", target_os = "android"))]
         set_half_open_timeout(&stream);
 
-        let conn =
-            builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone()));
+        let io = TokioIo::new(ConnectionIo::new(
+            stream,
+            write_stall,
+            header_read_timeout,
+            cancel.clone(),
+        ));
+        let conn = builder.serve_connection(io, TowerToHyperService::new(app.clone()));
         let cancel = cancel.clone();
         connections.spawn(async move {
             let _permit = permit;
@@ -2788,17 +3113,105 @@ mod tests {
             tokio_util::sync::CancellationToken,
             tokio::task::JoinHandle<()>,
         ) {
+            spawn_serve_http1_with(
+                axum::Router::new(),
+                crate::WriteStallTimeout::DEFAULT,
+                limit,
+            )
+            .await
+        }
+
+        /// Starts `serve_http1` over `app` with an explicit write-stall timeout.
+        async fn spawn_serve_http1_with(
+            app: axum::Router,
+            write_stall: crate::WriteStallTimeout,
+            limit: ConnectionLimit,
+        ) -> (
+            SocketAddr,
+            tokio_util::sync::CancellationToken,
+            tokio::task::JoinHandle<()>,
+        ) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let cancel = tokio_util::sync::CancellationToken::new();
             let task = tokio::spawn(super::super::serve_http1(
                 listener,
-                axum::Router::new(),
+                app,
                 cancel.clone(),
                 HeaderReadTimeout::DEFAULT,
+                write_stall,
                 limit,
             ));
             (addr, cancel, task)
+        }
+
+        /// A response body that never ends.
+        struct EndlessBody;
+
+        impl http_body::Body for EndlessBody {
+            type Data = axum::body::Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>>
+            {
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(
+                    axum::body::Bytes::from_static(&[b'x'; 16 * 1024]),
+                ))))
+            }
+        }
+
+        /// A peer that requests an endless response and never reads it loses
+        /// its connection after the write-stall timeout, so a one-connection
+        /// cap serves the next client.
+        #[tokio::test]
+        async fn test_serve_http1_write_stall_frees_the_permit_of_a_non_reading_peer() {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let stall = std::time::Duration::from_millis(300);
+            let app = axum::Router::new().route(
+                "/stream",
+                axum::routing::get(|| async { axum::body::Body::new(EndlessBody) }),
+            );
+            let (addr, cancel, task) = spawn_serve_http1_with(
+                app,
+                crate::WriteStallTimeout::new(stall).unwrap(),
+                ConnectionLimit::new(1).unwrap(),
+            )
+            .await;
+
+            let mut hog = tokio::net::TcpStream::connect(addr).await.unwrap();
+            hog.write_all(format!("GET /stream HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let started = tokio::time::Instant::now();
+
+            let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+            next.write_all(
+                format!("GET /nowhere HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 16];
+            let n = tokio::time::timeout(
+                stall + std::time::Duration::from_secs(5),
+                next.read(&mut buf),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the stalled connection must release its permit"))
+            .unwrap();
+
+            assert!(n > 0);
+            assert!(
+                started.elapsed() >= stall,
+                "the permit was freed before the stall deadline"
+            );
+            drop((hog, next));
+            cancel.cancel();
+            task.await.unwrap();
         }
 
         /// Cancelling drains an idle keep-alive connection instead of
@@ -2916,11 +3329,22 @@ mod tests {
             extra_headers: &str,
             body: &[u8],
         ) -> String {
+            raw_http_post_as(addr, &addr.to_string(), path, extra_headers, body).await
+        }
+
+        /// [`raw_http_post`] with an explicit `Host` header value.
+        async fn raw_http_post_as(
+            addr: SocketAddr,
+            host: &str,
+            path: &str,
+            extra_headers: &str,
+            body: &[u8],
+        ) -> String {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             let request = format!(
-                "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{extra_headers}Content-Length: {}\r\n\r\n",
+                "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n{extra_headers}Content-Length: {}\r\n\r\n",
                 body.len()
             );
             // One write, so a server that answers from the headers alone does
@@ -3327,6 +3751,303 @@ mod tests {
                 );
             }
 
+            server_task.abort();
+        }
+
+        #[test]
+        fn test_allowed_host_normalizes_case_and_keeps_ipv6_brackets() {
+            for (input, expected, port) in [
+                ("example.com", "example.com", None),
+                ("Example.COM:8080", "example.com:8080", Some(8080)),
+                ("[::1]", "[::1]", None),
+                ("[2001:DB8::1]:443", "[2001:db8::1]:443", Some(443)),
+                ("127.0.0.1:3000", "127.0.0.1:3000", Some(3000)),
+                ("  a.example  ", "a.example", None),
+            ] {
+                let host: crate::AllowedHost = input.parse().unwrap();
+                assert_eq!(host.to_string(), expected, "{input}");
+                assert_eq!(host.port(), port, "{input}");
+                assert_eq!(host.to_string().parse(), Ok(host), "{input}");
+            }
+        }
+
+        #[test]
+        fn test_allowed_host_rejects_each_invalid_shape() {
+            use crate::InvalidAllowedHost as Invalid;
+
+            for (input, expected) in [
+                ("*", Invalid::Wildcard),
+                ("*.example.com", Invalid::Wildcard),
+                ("example.com:*", Invalid::Wildcard),
+                ("user@example.com", Invalid::UserInfo),
+                ("user:pass@example.com:80", Invalid::UserInfo),
+                ("", Invalid::Malformed),
+                ("https://example.com", Invalid::Malformed),
+                ("example.com/path", Invalid::Malformed),
+                ("::1", Invalid::Malformed),
+                (":8080", Invalid::MissingHost),
+                ("example.com:", Invalid::InvalidPort),
+                ("example.com:99999", Invalid::InvalidPort),
+                ("example.com.", Invalid::TrailingDot),
+                ("example.com.:8080", Invalid::TrailingDot),
+                ("b\u{fc}cher.example", Invalid::NonAscii),
+                ("example.com:+80", Invalid::InvalidPort),
+            ] {
+                assert_eq!(
+                    input.parse::<crate::AllowedHost>(),
+                    Err(expected),
+                    "{input:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_effective_allowed_hosts_by_bind_address() {
+            let names = |bind: &str, configured: &[&str]| -> Vec<String> {
+                let configured: Vec<crate::AllowedHost> =
+                    configured.iter().map(|h| h.parse().unwrap()).collect();
+                super::super::effective_allowed_hosts(bind.parse().unwrap(), &configured)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            };
+            let loopback = ["localhost", "127.0.0.1", "[::1]"];
+
+            assert_eq!(names("127.0.0.1:3000", &[]), loopback);
+            assert_eq!(names("[::1]:3000", &[]), loopback);
+            assert_eq!(names("0.0.0.0:3000", &[]), loopback);
+            assert_eq!(names("[::]:3000", &[]), loopback);
+            assert_eq!(
+                names("192.168.1.5:3000", &["mcp.example.com"]),
+                [loopback.as_slice(), &["192.168.1.5", "mcp.example.com"]].concat()
+            );
+            assert_eq!(
+                names("[2001:db8::5]:3000", &[]),
+                [loopback.as_slice(), &["[2001:db8::5]"]].concat()
+            );
+        }
+
+        /// A client reaching a `:80` bind by IP sends `Host` without a port,
+        /// so the bound IP must reach `rmcp` portless.
+        #[test]
+        fn test_rmcp_config_allows_the_bound_ip_without_a_port() {
+            let cfg = HttpConfig::new("192.168.1.5:80".parse().unwrap());
+
+            let rmcp_cfg = super::super::rmcp_service_config(
+                "192.168.1.5:80".parse().unwrap(),
+                &cfg,
+                tokio_util::sync::CancellationToken::new(),
+            );
+
+            assert!(rmcp_cfg.allowed_hosts.iter().any(|h| h == "192.168.1.5"));
+            assert!(rmcp_cfg.allowed_hosts.iter().all(|h| h != "192.168.1.5:80"));
+        }
+
+        /// #597: a `Host` outside the loopback names is rejected with `403`
+        /// unless it is configured; a host without a port matches any port and
+        /// one with a port matches only that port.
+        #[tokio::test]
+        async fn test_run_http_enforces_configured_allowed_hosts() {
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_allowed_hosts(
+                    ["evil.example", "Pinned.example:8443"]
+                        .map(|host| host.parse::<crate::AllowedHost>().unwrap()),
+                )
+            })
+            .await;
+            let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+            let post = |host: String| async move {
+                raw_http_post_as(
+                    addr,
+                    &host,
+                    "/mcp",
+                    "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n",
+                    initialize_body,
+                )
+                .await
+            };
+
+            for accepted in [
+                format!("localhost:{}", addr.port()),
+                format!("127.0.0.1:{}", addr.port()),
+                "localhost".to_owned(),
+                "evil.example".to_owned(),
+                "evil.example:80".to_owned(),
+                "EVIL.example:1234".to_owned(),
+                "pinned.example:8443".to_owned(),
+            ] {
+                let response = post(accepted.clone()).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 200"),
+                    "Host {accepted} should be accepted, got: {response}"
+                );
+            }
+            for rejected in [
+                "other.example",
+                "evil.example.attacker.test",
+                "pinned.example:1",
+                "pinned.example",
+            ] {
+                let response = post(rejected.to_owned()).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 403"),
+                    "Host {rejected} should be rejected, got: {response}"
+                );
+            }
+
+            server_task.abort();
+        }
+
+        /// Reads to EOF or error, returning what arrived and the error kind.
+        async fn read_until_close(
+            stream: &mut (impl tokio::io::AsyncRead + Unpin),
+            limit: std::time::Duration,
+        ) -> (String, Option<std::io::ErrorKind>) {
+            use tokio::io::AsyncReadExt as _;
+
+            let mut response = Vec::new();
+            let mut buf = [0u8; 4096];
+            let deadline = tokio::time::Instant::now() + limit;
+            let error = loop {
+                match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+                    Ok(Ok(0)) => break None,
+                    Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+                    Ok(Err(e)) => break Some(e.kind()),
+                    Err(elapsed) => panic!("the connection stayed open past {limit:?}: {elapsed}"),
+                }
+            };
+            (String::from_utf8_lossy_owned(response), error)
+        }
+
+        /// POSTs `extra_headers` with a request body of `body_len` bytes (all of
+        /// it, or never-ending when `None`) streamed while the response is read.
+        async fn post_streamed_body(
+            addr: SocketAddr,
+            extra_headers: &str,
+            body_len: Option<usize>,
+            read_delay: std::time::Duration,
+            limit: std::time::Duration,
+        ) -> (
+            String,
+            Option<std::io::ErrorKind>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            use tokio::io::AsyncWriteExt as _;
+
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut reader, mut writer) = stream.into_split();
+            let head = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\n{extra_headers}Content-Length: {}\r\n\r\n",
+                body_len.unwrap_or(1 << 40)
+            );
+            let sender = tokio::spawn(async move {
+                if writer.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let chunk = [b'a'; 16 * 1024];
+                let mut remaining = body_len;
+                loop {
+                    let len = remaining.map_or(chunk.len(), |r| r.min(chunk.len()));
+                    if len == 0 || writer.write_all(&chunk[..len]).await.is_err() {
+                        return;
+                    }
+                    remaining = remaining.map(|r| r - len);
+                }
+            });
+            tokio::time::sleep(read_delay).await;
+            let (response, error) = read_until_close(&mut reader, limit).await;
+            (response, error, sender)
+        }
+
+        const JSON_POST_HEADERS: &str =
+            "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
+
+        /// #602: a `403` sent while a large request body is unread arrives
+        /// intact and the connection then ends cleanly, not with a reset.
+        #[tokio::test]
+        async fn test_early_403_with_a_large_unread_body_delivers_the_status() {
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| cfg).await;
+            let headers = format!("{JSON_POST_HEADERS}Origin: http://evil.example\r\n");
+
+            let (response, error, sender) = post_streamed_body(
+                addr,
+                &headers,
+                Some(512 << 10),
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(10),
+            )
+            .await;
+
+            assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+            assert_eq!(error, None);
+            sender.abort();
+            server_task.abort();
+        }
+
+        /// #602: a `413` for a body over the limit also arrives intact.
+        #[tokio::test]
+        async fn test_early_413_with_a_large_unread_body_delivers_the_status() {
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_max_request_body(crate::RequestBodyLimit::new(64).unwrap())
+            })
+            .await;
+
+            let (response, error, sender) = post_streamed_body(
+                addr,
+                JSON_POST_HEADERS,
+                Some(512 << 10),
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(10),
+            )
+            .await;
+
+            assert!(response.starts_with("HTTP/1.1 413"), "got: {response}");
+            assert_eq!(error, None);
+            sender.abort();
+            server_task.abort();
+        }
+
+        /// #602: a peer that keeps sending after an early `403` is cut once the
+        /// linger budget (`header_read_timeout` here) is spent, which frees
+        /// the connection permit.
+        #[tokio::test]
+        async fn test_early_403_with_an_endless_body_frees_the_permit_within_the_linger_cap() {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+                cfg.with_header_read_timeout(
+                    HeaderReadTimeout::new(std::time::Duration::from_millis(500)).unwrap(),
+                )
+                .with_max_concurrent_connections(ConnectionLimit::new(1).unwrap())
+            })
+            .await;
+            let headers = format!("{JSON_POST_HEADERS}Origin: http://evil.example\r\n");
+
+            let (response, _, sender) = post_streamed_body(
+                addr,
+                &headers,
+                None,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(10),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+
+            let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+            next.write_all(
+                format!("GET /nowhere HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 16];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), next.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("the lingering connection must release its permit"))
+                .unwrap();
+
+            assert!(n > 0);
+            sender.abort();
             server_task.abort();
         }
 

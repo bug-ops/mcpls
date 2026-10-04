@@ -28,6 +28,10 @@ agent as 29 MCP tools — hover, go-to-definition, references, diagnostics, rena
 hierarchy, document highlights, a `get_tool_support` report of which tools work for which
 languages, and more.
 
+Secrets configured for a server (secret-named `env` values, flags and options) are replaced by
+`[redacted:NAME]` markers in the display text of tool results. This is partial: edits, URIs,
+identifiers and command arguments are returned unmodified.
+
 This skill covers operating the **binary**: installing it, choosing CLI flags and
 environment variables, registering it with an MCP client, and writing `mcpls.toml`.
 It does not enumerate the 29 MCP tools themselves or their parameters — for that, see
@@ -97,7 +101,8 @@ no environment variable equivalent.
 | `--log-json` | — | `MCPLS_LOG_JSON` | `false` | Output logs in JSON format for structured logging. The env var accepts `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive). |
 | `--listen <ADDR>` | — | `MCPLS_LISTEN` | unset | HTTP transport bind address (e.g. `127.0.0.1:3000`). Only exists when built with `--features transport-http` — see [HTTP transport caveats](#registering-with-an-mcp-client). |
 | `--http-path <PATH>` | — | `MCPLS_HTTP_PATH` | `/mcp` | URL path the MCP service mounts at. Must start with `/`, must not be `/`, and may use only ASCII letters, digits and `-._~` per segment; an invalid value exits with code 2 before any server starts, even without `--listen`. Only used with `--listen`; same `transport-http` feature gate. HTTP requests carrying an `Origin` other than a loopback origin on the bound port or one listed with `--http-allowed-origin` get `403`. |
-| `--http-allowed-origin <ORIGIN>` | — | `MCPLS_HTTP_ALLOWED_ORIGINS` | none | Extra browser origin (`http(s)://host[:port]`, repeatable or comma-separated) accepted besides loopback origins on the bound port. The `Host` check stays loopback-only (#597), so this serves pages whose requests reach mcpls with a loopback `Host`. |
+| `--http-allowed-origin <ORIGIN>` | — | `MCPLS_HTTP_ALLOWED_ORIGINS` | none | Extra browser origin (`http(s)://host[:port]`, repeatable or comma-separated) accepted besides loopback origins on the bound port. The request's `Host` must be allowed too (`--http-allowed-host`). |
+| `--http-allowed-host <HOST>` | — | `MCPLS_HTTP_ALLOWED_HOSTS` | none | Extra `Host` header value (`host[:port]`, no wildcards, repeatable or comma-separated) accepted besides `localhost`, `127.0.0.1`, `::1` and the bound IP address; without a port any port matches; never pin `:80` or `:443` (clients omit them). Needed when reaching mcpls by name or when bound to `0.0.0.0`. |
 
 Plus standard `--version` / `--help`. No subcommands.
 
