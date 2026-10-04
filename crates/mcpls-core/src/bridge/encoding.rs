@@ -242,8 +242,7 @@ impl EncodingConverter {
                 "Byte offset {byte_offset} exceeds text length {text_len}"
             ));
         }
-        // `text[..byte_offset]` below panics (and, under `panic = "abort"`,
-        // kills the whole process) if `byte_offset` lands mid-character. A
+        // `text[..byte_offset]` below panics if `byte_offset` lands mid-character. A
         // server-reported offset should always be on a boundary, but this is
         // untrusted external input, so it is checked rather than trusted.
         if !text.is_char_boundary(byte_offset) {
@@ -603,8 +602,7 @@ mod tests {
     /// C1 regression: a byte offset that lands mid-character must error, not
     /// panic. `"héllo"` encodes `é` as the 2 bytes `0xC3 0xA9`; byte offset 2
     /// sits between them. Before the boundary guard this reached
-    /// `text[..2].encode_utf16().count()` and panicked (and, under
-    /// `panic = "abort"`, aborted the whole process).
+    /// `text[..2].encode_utf16().count()` and panicked.
     #[test]
     fn test_byte_offset_to_character_mid_char_boundary_does_not_panic() {
         let text = "héllo";

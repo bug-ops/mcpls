@@ -70,7 +70,7 @@ The HTTP transport (`run_http`) is not affected by this specific mechanism — i
 ### Out of Scope
 
 - HTTP transport shutdown (already bounded/verified correct — not affected by this mechanism)
-- The `panic = "abort"` cleanup-bypass limitation already documented as a known limitation on `Translator::shutdown_servers` (separate, already-acknowledged gap)
+- Panic handling: release builds unwind, and `main` catches a panic and shuts the runtime down with a bounded grace period (see `Translator::shutdown_servers` limitations)
 - Redesigning the LSP-server graceful-shutdown handshake itself (`Translator::shutdown_servers` is confirmed working correctly)
 
 ## 2. User Stories
@@ -127,7 +127,7 @@ No new domain entities — this is a process-lifecycle/shutdown-sequencing fix.
 | Client stays connected, SIGTERM arrives | Process exits promptly anyway (this fix) |
 | `SIGKILL` sent instead of `SIGTERM` | Unaffected (already an immediate hard kill, out of scope) |
 | HTTP transport, any signal | Unaffected — does not use `tokio::io::stdin()` |
-| Panic under `panic = "abort"` | Unaffected — already a documented, separate known limitation |
+| Panic in the main future | `main` catches it, runs `Runtime::shutdown_timeout` (1s cap on the stdin reader wait), then exits 101 |
 
 ## 7. Success Criteria
 

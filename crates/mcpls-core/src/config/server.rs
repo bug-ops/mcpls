@@ -270,6 +270,92 @@ pub const MAX_TIMEOUT_SECONDS: u64 = 900;
 /// project nesting.
 pub const MAX_HEURISTICS_DEPTH: usize = 64;
 
+/// Language servers mcpls ships a default configuration for.
+///
+/// Single source of truth for each builtin's executable name and its install
+/// hint, so spawn-failure guidance cannot drift from the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinServer {
+    /// rust-analyzer for Rust.
+    RustAnalyzer,
+    /// pyright for Python.
+    Pyright,
+    /// typescript-language-server for TypeScript.
+    TypescriptLanguageServer,
+    /// gopls for Go.
+    Gopls,
+    /// clangd for C and C++.
+    Clangd,
+    /// zls for Zig.
+    Zls,
+}
+
+impl BuiltinServer {
+    /// Every builtin server.
+    pub const ALL: [Self; 6] = [
+        Self::RustAnalyzer,
+        Self::Pyright,
+        Self::TypescriptLanguageServer,
+        Self::Gopls,
+        Self::Clangd,
+        Self::Zls,
+    ];
+
+    /// Executable name looked up on `PATH`.
+    #[must_use]
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::RustAnalyzer => "rust-analyzer",
+            Self::Pyright => "pyright-langserver",
+            Self::TypescriptLanguageServer => "typescript-language-server",
+            Self::Gopls => "gopls",
+            Self::Clangd => "clangd",
+            Self::Zls => "zls",
+        }
+    }
+
+    /// One-line instruction for installing this server.
+    #[must_use]
+    pub const fn install_hint(self) -> &'static str {
+        match self {
+            Self::RustAnalyzer => "rustup component add rust-analyzer",
+            Self::Pyright => "npm install -g pyright",
+            Self::TypescriptLanguageServer => {
+                "npm install -g typescript-language-server typescript"
+            }
+            Self::Gopls => "go install golang.org/x/tools/gopls@latest",
+            Self::Clangd => {
+                "install clangd via your package manager (e.g. apt install clangd, brew install llvm) or see https://clangd.llvm.org/installation"
+            }
+            Self::Zls => {
+                "install a zls matching your Zig version: https://zigtools.org/zls/install/"
+            }
+        }
+    }
+
+    /// Whether this server is distributed through npm, and so is installed
+    /// as a `.cmd` shim on Windows.
+    #[must_use]
+    pub const fn is_npm_package(self) -> bool {
+        matches!(self, Self::Pyright | Self::TypescriptLanguageServer)
+    }
+
+    /// Look up a builtin by its exact executable name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::config::BuiltinServer;
+    ///
+    /// assert_eq!(BuiltinServer::from_command("gopls"), Some(BuiltinServer::Gopls));
+    /// assert_eq!(BuiltinServer::from_command("/usr/bin/gopls"), None);
+    /// ```
+    #[must_use]
+    pub fn from_command(command: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|b| b.command() == command)
+    }
+}
+
 impl LspServerConfig {
     /// Check if this server should be spawned for the given workspace.
     ///
@@ -302,14 +388,14 @@ impl LspServerConfig {
     /// a parameter.
     fn builtin(
         language_id: &str,
-        command: &str,
+        server: BuiltinServer,
         args: &[&str],
         file_patterns: &[&str],
         markers: impl IntoIterator<Item = &'static str>,
     ) -> Self {
         Self {
             language_id: language_id.to_string(),
-            command: command.to_string(),
+            command: server.command().to_string(),
             args: args.iter().map(ToString::to_string).collect(),
             env: HashMap::new(),
             file_patterns: file_patterns.iter().map(ToString::to_string).collect(),
@@ -328,7 +414,7 @@ impl LspServerConfig {
     pub fn rust_analyzer() -> Self {
         Self::builtin(
             "rust",
-            "rust-analyzer",
+            BuiltinServer::RustAnalyzer,
             &[],
             &["**/*.rs"],
             ["Cargo.toml", "rust-toolchain.toml"],
@@ -340,7 +426,7 @@ impl LspServerConfig {
     pub fn pyright() -> Self {
         Self::builtin(
             "python",
-            "pyright-langserver",
+            BuiltinServer::Pyright,
             &["--stdio"],
             &["**/*.py"],
             [
@@ -357,7 +443,7 @@ impl LspServerConfig {
     pub fn typescript() -> Self {
         Self::builtin(
             "typescript",
-            "typescript-language-server",
+            BuiltinServer::TypescriptLanguageServer,
             &["--stdio"],
             &["**/*.ts", "**/*.tsx"],
             ["package.json", "tsconfig.json", "jsconfig.json"],
@@ -369,7 +455,7 @@ impl LspServerConfig {
     pub fn gopls() -> Self {
         Self::builtin(
             "go",
-            "gopls",
+            BuiltinServer::Gopls,
             &["serve"],
             &["**/*.go"],
             ["go.mod", "go.sum"],
@@ -381,7 +467,7 @@ impl LspServerConfig {
     pub fn clangd() -> Self {
         Self::builtin(
             "cpp",
-            "clangd",
+            BuiltinServer::Clangd,
             &[],
             &["**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp"],
             [
@@ -398,7 +484,7 @@ impl LspServerConfig {
     pub fn zls() -> Self {
         Self::builtin(
             "zig",
-            "zls",
+            BuiltinServer::Zls,
             &[],
             &["**/*.zig"],
             ["build.zig", "build.zig.zon"],

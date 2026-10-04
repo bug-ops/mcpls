@@ -101,8 +101,8 @@ THEN the resulting LSP character offset correctly points at the same character t
 AS A mcpls operator
 I WANT a server-reported byte offset that lands mid-character, or a client-reported column past
 the end of a line, to be handled gracefully
-SO THAT a single malformed position cannot panic the process (`panic = "abort"` is configured
-project-wide, so a panic here would kill every in-flight request, not just one)
+SO THAT a single malformed position cannot panic a request handler (a panic there sends no
+response, so that request would wait out the client's timeout)
 
 **Acceptance criteria:**
 ```
@@ -135,7 +135,7 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 
 | ID | Category | Requirement |
 |----|----------|-------------|
-| NFR-001 | Safety | No conversion path may panic on untrusted input (a server-reported or client-reported offset), consistent with the workspace's `panic = "abort"` configuration where a single panic kills the whole process, not just one request |
+| NFR-001 | Safety | No conversion path may panic on untrusted input (a server-reported or client-reported offset), since a panicking handler sends no response and its request would hang until the client's timeout |
 | NFR-002 | Correctness | ASCII-only text must convert identically regardless of negotiated encoding (`Utf8`==`Utf16`==`Utf32` for pure-ASCII lines), since ASCII characters are exactly 1 byte/1 UTF-16 unit/1 code point in every encoding |
 | NFR-003 | Performance | Conversion for the common case (`Utf16`, the default and most-negotiated encoding per `config/mod.rs`'s `default_position_encodings` doc comment) must be O(1) — no `line_text` scan at all |
 | NFR-004 | Testability | Every fallback path (missing `line_text`, out-of-bounds, mid-character-boundary, astral/surrogate-pair) must have a dedicated regression test, since these are exactly the cases a naive implementation gets wrong silently |
@@ -158,7 +158,7 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | Negotiated encoding is `Utf8`, line contains a 2-byte character (e.g. `é`) before the target column | Column re-derived in bytes, one further than a naive UTF-16-based offset (`test_mcp_to_lsp_position_utf8_negotiated_multibyte`) |
 | Negotiated encoding is `Utf8`, line contains an astral character (e.g. `𝄞`, 4 UTF-8 bytes / 2 UTF-16 units) | Column correctly re-derived across the surrogate pair (`test_mcp_to_lsp_position_utf8_negotiated_astral_char`) |
 | MCP character offset lands mid-surrogate-pair (client miscounted an astral character) | Falls back to the raw offset, flagged `PassedThrough`, rather than rounding forward past the whole character (`test_mcp_to_lsp_position_mid_surrogate_falls_back`) |
-| Byte offset lands mid-character (not a char boundary) | `Err`, not a panic (`test_byte_offset_to_character_mid_char_boundary_does_not_panic`) — a documented regression fix, since `text[..byte_offset]` would otherwise panic and, under `panic = "abort"`, kill the whole process |
+| Byte offset lands mid-character (not a char boundary) | `Err`, not a panic (`test_byte_offset_to_character_mid_char_boundary_does_not_panic`) — a documented regression fix, since `text[..byte_offset]` would otherwise panic the handler |
 | MCP character far past the end of a short line | Clamped to the line length in target units, `Exact` (`test_mcp_to_lsp_position_past_end_of_line_clamps_exactly`) |
 | Server character past the end of its line text | Clamped but `PassedThrough` (`test_lsp_to_mcp_position_past_end_of_line_clamps_but_is_flagged_as_stale_text`) |
 | `line_text` is `None` (file unreadable) | Falls back to the raw value, `PassedThrough` (`test_mcp_to_lsp_position_missing_line_text_passes_through_flagged`) |
@@ -192,8 +192,8 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 
 ### Never
 - Slice `text` at a byte offset without first checking `text.is_char_boundary(offset)` — this is
-  exactly the panic class `byte_offset_to_character`'s guard exists to prevent, and under
-  `panic = "abort"` such a panic kills the entire process, not just one request
+  exactly the panic class `byte_offset_to_character`'s guard exists to prevent, and such a
+  panic leaves that request without a response
 
 ## 9. Open Questions
 

@@ -19,14 +19,14 @@ use lsp_types::{
 };
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
-use crate::lsp::client::LspClient;
+use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 
@@ -313,6 +313,9 @@ pub struct LspServer {
     /// (see `crate::test_lsp`, `Self::new_for_test_with_encoding`) --
     /// [`Self::spawn`] always populates this with `Some`.
     child: Option<tokio::process::Child>,
+    /// Config this server was spawned from; the single source of its routing
+    /// identity, respawn config and indexing policy.
+    init_config: ServerInitConfig,
 }
 
 impl std::fmt::Debug for LspServer {
@@ -324,11 +327,17 @@ impl std::fmt::Debug for LspServer {
             .field("notification_rx", &"<channel>")
             .field("lifecycle_rx", &"<channel>")
             .field("child", &"<process>")
+            .field("id", &self.init_config.server_config.id())
             .finish()
     }
 }
 
 impl LspServer {
+    /// The config this server was spawned from.
+    pub(crate) const fn init_config(&self) -> &ServerInitConfig {
+        &self.init_config
+    }
+
     /// Take the notification receiver out of this server, replacing it with a dummy channel.
     ///
     /// Use this to extract the receiver for a background pump task before registering
@@ -395,10 +404,9 @@ impl LspServer {
             config.server_config.env.len()
         );
 
-        let mut child = command.spawn().map_err(|e| Error::ServerSpawnFailed {
-            command: config.server_config.command.clone(),
-            source: e,
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| spawn_error(config.server_config.command.clone(), e))?;
 
         let stdin = child
             .stdin
@@ -430,6 +438,7 @@ impl LspServer {
             notification_rx,
             lifecycle_rx,
             child: Some(child),
+            init_config: config,
         })
     }
 
@@ -685,37 +694,63 @@ impl LspServer {
         }
     }
 
-    /// Shutdown server gracefully.
+    /// Whether this server can no longer serve requests: its child process
+    /// has exited, or its message loop has stopped (e.g. it panicked) while
+    /// the child is still running.
     ///
-    /// Sends the LSP `shutdown` request, waits for the response, sends the
-    /// `exit` notification, then waits up to a fixed grace period for the
-    /// child process to exit on its own. If it hasn't by then, or if the
-    /// `shutdown`/`exit` handshake itself fails, the child is simply dropped
-    /// here — `kill_on_drop` terminates it via SIGKILL (a no-op if it has
-    /// already exited). A test fixture with no real backing process (`child`
-    /// is `None`) skips this step entirely -- there is nothing to wait for or
-    /// kill.
+    /// Unlike [`Self::has_exited`], this catches a live child whose connection
+    /// is already dead, which nothing else would ever respawn. Test fixtures
+    /// with no child process are never reported dead.
     ///
     /// # Errors
     ///
-    /// Returns an error if the `shutdown`/`exit` handshake fails. The child
-    /// process is still torn down (gracefully if it exits in time, killed
-    /// otherwise) regardless of whether this returns `Ok` or `Err`.
+    /// Returns an error if the OS fails to report the process's status.
+    pub(crate) fn is_dead(&mut self) -> Result<bool> {
+        if self.has_exited()? {
+            return Ok(true);
+        }
+        Ok(self.child.is_some() && self.client.is_message_loop_finished())
+    }
+
+    /// Shutdown server gracefully, with an overall deadline of [`SHUTDOWN_TIMEOUT`].
+    ///
+    /// Sends the LSP `shutdown` request, waits for the response, sends the
+    /// `exit` notification, stops the message loop, then waits up to a grace
+    /// period (never past the overall deadline) for the child process to exit
+    /// on its own. If it hasn't by then, or if the handshake itself fails or
+    /// times out, the child is simply dropped here — `kill_on_drop`
+    /// terminates it via SIGKILL (a no-op if it has already exited). A test
+    /// fixture with no real backing process (`child` is `None`) skips this
+    /// step entirely -- there is nothing to wait for or kill.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error of the handshake or the message-loop stop,
+    /// including [`Error::ShutdownTimeout`] when the deadline elapsed. The
+    /// child process is still torn down (gracefully if it exits in time,
+    /// killed otherwise) regardless of whether this returns `Ok` or `Err`.
     pub async fn shutdown(self) -> Result<()> {
         debug!("Shutting down LSP server");
 
-        let handshake: Result<()> = async move {
-            let _: serde_json::Value = self
-                .client
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let client = self.client;
+
+        let handshake: Result<()> = timeout_at(deadline, async {
+            let _: serde_json::Value = client
                 .request(ShutdownRequest::METHOD.as_str(), (), Duration::from_secs(5))
                 .await?;
-            self.client.notify_typed::<ExitNotification>(()).await?;
-            self.client.shutdown().await
-        }
-        .await;
+            client.notify_typed::<ExitNotification>(()).await
+        })
+        .await
+        .unwrap_or(Err(Error::ShutdownTimeout));
+        let handshake = match client.shutdown_until(deadline).await {
+            Ok(()) => handshake,
+            Err(e) => handshake.and(Err(e)),
+        };
 
         if let Some(mut child) = self.child {
-            match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
+            let child_deadline = deadline.min(Instant::now() + CHILD_EXIT_GRACE);
+            match timeout_at(child_deadline, child.wait()).await {
                 Ok(Ok(status)) => {
                     debug!(
                         ?status,
@@ -855,6 +890,16 @@ fn resolve_position_encodings(configured: &[String]) -> Vec<PositionEncodingKind
     }
 }
 
+/// Classify a spawn failure: a missing executable gets its own variant so the
+/// message can carry PATH and install guidance.
+fn spawn_error(command: String, source: std::io::Error) -> Error {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        Error::ServerNotFound { command, source }
+    } else {
+        Error::ServerSpawnFailed { command, source }
+    }
+}
+
 /// Build the `workspace/workspaceFolders` entry for one configured root.
 ///
 /// Reserved characters have to be percent-encoded here: an unencoded `#`
@@ -889,8 +934,15 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 /// registerable `LspServer` from.
 #[cfg(test)]
 pub fn fake_lsp_server() -> LspServer {
+    fake_lsp_server_with_config(LspServerConfig::pyright())
+}
+
+/// As [`fake_lsp_server`], with a caller-chosen config, which is also what
+/// the returned server reports as its `init_config`.
+#[cfg(test)]
+pub fn fake_lsp_server_with_config(server_config: LspServerConfig) -> LspServer {
     let transport = crate::test_lsp::inert_transport();
-    let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
+    let client = LspClient::from_transport(server_config.clone(), transport);
     let (_, mock_notification_rx) = mpsc::channel(1);
     let (_, mock_lifecycle_rx) = mpsc::channel(1);
     LspServer {
@@ -900,6 +952,33 @@ pub fn fake_lsp_server() -> LspServer {
         notification_rx: mock_notification_rx,
         lifecycle_rx: mock_lifecycle_rx,
         child: None,
+        init_config: test_init_config(server_config),
+    }
+}
+
+/// A server whose child process (`sleep`) is alive but whose message loop
+/// dies at once on its inert transport -- the shape of a panicked loop.
+#[cfg(all(test, unix))]
+pub fn fake_lsp_server_with_dead_loop_and_live_child() -> LspServer {
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn sleep: {e}"));
+    let mut server = fake_lsp_server();
+    server.child = Some(child);
+    server
+}
+
+/// Minimal [`ServerInitConfig`] around `server_config` for test fixtures.
+#[cfg(test)]
+const fn test_init_config(server_config: LspServerConfig) -> ServerInitConfig {
+    ServerInitConfig {
+        server_config,
+        workspace_roots: vec![],
+        initialization_options: None,
+        position_encodings: vec![],
+        notification_tx: None,
     }
 }
 
@@ -939,6 +1018,7 @@ impl LspServer {
             notification_rx,
             lifecycle_rx,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         }
     }
 }
@@ -1231,6 +1311,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: Some(mock_child),
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         assert!(
@@ -1245,6 +1326,58 @@ mod tests {
             server.has_exited().unwrap(),
             "killed child must report as exited"
         );
+    }
+
+    /// A live child whose message loop has stopped must be reported dead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_is_dead_when_message_loop_finished_but_child_alive() {
+        let mut server = fake_lsp_server_with_dead_loop_and_live_child();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !server.client.is_message_loop_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!server.has_exited().unwrap());
+        assert!(server.is_dead().unwrap());
+    }
+
+    /// A server that never answers `shutdown` fails the handshake with the
+    /// request timeout, well inside `SHUTDOWN_TIMEOUT`, and still stops its
+    /// message loop.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_reports_handshake_timeout_within_deadline() {
+        let (client, _fake_server) = crate::test_lsp::fake_lsp_client();
+        let probe = client.clone();
+        let (_, notification_rx) = mpsc::channel(1);
+        let (_, lifecycle_rx) = mpsc::channel(1);
+        let server = LspServer {
+            client,
+            capabilities: lsp_types::ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            notification_rx,
+            lifecycle_rx,
+            child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
+        };
+
+        let started = Instant::now();
+        let result = server.shutdown().await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))), "got {result:?}");
+        assert!(started.elapsed() <= SHUTDOWN_TIMEOUT);
+        assert!(matches!(probe.state().await, ServerState::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn test_is_dead_false_for_childless_fixture() {
+        let mut server = fake_lsp_server();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!server.is_dead().unwrap());
     }
 
     #[tokio::test]
@@ -1263,6 +1396,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -1332,6 +1466,7 @@ mod tests {
             notification_rx: mock_notification_rx1,
             lifecycle_rx: mock_lifecycle_rx1,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1359,6 +1494,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server);
@@ -1401,6 +1537,7 @@ mod tests {
                 notification_rx: mock_notification_rx,
                 lifecycle_rx: mock_lifecycle_rx,
                 child: None,
+                init_config: test_init_config(config.clone()),
             };
 
             result.add_server(config.language_id, server);
@@ -1429,6 +1566,7 @@ mod tests {
             notification_rx: mock_notification_rx1,
             lifecycle_rx: mock_lifecycle_rx1,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1446,6 +1584,7 @@ mod tests {
             notification_rx: mock_notification_rx2,
             lifecycle_rx: mock_lifecycle_rx2,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server2);
@@ -1501,6 +1640,31 @@ mod tests {
         assert!(!result.partial_success());
         assert_eq!(result.server_count(), 0);
         assert_eq!(result.failure_count(), 0);
+    }
+
+    #[test]
+    fn test_spawn_error_classifies_not_found() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        let missing = spawn_error("x".to_string(), IoError::from(ErrorKind::NotFound));
+        assert!(matches!(missing, Error::ServerNotFound { .. }));
+        let denied = spawn_error("x".to_string(), IoError::from(ErrorKind::PermissionDenied));
+        assert!(matches!(denied, Error::ServerSpawnFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_nonexistent_command_is_server_not_found() {
+        let mut server_config = LspServerConfig::rust_analyzer();
+        server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+        let config = ServerInitConfig {
+            server_config,
+            workspace_roots: vec![],
+            initialization_options: None,
+            position_encodings: vec![],
+            notification_tx: None,
+        };
+        let err = LspServer::spawn(config).await.unwrap_err();
+        assert!(matches!(err, Error::ServerNotFound { .. }), "got {err:?}");
     }
 
     #[tokio::test]
@@ -2131,15 +2295,38 @@ mod tests {
 
         // Only pylsp actually registers; pyright-diag never spawned.
         let mut result = ServerInitResult::new();
-        result.add_server(pylsp_id.clone(), fake_lsp_server());
+        result.add_server(
+            pylsp_id.clone(),
+            fake_lsp_server_with_config(configs[1].clone()),
+        );
 
-        let registered = crate::register_servers(result, &translator, &HashMap::new());
+        let registered = crate::register_servers(result, &translator);
 
         assert_eq!(
             registered.diagnostics_flags.get(&pylsp_id),
             Some(&true),
             "pylsp must inherit the diagnostics route once pyright-diag is \
              known dead, and the flag must reflect that post-rebind state"
+        );
+    }
+
+    /// The indexing policy comes from the server's own `init_config`.
+    #[tokio::test]
+    async fn test_register_servers_reports_indexing_policy_from_init_config() {
+        use crate::bridge::{IndexingPolicy, Translator};
+
+        let mut config = LspServerConfig::rust_analyzer();
+        config.indexing = IndexingPolicy::Disabled;
+        let id = config.id();
+
+        let mut result = ServerInitResult::new();
+        result.add_server(id.clone(), fake_lsp_server_with_config(config));
+
+        let registered = crate::register_servers(result, &Translator::new());
+
+        assert_eq!(
+            registered.indexing_policies.get(&id),
+            Some(&IndexingPolicy::Disabled)
         );
     }
 }
