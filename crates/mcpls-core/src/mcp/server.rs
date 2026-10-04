@@ -978,7 +978,7 @@ impl McplsServer {
 
     /// Report which tools are usable for which languages.
     #[tool(
-        description = "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` lists each language's `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
+        description = "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
         title = "Tool Support"
     )]
     fn get_tool_support(
@@ -4499,7 +4499,7 @@ sleep 0.3
                 let refused = call_tool(&fixture.server, tool, &fixture.file)
                     .await
                     .is_err_and(|e| e.message.contains(CAPABILITY_REFUSAL));
-                let (reported, expected_refusal) = match tool.backend() {
+                let (reported, expected_refusal) = match tool.spec().backend {
                     ToolBackend::Local => (None, false),
                     ToolBackend::Document(kind) => (
                         Some(snapshot.document_support("rust", kind)),
@@ -4576,9 +4576,9 @@ sleep 0.3
         assert_eq!(
             hover["routes"],
             serde_json::json!([
-                {"language": "python", "status": "capability_not_advertised",
+                {"languages": ["python"], "status": "capability_not_advertised",
                  "server": "py-srv", "capability": "hoverProvider"},
-                {"language": "rust", "status": "supported", "server": "rust-srv"},
+                {"languages": ["rust"], "status": "supported", "server": "rust-srv"},
             ])
         );
 
@@ -4588,7 +4588,7 @@ sleep 0.3
 
         let workspace = tool_entry(&report, "workspace_symbol_search");
         assert_eq!(workspace["coverage"], "none");
-        assert!(workspace["routes"][0].get("language").is_none());
+        assert!(workspace["routes"][0].get("languages").is_none());
 
         let logs = tool_entry(&report, "get_server_logs");
         assert_eq!(logs["coverage"], "always");
@@ -4666,8 +4666,96 @@ sleep 0.3
         assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
         assert_eq!(
             tool_entry(&report, "get_hover")["routes"][0],
-            serde_json::json!({"language": "python", "status": "no_server"})
+            serde_json::json!({"languages": ["python"], "status": "no_server"})
         );
+    }
+
+    /// Languages sharing one outcome collapse into a single route entry.
+    #[tokio::test]
+    async fn test_get_tool_support_groups_languages_with_identical_status() {
+        let none = lsp_types::ServerCapabilities::default;
+        let fixture = support_fixture(
+            vec![
+                ("a-srv", "alpha", none()),
+                ("b-srv", "beta", none()),
+                ("c-srv", "gamma", none()),
+            ],
+            McpConfig::default(),
+        );
+        let report = report_json(&fixture.server, None);
+        let routes = tool_entry(&report, "get_hover")["routes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(routes.len(), 3);
+
+        fixture
+            .server
+            .context
+            .translator
+            .rebind_router(&std::collections::HashSet::new());
+        let report = report_json(&fixture.server, None);
+        assert_eq!(
+            tool_entry(&report, "get_hover")["routes"],
+            serde_json::json!([
+                {"languages": ["alpha", "beta", "gamma"], "status": "no_server"}
+            ])
+        );
+    }
+
+    /// With every other configured server advertising nothing, each
+    /// capability advertised by the one target server (mid config order)
+    /// must be reported and enforced for exactly that server's language.
+    #[tokio::test(start_paused = true)]
+    async fn test_tool_support_report_matches_enforcement_with_one_server_among_many() {
+        use crate::bridge::RouteSupport;
+
+        for advertised in Capability::ALL {
+            let fixture = support_fixture(
+                vec![
+                    ("a-srv", "alpha", lsp_types::ServerCapabilities::default()),
+                    ("rust", "rust", capabilities_advertising(advertised)),
+                    ("z-srv", "zeta", lsp_types::ServerCapabilities::default()),
+                ],
+                McpConfig::default(),
+            );
+            let snapshot = fixture.server.context.translator.tool_support_snapshot();
+
+            for tool in McpTool::ALL {
+                let refused = call_tool(&fixture.server, tool, &fixture.file)
+                    .await
+                    .is_err_and(|e| e.message.contains(CAPABILITY_REFUSAL));
+                let reported = match tool.spec().backend {
+                    ToolBackend::Local => continue,
+                    ToolBackend::Document(kind) => snapshot.document_support("rust", kind),
+                    ToolBackend::Workspace(kind) => snapshot.workspace_support(kind),
+                };
+                assert_eq!(
+                    refused,
+                    matches!(reported, RouteSupport::CapabilityNotAdvertised { .. }),
+                    "{} with only {advertised:?} on rust: refused={refused}, report={reported:?}",
+                    tool.name()
+                );
+                match tool.spec().backend {
+                    ToolBackend::Document(kind) => assert_eq!(
+                        refused,
+                        Capability::for_tool(kind).is_some_and(|cap| cap != advertised),
+                        "{} with only {advertised:?} on rust",
+                        tool.name()
+                    ),
+                    // `resolve_any` picks the first catch-all in config order,
+                    // which advertises nothing, whatever "rust" advertises.
+                    ToolBackend::Workspace(_) => assert_eq!(
+                        reported,
+                        RouteSupport::CapabilityNotAdvertised {
+                            server: "a-srv".into(),
+                            capability: Capability::WorkspaceSymbols,
+                        }
+                    ),
+                    ToolBackend::Local => {}
+                }
+            }
+        }
     }
 
     /// Before registration completes, an expected server reads as

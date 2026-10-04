@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `get_tool_support` `routes[].language` is replaced by `routes[].languages`, grouping languages that share a status; the snapshot no longer clones router and server capabilities per call. (#549)
+- **Breaking:** `mcpls-bench` reports gain `memory`, `memory_summary`, `stderr_log`, `p95_us` and `orphans_killed`, and scenario `source.url` must be a canonical `https://github.com/<owner>/<repo>`; mcpls runs in its own process group killed on shutdown or SIGINT/SIGTERM. (#549)
+- CI checks `cargo check -p mcpls --locked`. (#549)
 - Bump rmcp to 3.5.0. (#536)
 - **Breaking:** `RetryableErrorData` gains a `ListenStreamsExhausted` variant. (#536)
 - **Breaking:** every tool now returns `structuredContent` with an `outputSchema`; the text copy is key-sorted JSON, so payloads roughly double. (#546)

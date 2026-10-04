@@ -29,6 +29,79 @@ impl From<Duration> for Micros {
     }
 }
 
+/// A resident set size in kibibytes, as reported by `ps`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Kib(pub u64);
+
+/// Resident memory of one process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessRss {
+    /// Process id.
+    pub pid: u32,
+    /// Resident set size.
+    pub rss: Kib,
+    /// Executable name as printed by `ps` (`comm`).
+    pub command: String,
+}
+
+/// A point of a run at which process-tree memory is sampled, never during a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCheckpoint {
+    /// Right after the ready probe passed.
+    Ready,
+    /// After the last probe iteration.
+    AfterProbes,
+}
+
+impl MemoryCheckpoint {
+    /// The `snake_case` name used in the JSON report.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::AfterProbes => "after_probes",
+        }
+    }
+}
+
+impl fmt::Display for MemoryCheckpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// Resident memory of the mcpls process group, summed over its members.
+///
+/// The sum double-counts pages shared between processes and misses
+/// descendants that left the group with `setsid`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RssReading {
+    /// The group was observed.
+    Measured {
+        /// Sum of the member sizes.
+        total: Kib,
+        /// Every member of the group.
+        processes: Vec<ProcessRss>,
+    },
+    /// Memory could not be read on this platform or `ps` failed.
+    Unavailable {
+        /// Why no reading exists.
+        reason: String,
+    },
+}
+
+/// One memory observation of a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRecord {
+    /// Where in the run the reading was taken.
+    pub checkpoint: MemoryCheckpoint,
+    /// The reading.
+    pub reading: RssReading,
+}
+
 /// A measured phase of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +185,8 @@ pub enum ShutdownOutcome {
     Clean,
     /// The process had to be killed.
     Killed,
+    /// The process exited, but members of its process group outlived it and were killed.
+    OrphansKilled,
 }
 
 /// How the ready probe fared in one run.
@@ -137,6 +212,10 @@ pub struct RunRecord {
     pub truncated_after_timeout: bool,
     /// All samples of the run in execution order.
     pub samples: Vec<Sample>,
+    /// Process-tree memory observations in execution order.
+    pub memory: Vec<MemoryRecord>,
+    /// File receiving the stderr of the mcpls process.
+    pub stderr_log: PathBuf,
     /// How the process ended.
     pub shutdown: ShutdownOutcome,
 }
@@ -234,19 +313,50 @@ pub struct RunParams {
     pub ready_timeout_secs: u64,
     /// Per-call deadline in seconds.
     pub call_timeout_secs: u64,
+    /// Pause between ready-probe attempts in milliseconds.
+    pub ready_retry_interval_ms: u64,
     /// Whether version mismatches were tolerated.
     pub allow_version_mismatch: bool,
 }
 
-/// Min/median/max of a set of successful samples.
+/// Fewest samples for which a 95th percentile is distinct from the maximum.
+pub const P95_MIN_SAMPLES: usize = 20;
+
+/// Min/median/p95/max of a set of successful samples.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
     /// Fastest sample.
     pub min_us: Micros,
     /// Lower median.
     pub median_us: Micros,
+    /// Nearest-rank 95th percentile; `None` below [`P95_MIN_SAMPLES`] samples.
+    pub p95_us: Option<Micros>,
     /// Slowest sample.
     pub max_us: Micros,
+}
+
+/// Min/median/max of the total resident memory at one checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryStats {
+    /// Smallest total.
+    pub min_kib: Kib,
+    /// Lower median.
+    pub median_kib: Kib,
+    /// Largest total.
+    pub max_kib: Kib,
+}
+
+/// Memory statistics of one checkpoint across measured runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySummary {
+    /// Summarised checkpoint.
+    pub checkpoint: MemoryCheckpoint,
+    /// Readings that were [`RssReading::Measured`].
+    pub measured: usize,
+    /// Readings that were [`RssReading::Unavailable`].
+    pub unavailable: usize,
+    /// Statistics of the measured totals.
+    pub total: Option<MemoryStats>,
 }
 
 /// Statistics of one region, split into the first repetition and the rest.
@@ -289,17 +399,102 @@ pub struct RunReport {
     pub runs: Vec<RunRecord>,
     /// Set when later runs were skipped because a run never became ready.
     pub aborted: bool,
-    /// Statistics over non-warm-up runs.
+    /// Latency statistics over non-warm-up runs.
     pub summary: Vec<RegionSummary>,
+    /// Memory statistics over non-warm-up runs.
+    pub memory_summary: Vec<MemorySummary>,
+}
+
+/// Sorts `values` and returns `(min, lower median, max)`.
+fn order_stats<T: Copy + Ord>(values: &mut [T]) -> Option<(T, T, T)> {
+    values.sort_unstable();
+    Some((
+        *values.first()?,
+        *values.get((values.len() - 1) / 2)?,
+        *values.last()?,
+    ))
 }
 
 fn stats(mut values: Vec<Micros>) -> Option<Stats> {
-    values.sort_unstable();
+    let (min_us, median_us, max_us) = order_stats(&mut values)?;
+    let p95_us = if values.len() >= P95_MIN_SAMPLES {
+        values.get((values.len() * 95).div_ceil(100) - 1).copied()
+    } else {
+        None
+    };
     Some(Stats {
-        min_us: *values.first()?,
-        median_us: *values.get((values.len() - 1) / 2)?,
-        max_us: *values.last()?,
+        min_us,
+        median_us,
+        p95_us,
+        max_us,
     })
+}
+
+/// Summarises the memory readings of the non-warm-up runs, one entry per observed checkpoint.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_bench::report::{
+///     summarize_memory, Kib, MemoryCheckpoint, MemoryRecord, ReadyRecord, RssReading, RunRecord,
+///     ShutdownOutcome,
+/// };
+///
+/// let run = RunRecord {
+///     index: 0,
+///     warmup: false,
+///     ready: ReadyRecord { attempts: 1, last_failure: None },
+///     truncated_after_timeout: false,
+///     samples: Vec::new(),
+///     memory: vec![MemoryRecord {
+///         checkpoint: MemoryCheckpoint::Ready,
+///         reading: RssReading::Measured { total: Kib(2048), processes: Vec::new() },
+///     }],
+///     stderr_log: "run-0.log".into(),
+///     shutdown: ShutdownOutcome::Clean,
+/// };
+/// let summary = summarize_memory(&[run]);
+/// assert_eq!(summary[0].total.as_ref().unwrap().max_kib, Kib(2048));
+/// ```
+#[must_use]
+pub fn summarize_memory(runs: &[RunRecord]) -> Vec<MemorySummary> {
+    let records: Vec<&MemoryRecord> = runs
+        .iter()
+        .filter(|r| !r.warmup)
+        .flat_map(|r| &r.memory)
+        .collect();
+    let mut checkpoints: Vec<MemoryCheckpoint> = records.iter().map(|m| m.checkpoint).collect();
+    checkpoints.sort_unstable();
+    checkpoints.dedup();
+
+    checkpoints
+        .into_iter()
+        .map(|checkpoint| {
+            let mut totals: Vec<Kib> = records
+                .iter()
+                .filter(|m| m.checkpoint == checkpoint)
+                .filter_map(|m| match &m.reading {
+                    RssReading::Measured { total, .. } => Some(*total),
+                    RssReading::Unavailable { .. } => None,
+                })
+                .collect();
+            let observed = records
+                .iter()
+                .filter(|m| m.checkpoint == checkpoint)
+                .count();
+            let measured = totals.len();
+            MemorySummary {
+                checkpoint,
+                measured,
+                unavailable: observed - measured,
+                total: order_stats(&mut totals).map(|(min_kib, median_kib, max_kib)| MemoryStats {
+                    min_kib,
+                    median_kib,
+                    max_kib,
+                }),
+            }
+        })
+        .collect()
 }
 
 /// Summarises the non-warm-up samples of `runs`, one entry per observed region.
@@ -325,6 +520,8 @@ fn stats(mut values: Vec<Micros>) -> Option<Stats> {
 ///     ready: ReadyRecord { attempts: 1, last_failure: None },
 ///     truncated_after_timeout: false,
 ///     samples: vec![sample(0, 900), sample(1, 30), sample(2, 10), sample(3, 20)],
+///     memory: Vec::new(),
+///     stderr_log: "run-0.log".into(),
 ///     shutdown: ShutdownOutcome::Clean,
 /// };
 /// let summary = summarize(&[run]);
@@ -394,6 +591,8 @@ mod tests {
             },
             truncated_after_timeout: false,
             samples,
+            memory: Vec::new(),
+            stderr_log: PathBuf::from("run.log"),
             shutdown: ShutdownOutcome::Clean,
         }
     }
@@ -445,6 +644,56 @@ mod tests {
             vec![sample(Region::Ready, Outcome::TimedOut, 10, 0)],
         )];
         assert_eq!(summarize(&runs)[0].first, None);
+    }
+
+    #[test]
+    fn checkpoint_display_matches_the_json_name() {
+        for checkpoint in [MemoryCheckpoint::Ready, MemoryCheckpoint::AfterProbes] {
+            assert_eq!(
+                serde_json::to_string(&checkpoint).unwrap(),
+                format!("\"{checkpoint}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn p95_needs_enough_samples_and_is_an_observed_value() {
+        let few: Vec<Micros> = (1..=19).map(Micros).collect();
+        assert_eq!(stats(few).unwrap().p95_us, None);
+        let enough: Vec<Micros> = (1..=20).map(Micros).collect();
+        assert_eq!(stats(enough).unwrap().p95_us, Some(Micros(19)));
+        let many: Vec<Micros> = (1..=100).map(Micros).collect();
+        assert_eq!(stats(many).unwrap().p95_us, Some(Micros(95)));
+    }
+
+    #[test]
+    fn memory_summary_counts_unavailable_readings() {
+        let reading = |reading| MemoryRecord {
+            checkpoint: MemoryCheckpoint::Ready,
+            reading,
+        };
+        let mut record = run(false, Vec::new());
+        record.memory = vec![
+            reading(RssReading::Measured {
+                total: Kib(10),
+                processes: Vec::new(),
+            }),
+            reading(RssReading::Unavailable {
+                reason: "no ps".to_owned(),
+            }),
+        ];
+        let summary = summarize_memory(&[record]);
+        assert_eq!(summary.len(), 1);
+        assert_eq!((summary[0].measured, summary[0].unavailable), (1, 1));
+        assert_eq!(summary[0].total.as_ref().unwrap().median_kib, Kib(10));
+    }
+
+    #[test]
+    fn shutdown_outcomes_serialize_in_snake_case() {
+        let json = |outcome| serde_json::to_string(&outcome).unwrap();
+        assert_eq!(json(ShutdownOutcome::OrphansKilled), "\"orphans_killed\"");
+        assert_eq!(json(ShutdownOutcome::Clean), "\"clean\"");
+        assert_eq!(json(ShutdownOutcome::Killed), "\"killed\"");
     }
 
     #[test]

@@ -24,6 +24,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 toml = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -90,7 +90,7 @@ pub struct Translator {
     /// Locked independently so `rebind_router` (called from a background
     /// task once registration completes) never contends with an in-flight
     /// LSP round trip.
-    router: Arc<StdMutex<ToolRouter>>,
+    router: Arc<StdMutex<Arc<ToolRouter>>>,
     /// The routing table as installed by [`Self::with_router`], before
     /// `rebind_router` drops routes to servers that failed to start. Read-only
     /// afterwards: lets a failed lookup be traced back to the server that
@@ -169,7 +169,7 @@ impl Translator {
             workspace_roots: Arc::new(Vec::new()),
             extension_map: Arc::new(HashMap::new()),
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
-            router: Arc::new(StdMutex::new(ToolRouter::default())),
+            router: Arc::new(StdMutex::new(Arc::new(ToolRouter::default()))),
             configured_router: Arc::new(ToolRouter::default()),
             startup_failures: Arc::new(StdMutex::new(HashMap::new())),
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
@@ -249,7 +249,8 @@ impl Translator {
     /// shared, so this replaces the `Arc`-wrapped router wholesale.
     #[must_use]
     pub fn with_router(mut self, router: ToolRouter) -> Self {
-        self.configured_router = Arc::new(router.clone());
+        let router = Arc::new(router);
+        self.configured_router = Arc::clone(&router);
         self.router = Arc::new(StdMutex::new(router));
         self
     }
@@ -321,7 +322,7 @@ impl Translator {
     /// registered, dropping or redirecting routes to servers that failed to
     /// spawn. See `ToolRouter::rebind_to_registered` for the full semantics.
     pub fn rebind_router(&self, registered: &HashSet<ServerId>) {
-        lock_std(&self.router).rebind_to_registered(registered);
+        Arc::make_mut(&mut lock_std(&self.router)).rebind_to_registered(registered);
     }
 
     /// Whether `id` is the server the router currently resolves

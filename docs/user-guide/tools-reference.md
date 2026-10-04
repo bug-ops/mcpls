@@ -1016,8 +1016,8 @@ Report which tools are usable for which languages in the current session, so an 
       "name": "get_hover",
       "coverage": "some",
       "routes": [
-        {"language": "python", "status": "capability_not_advertised", "server": "pyright", "capability": "hoverProvider"},
-        {"language": "rust", "status": "supported", "server": "rust-analyzer"}
+        {"languages": ["python"], "status": "capability_not_advertised", "server": "pyright", "capability": "hoverProvider"},
+        {"languages": ["rust"], "status": "supported", "server": "rust-analyzer"}
       ]
     },
     {"name": "get_diagnostics", "coverage": "all"},
@@ -1029,12 +1029,14 @@ Report which tools are usable for which languages in the current session, so an 
 | Field | Values |
 |-------|--------|
 | `coverage` | `all` (every listed language), `some`, `none`, `unknown` (a server is still initializing), `always` (needs no language server) |
+| `routes[].languages` | Languages sharing this route's outcome (absent for workspace-wide tools) |
 | `routes[].status` | `supported`, `capability_not_advertised`, `initializing`, `no_server` |
 
 ### Notes
 
 - `languages` lists every configured language (or only the language of `file_path`); an empty list means no server is configured
-- `routes` is omitted for tools with `all` or `always` coverage; workspace-wide tools such as `workspace_symbol_search` have one route without a `language`
+- `routes` is omitted for tools with `all` or `always` coverage; workspace-wide tools such as `workspace_symbol_search` have one route without `languages`
+- Languages with an identical outcome (same `status`, `server` and `capability`) share one route entry, listed in `languages` in first-seen order, so the response stays compact with many configured languages
 - `supported` means the call will be dispatched to a server that advertises the capability, not that it will succeed: indexing, push-only diagnostics, and respawn backoff can still fail it
 - Capabilities a server registers dynamically after `initialize` are not reflected, here or in per-call enforcement
 - `unknown` coverage is transient (a server is still starting): call the tool again later instead of caching the report

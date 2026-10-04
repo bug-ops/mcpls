@@ -52,6 +52,81 @@ impl From<CommitSha> for String {
     }
 }
 
+/// Hosts a scenario may clone from.
+const ALLOWED_GIT_HOSTS: [&str; 1] = ["github.com"];
+
+/// An `https://github.com/<owner>/<repo>` clone URL without credentials, port, query or fragment.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_bench::scenario::GitUrl;
+///
+/// assert!(GitUrl::try_from("https://github.com/sharkdp/fd".to_owned()).is_ok());
+/// assert!(GitUrl::try_from("http://github.com/sharkdp/fd".to_owned()).is_err());
+/// assert!(GitUrl::try_from("https://github.com:8443/sharkdp/fd".to_owned()).is_err());
+/// assert!(GitUrl::try_from("https://evil.example/sharkdp/fd".to_owned()).is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GitUrl(String);
+
+impl GitUrl {
+    /// The URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for GitUrl {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let reject = |why: &str| format!("git url `{value}` {why}");
+        let url = url::Url::parse(&value).map_err(|error| reject(&error.to_string()))?;
+        if url.as_str() != value {
+            return Err(reject(
+                "is not in canonical form (git and the url parser would read it differently)",
+            ));
+        }
+        if url.scheme() != "https" {
+            return Err(reject("must use https"));
+        }
+        if !url
+            .host_str()
+            .is_some_and(|host| ALLOWED_GIT_HOSTS.contains(&host))
+        {
+            return Err(reject(&format!("must be hosted on {ALLOWED_GIT_HOSTS:?}")));
+        }
+        if url.port().is_some() {
+            return Err(reject("must not carry a port"));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(reject("must not carry credentials, a query or a fragment"));
+        }
+        let segments = url
+            .path_segments()
+            .map_or(0, |s| s.filter(|part| !part.is_empty()).count());
+        if segments != 2 {
+            return Err(reject(
+                "must have the form https://github.com/<owner>/<repo>",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<GitUrl> for String {
+    fn from(url: GitUrl) -> Self {
+        url.0
+    }
+}
+
 /// A scenario identifier safe to use as a directory name (`[a-z0-9-]+`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -144,7 +219,7 @@ pub enum RepoSource {
     /// A git repository pinned to an exact commit.
     Git {
         /// Clone URL.
-        url: String,
+        url: GitUrl,
         /// Exact commit that is checked out.
         commit: CommitSha,
     },
@@ -323,6 +398,35 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, Probe::Diagnostics { .. }))
         );
+    }
+
+    #[test]
+    fn git_urls_are_restricted_to_plain_github_https() {
+        for bad in [
+            "http://github.com/a/b",
+            "ssh://git@github.com/a/b",
+            "https://gitlab.com/a/b",
+            "https://github.com:8443/a/b",
+            "https://github.com:443/a/b",
+            "https://user@github.com/a/b",
+            "https://github.com/a/b?x=1",
+            "https://github.com/a/b#frag",
+            "https://github.com/a",
+            "https://github.com/a/b/c",
+            "-oProxyCommand=x",
+            "https://github.com\\@evil.invalid/a",
+            " https://github.com/a/b",
+            "https://github.com/a/b\n",
+            "https://github.com/a/\tb",
+            "https://github.com/a/../b",
+            "https://github.com/a/b/..",
+            "HTTPS://github.com/a/b",
+            "https://GitHub.com/a/b",
+            "https://github.com/a b",
+        ] {
+            assert!(GitUrl::try_from(bad.to_owned()).is_err(), "{bad}");
+        }
+        assert!(GitUrl::try_from("https://github.com/a/b.git".to_owned()).is_ok());
     }
 
     #[test]

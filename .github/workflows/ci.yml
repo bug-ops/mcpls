@@ -90,6 +90,8 @@ jobs:
           shared-key: "ci"
       - name: Clippy
         run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+      - name: Check mcpls with the committed lockfile
+        run: cargo check -p mcpls --locked
 
   build-tests:
     name: Build Tests (${{ matrix.os }})

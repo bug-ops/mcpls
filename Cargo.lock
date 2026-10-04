@@ -997,11 +997,13 @@ dependencies = [
  "dunce",
  "mcpls-core",
  "rmcp",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use mcpls_core::ServerConfig;
@@ -17,14 +17,15 @@ use tokio::process::Command;
 use crate::pin::{ensure_matches, pin};
 use crate::prepare::{absolute, repo_dir, verify_prepared};
 use crate::probe::Incorrect;
+use crate::process_tree::{ProcessGroup, ProcessGroupId, SHUTDOWN_GRACE, sample_rss};
 use crate::report::{
-    BinaryRecord, BuildProfile, Micros, Outcome, PinRecord, ReadyRecord, Region, RunParams,
-    RunRecord, RunReport, Sample, ShutdownOutcome, SourceRecord, summarize,
+    BinaryRecord, BuildProfile, MemoryCheckpoint, MemoryRecord, Micros, Outcome, PinRecord,
+    ReadyRecord, Region, RunParams, RunRecord, RunReport, Sample, SourceRecord, summarize,
+    summarize_memory,
 };
 use crate::scenario::{Executable, Probe, Scenario};
 
-const READY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const READY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const LSP_TIMEOUT_SECS: u64 = 60;
 
 /// Options of one `run` invocation.
@@ -116,21 +117,21 @@ pub async fn run(
 
     let config_path = write_config(scenario, &repo, work_dir, &server.path)?;
 
+    let log_dir = invocation_log_dir(work_dir, scenario, SystemTime::now());
+    let env = RunEnv {
+        scenario,
+        repo: &repo,
+        config_path: &config_path,
+        log_dir: &log_dir,
+        mcpls: &mcpls,
+        options,
+    };
     let total = options.warmup_runs.saturating_add(options.runs);
     let mut runs = Vec::new();
     let mut aborted = false;
     for index in 0..total {
         let warmup = index < options.warmup_runs;
-        let record = one_run(
-            index,
-            warmup,
-            scenario,
-            &repo,
-            &config_path,
-            &mcpls,
-            options,
-        )
-        .await?;
+        let record = one_run(index, warmup, &env).await?;
         eprintln!(
             "run {}/{total} ({}) done",
             index + 1,
@@ -161,10 +162,13 @@ pub async fn run(
             iterations: options.iterations,
             ready_timeout_secs: options.ready_timeout.as_secs(),
             call_timeout_secs: options.call_timeout.as_secs(),
+            ready_retry_interval_ms: u64::try_from(READY_RETRY_INTERVAL.as_millis())
+                .unwrap_or(u64::MAX),
             allow_version_mismatch: options.allow_version_mismatch,
         },
         aborted,
         summary: summarize(&runs),
+        memory_summary: summarize_memory(&runs),
         runs,
     })
 }
@@ -220,49 +224,83 @@ fn write_config(
     Ok(path)
 }
 
-async fn one_run(
-    index: u32,
-    warmup: bool,
-    scenario: &Scenario,
-    repo: &Path,
-    config_path: &Path,
-    mcpls: &PinRecord,
-    options: &RunOptions,
-) -> Result<RunRecord> {
+/// Everything one run needs besides its index.
+struct RunEnv<'a> {
+    scenario: &'a Scenario,
+    repo: &'a Path,
+    config_path: &'a Path,
+    log_dir: &'a Path,
+    mcpls: &'a PinRecord,
+    options: &'a RunOptions,
+}
+
+/// What a session records besides its samples.
+#[derive(Default)]
+struct Recorder {
+    samples: Vec<Sample>,
+    memory: Vec<MemoryRecord>,
+}
+
+impl Recorder {
+    async fn sample_memory(&mut self, checkpoint: MemoryCheckpoint, group: ProcessGroupId) {
+        self.memory.push(MemoryRecord {
+            checkpoint,
+            reading: sample_rss(group).await,
+        });
+    }
+}
+
+/// `<work_dir>/logs/<scenario>/<unix millis of the invocation>`, so a later invocation never overwrites these logs.
+fn invocation_log_dir(work_dir: &Path, scenario: &Scenario, now: SystemTime) -> PathBuf {
+    let millis = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    work_dir
+        .join("logs")
+        .join(scenario.name.as_str())
+        .join(millis.to_string())
+}
+
+fn stderr_log_path(log_dir: &Path, index: u32) -> PathBuf {
+    log_dir.join(format!("run-{index}.log"))
+}
+
+fn create_stderr_log(path: &Path) -> Result<Stdio> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(Stdio::from(file))
+}
+
+async fn one_run(index: u32, warmup: bool, env: &RunEnv<'_>) -> Result<RunRecord> {
     let started = Instant::now();
-    let mut child = Command::new(&mcpls.path)
+    let stderr_log = stderr_log_path(env.log_dir, index);
+    let mut command = Command::new(&env.mcpls.path);
+    command
         .arg("--config")
-        .arg(config_path)
-        .current_dir(repo)
+        .arg(env.config_path)
+        .current_dir(env.repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", mcpls.path.display()))?;
-    let stdin = child.stdin.take().context("mcpls stdin was not captured")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("mcpls stdout was not captured")?;
+        .stderr(create_stderr_log(&stderr_log)?);
+    let mut group = ProcessGroup::spawn(&mut command)
+        .with_context(|| format!("failed to spawn {}", env.mcpls.path.display()))?;
+    let transport = group.take_stdio()?;
 
-    let mut samples = Vec::new();
-    let session = drive(
-        (stdout, stdin),
-        scenario,
-        repo,
-        started,
-        options,
-        &mut samples,
-    )
-    .await;
+    let mut recorder = Recorder::default();
+    let session = drive(transport, env, started, group.pgid(), &mut recorder).await;
     Ok(RunRecord {
         index,
         warmup,
         ready: session.ready,
         truncated_after_timeout: session.truncated,
-        samples,
-        shutdown: finish(&mut child, session.closed).await,
+        samples: recorder.samples,
+        memory: recorder.memory,
+        stderr_log,
+        shutdown: group.finish(session.closed).await,
     })
 }
 
@@ -272,22 +310,27 @@ struct Session {
     closed: bool,
 }
 
-/// Runs one MCP session and appends its samples.
+/// Runs one MCP session, recording its samples and memory readings.
 async fn drive(
     transport: (tokio::process::ChildStdout, tokio::process::ChildStdin),
-    scenario: &Scenario,
-    repo: &Path,
+    env: &RunEnv<'_>,
     started: Instant,
-    options: &RunOptions,
-    samples: &mut Vec<Sample>,
+    group: ProcessGroupId,
+    recorder: &mut Recorder,
 ) -> Session {
+    let RunEnv {
+        scenario,
+        repo,
+        options,
+        ..
+    } = *env;
     let client = match ().serve(transport).await {
         Ok(client) => client,
         Err(error) => {
             let failure = Outcome::Failed {
                 error: error.to_string(),
             };
-            samples.push(Sample {
+            recorder.samples.push(Sample {
                 region: Region::Startup,
                 outcome: failure.clone(),
                 elapsed_us: started.elapsed().into(),
@@ -303,7 +346,7 @@ async fn drive(
             };
         }
     };
-    samples.push(Sample {
+    recorder.samples.push(Sample {
         region: Region::Startup,
         outcome: Outcome::Ok,
         elapsed_us: started.elapsed().into(),
@@ -311,9 +354,17 @@ async fn drive(
     });
     let (ready, ready_sample) = wait_until_ready(&client, scenario, repo, started, options).await;
     let is_ready = ready.last_failure.is_none();
-    samples.push(ready_sample);
+    recorder.samples.push(ready_sample);
     let truncated = if is_ready {
-        measure_probes(&client, scenario, repo, options, samples).await
+        recorder.sample_memory(MemoryCheckpoint::Ready, group).await;
+        let truncated =
+            measure_probes(&client, scenario, repo, options, &mut recorder.samples).await;
+        if !truncated {
+            recorder
+                .sample_memory(MemoryCheckpoint::AfterProbes, group)
+                .await;
+        }
+        truncated
     } else {
         false
     };
@@ -326,20 +377,6 @@ async fn drive(
         truncated,
         closed,
     }
-}
-
-async fn finish(child: &mut tokio::process::Child, closed: bool) -> ShutdownOutcome {
-    let exited = matches!(
-        tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await,
-        Ok(Ok(_))
-    );
-    if closed && exited {
-        return ShutdownOutcome::Clean;
-    }
-    if let Err(error) = child.kill().await {
-        eprintln!("warning: failed to kill mcpls: {error}");
-    }
-    ShutdownOutcome::Killed
 }
 
 /// Retries the ready probe until it passes, fails permanently, or the deadline passes.
@@ -516,6 +553,21 @@ mod tests {
         assert!(Path::new(&bare.command).starts_with(std::env::current_dir().unwrap()));
         let dotted = mcpls_executable(Path::new("./mcpls")).unwrap();
         assert!(Path::new(&dotted.command).is_absolute());
+    }
+
+    #[test]
+    fn stderr_logs_are_grouped_per_invocation() {
+        let scenario: Scenario =
+            toml::from_str(include_str!("../scenarios/smoke-fixture.toml")).unwrap();
+        let at = |millis| UNIX_EPOCH + Duration::from_millis(millis);
+        let first = invocation_log_dir(Path::new("/w"), &scenario, at(1_000));
+        let second = invocation_log_dir(Path::new("/w"), &scenario, at(2_000));
+        assert_eq!(first, Path::new("/w/logs/smoke-fixture/1000"));
+        assert_ne!(first, second);
+        assert_eq!(
+            stderr_log_path(&first, 3),
+            Path::new("/w/logs/smoke-fixture/1000/run-3.log")
+        );
     }
 
     #[test]

@@ -1,11 +1,13 @@
 //! Typed catalogue of the MCP tool surface and the `get_tool_support` report.
 //!
 //! [`McpTool`] names every tool exactly once and declares, via
-//! [`McpTool::backend`], which LSP route (if any) serves it, so the report is
-//! derived from the same routing vocabulary the bridge enforces with.
+//! [`McpTool::spec`], its name and which LSP route (if any) serves it, so the
+//! report is derived from the same routing vocabulary the bridge enforces with.
 
-use schemars::JsonSchema;
-use serde::Serialize;
+use std::borrow::Cow;
+
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Serialize, Serializer};
 
 use crate::bridge::{RouteSupport, ToolSupportSnapshot};
 use crate::config::{ToolKind, ToolPrefix};
@@ -19,6 +21,16 @@ pub(super) enum ToolBackend {
     Workspace(ToolKind),
     /// Answered by mcpls itself; needs no language server.
     Local,
+}
+
+/// The static description of one [`McpTool`]: the single record from which
+/// [`McpTool::name`] and [`McpTool::spec`] are derived.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ToolSpec {
+    /// The unprefixed MCP tool name.
+    pub(super) name: &'static str,
+    /// The route serving the tool.
+    pub(super) backend: ToolBackend,
 }
 
 /// Every MCP tool mcpls exposes, one variant per `#[tool]` handler.
@@ -91,58 +103,49 @@ impl McpTool {
         max
     };
 
-    /// The unprefixed MCP tool name.
-    pub(super) const fn name(self) -> &'static str {
-        match self {
-            Self::GetHover => "get_hover",
-            Self::GetDefinition => "get_definition",
-            Self::GetReferences => "get_references",
-            Self::GetDiagnostics => "get_diagnostics",
-            Self::RenameSymbol => "rename_symbol",
-            Self::GetCompletions => "get_completions",
-            Self::GetDocumentSymbols => "get_document_symbols",
-            Self::FormatDocument => "format_document",
-            Self::WorkspaceSymbolSearch => "workspace_symbol_search",
-            Self::GetCodeActions => "get_code_actions",
-            Self::PrepareCallHierarchy => "prepare_call_hierarchy",
-            Self::GetIncomingCalls => "get_incoming_calls",
-            Self::GetOutgoingCalls => "get_outgoing_calls",
-            Self::GetCachedDiagnostics => "get_cached_diagnostics",
-            Self::GetServerLogs => "get_server_logs",
-            Self::GetServerMessages => "get_server_messages",
-            Self::GetSignatureHelp => "get_signature_help",
-            Self::GoToImplementation => "go_to_implementation",
-            Self::GoToTypeDefinition => "go_to_type_definition",
-            Self::GetInlayHints => "get_inlay_hints",
-            Self::GetToolSupport => "get_tool_support",
-        }
+    /// The name and route of this tool.
+    pub(super) const fn spec(self) -> ToolSpec {
+        use ToolBackend::{Document, Local, Workspace};
+        let (name, backend) = match self {
+            Self::GetHover => ("get_hover", Document(ToolKind::Hover)),
+            Self::GetDefinition => ("get_definition", Document(ToolKind::Definition)),
+            Self::GetReferences => ("get_references", Document(ToolKind::References)),
+            Self::GetDiagnostics => ("get_diagnostics", Document(ToolKind::Diagnostics)),
+            Self::RenameSymbol => ("rename_symbol", Document(ToolKind::Rename)),
+            Self::GetCompletions => ("get_completions", Document(ToolKind::Completions)),
+            Self::GetDocumentSymbols => {
+                ("get_document_symbols", Document(ToolKind::DocumentSymbols))
+            }
+            Self::FormatDocument => ("format_document", Document(ToolKind::FormatDocument)),
+            Self::WorkspaceSymbolSearch => (
+                "workspace_symbol_search",
+                Workspace(ToolKind::WorkspaceSymbols),
+            ),
+            Self::GetCodeActions => ("get_code_actions", Document(ToolKind::CodeActions)),
+            Self::PrepareCallHierarchy => {
+                ("prepare_call_hierarchy", Document(ToolKind::CallHierarchy))
+            }
+            Self::GetIncomingCalls => ("get_incoming_calls", Document(ToolKind::CallHierarchy)),
+            Self::GetOutgoingCalls => ("get_outgoing_calls", Document(ToolKind::CallHierarchy)),
+            Self::GetCachedDiagnostics => ("get_cached_diagnostics", Local),
+            Self::GetServerLogs => ("get_server_logs", Local),
+            Self::GetServerMessages => ("get_server_messages", Local),
+            Self::GetSignatureHelp => ("get_signature_help", Document(ToolKind::SignatureHelp)),
+            Self::GoToImplementation => {
+                ("go_to_implementation", Document(ToolKind::Implementation))
+            }
+            Self::GoToTypeDefinition => {
+                ("go_to_type_definition", Document(ToolKind::TypeDefinition))
+            }
+            Self::GetInlayHints => ("get_inlay_hints", Document(ToolKind::InlayHints)),
+            Self::GetToolSupport => ("get_tool_support", Local),
+        };
+        ToolSpec { name, backend }
     }
 
-    /// The route serving this tool.
-    pub(super) const fn backend(self) -> ToolBackend {
-        match self {
-            Self::GetHover => ToolBackend::Document(ToolKind::Hover),
-            Self::GetDefinition => ToolBackend::Document(ToolKind::Definition),
-            Self::GetReferences => ToolBackend::Document(ToolKind::References),
-            Self::GetDiagnostics => ToolBackend::Document(ToolKind::Diagnostics),
-            Self::RenameSymbol => ToolBackend::Document(ToolKind::Rename),
-            Self::GetCompletions => ToolBackend::Document(ToolKind::Completions),
-            Self::GetDocumentSymbols => ToolBackend::Document(ToolKind::DocumentSymbols),
-            Self::FormatDocument => ToolBackend::Document(ToolKind::FormatDocument),
-            Self::WorkspaceSymbolSearch => ToolBackend::Workspace(ToolKind::WorkspaceSymbols),
-            Self::GetCodeActions => ToolBackend::Document(ToolKind::CodeActions),
-            Self::PrepareCallHierarchy | Self::GetIncomingCalls | Self::GetOutgoingCalls => {
-                ToolBackend::Document(ToolKind::CallHierarchy)
-            }
-            Self::GetSignatureHelp => ToolBackend::Document(ToolKind::SignatureHelp),
-            Self::GoToImplementation => ToolBackend::Document(ToolKind::Implementation),
-            Self::GoToTypeDefinition => ToolBackend::Document(ToolKind::TypeDefinition),
-            Self::GetInlayHints => ToolBackend::Document(ToolKind::InlayHints),
-            Self::GetCachedDiagnostics
-            | Self::GetServerLogs
-            | Self::GetServerMessages
-            | Self::GetToolSupport => ToolBackend::Local,
-        }
+    /// The unprefixed MCP tool name.
+    pub(super) const fn name(self) -> &'static str {
+        self.spec().name
     }
 }
 
@@ -194,14 +197,76 @@ impl ToolCoverage {
     }
 }
 
-/// One route of a tool in the report: a language (absent for workspace-wide
-/// tools) and its support status.
-#[derive(Debug, Serialize, JsonSchema)]
-pub(super) struct RouteEntry {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
+/// The languages of one tool that share an identical [`RouteSupport`].
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(super) struct LanguageGroup {
+    languages: Vec<String>,
     #[serde(flatten)]
     support: RouteSupport,
+}
+
+/// The routes of one tool in the report.
+///
+/// Serializes as a flat array in both variants: document routes are grouped
+/// by identical support (`languages` lists the members), a workspace route has
+/// no language and is a single element without `languages`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ToolRoutes {
+    /// Per-document tool: languages grouped by identical support, in
+    /// first-seen order over the sorted languages.
+    Document(Vec<LanguageGroup>),
+    /// Workspace-wide tool: its one route.
+    Workspace(RouteSupport),
+}
+
+impl ToolRoutes {
+    /// Group `routes` (one per language) by identical support, keeping the
+    /// order in which each distinct support is first seen.
+    fn grouped(routes: Vec<(String, RouteSupport)>) -> Self {
+        let mut groups: Vec<LanguageGroup> = Vec::new();
+        for (language, support) in routes {
+            match groups.iter_mut().find(|group| group.support == support) {
+                Some(group) => group.languages.push(language),
+                None => groups.push(LanguageGroup {
+                    languages: vec![language],
+                    support,
+                }),
+            }
+        }
+        Self::Document(groups)
+    }
+}
+
+/// One route of a tool in the report: the languages sharing this support
+/// status (absent for workspace-wide tools) and the status itself.
+#[derive(JsonSchema)]
+#[allow(
+    dead_code,
+    reason = "describes the wire shape for schema generation only"
+)]
+struct RouteShape {
+    languages: Option<Vec<String>>,
+    #[serde(flatten)]
+    support: RouteSupport,
+}
+
+impl JsonSchema for ToolRoutes {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ToolRoutes")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        <Vec<RouteShape>>::json_schema(generator)
+    }
+}
+
+impl Serialize for ToolRoutes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Document(groups) => serializer.collect_seq(groups),
+            Self::Workspace(support) => serializer.collect_seq(std::iter::once(support)),
+        }
+    }
 }
 
 /// One tool in the report.
@@ -210,7 +275,7 @@ pub(super) struct ToolEntry {
     name: String,
     coverage: ToolCoverage,
     #[serde(skip_serializing_if = "Option::is_none")]
-    routes: Option<Vec<RouteEntry>>,
+    routes: Option<ToolRoutes>,
 }
 
 /// The `get_tool_support` response.
@@ -231,32 +296,36 @@ impl ToolSupportReport {
         let tools = McpTool::ALL
             .iter()
             .map(|tool| {
-                let name = prefixed_tool_name(prefix, tool.name());
-                let routes: Vec<RouteEntry> = match tool.backend() {
-                    ToolBackend::Local => {
-                        return ToolEntry {
-                            name,
-                            coverage: ToolCoverage::Always,
-                            routes: None,
-                        };
+                let spec = tool.spec();
+                let (coverage, routes) = match spec.backend {
+                    ToolBackend::Local => (ToolCoverage::Always, None),
+                    ToolBackend::Document(kind) => {
+                        let routes: Vec<_> = languages
+                            .iter()
+                            .map(|language| {
+                                (language.clone(), snapshot.document_support(language, kind))
+                            })
+                            .collect();
+                        let coverage = ToolCoverage::from_routes(routes.iter().map(|(_, s)| s));
+                        (
+                            coverage,
+                            (coverage != ToolCoverage::All).then(|| ToolRoutes::grouped(routes)),
+                        )
                     }
-                    ToolBackend::Document(kind) => languages
-                        .iter()
-                        .map(|language| RouteEntry {
-                            language: Some(language.clone()),
-                            support: snapshot.document_support(language, kind),
-                        })
-                        .collect(),
-                    ToolBackend::Workspace(kind) => vec![RouteEntry {
-                        language: None,
-                        support: snapshot.workspace_support(kind),
-                    }],
+                    ToolBackend::Workspace(kind) => {
+                        let support = snapshot.workspace_support(kind);
+                        let coverage = ToolCoverage::from_routes(std::iter::once(&support));
+                        (
+                            coverage,
+                            (coverage != ToolCoverage::All)
+                                .then_some(ToolRoutes::Workspace(support)),
+                        )
+                    }
                 };
-                let coverage = ToolCoverage::from_routes(routes.iter().map(|r| &r.support));
                 ToolEntry {
-                    name,
+                    name: prefixed_tool_name(prefix, spec.name),
                     coverage,
-                    routes: (coverage != ToolCoverage::All).then_some(routes),
+                    routes,
                 }
             })
             .collect();
@@ -339,5 +408,31 @@ mod tests {
             "optics_get_hover"
         );
         assert_eq!(prefixed_tool_name(None, "get_hover"), "get_hover");
+    }
+
+    #[test]
+    fn document_routes_group_identical_support_in_first_seen_order() {
+        let none = RouteSupport::NoServer;
+        let routes = ToolRoutes::grouped(vec![
+            ("c".to_string(), none.clone()),
+            ("go".to_string(), supported()),
+            ("java".to_string(), none),
+            ("rust".to_string(), supported()),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&routes).unwrap(),
+            serde_json::json!([
+                {"languages": ["c", "java"], "status": "no_server"},
+                {"languages": ["go", "rust"], "status": "supported", "server": "s"},
+            ])
+        );
+    }
+
+    #[test]
+    fn workspace_route_serializes_without_languages() {
+        assert_eq!(
+            serde_json::to_value(ToolRoutes::Workspace(RouteSupport::NoServer)).unwrap(),
+            serde_json::json!([{"status": "no_server"}])
+        );
     }
 }

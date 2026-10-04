@@ -2398,7 +2398,7 @@
   {
     "name": "get_tool_support",
     "title": "Tool Support",
-    "description": "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` lists each language's `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
+    "description": "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -2418,8 +2418,8 @@
           "description": "LSP server capability the tool is gated on.",
           "type": "string"
         },
-        "RouteEntry": {
-          "description": "One route of a tool in the report: a language (absent for workspace-wide\ntools) and its support status.",
+        "RouteShape": {
+          "description": "One route of a tool in the report: the languages sharing this support\nstatus (absent for workspace-wide tools) and the status itself.",
           "oneOf": [
             {
               "description": "The routed server is registered and advertises the tool's capability.",
@@ -2490,9 +2490,12 @@
             }
           ],
           "properties": {
-            "language": {
+            "languages": {
+              "items": {
+                "type": "string"
+              },
               "type": [
-                "string",
+                "array",
                 "null"
               ]
             }
@@ -2543,12 +2546,13 @@
               "type": "string"
             },
             "routes": {
-              "items": {
-                "$ref": "#/$defs/RouteEntry"
-              },
-              "type": [
-                "array",
-                "null"
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolRoutes"
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
           },
@@ -2557,6 +2561,12 @@
             "coverage"
           ],
           "type": "object"
+        },
+        "ToolRoutes": {
+          "items": {
+            "$ref": "#/$defs/RouteShape"
+          },
+          "type": "array"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
