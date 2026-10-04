@@ -4,9 +4,30 @@ use anyhow::{Context, Result};
 use mcpls_core::escape_control;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::filter::Directive;
 use tracing_subscriber::fmt::format::{FormatFields, Writer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
+
+/// Directives appended after the user's level so rmcp's session-creation
+/// event and worker span, which carry the secret `Mcp-Session-Id`, stay
+/// below the default level. A more specific user directive still overrides.
+const SESSION_ID_LOG_CAPS: [&str; 2] = [
+    "rmcp::transport::streamable_http_server::session=warn",
+    "rmcp::transport::worker=debug",
+];
+
+fn build_filter(level: &str) -> Result<EnvFilter> {
+    let filter = EnvFilter::try_new(level)
+        .or_else(|_| EnvFilter::try_new("info"))
+        .context("failed to parse log level")?;
+    SESSION_ID_LOG_CAPS.iter().try_fold(filter, |filter, cap| {
+        let directive: Directive = cap
+            .parse()
+            .with_context(|| format!("invalid session log cap `{cap}`"))?;
+        Ok(filter.add_directive(directive))
+    })
+}
 
 /// Text-mode field formatter that control-escapes every field value, so
 /// attacker-influenceable text (an LSP server's message or method name, a
@@ -61,13 +82,15 @@ impl Visit for EscapingVisitor<'_> {
 ///
 /// An invalid `level` falls back to `"info"` rather than erroring.
 ///
+/// rmcp's session-id-bearing log targets are capped regardless of `level`; a
+/// more specific directive (for example `rmcp::...::session::local=info`)
+/// overrides the cap and re-exposes session ids.
+///
 /// # Errors
 ///
 /// Returns an error if the fallback `"info"` filter itself fails to parse.
 pub fn init(level: &str, log_json: bool) -> Result<()> {
-    let filter = EnvFilter::try_new(level)
-        .or_else(|_| EnvFilter::try_new("info"))
-        .context("failed to parse log level")?;
+    let filter = build_filter(level)?;
 
     // Use stderr for logs so stdout remains clean for MCP protocol
     let registry = tracing_subscriber::registry().with(filter);
@@ -154,6 +177,39 @@ mod tests {
             output.contains("method=file:///a\\nERROR"),
             "got {output:?}"
         );
+    }
+
+    #[test]
+    fn test_session_id_never_logged_by_rmcp_targets_at_trace_level() {
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(build_filter("trace").unwrap())
+            .with(
+                fmt::layer()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "rmcp::transport::streamable_http_server::session::local",
+                session_id = "SECRET-SESSION-ID",
+                "create new session"
+            );
+            let span = tracing::trace_span!(
+                target: "rmcp::transport::worker",
+                "transport_worker",
+                name = "streamable-http-session-SECRET-SESSION-ID"
+            );
+            let _entered = span.enter();
+            tracing::trace!(target: "rmcp::transport::worker", "inside worker");
+            tracing::info!(target: "mcpls_core", "kept");
+        });
+
+        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("SECRET-SESSION-ID"), "got {output:?}");
+        assert!(output.contains("kept"), "got {output:?}");
     }
 
     #[test]

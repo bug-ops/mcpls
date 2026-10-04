@@ -427,6 +427,22 @@ mod liveness;
 #[cfg(feature = "transport-http")]
 use liveness::{ProbeId, SessionLiveness, StreamProbe, is_common_channel_event_id};
 
+/// Log-safe correlation handle for a session: eight hex digits of a hash of
+/// the id, so log lines can be matched without disclosing the bearer secret.
+#[cfg(feature = "transport-http")]
+struct SessionFingerprint<'a>(&'a SessionId);
+
+#[cfg(feature = "transport-http")]
+impl std::fmt::Display for SessionFingerprint<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+
+        let mut hasher = DefaultHasher::new();
+        self.0.hash(&mut hasher);
+        write!(f, "{:08x}", hasher.finish() >> 32)
+    }
+}
+
 /// A registered handle for waiting on a shutdown signal: `SIGTERM`/`SIGINT`
 /// on Unix (as sent by containers, systemd, and `Ctrl-C`) or `Ctrl-C` on
 /// Windows.
@@ -1292,12 +1308,15 @@ impl CappedSessionManager {
             ids
         };
         for id in &idle_ids {
-            tracing::debug!(session = %id, "closing idle HTTP session");
+            tracing::debug!(session = %SessionFingerprint(id), "closing idle HTTP session");
             let inner = std::sync::Arc::clone(&self.inner);
             let id = id.clone();
             tokio::spawn(async move {
                 if let Err(e) = inner.close_session(&id).await {
-                    tracing::debug!(session = %id, "closing idle HTTP session failed: {e}");
+                    tracing::debug!(
+                        session = %SessionFingerprint(&id),
+                        "closing idle HTTP session failed: {e}"
+                    );
                 }
             });
         }
@@ -1614,6 +1633,18 @@ mod tests {
     use std::assert_matches;
 
     use crate::bridge::WorkspaceRoots;
+
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_session_fingerprint_hides_id() {
+        let id: super::SessionId = "61429d44-e35a-4615-bd7f-1ccb38acecae".into();
+        let shown = super::SessionFingerprint(&id).to_string();
+
+        assert_eq!(shown.len(), 8);
+        assert!(shown.chars().all(|c| c.is_ascii_hexdigit()), "{shown}");
+        assert!(!id.contains(&shown));
+        assert_eq!(shown, super::SessionFingerprint(&id).to_string());
+    }
 
     /// An accepted stream must read back the half-open `TCP_USER_TIMEOUT`.
     #[cfg(all(
