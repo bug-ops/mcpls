@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `NotificationCache`/`DocumentTracker`/`DocumentState` internals are no longer public; removed `NotificationCache::{clear_diagnostics, clear_all_diagnostics, clear_logs, clear_messages}` and `DocumentTracker::{update, close_all}`. (#PR)
+- **Breaking:** `mcp_to_lsp_position` takes the typed `Position` and `lsp_to_mcp_position` returns `Position2D` instead of bare `u32` pairs/tuples. (#PR)
+- **Breaking:** `workspace.heuristics_max_depth` is now bounded by `MAX_HEURISTICS_DEPTH` (64); larger values fail config validation. (#PR)
+
 ## [0.6.0] - 2026-09-21
 
 ### Added

@@ -128,7 +128,7 @@ impl Translator {
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, line, character).await;
+        let lsp_position = ctx.to_lsp(&uri, position).await;
 
         let params = LspCallHierarchyPrepareParams {
             text_document_position_params: TextDocumentPositionParams {

@@ -15,7 +15,8 @@ pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
-    DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, ServerHeuristics,
+    DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_HEURISTICS_DEPTH, MAX_TIMEOUT_SECONDS,
+    ServerHeuristics,
 };
 
 use crate::bridge::{
@@ -307,7 +308,7 @@ pub struct WorkspaceConfig {
 
     /// Maximum depth for recursive project marker search.
     /// Controls how deeply nested projects can be detected.
-    /// Default: 10
+    /// Default: 10. Values above [`MAX_HEURISTICS_DEPTH`] are rejected by [`ServerConfig::validate`].
     #[serde(default = "default_heuristics_max_depth")]
     pub heuristics_max_depth: usize,
 
@@ -1007,7 +1008,7 @@ impl ServerConfig {
     /// ```
     pub fn validate(&self) -> Result<()> {
         self.validate_mcp()?;
-        self.validate_indexing_ready_timeout()?;
+        self.validate_workspace_bounds()?;
 
         if self.workspace.position_encodings.is_empty() {
             return Err(Error::InvalidConfig(
@@ -1115,6 +1116,26 @@ impl ServerConfig {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Runs the numeric-bound checks on `[workspace]`; split out of
+    /// [`Self::validate`] to keep that function under clippy's line count
+    /// threshold.
+    fn validate_workspace_bounds(&self) -> Result<()> {
+        self.validate_indexing_ready_timeout()?;
+        self.validate_heuristics_max_depth()
+    }
+
+    /// Rejects `workspace.heuristics_max_depth` above [`MAX_HEURISTICS_DEPTH`].
+    fn validate_heuristics_max_depth(&self) -> Result<()> {
+        let depth = self.workspace.heuristics_max_depth;
+        if depth > MAX_HEURISTICS_DEPTH {
+            return Err(Error::InvalidConfig(format!(
+                "workspace.heuristics_max_depth ({depth}) exceeds the maximum of \
+                 {MAX_HEURISTICS_DEPTH}"
+            )));
         }
         Ok(())
     }
@@ -1415,6 +1436,47 @@ mod tests {
         } else {
             panic!("Expected InvalidConfig error, got {result:?}");
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_heuristics_max_depth_above_max() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = format!(
+            "[workspace]\nheuristics_max_depth = {}\n",
+            MAX_HEURISTICS_DEPTH + 1
+        );
+        fs::write(&config_path, toml_content).unwrap();
+
+        let result = ServerConfig::load_from(&config_path);
+        if let Err(Error::InvalidConfig(msg)) = result {
+            assert!(msg.contains("heuristics_max_depth"));
+            assert!(msg.contains("exceeds the maximum"));
+        } else {
+            panic!("Expected InvalidConfig error, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_heuristics_max_depth_below_max() {
+        for depth in [1, MAX_HEURISTICS_DEPTH - 1] {
+            let mut config = ServerConfig::default();
+            config.workspace.heuristics_max_depth = depth;
+            assert!(config.validate().is_ok(), "depth {depth} must be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_heuristics_max_depth_at_max() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+
+        let toml_content = format!("[workspace]\nheuristics_max_depth = {MAX_HEURISTICS_DEPTH}\n");
+        fs::write(&config_path, toml_content).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.workspace.heuristics_max_depth, MAX_HEURISTICS_DEPTH);
     }
 
     #[test]

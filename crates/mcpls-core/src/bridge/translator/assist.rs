@@ -63,7 +63,6 @@ impl Translator {
         position: Position,
         trigger: Option<String>,
     ) -> Result<CompletionsResult> {
-        let Position { line, character } = position;
         validate_completions_params(trigger.as_deref())?;
 
         let (server_id, client, uri) = self
@@ -74,10 +73,7 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let lsp_position = self
-            .encoding_ctx(&server_id)
-            .to_lsp(&uri, line, character)
-            .await;
+        let lsp_position = self.encoding_ctx(&server_id).to_lsp(&uri, position).await;
 
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
             trigger_kind: CompletionTriggerKind::TriggerCharacter,
@@ -136,7 +132,6 @@ impl Translator {
         file_path: String,
         position: Position,
     ) -> Result<SignatureHelpResult> {
-        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -145,10 +140,7 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
-        let lsp_position = self
-            .encoding_ctx(&server_id)
-            .to_lsp(&uri, line, character)
-            .await;
+        let lsp_position = self.encoding_ctx(&server_id).to_lsp(&uri, position).await;
 
         let params = LspSignatureHelpParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -229,8 +221,8 @@ impl Translator {
         let ctx = self.encoding_ctx(&server_id);
         let response_uri = uri.clone();
 
-        let lsp_start = ctx.to_lsp(&uri, start.line, start.character).await;
-        let lsp_end = ctx.to_lsp(&uri, end.line, end.character).await;
+        let lsp_start = ctx.to_lsp(&uri, start).await;
+        let lsp_end = ctx.to_lsp(&uri, end).await;
 
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },

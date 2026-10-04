@@ -134,8 +134,8 @@ THEN server B receives didOpen (not didChange), independent of server A's sync h
 | FR-002 | WHEN a document's on-disk `(mtime, size)` matches the last-observed snapshot AND that mtime is old enough (past a filesystem mtime-granularity margin) to be trusted as settled THE SYSTEM SHALL trust the cached in-memory content without re-reading the file | must |
 | FR-003 | WHEN a document's on-disk `(mtime, size)` does not match the last-observed snapshot, OR the mtime is not yet settled THE SYSTEM SHALL re-read the file and compare content directly rather than trusting the stat alone | must |
 | FR-004 | WHEN a not-yet-settled stat is observed repeatedly with an unchanged `(mtime, size)` THE SYSTEM SHALL debounce the (comparatively expensive) content re-read within a bounded window, while the disk stat itself is never debounced | must |
-| FR-005 | WHEN a document's content is updated via a local (non-disk) edit (`update`) THE SYSTEM SHALL bump its version, replace its content, and clear its disk provenance (so the next `ensure_open` always re-verifies by content compare rather than trusting a stale stat) | must |
-| FR-006 | THE SYSTEM SHALL serialize `ensure_open`/`update` calls for the *same* path via a per-path lock, while calls for *different* paths never block on each other | must |
+| FR-005 | WHEN `ensure_open` reloads changed on-disk content THE SYSTEM SHALL bump the document's version, replace its content, and record the verified disk snapshot (`commit_reload`) | must |
+| FR-006 | THE SYSTEM SHALL serialize `ensure_open` calls for the *same* path via a per-path lock, while calls for *different* paths never block on each other | must |
 | FR-007 | THE SYSTEM SHALL track, per (document, server) pair, the last version synced to that server, so a server that has never seen a document receives `didOpen` and one that has already seen an earlier version receives `didChange` | must |
 | FR-008 | THE SYSTEM SHALL provide `forget_server(server_id)` to clear one server's entire sync history across all tracked documents, without affecting any other server's sync history for the same documents | must |
 | FR-009 | THE SYSTEM SHALL provide `line_text(path, line)`, reading from in-memory tracked content (not disk), for range/position conversion consumers ([[bridge/001-position-encoding-layer/spec|spec bridge/001]]) that need a document's current line text without an extra disk read | must |
@@ -166,8 +166,7 @@ THEN server B receives didOpen (not didChange), independent of server A's sync h
 | File's `(mtime, size)` unchanged but mtime is *not yet* settled (rewritten within the granularity window) | Re-read and content-compare, debounced within `DISK_CHECK_DEBOUNCE` (250ms) for repeated calls against the same unsettled snapshot |
 | File's `(mtime, size)` changed on every stat (rapid external rewrites) | Never debounced — each such call already disagrees with the cached snapshot, so it always takes the immediate re-read path |
 | Filesystem does not report mtime at all | Entry is never treated as settled; forces a content re-read outside the debounce window every time |
-| Local edit applied via `update` | Version bumps, disk provenance cleared — next `ensure_open` always re-verifies by content compare, since the new content's disk provenance is unknown |
-| `update` called from within a task that already holds the same path's lock | Self-deadlock (no panic, no timeout) — documented as a hard invariant, not handled defensively |
+| `open` called without holding the path's `lock_path` | Not supported: `open` is crate-private and its only production caller (`ensure_open`'s disk phase) holds the lock |
 | A document reopened via `open` while already tracked | Entry unconditionally replaced: version resets to 1, all servers' sync history for that path cleared |
 | Server A has synced a document, server B has not | Server B's next `ensure_open` for that document sends `didOpen`, independent of server A's already-synced state |
 | A server is forgotten via `forget_server` | Only that server's sync history is cleared across every tracked document; other servers' sync history is untouched |
@@ -184,9 +183,9 @@ THEN server B receives didOpen (not didChange), independent of server A's sync h
 
 ### Always (without asking)
 - Route every document-content mutation through `DocumentState`'s dedicated methods
-  (`apply_local_edit`, `commit_reload`, `set_disk`, `mark_synced`, `forget_server`) rather than a
+  (`commit_reload`, `set_disk`, `mark_synced`, `forget_server`) rather than a
   partial field write, preserving the monotonic-version invariant (NFR-002)
-- Preserve the per-path (not global) locking granularity in `ensure_open`/`update`
+- Preserve the per-path (not global) locking granularity in `ensure_open`
 
 ### Ask First
 - Changing `MTIME_GRANULARITY` or `DISK_CHECK_DEBOUNCE` — both are tuned against real filesystem

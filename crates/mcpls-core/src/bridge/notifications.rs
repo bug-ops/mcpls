@@ -526,7 +526,7 @@ pub struct NotificationCache {
     /// out-of-band signals (rust-analyzer's `experimental/serverStatus`, and
     /// a generic `$/progress` `begin`/`end` sequence) rather than the
     /// `initialize`/`initialized` handshake. See
-    /// [`Self::observe_indexing_signal`] and [`Self::observe_progress`].
+    /// `Self::observe_indexing_signal` and [`Self::observe_progress`].
     indexing: IndexingTracker,
 }
 
@@ -571,7 +571,7 @@ impl NotificationCache {
     /// gets fair-share partitioning once more than one server has written an
     /// entry, rather than silently handing the whole budget to a single
     /// early publisher.
-    pub fn set_diagnostics_route_count(&mut self, count: usize) {
+    pub(crate) fn set_diagnostics_route_count(&mut self, count: usize) {
         self.diagnostics_route_count = Some(count.max(1));
     }
 
@@ -762,21 +762,7 @@ impl NotificationCache {
     /// being capped at a static equal split regardless of how much of it
     /// they actually use. Which exact entry is removed is further refined by
     /// emptiness -- see the private `entry_to_evict` (#284).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mcpls_core::bridge::NotificationCache;
-    /// use mcpls_core::config::ServerId;
-    /// use lsp_types::Uri;
-    ///
-    /// let mut cache = NotificationCache::new();
-    /// let server: ServerId = "rust-analyzer".into();
-    /// let uri: Uri = Uri::from("file:///main.rs");
-    /// cache.store_diagnostics(&server, &uri, Some(1), vec![]);
-    /// assert!(cache.diagnostics(uri.as_ref()).is_some());
-    /// ```
-    pub fn store_diagnostics(
+    pub(crate) fn store_diagnostics(
         &mut self,
         server_id: &ServerId,
         uri: &Uri,
@@ -867,7 +853,7 @@ impl NotificationCache {
     ///
     /// Maintains a maximum of `MAX_LOG_ENTRIES` entries, removing oldest when full.
     /// `message` is truncated to `MAX_ENTRY_TEXT_BYTES` before storing.
-    pub fn store_log(&mut self, level: LogLevel, message: String) {
+    pub(crate) fn store_log(&mut self, level: LogLevel, message: String) {
         let entry = LogEntry {
             level,
             message: truncate_string(message, MAX_ENTRY_TEXT_BYTES),
@@ -884,7 +870,7 @@ impl NotificationCache {
     ///
     /// Maintains a maximum of `MAX_SERVER_MESSAGES` entries, removing oldest when full.
     /// `message` is truncated to `MAX_ENTRY_TEXT_BYTES` before storing.
-    pub fn store_message(&mut self, message_type: MessageType, message: String) {
+    pub(crate) fn store_message(&mut self, message_type: MessageType, message: String) {
         let msg = ServerMessage {
             message_type,
             message: truncate_string(message, MAX_ENTRY_TEXT_BYTES),
@@ -915,27 +901,7 @@ impl NotificationCache {
     /// re-indexing triggered by large-scale file changes. See
     /// [`Self::reset_indexing_state`] for the one case that does move a
     /// server back out of `Ready`/`Loading`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mcpls_core::bridge::{IndexingState, NotificationCache};
-    /// use mcpls_core::config::ServerId;
-    /// use serde_json::json;
-    ///
-    /// let mut cache = NotificationCache::new();
-    /// let id: ServerId = "rust-analyzer".into();
-    /// assert_eq!(cache.indexing_state(&id), IndexingState::Unknown);
-    ///
-    /// let loading = json!({"quiescent": false});
-    /// cache.observe_indexing_signal(&id, "experimental/serverStatus", Some(&loading));
-    /// assert_eq!(cache.indexing_state(&id), IndexingState::Loading);
-    ///
-    /// let ready = json!({"quiescent": true});
-    /// cache.observe_indexing_signal(&id, "experimental/serverStatus", Some(&ready));
-    /// assert_eq!(cache.indexing_state(&id), IndexingState::Ready);
-    /// ```
-    pub fn observe_indexing_signal(
+    pub(crate) fn observe_indexing_signal(
         &mut self,
         server_id: &ServerId,
         method: &str,
@@ -947,7 +913,7 @@ impl NotificationCache {
 
     /// Record a `$/progress` notification toward `server_id`'s tracked
     /// [`IndexingState`] -- the generic LSP counterpart to
-    /// [`Self::observe_indexing_signal`]'s rust-analyzer-specific
+    /// `Self::observe_indexing_signal`'s rust-analyzer-specific
     /// `experimental/serverStatus`. See
     /// [`crate::bridge::indexing::IndexingTracker::observe_progress`] for
     /// the full begin/end/settle/latch transition rules.
@@ -968,7 +934,7 @@ impl NotificationCache {
     /// Current tracked workspace-indexing readiness for `server_id`.
     ///
     /// Returns [`IndexingState::Unknown`] for a server no readiness signal
-    /// has ever been observed for -- see [`Self::observe_indexing_signal`].
+    /// has ever been observed for -- see `Self::observe_indexing_signal`.
     ///
     /// A `Loading` entry older than `INDEXING_STALENESS_BOUND` is read
     /// back as `Unknown` rather than `Loading`: this is the self-heal for a
@@ -992,23 +958,7 @@ impl NotificationCache {
     /// leak into requests routed to its replacement. This is the only
     /// production caller: a timed-out [`Self::indexing_state`] read does
     /// *not* call this, so one caller's wait can never affect another's.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mcpls_core::bridge::{IndexingState, NotificationCache};
-    /// use mcpls_core::config::ServerId;
-    /// use serde_json::json;
-    ///
-    /// let mut cache = NotificationCache::new();
-    /// let id: ServerId = "rust-analyzer".into();
-    /// cache.observe_indexing_signal(&id, "experimental/serverStatus", Some(&json!({"quiescent": false})));
-    /// assert_eq!(cache.indexing_state(&id), IndexingState::Loading);
-    ///
-    /// cache.reset_indexing_state(&id);
-    /// assert_eq!(cache.indexing_state(&id), IndexingState::Unknown);
-    /// ```
-    pub fn reset_indexing_state(&mut self, server_id: &ServerId) {
+    pub(crate) fn reset_indexing_state(&mut self, server_id: &ServerId) {
         self.indexing.reset(server_id);
     }
 
@@ -1049,54 +999,12 @@ impl NotificationCache {
         &self.messages
     }
 
-    /// Clear diagnostics for a specific document URI.
-    ///
-    /// Returns the cleared diagnostics if they existed.
-    pub fn clear_diagnostics(&mut self, uri: &str) -> Option<DiagnosticInfo> {
-        let key = uri_cache_key(uri).into_owned();
-        if let Some(owner) = self.diagnostics_owners.remove(&key)
-            && let Some(seq) = self.diagnostic_seq.remove(&key)
-            && let Some(order) = self.diagnostic_order.get_mut(&owner)
-        {
-            order.remove(&seq);
-        }
-        let removed = self.diagnostics.remove(&key);
-        if removed
-            .as_ref()
-            .is_some_and(|info| info.diagnostics.is_empty())
-        {
-            self.empty_diagnostics_count -= 1;
-        }
-        removed
-    }
-
     /// Clear all diagnostics owned by a single server.
     ///
     /// Used when a server crashes and respawns: its own stale entries must
     /// be invalidated without disturbing any other server's cache entries
-    /// (#266), unlike [`Self::clear_all_diagnostics`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mcpls_core::bridge::NotificationCache;
-    /// use mcpls_core::config::ServerId;
-    /// use lsp_types::Uri;
-    ///
-    /// let mut cache = NotificationCache::new();
-    /// let crashed: ServerId = "pyright".into();
-    /// let healthy: ServerId = "rust-analyzer".into();
-    /// let crashed_uri: Uri = Uri::from("file:///main.py");
-    /// let healthy_uri: Uri = Uri::from("file:///main.rs");
-    /// cache.store_diagnostics(&crashed, &crashed_uri, Some(1), vec![]);
-    /// cache.store_diagnostics(&healthy, &healthy_uri, Some(1), vec![]);
-    ///
-    /// cache.clear_server_diagnostics(&crashed);
-    ///
-    /// assert!(cache.diagnostics(crashed_uri.as_ref()).is_none());
-    /// assert!(cache.diagnostics(healthy_uri.as_ref()).is_some());
-    /// ```
-    pub fn clear_server_diagnostics(&mut self, server_id: &ServerId) {
+    /// (#266).
+    pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) {
         let Some(order) = self.diagnostic_order.remove(server_id) else {
             return;
         };
@@ -1116,20 +1024,7 @@ impl NotificationCache {
     /// Marks `server_id`'s push-based diagnostics as no longer live -- see
     /// the `push_degraded` field doc for why this is permanent for the life
     /// of the cache.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mcpls_core::bridge::NotificationCache;
-    /// use mcpls_core::config::ServerId;
-    ///
-    /// let mut cache = NotificationCache::new();
-    /// let id: ServerId = "rust-analyzer".into();
-    /// assert!(!cache.is_push_degraded(&id));
-    /// cache.mark_push_degraded(&id);
-    /// assert!(cache.is_push_degraded(&id));
-    /// ```
-    pub fn mark_push_degraded(&mut self, server_id: &ServerId) {
+    pub(crate) fn mark_push_degraded(&mut self, server_id: &ServerId) {
         self.push_degraded.insert(server_id.clone());
     }
 
@@ -1140,47 +1035,31 @@ impl NotificationCache {
     /// current.
     #[inline]
     #[must_use]
-    pub fn is_push_degraded(&self, server_id: &ServerId) -> bool {
+    pub(crate) fn is_push_degraded(&self, server_id: &ServerId) -> bool {
         self.push_degraded.contains(server_id)
-    }
-
-    /// Clear all diagnostics, for every server.
-    pub fn clear_all_diagnostics(&mut self) {
-        self.diagnostics.clear();
-        self.diagnostics_owners.clear();
-        self.diagnostic_order.clear();
-        self.diagnostic_seq.clear();
-        self.empty_diagnostics_count = 0;
-    }
-
-    /// Clear all logs.
-    pub fn clear_logs(&mut self) {
-        self.logs.clear();
-    }
-
-    /// Clear all messages.
-    pub fn clear_messages(&mut self) {
-        self.messages.clear();
     }
 
     /// Get the number of documents with stored diagnostics.
     #[inline]
     #[must_use]
-    pub fn diagnostics_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn diagnostics_count(&self) -> usize {
         self.diagnostics.len()
     }
 
     /// Get the number of stored log entries.
     #[inline]
     #[must_use]
-    pub fn logs_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn logs_count(&self) -> usize {
         self.logs.len()
     }
 
     /// Get the number of stored server messages.
     #[inline]
     #[must_use]
-    pub fn messages_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn messages_count(&self) -> usize {
         self.messages.len()
     }
 }
@@ -1703,33 +1582,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_diagnostics() {
-        let mut cache = NotificationCache::new();
-        let uri: Uri = Uri::from("file:///test.rs");
-
-        cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
-        assert_eq!(cache.diagnostics_count(), 1);
-
-        let cleared = cache.clear_diagnostics(uri.as_ref());
-        assert!(cleared.is_some());
-        assert_eq!(cache.diagnostics_count(), 0);
-    }
-
-    #[test]
-    fn test_clear_all_diagnostics() {
-        let mut cache = NotificationCache::new();
-        let uri1: Uri = Uri::from("file:///test1.rs");
-        let uri2: Uri = Uri::from("file:///test2.rs");
-
-        cache.store_diagnostics(&test_server(), &uri1, Some(1), vec![]);
-        cache.store_diagnostics(&test_server(), &uri2, Some(1), vec![]);
-        assert_eq!(cache.diagnostics_count(), 2);
-
-        cache.clear_all_diagnostics();
-        assert_eq!(cache.diagnostics_count(), 0);
-    }
-
-    #[test]
     fn test_store_and_get_logs() {
         let mut cache = NotificationCache::new();
 
@@ -1790,16 +1642,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_logs() {
-        let mut cache = NotificationCache::new();
-        cache.store_log(LogLevel::Info, "test".to_string());
-        assert_eq!(cache.logs_count(), 1);
-
-        cache.clear_logs();
-        assert_eq!(cache.logs_count(), 0);
-    }
-
-    #[test]
     fn test_store_and_get_messages() {
         let mut cache = NotificationCache::new();
 
@@ -1832,16 +1674,6 @@ mod tests {
             messages.back().unwrap().message,
             format!("message {}", MAX_SERVER_MESSAGES + 9)
         );
-    }
-
-    #[test]
-    fn test_clear_messages() {
-        let mut cache = NotificationCache::new();
-        cache.store_message(MessageType::Info, "test".to_string());
-        assert_eq!(cache.messages_count(), 1);
-
-        cache.clear_messages();
-        assert_eq!(cache.messages_count(), 0);
     }
 
     /// #311: same per-entry byte cap as `store_log`, applied to server messages.
@@ -2072,33 +1904,6 @@ mod tests {
             "the oldest never-republished entry must be evicted instead"
         );
         assert!(cache.diagnostics(overflow.as_ref()).is_some());
-    }
-
-    #[test]
-    fn test_clear_diagnostics_then_refill_does_not_evict_early() {
-        let mut cache = NotificationCache::new();
-        let first: Uri = Uri::from("file:///first.rs");
-        cache.store_diagnostics(&test_server(), &first, Some(1), vec![]);
-        cache.clear_diagnostics(first.as_ref());
-        assert_eq!(cache.diagnostics_count(), 0);
-
-        for i in 0..MAX_DIAGNOSTIC_ENTRIES {
-            let uri: Uri = Uri::from(format!("file:///test{i}.rs"));
-            cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
-        }
-        assert_eq!(cache.diagnostics_count(), MAX_DIAGNOSTIC_ENTRIES);
-        // Every entry from this batch must still be present -- the earlier
-        // clear must not have left a stale `diagnostic_order` entry that
-        // causes a premature eviction here.
-        let first_of_batch: Uri = Uri::from("file:///test0.rs");
-        assert!(cache.diagnostics(first_of_batch.as_ref()).is_some());
-    }
-
-    #[test]
-    fn test_clear_diagnostics_nonexistent() {
-        let mut cache = NotificationCache::new();
-        let result = cache.clear_diagnostics("file:///nonexistent.rs");
-        assert!(result.is_none());
     }
 
     #[test]
@@ -2354,7 +2159,7 @@ mod tests {
     }
 
     /// #266 S2: clearing one server's diagnostics must not disturb another
-    /// server's cached entries, unlike `clear_all_diagnostics`.
+    /// server's cached entries.
     #[test]
     fn test_clear_server_diagnostics_scopes_to_one_server() {
         let mut cache = NotificationCache::new();

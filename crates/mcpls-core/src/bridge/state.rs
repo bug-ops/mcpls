@@ -126,8 +126,8 @@ impl Eq for DiskSync {}
 /// All fields are private. `DocumentTracker::open` (via `Self::new`)
 /// establishes the initial state: `version` starts at 1, `disk` provenance
 /// starts `None`, and no server is recorded as synced. From there, every
-/// mutation goes through a dedicated method (`apply_local_edit`,
-/// `commit_reload`, `set_disk`, `mark_synced`, `forget_server`) rather than a
+/// mutation goes through a dedicated method (`commit_reload`, `set_disk`,
+/// `mark_synced`, `forget_server`) rather than a
 /// partial field write, so within a single tracked lifetime `version` (see
 /// [`Self::version`]) only increases. This does not cover re-opening: calling
 /// `DocumentTracker::open` again for an already-tracked path unconditionally
@@ -135,8 +135,8 @@ impl Eq for DiskSync {}
 /// that method's docs.
 ///
 /// The `disk` provenance invariant: `None` means the content's on-disk
-/// provenance is unknown (it came from an in-memory `open`/`update` call, not
-/// a verified disk read), so `ensure_open` must always re-verify by content
+/// provenance is unknown (it came from an in-memory `open` call, not a
+/// verified disk read), so `ensure_open` must always re-verify by content
 /// compare rather than trusting a stat match. `DiskSync`'s hand-written
 /// `PartialEq` excludes `content_checked_at` (see that field's doc comment),
 /// and that exclusion propagates here: two `DocumentState`s can compare
@@ -146,14 +146,14 @@ impl Eq for DiskSync {}
 /// logical state. `last_accessed` (also excluded, for the same reason) is
 /// likewise not logical state, just an LRU-eviction timestamp (#495).
 #[derive(Debug, Clone)]
-pub struct DocumentState {
+pub(super) struct DocumentState {
     uri: Uri,
     language_id: String,
     version: i32,
     content: String,
     disk: Option<DiskSync>,
     synced: HashMap<ServerId, i32>,
-    /// When this document was last accessed via `ensure_open`/`update`
+    /// When this document was last accessed via `ensure_open`
     /// (`Self::touch`), used to pick the least-recently-used entry when
     /// `DocumentTracker::open` must evict to stay under
     /// `ResourceLimits::max_documents` (#495).
@@ -209,27 +209,31 @@ impl DocumentState {
 
     /// Document URI.
     #[must_use]
-    pub const fn uri(&self) -> &Uri {
+    #[cfg(test)]
+    pub(crate) const fn uri(&self) -> &Uri {
         &self.uri
     }
 
     /// Language identifier.
     #[must_use]
-    pub fn language_id(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn language_id(&self) -> &str {
         &self.language_id
     }
 
     /// Document version. Monotonically increasing: every mutation that
-    /// changes `content` (`apply_local_edit`, `commit_reload`) also bumps
+    /// changes `content` (`commit_reload`) also bumps
     /// this, and never decreases it.
     #[must_use]
-    pub const fn version(&self) -> i32 {
+    #[cfg(test)]
+    pub(crate) const fn version(&self) -> i32 {
         self.version
     }
 
     /// Document content.
     #[must_use]
-    pub fn content(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn content(&self) -> &str {
         &self.content
     }
 
@@ -248,23 +252,13 @@ impl DocumentState {
     /// from this map has never seen the document and must receive
     /// `didOpen`, not `didChange`, on its next `ensure_open` call.
     #[must_use]
-    pub fn synced_version(&self, server: &ServerId) -> Option<i32> {
+    pub(crate) fn synced_version(&self, server: &ServerId) -> Option<i32> {
         self.synced.get(server).copied()
     }
 
     /// Whether no server has ever synced this document.
     fn has_never_synced(&self) -> bool {
         self.synced.is_empty()
-    }
-
-    /// Applies a local (non-disk) edit: bumps `version`, replaces `content`,
-    /// and clears `disk` provenance, since the new content did not come from
-    /// a verified disk read. Returns the new version.
-    fn apply_local_edit(&mut self, content: String) -> i32 {
-        self.version += 1;
-        self.content = content;
-        self.disk = None;
-        self.version
     }
 
     /// Commits a disk-verified reload: sets `version`, `content`, and `disk`
@@ -357,7 +351,7 @@ pub struct LineRead {
     pub(crate) bytes_read: u64,
 }
 
-/// A document evicted by [`DocumentTracker::open`]'s LRU eviction (#495).
+/// A document evicted by `DocumentTracker::open`'s LRU eviction (#495).
 ///
 /// Carries the servers whose `textDocument/didOpen`/`didChange` it had
 /// received. `DocumentTracker` itself has no access to any server's
@@ -395,9 +389,9 @@ pub struct DocumentTracker {
     /// `lock_path` for how entries are created and evicted.
     ///
     /// Also doubles as the "has an in-flight operation" signal
-    /// [`Self::open`]'s LRU eviction consults (#495): a path is present here
-    /// for the whole duration of any `ensure_open`/`update` call against it
-    /// (`lock_path`'s guard is held across both), so excluding every path
+    /// `Self::open`'s LRU eviction consults (#495): a path is present here
+    /// for the whole duration of any `ensure_open` call against it
+    /// (`lock_path`'s guard is held across it), so excluding every path
     /// present in this map from eviction candidates is exactly "never evict
     /// a document with an operation in flight".
     path_locks: StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
@@ -412,7 +406,7 @@ pub struct DocumentTracker {
     limits: ResourceLimits,
     /// Custom file extension to language ID mappings.
     extension_map: HashMap<String, String>,
-    /// Documents evicted by [`Self::open`]'s LRU eviction, queued for
+    /// Documents evicted by `Self::open`'s LRU eviction, queued for
     /// [`Self::take_evicted`] to hand to a caller that can notify their
     /// servers (#495). See [`EvictedDocument`].
     evicted: StdMutex<Vec<EvictedDocument>>,
@@ -432,7 +426,7 @@ impl DocumentTracker {
         }
     }
 
-    /// Drains and returns documents evicted by [`Self::open`]'s LRU eviction
+    /// Drains and returns documents evicted by `Self::open`'s LRU eviction
     /// since the last call (#495) -- see [`EvictedDocument`]. A caller with
     /// access to each server's `LspClient` (i.e. `Translator`) should call
     /// this after every `ensure_open` that could have triggered eviction and
@@ -450,7 +444,8 @@ impl DocumentTracker {
 
     /// Get a clone of the state of an open document.
     #[must_use]
-    pub fn get(&self, path: &Path) -> Option<DocumentState> {
+    #[cfg(test)]
+    pub(super) fn get(&self, path: &Path) -> Option<DocumentState> {
         lock_std(&self.documents).get(path).cloned()
     }
 
@@ -473,13 +468,15 @@ impl DocumentTracker {
 
     /// Get the number of open documents.
     #[must_use]
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         lock_std(&self.documents).len()
     }
 
     /// Check if there are no open documents.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         lock_std(&self.documents).is_empty()
     }
 
@@ -489,7 +486,7 @@ impl DocumentTracker {
     ///
     /// When `max_documents` would otherwise be exceeded, evicts the
     /// least-recently-used tracked document that both has no
-    /// `ensure_open`/`update` call currently in flight against it and is
+    /// `ensure_open` call currently in flight against it and is
     /// disk-verified (see `evict_lru`) to make room, rather than failing
     /// outright (#495) -- the evicted document is queued for
     /// [`Self::take_evicted`]. Only falls back to
@@ -498,13 +495,14 @@ impl DocumentTracker {
     ///
     /// `take_evicted`'s queue is an unbounded `Vec` that only ever grows
     /// until drained -- `Translator` drains it after every `ensure_open`
-    /// that could have triggered eviction, but a caller that invokes this
-    /// method directly (bypassing `ensure_open`, e.g. an embedder) is
-    /// responsible for draining it too, or the queue (and every
-    /// `EvictedDocument`'s content) accumulates for the tracker's lifetime.
+    /// that could have triggered eviction.
+    ///
+    /// The caller must hold `lock_path` for `path` (as `ensure_open` does):
+    /// without it, a concurrent `ensure_open` for the same path could
+    /// interleave with the insert below and lose its disk snapshot.
     ///
     /// Note the narrower guarantee than "no operation in flight" might
-    /// suggest: the `ensure_open`/`update` lock this checks (`path_locks`)
+    /// suggest: the `ensure_open` lock this checks (`path_locks`)
     /// is released once that call returns, *before* the caller's actual LSP
     /// round-trip for the document runs (see `path_locks`'s doc) -- a
     /// document already past its own `ensure_open` can still be evicted
@@ -519,7 +517,7 @@ impl DocumentTracker {
     /// Returns an error if:
     /// - Document limit is exceeded and no document is evictable
     /// - File size limit is exceeded
-    pub fn open(&self, path: PathBuf, content: String) -> Result<Uri> {
+    pub(crate) fn open(&self, path: PathBuf, content: String) -> Result<Uri> {
         self.check_file_size(content.len() as u64)?;
 
         let uri = path_to_uri(&path)?;
@@ -564,22 +562,16 @@ impl DocumentTracker {
 
     /// Removes and returns the least-recently-used entry in `documents` that
     /// is both unlocked and disk-verified -- see `path_locks`'s doc for why
-    /// "present in `path_locks`" is exactly "has an `ensure_open`/`update`
+    /// "present in `path_locks`" is exactly "has an `ensure_open`
     /// operation in flight" (#495), and below for why "disk-verified" is
     /// required too.
     ///
-    /// A candidate whose `disk()` is `None` is skipped: that means its
-    /// in-memory `content` either has never been read-back-verified against
-    /// disk at all, or -- the concerning case -- has *diverged* from disk
-    /// via `Self::update`'s `apply_local_edit` (a local, not-yet-`didOpen`ed
-    /// edit already pushed to the server, per that method's own doc). In
-    /// either case, evicting it and later reopening the path from disk on a
-    /// future `ensure_open` would silently discard content mcpls has no
-    /// other record of -- unlike a disk-verified candidate, whose evicted
-    /// content is by definition reproducible by re-reading the file. No
-    /// in-tree caller invokes `update` today, so this is a structural guard
-    /// against a latent, not-yet-reachable data-loss shape rather than a
-    /// currently-observed bug.
+    /// A candidate whose `disk()` is `None` is skipped: its in-memory
+    /// `content` has not been read-back-verified against disk (e.g. it was
+    /// just `open`ed and `ensure_open` has not yet recorded a snapshot), so
+    /// evicting it could discard content mcpls has no other record of --
+    /// unlike a disk-verified candidate, whose evicted content is
+    /// reproducible by re-reading the file.
     ///
     /// Returns `None` if every tracked document is currently locked or not
     /// disk-verified, in which case the caller must not evict anything.
@@ -597,34 +589,6 @@ impl DocumentTracker {
             .min_by_key(|(_, state)| state.last_accessed)
             .map(|(path, _)| path.clone())?;
         documents.remove(&lru_path).map(|state| (lru_path, state))
-    }
-
-    /// Update a document's content and increment its version.
-    ///
-    /// Returns `None` if the document is not open. The updated content has no
-    /// known disk provenance, so the next `ensure_open` call on this path
-    /// will always re-verify by content compare rather than trusting a stat.
-    ///
-    /// # Concurrency
-    ///
-    /// Takes the same per-path lock as [`Self::ensure_open`] (see
-    /// `lock_path`), so this can never interleave with an `ensure_open` call
-    /// for the same path -- closing the race where `ensure_open`'s disk
-    /// phase reads a `(uri, version, disk snapshot)` under a short-lived
-    /// lock and its sync phase later commits against that now-stale
-    /// snapshot after a concurrent `update` bumped the version in between.
-    ///
-    /// **Warning**: `lock_path`'s mutex is not reentrant. Never call `update`
-    /// from a task that already holds this same path's `lock_path` guard
-    /// (e.g. from within `ensure_open`/`disk_phase`/`sync_phase`, or any
-    /// future caller nested inside one) -- doing so self-deadlocks
-    /// permanently, with no panic and no timeout to signal it.
-    pub async fn update(&self, path: &Path, content: String) -> Option<i32> {
-        let _path_guard = self.lock_path(path).await;
-        lock_std(&self.documents).get_mut(path).map(|state| {
-            state.touch();
-            state.apply_local_edit(content)
-        })
     }
 
     /// Returns an error if `size` exceeds the configured file size limit.
@@ -653,16 +617,9 @@ impl DocumentTracker {
     /// Close a document and remove it from tracking.
     ///
     /// Returns the document state if it was open.
-    pub fn close(&self, path: &Path) -> Option<DocumentState> {
+    #[cfg(test)]
+    pub(super) fn close(&self, path: &Path) -> Option<DocumentState> {
         lock_std(&self.documents).remove(path)
-    }
-
-    /// Close all documents.
-    pub fn close_all(&self) -> Vec<DocumentState> {
-        lock_std(&self.documents)
-            .drain()
-            .map(|(_, state)| state)
-            .collect()
     }
 
     /// Snapshot of the filesystem paths of all currently open documents.
@@ -756,7 +713,7 @@ impl DocumentTracker {
     /// changed since a first server was opened on it.
     ///
     /// **Sync phase**: compares `server`'s last-synced version (tracked via
-    /// [`DocumentState::synced_version`]) against the version decided by the disk
+    /// `DocumentState::synced_version`) against the version decided by the disk
     /// phase, and sends exactly one of `didOpen` (server has never seen this
     /// document), `didChange` (server is behind), or nothing (server is
     /// already caught up). A `didChange` is always a single full-replacement
@@ -1491,11 +1448,6 @@ mod tests {
         assert_eq!(state.version(), 1);
         assert_eq!(state.language_id(), "rust");
 
-        let new_version = tracker
-            .update(&path, "fn main() { println!() }".to_string())
-            .await;
-        assert_eq!(new_version, Some(2));
-
         tracker.close(&path);
         assert!(!tracker.is_open(&path));
         assert!(tracker.is_empty());
@@ -1688,47 +1640,29 @@ mod tests {
         assert!(tracker.take_evicted().is_empty());
     }
 
-    /// #495 S4: a document whose content has diverged from disk (via
-    /// `update`, which clears `disk` -- see `DocumentState::apply_local_edit`)
-    /// must never be evicted even though it is unlocked -- evicting it would
-    /// silently discard in-memory content mcpls has no other record of. No
-    /// in-tree caller invokes `update` today; this guards a structural,
-    /// not-yet-reachable data-loss shape rather than a currently-observed bug.
-    #[tokio::test]
-    async fn test_evict_lru_skips_document_with_diverged_unsaved_content() {
-        let dir = TempDir::new().unwrap();
-        let path_a = dir.path().join("a.rs");
-        std::fs::write(&path_a, "AAAA").unwrap();
-        set_mtime(&path_a, settled_past());
-
+    /// #495 S4: a document with no disk-verified snapshot (`disk()` is
+    /// `None`) must never be evicted, even though it is unlocked.
+    #[test]
+    fn test_evict_lru_skips_document_without_disk_snapshot() {
         let limits = ResourceLimits {
             max_documents: 1,
             max_file_size: 0,
         };
-        let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
-        let server_id = ServerId::from("rust");
-
+        let first = PathBuf::from("/test/first.rs");
         tracker
-            .ensure_open(&path_a, &server_id, &client)
-            .await
-            .unwrap();
-        // Diverge from disk: an in-memory edit not yet reflected on disk.
-        tracker
-            .update(&path_a, "AAAA-edited".to_string())
-            .await
+            .open(first.clone(), "fn first() {}".to_string())
             .unwrap();
 
-        let path_b = dir.path().join("b.rs");
-        std::fs::write(&path_b, "BBBB").unwrap();
-
-        let result = tracker.open(path_b, "BBBB".to_string());
+        let result = tracker.open(
+            PathBuf::from("/test/second.rs"),
+            "fn second() {}".to_string(),
+        );
         assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
         assert!(
-            tracker.is_open(&path_a),
-            "the diverged, not-disk-verified document must not be evicted"
+            tracker.is_open(&first),
+            "the not-disk-verified document must not be evicted"
         );
-        assert_eq!(tracker.get(&path_a).unwrap().content(), "AAAA-edited");
         assert!(tracker.take_evicted().is_empty());
     }
 
@@ -1882,19 +1816,6 @@ mod tests {
         assert_eq!(cloned.content(), state.content());
     }
 
-    #[tokio::test]
-    async fn test_update_nonexistent_document() {
-        let map = HashMap::new();
-        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
-        let path = PathBuf::from("/test/nonexistent.rs");
-
-        let version = tracker.update(&path, "new content".to_string()).await;
-        assert_eq!(
-            version, None,
-            "Updating non-existent document should return None"
-        );
-    }
-
     #[test]
     fn test_close_nonexistent_document() {
         let map = HashMap::new();
@@ -1909,30 +1830,6 @@ mod tests {
     }
 
     #[test]
-    fn test_close_all_documents() {
-        let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
-
-        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
-
-        tracker
-            .open(PathBuf::from("/test/file1.rs"), "content1".to_string())
-            .unwrap();
-        tracker
-            .open(PathBuf::from("/test/file2.rs"), "content2".to_string())
-            .unwrap();
-        tracker
-            .open(PathBuf::from("/test/file3.rs"), "content3".to_string())
-            .unwrap();
-
-        assert_eq!(tracker.len(), 3);
-
-        let closed = tracker.close_all();
-        assert_eq!(closed.len(), 3);
-        assert!(tracker.is_empty());
-    }
-
-    #[test]
     fn test_get_nonexistent_document() {
         let map = HashMap::new();
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
@@ -1943,27 +1840,6 @@ mod tests {
             state.is_none(),
             "Getting non-existent document should return None"
         );
-    }
-
-    #[tokio::test]
-    async fn test_document_version_increments() {
-        let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
-
-        let tracker = DocumentTracker::new(ResourceLimits::default(), map);
-        let path = PathBuf::from("/test/versioned.rs");
-
-        tracker.open(path.clone(), "v1".to_string()).unwrap();
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
-
-        tracker.update(&path, "v2".to_string()).await;
-        assert_eq!(tracker.get(&path).unwrap().version(), 2);
-
-        tracker.update(&path, "v3".to_string()).await;
-        assert_eq!(tracker.get(&path).unwrap().version(), 3);
-
-        tracker.update(&path, "v4".to_string()).await;
-        assert_eq!(tracker.get(&path).unwrap().version(), 4);
     }
 
     #[test]
@@ -2236,8 +2112,7 @@ mod tests {
         assert!(tracker.is_open(&path1));
         assert!(tracker.is_open(&path2));
 
-        tracker.update(&path1, "new content1".to_string()).await;
-        assert_eq!(tracker.get(&path1).unwrap().content(), "new content1");
+        assert_eq!(tracker.get(&path1).unwrap().content(), "content1");
         assert_eq!(tracker.get(&path2).unwrap().content(), "content2");
 
         tracker.close(&path1);
@@ -2795,30 +2670,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_clears_disk_provenance() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("a.rs");
-        std::fs::write(&path, "fn main() {}").unwrap();
-        set_mtime(&path, settled_past());
-
-        let (client, _server) = fake_lsp_client();
-        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
-            .await
-            .unwrap();
-        assert!(tracker.get(&path).unwrap().disk.is_some());
-
-        tracker
-            .update(&path, "fn main() { updated(); }".to_string())
-            .await;
-        assert!(
-            tracker.get(&path).unwrap().disk.is_none(),
-            "update() must clear disk provenance so the next ensure_open re-verifies by content"
-        );
-    }
-
-    #[tokio::test]
     async fn test_first_open_self_heals_when_did_open_notify_fails() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.rs");
@@ -3107,79 +2958,6 @@ mod tests {
 
         handle_a.await.unwrap().unwrap();
         assert_eq!(tracker.get(&path_a).unwrap().content(), "fn a() {}");
-    }
-
-    /// Regression for #358: `update` must serialize against a concurrent
-    /// `ensure_open` for the *same* path via the shared per-path lock, not
-    /// just against other `ensure_open` calls.
-    ///
-    /// A real, spawned `ensure_open(path)` call is genuinely parked on the
-    /// path's lock (held via `lock_path`, the exact primitive `ensure_open`
-    /// acquires before its disk I/O) while `update` is raced against it --
-    /// see `test_ensure_open_different_paths_do_not_serialize` for why a
-    /// standalone `lock_path` guard alone is not enough, and for why this
-    /// replaced the previous FIFO-blocking idiom. Before the #358 fix,
-    /// `update` took no per-path lock at all and would have raced straight
-    /// through instead of blocking.
-    #[tokio::test]
-    async fn test_update_serializes_with_concurrent_ensure_open_same_path() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("a.rs");
-        std::fs::write(&path, "fn a() {}").unwrap();
-        set_mtime(&path, settled_past());
-
-        let (client, _server) = fake_lsp_client();
-        let tracker = Arc::new(DocumentTracker::new(
-            ResourceLimits::default(),
-            HashMap::new(),
-        ));
-
-        let path_guard = tracker.lock_path(&path).await;
-
-        // Spawned so a real `ensure_open(path)` call is genuinely parked on
-        // the path's lock (held by `path_guard` above) while `update` is
-        // raced against it below.
-        let tracker_for_open = Arc::clone(&tracker);
-        let path_for_task = path.clone();
-        let handle_open = tokio::spawn(async move {
-            tracker_for_open
-                .ensure_open(&path_for_task, &ServerId::from("rust"), &client)
-                .await
-        });
-
-        // Give the spawned task a chance to actually reach and block on the
-        // path's lock before racing `update` against it below.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // A successful (non-timeout) result here would mean `update` raced
-        // straight past `ensure_open`'s still-held per-path lock -- the
-        // exact regression #358 fixes.
-        let update_while_blocked = tokio::time::timeout(
-            Duration::from_millis(300),
-            tracker.update(&path, "raced content".to_string()),
-        )
-        .await;
-        assert!(
-            update_while_blocked.is_err(),
-            "update() must block while ensure_open holds the per-path lock for the same path"
-        );
-
-        drop(path_guard);
-
-        handle_open.await.unwrap().unwrap();
-        assert_eq!(tracker.get(&path).unwrap().content(), "fn a() {}");
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
-
-        // With the lock released, `update` must now proceed and observably
-        // apply on top of `ensure_open`'s committed state.
-        let new_version = tracker
-            .update(&path, "fn a() { updated(); }".to_string())
-            .await;
-        assert_eq!(new_version, Some(2));
-        assert_eq!(
-            tracker.get(&path).unwrap().content(),
-            "fn a() { updated(); }"
-        );
     }
 
     /// Regression for #227: N concurrent `ensure_open` calls for the same

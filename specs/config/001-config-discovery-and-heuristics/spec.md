@@ -152,9 +152,9 @@ THEN node_modules is excluded from the search and this nested package.json does 
 | FR-007 | THE SYSTEM SHALL resolve relative `workspace.roots` entries against the config file's own directory for an explicitly-named config (`load_from`'s default), but against the process's current working directory for the auto-discovered global/user config tier (since that tier is not tied to any particular project) | must |
 | FR-008 | THE SYSTEM SHALL provide 6 built-in `LspServerConfig`s (rust-analyzer, pyright, typescript-language-server, gopls, clangd, zls), each gated by `ServerHeuristics::project_markers` naming the files/directories that indicate that language's project type | must |
 | FR-009 | THE SYSTEM SHALL provide ~30 built-in file-extension → language-ID mappings (`default_language_extensions`), user-overridable/-extensible via `workspace.language_extensions` | must |
-| FR-010 | WHEN `ServerHeuristics::is_applicable_recursive` searches a workspace tree for project markers THE SYSTEM SHALL search recursively up to `heuristics_max_depth` (default 10), excluding well-known noise directories (`node_modules`, `target`, `.git`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `build`, `dist`, `.cargo`, `.rustup`, `vendor`, `coverage`, `.next`, `.nuxt`) | must |
+| FR-010 | WHEN `ServerHeuristics::is_applicable_recursive` searches a workspace tree for project markers THE SYSTEM SHALL search recursively up to `heuristics_max_depth` (default 10; `ServerConfig::validate` rejects values above `MAX_HEURISTICS_DEPTH` = 64), excluding well-known noise directories (`node_modules`, `target`, `.git`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `build`, `dist`, `.cargo`, `.rustup`, `vendor`, `coverage`, `.next`, `.nuxt`) | must |
 | FR-011 | WHEN `ServerHeuristics::project_markers` is empty THE SYSTEM SHALL treat the server as always applicable (no heuristic gating) | must |
-| FR-012 | THE SYSTEM SHALL reject (`Error::InvalidConfig`) an empty `workspace.position_encodings` list, an unrecognized encoding string, an empty `workspace.roots` entry, an empty/duplicate-claiming server config (`language_id`, `command`, `handles`), and a `timeout_seconds`/`request_timeout_seconds` of `0` or above `MAX_TIMEOUT_SECONDS` (900s) | must |
+| FR-012 | THE SYSTEM SHALL reject (`Error::InvalidConfig`) an empty `workspace.position_encodings` list, an unrecognized encoding string, an empty `workspace.roots` entry, an empty/duplicate-claiming server config (`language_id`, `command`, `handles`), a `timeout_seconds`/`request_timeout_seconds` of `0` or above `MAX_TIMEOUT_SECONDS` (900s), and a `workspace.heuristics_max_depth` above `MAX_HEURISTICS_DEPTH` (64) | must |
 
 ## 4. Non-Functional Requirements
 
@@ -191,7 +191,7 @@ THEN node_modules is excluded from the search and this nested package.json does 
 | A workspace root that does not exist on disk | `Error::InvalidConfig` naming the missing root and the base directory it was resolved against |
 | `workspace.roots` entry is an empty string | Rejected explicitly (`Path::is_relative()` is `true` for an empty path and would otherwise silently resolve to the base directory unchanged) |
 | Project marker exists only inside `node_modules`/`target`/`.git`/etc. | Not found — these directories are excluded from the recursive walk entirely (not merely deprioritized) |
-| Project marker exists at a depth beyond `heuristics_max_depth` | Not found; increasing `heuristics_max_depth` (default 10) finds it |
+| Project marker exists at a depth beyond `heuristics_max_depth` | Not found; increasing `heuristics_max_depth` (default 10, maximum 64) finds it |
 
 ## 7. Success Criteria
 

@@ -119,7 +119,7 @@ THEN the raw (unconverted) value is used as a fallback rather than erroring the 
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE SYSTEM SHALL convert an MCP position (1-based line/character) to an LSP position (0-based) via `mcp_to_lsp_position`, and the inverse via `lsp_to_mcp_position` | must |
+| FR-001 | THE SYSTEM SHALL convert an MCP position (1-based line/character) to an LSP position (0-based) via `mcp_to_lsp_position` (taking the typed `Position`), and the inverse via `lsp_to_mcp_position` (returning `Position2D`) | must |
 | FR-002 | WHEN the negotiated encoding is `Utf16` THE SYSTEM SHALL perform a pure line/column offset with no `line_text` lookup — byte-for-byte identical to fixed-encoding (pre-negotiation) behavior, since MCP's own columns are already UTF-16 | must |
 | FR-003 | WHEN the negotiated encoding is `Utf8` or `Utf32` AND `line_text` is available THE SYSTEM SHALL re-derive the column in the target encoding's units from the line's actual text, not a fixed arithmetic offset | must |
 | FR-004 | WHEN `line_text` is unavailable (e.g. the file could not be read) THE SYSTEM SHALL fall back to the raw, unconverted MCP/LSP character rather than failing the request | must |
@@ -167,7 +167,7 @@ THEN the raw (unconverted) value is used as a fallback rather than erroring the 
 | ID | Metric | Target |
 |----|--------|--------|
 | SC-001 | `cargo nextest run -E 'package(mcpls-core) and test(encoding)'` | All existing unit tests in `bridge/encoding.rs` pass |
-| SC-002 | Round-trip property: `lsp_to_mcp_position(mcp_to_lsp_position(l, c, ...), ...) == (l, c)` for the `Utf16` fast path | Holds for `line`/`char` in `1..100` (`test_roundtrip`) |
+| SC-002 | Round-trip property: `lsp_to_mcp_position(mcp_to_lsp_position(Position { line: l, character: c }, ...), ...) == Position2D { line: l, character: c }` for the `Utf16` fast path | Holds for `line`/`char` in `1..100` (`test_roundtrip`) |
 | SC-003 | No panic on any fuzzed/adversarial byte offset within `0..=text.len()` | Every offset either succeeds or returns `Err`, never panics |
 
 ## 8. Agent Boundaries

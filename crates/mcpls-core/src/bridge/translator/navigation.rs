@@ -376,7 +376,6 @@ impl Translator {
     /// server is still indexing the workspace after
     /// `INDEXING_READY_TIMEOUT`.
     pub async fn handle_hover(&self, file_path: String, position: Position) -> Result<HoverResult> {
-        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -386,7 +385,7 @@ impl Translator {
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, line, character).await;
+        let lsp_position = ctx.to_lsp(&uri, position).await;
         let response_uri = uri.clone();
 
         let params = LspHoverParams {
@@ -449,12 +448,11 @@ impl Translator {
         R::Params: GotoParams,
         T: GotoResponse,
     {
-        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(file_path, tool, capability, IndexingGate::Required)
             .await?;
         let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, line, character).await;
+        let lsp_position = ctx.to_lsp(&uri, position).await;
 
         let params = R::Params::from_position(TextDocumentPositionParams {
             text_document: TextDocumentIdentifier { uri },
@@ -515,7 +513,6 @@ impl Translator {
         position: Position,
         include_declaration: bool,
     ) -> Result<ReferencesResult> {
-        let Position { line, character } = position;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -525,7 +522,7 @@ impl Translator {
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, line, character).await;
+        let lsp_position = ctx.to_lsp(&uri, position).await;
 
         let params = ReferenceParams {
             text_document_position_params: TextDocumentPositionParams {
