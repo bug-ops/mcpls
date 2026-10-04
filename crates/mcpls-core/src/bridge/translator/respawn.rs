@@ -645,10 +645,7 @@ sleep __SLEEP__
             translator.register_server_config(id.clone(), broken);
 
             let err = translator.respawn_if_dead(&id).await.unwrap_err();
-            assert!(
-                matches!(err, Error::ServerSpawnFailed { .. }),
-                "got {err:?}"
-            );
+            assert!(matches!(err, Error::ServerNotFound { .. }), "got {err:?}");
         }
 
         /// #249: two concurrent tool calls that both observe the same dead
@@ -722,7 +719,7 @@ fi
         /// instead of repeating a real spawn attempt -- proven by the
         /// *kind* of error changing between the two calls, not by timing:
         /// the first call's failure is the genuine `LspServer::spawn` error
-        /// (`Error::ServerSpawnFailed`, from a command that does not
+        /// (`Error::ServerNotFound`, from a command that does not
         /// exist), and the second, immediately following, is the distinct
         /// backoff error.
         #[tokio::test]
@@ -745,7 +742,7 @@ fi
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
             assert!(
-                matches!(err1, Error::ServerSpawnFailed { .. }),
+                matches!(err1, Error::ServerNotFound { .. }),
                 "first attempt should be a real (failed) spawn, got {err1:?}"
             );
 
@@ -782,7 +779,7 @@ fi
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
             assert!(
-                matches!(err1, Error::ServerSpawnFailed { .. }),
+                matches!(err1, Error::ServerNotFound { .. }),
                 "first attempt should be a real (failed) spawn, got {err1:?}"
             );
 

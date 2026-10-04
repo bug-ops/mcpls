@@ -3,11 +3,42 @@
 //! This module defines the canonical error type for the library,
 //! following the Microsoft Rust Guidelines for error handling.
 
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::config::{ServerId, ToolKind};
+use crate::config::{BuiltinServer, ServerId, ToolKind};
+
+/// Display suffix explaining how to fix a missing LSP server executable.
+struct NotFoundGuidance<'a>(&'a str);
+
+impl fmt::Display for NotFoundGuidance<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let command = self.0;
+        if Path::new(command)
+            .parent()
+            .is_some_and(|p| !p.as_os_str().is_empty())
+        {
+            return f.write_str("; check that the configured path exists");
+        }
+        write!(
+            f,
+            "; '{command}' is not on the PATH mcpls runs with -- if it is installed, add its \
+             directory to the MCP client's PATH or set `command` to an absolute path"
+        )?;
+        let Some(builtin) = BuiltinServer::from_command(command) else {
+            return Ok(());
+        };
+        if cfg!(windows) && builtin.is_npm_package() {
+            write!(
+                f,
+                " (npm-installed servers need the `.cmd` name, e.g. `{command}.cmd`)"
+            )?;
+        }
+        write!(f, "; otherwise install it: {}", builtin.install_hint())
+    }
+}
 
 /// Substring rust-analyzer's raw error text carries when a position-based
 /// request's `line`/`character` falls outside the target document. Shared
@@ -191,6 +222,19 @@ pub enum Error {
     #[error("failed to spawn LSP server '{command}': {source}")]
     ServerSpawnFailed {
         /// Command that failed to spawn.
+        command: String,
+        /// Underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// LSP server executable was not found.
+    ///
+    /// Distinct from [`Error::ServerSpawnFailed`] so the message can carry
+    /// PATH and install guidance.
+    #[error("failed to spawn LSP server '{command}': {source}{}", NotFoundGuidance(.command))]
+    ServerNotFound {
+        /// Command that could not be found.
         command: String,
         /// Underlying IO error.
         #[source]
@@ -569,6 +613,7 @@ impl Error {
             | Self::Transport(_)
             | Self::Timeout(_)
             | Self::ServerSpawnFailed { .. }
+            | Self::ServerNotFound { .. }
             | Self::LspProtocolError(_)
             | Self::ServerTerminated
             | Self::ServerUnavailable { .. }
@@ -768,6 +813,41 @@ mod tests {
         if let Ok(value) = result {
             assert_eq!(value, 42);
         }
+    }
+
+    fn not_found(command: &str) -> Error {
+        Error::ServerNotFound {
+            command: command.to_string(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }
+    }
+
+    #[test]
+    fn test_server_not_found_bare_builtin_has_path_and_install_hint() {
+        let msg = not_found("rust-analyzer").to_string();
+        assert!(msg.contains("not on the PATH"), "{msg}");
+        assert!(msg.contains("rustup component add rust-analyzer"), "{msg}");
+    }
+
+    #[test]
+    fn test_server_not_found_bare_unknown_has_no_install_hint() {
+        let msg = not_found("my-custom-lsp").to_string();
+        assert!(msg.contains("not on the PATH"), "{msg}");
+        assert!(!msg.contains("install it"), "{msg}");
+        assert!(!msg.contains(".cmd"), "{msg}");
+    }
+
+    #[test]
+    fn test_server_not_found_path_command_has_no_path_text() {
+        let msg = not_found("/nonexistent/rust-analyzer").to_string();
+        assert!(msg.contains("configured path exists"), "{msg}");
+        assert!(!msg.contains("PATH"), "{msg}");
+        assert!(!msg.contains("install it"), "{msg}");
+    }
+
+    #[test]
+    fn test_server_not_found_maps_to_internal() {
+        assert_eq!(not_found("x").mcp_error_kind(), McpErrorKind::Internal);
     }
 
     #[test]

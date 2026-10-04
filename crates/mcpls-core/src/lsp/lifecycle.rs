@@ -395,10 +395,9 @@ impl LspServer {
             config.server_config.env.len()
         );
 
-        let mut child = command.spawn().map_err(|e| Error::ServerSpawnFailed {
-            command: config.server_config.command.clone(),
-            source: e,
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| spawn_error(config.server_config.command.clone(), e))?;
 
         let stdin = child
             .stdin
@@ -852,6 +851,16 @@ fn resolve_position_encodings(configured: &[String]) -> Vec<PositionEncodingKind
             .collect()
     } else {
         encodings
+    }
+}
+
+/// Classify a spawn failure: a missing executable gets its own variant so the
+/// message can carry PATH and install guidance.
+fn spawn_error(command: String, source: std::io::Error) -> Error {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        Error::ServerNotFound { command, source }
+    } else {
+        Error::ServerSpawnFailed { command, source }
     }
 }
 
@@ -1501,6 +1510,31 @@ mod tests {
         assert!(!result.partial_success());
         assert_eq!(result.server_count(), 0);
         assert_eq!(result.failure_count(), 0);
+    }
+
+    #[test]
+    fn test_spawn_error_classifies_not_found() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        let missing = spawn_error("x".to_string(), IoError::from(ErrorKind::NotFound));
+        assert!(matches!(missing, Error::ServerNotFound { .. }));
+        let denied = spawn_error("x".to_string(), IoError::from(ErrorKind::PermissionDenied));
+        assert!(matches!(denied, Error::ServerSpawnFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_nonexistent_command_is_server_not_found() {
+        let mut server_config = LspServerConfig::rust_analyzer();
+        server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+        let config = ServerInitConfig {
+            server_config,
+            workspace_roots: vec![],
+            initialization_options: None,
+            position_encodings: vec![],
+            notification_tx: None,
+        };
+        let err = LspServer::spawn(config).await.unwrap_err();
+        assert!(matches!(err, Error::ServerNotFound { .. }), "got {err:?}");
     }
 
     #[tokio::test]

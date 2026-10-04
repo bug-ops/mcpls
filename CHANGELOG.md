@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `get_diagnostics` now reports `push_notifications_degraded`, sampled before and after the pull so a restart triggered by the call itself is caught. (#520)
 - Completions and signature help now report `positions_degraded`. (#520)
+- Install and PATH guidance in the error for a missing LSP server executable, with a per-server install hint for the six builtin servers (`BuiltinServer`). (#PR)
 
 ### Changed
 
@@ -20,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** retryable error `data` keys are now `server_id` and `elapsed_secs`, and `McpErrorKind::Retryable` wraps the new typed `RetryableErrorData`. (#520)
 - **Breaking:** `positions_degraded` is now `"request"` or `"response"` instead of a bool, and is omitted when positions are exact. (#520)
 - **Breaking:** `mcp_to_lsp_position`/`lsp_to_mcp_position` take the typed `Position`/`Position2D`, return `Converted` values, and are now crate-private. (#512, #520)
+- **`Error::ServerNotFound`** — Breaking change: a missing server binary now yields this variant instead of `Error::ServerSpawnFailed`. (#PR)
 
 ### Fixed
 
