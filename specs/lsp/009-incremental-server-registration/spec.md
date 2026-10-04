@@ -10,7 +10,7 @@ tags:
   - startup
   - graceful-degradation
 created: 2026-10-04
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp-server-lifecycle-and-respawn]]"
@@ -148,7 +148,7 @@ THEN failures are listed in configuration order and the set of servers equals th
 | FR-004 | THE SYSTEM SHALL perform the per-server settlement writes in this order: (1) record the failure, or register client then server; (2) update the router; (3) remove the server id from the expected-server set. A reader that reads the expected set first and the router last (as `Translator::tool_support_snapshot` does) SHALL never observe a server that is neither expected, nor registered, nor recorded as failed | must |
 | FR-005 | WHILE any server is still initializing THE SYSTEM SHALL keep every route that names it intact: not dropped, not redirected to another server, and its position in the router's server order preserved, so that `resolve_any` (workspace-wide tools) resolves the same server it would have resolved before any registration | must |
 | FR-006 | WHEN every server has settled THE SYSTEM SHALL hold a routing table identical to the one the batch rebind produces today for the same set of registered and failed servers, independent of the order in which servers settled | must |
-| FR-007 | WHEN an explicit-route server fails while the language's catch-all is still initializing THE SYSTEM SHALL NOT bind the dead route to the catch-all until the catch-all has registered, and SHALL drop the route (reporting the recorded failure) if the catch-all subsequently fails; a dead route is still never rebound to a narrowly-scoped (`handles = [...]`) live server | must |
+| FR-007 | WHEN an explicit-route server fails while the language's catch-all is still initializing THE SYSTEM SHALL NOT bind the dead route to the catch-all until the catch-all has registered: the route keeps naming the failed server, so the tool reports that server's recorded failure (`ServerFailedToStart`) during the window, and the diagnostics readers report `FailedToStart`. WHEN the catch-all registers THE SYSTEM SHALL serve the route through it, and SHALL drop the route (reporting the explicit server's recorded failure) if the catch-all fails instead; a dead route is still never rebound to a narrowly-scoped (`handles = [...]`) live server | must |
 | FR-008 | WHEN a tool call's route resolves to a server that is expected but not yet registered THE SYSTEM SHALL return `Error::ServerInitializing` (-32051) naming that server; WHEN it resolves to a registered server THE SYSTEM SHALL serve it normally; WHEN the route was dropped because the server failed THE SYSTEM SHALL return `Error::ServerFailedToStart` with the recorded failure. These semantics are unchanged from today and apply per route, at any moment during startup | must |
 | FR-009 | THE SYSTEM SHALL report `get_tool_support` route status per route using the same registered / initializing / failed / no-server classification, so a language whose server is registered reports `supported` (or capability-specific status) while another language still reports `initializing` | must |
 | FR-010 | WHEN a server registers THE SYSTEM SHALL apply its `IndexingPolicy` to the notification cache and then start its diagnostics pump, before any notification of that server can be consumed; pumps of other servers are neither delayed nor restarted | must |
@@ -157,11 +157,11 @@ THEN failures are listed in configuration order and the set of servers equals th
 | FR-013 | THE `run_init_supervised` outer net SHALL remain: a panic that escapes per-server containment settles every config that has not settled (recorded as `InitTaskPanicked` unless a failure is already recorded), rebinds against what registered, clears the expected set, and marks registered servers push-degraded, exactly as `Translator::settle_after_init_panic` does today | must |
 | FR-014 | THE init body SHALL keep running on the supervised task (or on tasks owned by it such that aborting the outer task aborts them), so that aborting the outer task drops every not-yet-registered `Child` and no LSP process is orphaned ([[lsp/007-lsp-child-process-lifetime/spec\|lsp/007]]) | must |
 | FR-015 | WHEN shutdown or cancellation arrives while servers are initializing THE SYSTEM SHALL abandon all in-flight spawns, with the same bounded wait and abort fallback as `await_lsp_init_handle` today | must |
-| FR-016 | WHEN a server fails THE SYSTEM SHALL publish startup-failure notifications to subscribers of files routed to that server at settlement time of that server (after its record, rebind and expected-set removal), rather than once after the whole batch | should |
+| FR-016 | WHEN a server fails THE SYSTEM SHALL publish startup-failure notifications, at settlement time of that server (after its record, rebind and expected-set removal), to subscribers of every file whose route is now failed, including routes attributed to it through the configured router while a catch-all is pending; re-notifying an earlier failure is harmless, and nothing is published once per batch | should |
 | FR-017 | THE SYSTEM SHALL emit per-server `info!`/`error!` lines as today; aggregate messages ("All N configured LSP server(s) failed to initialize", "Partial server initialization", "Proceeding with N LSP server(s)") SHALL be emitted once, when the last server settles | should |
 | FR-018 | WHEN the last server settles and none registered THE SYSTEM SHALL end in the same state as today's all-failed path: router rebound against an empty set, expected set empty, every tool returning a terminal error (`AllServersFailedToInit` / `ServerFailedToStart`) | must |
 | FR-019 | `LspServer::spawn_batch` SHALL run its configs concurrently and return a `ServerInitResult` whose `failures` are in configuration order | must |
-| FR-020 | THE doc comment of `ToolRouter::rebind_to_registered` (which states it is sound only because registration is all-or-nothing) SHALL be replaced by the contract of whichever mechanism implements FR-005..FR-007 | must |
+| FR-020 | THE doc comment of `ToolRouter::rebind_to_registered` (which stated it is sound only because registration is all-or-nothing) SHALL be replaced by the contract of the mechanism that implements FR-005..FR-007: `ToolRouter::rebind` derives the active table from the immutable configured router and each server's `ServerSettlement` (`Pending`, `Registered`, `Failed`) on every settlement, a pure function of that state, and `rebind_to_registered` is its finished-startup special case | must |
 
 ## 4. Non-Functional Requirements
 
@@ -194,7 +194,7 @@ THEN failures are listed in configuration order and the set of servers equals th
 |----------|-------------------|
 | Slow server listed first, fast second | Fast server registers at its own completion; slow one stays `ServerInitializing` until it settles (US-001) |
 | Fast server fails instantly, slow one still initializing | Failed server's languages return `ServerFailedToStart` at once; slow server's languages return `ServerInitializing` |
-| Explicit-route server fails, catch-all still initializing | Route is not rebound until the catch-all registers (FR-007); if the catch-all then fails, the route is dropped and the explicit server's failure is reported. [NEEDS CLARIFICATION: while the catch-all is pending, should the dead explicit tool report `ServerInitializing` (naming the catch-all) or `ServerFailedToStart`?] |
+| Explicit-route server fails, catch-all still initializing | Route is not rebound until the catch-all registers (FR-007): the dead explicit tool reports `ServerFailedToStart` with the explicit server's failure (diagnostics readers: `FailedToStart`). Workspace-wide tools fall through to the pending catch-all and report `ServerInitializing` naming it, since the failed server leaves the server order. When the catch-all registers the route is served by it; if it fails instead, the route is dropped and the explicit server's failure is reported |
 | Catch-all fails after explicit server was bound to it | The redirect is dropped; affected tools report the explicit server's recorded failure |
 | Two servers settle at the same instant | Result identical to either order (NFR-005); registration of one never observes a half-registered other |
 | All servers fail | Same terminal state as today (FR-018); log once |
@@ -246,14 +246,14 @@ THEN failures are listed in configuration order and the set of servers equals th
 ## 9. Open Questions
 
 > [!question] Open items
-> - [NEEDS CLARIFICATION: mechanism for FR-005..FR-007 -- (a) derive the active routing table on each lookup from `configured_router` plus the settled set (the alternative `ToolRouter::rebind_to_registered`'s own doc names), or (b) keep a mutating router but rebind only on a settled set and re-evaluate on each settlement. Choice affects whether `configured_router` and `rebind_to_registered` remain.]
-> - [NEEDS CLARIFICATION: cap on parallel server initialization -- unbounded (applicable set is small, project-marker filtered) vs a fixed or configurable limit. Machines running several heavy servers (rust-analyzer, OmniSharp, JDT) may spike memory/CPU when all index at once; no measurement exists.]
-> - [NEEDS CLARIFICATION: provisional diagnostics-route count while servers are pending (FR-011): count pending servers that the configured router names as the diagnostics route, or only settled ones. Eviction only matters once the shared cache is full, so the difference may be negligible.]
-> - [NEEDS CLARIFICATION: edge case "explicit-route server failed, catch-all pending" -- which error does the dead tool report during the window (see section 6).]
-> - [NEEDS CLARIFICATION: public API shape -- keep `spawn_batch` as an internal concurrent join returning the full `ServerInitResult` (and implement incremental registration separately in `init_lsp_servers`), or expose a per-server completion stream usable by embedders. Pre-1.0, so a breaking change is acceptable if documented in `CHANGELOG.md`.]
-> - [NEEDS CLARIFICATION: panic containment strategy -- per-future `catch_unwind` on the supervised task (keeps FR-014 trivially) vs a `JoinSet` of per-server tasks (aborted on drop); both must satisfy FR-012..FR-014.]
-> - [NEEDS CLARIFICATION: whether concurrent `LspServer::spawn` is safe with respect to process-wide state in `lsp/process.rs` (`LIFELINE` mutex, `WARNED` flag) added by [[lsp/007-lsp-child-process-lifetime/spec|lsp/007]]; expected to be, but unverified.]
-> - [NEEDS CLARIFICATION: `Translator::tool_support_snapshot` does not read recorded startup failures; confirm that a failed server whose route was dropped is classified as failed (not `no_server`) at every interleaving once failure settlement is per-server.]
+> - [x] Mechanism for FR-005..FR-007: the active table is re-derived from the immutable `configured_router` and the three-state settlement on every settlement (`ToolRouter::rebind`); `rebind_to_registered` remains as the finished-startup wrapper.
+> - [ ] Cap on parallel server initialization: unbounded for now (applicable set is small, project-marker filtered); revisit only if a measurement shows a spike.
+> - [x] Provisional diagnostics-route count (FR-011): non-failed servers, pending ones included, that are the diagnostics route in the current re-derived router.
+> - [x] Edge case "explicit-route server failed, catch-all pending": the dead tool reports `ServerFailedToStart` (FR-007, section 6).
+> - [x] Public API shape: `spawn_batch` is a concurrent join returning the full `ServerInitResult`; incremental registration lives in `init_lsp_servers` over the crate-private `LspServer::start_contained`.
+> - [x] Panic containment: per-future `catch_unwind` on the supervised task (`start_contained`), so aborting the task drops every unregistered child (FR-014).
+> - [x] Concurrent `LspServer::spawn` is safe with `lsp/process.rs` process-wide state: `LIFELINE` is a synchronous mutex never held across an await and `WARNED` is atomic.
+> - [x] `Translator::tool_support_snapshot` still does not read recorded startup failures: a failed server's routes are reported `no_server`, as before; per-route enforcement (`client_for_file`, `diagnostics_route_for_path`) reports the recorded failure, including in the FR-007 window.
 
 ## 10. See Also
 

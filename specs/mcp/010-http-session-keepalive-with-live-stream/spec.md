@@ -9,7 +9,7 @@ tags:
   - http
   - transport
 created: 2026-10-04
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/006-http-stream-liveness/spec|http-stream-liveness]]"
@@ -107,7 +107,7 @@ THEN  the session expires through the mcpls reaper IdleTimeout after the stream 
 | FR-005 | WHEN a client with an open GET stream stops answering probes, THE SYSTEM SHALL close the stream per mcp/006 FR-002 and SHALL then expire the session after `IdleTimeout` measured from the stream close, unchanged | must |
 | FR-006 | WHEN the client sends `DELETE` or closes its stream and sends nothing further, THE SYSTEM SHALL release the session as today (explicit `close_session`; idle expiry after stream close) | must |
 | FR-007 | THE SYSTEM SHALL keep probe replies out of the MCP service (mcp/006 FR-003) unless the chosen design requires forwarding them; any forwarding SHALL NOT produce an outbound message on any stream or an `unknown request id` warning | must |
-| FR-008 | WHILE probing is `StreamLiveness::Disabled`, THE SYSTEM SHALL bound the lifetime of a session whose peer vanished no more loosely than today (a quiet session with no notifications expires within `IdleTimeout` of its last inbound activity), documenting any case where the bound changes. [NEEDS CLARIFICATION: with probing off, no signal distinguishes a live from a vanished client holding an open GET stream. Options: (a) keep today's rmcp `keep_alive` semantics for this mode and accept the 5-minute drop of quiet healthy clients, which is what `--http-stream-liveness off` users have today; (b) let the reaper treat an open stream as alive only when a client-originated signal is recent, bounding the stream lifetime without probes; (c) accept an open stream as alive forever, relying on `TCP_USER_TIMEOUT` and OS timeouts, which is unbounded on macOS/Windows and behind a proxy.] | must |
+| FR-008 | WHILE probing is `StreamLiveness::Disabled`, THE SYSTEM SHALL NOT count an open GET stream as proof of life: the stream does not hold its session, which expires within `IdleTimeout` of the last inbound request (the open counts as activity at the moment it is established), so a vanished peer is bounded exactly as a quiet session is. Decision recorded for option (b) of the original question, accepted as **Breaking**: a healthy `--http-stream-liveness off` listener that only receives notifications is now cut 5 minutes after its last request, which rmcp's notification-fed timer used to prevent. A request-wise POST stream keeps its session while open; if its peer vanished mid-write it is bounded by TCP (`TCP_USER_TIMEOUT` of 60 s on Linux and Android, the OS default elsewhere, or the reverse proxy timeout), no longer by rmcp's 5-minute timer | must |
 | FR-009 | THE SYSTEM SHALL update the `serve_http` doc comment, mcp/002 FR-008 and mcp/006 so that none of them still states that rmcp's `keep_alive` ends a session whose client holds an answering GET stream | must |
 | FR-010 | THE test suite SHALL contain a case that fails on `ad90190`: a session kept alive only by an open GET stream and answered probes, with no notifications and no other requests, survives longer than rmcp's keep_alive using the same effective values (scaled down), through the real rmcp worker, not only through `SessionActivity` | must |
 
@@ -144,7 +144,7 @@ THEN  the session expires through the mcpls reaper IdleTimeout after the stream 
 
 The requirements are outcome-based. Candidate shapes, to be decided in `/sdd plan`:
 
-- **Neutralise rmcp's timer, reaper owns expiry.** `CappedSessionManager::new` builds `LocalSessionManager::default()`, whose `session_config` is a public field; setting `keep_alive` to `None` removes the second owner. That alone loosens bounds in `Disabled` mode and for POST-only streams (FR-008, NFR-001), so the reaper's open-stream rule must be tightened to compensate. Needs a decision on what counts as proof of life when probes are off.
+- **Neutralise rmcp's timer, reaper owns expiry (implemented).** `CappedSessionManager::new` builds `LocalSessionManager::default()`, whose `session_config` is a public field; setting `keep_alive` to `None` removes the second owner. That alone loosens bounds in `Disabled` mode and for POST-only streams (FR-008, NFR-001), so the reaper's open-stream rule must be tightened to compensate. Needs a decision on what counts as proof of life when probes are off.
 - **Feed rmcp's timer.** Forwarding the probe reply (or a synthetic client `ping`) into the worker re-arms the timer, but reverses mcp/006 FR-003 and risks a stray response on the common channel; rejected unless the plan shows it can be done cleanly.
 - **Make the reaper stream-aware.** Count only a probe-acknowledged GET stream as keeping the session alive. This gives `Disabled` mode a defined bound and is the likely companion of the first option.
 - The `serve_http` doc comment and mcp/002 FR-008 name the gap explicitly; both change with this feature (FR-009).
@@ -191,8 +191,9 @@ Release build with `--features transport-http`, HEAD `ad90190`.
 
 > [!question] Open items
 > - [ ] Issue number: #573
-> - [ ] FR-008: the `Disabled`-mode bound, options (a), (b), (c)
-> - [ ] Edge cases: bounding a request-wise POST stream held by a vanished peer; shadow-stream accounting
+> - [x] FR-008: the `Disabled`-mode bound: option (b), recorded as a Breaking change
+> - [x] Edge case: a request-wise POST stream held by a vanished peer is bounded by TCP, not by a stream-age cap (see FR-008)
+> - [ ] Edge cases: shadow-stream accounting
 > - [ ] NFR-007: distinct log line for an rmcp-originated expiry
 > - [ ] Whether a CLI/config setting for the session idle timeout is wanted
 
