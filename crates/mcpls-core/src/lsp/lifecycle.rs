@@ -1951,7 +1951,8 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
             &crate::test_lsp::with_read_preamble(
                 r#"body='{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"rejected by server"}}'
 printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
-sleep 0.02
+# Shell-only pause: an external `sleep` can take longer than the 100 ms EOF grace just to start on a loaded macOS runner.
+i=0; while [ $i -lt 300 ]; do i=$((i+1)); done
 echo 'fatal: bad toolchain' >&2
 "#,
             ),
