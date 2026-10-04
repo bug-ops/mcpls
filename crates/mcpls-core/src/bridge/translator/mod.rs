@@ -33,8 +33,17 @@ mod clock;
 mod diagnostics;
 mod dto;
 mod edits;
+mod enclosing;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod enclosing_tests;
 mod encoding_ctx;
+mod hierarchy;
+mod highlights;
 mod navigation;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod prepare_range_tests;
 mod respawn;
 mod restart;
 mod routing;
@@ -43,20 +52,23 @@ mod symbols;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod testing;
+mod type_hierarchy;
 
 pub use addressing::{
     AddressableTool, Addressed, MAX_SYMBOL_NAME_BYTES, PositionSource, ResolvedSymbol,
     ResolvedTarget, SymbolName, SymbolNameError, SymbolQuery, SymbolTarget,
 };
 pub use dto::*;
+pub use enclosing::{
+    ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,
+    EnrichmentSummary, NotComputedReason, ResultContext, SymbolFidelity, UnavailableReason,
+};
 pub use restart::{
     MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NotificationReceivers, NotificationWiring,
     RestartFailure, RestartOutcome, RestartServerResult, RestartTarget, ServerIds, ServerIdsError,
     ServerRestartEntry,
 };
-#[cfg(test)]
-pub use routing::Capability;
-pub use routing::validate_path_against_roots;
+pub use routing::{Capability, validate_path_against_roots};
 pub use support::{RouteSupport, ToolSupportSnapshot};
 pub use symbols::parse_symbol_kind;
 

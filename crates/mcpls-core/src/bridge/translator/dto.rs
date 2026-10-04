@@ -4,6 +4,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSummary};
+
 /// Convert an LSP integer-valued enum (`SymbolKind`, `CompletionItemKind`,
 /// `InlayHintKind`, ...) to its wire-format `u32`.
 ///
@@ -128,7 +130,7 @@ pub struct HoverResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefinitionResult {
     /// Locations of the definition.
-    pub locations: Vec<Location>,
+    pub locations: Vec<ContextualLocation>,
     /// Whether `locations` was capped below the LSP server's full response
     /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations
     /// exist than are returned here. Omitted (defaults to `false`) when
@@ -141,13 +143,19 @@ pub struct DefinitionResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "PositionDegradation")]
     pub positions_degraded: Option<PositionDegradation>,
+    /// Set only when `context: "enclosing_symbol"` was requested and at least one
+    /// item was looked up: how many files were enriched or skipped, and whether
+    /// the file cap or time budget cut it short.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "EnrichmentSummary")]
+    pub enrichment: Option<EnrichmentSummary>,
 }
 
 /// Result of a references request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReferencesResult {
     /// Locations of all references.
-    pub locations: Vec<Location>,
+    pub locations: Vec<ContextualLocation>,
     /// Whether `locations` was capped below the LSP server's full response
     /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more references
     /// exist than are returned here. Omitted (defaults to `false`) when
@@ -160,6 +168,12 @@ pub struct ReferencesResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "PositionDegradation")]
     pub positions_degraded: Option<PositionDegradation>,
+    /// Set only when `context: "enclosing_symbol"` was requested and at least one
+    /// item was looked up: how many files were enriched or skipped, and whether
+    /// the file cap or time budget cut it short.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "EnrichmentSummary")]
+    pub enrichment: Option<EnrichmentSummary>,
 }
 
 /// Diagnostic severity.
@@ -200,6 +214,25 @@ pub struct DiagnosticsResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "PositionDegradation")]
     pub positions_degraded: Option<PositionDegradation>,
+}
+
+/// Result of a `get_diagnostics` request: [`DiagnosticsResult`] plus the
+/// opt-in enclosing-symbol context.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DocumentDiagnosticsResult {
+    /// List of diagnostics for the document.
+    pub diagnostics: Vec<ContextualDiagnostic>,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
+    /// Set only when `context: "enclosing_symbol"` was requested and the file has
+    /// diagnostics: how many files were enriched or skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "EnrichmentSummary")]
+    pub enrichment: Option<EnrichmentSummary>,
 }
 
 /// A text edit operation.
@@ -607,7 +640,7 @@ pub struct SignatureHelpResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LocationsResult {
     /// Locations found.
-    pub locations: Vec<Location>,
+    pub locations: Vec<ContextualLocation>,
     /// Whether `locations` was capped below the LSP server's full response
     /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations
     /// exist than are returned here. Omitted (defaults to `false`) when
@@ -619,6 +652,12 @@ pub struct LocationsResult {
     /// or only the returned offsets are affected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions_degraded: Option<PositionDegradation>,
+    /// Set only when `context: "enclosing_symbol"` was requested and at least one
+    /// item was looked up: how many files were enriched or skipped, and whether
+    /// the file cap or time budget cut it short.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "EnrichmentSummary")]
+    pub enrichment: Option<EnrichmentSummary>,
 }
 
 /// A single inlay hint entry.
@@ -657,6 +696,161 @@ pub struct InlayHintsResult {
     /// servers only); omitted when all are exact. Tells whether the queried position
     /// or only the returned offsets are affected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_degraded: Option<PositionDegradation>,
+}
+
+/// A type hierarchy item, returned by `prepare_type_hierarchy`,
+/// `get_supertypes` and `get_subtypes` and accepted back as the typed `item`
+/// input of the latter two.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::TypeHierarchyItemResult;
+///
+/// let item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({
+///     "name": "Base", "kind": 5, "uri": "file:///a.cpp",
+///     "range": {"start": {"line": 1, "character": 1}, "end": {"line": 2, "character": 1}},
+///     "selectionRange": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 11}},
+/// }))
+/// .unwrap();
+/// assert_eq!(item.name, "Base");
+/// assert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());
+/// ```
+///
+/// Same shape as a call hierarchy item; `data` is opaque to the caller
+/// and meaningful only to the server that produced the item.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TypeHierarchyItemResult {
+    /// Name of the type.
+    pub name: String,
+    /// LSP numeric symbol kind (e.g. 5 for Class).
+    pub kind: u32,
+    /// More detail for this item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// URI of the document.
+    pub uri: String,
+    /// Range of the type.
+    pub range: Range,
+    /// Selection range (identifier location).
+    #[serde(rename = "selectionRange")]
+    pub selection_range: Range,
+    /// Opaque data to pass back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// Whether this item is not provably inside any configured workspace
+    /// root -- see [`Location::out_of_workspace`]. Ignored on input.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub out_of_workspace: bool,
+}
+
+/// Result of a type hierarchy prepare, supertypes or subtypes request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TypeHierarchyResult {
+    /// Type hierarchy items at the position, or the supertypes/subtypes of
+    /// the queried item.
+    pub items: Vec<TypeHierarchyItemResult>,
+    /// Whether `items` was capped below the LSP server's full response (see
+    /// `MAX_NORMALIZED_LOCATIONS`). Omitted (defaults to `false`) when
+    /// serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
+}
+
+/// Whether the symbol at a position can be renamed, as answered by
+/// `textDocument/prepareRename`.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::PrepareRenameOutcome;
+///
+/// let outcome = PrepareRenameOutcome::NotRenameable { server_message: None };
+/// assert_eq!(
+///     serde_json::to_value(&outcome).unwrap(),
+///     serde_json::json!({"status": "not_renameable"})
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PrepareRenameOutcome {
+    /// The identifier can be renamed.
+    Renameable {
+        /// Range of the identifier that a rename would replace.
+        range: Range,
+        /// Current name of the identifier, when the server supplies it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+    },
+    /// The server accepts a rename here but leaves the identifier range to the
+    /// client's own word-selection rule; no range is invented.
+    DefaultBehavior,
+    /// The position cannot be renamed. Distinct from a transport failure and
+    /// from a server that does not support rename preparation.
+    NotRenameable {
+        /// The server's own explanation, when it reported one as an error.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_message: Option<String>,
+    },
+}
+
+/// Result of a prepare rename request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PrepareRenameResult {
+    /// The rename-preparation verdict.
+    #[serde(flatten)]
+    pub outcome: PrepareRenameOutcome,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
+}
+
+/// How a document highlight occurrence uses its symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentHighlightKind {
+    /// A textual occurrence; also what a server that omits the kind means.
+    Text,
+    /// A read access, such as reading a variable.
+    Read,
+    /// A write access, such as assigning a variable.
+    Write,
+}
+
+/// One occurrence of a symbol within a document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DocumentHighlightEntry {
+    /// Range of the occurrence.
+    pub range: Range,
+    /// How the occurrence uses the symbol.
+    pub kind: DocumentHighlightKind,
+}
+
+/// Result of a document highlights request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DocumentHighlightsResult {
+    /// Occurrences of the symbol at the position within the file.
+    pub highlights: Vec<DocumentHighlightEntry>,
+    /// Whether `highlights` was capped below the LSP server's full response
+    /// (see `MAX_NORMALIZED_LOCATIONS`). Omitted (defaults to `false`) when
+    /// serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
+    /// servers only); omitted when all are exact. Tells whether the queried position
+    /// or only the returned offsets are affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
     pub positions_degraded: Option<PositionDegradation>,
 }
 

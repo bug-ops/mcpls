@@ -277,6 +277,68 @@ impl ResolvedRoot {
     }
 }
 
+/// A symlink found directly under the filesystem root, with its target
+/// already resolved lexically against that directory.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootLink {
+    link: PathBuf,
+    target: PathBuf,
+}
+
+/// Lists the symlinks directly under `links_dir` without following them, so
+/// automount or dead network links are never touched. Any I/O error yields
+/// an empty list.
+#[cfg(unix)]
+fn read_root_links(links_dir: &Path) -> Vec<RootLink> {
+    let entries = match std::fs::read_dir(links_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::debug!(dir = %links_dir.display(), %err, "cannot list root-level links");
+            return Vec::new();
+        }
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_symlink()))
+        .filter_map(|entry| {
+            let link = entry.path();
+            let target = std::fs::read_link(&link).ok()?;
+            Some(RootLink {
+                target: lexically_normalize(&links_dir.join(target)),
+                link,
+            })
+        })
+        .collect()
+}
+
+/// Candidate aliases of `roots` that differ only by a root-level symlink whose
+/// target is a component prefix of the root. Unverified: callers must check
+/// `canonicalize(alias) == root`.
+#[cfg(unix)]
+fn system_symlink_aliases(roots: &[PathBuf], links: &[RootLink]) -> Vec<(PathBuf, PathBuf)> {
+    let mut candidates = Vec::new();
+    for root in roots {
+        for RootLink { link, target } in links {
+            if let Ok(rest) = root.strip_prefix(target) {
+                candidates.push((link.join(rest), root.clone()));
+            }
+        }
+    }
+    candidates
+}
+
+/// Aliases of `roots` through symlinks directly under `links_dir`, each
+/// verified to canonicalize back to its own root.
+#[cfg(unix)]
+fn verified_system_aliases(links_dir: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    system_symlink_aliases(roots, &read_root_links(links_dir))
+        .into_iter()
+        .filter(|(alias, root)| dunce::canonicalize(alias).is_ok_and(|real| &real == root))
+        .map(|(alias, _)| alias)
+        .collect()
+}
+
 /// The canonical workspace roots plus the lexical aliases they may be named by.
 ///
 /// A path is admitted by `validate_path_against_roots` only if it passes the
@@ -380,7 +442,31 @@ impl WorkspaceRoots {
             .flat_map(ResolvedRoot::verified_aliases)
             .collect();
         let canonical = resolved.into_iter().map(|root| root.canonical).collect();
-        Ok(Self::from_parts(canonical, aliases))
+        Ok(Self::from_parts(canonical, aliases).with_system_aliases())
+    }
+
+    /// Adds aliases that differ from a canonical root only through a
+    /// root-level system symlink (`/tmp`, `/var` on macOS), discovered once
+    /// from `/`. Each alias is verified to canonicalize to its own root, so
+    /// the admitted file set never widens. No-op on non-Unix platforms.
+    #[cfg(unix)]
+    #[must_use]
+    fn with_system_aliases(self) -> Self {
+        self.with_system_aliases_in(Path::new("/"))
+    }
+
+    /// Non-Unix platforms have no root-level system symlinks to admit.
+    #[cfg(not(unix))]
+    #[must_use]
+    const fn with_system_aliases(self) -> Self {
+        self
+    }
+
+    #[cfg(unix)]
+    fn with_system_aliases_in(self, links_dir: &Path) -> Self {
+        let extra = verified_system_aliases(links_dir, &self.canonical);
+        let aliases = self.aliases.iter().cloned().chain(extra).collect();
+        Self::from_parts(self.canonical.to_vec(), aliases)
     }
 
     /// The canonical roots, in configuration order.
@@ -869,7 +955,7 @@ mod tests {
         let roots = resolve_in(&[link.join("..")], &base).unwrap();
 
         assert_eq!(roots.canonical(), [base.join("data/a")]);
-        assert!(roots.aliases.is_empty());
+        assert!(roots.aliases.iter().all(|alias| !alias.starts_with(&home)));
         assert!(!roots.admits_lexically(&home.join("anything")));
     }
 
@@ -898,5 +984,100 @@ mod tests {
         let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&raw)).unwrap();
 
         assert!(roots.admits_lexically(&raw.join("a.rs")));
+    }
+
+    #[cfg(unix)]
+    fn fake_root() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        (dir, base)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_aliases_symlink_table() {
+        let (_guard, base) = fake_root();
+        let real = base.join("private/tmp/proj");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(base.join("private/tmp"), base.join("tmp")).unwrap();
+        std::os::unix::fs::symlink(base.join("private/var"), base.join("var")).unwrap();
+        std::os::unix::fs::symlink("private/tmp", base.join("rel")).unwrap();
+
+        let roots =
+            WorkspaceRoots::for_test(vec![real.clone()], vec![]).with_system_aliases_in(&base);
+
+        assert!(roots.admits_lexically(&base.join("tmp/proj/a.rs")));
+        assert!(roots.admits_lexically(&base.join("rel/proj/a.rs")));
+        assert!(!roots.admits_lexically(&base.join("var/proj/a.rs")));
+        assert!(!roots.admits_lexically(&base.join("tmp/other/a.rs")));
+        assert!(roots.contains_canonical(&real.join("a.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_aliases_reject_forged_alias() {
+        let (_guard, base) = fake_root();
+        let real = base.join("p/b/proj");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere/deep")).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere/b/proj")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere/deep"), base.join("p/a")).unwrap();
+        // Lexically `p/a/../b` is `p/b`, physically it is `elsewhere/b`.
+        std::os::unix::fs::symlink("p/a/../b", base.join("x")).unwrap();
+
+        let roots = WorkspaceRoots::for_test(vec![real], vec![]).with_system_aliases_in(&base);
+
+        assert!(!roots.admits_lexically(&base.join("x/proj/a.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_aliases_ignore_file_dangling_and_looping_links() {
+        let (_guard, base) = fake_root();
+        let real = base.join("gone/proj");
+        let file = base.join("file");
+        std::fs::write(&file, "").unwrap();
+        std::os::unix::fs::symlink(&file, base.join("to_file")).unwrap();
+        std::os::unix::fs::symlink(base.join("gone"), base.join("dangling")).unwrap();
+        std::os::unix::fs::symlink("loop_b", base.join("loop_a")).unwrap();
+        std::os::unix::fs::symlink("loop_a", base.join("loop_b")).unwrap();
+
+        let roots = WorkspaceRoots::for_test(vec![real], vec![]).with_system_aliases_in(&base);
+
+        assert!(roots.aliases.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_aliases_unreadable_dir_yields_none() {
+        let (_guard, base) = fake_root();
+        let roots = WorkspaceRoots::for_test(vec![base.join("r")], vec![])
+            .with_system_aliases_in(&base.join("missing"));
+        assert!(roots.aliases.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_aliases_dotdot_and_sibling_rejected_without_stat() {
+        let roots = WorkspaceRoots::for_test(
+            vec![PathBuf::from("/private/tmp/proj")],
+            vec![PathBuf::from("/tmp/proj")],
+        );
+        assert!(roots.admits_lexically(&PathBuf::from("/tmp/proj/a.rs")));
+        assert!(!roots.admits_lexically(&lexically_normalize(Path::new("/tmp/proj/../other/a"))));
+        assert!(!roots.admits_lexically(Path::new("/tmp/projx/a.rs")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_system_aliases_real_tmp_on_macos() {
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let canonical = dunce::canonicalize(dir.path()).unwrap();
+        assert!(canonical.starts_with("/private/tmp"));
+
+        let roots = WorkspaceRoots::for_test(vec![canonical], vec![]).with_system_aliases();
+
+        assert!(roots.admits_lexically(&dir.path().join("a.rs")));
+        assert!(!roots.admits_lexically(Path::new("/tmp/other-dir/a.rs")));
     }
 }

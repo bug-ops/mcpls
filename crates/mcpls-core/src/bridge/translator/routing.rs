@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::Translator;
+use super::dto::Position;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
 use crate::bridge::{ClientPath, InFlightGuard, WorkspaceRoots, lexically_normalize, lock_std};
@@ -16,6 +17,40 @@ pub(super) const MAX_POSITION_VALUE: u32 = 1_000_000;
 
 /// Maximum allowed range size in lines.
 pub(super) const MAX_RANGE_LINES: u32 = 10_000;
+
+/// Reject a 1-based position that is zero or beyond [`MAX_POSITION_VALUE`].
+pub(super) fn validate_position(position: Position) -> Result<()> {
+    let Position { line, character } = position;
+    if line < 1 || character < 1 {
+        return Err(Error::InvalidToolParams(
+            "Line and character positions must be >= 1".to_string(),
+        ));
+    }
+    if line > MAX_POSITION_VALUE || character > MAX_POSITION_VALUE {
+        return Err(Error::InvalidToolParams(format!(
+            "Position values must be <= {MAX_POSITION_VALUE}"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a 1-based range whose ends are invalid positions, that spans more
+/// than [`MAX_RANGE_LINES`], or whose start is after its end.
+pub(super) fn validate_range(start: Position, end: Position) -> Result<()> {
+    validate_position(start)?;
+    validate_position(end)?;
+    if end.line.saturating_sub(start.line) > MAX_RANGE_LINES {
+        return Err(Error::InvalidToolParams(format!(
+            "Range size must be <= {MAX_RANGE_LINES} lines"
+        )));
+    }
+    if start.line > end.line || (start.line == end.line && start.character > end.character) {
+        return Err(Error::InvalidToolParams(
+            "Start position must be before or equal to end position".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Total time `Translator::flush_pending_closes` may spend per call.
 const FLUSH_PENDING_CLOSES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -201,6 +236,17 @@ pub enum Capability {
     WorkspaceSymbols,
     /// `declarationProvider` (`textDocument/declaration`).
     Declaration,
+    /// `typeHierarchyProvider` (`textDocument/prepareTypeHierarchy`,
+    /// `typeHierarchy/supertypes`, `typeHierarchy/subtypes`).
+    TypeHierarchy,
+    /// `renameProvider.prepareProvider` (`textDocument/prepareRename`). Gated
+    /// on the [`ToolKind::Rename`] route, so it is never the primary
+    /// capability of its tool; see [`Self::is_primary`].
+    PrepareRename,
+    /// `documentHighlightProvider` (`textDocument/documentHighlight`).
+    DocumentHighlights,
+    /// `documentRangeFormattingProvider` (`textDocument/rangeFormatting`).
+    FormatRange,
 }
 
 #[allow(
@@ -209,8 +255,8 @@ pub enum Capability {
     reason = "compile-time check; the loop condition keeps `i` below `ALL.len()`"
 )]
 const _: () = {
-    assert!(Capability::ALL.len() == Capability::Declaration as usize + 1);
-    assert!(Capability::ALL.len() <= u16::BITS as usize);
+    assert!(Capability::ALL.len() == Capability::FormatRange as usize + 1);
+    assert!(Capability::ALL.len() <= u32::BITS as usize);
     let mut i = 0;
     while i < Capability::ALL.len() {
         assert!(Capability::ALL[i] as usize == i);
@@ -220,7 +266,7 @@ const _: () = {
 
 impl Capability {
     /// Every capability, in discriminant order.
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 19] = [
         Self::Completions,
         Self::SignatureHelp,
         Self::InlayHints,
@@ -236,6 +282,10 @@ impl Capability {
         Self::DocumentSymbols,
         Self::WorkspaceSymbols,
         Self::Declaration,
+        Self::TypeHierarchy,
+        Self::PrepareRename,
+        Self::DocumentHighlights,
+        Self::FormatRange,
     ];
 
     /// The [`ToolKind`] whose route this capability gates -- the single
@@ -251,18 +301,29 @@ impl Capability {
             Self::Implementation => ToolKind::Implementation,
             Self::TypeDefinition => ToolKind::TypeDefinition,
             Self::CallHierarchy => ToolKind::CallHierarchy,
-            Self::Rename => ToolKind::Rename,
+            Self::Rename | Self::PrepareRename => ToolKind::Rename,
             Self::FormatDocument => ToolKind::FormatDocument,
             Self::CodeActions => ToolKind::CodeActions,
             Self::DocumentSymbols => ToolKind::DocumentSymbols,
             Self::WorkspaceSymbols => ToolKind::WorkspaceSymbols,
             Self::Declaration => ToolKind::Declaration,
+            Self::TypeHierarchy => ToolKind::TypeHierarchy,
+            Self::DocumentHighlights => ToolKind::DocumentHighlights,
+            Self::FormatRange => ToolKind::FormatRange,
         }
     }
 
-    /// The capability gating `tool`, or `None` for a tool dispatched without
-    /// a capability check (`Diagnostics`). Derived from [`Self::tool_kind`]
-    /// over [`Self::ALL`], so the pairing has a single source.
+    /// Whether this is the capability [`Self::for_tool`] returns for its
+    /// [`ToolKind`]. Only [`Self::PrepareRename`] is not: it shares the
+    /// `Rename` route, and `Rename` precedes it in [`Self::ALL`].
+    pub(crate) const fn is_primary(self) -> bool {
+        !matches!(self, Self::PrepareRename)
+    }
+
+    /// The primary capability gating `tool` (the first match in
+    /// [`Self::ALL`]), or `None` for a tool dispatched without a capability
+    /// check (`Diagnostics`). Derived from [`Self::tool_kind`] over
+    /// [`Self::ALL`], so the pairing has a single source.
     pub(crate) const fn for_tool(tool: ToolKind) -> Option<Self> {
         Self::find_gating(&Self::ALL, tool)
     }
@@ -271,7 +332,7 @@ impl Capability {
         match candidates {
             // `PartialEq` is not const, so compare discriminants.
             [first, rest @ ..] => {
-                if first.tool_kind() as u8 == tool as u8 {
+                if first.is_primary() && first.tool_kind() as u8 == tool as u8 {
                     Some(*first)
                 } else {
                     Self::find_gating(rest, tool)
@@ -311,10 +372,15 @@ impl Capability {
             Self::DocumentSymbols => "documentSymbolProvider",
             Self::WorkspaceSymbols => "workspaceSymbolProvider",
             Self::Declaration => "declarationProvider",
+            Self::TypeHierarchy => "typeHierarchyProvider",
+            Self::PrepareRename => "renameProvider.prepareProvider",
+            Self::DocumentHighlights => "documentHighlightProvider",
+            Self::FormatRange => "documentRangeFormattingProvider",
         }
     }
 
     /// Whether `caps` advertises support for this capability.
+    #[allow(clippy::too_many_lines, reason = "one match arm per capability")]
     pub(crate) const fn is_supported(self, caps: &lsp_types::ServerCapabilities) -> bool {
         match self {
             Self::Completions => caps.completion_provider.is_some(),
@@ -413,6 +479,37 @@ impl Capability {
                     lsp_types::DeclarationProvider::Bool(true)
                         | lsp_types::DeclarationProvider::DeclarationOptions(_)
                         | lsp_types::DeclarationProvider::DeclarationRegistrationOptions(_)
+                )
+            ),
+            Self::TypeHierarchy => matches!(
+                caps.type_hierarchy_provider,
+                Some(
+                    lsp_types::TypeHierarchyProvider::Bool(true)
+                        | lsp_types::TypeHierarchyProvider::TypeHierarchyOptions(_)
+                        | lsp_types::TypeHierarchyProvider::TypeHierarchyRegistrationOptions(_)
+                )
+            ),
+            Self::PrepareRename => matches!(
+                caps.rename_provider,
+                Some(lsp_types::RenameProvider::RenameOptions(
+                    lsp_types::RenameOptions {
+                        prepare_provider: Some(true),
+                        ..
+                    }
+                ))
+            ),
+            Self::DocumentHighlights => matches!(
+                caps.document_highlight_provider,
+                Some(
+                    lsp_types::DocumentHighlightProvider::Bool(true)
+                        | lsp_types::DocumentHighlightProvider::DocumentHighlightOptions(_)
+                )
+            ),
+            Self::FormatRange => matches!(
+                caps.document_range_formatting_provider,
+                Some(
+                    lsp_types::DocumentRangeFormattingProvider::Bool(true)
+                        | lsp_types::DocumentRangeFormattingProvider::DocumentRangeFormattingOptions(_)
                 )
             ),
         }
@@ -1183,11 +1280,11 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::NotificationCache;
     use crate::bridge::translator::assist::MAX_TRIGGER_CHARACTER_BYTES;
     use crate::bridge::translator::dto::Position;
     use crate::bridge::translator::edits::MAX_NEW_NAME_LENGTH;
     use crate::bridge::translator::testing::*;
+    use crate::bridge::{NotificationCache, ResultContext};
     use crate::config::{LspServerConfig, ToolRouter};
     use crate::error::Error;
     use crate::lsp::LspServer;
@@ -1978,7 +2075,11 @@ mod tests {
         let cache = Mutex::new(crate::bridge::NotificationCache::new());
 
         let err = translator
-            .handle_diagnostics(client_path(file.to_string_lossy().into_owned()), &cache)
+            .handle_diagnostics(
+                client_path(file.to_string_lossy().into_owned()),
+                ResultContext::None,
+                &cache,
+            )
             .await
             .unwrap_err();
 
@@ -2725,7 +2826,7 @@ mod tests {
             let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
             tokio::spawn(async move {
                 translator
-                    .handle_diagnostics(file, &notification_cache)
+                    .handle_diagnostics(file, ResultContext::None, &notification_cache)
                     .await
             })
         };
@@ -3130,6 +3231,7 @@ mod tests {
                     line: 1,
                     character: 1,
                 },
+                ResultContext::None,
             )
             .await;
 
@@ -3163,6 +3265,7 @@ mod tests {
                     character: 1,
                 },
                 false,
+                ResultContext::None,
             )
             .await;
 
@@ -3298,6 +3401,7 @@ mod tests {
                     line: 1,
                     character: 1,
                 },
+                ResultContext::None,
             )
             .await;
 
@@ -3330,6 +3434,7 @@ mod tests {
                     line: 1,
                     character: 1,
                 },
+                ResultContext::None,
             )
             .await;
 

@@ -12,9 +12,10 @@ use tokio::sync::Mutex;
 
 use super::Translator;
 use super::dto::{
-    Diagnostic, DiagnosticSeverity, DiagnosticsResult, Position2D, Range, ServerLogsResult,
-    ServerMessagesResult,
+    Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentDiagnosticsResult, Position2D,
+    Range, ServerLogsResult, ServerMessagesResult,
 };
+use super::enclosing::{ContextualDiagnostics, ResultContext};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::validate_path_against_roots;
 use crate::bridge::encoding::PositionEncoding;
@@ -159,8 +160,9 @@ impl Translator {
     pub async fn handle_diagnostics(
         &self,
         file_path: ClientPath,
+        context: ResultContext,
         notification_cache: &Mutex<NotificationCache>,
-    ) -> Result<DiagnosticsResult> {
+    ) -> Result<DocumentDiagnosticsResult> {
         let doc = self
             .prepare_document(&file_path, ToolKind::Diagnostics)
             .await?;
@@ -185,7 +187,7 @@ impl Translator {
         };
         let diag_info = sources.merge();
 
-        match pull_response {
+        let merged = match pull_response {
             Ok(response) => {
                 let items = match response {
                     DocumentDiagnosticReportResult::Report(report) => match report {
@@ -227,7 +229,25 @@ impl Translator {
                     Ok(cache_only)
                 }
             }
-        }
+        }?;
+
+        let ContextualDiagnostics {
+            diagnostics,
+            enrichment,
+            positions_degraded,
+        } = self
+            .contextualize_diagnostics(
+                uri.as_ref(),
+                merged.diagnostics,
+                context,
+                merged.positions_degraded,
+            )
+            .await;
+        Ok(DocumentDiagnosticsResult {
+            diagnostics,
+            positions_degraded,
+            enrichment,
+        })
     }
 
     /// Convert a cached diagnostics entry into the MCP-facing result shape.
@@ -1381,7 +1401,11 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_diagnostics(client_path(path_str), &notification_cache)
+                    .handle_diagnostics(
+                        client_path(path_str),
+                        ResultContext::None,
+                        &notification_cache,
+                    )
                     .await
             })
         };
@@ -1451,7 +1475,11 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_diagnostics(client_path(path_str), &notification_cache)
+                    .handle_diagnostics(
+                        client_path(path_str),
+                        ResultContext::None,
+                        &notification_cache,
+                    )
                     .await
             })
         };
@@ -1517,7 +1545,11 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_diagnostics(client_path(path_str), &notification_cache)
+                    .handle_diagnostics(
+                        client_path(path_str),
+                        ResultContext::None,
+                        &notification_cache,
+                    )
                     .await
             })
         };

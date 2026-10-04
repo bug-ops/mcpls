@@ -46,7 +46,7 @@ Each entry defines one language server; a language may have multiple entries (se
 | `handles` | array of routing values | no | unset = catch-all | Restricts a server to specific tools; see [Tool routing](#tool-routing-handles) below. |
 | `timeout_seconds` | integer | no | `30` | Timeout for the `initialize` handshake only. Rejects `0`. |
 | `request_timeout_seconds` | integer | no | `30` | Timeout per individual LSP request after initialization (hover, definition, etc.), independent of `timeout_seconds`. Rejects `0`. Worst case per tool call: `4 * request_timeout_seconds + 3.5s` (retry budget on `-32802` responses). The completions timeout is `min(request_timeout_seconds, 10s)` — a value below 10 lowers the completions cap too; only values above 10 get clamped down to it. |
-| `initialization_options` | table | no | `{}` | Server-specific options passed in the LSP `initialize` request, e.g. `cargo.features = "all"` for rust-analyzer. |
+| `initialization_options` | table | no | `{}` | Server-specific options passed in the LSP `initialize` request, e.g. `cargo.features = "all"` for rust-analyzer. For `typescript-language-server`, mcpls adds `tsserver.path` (the bundled tsserver) unless you set it or set other options without it. |
 | `env` | table | no | `{}` | See [Environment passthrough](#environment-passthrough-env) below. |
 | `heuristics.project_markers` | array of strings | no | unset | Marker files/directories that make this server applicable. mcpls searches for them recursively through the workspace tree up to `heuristics_max_depth` levels, skipping `node_modules`, `target`, and `.git`, e.g. `["pyproject.toml"]`. |
 
@@ -64,15 +64,18 @@ a few map many-to-one:
 | `implementation` | `go_to_implementation` |
 | `references` | `get_references` |
 | `diagnostics` | `get_diagnostics` (pull) **and** `get_cached_diagnostics` (same route serves both) |
-| `rename` | `rename_symbol` |
+| `rename` | `rename_symbol`, `prepare_rename` |
 | `completions` | `get_completions` |
 | `signature_help` | `get_signature_help` |
 | `document_symbols` | `get_document_symbols` |
 | `workspace_symbols` | `workspace_symbol_search` (see the special case below) |
 | `format_document` | `format_document` |
+| `format_range` | `format_range` |
 | `code_actions` | `get_code_actions` |
 | `call_hierarchy` | `prepare_call_hierarchy`, `get_incoming_calls`, `get_outgoing_calls`, sharing one route: an incoming/outgoing-calls lookup only makes sense against the server that produced the originating call-hierarchy item |
 | `inlay_hints` | `get_inlay_hints` |
+| `type_hierarchy` | `prepare_type_hierarchy`, `get_supertypes`, `get_subtypes`, sharing one route like call hierarchy |
+| `document_highlights` | `get_document_highlights` |
 
 Rules:
 

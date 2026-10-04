@@ -404,6 +404,7 @@ async fn test_definition_user_struct() {
                 line: 9,
                 character: 16, // Position on "User"
             },
+            mcpls_core::bridge::ResultContext::None,
         ),
     )
     .await;
@@ -454,6 +455,7 @@ async fn test_definition_across_files() {
                 line: 3,
                 character: 24, // Position on "Repository"
             },
+            mcpls_core::bridge::ResultContext::None,
         ),
     )
     .await;
@@ -495,6 +497,7 @@ async fn test_references_create_repo_function() {
                 character: 12, // Position on "create_repo"
             },
             true, // Include declaration
+            mcpls_core::bridge::ResultContext::None,
         ),
     )
     .await;
@@ -538,6 +541,7 @@ async fn test_references_user_struct() {
                 character: 15, // Position on "User"
             },
             true,
+            mcpls_core::bridge::ResultContext::None,
         ),
     )
     .await;
@@ -601,10 +605,11 @@ async fn test_diagnostics_with_error() {
         attempts += 1;
         let result = timeout(
             Duration::from_secs(10),
-            translator
-                .lock()
-                .await
-                .handle_diagnostics(client_path(lib_file.clone()), &notification_cache),
+            translator.lock().await.handle_diagnostics(
+                client_path(lib_file.clone()),
+                mcpls_core::bridge::ResultContext::None,
+                &notification_cache,
+            ),
         )
         .await;
 
@@ -658,6 +663,7 @@ async fn test_diagnostics_no_errors() {
         Duration::from_secs(10),
         translator.lock().await.handle_diagnostics(
             client_path(types_file.to_string_lossy().into_owned()),
+            mcpls_core::bridge::ResultContext::None,
             &notification_cache,
         ),
     )

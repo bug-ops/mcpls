@@ -27,7 +27,7 @@ The codebase is organized into four modules that match the four-block spec numbe
 
 - **`config/`** — TOML config loading, LSP server discovery with project-marker heuristics (Cargo.toml → rust-analyzer, package.json → typescript-language-server, etc.), auto-generates default config with 30 language mappings on first run
 - **`lsp/`** — LSP client: spawns server processes, manages JSON-RPC 2.0 over stdin/stdout, handles lifecycle (initialize → shutdown)
-- **`mcp/`** — MCP server (via `rmcp` crate): defines 23 tools (hover, definition, references, diagnostics, rename, format, call hierarchy, signature help, implementation/type-definition/declaration, inlay hints, `restart_server`, etc.), dispatches tool calls to the bridge
+- **`mcp/`** — MCP server (via `rmcp` crate): defines 29 tools (hover, definition, references, diagnostics, rename and `prepare_rename`, document and range format, call and type hierarchy, document highlights, signature help, implementation/type-definition/declaration, inlay hints, `restart_server`, etc.), dispatches tool calls to the bridge
 - **`bridge/`** — protocol translation layer:
   - `translator/` — core MCP→LSP request/response mapping (organized into submodules: diagnostics, navigation, routing, symbols, call_hierarchy, assist, edits, respawn, characterization, clock, dto, encoding_ctx)
   - `state.rs` — lazy document state tracking (textDocument/didOpen sent on first access)

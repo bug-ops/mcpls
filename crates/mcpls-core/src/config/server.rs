@@ -171,6 +171,13 @@ pub struct LspServerConfig {
     pub file_patterns: Vec<String>,
 
     /// LSP initialization options (server-specific).
+    ///
+    /// For typescript-language-server, `None` lets mcpls pin the tsserver
+    /// bundled next to the server (`tsserver.path`) so a workspace-supplied
+    /// tsserver is not run. Setting `tsserver.path` here overrides the pin,
+    /// for example to opt back in to the workspace's TypeScript. Setting any
+    /// other options disables the pin: mcpls does not merge into user options.
+    /// See `SECURITY.md` for the trust model.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
 
@@ -459,6 +466,10 @@ impl LspServerConfig {
     }
 
     /// Create a default configuration for TypeScript language server.
+    ///
+    /// `initialization_options` stays `None` here; at startup mcpls fills in
+    /// the tsserver pin when it can resolve the server's bundled tsserver (see
+    /// [`Self::initialization_options`]).
     #[must_use]
     pub fn typescript() -> Self {
         Self::builtin(

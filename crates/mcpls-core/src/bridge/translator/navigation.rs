@@ -14,6 +14,7 @@ use super::dto::{
     DefinitionResult, HoverResult, Location, LocationsResult, Position, PositionDegradation,
     ReferencesResult,
 };
+use super::enclosing::{ContextualLocation, ContextualLocations, ResultContext};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::indexing::{
@@ -517,6 +518,15 @@ impl Translator {
         Ok(result)
     }
 
+    async fn contextualize(
+        &self,
+        normalized: NormalizedLocations,
+        context: ResultContext,
+    ) -> ContextualLocations {
+        self.contextualize_locations(normalized.locations, context, normalized.positions_degraded)
+            .await
+    }
+
     /// Shared implementation of the go-to-X handlers (`textDocument/definition`,
     /// `textDocument/implementation`, `textDocument/typeDefinition`): gate on
     /// the request's capability and on indexing readiness, translate the MCP
@@ -572,23 +582,27 @@ impl Translator {
         &self,
         file_path: ClientPath,
         position: Position,
+        context: ResultContext,
     ) -> Result<DefinitionResult> {
-        let NormalizedLocations {
-            locations,
-            truncated,
-            positions_degraded,
-        } = self
+        let normalized = self
             .handle_goto::<lsp_types::DefinitionRequest, _>(
                 &file_path,
                 position,
                 Capability::Definition,
             )
             .await?;
+        let truncated = normalized.truncated;
+        let ContextualLocations {
+            locations,
+            enrichment,
+            positions_degraded,
+        } = self.contextualize(normalized, context).await;
 
         Ok(DefinitionResult {
             locations,
             truncated,
             positions_degraded,
+            enrichment,
         })
     }
 
@@ -605,6 +619,7 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
         include_declaration: bool,
+        context: ResultContext,
     ) -> Result<ReferencesResult> {
         let doc = self
             .prepare_gated_document(&file_path, Capability::References, IndexingGate::Required)
@@ -629,17 +644,19 @@ impl Translator {
             .request_typed::<lsp_types::ReferencesRequest>(params, client.request_timeout())
             .await?;
 
-        let locations = response.unwrap_or_default();
-        let NormalizedLocations {
+        let normalized = lsp_locations_to_mcp(response.unwrap_or_default(), &ctx).await;
+        let truncated = normalized.truncated;
+        let ContextualLocations {
             locations,
-            truncated,
+            enrichment,
             positions_degraded,
-        } = lsp_locations_to_mcp(locations, &ctx).await;
+        } = self.contextualize(normalized, context).await;
 
         Ok(ReferencesResult {
             locations,
             truncated,
             positions_degraded,
+            enrichment,
         })
     }
 
@@ -657,23 +674,27 @@ impl Translator {
         &self,
         file_path: ClientPath,
         position: Position,
+        context: ResultContext,
     ) -> Result<LocationsResult> {
-        let NormalizedLocations {
-            locations,
-            truncated,
-            positions_degraded,
-        } = self
+        let normalized = self
             .handle_goto::<lsp_types::ImplementationRequest, _>(
                 &file_path,
                 position,
                 Capability::Implementation,
             )
             .await?;
+        let truncated = normalized.truncated;
+        let ContextualLocations {
+            locations,
+            enrichment,
+            positions_degraded,
+        } = self.contextualize(normalized, context).await;
 
         Ok(LocationsResult {
             locations,
             truncated,
             positions_degraded,
+            enrichment,
         })
     }
 
@@ -692,23 +713,27 @@ impl Translator {
         &self,
         file_path: ClientPath,
         position: Position,
+        context: ResultContext,
     ) -> Result<LocationsResult> {
-        let NormalizedLocations {
-            locations,
-            truncated,
-            positions_degraded,
-        } = self
+        let normalized = self
             .handle_goto::<lsp_types::TypeDefinitionRequest, _>(
                 &file_path,
                 position,
                 Capability::TypeDefinition,
             )
             .await?;
+        let truncated = normalized.truncated;
+        let ContextualLocations {
+            locations,
+            enrichment,
+            positions_degraded,
+        } = self.contextualize(normalized, context).await;
 
         Ok(LocationsResult {
             locations,
             truncated,
             positions_degraded,
+            enrichment,
         })
     }
 
@@ -742,9 +767,13 @@ impl Translator {
             .await?;
 
         Ok(LocationsResult {
-            locations,
+            locations: locations
+                .into_iter()
+                .map(ContextualLocation::from)
+                .collect(),
             truncated,
             positions_degraded,
+            enrichment: None,
         })
     }
 }
@@ -1075,7 +1104,11 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_definition(client_path(path.to_string_lossy().into_owned()), pos(1, 1))
+            .handle_definition(
+                client_path(path.to_string_lossy().into_owned()),
+                pos(1, 1),
+                ResultContext::None,
+            )
             .await
             .unwrap_err();
 
@@ -1113,7 +1146,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_definition(client_path(path), pos(1, 1))
+                    .handle_definition(client_path(path), pos(1, 1), ResultContext::None)
                     .await
             })
         };
@@ -1164,6 +1197,7 @@ mod tests {
                 client_path(path.to_string_lossy().into_owned()),
                 pos(1, 1),
                 true,
+                ResultContext::None,
             )
             .await
             .unwrap_err();
@@ -1202,7 +1236,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_references(client_path(path), pos(1, 1), true)
+                    .handle_references(client_path(path), pos(1, 1), true, ResultContext::None)
                     .await
             })
         };
@@ -1250,7 +1284,11 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_implementation(client_path(path.to_string_lossy().into_owned()), pos(1, 1))
+            .handle_implementation(
+                client_path(path.to_string_lossy().into_owned()),
+                pos(1, 1),
+                ResultContext::None,
+            )
             .await
             .unwrap_err();
 
@@ -1283,7 +1321,11 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_type_definition(client_path(path.to_string_lossy().into_owned()), pos(1, 1))
+            .handle_type_definition(
+                client_path(path.to_string_lossy().into_owned()),
+                pos(1, 1),
+                ResultContext::None,
+            )
             .await
             .unwrap_err();
 
@@ -1454,6 +1496,7 @@ mod tests {
                             line: 1,
                             character: 1,
                         },
+                        ResultContext::None,
                     )
                     .await
             })
@@ -1525,6 +1568,7 @@ mod tests {
                             line: 1,
                             character: 1,
                         },
+                        ResultContext::None,
                     )
                     .await
             })
@@ -1594,7 +1638,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_references(client_path(path), pos(1, 1), true)
+                    .handle_references(client_path(path), pos(1, 1), true, ResultContext::None)
                     .await
             })
         };
@@ -1685,7 +1729,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_references(client_path(path), pos(1, 1), true)
+                    .handle_references(client_path(path), pos(1, 1), true, ResultContext::None)
                     .await
             })
         };
@@ -1761,6 +1805,7 @@ mod tests {
                             line: 1,
                             character: 1,
                         },
+                        ResultContext::None,
                     )
                     .await
             })
@@ -2020,6 +2065,7 @@ mod tests {
                             line: 1,
                             character: 1,
                         },
+                        ResultContext::None,
                     )
                     .await
             })

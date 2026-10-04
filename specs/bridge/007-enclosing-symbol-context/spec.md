@@ -10,7 +10,7 @@ tags:
   - token-efficiency
   - competitor-gap
 created: 2026-10-04
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[bridge/001-position-encoding-layer/spec|position-encoding-layer]]"
@@ -24,6 +24,49 @@ related:
 > **Type**: research (competitor gap, token-efficiency refinement)
 > **Priority**: P4
 > **Related issues**: #565
+
+## Decision (#565): implemented, opt-in
+
+> [!important] Resolved
+> Shipped as an opt-in `context` input (`none` | `enclosing_symbol`, default `none`) on
+> `get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and
+> `get_diagnostics`. Default output and LSP traffic are unchanged (golden test).
+
+Resolutions of the open questions in section 9:
+
+| Question | Resolution |
+|----------|------------|
+| Opt-in shape | One closed enum `ResultContext` (`none`, `enclosing_symbol`), shared by all five tools |
+| Hit-line snippet | Deferred; the enum leaves room for a later level |
+| Diagnostics grouping | Annotate only; no grouped shape |
+| FR-005 `get_cached_diagnostics` | Excluded: keeps "no new analysis" and zero extra LSP traffic. The tool has no `context` input |
+| FR-011 file cap | 16 when `workspace.max_documents` is 0 (limit disabled), else `clamp(max_documents / 4, 1, 16)`; not charged to the primary item budget |
+| NFR-002 deadline | One 30 s budget per call for all `documentSymbol` lookups; files not reached are `not_computed: deadline`, a lookup running past it is `unavailable: timed_out` |
+| FR-015 approximate state | No item-level state. Containment is decided in MCP-normalized coordinates on both sides, and `positions_degraded` is the maximum of the primary and enrichment contexts |
+| Straddling rule | Innermost symbol containing the whole range; else innermost containing the range start. Ties on identical ranges break by `(name, kind)`, so output is independent of server order |
+| Other tools in scope | Call hierarchy and workspace symbols stay excluded |
+| Constitution VI | The opt-in is the only path that adds LSP traffic, bounded by the file cap and deadline |
+
+Wire shape: each item gains an `enclosing_symbol` field with an internally tagged `status`:
+`resolved` (flattened `name_path`, `kind`, `range`, `fidelity` of `hierarchical` | `flat`),
+`top_level`, `not_computed` (`reason`: `file_cap`, `out_of_workspace`, `tracker_limit`, `deadline`) or
+`unavailable` (`reason`: `capability_absent`, `request_failed`, `timed_out`). The result gains
+`enrichment { files_enriched, files_skipped, cut_short }`; both fields are omitted when `context` is
+`none` or the result is empty. `item_budget` from the planning draft is not a reason: the primary
+list is capped before enrichment and enrichment never spends that budget.
+
+Security: every file named by a result is validated (`parse_file_uri`, then the workspace-root
+check, canonical, so a symlink escaping the workspace is rejected) before it is opened, and
+`documentSymbol` goes through that file's own `DocumentSymbols` route. A failing check yields
+`not_computed: out_of_workspace`; the `out_of_workspace` flag of the location is not consulted.
+
+Deviation from the "opt-in on a tool that does not support it is an error" edge case: the five
+tools declare `context` in their schemas, and an unknown `context` field sent to any other tool is
+ignored rather than rejected (`#[serde(flatten)]` position structs are incompatible with
+`deny_unknown_fields`); schema absence is the contract.
+
+Out of scope, recorded: `go_to_declaration` (#608) (added after this spec; it shares the location shape and can adopt `context` later), `get_cached_diagnostics`, hit-line snippets, grouping by symbol, call
+hierarchy and workspace-symbol enrichment, cross-call symbol-tree caching.
 
 ## 1. Overview
 

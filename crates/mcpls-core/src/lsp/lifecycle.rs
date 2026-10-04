@@ -375,6 +375,23 @@ impl std::fmt::Debug for LspServer {
     }
 }
 
+/// Resolve one environment variable as the spawned server would see it:
+/// the server config's `env` override wins, otherwise the parent value.
+///
+/// `parent_env` is injected so callers and tests need not touch the real
+/// process environment.
+pub fn child_env_var(
+    config: &LspServerConfig,
+    key: &str,
+    parent_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    config
+        .env
+        .get(key)
+        .map(std::ffi::OsString::from)
+        .or_else(|| parent_env(key))
+}
+
 impl LspServer {
     /// The config this server was spawned from.
     pub(crate) const fn init_config(&self) -> &ServerInitConfig {
@@ -569,13 +586,13 @@ impl LspServer {
         command.args(&config.args).env_clear();
 
         for key in ENV_PASSTHROUGH {
-            if let Some(value) = parent_env(key) {
+            if let Some(value) = child_env_var(config, key, &parent_env) {
                 command.env(key, value);
             }
         }
         #[cfg(windows)]
         for key in ENV_PASSTHROUGH_WINDOWS {
-            if let Some(value) = parent_env(key) {
+            if let Some(value) = child_env_var(config, key, &parent_env) {
                 command.env(key, value);
             }
         }
@@ -642,6 +659,16 @@ impl LspServer {
                 }),
                 references: Some(lsp_types::ReferenceClientCapabilities {
                     dynamic_registration: Some(false),
+                }),
+                // clangd and typescript-language-server answer `prepareProvider` only
+                // when the client advertises `prepareSupport`.
+                rename: Some(lsp_types::RenameClientCapabilities {
+                    dynamic_registration: Some(false),
+                    prepare_support: Some(true),
+                    prepare_support_default_behavior: Some(
+                        lsp_types::PrepareSupportDefaultBehavior::Identifier,
+                    ),
+                    ..Default::default()
                 }),
                 code_action: Some(lsp_types::CodeActionClientCapabilities {
                     dynamic_registration: Some(false),
@@ -1324,6 +1351,23 @@ mod tests {
         assert_eq!(
             capabilities.window.and_then(|w| w.work_done_progress),
             Some(true)
+        );
+    }
+
+    /// Without `prepareSupport`, clangd and typescript-language-server never
+    /// advertise `prepareProvider`, which would make `prepare_rename`
+    /// unreachable on them.
+    #[test]
+    fn test_client_capabilities_advertises_prepare_rename_support() {
+        let rename = LspServer::client_capabilities(&["utf-16".to_string()])
+            .text_document
+            .and_then(|t| t.rename)
+            .unwrap();
+
+        assert_eq!(rename.prepare_support, Some(true));
+        assert_eq!(
+            rename.prepare_support_default_behavior,
+            Some(lsp_types::PrepareSupportDefaultBehavior::Identifier)
         );
     }
 

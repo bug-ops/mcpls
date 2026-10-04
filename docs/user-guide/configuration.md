@@ -41,6 +41,38 @@ e.g. a `Cargo.toml` in the workspace still spawns rust-analyzer. An explicit
 `--config <path>` or `$MCPLS_CONFIG` is always trusted, since naming a path is
 itself the user's consent.
 
+#### Trust model
+
+`--trust-project-config` governs only the mcpls config. It does not make the workspace itself safe
+to analyze: language servers execute workspace-supplied code, which is inherent to LSP and the same
+for every LSP bridge, and mcpls does not sandbox them. See
+[SECURITY.md](https://github.com/bug-ops/mcpls/blob/main/SECURITY.md) for the full policy.
+
+| Server | Workspace-supplied code it can run |
+|--------|-------------------------------------|
+| typescript-language-server | The workspace's `node_modules/typescript/lib/tsserver.js` unless pinned (below); tsconfig plugins; automatic type acquisition may fetch packages over the network |
+| rust-analyzer | Cargo build scripts and procedural macros |
+| pyright / pylsp | The project's Python environment, plugins and interpreters named in config |
+| gopls | The Go toolchain, including toolchain downloads requested by `go.mod` |
+| clangd | Commands from `compile_commands.json` and `.clangd` configuration |
+
+Only the typescript-language-server row has been verified live; the others describe the well-known
+behavior of those servers. Run mcpls against untrusted code only inside an environment you are
+willing to have that code execute in (a container or a disposable VM).
+
+**tsserver pin (TypeScript).** By default mcpls passes the tsserver bundled next to
+`typescript-language-server` as `initializationOptions.tsserver.path`, so a workspace's own
+`node_modules` tsserver is not selected. Covered: `npm -g` style symlink installs (verified with
+Homebrew's node) that have a global `typescript` package with a `package.json` `version` next to
+the server. Not covered (#604), with a warning logged: Windows `.cmd` shims, script launchers (pnpm,
+Volta, asdf, mise), `npx`/`bunx`/`node cli.mjs` wrappers, and installs with no valid `typescript`
+package. A server installed inside the workspace is pinned with a warning, but that narrows
+nothing because the server itself is workspace code. A
+`tsserver.path` in your own `initialization_options` always wins; set it to a workspace path to opt
+back in to the workspace's TypeScript. Other `initialization_options` that do not set
+`tsserver.path` disable the pin (with a warning). Automatic type acquisition network fetches are not
+prevented. The pin narrows one vector; it does not make an untrusted workspace safe.
+
 > [!WARNING]
 > `--trust-project-config` (and `MCPLS_TRUST_PROJECT_CONFIG=true`) is a **global**
 > trust grant for the whole mcpls process — it is not scoped to a single project.
@@ -176,7 +208,10 @@ from:
   intuitively read as "relative to wherever mcpls was launched."
 
 The resolved path must exist and is canonicalized before any LSP server is
-initialized. A `ServerConfig` built programmatically has no config-file
+initialized. A file path is also accepted under a root-level system symlink spelling of a root
+(for example `/tmp/proj` on macOS for a root at `/private/tmp/proj`) once that spelling is
+verified to resolve to the root; links deeper in the tree are not admitted. See
+[`file_path`](tools-reference.md#file_path). A `ServerConfig` built programmatically has no config-file
 location either; its relative roots are likewise resolved against the
 process cwd when `serve`/`serve_with` starts.
 
@@ -307,6 +342,8 @@ Maximum number of documents mcpls will keep open simultaneously. Once the ceilin
 [workspace]
 max_documents = 500
 ```
+
+A call that opts into `context: "enclosing_symbol"` opens at most `max_documents / 4` distinct files (at least 1, at most 16; 16 when the limit is `0`) for symbol lookup, so enrichment cannot evict most of the open documents.
 
 Raising this limit increases mcpls's steady-state memory usage, since each open document's full content is held in memory. This is most useful for long-running agent sessions or broad-scope work (large monorepo audits, repo-wide refactors) that touch more than 100 distinct files.
 
@@ -507,6 +544,8 @@ python.analysis.typeCheckingMode = "strict"
 
 See your language server documentation for available options.
 
+For `typescript-language-server`, mcpls adds `tsserver.path` automatically unless you set it or set other options without it; see [Trust model](#trust-model).
+
 ### `env`
 
 **Type**: Table (key-value pairs)
@@ -575,21 +614,26 @@ handles = ["diagnostics"]
 Restricts a server to exactly the listed routing values. Valid values:
 `hover`, `definition`, `type_definition`, `declaration`, `implementation`, `references`,
 `diagnostics`, `rename`, `completions`, `signature_help`,
-`document_symbols`, `workspace_symbols`, `format_document`, `code_actions`,
-`call_hierarchy`, `inlay_hints`. These are routing identifiers, not MCP tool
+`document_symbols`, `workspace_symbols`, `format_document`, `format_range`, `code_actions`,
+`call_hierarchy`, `type_hierarchy`, `document_highlights`, `inlay_hints`. These are routing identifiers, not MCP tool
 names — several MCP tools map to a shorter routing value:
 
 | `handles` value | MCP tool(s) it governs |
 |---|---|
-| `rename` | `rename_symbol` |
+| `rename` | `rename_symbol`, `prepare_rename` |
 | `workspace_symbols` | `workspace_symbol_search` |
 | `implementation` | `go_to_implementation` |
+| `document_highlights` | `get_document_highlights` |
+| `format_range` | `format_range` |
 | `type_definition` | `go_to_type_definition` |
 | `declaration` | `go_to_declaration` |
 | `call_hierarchy` | `prepare_call_hierarchy`, `get_incoming_calls`, `get_outgoing_calls` (one route: the item `prepare_call_hierarchy` returns is only meaningful to the server that produced it) |
+| `type_hierarchy` | `prepare_type_hierarchy`, `get_supertypes`, `get_subtypes` (one route, for the same reason) |
 | `diagnostics` | `get_diagnostics` (pull) **and** `get_cached_diagnostics` (the push-notification cache is filtered by the same route, so both are always served by the same server) |
 
 Every other value matches its MCP tool name directly (`hover` → `hover`, etc.).
+
+When a language has no catch-all server, mcpls logs a warning naming the routing values no server claims; those tools then have no server for that language. After upgrading, add `type_hierarchy`, `document_highlights` and `format_range` to a server's list to enable the newer tools there.
 
 At most one server per language may omit `handles` (the catch-all). A tool
 may be claimed by only one server per language. In the example above,

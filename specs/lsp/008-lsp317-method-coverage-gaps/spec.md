@@ -31,8 +31,59 @@ related:
 > **Implemented**: group A (declaration) with #567 as the `go_to_declaration` tool, routed through the `declaration` `handles` value, gated on `declarationProvider` and on indexing readiness like `get_definition`, taking a position only; link results are flattened like definition links. Groups B and C remain draft.
 > **Related issues**: #567 (declaration, P3), #568 (type hierarchy, P4), #569 (minor methods: prepare rename, document highlight, range formatting, P4)
 
+## Decision (#568, #569): Groups B and C implemented, declaration untouched
+
+> [!important] Resolved
+> Scope: Group B (FR-010 to FR-017) and Group C (FR-020 to FR-028) with the cross-cutting
+> requirements for them. Group A (declaration, #567) is not part of this change and stays open.
+> `semanticTokens` stays a documented non-goal (Out of Scope). The tool surface grows from 21 to 27.
+
+- **Tools (open question 1).** Six tools, one per concern: `prepare_type_hierarchy`,
+  `get_supertypes`, `get_subtypes`, `prepare_rename`, `get_document_highlights`, `format_range`.
+  The supertypes and subtypes `item` input is the typed `TypeHierarchyItemResult`, not untyped
+  JSON (NFR-002); call hierarchy keeps its existing untyped `item`.
+- **Routing (question 2).** One `ToolKind::TypeHierarchy` covers prepare, supertypes and subtypes
+  (FR-014: the item is producer-bound). `prepare_rename` routes through `ToolKind::Rename`, so the
+  verdict comes from the server that performs the rename. New kinds `TypeHierarchy`,
+  `DocumentHighlights`, `FormatRange` bring `ToolKind::ALL` to 18. `Capability` gains
+  `TypeHierarchy`, `PrepareRename`, `DocumentHighlights`, `FormatRange` (18 total, `CapabilitySet`
+  widened to `u32`). `PrepareRename` is the one non-primary capability: it is gated per tool via
+  `McpTool::capability()`, and the support report and the per-call gate read the same value.
+- **Capability (FR-023, FR-028).** `PrepareRename` is supported only when `renameProvider` is a
+  `RenameOptions` with `prepareProvider: true`. mcpls now advertises
+  `textDocument.rename.prepareSupport` (with `prepareSupportDefaultBehavior: identifier`), without
+  which clangd and typescript-language-server never advertise it.
+- **Live servers (question 3).** Verified live on 2026-10-04: clangd advertises and answers all four
+  groups' methods (type hierarchy, prepare rename, highlights, range formatting);
+  typescript-language-server answers prepare rename, highlights and range formatting and does not
+  advertise type hierarchy. rust-analyzer advertises prepare rename and highlights, and neither
+  type hierarchy nor range formatting.
+- **Indexing gate (question 4, FR-035).** `prepare_type_hierarchy` NotRequired (mirrors
+  `prepare_call_hierarchy`), `get_supertypes` and `get_subtypes` Required, `prepare_rename`
+  Required (a mid-index "not renameable" would mislead), `get_document_highlights` NotRequired,
+  `format_range` NotRequired.
+- **Rename flow (question 5).** `rename_symbol` stays independent of `prepare_rename`.
+- **Range formatting (question 6).** A new `format_range` tool returning `FormatDocumentResult`.
+  Like `format_document` it does not cap the edit list, and mcpls neither filters nor invents edits.
+- **Default `handles` (question 8).** Warning only. The uncovered-tool warning now also names
+  `type_hierarchy`, `document_highlights` and `format_range`; `prepare_rename` rides on `rename`.
+- **Respawn (question 9).** A walk is always dispatched to the route of the item's file, never to
+  another server (FR-014). A respawned server may reject or empty-answer a stale item; mcpls adds no
+  special handling.
+- **Prepare rename outcomes (FR-021, FR-022).** `status` is `renameable` (range, optional
+  placeholder), `default_behavior` (no range invented) or `not_renameable` (optional
+  `server_message`). A `null` answer, `defaultBehavior: false`, or a JSON-RPC `-32602` error
+  reads as `not_renameable`; a `-32602` that mcpls classifies as an out-of-range position
+  (rust-analyzer's "Invalid offset" text) is checked first and stays a caller-fault error.
+- **Highlights (FR-025).** `kind` is `text`, `read` or `write`; an omitted or custom kind maps to
+  `text`.
+- **Known deviations.** (Position and range bounds against document content: #607; `tab_size` bound: #606.) FR-027 rejects zero, oversized and reversed ranges but does not check the
+  range against the document's length, like `get_code_actions` and `get_inlay_hints`. clangd reports
+  both "no symbol at this position" and "line out of range" as `-32001` with different messages, so
+  its non-renameable answer surfaces as a server error rather than `not_renameable`.
+
 > [!abstract]
-> mcpls exposed 21 MCP tools when this was written (23 now, including `go_to_declaration`), covering most LSP 3.17 navigation and editing requests. Six
+> mcpls exposed 21 MCP tools when this was written (29 now, including `go_to_declaration` and the tools this spec added), covering most LSP 3.17 navigation and editing requests. Six
 > request methods remain unexposed while competing bridges already ship them:
 > `textDocument/declaration`, `textDocument/prepareTypeHierarchy` with
 > `typeHierarchy/supertypes` and `typeHierarchy/subtypes`, `textDocument/prepareRename`,

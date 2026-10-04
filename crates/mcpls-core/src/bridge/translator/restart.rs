@@ -294,6 +294,9 @@ pub struct NotificationReceivers {
     pub(crate) notifications: mpsc::Receiver<LspNotification>,
     /// `$/progress` and unrecognized notifications lane.
     pub(crate) lifecycle: mpsc::Receiver<LspNotification>,
+    /// The `tsserver` path mcpls pinned for this server, so the lifecycle lane
+    /// can warn when the server reports it did not take effect.
+    pub(crate) pinned_tsserver: Option<std::path::PathBuf>,
 }
 
 /// How a respawned server's notifications are consumed.
@@ -820,6 +823,7 @@ mod tests {
             let receivers = NotificationReceivers {
                 notifications: server.take_notification_rx(),
                 lifecycle: server.take_lifecycle_rx(),
+                pinned_tsserver: None,
             };
             translator.register_server_complete(server);
 
@@ -1355,6 +1359,7 @@ mod tests {
                 let receivers = NotificationReceivers {
                     notifications: server.take_notification_rx(),
                     lifecycle: server.take_lifecycle_rx(),
+                    pinned_tsserver: None,
                 };
                 translator.register_server_complete(server);
                 let id = ServerId::from(name.as_str());

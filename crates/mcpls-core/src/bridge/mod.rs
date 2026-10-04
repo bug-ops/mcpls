@@ -39,23 +39,25 @@ pub use state::{
     uri_to_path,
 };
 pub(crate) use state::{InFlightGuard, try_path_to_uri};
-#[cfg(test)]
-pub(crate) use translator::Capability;
 pub use translator::{
-    AddressableTool, Addressed, Completion, CompletionsResult, DefinitionResult, Diagnostic,
-    DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, DroppedEdits,
-    FormatDocumentResult, HoverResult, Location, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
-    MAX_SYMBOL_NAME_BYTES, Position, Position2D, PositionDegradation, PositionSource, Range,
-    ReferencesResult, RenameResult, ResolvedSymbol, ResolvedTarget, RestartFailure, RestartOutcome,
-    RestartServerResult, RestartTarget, ServerIds, ServerIdsError, ServerRestartEntry, Symbol,
-    SymbolName, SymbolNameError, SymbolQuery, SymbolTarget, TextEdit, Translator,
-    parse_symbol_kind,
+    AddressableTool, Addressed, Completion, CompletionsResult, ContextualDiagnostic,
+    ContextualLocation, DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult,
+    DocumentChanges, DocumentDiagnosticsResult, DocumentHighlightEntry, DocumentHighlightKind,
+    DocumentHighlightsResult, DocumentSymbolsResult, DroppedEdits, EnclosingSymbol,
+    EnclosingSymbolOutcome, EnrichmentSummary, FormatDocumentResult, HoverResult, Location,
+    MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, NotComputedReason,
+    Position, Position2D, PositionDegradation, PositionSource, PrepareRenameOutcome,
+    PrepareRenameResult, Range, ReferencesResult, RenameResult, ResolvedSymbol, ResolvedTarget,
+    RestartFailure, RestartOutcome, RestartServerResult, RestartTarget, ResultContext, ServerIds,
+    ServerIdsError, ServerRestartEntry, Symbol, SymbolFidelity, SymbolName, SymbolNameError,
+    SymbolQuery, SymbolTarget, TextEdit, Translator, TypeHierarchyItemResult, TypeHierarchyResult,
+    UnavailableReason, parse_symbol_kind,
 };
 pub(crate) use translator::{
-    CallHierarchyPrepareResult, CodeActionsResult, IncomingCallsResult, InlayHintsResult,
-    LocationsResult, NotificationReceivers, NotificationWiring, OutgoingCallsResult, RouteSupport,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, ToolSupportSnapshot,
-    WorkspaceSymbolResult, validate_path_against_roots,
+    CallHierarchyPrepareResult, Capability, CodeActionsResult, IncomingCallsResult,
+    InlayHintsResult, LocationsResult, NotificationReceivers, NotificationWiring,
+    OutgoingCallsResult, RouteSupport, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
+    ToolSupportSnapshot, WorkspaceSymbolResult, validate_path_against_roots,
 };
 #[cfg(test)]
 pub(crate) use workspace_roots::ProcessCwd;

@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Serialize, Serializer};
 
-use crate::bridge::{RouteSupport, ToolSupportSnapshot};
+use crate::bridge::{Capability, RouteSupport, ToolSupportSnapshot};
 use crate::config::{ToolKind, ToolPrefix};
 
 /// Where a tool's request is served.
@@ -49,6 +49,12 @@ pub(super) enum McpTool {
     PrepareCallHierarchy,
     GetIncomingCalls,
     GetOutgoingCalls,
+    PrepareTypeHierarchy,
+    GetSupertypes,
+    GetSubtypes,
+    PrepareRename,
+    GetDocumentHighlights,
+    FormatRange,
     GetCachedDiagnostics,
     GetServerLogs,
     GetServerMessages,
@@ -63,7 +69,7 @@ pub(super) enum McpTool {
 
 impl McpTool {
     /// Every tool, in registration order.
-    pub(super) const ALL: [Self; 23] = [
+    pub(super) const ALL: [Self; 29] = [
         Self::GetHover,
         Self::GetDefinition,
         Self::GetReferences,
@@ -77,6 +83,12 @@ impl McpTool {
         Self::PrepareCallHierarchy,
         Self::GetIncomingCalls,
         Self::GetOutgoingCalls,
+        Self::PrepareTypeHierarchy,
+        Self::GetSupertypes,
+        Self::GetSubtypes,
+        Self::PrepareRename,
+        Self::GetDocumentHighlights,
+        Self::FormatRange,
         Self::GetCachedDiagnostics,
         Self::GetServerLogs,
         Self::GetServerMessages,
@@ -131,6 +143,17 @@ impl McpTool {
             }
             Self::GetIncomingCalls => ("get_incoming_calls", Document(ToolKind::CallHierarchy)),
             Self::GetOutgoingCalls => ("get_outgoing_calls", Document(ToolKind::CallHierarchy)),
+            Self::PrepareTypeHierarchy => {
+                ("prepare_type_hierarchy", Document(ToolKind::TypeHierarchy))
+            }
+            Self::GetSupertypes => ("get_supertypes", Document(ToolKind::TypeHierarchy)),
+            Self::GetSubtypes => ("get_subtypes", Document(ToolKind::TypeHierarchy)),
+            Self::PrepareRename => ("prepare_rename", Document(ToolKind::Rename)),
+            Self::GetDocumentHighlights => (
+                "get_document_highlights",
+                Document(ToolKind::DocumentHighlights),
+            ),
+            Self::FormatRange => ("format_range", Document(ToolKind::FormatRange)),
             Self::GetCachedDiagnostics => ("get_cached_diagnostics", Local),
             Self::GetServerLogs => ("get_server_logs", Local),
             Self::GetServerMessages => ("get_server_messages", Local),
@@ -152,6 +175,22 @@ impl McpTool {
     /// The unprefixed MCP tool name.
     pub(super) const fn name(self) -> &'static str {
         self.spec().name
+    }
+
+    /// The capability this tool's call is gated on, or `None` when it is
+    /// ungated or answered locally. A tool sharing another tool's route can
+    /// need a different capability (`prepare_rename` on the `Rename` route),
+    /// so this is per tool, not per [`ToolKind`].
+    pub(super) const fn capability(self) -> Option<Capability> {
+        match self {
+            Self::PrepareRename => Some(Capability::PrepareRename),
+            _ => match self.spec().backend {
+                ToolBackend::Document(kind) | ToolBackend::Workspace(kind) => {
+                    Capability::for_tool(kind)
+                }
+                ToolBackend::Local => None,
+            },
+        }
     }
 }
 
@@ -309,7 +348,14 @@ impl ToolSupportReport {
                         let routes: Vec<_> = languages
                             .iter()
                             .map(|language| {
-                                (language.clone(), snapshot.document_support(language, kind))
+                                (
+                                    language.clone(),
+                                    snapshot.document_support_gated(
+                                        language,
+                                        kind,
+                                        tool.capability(),
+                                    ),
+                                )
                             })
                             .collect();
                         let coverage = ToolCoverage::from_routes(routes.iter().map(|(_, s)| s));

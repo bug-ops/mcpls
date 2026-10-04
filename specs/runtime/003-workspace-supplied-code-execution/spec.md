@@ -11,7 +11,7 @@ tags:
   - security
   - hardening
 created: 2026-10-04
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[config/001-config-discovery-and-heuristics/spec|config-discovery-and-heuristics]]"
@@ -24,6 +24,44 @@ related:
 > **Type**: research / security hardening (vulnerability-class sweep)
 > **Priority**: P3
 > **Related issues**: #566.
+
+## Decision (#566): documentation plus a best-effort tsserver pin
+
+> [!important] Resolved
+> Scope: FR-001 to FR-006, FR-009 implemented. FR-007 and FR-008 (untrusted-workspace mode, #603) are
+> deferred to a follow-up issue. Open questions 1 to 3, 7 and 8 are answered below.
+
+- **Docs.** `SECURITY.md` carries the per-server trust table, the `--trust-project-config`
+  disclaimer (FR-001, FR-002), the private reporting route (FR-009) and the pin coverage. Only the
+  typescript-language-server row was verified live; the other rows state well-known server behavior.
+- **Pin.** At startup mcpls resolves the tsserver typescript-language-server would pick as
+  "bundled" and sends it as `initializationOptions.tsserver.path`
+  (`crates/mcpls-core/src/lsp/tsserver_pin.rs`). Resolution is by node's lookup of the `typescript`
+  dependency from the server's package directory, found by following the executable's symlinks. No
+  absolute path is shipped (NFR-002, SC-004).
+- **Identification** is by the command's file stem, so absolute paths and `.cmd` names are recognized.
+  `PATH` is read as the child sees it (config `env` override, else the parent environment).
+- **Coverage (SC-002 scope).** `npm -g` style symlink installs (verified with Homebrew's node; the
+  Homebrew formula layout and bun were not checked) with a `typescript` package next to the server
+  whose `package.json` has a `version`, which the server requires of an install before it honors
+  it. Windows `.cmd` shims, script launchers (pnpm, Volta, asdf/mise) and `npx`/`bunx`/`node cli.mjs`
+  wrappers that only name the server in `args` are logged as `UnsupportedLauncher` and not pinned.
+  A missing or invalid `typescript` package is logged as `NoTypescriptNextToServer`, a missing
+  executable as `ServerNotOnPath`. None blocks startup (NFR-005). Follow-up filed for shim support.
+- **Inside the workspace.** A server installed inside the workspace is still pinned and a warning is
+  logged: skipping would let the server walk the `rootUri` ancestors and pick the workspace tsserver.
+- **User options (FR-006).** A user `tsserver.path` wins. User options without `tsserver.path` skip
+  the pin with a warning (no merge).
+- **Post-init check.** On `$/typescriptVersion` with a pinned `tsserver.path`, a `source` other than
+  `user-setting` logs a warning. This catches a stale pin on respawn, because resolution happens once
+  at startup.
+- **Not covered.** Automatic type acquisition may fetch packages over the network, and tsconfig
+  plugins are not loaded from the workspace by a pinned tsserver because `allowLocalPluginLoads` is
+  never passed; this holds only while the pin applies. The startup read of the install layout adds no
+  LSP requests (NFR-006): the post-init check reads a notification the server sends anyway.
+- **Behavior change (NFR-003).** Projects relying on a workspace-pinned TypeScript now get the
+  bundled one by default. Opt out by setting `initialization_options.tsserver.path`. Recorded in
+  CHANGELOG as breaking.
 
 ## 1. Overview
 

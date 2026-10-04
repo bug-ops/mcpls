@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete reference for all 23 MCP tools provided by mcpls.
+Complete reference for all 29 MCP tools provided by mcpls.
 
 ## Overview
 
@@ -57,6 +57,52 @@ neither blocks or filters the result, they just tell the caller when to apply ex
   Column 1 and columns past the end of a line never trigger it (the latter clamp to the line end).
   For range tools (`get_inlay_hints`, `get_code_actions`), keep the range end inside the file.
 
+### Enclosing-Symbol Context
+
+`get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and
+`get_diagnostics` accept an optional `context` parameter: `"none"` (the default) or
+`"enclosing_symbol"`. With the default, the response is exactly what it was before the parameter
+existed and mcpls issues no extra LSP request. `get_cached_diagnostics` does not accept it, because
+it promises no new analysis. `go_to_declaration` does not accept it either (#608); other tools ignore an unknown `context` field. With `symbol_name` addressing the context applies to the returned locations as usual.
+
+With `"enclosing_symbol"`, each location or diagnostic gains an `enclosing_symbol` field naming the
+innermost symbol of its file that contains it, found with one `textDocument/documentSymbol` request
+per distinct file (reused for every item in that file):
+
+```json
+{
+  "uri": "file:///path/to/file.rs",
+  "range": { "start": { "line": 15, "character": 4 }, "end": { "line": 15, "character": 8 } },
+  "enclosing_symbol": {
+    "status": "resolved",
+    "name_path": ["Parser", "parse"],
+    "kind": 6,
+    "range": { "start": { "line": 12, "character": 1 }, "end": { "line": 30, "character": 2 } },
+    "fidelity": "hierarchical"
+  }
+}
+```
+
+| `status` | Meaning |
+|----------|---------|
+| `resolved` | The innermost containing symbol: `name_path` (outermost ancestor first), LSP numeric `kind` (the value `workspace_symbol_search` accepts as `kind_filter`), `range`, and `fidelity` |
+| `top_level` | The file's symbols were read and none contains the item |
+| `not_computed` | Skipped, with `reason`: `file_cap`, `out_of_workspace`, `tracker_limit` or `deadline` |
+| `unavailable` | Attempted and failed, with `reason`: `capability_absent`, `request_failed` or `timed_out` |
+
+`not_computed` and `unavailable` mean nothing is known: never read them as top level.
+`fidelity: "flat"` means the server answered with the legacy flat symbol list, so the name path has
+at most one container segment taken from `containerName`; `"hierarchical"` is a full ancestor chain.
+A hit that straddles symbol boundaries is attributed to the innermost symbol containing the whole
+range, else the innermost one containing its start.
+
+The result also gains `enrichment`: `files_enriched`, `files_skipped` and `cut_short` (`true` when the
+per-call file cap or the 30 second time budget skipped files). The cap is 16 distinct files, or
+`max_documents / 4` (at least 1) when `workspace.max_documents` is below 64. Every file is validated
+against the workspace roots before it is opened, so locations in the standard library or a
+dependency come back `not_computed` with `out_of_workspace`; the primary result is never affected.
+The `positions_degraded` flag also covers positions read during enrichment.
+
 ### Output Key Naming
 
 Every key mcpls defines in tool results, in the `lsp-diagnostics://` resource payload, and in
@@ -78,6 +124,7 @@ array, `selectionRange` on call hierarchy items (so they round-trip into `get_in
 | [get_completions](#get_completions) | `textDocument/completion` | Code completion suggestions |
 | [get_document_symbols](#get_document_symbols) | `textDocument/documentSymbol` | Document symbol outline |
 | [workspace_symbol_search](#workspace_symbol_search) | `workspace/symbol` | Search symbols across workspace |
+| [get_document_highlights](#get_document_highlights) | `textDocument/documentHighlight` | Read, write and text occurrences of a symbol in one file |
 
 ### Diagnostics & Formatting Tools
 
@@ -86,11 +133,13 @@ array, `selectionRange` on call hierarchy items (so they round-trip into `get_in
 | [get_diagnostics](#get_diagnostics) | `textDocument/diagnostic` + push notifications | Compiler errors, warnings, and hints (merged from pull and push) |
 | [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications only |
 | [format_document](#format_document) | `textDocument/formatting` | Document formatting |
+| [format_range](#format_range) | `textDocument/rangeFormatting` | Formatting of a range |
 
 ### Refactoring Tools
 
 | Tool | LSP Method | Description |
 |------|------------|-------------|
+| [prepare_rename](#prepare_rename) | `textDocument/prepareRename` | Check whether a position can be renamed |
 | [rename_symbol](#rename_symbol) | `textDocument/rename` | Workspace-wide symbol renaming |
 | [get_code_actions](#get_code_actions) | `textDocument/codeAction` | Quick fixes and refactorings |
 
@@ -101,6 +150,14 @@ array, `selectionRange` on call hierarchy items (so they round-trip into `get_in
 | [prepare_call_hierarchy](#prepare_call_hierarchy) | `textDocument/prepareCallHierarchy` | Prepare call hierarchy at position |
 | [get_incoming_calls](#get_incoming_calls) | `callHierarchy/incomingCalls` | Functions that call the target |
 | [get_outgoing_calls](#get_outgoing_calls) | `callHierarchy/outgoingCalls` | Functions called by the target |
+
+### Type Hierarchy Tools
+
+| Tool | LSP Method | Description |
+|------|------------|-------------|
+| [prepare_type_hierarchy](#prepare_type_hierarchy) | `textDocument/prepareTypeHierarchy` | Prepare type hierarchy at position |
+| [get_supertypes](#get_supertypes) | `typeHierarchy/supertypes` | Supertypes of a type |
+| [get_subtypes](#get_subtypes) | `typeHierarchy/subtypes` | Subtypes of a type |
 
 ### Navigation Tools
 
@@ -202,6 +259,7 @@ Jump to the definition of a symbol at a specific position.
 | `file_path` | string | Yes | Absolute path to the file |
 | `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
 | `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
+| `context` | string | No | `none` (default) or `enclosing_symbol`; see [Enclosing-Symbol Context](#enclosing-symbol-context) |
 
 Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
@@ -268,6 +326,7 @@ Find all references to a symbol in the workspace.
 | `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
 | `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
 | `include_declaration` | boolean | No | Include the declaration site (default: false) |
+| `context` | string | No | `none` (default) or `enclosing_symbol`; see [Enclosing-Symbol Context](#enclosing-symbol-context) |
 
 Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
@@ -340,6 +399,7 @@ Get compiler errors, warnings, and hints for a file, including diagnostics from 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
+| `context` | string | No | `none` (default) or `enclosing_symbol`; see [Enclosing-Symbol Context](#enclosing-symbol-context) |
 
 ### Returns
 
@@ -709,7 +769,7 @@ Format a document according to language server rules.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `tab_size` | integer | No | Tab size for formatting (default: 4) |
+| `tab_size` | integer | No | Tab size for formatting (default: 4); not bounded yet (#606) |
 | `insert_spaces` | boolean | No | Use spaces instead of tabs (default: true) |
 
 ### Returns
@@ -1152,6 +1212,7 @@ Jump to all implementations of a trait, interface, or abstract method.
 | `file_path` | string | Yes | Absolute path to the file |
 | `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
 | `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
+| `context` | string | No | `none` (default) or `enclosing_symbol`; see [Enclosing-Symbol Context](#enclosing-symbol-context) |
 
 Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
@@ -1202,6 +1263,7 @@ Jump to the type definition of the value under the cursor (e.g. follow a typedef
 | `file_path` | string | Yes | Absolute path to the file |
 | `line` | integer | Yes, or `symbol_name` | Line number (1-based) |
 | `character` | integer | Yes, or `symbol_name` | Character position (1-based, UTF-8) |
+| `context` | string | No | `none` (default) or `enclosing_symbol`; see [Enclosing-Symbol Context](#enclosing-symbol-context) |
 
 Instead of `line`/`character`, a `symbol_name` (with optional `symbol_kind` and `container`) may be given; see [Addressing a Symbol by Name](#addressing-a-symbol-by-name).
 
@@ -1291,6 +1353,187 @@ Array of inlay hints with positions and labels:
 
 ---
 
+## get_document_highlights
+
+Find the occurrences of the symbol at a position within the same file, classified by how each uses the symbol.
+
+### Parameters
+
+```json
+{
+  "file_path": "/absolute/path/to/file.rs",
+  "line": 10,
+  "character": 5
+}
+```
+
+### Returns
+
+```json
+{
+  "highlights": [
+    { "range": { "start": { "line": 10, "character": 5 }, "end": { "line": 10, "character": 9 } }, "kind": "write" },
+    { "range": { "start": { "line": 14, "character": 12 }, "end": { "line": 14, "character": 16 } }, "kind": "read" }
+  ]
+}
+```
+
+`kind` is `read`, `write` or `text`; a server that omits the kind yields `text`. `truncated` and `positions_degraded` appear only when set.
+
+### Notes
+
+- Single-file analysis: valid while the server is still indexing
+- Returns an empty list when the position names nothing
+- Verified live on clangd and typescript-language-server
+
+---
+
+## format_range
+
+Format only a range of a document.
+
+### Parameters
+
+```json
+{
+  "file_path": "/absolute/path/to/file.rs",
+  "start_line": 5,
+  "start_character": 1,
+  "end_line": 12,
+  "end_character": 1,
+  "tab_size": 4,
+  "insert_spaces": true
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `start_line`, `start_character` | integer | Yes | Start of the range (1-based) |
+| `end_line`, `end_character` | integer | Yes | End of the range (1-based) |
+| `tab_size` | integer | No | Tab size for formatting (default: 4); not bounded yet (#606) |
+| `insert_spaces` | boolean | No | Use spaces instead of tabs (default: true) |
+
+### Returns
+
+Same shape as `format_document`: an `edits` array of `{ range, new_text }` plus `positions_degraded` when set.
+
+### Notes
+
+- Returns an edit plan; nothing is applied
+- Edits are not capped, like `format_document`
+- The range is not checked against the document length: keep it inside the file (#607)
+- Verified live on clangd and typescript-language-server; rust-analyzer does not advertise range formatting, so the call reports `capability_not_advertised` (see `get_tool_support`)
+
+---
+
+## prepare_rename
+
+Check whether the symbol at a position can be renamed, before calling `rename_symbol`.
+
+### Parameters
+
+Same as `get_hover`: `file_path`, `line`, `character`.
+
+### Returns
+
+A `status` field selects the shape:
+
+```json
+{ "status": "renameable", "range": { "start": { "line": 3, "character": 8 }, "end": { "line": 3, "character": 15 } }, "placeholder": "counter" }
+```
+
+| `status` | Meaning |
+|----------|---------|
+| `renameable` | The identifier can be renamed; `range` is what a rename would replace and `placeholder` its current name when the server supplies it |
+| `default_behavior` | The server accepts a rename here but leaves the identifier range to the client; no range is invented |
+| `not_renameable` | The position cannot be renamed; `server_message` carries the server's explanation when it gave one |
+
+### Notes
+
+- Requires a server advertising `prepareProvider`; mcpls advertises `rename.prepareSupport` so servers such as typescript-language-server answer with a range
+- Waits for indexing like `rename_symbol`, so a mid-index "not renameable" cannot mislead
+- An out-of-range position stays an error and is not reported as `not_renameable`; servers that answer an out-of-range line with `null` read as `not_renameable` (#607)
+- clangd reports "no symbol here" and "line out of range" as server error `-32001`, so on clangd a non-renameable position can surface as a server error rather than `not_renameable`
+
+---
+
+## prepare_type_hierarchy
+
+Get the type hierarchy items at a position; feed an item to `get_supertypes` or `get_subtypes`.
+
+### Parameters
+
+Same as `get_hover`: `file_path`, `line`, `character`.
+
+### Returns
+
+```json
+{
+  "items": [
+    {
+      "name": "Derived",
+      "kind": 5,
+      "uri": "file:///path/to/main.cpp",
+      "range": { "start": { "line": 8, "character": 1 }, "end": { "line": 8, "character": 30 } },
+      "selectionRange": { "start": { "line": 8, "character": 8 }, "end": { "line": 8, "character": 15 } },
+      "data": "opaque"
+    }
+  ]
+}
+```
+
+`truncated`, `positions_degraded` and a per-item `out_of_workspace` appear only when set.
+
+---
+
+## get_supertypes
+
+Get the supertypes of a type hierarchy item.
+
+### Parameters
+
+```json
+{
+  "item": { "name": "Derived", "kind": 5, "uri": "file:///path/to/main.cpp", "range": {}, "selectionRange": {} }
+}
+```
+
+`item` is a typed object: pass back an item exactly as returned by `prepare_type_hierarchy`, `get_supertypes` or `get_subtypes`, including `data`.
+
+### Returns
+
+Same shape as `prepare_type_hierarchy`.
+
+### Notes
+
+- Waits for indexing; `prepare_type_hierarchy` does not
+- Verified live on clangd. rust-analyzer and typescript-language-server do not advertise type hierarchy, so those calls report `capability_not_advertised`
+
+---
+
+## get_subtypes
+
+Get the subtypes of a type hierarchy item. Parameters, returns and notes are the same as `get_supertypes`.
+
+---
+
+## Verifying an Edit
+
+mcpls never applies edits itself and does not preview an edit before it is applied: a speculative-preview tool is a
+deliberate non-goal, because an overlay on the document tracker would race other calls on the same
+file and leak speculative diagnostics into the cache and resource subscriptions. To check an edit:
+
+1. Get the edit from `rename_symbol`, `format_document`, `format_range` or `get_code_actions`, or write it directly.
+2. Apply it with your own editor tooling and save the file.
+3. Call `get_diagnostics`. Servers whose compiler diagnostics come from a build step (rust-analyzer's flycheck) report new errors only after the save, so an empty result right after the write can be stale: poll again, and check indexing with `get_tool_support`.
+4. Revert with your own tools (for example `git checkout -- <file>`) if new errors appear.
+
+The loop touches the working tree (file watchers, formatters on save, version-control status) and cannot run
+where writes are denied.
+
+---
+
 ## restart_server
 
 Restart one or more LSP servers without restarting mcpls. The old process is stopped (graceful
@@ -1347,7 +1590,7 @@ One entry per targeted server, sorted by id:
 **Format**: Absolute path
 **Validation**: Must be non-empty, free of NUL bytes, and exist within workspace roots
 
-A path is accepted when it names a location under a workspace root through one of these spellings: the root's canonical (symlink-free) path, the root exactly as configured, or the logical working directory (`$PWD`) when it resolves to the same directory as the real working directory. The path is then resolved on disk and must still lie under a root, so a symlink inside a root that points elsewhere is rejected. A path that reaches a root only through some other symlink spelling is rejected with `PathOutsideWorkspace`, even though earlier versions accepted it; use one of the spellings above. Paths outside every root are rejected before the filesystem is consulted, so the error does not reveal whether such a file exists.
+A path is accepted when it names a location under a workspace root through one of these spellings: the root's canonical (symlink-free) path, the root exactly as configured, or the logical working directory (`$PWD`) when it resolves to the same directory as the real working directory. The path is then resolved on disk and must still lie under a root, so a symlink inside a root that points elsewhere is rejected. Root-level system symlinks are admitted too: when a root lies under a link directly below `/` (for example `/tmp` on macOS, which points to `/private/tmp`), the link spelling of that root is accepted, after checking that it resolves to the same directory. Every other symlink spelling, including a link deeper in the tree such as `~/link`, is rejected with `PathOutsideWorkspace`, even though earlier versions accepted it; use one of the spellings above. The `out_of_workspace` result flag stays canonical-only (alias-aware flag: #605), so a location a server reports under a `/tmp` spelling can read `true` even though that spelling is admitted as input. Paths outside every root are rejected before the filesystem is consulted, so the error does not reveal whether such a file exists.
 
 ```json
 {

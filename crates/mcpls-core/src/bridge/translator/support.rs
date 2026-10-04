@@ -55,7 +55,7 @@ pub enum RouteSupport {
 /// Computed once per snapshot through [`Capability::is_supported`], so the
 /// snapshot never clones a server's full `ServerCapabilities`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CapabilitySet(u16);
+pub struct CapabilitySet(u32);
 
 impl CapabilitySet {
     /// The capabilities `caps` advertises.
@@ -64,13 +64,13 @@ impl CapabilitySet {
             .into_iter()
             .filter(|capability| capability.is_supported(caps))
             .fold(Self::default(), |set, capability| {
-                Self(set.0 | 1 << capability as u8)
+                Self(set.0 | 1 << capability as u32)
             })
     }
 
     /// Whether `capability` is in the set.
     pub const fn contains(self, capability: Capability) -> bool {
-        self.0 & (1 << capability as u8) != 0
+        self.0 & (1 << capability as u32) != 0
     }
 }
 
@@ -93,8 +93,23 @@ impl ToolSupportSnapshot {
         self.router.configured_languages()
     }
 
-    /// Support for a per-document `tool` on files of `language`.
+    /// Support for a per-document `tool` on files of `language`, gated on the
+    /// tool's primary capability.
+    #[cfg(test)]
     pub(crate) fn document_support(&self, language: &str, tool: ToolKind) -> RouteSupport {
+        self.document_support_gated(language, tool, Capability::for_tool(tool))
+    }
+
+    /// Support for a per-document `tool` on files of `language`, gated on
+    /// `capability` (`None` for an ungated tool). A tool that shares another
+    /// tool's route but needs a different capability, such as `prepare_rename`
+    /// on the `Rename` route, passes its own.
+    pub(crate) fn document_support_gated(
+        &self,
+        language: &str,
+        tool: ToolKind,
+        capability: Option<Capability>,
+    ) -> RouteSupport {
         let lookup = lookup_route(
             &LanguageCandidates::new(language.to_string()),
             |lang| self.router.resolve(lang, tool).cloned(),
@@ -109,7 +124,7 @@ impl ToolSupportSnapshot {
             |_| None,
         );
         match lookup {
-            RouteLookup::Registered(server, ()) => self.registered_support(server, tool),
+            RouteLookup::Registered(server, ()) => self.registered_support(server, capability),
             RouteLookup::Initializing(_) => RouteSupport::Initializing,
             RouteLookup::Failed(_) | RouteLookup::Dangling { .. } | RouteLookup::Unrouted => {
                 RouteSupport::NoServer
@@ -126,7 +141,9 @@ impl ToolSupportSnapshot {
             || self.expected.is_empty(),
         );
         match lookup {
-            WorkspaceRouteLookup::Registered(server) => self.registered_support(server, tool),
+            WorkspaceRouteLookup::Registered(server) => {
+                self.registered_support(server, Capability::for_tool(tool))
+            }
             WorkspaceRouteLookup::Initializing(_) | WorkspaceRouteLookup::AllInitializing => {
                 RouteSupport::Initializing
             }
@@ -136,11 +153,11 @@ impl ToolSupportSnapshot {
         }
     }
 
-    fn registered_support(&self, server: ServerId, tool: ToolKind) -> RouteSupport {
+    fn registered_support(&self, server: ServerId, capability: Option<Capability>) -> RouteSupport {
         let Some(caps) = self.capabilities.get(&server) else {
             return RouteSupport::Initializing;
         };
-        match Capability::for_tool(tool) {
+        match capability {
             Some(capability) if !caps.contains(capability) => {
                 RouteSupport::CapabilityNotAdvertised { server, capability }
             }
@@ -269,10 +286,17 @@ mod tests {
     #[test]
     fn capability_tool_kind_round_trips() {
         for capability in Capability::ALL {
-            assert_eq!(
-                Capability::for_tool(capability.tool_kind()),
-                Some(capability)
-            );
+            if capability.is_primary() {
+                assert_eq!(
+                    Capability::for_tool(capability.tool_kind()),
+                    Some(capability)
+                );
+            } else {
+                assert_ne!(
+                    Capability::for_tool(capability.tool_kind()),
+                    Some(capability)
+                );
+            }
         }
         assert_eq!(Capability::for_tool(ToolKind::Diagnostics), None);
         for tool in ToolKind::ALL {
@@ -280,12 +304,61 @@ mod tests {
             assert_eq!(
                 Capability::ALL
                     .iter()
-                    .filter(|c| c.tool_kind() == *tool)
+                    .filter(|c| c.tool_kind() == *tool && c.is_primary())
                     .count(),
                 expected,
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn prepare_rename_shares_the_rename_route_with_its_own_capability() {
+        let rename_only = ServerCapabilities {
+            rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
+            ..Default::default()
+        };
+        let with_prepare = ServerCapabilities {
+            rename_provider: Some(lsp_types::RenameProvider::RenameOptions(
+                lsp_types::RenameOptions {
+                    prepare_provider: Some(true),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let server = ServerId::from("rust");
+        let snap = snapshot(&["rust"], &[], &[("rust", rename_only)]);
+        assert_eq!(
+            snap.document_support("rust", ToolKind::Rename),
+            RouteSupport::Supported {
+                server: server.clone()
+            }
+        );
+        assert_eq!(
+            snap.document_support_gated("rust", ToolKind::Rename, Some(Capability::PrepareRename)),
+            RouteSupport::CapabilityNotAdvertised {
+                server: server.clone(),
+                capability: Capability::PrepareRename,
+            }
+        );
+        let snap = snapshot(&["rust"], &[], &[("rust", with_prepare)]);
+        assert_eq!(
+            snap.document_support_gated("rust", ToolKind::Rename, Some(Capability::PrepareRename)),
+            RouteSupport::Supported { server }
+        );
+    }
+
+    #[test]
+    fn capability_set_fits_every_capability() {
+        assert!(Capability::ALL.len() > 16);
+        let caps = ServerCapabilities {
+            document_range_formatting_provider: Some(
+                lsp_types::DocumentRangeFormattingProvider::Bool(true),
+            ),
+            ..Default::default()
+        };
+        assert!(CapabilitySet::of(&caps).contains(Capability::FormatRange));
     }
 
     #[test]

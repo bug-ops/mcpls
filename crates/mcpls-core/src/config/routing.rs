@@ -69,7 +69,10 @@ impl From<&str> for ServerId {
 /// as a single route: the opaque item returned by `prepare` is only
 /// meaningful to the server that produced it, and the incoming/outgoing
 /// handlers never call `ensure_open` themselves — they rely on `prepare`
-/// having already synced the document to the *same* server.
+/// having already synced the document to the *same* server. `TypeHierarchy`
+/// covers `prepare_type_hierarchy`, `get_supertypes` and `get_subtypes` for
+/// the same reason. `Rename` also covers `prepare_rename`, so the verdict
+/// and the edit always come from the same server.
 ///
 /// # Examples
 ///
@@ -77,7 +80,7 @@ impl From<&str> for ServerId {
 /// use mcpls_core::config::ToolKind;
 ///
 /// assert_eq!(ToolKind::Hover.as_str(), "hover");
-/// assert_eq!(ToolKind::ALL.len(), 16);
+/// assert_eq!(ToolKind::ALL.len(), 19);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,7 +98,7 @@ pub enum ToolKind {
     References,
     /// `textDocument/diagnostic` (pull) and the `publishDiagnostics` cache filter.
     Diagnostics,
-    /// `textDocument/rename`.
+    /// `textDocument/rename` and `textDocument/prepareRename`.
     Rename,
     /// `textDocument/completion`.
     Completions,
@@ -115,6 +118,12 @@ pub enum ToolKind {
     InlayHints,
     /// `textDocument/declaration`.
     Declaration,
+    /// `textDocument/prepareTypeHierarchy`, `typeHierarchy/supertypes`, `typeHierarchy/subtypes`.
+    TypeHierarchy,
+    /// `textDocument/documentHighlight`.
+    DocumentHighlights,
+    /// `textDocument/rangeFormatting`.
+    FormatRange,
 }
 
 impl ToolKind {
@@ -137,6 +146,9 @@ impl ToolKind {
         Self::CallHierarchy,
         Self::InlayHints,
         Self::Declaration,
+        Self::TypeHierarchy,
+        Self::DocumentHighlights,
+        Self::FormatRange,
     ];
 
     /// The `snake_case` name used in config `handles` lists and error messages.
@@ -159,6 +171,9 @@ impl ToolKind {
             Self::CallHierarchy => "call_hierarchy",
             Self::InlayHints => "inlay_hints",
             Self::Declaration => "declaration",
+            Self::TypeHierarchy => "type_hierarchy",
+            Self::DocumentHighlights => "document_highlights",
+            Self::FormatRange => "format_range",
         }
     }
 }
@@ -933,7 +948,7 @@ mod tests {
     fn test_tool_kind_as_str_and_all_len() {
         assert_eq!(ToolKind::Hover.as_str(), "hover");
         assert_eq!(ToolKind::CallHierarchy.as_str(), "call_hierarchy");
-        assert_eq!(ToolKind::ALL.len(), 16);
+        assert_eq!(ToolKind::ALL.len(), 19);
 
         // `ALL` is a slice now, so nothing pins its element count at compile
         // time the way `[Self; 15]` used to -- guard against duplicate or

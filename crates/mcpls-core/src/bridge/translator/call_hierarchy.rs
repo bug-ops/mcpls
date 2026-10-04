@@ -9,11 +9,12 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{
     CallHierarchyItemResult, CallHierarchyPrepareResult, IncomingCall, IncomingCallsResult,
-    OutgoingCall, OutgoingCallsResult, Position, lsp_kind_to_u32,
+    OutgoingCall, OutgoingCallsResult, Position,
 };
 use super::encoding_ctx::EncodingCtx;
+use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE};
+use super::routing::{Capability, IndexingGate, validate_position};
 use crate::bridge::ClientPath;
 use crate::error::{Error, Result};
 
@@ -48,29 +49,16 @@ fn parse_mcp_call_hierarchy_item(item: serde_json::Value) -> Result<ParsedCallHi
 
 /// Convert a parsed MCP call hierarchy item (1-based coordinates) into a
 /// `lsp_types::CallHierarchyItem` (0-based, in `ctx`'s negotiated encoding).
+///
+/// `uri` is the opened document's own canonical URI, not the client's raw
+/// string: the server must read the file mcpls validated, not a spelling
+/// (`sym/../f`) that resolves elsewhere on its side.
 async fn call_hierarchy_item_to_lsp(
     parsed: ParsedCallHierarchyItem,
+    uri: lsp_types::Uri,
     ctx: &EncodingCtx,
 ) -> CallHierarchyItem {
-    let ParsedCallHierarchyItem { uri, mcp } = parsed;
-
-    // `SymbolKind: From<u32>` is infallible (see `lsp_kind_to_u32`'s docs),
-    // so this exactly reverses the `lsp_kind_to_u32` call in
-    // `convert_call_hierarchy_item` with no fallback needed.
-    let kind = lsp_types::SymbolKind::from(mcp.kind);
-    let range = ctx.denormalize_range(&uri, &mcp.range).await;
-    let selection_range = ctx.denormalize_range(&uri, &mcp.selection_range).await;
-
-    CallHierarchyItem {
-        name: mcp.name,
-        kind,
-        tags: None,
-        detail: mcp.detail,
-        uri,
-        range,
-        selection_range,
-        data: mcp.data,
-    }
+    hierarchy_item_to_lsp(parsed.mcp, uri, ctx).await
 }
 
 /// Convert LSP call hierarchy item to MCP call hierarchy item.
@@ -78,20 +66,7 @@ async fn convert_call_hierarchy_item(
     item: CallHierarchyItem,
     ctx: &EncodingCtx,
 ) -> CallHierarchyItemResult {
-    let out_of_workspace = ctx.is_out_of_workspace(&item.uri);
-    let range = ctx.normalize_range(&item.uri, item.range).await;
-    let selection_range = ctx.normalize_range(&item.uri, item.selection_range).await;
-
-    CallHierarchyItemResult {
-        name: item.name,
-        kind: lsp_kind_to_u32(item.kind),
-        detail: item.detail,
-        uri: item.uri.to_string(),
-        range,
-        selection_range,
-        data: item.data,
-        out_of_workspace,
-    }
+    hierarchy_item_to_mcp(item, ctx).await
 }
 
 impl Translator {
@@ -106,19 +81,7 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<CallHierarchyPrepareResult> {
-        let Position { line, character } = position;
-        // Validate position bounds
-        if line < 1 || character < 1 {
-            return Err(Error::InvalidToolParams(
-                "Line and character positions must be >= 1".to_string(),
-            ));
-        }
-
-        if line > MAX_POSITION_VALUE || character > MAX_POSITION_VALUE {
-            return Err(Error::InvalidToolParams(format!(
-                "Position values must be <= {MAX_POSITION_VALUE}"
-            )));
-        }
+        validate_position(position)?;
 
         let doc = self
             .prepare_gated_document(
@@ -198,7 +161,7 @@ impl Translator {
             .await?;
         let (server_id, client, _uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
-        let lsp_item = call_hierarchy_item_to_lsp(parsed, &ctx).await;
+        let lsp_item = call_hierarchy_item_to_lsp(parsed, doc.uri().clone(), &ctx).await;
 
         let params = CallHierarchyIncomingCallsParams {
             item: lsp_item,
@@ -277,8 +240,8 @@ impl Translator {
         let ctx = self.encoding_ctx(server_id);
         // Per the LSP spec, an outgoing call's `fromRanges` are ranges within
         // the *queried* item's own document, not the callee's (`call.to.uri`).
-        let source_uri = parsed.uri.clone();
-        let lsp_item = call_hierarchy_item_to_lsp(parsed, &ctx).await;
+        let source_uri = doc.uri().clone();
+        let lsp_item = call_hierarchy_item_to_lsp(parsed, source_uri.clone(), &ctx).await;
 
         let params = CallHierarchyOutgoingCallsParams {
             item: lsp_item,
