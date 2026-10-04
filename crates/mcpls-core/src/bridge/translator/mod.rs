@@ -344,13 +344,37 @@ impl Translator {
     /// needs the previous client back (to fail its pending requests) and
     /// must also reset `document_tracker` for the swapped-in server, neither
     /// of which this method does.
-    pub fn register_client(&self, id: impl Into<ServerId>, client: LspClient) {
+    pub(crate) fn register_client(&self, id: impl Into<ServerId>, client: LspClient) {
         lock_std(&self.lsp_clients).insert(id.into(), client);
     }
 
     /// Register an LSP server under its routing identity.
-    pub fn register_server(&self, id: impl Into<ServerId>, server: LspServer) {
+    pub(crate) fn register_server(&self, id: impl Into<ServerId>, server: LspServer) {
         lock_std(&self.lsp_servers).insert(id.into(), server);
+    }
+
+    /// Register a spawned server in every map that needs it: its routing
+    /// client, the server itself, and the config used to respawn it.
+    ///
+    /// The routing identity, client and respawn config are all derived from
+    /// `server` itself, so they cannot be registered out of sync.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use mcpls_core::bridge::Translator;
+    /// use mcpls_core::lsp::LspServer;
+    ///
+    /// fn register(translator: &Translator, server: LspServer) {
+    ///     translator.register_server_complete(server);
+    /// }
+    /// ```
+    pub fn register_server_complete(&self, server: LspServer) {
+        let config = server.init_config().clone();
+        let id = config.server_config.id();
+        self.register_client(id.clone(), server.client().clone());
+        self.register_server_config(id.clone(), config);
+        self.register_server(id, server);
     }
 
     /// Store the config needed to respawn `id` if its process dies later.
@@ -485,6 +509,18 @@ mod tests {
     use crate::config::{ServerId, ToolKind, ToolRouter};
     use crate::error::Error;
     use crate::test_lsp::fake_lsp_client;
+
+    #[tokio::test]
+    async fn test_register_server_complete_fills_all_maps_under_init_config_id() {
+        let translator = Translator::new();
+        let config = crate::config::LspServerConfig::rust_analyzer();
+        let id = config.id();
+        translator.register_server_complete(crate::lsp::fake_lsp_server_with_config(config));
+
+        assert!(lock_std(&translator.lsp_clients).contains_key(&id));
+        assert!(lock_std(&translator.lsp_servers).contains_key(&id));
+        assert!(lock_std(&translator.server_configs).contains_key(&id));
+    }
 
     /// A panicking shutdown task must be logged, not re-raised into the caller.
     #[tokio::test]

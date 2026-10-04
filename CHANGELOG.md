@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** retryable error `data` keys are now `server_id` and `elapsed_secs`, and `McpErrorKind::Retryable` wraps the new typed `RetryableErrorData`. (#520)
 - **Breaking:** `positions_degraded` is now `"request"` or `"response"` instead of a bool, and is omitted when positions are exact. (#520)
 - **Breaking:** `mcp_to_lsp_position`/`lsp_to_mcp_position` take the typed `Position`/`Position2D`, return `Converted` values, and are now crate-private. (#512, #520)
+- **`Translator::register_client`/`register_server`** — Breaking change: now crate-private; use the new `Translator::register_server_complete`, which registers the client, server and respawn config together. (#PR)
 - **`LspClient::shutdown`/`LspServer::shutdown`** — Breaking change: bounded in total by `lsp::SHUTDOWN_TIMEOUT` and may return the new `Error::ShutdownTimeout`; a wedged message loop is aborted and its pending requests failed. (#PR)
 - **`Error::ServerNotFound`** — Breaking change: a missing server binary now yields this variant instead of `Error::ServerSpawnFailed`. (#PR)
 

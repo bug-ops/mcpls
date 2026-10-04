@@ -313,6 +313,9 @@ pub struct LspServer {
     /// (see `crate::test_lsp`, `Self::new_for_test_with_encoding`) --
     /// [`Self::spawn`] always populates this with `Some`.
     child: Option<tokio::process::Child>,
+    /// Config this server was spawned from; the single source of its routing
+    /// identity, respawn config and indexing policy.
+    init_config: ServerInitConfig,
 }
 
 impl std::fmt::Debug for LspServer {
@@ -324,11 +327,17 @@ impl std::fmt::Debug for LspServer {
             .field("notification_rx", &"<channel>")
             .field("lifecycle_rx", &"<channel>")
             .field("child", &"<process>")
+            .field("id", &self.init_config.server_config.id())
             .finish()
     }
 }
 
 impl LspServer {
+    /// The config this server was spawned from.
+    pub(crate) const fn init_config(&self) -> &ServerInitConfig {
+        &self.init_config
+    }
+
     /// Take the notification receiver out of this server, replacing it with a dummy channel.
     ///
     /// Use this to extract the receiver for a background pump task before registering
@@ -429,6 +438,7 @@ impl LspServer {
             notification_rx,
             lifecycle_rx,
             child: Some(child),
+            init_config: config,
         })
     }
 
@@ -906,8 +916,15 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 /// registerable `LspServer` from.
 #[cfg(test)]
 pub fn fake_lsp_server() -> LspServer {
+    fake_lsp_server_with_config(LspServerConfig::pyright())
+}
+
+/// As [`fake_lsp_server`], with a caller-chosen config, which is also what
+/// the returned server reports as its `init_config`.
+#[cfg(test)]
+pub fn fake_lsp_server_with_config(server_config: LspServerConfig) -> LspServer {
     let transport = crate::test_lsp::inert_transport();
-    let client = LspClient::from_transport(LspServerConfig::pyright(), transport);
+    let client = LspClient::from_transport(server_config.clone(), transport);
     let (_, mock_notification_rx) = mpsc::channel(1);
     let (_, mock_lifecycle_rx) = mpsc::channel(1);
     LspServer {
@@ -917,6 +934,19 @@ pub fn fake_lsp_server() -> LspServer {
         notification_rx: mock_notification_rx,
         lifecycle_rx: mock_lifecycle_rx,
         child: None,
+        init_config: test_init_config(server_config),
+    }
+}
+
+/// Minimal [`ServerInitConfig`] around `server_config` for test fixtures.
+#[cfg(test)]
+const fn test_init_config(server_config: LspServerConfig) -> ServerInitConfig {
+    ServerInitConfig {
+        server_config,
+        workspace_roots: vec![],
+        initialization_options: None,
+        position_encodings: vec![],
+        notification_tx: None,
     }
 }
 
@@ -956,6 +986,7 @@ impl LspServer {
             notification_rx,
             lifecycle_rx,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         }
     }
 }
@@ -1248,6 +1279,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: Some(mock_child),
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         assert!(
@@ -1280,6 +1312,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -1349,6 +1382,7 @@ mod tests {
             notification_rx: mock_notification_rx1,
             lifecycle_rx: mock_lifecycle_rx1,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1376,6 +1410,7 @@ mod tests {
             notification_rx: mock_notification_rx,
             lifecycle_rx: mock_lifecycle_rx,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server);
@@ -1418,6 +1453,7 @@ mod tests {
                 notification_rx: mock_notification_rx,
                 lifecycle_rx: mock_lifecycle_rx,
                 child: None,
+                init_config: test_init_config(config.clone()),
             };
 
             result.add_server(config.language_id, server);
@@ -1446,6 +1482,7 @@ mod tests {
             notification_rx: mock_notification_rx1,
             lifecycle_rx: mock_lifecycle_rx1,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1463,6 +1500,7 @@ mod tests {
             notification_rx: mock_notification_rx2,
             lifecycle_rx: mock_lifecycle_rx2,
             child: None,
+            init_config: test_init_config(LspServerConfig::rust_analyzer()),
         };
 
         result.add_server("rust".to_string(), server2);
@@ -2173,15 +2211,38 @@ mod tests {
 
         // Only pylsp actually registers; pyright-diag never spawned.
         let mut result = ServerInitResult::new();
-        result.add_server(pylsp_id.clone(), fake_lsp_server());
+        result.add_server(
+            pylsp_id.clone(),
+            fake_lsp_server_with_config(configs[1].clone()),
+        );
 
-        let registered = crate::register_servers(result, &translator, &HashMap::new());
+        let registered = crate::register_servers(result, &translator);
 
         assert_eq!(
             registered.diagnostics_flags.get(&pylsp_id),
             Some(&true),
             "pylsp must inherit the diagnostics route once pyright-diag is \
              known dead, and the flag must reflect that post-rebind state"
+        );
+    }
+
+    /// The indexing policy comes from the server's own `init_config`.
+    #[tokio::test]
+    async fn test_register_servers_reports_indexing_policy_from_init_config() {
+        use crate::bridge::{IndexingPolicy, Translator};
+
+        let mut config = LspServerConfig::rust_analyzer();
+        config.indexing = IndexingPolicy::Disabled;
+        let id = config.id();
+
+        let mut result = ServerInitResult::new();
+        result.add_server(id.clone(), fake_lsp_server_with_config(config));
+
+        let registered = crate::register_servers(result, &Translator::new());
+
+        assert_eq!(
+            registered.indexing_policies.get(&id),
+            Some(&IndexingPolicy::Disabled)
         );
     }
 }

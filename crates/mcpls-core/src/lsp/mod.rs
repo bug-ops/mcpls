@@ -11,9 +11,9 @@ pub(crate) mod types;
 pub(crate) use client::CONTENT_MODIFIED_RETRY_METHODS;
 pub use client::{LspClient, SHUTDOWN_TIMEOUT};
 pub(crate) use lifecycle::SUPPORTED_SYMBOL_KINDS;
-#[cfg(test)]
-pub(crate) use lifecycle::fake_lsp_server;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
+#[cfg(test)]
+pub(crate) use lifecycle::{fake_lsp_server, fake_lsp_server_with_config};
 pub use transport::{LspTransport, LspTransportReader};
 pub use types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,
