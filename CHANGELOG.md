@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `get_diagnostics` now reports `push_notifications_degraded`, sampled before and after the pull so a restart triggered by the call itself is caught. (#520)
 - Completions and signature help now report `positions_degraded`. (#520)
-- Install and PATH guidance in the error for a missing LSP server executable, with a per-server install hint for the six builtin servers (`BuiltinServer`). (#PR)
+- Install and PATH guidance in the error for a missing LSP server executable, with a per-server install hint for the six builtin servers (`BuiltinServer`). (#530)
 
 ### Changed
 
@@ -21,10 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** retryable error `data` keys are now `server_id` and `elapsed_secs`, and `McpErrorKind::Retryable` wraps the new typed `RetryableErrorData`. (#520)
 - **Breaking:** `positions_degraded` is now `"request"` or `"response"` instead of a bool, and is omitted when positions are exact. (#520)
 - **Breaking:** `mcp_to_lsp_position`/`lsp_to_mcp_position` take the typed `Position`/`Position2D`, return `Converted` values, and are now crate-private. (#512, #520)
-- Release binaries now build with `panic = "unwind"`: a panic no longer orphans LSP children, and a server whose message loop panicked is respawned. (#PR)
-- **`Translator::register_client`/`register_server`** — Breaking change: now crate-private; use the new `Translator::register_server_complete`, which registers the client, server and respawn config together. (#PR)
-- **`LspClient::shutdown`/`LspServer::shutdown`** — Breaking change: now has an overall deadline of `lsp::SHUTDOWN_TIMEOUT` and may return the new `Error::ShutdownTimeout`; a wedged message loop is aborted and its pending requests failed. (#PR)
-- **`Error::ServerNotFound`** — Breaking change: a missing server binary now yields this variant instead of `Error::ServerSpawnFailed`. (#PR)
+- Release binaries now build with `panic = "unwind"`: a panic no longer orphans LSP children, and a server whose message loop panicked is respawned. (#530)
+- **`Translator::register_client`/`register_server`** — Breaking change: now crate-private; use the new `Translator::register_server_complete`, which registers the client, server and respawn config together. (#530)
+- **`LspClient::shutdown`/`LspServer::shutdown`** — Breaking change: now has an overall deadline of `lsp::SHUTDOWN_TIMEOUT` and may return the new `Error::ShutdownTimeout`; a wedged message loop is aborted and its pending requests failed. (#530)
+- **`Error::ServerNotFound`** — Breaking change: a missing server binary now yields this variant instead of `Error::ServerSpawnFailed`. (#530)
 
 ### Fixed
 
