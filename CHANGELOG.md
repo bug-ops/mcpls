@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - LSP servers and their descendants now die with mcpls on any exit (Windows Job Object, Unix watchdog group); descendants that call `setsid` survive on Unix (#541). (#546)
 - `HttpConfig` gains a header/body-stall timeout and a connection cap. (#546)
 - `proptest` properties and a `cargo-fuzz` target for the LSP frame parser. (#546)
+- HTTP GET streams are probed with an MCP ping and closed when the client stops answering, portably and behind proxies; new `--http-stream-liveness` flag and `HttpConfig::with_stream_liveness`. (#543, #553)
 
 ### Changed
 
@@ -27,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `mcpls-bench` reports gain `memory`, `memory_summary`, `stderr_log`, `p95_us` and `orphans_killed`, and scenario `source.url` must be a canonical `https://github.com/<owner>/<repo>`; mcpls runs in its own process group killed on shutdown or SIGINT/SIGTERM. (#549)
 - CI checks `cargo check -p mcpls --locked`. (#549)
 - Bump rmcp to 3.5.0. (#536)
+- **Breaking:** `HttpConfig` gains a `stream_liveness` field. (#543, #553)
+- **Breaking:** `get_cached_diagnostics` and the diagnostics resource return a retryable error while the server starts, and `resources/subscribe`/`subscriptions/listen` report startup failures. (#545, #544, #553)
 - **Breaking:** `RetryableErrorData` gains a `ListenStreamsExhausted` variant. (#536)
 - **Breaking:** every tool now returns `structuredContent` with an `outputSchema`; the text copy is key-sorted JSON, so payloads roughly double. (#546)
 - **Breaking:** `McpErrorKind` is `#[non_exhaustive]` and gains `InvalidPosition`; out-of-range positions return the raw server error as `data`. (#546)
