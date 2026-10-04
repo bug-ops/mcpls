@@ -21,8 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** retryable error `data` keys are now `server_id` and `elapsed_secs`, and `McpErrorKind::Retryable` wraps the new typed `RetryableErrorData`. (#520)
 - **Breaking:** `positions_degraded` is now `"request"` or `"response"` instead of a bool, and is omitted when positions are exact. (#520)
 - **Breaking:** `mcp_to_lsp_position`/`lsp_to_mcp_position` take the typed `Position`/`Position2D`, return `Converted` values, and are now crate-private. (#512, #520)
-- Release binaries now build with `panic = "unwind"` and `main` shuts the runtime down on a panic, so LSP children are reaped instead of orphaned; a panicking request handler no longer kills the whole process. (#PR)
-- Release binaries now build with `panic = "unwind"` and `main` shuts the runtime down on a panic in its own future so LSP children are reaped instead of orphaned; a panicking spawned task (e.g. a request handler) is now contained by tokio instead of killing the process, and a server whose message loop panicked is respawned. (#PR)
 - Release binaries now build with `panic = "unwind"`: a panic no longer orphans LSP children, and a server whose message loop panicked is respawned. (#PR)
 - **`Translator::register_client`/`register_server`** — Breaking change: now crate-private; use the new `Translator::register_server_complete`, which registers the client, server and respawn config together. (#PR)
 - **`LspClient::shutdown`/`LspServer::shutdown`** — Breaking change: now has an overall deadline of `lsp::SHUTDOWN_TIMEOUT` and may return the new `Error::ShutdownTimeout`; a wedged message loop is aborted and its pending requests failed. (#PR)
