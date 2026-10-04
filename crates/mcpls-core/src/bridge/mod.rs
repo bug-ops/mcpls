@@ -29,11 +29,11 @@ pub(crate) use notifications::apply_lifecycle_notification;
 pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
-pub(crate) use state::try_path_to_uri;
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, EvictedDocument, ResourceLimits,
     path_to_uri, uri_to_path,
 };
+pub(crate) use state::{InFlightGuard, try_path_to_uri};
 pub(crate) use translator::validate_path_against_roots;
 pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,

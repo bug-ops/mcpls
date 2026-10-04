@@ -1,5 +1,6 @@
 //! Rename, format-document, and code-actions handlers.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use lsp_types::{
@@ -16,6 +17,7 @@ use super::dto::{
     FormatDocumentResult, Position, RenameResult, TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
+use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
 use crate::bridge::uri_in_workspace_roots;
 use crate::config::{ServerId, ToolKind};
@@ -126,74 +128,154 @@ fn validate_rename_params(new_name: &str) -> Result<()> {
 /// do not set `workspace.workspaceEdit.documentChanges`, so per LSP 3.17 a
 /// spec-compliant server must always populate `changes`; the
 /// `documentChanges`-only fallback exists solely for common non-compliant
-/// servers (e.g. rust-analyzer), and the branch where both are present is
-/// effectively dead in practice -- do not "fix" this to prefer
-/// `documentChanges` first without first advertising that capability. An
-/// entry outside `workspace_roots` is dropped rather than rewritten into the
-/// response -- see [`crate::bridge::uri_in_workspace_roots`]. `edit_kind`
-/// names the caller for the dropped-entry log line (e.g. `"rename edit"`,
-/// `"code-action edit"`).
+/// servers (e.g. rust-analyzer) -- do not "fix" this to prefer
+/// `documentChanges` first without first advertising that capability.
+///
+/// When both fields are present, `changes` wins but `documentChanges` is
+/// still tallied so nothing is discarded untraced (#498): file operations
+/// count as `unsupported_file_operation`, and a text-document edit whose URI
+/// `changes` does not already name counts as `shadowed_by_changes`. A URI
+/// present in both is a mirror, not a drop. An entry outside
+/// `workspace_roots` is dropped rather than rewritten into the response --
+/// see [`crate::bridge::uri_in_workspace_roots`]. Edits beyond
+/// `MAX_NORMALIZED_LOCATIONS` are counted in `exceeds_item_cap` (#487): each
+/// file's edit list is admitted whole or not at all, files in URI order, from
+/// the caller's `budget`, which the caller shares across every edit of one
+/// response. `edit_kind` names the caller for the dropped-entry log line
+/// (e.g. `"rename edit"`, `"code-action edit"`).
 async fn convert_workspace_edit(
     edit: lsp_types::WorkspaceEdit,
     ctx: &EncodingCtx,
     workspace_roots: &[PathBuf],
     edit_kind: &str,
+    budget: &mut ItemBudget,
 ) -> (Vec<DocumentChanges>, DroppedEdits) {
-    let mut result_changes = Vec::new();
-    let mut dropped = DroppedEdits::default();
+    let mut converter = WorkspaceEditConverter {
+        ctx,
+        workspace_roots,
+        edit_kind,
+        budget,
+        dropped: DroppedEdits::default(),
+        changes: Vec::new(),
+    };
 
     if let Some(changes_map) = edit.changes.filter(|m| !m.is_empty()) {
-        for (uri, edits) in changes_map {
-            if !uri_in_workspace_roots(&uri, workspace_roots) {
-                tracing::warn!(uri = uri.as_ref(), "dropping out-of-workspace {edit_kind}");
-                dropped.out_of_workspace += 1;
+        let mirrored: HashSet<lsp_types::Uri> = changes_map.keys().cloned().collect();
+        converter.convert_changes_map(changes_map).await;
+        if let Some(document_changes) = edit.document_changes {
+            converter.tally_shadowed(document_changes, &mirrored);
+        }
+    } else if let Some(document_changes) = edit.document_changes {
+        converter.convert_document_changes(document_changes).await;
+    }
+
+    (converter.changes, converter.dropped)
+}
+
+/// Mutable state threaded through [`convert_workspace_edit`]'s two source
+/// branches so they share one item budget and one drop tally.
+struct WorkspaceEditConverter<'a> {
+    ctx: &'a EncodingCtx,
+    workspace_roots: &'a [PathBuf],
+    edit_kind: &'a str,
+    budget: &'a mut ItemBudget,
+    dropped: DroppedEdits,
+    changes: Vec<DocumentChanges>,
+}
+
+impl WorkspaceEditConverter<'_> {
+    /// Whether `uri` is inside a workspace root; an outside URI is logged and
+    /// tallied in `dropped.out_of_workspace` as a side effect.
+    fn check_in_workspace(&mut self, uri: &lsp_types::Uri) -> bool {
+        let in_workspace = uri_in_workspace_roots(uri, self.workspace_roots);
+        if !in_workspace {
+            tracing::warn!(
+                uri = uri.as_ref(),
+                "dropping out-of-workspace {}",
+                self.edit_kind
+            );
+            self.dropped.out_of_workspace += 1;
+        }
+        in_workspace
+    }
+
+    /// Admits one file's whole edit list against the budget, or tallies all
+    /// of it as over the cap and returns `None`. Snippet edits are admitted
+    /// (and so spend budget) before they are dropped as unsupported.
+    fn admit_edits<T>(&mut self, edits: Vec<T>) -> Option<Vec<T>> {
+        let total = edits.len();
+        let admitted = self.budget.admit_whole(edits);
+        if admitted.is_none() {
+            self.dropped.exceeds_item_cap += total;
+        }
+        admitted
+    }
+
+    /// An entry whose edits were all dropped is left out; one that arrived
+    /// empty still round-trips.
+    fn push_entry(&mut self, uri: String, edits: Vec<TextEdit>, entry_dropped: usize) {
+        if edits.is_empty() && entry_dropped > 0 {
+            return;
+        }
+        self.changes.push(DocumentChanges { uri, edits });
+    }
+
+    async fn convert_changes_map(
+        &mut self,
+        changes_map: HashMap<lsp_types::Uri, Vec<lsp_types::TextEdit>>,
+    ) {
+        let mut entries: Vec<_> = changes_map.into_iter().collect();
+        entries.sort_by_cached_key(|(uri, _)| uri.to_string());
+        for (uri, edits) in entries {
+            if !self.check_in_workspace(&uri) {
                 continue;
             }
+            let Some(edits) = self.admit_edits(edits) else {
+                continue;
+            };
             let mut text_edits = Vec::with_capacity(edits.len());
             for e in edits {
                 text_edits.push(TextEdit {
-                    range: ctx.normalize_range(&uri, e.range).await,
+                    range: self.ctx.normalize_range(&uri, e.range).await,
                     new_text: e.new_text,
                 });
             }
-            result_changes.push(DocumentChanges {
-                uri: uri.to_string(),
-                edits: text_edits,
-            });
+            self.push_entry(uri.to_string(), text_edits, 0);
         }
-    } else if let Some(document_changes) = edit.document_changes {
-        let text_doc_edits: Vec<lsp_types::TextDocumentEdit> = document_changes
-            .into_iter()
-            .filter_map(|change| match change {
-                lsp_types::DocumentChange::TextDocumentEdit(e) => Some(e),
+    }
+
+    async fn convert_document_changes(&mut self, document_changes: Vec<lsp_types::DocumentChange>) {
+        for change in document_changes {
+            let tde = match change {
+                lsp_types::DocumentChange::TextDocumentEdit(e) => e,
                 lsp_types::DocumentChange::CreateFile(_)
                 | lsp_types::DocumentChange::RenameFile(_)
                 | lsp_types::DocumentChange::DeleteFile(_) => {
                     tracing::debug!("dropping unsupported file-operation document change");
-                    dropped.unsupported_file_operation += 1;
-                    None
+                    self.dropped.unsupported_file_operation += 1;
+                    continue;
                 }
-            })
-            .collect();
-        for tde in text_doc_edits {
-            let edit_uri = &tde.text_document.text_document_identifier.uri;
-            if !uri_in_workspace_roots(edit_uri, workspace_roots) {
-                tracing::warn!(
-                    uri = edit_uri.as_ref(),
-                    "dropping out-of-workspace {edit_kind}"
-                );
-                dropped.out_of_workspace += 1;
+            };
+            let edit_uri = tde.text_document.text_document_identifier.uri;
+            if !self.check_in_workspace(&edit_uri) {
                 continue;
             }
-            let mut text_edits = Vec::with_capacity(tde.edits.len());
-            for one_of in tde.edits {
+            let Some(edits) = self.admit_edits(tde.edits) else {
+                continue;
+            };
+            let mut entry_dropped = 0;
+            let mut text_edits = Vec::with_capacity(edits.len());
+            for one_of in edits {
                 let text_edit = match one_of {
                     lsp_types::Edit::TextEdit(te) => TextEdit {
-                        range: ctx.normalize_range(edit_uri, te.range).await,
+                        range: self.ctx.normalize_range(&edit_uri, te.range).await,
                         new_text: te.new_text,
                     },
                     lsp_types::Edit::AnnotatedTextEdit(ate) => TextEdit {
-                        range: ctx.normalize_range(edit_uri, ate.text_edit.range).await,
+                        range: self
+                            .ctx
+                            .normalize_range(&edit_uri, ate.text_edit.range)
+                            .await,
                         new_text: ate.text_edit.new_text,
                     },
                     // Snippet edits are an LSP 3.18 addition mcpls does not
@@ -207,20 +289,44 @@ async fn convert_workspace_edit(
                     // dropped above rather than mistranslated.
                     lsp_types::Edit::SnippetTextEdit(_) => {
                         tracing::debug!("dropping unsupported snippet text edit");
-                        dropped.unsupported_snippet_edit += 1;
+                        self.dropped.unsupported_snippet_edit += 1;
+                        entry_dropped += 1;
                         continue;
                     }
                 };
                 text_edits.push(text_edit);
             }
-            result_changes.push(DocumentChanges {
-                uri: edit_uri.to_string(),
-                edits: text_edits,
-            });
+            self.push_entry(edit_uri.to_string(), text_edits, entry_dropped);
         }
     }
 
-    (result_changes, dropped)
+    fn tally_shadowed(
+        &mut self,
+        document_changes: Vec<lsp_types::DocumentChange>,
+        mirrored: &HashSet<lsp_types::Uri>,
+    ) {
+        for change in document_changes {
+            match change {
+                lsp_types::DocumentChange::TextDocumentEdit(tde) => {
+                    let uri = &tde.text_document.text_document_identifier.uri;
+                    if !mirrored.contains(uri) {
+                        tracing::warn!(
+                            uri = uri.as_ref(),
+                            "ignoring documentChanges entry shadowed by a non-empty changes map in {}",
+                            self.edit_kind
+                        );
+                        self.dropped.shadowed_by_changes += 1;
+                    }
+                }
+                lsp_types::DocumentChange::CreateFile(_)
+                | lsp_types::DocumentChange::RenameFile(_)
+                | lsp_types::DocumentChange::DeleteFile(_) => {
+                    tracing::debug!("dropping unsupported file-operation document change");
+                    self.dropped.unsupported_file_operation += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Upper bound on the number of `codeAction/resolve` round-trips attempted
@@ -370,9 +476,11 @@ async fn convert_code_action(
     ctx: &EncodingCtx,
     uri: &lsp_types::Uri,
     workspace_roots: &[PathBuf],
+    budget: &mut ItemBudget,
 ) -> CodeAction {
     let diagnostics = match action.diagnostics {
         Some(diags) => {
+            let diags = budget.admit(diags);
             let mut result = Vec::with_capacity(diags.len());
             for d in &diags {
                 result.push(diagnostic_to_mcp(d, ctx, uri).await);
@@ -385,7 +493,8 @@ async fn convert_code_action(
     let edit = match action.edit {
         Some(edit) => {
             let (changes, dropped) =
-                convert_workspace_edit(edit, ctx, workspace_roots, "code-action edit").await;
+                convert_workspace_edit(edit, ctx, workspace_roots, "code-action edit", budget)
+                    .await;
             Some(WorkspaceEditDescription { changes, dropped })
         }
         None => None,
@@ -430,7 +539,7 @@ impl Translator {
     ) -> Result<RenameResult> {
         validate_rename_params(&new_name)?;
 
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::Rename,
@@ -438,12 +547,13 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, position).await;
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
+        let lsp_position = ctx.to_lsp(uri, position).await;
 
         let params = LspRenameParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: lsp_position,
             },
             new_name,
@@ -455,7 +565,14 @@ impl Translator {
             .await?;
 
         let (changes, dropped) = if let Some(edit) = response {
-            convert_workspace_edit(edit, &ctx, &self.workspace_roots, "rename edit").await
+            convert_workspace_edit(
+                edit,
+                &ctx,
+                &self.workspace_roots,
+                "rename edit",
+                &mut ItemBudget::new(),
+            )
+            .await
         } else {
             (vec![], DroppedEdits::default())
         };
@@ -479,7 +596,7 @@ impl Translator {
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::FormatDocument,
@@ -487,11 +604,12 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
         let response_uri = uri.clone();
 
         let params = DocumentFormattingParams {
-            text_document: TextDocumentIdentifier { uri },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             options: FormattingOptions {
                 tab_size,
                 insert_spaces,
@@ -543,7 +661,7 @@ impl Translator {
     ) -> Result<CodeActionsResult> {
         validate_code_action_params(start, end, kind_filter.as_deref())?;
 
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::CodeActions,
@@ -551,12 +669,13 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
         let response_uri = uri.clone();
 
         let range = lsp_types::Range {
-            start: ctx.to_lsp(&uri, start).await,
-            end: ctx.to_lsp(&uri, end).await,
+            start: ctx.to_lsp(uri, start).await,
+            end: ctx.to_lsp(uri, end).await,
         };
 
         // Build context with optional kind filter
@@ -569,7 +688,7 @@ impl Translator {
         let context_diagnostics: Vec<lsp_types::Diagnostic> = vec![];
 
         let params = lsp_types::CodeActionParams {
-            text_document: TextDocumentIdentifier { uri },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             range,
             context: lsp_types::CodeActionContext {
                 diagnostics: context_diagnostics,
@@ -583,15 +702,23 @@ impl Translator {
         let response = client
             .request_typed::<lsp_types::CodeActionRequest>(params, client.request_timeout())
             .await?;
-        let mut entries = response.unwrap_or_default();
-        let resolve_supported = self.code_action_resolve_supported(&server_id);
-        resolve_deferred_code_actions(&mut entries, &client, &server_id, resolve_supported).await;
+        let mut budget = ItemBudget::new();
+        let mut entries = budget.admit(response.unwrap_or_default());
+        let resolve_supported = self.code_action_resolve_supported(server_id);
+        resolve_deferred_code_actions(&mut entries, client, server_id, resolve_supported).await;
 
         let mut actions = Vec::with_capacity(entries.len());
         for action_or_command in entries {
             let action = match action_or_command {
                 lsp_types::CodeActionResponse::CodeAction(action) => {
-                    convert_code_action(action, &ctx, &response_uri, &self.workspace_roots).await
+                    convert_code_action(
+                        action,
+                        &ctx,
+                        &response_uri,
+                        &self.workspace_roots,
+                        &mut budget,
+                    )
+                    .await
                 }
                 lsp_types::CodeActionResponse::Command(cmd) => {
                     let arguments = cmd.arguments.unwrap_or_else(Vec::new);
@@ -614,6 +741,7 @@ impl Translator {
 
         Ok(CodeActionsResult {
             actions,
+            truncated: budget.truncated(),
             positions_degraded: ctx.positions_degraded(),
         })
     }
@@ -1092,10 +1220,17 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
+        let result = convert_code_action(
+            lsp_action,
+            &test_ctx(),
+            &test_uri(),
+            &[],
+            &mut ItemBudget::new(),
+        )
+        .await;
         assert_eq!(result.title, "Fix issue");
         assert!(result.kind.is_none());
-        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.diagnostics.len(), 0);
         assert!(result.edit.is_none());
         assert!(result.command.is_none());
         assert!(!result.is_preferred);
@@ -1199,7 +1334,14 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
+        let result = convert_code_action(
+            lsp_action,
+            &test_ctx(),
+            &test_uri(),
+            &[],
+            &mut ItemBudget::new(),
+        )
+        .await;
         assert_eq!(result.diagnostics.len(), 4);
         assert!(matches!(
             result.diagnostics[0].severity,
@@ -1268,8 +1410,14 @@ mod tests {
         };
 
         let workspace_roots = vec![dir.path().to_path_buf()];
-        let result =
-            convert_code_action(lsp_action, &test_ctx(), &test_uri(), &workspace_roots).await;
+        let result = convert_code_action(
+            lsp_action,
+            &test_ctx(),
+            &test_uri(),
+            &workspace_roots,
+            &mut ItemBudget::new(),
+        )
+        .await;
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
@@ -1331,8 +1479,14 @@ mod tests {
         };
 
         let workspace_roots = vec![dir.path().to_path_buf()];
-        let result =
-            convert_code_action(lsp_action, &test_ctx(), &test_uri(), &workspace_roots).await;
+        let result = convert_code_action(
+            lsp_action,
+            &test_ctx(),
+            &test_uri(),
+            &workspace_roots,
+            &mut ItemBudget::new(),
+        )
+        .await;
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
@@ -1344,8 +1498,8 @@ mod tests {
 
     /// #429 companion: when a `WorkspaceEdit` carries both `changes` and
     /// `documentChanges`, `changes` must win and `documentChanges` must be
-    /// ignored -- matching the precedence `convert_workspace_edit` already
-    /// applies for `handle_rename`.
+    /// tallied as shadowed -- matching the precedence `convert_workspace_edit`
+    /// already applies for `handle_rename`.
     #[tokio::test]
     #[allow(clippy::mutable_key_type)]
     async fn test_convert_code_action_changes_takes_precedence_over_document_changes() {
@@ -1424,8 +1578,14 @@ mod tests {
         };
 
         let workspace_roots = vec![dir.path().to_path_buf()];
-        let result =
-            convert_code_action(lsp_action, &test_ctx(), &test_uri(), &workspace_roots).await;
+        let result = convert_code_action(
+            lsp_action,
+            &test_ctx(),
+            &test_uri(),
+            &workspace_roots,
+            &mut ItemBudget::new(),
+        )
+        .await;
         let edit = result.edit.unwrap();
         assert_eq!(
             edit.changes.len(),
@@ -1434,10 +1594,11 @@ mod tests {
         );
         assert_eq!(edit.changes[0].uri, changes_uri_string);
         assert_eq!(edit.changes[0].edits[0].new_text, "from_changes");
-        assert!(
-            edit.dropped.is_empty(),
-            "documentChanges being ignored in favor of changes is not a drop"
+        assert_eq!(
+            edit.dropped.shadowed_by_changes, 1,
+            "a documentChanges entry shadowed by a non-empty changes map must be tallied (#498)"
         );
+        assert_eq!(edit.dropped.out_of_workspace, 0);
     }
 
     /// #429 companion / #415 parity: a `documentChanges` entry whose URI
@@ -1496,8 +1657,14 @@ mod tests {
         };
 
         let workspace_roots = vec![dir.path().to_path_buf()];
-        let result =
-            convert_code_action(lsp_action, &test_ctx(), &test_uri(), &workspace_roots).await;
+        let result = convert_code_action(
+            lsp_action,
+            &test_ctx(),
+            &test_uri(),
+            &workspace_roots,
+            &mut ItemBudget::new(),
+        )
+        .await;
         let edit = result.edit.unwrap();
         assert_eq!(
             edit.changes.len(),
@@ -1572,8 +1739,14 @@ mod tests {
         };
 
         let workspace_roots = vec![dir.path().to_path_buf()];
-        let (changes, dropped) =
-            convert_workspace_edit(edit, &test_ctx(), &workspace_roots, "rename edit").await;
+        let (changes, dropped) = convert_workspace_edit(
+            edit,
+            &test_ctx(),
+            &workspace_roots,
+            "rename edit",
+            &mut ItemBudget::new(),
+        )
+        .await;
 
         assert_eq!(
             changes.len(),
@@ -1628,6 +1801,7 @@ mod tests {
             &test_ctx(),
             &workspace_roots,
             "rename edit",
+            &mut ItemBudget::new(),
         )
         .await;
         assert!(changes.is_empty());
@@ -1642,8 +1816,14 @@ mod tests {
             document_changes: None,
             change_annotations: None,
         };
-        let (changes, dropped) =
-            convert_workspace_edit(no_op_edit, &test_ctx(), &workspace_roots, "rename edit").await;
+        let (changes, dropped) = convert_workspace_edit(
+            no_op_edit,
+            &test_ctx(),
+            &workspace_roots,
+            "rename edit",
+            &mut ItemBudget::new(),
+        )
+        .await;
         assert!(changes.is_empty());
         assert!(
             dropped.is_empty(),
@@ -1653,8 +1833,8 @@ mod tests {
 
     /// #475 M1: a `WorkspaceEdit` populating both `changes` and
     /// `documentChanges` with the same withheld entry must not tally it
-    /// twice -- `changes` takes exclusive precedence, so `documentChanges`
-    /// is never even inspected once `changes` is present.
+    /// twice -- `changes` takes precedence, and a `documentChanges` entry
+    /// mirroring one of its URIs is not tallied again.
     #[tokio::test]
     #[allow(clippy::mutable_key_type)]
     async fn test_convert_workspace_edit_changes_precedence_avoids_double_counting_drops() {
@@ -1709,8 +1889,14 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let workspace_roots = vec![dir.path().to_path_buf()];
-        let (changes, dropped) =
-            convert_workspace_edit(edit, &test_ctx(), &workspace_roots, "rename edit").await;
+        let (changes, dropped) = convert_workspace_edit(
+            edit,
+            &test_ctx(),
+            &workspace_roots,
+            "rename edit",
+            &mut ItemBudget::new(),
+        )
+        .await;
 
         assert!(changes.is_empty());
         assert_eq!(
@@ -1807,8 +1993,14 @@ mod tests {
         };
 
         let workspace_roots = vec![dir.path().to_path_buf()];
-        let (changes, dropped) =
-            convert_workspace_edit(edit, &test_ctx(), &workspace_roots, "rename edit").await;
+        let (changes, dropped) = convert_workspace_edit(
+            edit,
+            &test_ctx(),
+            &workspace_roots,
+            "rename edit",
+            &mut ItemBudget::new(),
+        )
+        .await;
 
         assert!(
             changes.is_empty(),
@@ -1869,8 +2061,14 @@ mod tests {
         };
 
         let workspace_roots = vec![dir.path().to_path_buf()];
-        let (changes, dropped) =
-            convert_workspace_edit(edit, &test_ctx(), &workspace_roots, "rename edit").await;
+        let (changes, dropped) = convert_workspace_edit(
+            edit,
+            &test_ctx(),
+            &workspace_roots,
+            "rename edit",
+            &mut ItemBudget::new(),
+        )
+        .await;
 
         assert_eq!(
             changes.len(),
@@ -1905,6 +2103,7 @@ mod tests {
                 out_of_workspace: 1,
                 unsupported_file_operation: 2,
                 unsupported_snippet_edit: 0,
+                ..DroppedEdits::default()
             },
             positions_degraded: None,
         };
@@ -1939,7 +2138,14 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action, &test_ctx(), &test_uri(), &[]).await;
+        let result = convert_code_action(
+            lsp_action,
+            &test_ctx(),
+            &test_uri(),
+            &[],
+            &mut ItemBudget::new(),
+        )
+        .await;
         assert!(result.command.is_some());
         let cmd = result.command.unwrap();
         assert_eq!(cmd.title, "Execute refactor");
@@ -2686,5 +2892,283 @@ mod tests {
 
         let result = handle.await.unwrap().unwrap();
         assert!(result.changes.is_empty());
+    }
+
+    fn file_uri(dir: &tempfile::TempDir, name: &str) -> String {
+        let path = dir.path().join(name);
+        fs::write(&path, "fn f() {}").unwrap();
+        url::Url::from_file_path(&path).unwrap().to_string()
+    }
+
+    fn json_edit(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1}
+            },
+            "newText": text
+        })
+    }
+
+    fn json_snippet_edit() -> serde_json::Value {
+        serde_json::json!({
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 0}
+            },
+            "snippet": { "value": "x", "kind": "snippet" }
+        })
+    }
+
+    fn json_text_document_edit(uri: &str, edits: &[serde_json::Value]) -> serde_json::Value {
+        serde_json::json!({
+            "textDocument": { "uri": uri, "version": 1 },
+            "edits": edits
+        })
+    }
+
+    async fn convert_json(
+        dir: &tempfile::TempDir,
+        edit: serde_json::Value,
+    ) -> (Vec<DocumentChanges>, DroppedEdits) {
+        let edit: lsp_types::WorkspaceEdit = serde_json::from_value(edit).unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        convert_workspace_edit(
+            edit,
+            &test_ctx(),
+            &roots,
+            "rename edit",
+            &mut ItemBudget::new(),
+        )
+        .await
+    }
+
+    /// #498 site 1: with a non-empty `changes`, `documentChanges` entries it
+    /// does not mirror must be tallied instead of vanishing.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_tallies_document_changes_shadowed_by_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let in_changes = file_uri(&dir, "a.rs");
+        let only_in_document_changes = file_uri(&dir, "b.rs");
+
+        let (changes, dropped) = convert_json(
+            &dir,
+            serde_json::json!({
+                "changes": { in_changes.clone(): [json_edit("x")] },
+                "documentChanges": [
+                    json_text_document_edit(&only_in_document_changes, &[json_edit("y")]),
+                    { "kind": "create", "uri": "file:///workspace/new.rs" },
+                    { "kind": "delete", "uri": "file:///workspace/gone.rs" }
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].uri, in_changes);
+        assert_eq!(dropped.shadowed_by_changes, 1);
+        assert_eq!(dropped.unsupported_file_operation, 2);
+        assert_eq!(dropped.out_of_workspace, 0);
+    }
+
+    /// #498 / #475 M1: a URI present in both fields is a mirror, not a drop.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_mirrored_document_changes_are_not_tallied() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = file_uri(&dir, "a.rs");
+
+        let (changes, dropped) = convert_json(
+            &dir,
+            serde_json::json!({
+                "changes": { uri.clone(): [json_edit("x")] },
+                "documentChanges": [json_text_document_edit(&uri, &[json_edit("x")])]
+            }),
+        )
+        .await;
+
+        assert_eq!(changes.len(), 1);
+        assert!(dropped.is_empty(), "mirror tallied as a drop: {dropped:?}");
+    }
+
+    /// #498 site 2: an entry whose every edit was dropped is not listed, while
+    /// one that arrived empty still round-trips.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_omits_entry_whose_edits_were_all_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let all_snippets = file_uri(&dir, "snippets.rs");
+        let empty_on_arrival = file_uri(&dir, "empty.rs");
+
+        let (changes, dropped) = convert_json(
+            &dir,
+            serde_json::json!({
+                "documentChanges": [
+                    json_text_document_edit(
+                        &all_snippets,
+                        &[json_snippet_edit(), json_snippet_edit()]
+                    ),
+                    json_text_document_edit(&empty_on_arrival, &[])
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].uri, empty_on_arrival);
+        assert_eq!(dropped.unsupported_snippet_edit, 2);
+    }
+
+    fn json_edits(count: usize) -> Vec<serde_json::Value> {
+        (0..count).map(|_| json_edit("x")).collect()
+    }
+
+    /// #487 M1: a file's edits are admitted whole or not at all, and files are
+    /// considered in URI order, so the second of two files that jointly exceed
+    /// the cap is the one dropped -- never a half-applied first file.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_admits_files_whole_in_uri_order() {
+        use super::super::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = file_uri(&dir, "a.rs");
+        let second = file_uri(&dir, "b.rs");
+        let per_file = MAX_NORMALIZED_LOCATIONS / 2 + 250;
+        let edits = json_edits(per_file);
+
+        let (changes, dropped) = convert_json(
+            &dir,
+            serde_json::json!({ "changes": { second: edits.clone(), first.clone(): edits } }),
+        )
+        .await;
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].uri, first);
+        assert_eq!(changes[0].edits.len(), per_file);
+        assert_eq!(dropped.exceeds_item_cap, per_file);
+    }
+
+    /// #487: exactly `MAX_NORMALIZED_LOCATIONS` edits is within the cap.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_exactly_at_cap_drops_nothing() {
+        use super::super::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = file_uri(&dir, "a.rs");
+
+        let (changes, dropped) = convert_json(
+            &dir,
+            serde_json::json!({ "changes": { uri: json_edits(MAX_NORMALIZED_LOCATIONS) } }),
+        )
+        .await;
+
+        assert_eq!(changes[0].edits.len(), MAX_NORMALIZED_LOCATIONS);
+        assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
+    /// #487: one edit past the cap drops the whole file and counts every edit.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_one_past_cap_drops_whole_file() {
+        use super::super::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = file_uri(&dir, "a.rs");
+
+        let (changes, dropped) = convert_json(
+            &dir,
+            serde_json::json!({ "changes": { uri: json_edits(MAX_NORMALIZED_LOCATIONS + 1) } }),
+        )
+        .await;
+
+        assert!(changes.is_empty());
+        assert_eq!(dropped.exceeds_item_cap, MAX_NORMALIZED_LOCATIONS + 1);
+    }
+
+    /// #487 x #475 M1: a `documentChanges` entry mirroring a `changes` URI
+    /// draws nothing from the budget, and a shadowed entry that is not a
+    /// mirror is tallied as shadowed without counting against the cap.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_mirror_and_shadowed_entries_spend_no_budget() {
+        use super::super::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mirrored = file_uri(&dir, "a.rs");
+        let shadowed = file_uri(&dir, "b.rs");
+        let full = json_edits(MAX_NORMALIZED_LOCATIONS);
+
+        let (changes, dropped) = convert_json(
+            &dir,
+            serde_json::json!({
+                "changes": { mirrored.clone(): full.clone() },
+                "documentChanges": [
+                    json_text_document_edit(&mirrored, &full),
+                    json_text_document_edit(&shadowed, &[json_edit("y")])
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].edits.len(), MAX_NORMALIZED_LOCATIONS);
+        assert_eq!(dropped.exceeds_item_cap, 0);
+        assert_eq!(dropped.shadowed_by_changes, 1);
+    }
+
+    /// #487 S1: one budget is shared across every code action of a response,
+    /// so N actions cannot each normalize a full cap's worth of edits.
+    #[tokio::test]
+    async fn test_convert_code_action_shares_budget_across_actions() {
+        use super::super::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = file_uri(&dir, "a.rs");
+        let per_action = MAX_NORMALIZED_LOCATIONS / 2 + 250;
+        let action = |title: &str| -> lsp_types::CodeAction {
+            serde_json::from_value(serde_json::json!({
+                "title": title,
+                "edit": { "changes": { uri.clone(): json_edits(per_action) } }
+            }))
+            .unwrap()
+        };
+        let roots = vec![dir.path().to_path_buf()];
+        let mut budget = ItemBudget::new();
+
+        let first =
+            convert_code_action(action("one"), &test_ctx(), &test_uri(), &roots, &mut budget).await;
+        let second =
+            convert_code_action(action("two"), &test_ctx(), &test_uri(), &roots, &mut budget).await;
+
+        assert!(first.edit.unwrap().dropped.is_empty());
+        let second_edit = second.edit.unwrap();
+        assert!(second_edit.changes.is_empty());
+        assert_eq!(second_edit.dropped.exceeds_item_cap, per_action);
+        assert!(budget.truncated());
+    }
+
+    /// #487: a file reached after the budget is spent is left out entirely
+    /// and counted, not listed with no edits.
+    #[tokio::test]
+    async fn test_convert_workspace_edit_skips_files_once_budget_is_spent() {
+        use super::super::navigation::MAX_NORMALIZED_LOCATIONS;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let full = file_uri(&dir, "full.rs");
+        let overflow = file_uri(&dir, "overflow.rs");
+        let full_edits: Vec<_> = (0..MAX_NORMALIZED_LOCATIONS)
+            .map(|_| json_edit("x"))
+            .collect();
+
+        let (changes, dropped) = convert_json(
+            &dir,
+            serde_json::json!({
+                "documentChanges": [
+                    json_text_document_edit(&full, &full_edits),
+                    json_text_document_edit(&overflow, &[json_edit("y"), json_edit("z")])
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].uri, full);
+        assert_eq!(dropped.exceeds_item_cap, 2);
     }
 }

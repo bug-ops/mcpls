@@ -11,7 +11,7 @@ use crate::common::test_utils::{
 #[test]
 fn test_translator_creation() {
     let translator = Translator::new();
-    assert!(translator.open_document_paths().is_empty());
+    assert_eq!(translator.open_document_paths().len(), 0);
 }
 
 #[test]
