@@ -1,7 +1,6 @@
 //! Rename, format-document, and code-actions handlers.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 use lsp_types::{
     DocumentFormattingParams, FormattingOptions, PartialResultParams,
@@ -19,7 +18,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate, MAX_POSITION_VALUE, MAX_RANGE_LINES};
-use crate::bridge::uri_in_workspace_roots;
+use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::LspClient;
@@ -137,7 +136,7 @@ fn validate_rename_params(new_name: &str) -> Result<()> {
 /// `changes` does not already name counts as `shadowed_by_changes`. A URI
 /// present in both is a mirror, not a drop. An entry outside
 /// `workspace_roots` is dropped rather than rewritten into the response --
-/// see [`crate::bridge::uri_in_workspace_roots`]. Edits beyond
+/// see [`WorkspaceRoots::admits_edit_uri`]. Edits beyond
 /// `MAX_NORMALIZED_LOCATIONS` are counted in `exceeds_item_cap` (#487): each
 /// file's edit list is admitted whole or not at all, files in URI order, from
 /// the caller's `budget`, which the caller shares across every edit of one
@@ -146,7 +145,7 @@ fn validate_rename_params(new_name: &str) -> Result<()> {
 async fn convert_workspace_edit(
     edit: lsp_types::WorkspaceEdit,
     ctx: &EncodingCtx,
-    workspace_roots: &[PathBuf],
+    workspace_roots: &WorkspaceRoots,
     edit_kind: &str,
     budget: &mut ItemBudget,
 ) -> (Vec<DocumentChanges>, DroppedEdits) {
@@ -176,7 +175,7 @@ async fn convert_workspace_edit(
 /// branches so they share one item budget and one drop tally.
 struct WorkspaceEditConverter<'a> {
     ctx: &'a EncodingCtx,
-    workspace_roots: &'a [PathBuf],
+    workspace_roots: &'a WorkspaceRoots,
     edit_kind: &'a str,
     budget: &'a mut ItemBudget,
     dropped: DroppedEdits,
@@ -184,10 +183,12 @@ struct WorkspaceEditConverter<'a> {
 }
 
 impl WorkspaceEditConverter<'_> {
-    /// Whether `uri` is inside a workspace root; an outside URI is logged and
-    /// tallied in `dropped.out_of_workspace` as a side effect.
-    fn check_in_workspace(&mut self, uri: &lsp_types::Uri) -> bool {
-        let in_workspace = uri_in_workspace_roots(uri, self.workspace_roots);
+    /// Whether `uri` may be written through (see
+    /// [`WorkspaceRoots::admits_edit_uri`]: exact-case lexical containment plus
+    /// canonical containment); an outside URI is logged and tallied in
+    /// `dropped.out_of_workspace` as a side effect.
+    async fn check_in_workspace(&mut self, uri: &lsp_types::Uri) -> bool {
+        let in_workspace = self.workspace_roots.admits_edit_uri(uri).await;
         if !in_workspace {
             tracing::warn!(
                 uri = uri.as_ref(),
@@ -227,7 +228,7 @@ impl WorkspaceEditConverter<'_> {
         let mut entries: Vec<_> = changes_map.into_iter().collect();
         entries.sort_by_cached_key(|(uri, _)| uri.to_string());
         for (uri, edits) in entries {
-            if !self.check_in_workspace(&uri) {
+            if !self.check_in_workspace(&uri).await {
                 continue;
             }
             let Some(edits) = self.admit_edits(edits) else {
@@ -258,7 +259,7 @@ impl WorkspaceEditConverter<'_> {
                 }
             };
             let edit_uri = tde.text_document.text_document_identifier.uri;
-            if !self.check_in_workspace(&edit_uri) {
+            if !self.check_in_workspace(&edit_uri).await {
                 continue;
             }
             let Some(edits) = self.admit_edits(tde.edits) else {
@@ -476,12 +477,12 @@ async fn resolve_deferred_code_actions(
 /// document's own URI, used for the action's `diagnostics` (always scoped to
 /// the requested document); `edit`'s per-file URIs (from either `changes` or
 /// `documentChanges`) are each checked against `workspace_roots` before being
-/// trusted -- see [`crate::bridge::uri_in_workspace_roots`].
+/// trusted -- see [`WorkspaceRoots::admits_edit_uri`].
 async fn convert_code_action(
     action: lsp_types::CodeAction,
     ctx: &EncodingCtx,
     uri: &lsp_types::Uri,
-    workspace_roots: &[PathBuf],
+    workspace_roots: &WorkspaceRoots,
     budget: &mut ItemBudget,
 ) -> CodeAction {
     let diagnostics = match action.diagnostics {
@@ -539,7 +540,7 @@ impl Translator {
     #[allow(clippy::too_many_lines)]
     pub async fn handle_rename(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         position: Position,
         new_name: String,
     ) -> Result<RenameResult> {
@@ -569,7 +570,7 @@ impl Translator {
             convert_workspace_edit(
                 edit,
                 &ctx,
-                self.workspace_roots.canonical(),
+                &self.workspace_roots,
                 "rename edit",
                 &mut ItemBudget::new(),
             )
@@ -593,7 +594,7 @@ impl Translator {
     /// or the routed server does not advertise `documentFormattingProvider` support.
     pub async fn handle_format_document(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
@@ -654,7 +655,7 @@ impl Translator {
     /// `wait_for_indexing_ready`).
     pub async fn handle_code_actions(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         start: Position,
         end: Position,
         kind_filter: Option<String>,
@@ -710,7 +711,7 @@ impl Translator {
                         action,
                         &ctx,
                         &response_uri,
-                        self.workspace_roots.canonical(),
+                        &self.workspace_roots,
                         &mut budget,
                     )
                     .await
@@ -751,6 +752,7 @@ mod tests {
     use crate::bridge::WorkspaceRoots;
     use crate::bridge::translator::dto::DiagnosticSeverity;
     use crate::bridge::translator::testing::*;
+    use crate::test_lsp::client_path;
 
     /// S2/S4 regression: a `documentChanges` entry mixing a plain `TextEdit`
     /// with an `Edit::SnippetTextEdit` (LSP 3.18, reachable even though mcpls
@@ -789,7 +791,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_rename(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 4,
@@ -901,7 +903,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_rename(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 4,
@@ -1004,7 +1006,7 @@ mod tests {
         let translator = Translator::new();
         let result = translator
             .handle_code_actions(
-                "/tmp/test.rs".to_string(),
+                client_path("/tmp/test.rs"),
                 Position {
                     line: 1,
                     character: 1,
@@ -1025,14 +1027,15 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = translator
             .handle_code_actions(
-                test_file.to_str().unwrap().to_string(),
+                client_path(test_file.to_str().unwrap()),
                 Position {
                     line: 1,
                     character: 1,
@@ -1055,14 +1058,15 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = translator
             .handle_code_actions(
-                test_file.to_str().unwrap().to_string(),
+                client_path(test_file.to_str().unwrap()),
                 Position {
                     line: 1,
                     character: 1,
@@ -1084,14 +1088,15 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = translator
             .handle_code_actions(
-                test_file.to_str().unwrap().to_string(),
+                client_path(test_file.to_str().unwrap()),
                 Position {
                     line: 1,
                     character: 1,
@@ -1113,14 +1118,15 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = translator
             .handle_code_actions(
-                test_file.to_str().unwrap().to_string(),
+                client_path(test_file.to_str().unwrap()),
                 Position {
                     line: 1,
                     character: 1,
@@ -1141,7 +1147,7 @@ mod tests {
         let translator = Translator::new();
         let result = translator
             .handle_code_actions(
-                "/tmp/test.rs".to_string(),
+                client_path("/tmp/test.rs"),
                 Position {
                     line: 0,
                     character: 1,
@@ -1161,7 +1167,7 @@ mod tests {
         let translator = Translator::new();
         let result = translator
             .handle_code_actions(
-                "/tmp/test.rs".to_string(),
+                client_path("/tmp/test.rs"),
                 Position {
                     line: 10,
                     character: 5,
@@ -1182,15 +1188,16 @@ mod tests {
 
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
-        translator
-            .set_workspace_roots(WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
         // Empty range (same position) should be valid
         let result = translator
             .handle_code_actions(
-                test_file.to_str().unwrap().to_string(),
+                client_path(test_file.to_str().unwrap()),
                 Position {
                     line: 1,
                     character: 5,
@@ -1225,7 +1232,7 @@ mod tests {
             lsp_action,
             &test_ctx(),
             &test_uri(),
-            &[],
+            &WorkspaceRoots::default(),
             &mut ItemBudget::new(),
         )
         .await;
@@ -1339,7 +1346,7 @@ mod tests {
             lsp_action,
             &test_ctx(),
             &test_uri(),
-            &[],
+            &WorkspaceRoots::default(),
             &mut ItemBudget::new(),
         )
         .await;
@@ -1401,7 +1408,7 @@ mod tests {
             data: None,
         };
 
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let result = convert_code_action(
             lsp_action,
             &test_ctx(),
@@ -1417,6 +1424,138 @@ mod tests {
         assert_eq!(edit.changes[0].edits.len(), 1);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
         assert!(result.is_preferred);
+    }
+
+    /// A canonical temp base with `real/a.rs` and `link -> real`; the root
+    /// sets that admit the `link` spelling: the configured symlink itself and
+    /// the logical `$PWD` of a relative root.
+    #[cfg(unix)]
+    fn alias_root_sets() -> (tempfile::TempDir, std::path::PathBuf, Vec<WorkspaceRoots>) {
+        use crate::bridge::ProcessCwd;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("a.rs"), "fn main() {}").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let roots = vec![
+            WorkspaceRoots::from_configured(std::slice::from_ref(&link)).unwrap(),
+            WorkspaceRoots::from_configured_with(&[std::path::PathBuf::from(".")], || {
+                Ok(ProcessCwd::new(
+                    real.clone(),
+                    Some(link.clone().into_os_string()),
+                ))
+            })
+            .unwrap(),
+        ];
+        (dir, link, roots)
+    }
+
+    /// #558: an edit whose URI uses an alias spelling of a root (configured
+    /// symlink, logical `$PWD`) is kept, like `validate_path_against_roots`
+    /// would admit it; an unrelated URI is still dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_convert_workspace_edit_keeps_alias_spelled_uri() {
+        let (_dir, link, root_sets) = alias_root_sets();
+        let alias_uri = crate::bridge::path_to_uri(&link.join("a.rs")).unwrap();
+        let outside_uri = lsp_types::Uri::from("file:///definitely/elsewhere/b.rs");
+        let text_edit = lsp_types::TextEdit {
+            range: lsp_types::Range::default(),
+            new_text: "x".to_string(),
+        };
+
+        for roots in root_sets {
+            let edit = lsp_types::WorkspaceEdit {
+                changes: Some(HashMap::from([
+                    (alias_uri.clone(), vec![text_edit.clone()]),
+                    (outside_uri.clone(), vec![text_edit.clone()]),
+                ])),
+                document_changes: None,
+                change_annotations: None,
+            };
+
+            let (changes, dropped) = convert_workspace_edit(
+                edit,
+                &test_ctx(),
+                &roots,
+                "rename edit",
+                &mut ItemBudget::new(),
+            )
+            .await;
+
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].uri, alias_uri.as_ref());
+            assert_eq!(dropped.out_of_workspace, 1);
+        }
+    }
+
+    /// Edits `path` through `roots` with a single-file `changes` map and
+    /// returns how many entries were kept and how many were dropped as
+    /// out-of-workspace.
+    #[cfg(unix)]
+    async fn convert_one_edit(roots: &WorkspaceRoots, path: &std::path::Path) -> (usize, usize) {
+        let uri = crate::bridge::path_to_uri(path).unwrap();
+        let edit = lsp_types::WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri,
+                vec![lsp_types::TextEdit {
+                    range: lsp_types::Range::default(),
+                    new_text: "x".to_string(),
+                }],
+            )])),
+            document_changes: None,
+            change_annotations: None,
+        };
+        let (changes, dropped) = convert_workspace_edit(
+            edit,
+            &test_ctx(),
+            roots,
+            "rename edit",
+            &mut ItemBudget::new(),
+        )
+        .await;
+        (changes.len(), dropped.out_of_workspace)
+    }
+
+    /// Aliases are only a spelling aid: a symlink inside the workspace that
+    /// points out, a retargeted alias, and a case-variant spelling are all
+    /// dropped even though a lexical check would admit (or fold) them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_convert_workspace_edit_drops_escaping_retargeted_and_case_variant_uris() {
+        let (_dir, link, root_sets) = alias_root_sets();
+        let base = link.parent().unwrap().to_path_buf();
+        let real = base.join("real");
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("out")).unwrap();
+
+        for roots in &root_sets {
+            for escaping in [
+                link.join("out/secret.rs"),
+                real.join("out/secret.rs"),
+                base.join("REAL/a.rs"),
+            ] {
+                assert_eq!(
+                    convert_one_edit(roots, &escaping).await,
+                    (0, 1),
+                    "{escaping:?}"
+                );
+            }
+            assert_eq!(convert_one_edit(roots, &link.join("a.rs")).await, (1, 0));
+        }
+
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&link)).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_eq!(
+            convert_one_edit(&roots, &link.join("secret.rs")).await,
+            (0, 1)
+        );
     }
 
     /// #429: a `codeAction` response carrying only `documentChanges` (the
@@ -1470,7 +1609,7 @@ mod tests {
             data: None,
         };
 
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let result = convert_code_action(
             lsp_action,
             &test_ctx(),
@@ -1569,7 +1708,7 @@ mod tests {
             data: None,
         };
 
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let result = convert_code_action(
             lsp_action,
             &test_ctx(),
@@ -1648,7 +1787,7 @@ mod tests {
             data: None,
         };
 
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let result = convert_code_action(
             lsp_action,
             &test_ctx(),
@@ -1730,7 +1869,7 @@ mod tests {
             change_annotations: None,
         };
 
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -1787,7 +1926,7 @@ mod tests {
         };
 
         let dir = tempfile::TempDir::new().unwrap();
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             all_dropped_edit,
             &test_ctx(),
@@ -1880,7 +2019,7 @@ mod tests {
         };
 
         let dir = tempfile::TempDir::new().unwrap();
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -1984,7 +2123,7 @@ mod tests {
             change_annotations: None,
         };
 
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -2052,7 +2191,7 @@ mod tests {
             change_annotations: None,
         };
 
-        let workspace_roots = vec![dir.path().to_path_buf()];
+        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -2134,7 +2273,7 @@ mod tests {
             lsp_action,
             &test_ctx(),
             &test_uri(),
-            &[],
+            &WorkspaceRoots::default(),
             &mut ItemBudget::new(),
         )
         .await;
@@ -2179,7 +2318,7 @@ mod tests {
 
         let err = translator
             .handle_code_actions(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -2237,7 +2376,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_code_actions(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -2315,7 +2454,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_code_actions(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -2427,7 +2566,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_code_actions(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -2517,7 +2656,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_code_actions(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -2617,7 +2756,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_code_actions(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -2725,7 +2864,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_code_actions(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -2804,7 +2943,7 @@ mod tests {
 
         let err = translator
             .handle_rename(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 4,
@@ -2858,7 +2997,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_rename(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 4,
@@ -2924,7 +3063,7 @@ mod tests {
         edit: serde_json::Value,
     ) -> (Vec<DocumentChanges>, DroppedEdits) {
         let edit: lsp_types::WorkspaceEdit = serde_json::from_value(edit).unwrap();
-        let roots = vec![dir.path().to_path_buf()];
+        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -3120,7 +3259,7 @@ mod tests {
             }))
             .unwrap()
         };
-        let roots = vec![dir.path().to_path_buf()];
+        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
         let mut budget = ItemBudget::new();
 
         let first =

@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use super::state::{encode_rfc3986_path_chars, uri_to_path};
-use super::{WorkspaceRoots, validate_path_against_roots};
+use super::{ClientPath, WorkspaceRoots, validate_path_against_roots};
 
 /// URI scheme used for diagnostic resources.
 const SCHEME: &str = "lsp-diagnostics";
@@ -125,7 +125,8 @@ pub fn make_uri(path: &Path) -> Result<String, ResourceUriError> {
 /// # Errors
 ///
 /// Returns an error if the URI does not start with the expected scheme,
-/// or if the percent-encoded path cannot be mapped to a filesystem path.
+/// or if the percent-encoded path cannot be mapped to a filesystem path
+/// (including a decoded NUL byte).
 ///
 /// # Examples
 ///
@@ -136,9 +137,9 @@ pub fn make_uri(path: &Path) -> Result<String, ResourceUriError> {
 /// let path = Path::new("/home/user/main.rs");
 /// let uri = make_uri(path).unwrap();
 /// let recovered = parse_uri(&uri).unwrap();
-/// assert_eq!(recovered, path);
+/// assert_eq!(recovered.as_path(), path);
 /// ```
-pub fn parse_uri(uri: &str) -> Result<PathBuf, ResourceUriError> {
+pub fn parse_uri(uri: &str) -> Result<ClientPath, ResourceUriError> {
     if !uri.starts_with(PREFIX) {
         return Err(ResourceUriError::InvalidScheme(uri.to_string()));
     }
@@ -155,8 +156,10 @@ pub fn parse_uri(uri: &str) -> Result<PathBuf, ResourceUriError> {
     let file_uri = format!("file://{after_prefix}");
     let url = Url::parse(&file_uri).map_err(|e| ResourceUriError::DecodeFailed(e.to_string()))?;
 
-    url.to_file_path()
-        .map_err(|()| ResourceUriError::DecodeFailed(file_uri))
+    let path = url
+        .to_file_path()
+        .map_err(|()| ResourceUriError::DecodeFailed(file_uri))?;
+    ClientPath::try_from(path).map_err(|e| ResourceUriError::DecodeFailed(e.to_string()))
 }
 
 /// A `lsp-diagnostics:///` resource URI in the form the diagnostics pump
@@ -193,14 +196,14 @@ pub(crate) struct PublishedDiagnosticsUri {
 impl PublishedDiagnosticsUri {
     /// Canonicalizes `published` (also when the file or some of its
     /// directories no longer exist) and checks the result against
-    /// `canonical_roots`.
+    /// `roots`.
     ///
     /// Returns `None` for a non-`file:` URI, an uncanonicalizable path, or a
     /// canonical path outside every root (for example a symlink pointing out
     /// of the workspace). Canonicalization runs on the blocking pool.
     pub(crate) async fn resolve(
         published: &lsp_types::Uri,
-        canonical_roots: &[PathBuf],
+        roots: &WorkspaceRoots,
     ) -> Option<Self> {
         let path = uri_to_path(published)?;
         let published_path = path.clone();
@@ -209,7 +212,7 @@ impl PublishedDiagnosticsUri {
                 .await
                 .ok()??;
         let canonical = super::try_path_to_uri(&canonical_path)?;
-        super::uri_in_workspace_roots(&canonical, canonical_roots).then(|| Self {
+        roots.contains_canonical(&canonical_path).then(|| Self {
             source: published.clone(),
             canonical,
             is_canonical: same_path(&published_path, &canonical_path),
@@ -482,6 +485,12 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::test_lsp::client_path;
+
+    fn roots_of(root: &Path) -> WorkspaceRoots {
+        WorkspaceRoots::from_configured(&[root.to_path_buf()]).unwrap()
+    }
 
     // ------------------------------------------------------------------
     // URI codec
@@ -497,6 +506,12 @@ mod tests {
     fn test_parse_uri_rejects_wrong_scheme() {
         let result = parse_uri("file:///home/user/main.rs");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_uri_rejects_decoded_nul() {
+        let result = parse_uri("lsp-diagnostics:///ws/a%00b.rs");
+        assert_matches!(result, Err(ResourceUriError::DecodeFailed(_)));
     }
 
     #[test]
@@ -525,7 +540,7 @@ mod tests {
         let path = PathBuf::from("/home/user/main.rs");
         let uri = make_uri(&path).unwrap();
         let recovered = parse_uri(&uri).unwrap();
-        assert_eq!(recovered, path);
+        assert_eq!(recovered.as_path(), path);
     }
 
     /// Round-trip: paths with spaces, unicode, `%`, `?`, `#`.
@@ -549,7 +564,7 @@ mod tests {
                 "URI should start with correct scheme: {uri}"
             );
             let recovered = parse_uri(&uri).expect(&uri);
-            assert_eq!(recovered, path, "Round-trip failed for: {raw}");
+            assert_eq!(recovered.as_path(), path, "Round-trip failed for: {raw}");
         }
     }
 
@@ -595,7 +610,7 @@ mod tests {
             !uri.contains(['[', ']', '^', '|', '{', '}', '`']),
             "no raw reserved characters should remain in {uri}"
         );
-        assert_eq!(parse_uri(&uri).unwrap(), path);
+        assert_eq!(parse_uri(&uri).unwrap().as_path(), path);
     }
 
     // ------------------------------------------------------------------
@@ -609,7 +624,7 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let err = DiagnosticsResourceUri::resolve(
             "file:///tmp/main.rs",
-            &WorkspaceRoots::resolve(vec![root]),
+            &WorkspaceRoots::from_configured(&[root]).unwrap(),
         )
         .unwrap_err();
         assert_matches!(err, crate::Error::InvalidUri(_), "got {err:?}");
@@ -620,10 +635,42 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let err = DiagnosticsResourceUri::resolve(
             "lsp-diagnostics://host/main.rs",
-            &WorkspaceRoots::resolve(vec![root]),
+            &WorkspaceRoots::from_configured(&[root]).unwrap(),
         )
         .unwrap_err();
         assert_matches!(err, crate::Error::InvalidUri(_), "got {err:?}");
+    }
+
+    /// #571: a subscribe URI naming a file through the configured symlinked
+    /// spelling of the root resolves to the canonical file.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_admits_configured_symlink_spelling() {
+        let (_dir, root, file) = workspace();
+        let link = root.join("link_to_root");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let roots = roots_of(&link);
+
+        let raw = make_uri(&link.join(file.strip_prefix(&root).unwrap())).unwrap();
+        let resolved = DiagnosticsResourceUri::resolve(&raw, &roots).unwrap();
+
+        assert_eq!(resolved.path, file);
+    }
+
+    /// #575: a subscribe URI whose path decodes to a NUL byte is an invalid
+    /// URI, which classifies as caller-fault.
+    #[test]
+    fn test_resolve_nul_uri_is_invalid_params() {
+        let (_dir, root, _file) = workspace();
+
+        let err =
+            DiagnosticsResourceUri::resolve("lsp-diagnostics:///ws/a%00b.rs", &roots_of(&root))
+                .unwrap_err();
+
+        assert_eq!(
+            err.mcp_error_kind(),
+            crate::error::McpErrorKind::InvalidParams
+        );
     }
 
     #[test]
@@ -632,7 +679,11 @@ mod tests {
         let (_other_dir, _other_root, other_file) = workspace();
         let raw = make_uri(&other_file).unwrap();
         assert!(
-            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::resolve(vec![root])).is_err()
+            DiagnosticsResourceUri::resolve(
+                &raw,
+                &WorkspaceRoots::from_configured(&[root]).unwrap()
+            )
+            .is_err()
         );
     }
 
@@ -641,7 +692,11 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let raw = make_uri(&root.join("missing.rs")).unwrap();
         assert!(
-            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::resolve(vec![root])).is_err()
+            DiagnosticsResourceUri::resolve(
+                &raw,
+                &WorkspaceRoots::from_configured(&[root]).unwrap()
+            )
+            .is_err()
         );
     }
 
@@ -649,8 +704,11 @@ mod tests {
     fn test_resolve_yields_canonical_path_and_uri() {
         let (_dir, root, file) = workspace();
         let raw = make_uri(&file).unwrap();
-        let resolved =
-            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::resolve(vec![root])).unwrap();
+        let resolved = DiagnosticsResourceUri::resolve(
+            &raw,
+            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+        )
+        .unwrap();
         assert_eq!(resolved.path, file);
         assert_eq!(resolved.uri.as_str(), raw);
     }
@@ -662,21 +720,21 @@ mod tests {
         let link = root.join("link.rs");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let raw = make_uri(&link).unwrap();
-        let resolved =
-            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::resolve(vec![root])).unwrap();
+        let resolved = DiagnosticsResourceUri::resolve(
+            &raw,
+            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+        )
+        .unwrap();
         assert_eq!(resolved.uri.as_str(), make_uri(&file).unwrap());
     }
 
     #[tokio::test]
     async fn test_for_published_matches_resolve_for_same_file() {
         let (_dir, root, file) = workspace();
-        let resolved = DiagnosticsResourceUri::resolve(
-            &make_uri(&file).unwrap(),
-            &WorkspaceRoots::resolve(vec![root.clone()]),
-        )
-        .unwrap();
+        let roots = WorkspaceRoots::from_configured(&[root]).unwrap();
+        let resolved = DiagnosticsResourceUri::resolve(&make_uri(&file).unwrap(), &roots).unwrap();
         let published = crate::bridge::path_to_uri(&file).unwrap();
-        let published = PublishedDiagnosticsUri::resolve(&published, std::slice::from_ref(&root))
+        let published = PublishedDiagnosticsUri::resolve(&published, &roots)
             .await
             .unwrap();
         assert_eq!(
@@ -689,7 +747,10 @@ mod tests {
     async fn test_published_resolve_rejects_non_file_uri() {
         let (_dir, root, _file) = workspace();
         let uri = lsp_types::Uri::from("untitled:Untitled-1");
-        assert_eq!(PublishedDiagnosticsUri::resolve(&uri, &[root]).await, None);
+        assert_eq!(
+            PublishedDiagnosticsUri::resolve(&uri, &roots_of(&root)).await,
+            None
+        );
     }
 
     /// Percent-encoding the path must not make a canonical spelling look like
@@ -701,7 +762,7 @@ mod tests {
         let encoded = lsp_types::Uri::from(canonical.as_ref().replace("main.rs", "main%2Ers"));
         assert_ne!(encoded, canonical);
 
-        let published = PublishedDiagnosticsUri::resolve(&encoded, &[root])
+        let published = PublishedDiagnosticsUri::resolve(&encoded, &roots_of(&root))
             .await
             .unwrap();
 
@@ -715,7 +776,7 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         let uri = crate::bridge::path_to_uri(&file).unwrap();
 
-        let published = PublishedDiagnosticsUri::resolve(&uri, &[root])
+        let published = PublishedDiagnosticsUri::resolve(&uri, &roots_of(&root))
             .await
             .unwrap();
 
@@ -730,7 +791,7 @@ mod tests {
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let link_uri = crate::bridge::path_to_uri(&link).unwrap();
 
-        let published = PublishedDiagnosticsUri::resolve(&link_uri, std::slice::from_ref(&root))
+        let published = PublishedDiagnosticsUri::resolve(&link_uri, &roots_of(&root))
             .await
             .unwrap();
 
@@ -740,8 +801,8 @@ mod tests {
             &crate::bridge::path_to_uri(&file).unwrap()
         );
         let client_side = crate::bridge::Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::resolve(vec![root]),
-            link.to_str().unwrap(),
+            &roots_of(&root),
+            &client_path(&link),
         )
         .unwrap();
         assert_eq!(published.canonical(), &client_side);
@@ -758,7 +819,7 @@ mod tests {
         let link_uri = crate::bridge::path_to_uri(&link).unwrap();
 
         assert_eq!(
-            PublishedDiagnosticsUri::resolve(&link_uri, &[root]).await,
+            PublishedDiagnosticsUri::resolve(&link_uri, &roots_of(&root)).await,
             None
         );
     }

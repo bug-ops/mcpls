@@ -20,7 +20,7 @@ use super::routing::validate_path_against_roots;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::notifications::message_as_str;
 use crate::bridge::{
-    DiagnosticInfo, DocumentTracker, NotificationCache, WorkspaceRoots, path_to_uri,
+    ClientPath, DiagnosticInfo, DocumentTracker, NotificationCache, WorkspaceRoots, path_to_uri,
 };
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
@@ -49,7 +49,7 @@ enum DocumentDiagnosticReportResult {
 
 /// Shared, never-mutated empty `workspace_roots` for an `EncodingCtx` built
 /// where it's documented as never read -- avoids a per-poll `Arc` allocation.
-static EMPTY_WORKSPACE_ROOTS: LazyLock<Arc<[PathBuf]>> = LazyLock::new(|| Arc::from(Vec::new()));
+static EMPTY_WORKSPACE_ROOTS: LazyLock<WorkspaceRoots> = LazyLock::new(WorkspaceRoots::default);
 
 /// Convert an LSP diagnostic into the MCP-facing `Diagnostic` shape.
 ///
@@ -94,7 +94,7 @@ impl Translator {
     /// Returns an error if the path is invalid or outside workspace boundaries.
     pub fn cached_diagnostics_uri(
         workspace_roots: &WorkspaceRoots,
-        file_path: &str,
+        file_path: &ClientPath,
     ) -> Result<Uri> {
         Self::cached_diagnostics_path_and_uri(workspace_roots, file_path).map(|(_, uri)| uri)
     }
@@ -111,10 +111,9 @@ impl Translator {
     /// Returns an error if the path is invalid or outside workspace boundaries.
     pub(crate) fn cached_diagnostics_path_and_uri(
         workspace_roots: &WorkspaceRoots,
-        file_path: &str,
+        file_path: &ClientPath,
     ) -> Result<(PathBuf, Uri)> {
-        let path = PathBuf::from(file_path);
-        let validated_path = validate_path_against_roots(&path, workspace_roots)?;
+        let validated_path = validate_path_against_roots(file_path, workspace_roots)?;
 
         // Use path_to_uri (strips \\?\ on Windows) so the key matches what
         // rust-analyzer stores in publishDiagnostics notifications.
@@ -159,7 +158,7 @@ impl Translator {
     /// diagnostics for the file either, or if the file cannot be opened.
     pub async fn handle_diagnostics(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         notification_cache: &Mutex<NotificationCache>,
     ) -> Result<DiagnosticsResult> {
         let doc = self
@@ -431,6 +430,7 @@ mod tests {
     use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
     use crate::config::{ServerId, ToolRouter};
+    use crate::test_lsp::client_path;
 
     /// Pins the upstream `lsp_types::DocumentDiagnosticParams` serde
     /// attributes (`skip_serializing_if` on both optionals) across future
@@ -462,8 +462,8 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
-            test_file.to_str().unwrap(),
+            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &client_path(&test_file),
         )
         .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
@@ -578,8 +578,8 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
-            test_file.to_str().unwrap(),
+            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &client_path(&test_file),
         )
         .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
@@ -694,8 +694,8 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), diagnostics);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
-            test_file.to_str().unwrap(),
+            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &client_path(&test_file),
         )
         .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
@@ -749,8 +749,8 @@ mod tests {
         cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::resolve(vec![temp_dir.path().to_path_buf()]),
-            test_file.to_str().unwrap(),
+            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &client_path(&test_file),
         )
         .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
@@ -769,8 +769,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("nonexistent/path/file.rs");
         let result = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]),
-            missing.to_str().unwrap(),
+            &WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            &client_path(&missing),
         );
         assert_matches!(result, Err(Error::FileIo { .. }));
     }
@@ -1320,8 +1320,8 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::resolve(workspace_roots),
-            test_file.to_str().unwrap(),
+            &WorkspaceRoots::from_configured(&workspace_roots).unwrap(),
+            &client_path(&test_file),
         );
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1343,7 +1343,9 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);
@@ -1379,7 +1381,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_diagnostics(path_str, &notification_cache)
+                    .handle_diagnostics(client_path(path_str), &notification_cache)
                     .await
             })
         };
@@ -1431,7 +1433,9 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);
@@ -1447,7 +1451,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_diagnostics(path_str, &notification_cache)
+                    .handle_diagnostics(client_path(path_str), &notification_cache)
                     .await
             })
         };
@@ -1495,7 +1499,9 @@ mod tests {
                     ServerId::from("rust"),
                     "rust".to_string(),
                 )]));
-        translator.set_workspace_roots(WorkspaceRoots::resolve(vec![dir.path().to_path_buf()]));
+        translator.set_workspace_roots(
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client("rust".to_string(), client);
@@ -1511,7 +1517,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_diagnostics(path_str, &notification_cache)
+                    .handle_diagnostics(client_path(path_str), &notification_cache)
                     .await
             })
         };

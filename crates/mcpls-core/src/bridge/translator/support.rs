@@ -9,7 +9,6 @@
 //! the authoritative enforcement point.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use lsp_types::ServerCapabilities;
@@ -21,7 +20,7 @@ use super::routing::{
     Capability, LanguageCandidates, RouteLookup, WorkspaceRouteLookup, lookup_route,
     lookup_workspace_route,
 };
-use crate::bridge::lock_std;
+use crate::bridge::{ClientPath, lock_std};
 use crate::config::{ServerId, ToolKind, ToolRouter};
 use crate::error::Result;
 
@@ -217,8 +216,8 @@ impl Translator {
     /// # Errors
     ///
     /// Returns the same path-validation errors as every document tool.
-    pub(crate) fn language_for_path(&self, path: &str) -> Result<String> {
-        let validated = self.validate_path(Path::new(path))?;
+    pub(crate) fn language_for_path(&self, path: &ClientPath) -> Result<String> {
+        let validated = self.validate_path(path)?;
         Ok(self.language_candidates(&validated).language().to_string())
     }
 }
@@ -230,6 +229,7 @@ mod tests {
 
     use super::super::testing::translator_with_capabilities;
     use super::*;
+    use crate::test_lsp::client_path;
 
     fn rust_caps(hover: bool) -> ServerCapabilities {
         ServerCapabilities {
@@ -470,14 +470,12 @@ mod tests {
         let file = dir.path().join("a.rs");
         std::fs::write(&file, "").unwrap();
         assert_eq!(
-            translator
-                .language_for_path(file.to_str().unwrap())
-                .unwrap(),
+            translator.language_for_path(&client_path(&file)).unwrap(),
             "rust"
         );
         assert!(
             translator
-                .language_for_path("/definitely/missing.rs")
+                .language_for_path(&client_path("/definitely/missing.rs"))
                 .is_err()
         );
     }

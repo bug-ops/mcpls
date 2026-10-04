@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::bridge::InvalidClientPath;
 use crate::config::{BuiltinServer, ServerId, ToolKind};
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 use crate::redaction::Redactions;
@@ -630,6 +631,26 @@ pub enum Error {
     #[error("invalid tool parameters: {0}")]
     InvalidToolParams(String),
 
+    /// A client-supplied file path is empty or contains a NUL byte.
+    #[error(transparent)]
+    InvalidClientPath(#[from] InvalidClientPath),
+
+    /// A client-supplied file path is malformed for the filesystem: it runs
+    /// through a regular file, or has an invalid or over-long name.
+    ///
+    /// Produced only while validating the client path
+    /// (`validate_path_against_roots`); the same IO kinds raised later, while
+    /// reading or opening an already validated file, stay [`Error::FileIo`]
+    /// because there they are environmental.
+    #[error("malformed file path {path:?}: {source}")]
+    MalformedPath {
+        /// The path as supplied by the client.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// File I/O error occurred.
     ///
     /// See [`Error::mcp_error_kind`] for the JSON-RPC classification: a
@@ -948,6 +969,8 @@ impl Error {
     pub fn mcp_error_kind(&self) -> McpErrorKind {
         match self {
             Self::InvalidToolParams(_)
+            | Self::InvalidClientPath(_)
+            | Self::MalformedPath { .. }
             | Self::PathOutsideWorkspace(_)
             | Self::NotARegularFile(_)
             | Self::InvalidUri(_)
@@ -968,9 +991,10 @@ impl Error {
             // `DocumentNotFound`, and matches the MCP spec's expectation
             // that resource-not-found map to INVALID_PARAMS, not
             // INTERNAL_ERROR (rmcp's `read_resource` handling, SEP-2164).
-            // Any other IO failure (permission denied, etc.) reaching here is
-            // a genuine server-side problem the caller cannot fix by
-            // changing their request.
+            // Any other IO failure (permission denied, an invalid-input error
+            // while reading an already validated file, etc.) reaching here is
+            // a genuine server-side problem the caller cannot fix by changing
+            // their request. A malformed client path is `MalformedPath`.
             Self::FileIo { source, .. } => {
                 if source.kind() == std::io::ErrorKind::NotFound {
                     McpErrorKind::InvalidParams
@@ -1678,6 +1702,7 @@ mod tests {
             Error::DocumentNotFound(PathBuf::from("/missing.rs")),
             Error::FileSizeLimitExceeded { size: 100, max: 10 },
             Error::ListenFilterTooLarge { max: 1000 },
+            Error::InvalidClientPath(InvalidClientPath::ContainsNul),
         ];
 
         for err in caller_fault_errors {
@@ -1835,6 +1860,40 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory"),
         };
         assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
+    }
+
+    /// #575: a malformed client path is caller-fault, whatever IO kind the
+    /// validation hit.
+    #[test]
+    fn test_mcp_error_kind_malformed_path_is_invalid_params() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::NotADirectory,
+            ErrorKind::InvalidFilename,
+            ErrorKind::InvalidInput,
+        ] {
+            let err = Error::MalformedPath {
+                path: PathBuf::from("/ws/main.rs/x"),
+                source: std::io::Error::new(kind, "bad path"),
+            };
+            assert_eq!(
+                err.mcp_error_kind(),
+                McpErrorKind::InvalidParams,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The same IO kinds from a post-validation read or open are
+    /// environmental, not caller-fault.
+    #[test]
+    fn test_mcp_error_kind_post_validation_file_io_invalid_input_stays_internal() {
+        let err = Error::FileIo {
+            path: PathBuf::from("/ws/main.rs"),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad input"),
+        };
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
     }
 
     /// Counterpart: a non-not-found IO failure (permission denied, etc.) is

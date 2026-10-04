@@ -15,7 +15,7 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{
-    IndexingState, NotificationCache, Position, Translator, WorkspaceRoots,
+    ClientPath, IndexingState, NotificationCache, Position, Translator, WorkspaceRoots,
     apply_lifecycle_notification,
 };
 use mcpls_core::config::{LspServerConfig, ServerId, ToolRouter};
@@ -27,6 +27,10 @@ use crate::common::test_utils::rust_workspace_path;
 use crate::skip_if_no_rust_analyzer;
 
 static INIT_TRACING: Once = Once::new();
+
+fn client_path(path: impl AsRef<Path>) -> ClientPath {
+    ClientPath::try_from(path.as_ref().to_path_buf()).unwrap()
+}
 
 fn init_tracing() {
     INIT_TRACING.call_once(|| {
@@ -82,7 +86,7 @@ fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
             ServerId::from("rust"),
             "rust".to_string(),
         )]));
-    translator.set_workspace_roots(WorkspaceRoots::resolve(vec![workspace_path]));
+    translator.set_workspace_roots(WorkspaceRoots::from_configured(&[workspace_path]).unwrap());
     translator.register_server_complete(server);
 
     Arc::new(Mutex::new(translator))
@@ -205,7 +209,7 @@ async fn wait_for_hover_ready(
             .lock()
             .await
             .handle_hover(
-                file_path.clone(),
+                client_path(file_path.clone()),
                 Position {
                     line,
                     character: col,
@@ -311,7 +315,7 @@ async fn test_hover_on_std_vec() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
-            file_path.to_string_lossy().to_string(),
+            client_path(file_path.to_string_lossy().into_owned()),
             Position {
                 line: string_line,
                 character: string_col,
@@ -355,7 +359,7 @@ async fn test_hover_on_u64_type() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
-            file_path.to_string_lossy().to_string(),
+            client_path(file_path.to_string_lossy().into_owned()),
             Position {
                 line: 19,
                 character: 13, // Position on "u64"
@@ -395,7 +399,7 @@ async fn test_definition_user_struct() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_definition(
-            types_file.to_string_lossy().to_string(),
+            client_path(types_file.to_string_lossy().into_owned()),
             Position {
                 line: 9,
                 character: 16, // Position on "User"
@@ -445,7 +449,7 @@ async fn test_definition_across_files() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_definition(
-            functions_file.to_string_lossy().to_string(),
+            client_path(functions_file.to_string_lossy().into_owned()),
             Position {
                 line: 3,
                 character: 24, // Position on "Repository"
@@ -485,7 +489,7 @@ async fn test_references_create_repo_function() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_references(
-            functions_file.to_string_lossy().to_string(),
+            client_path(functions_file.to_string_lossy().into_owned()),
             Position {
                 line: 7,
                 character: 12, // Position on "create_repo"
@@ -528,7 +532,7 @@ async fn test_references_user_struct() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_references(
-            lib_file.to_string_lossy().to_string(),
+            client_path(lib_file.to_string_lossy().into_owned()),
             Position {
                 line: 18,
                 character: 15, // Position on "User"
@@ -600,7 +604,7 @@ async fn test_diagnostics_with_error() {
             translator
                 .lock()
                 .await
-                .handle_diagnostics(lib_file.clone(), &notification_cache),
+                .handle_diagnostics(client_path(lib_file.clone()), &notification_cache),
         )
         .await;
 
@@ -653,7 +657,7 @@ async fn test_diagnostics_no_errors() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_diagnostics(
-            types_file.to_string_lossy().to_string(),
+            client_path(types_file.to_string_lossy().into_owned()),
             &notification_cache,
         ),
     )
@@ -697,7 +701,7 @@ async fn test_document_symbols() {
         translator
             .lock()
             .await
-            .handle_document_symbols(lib_file.to_string_lossy().to_string()),
+            .handle_document_symbols(client_path(lib_file.to_string_lossy().into_owned())),
     )
     .await;
 
@@ -751,7 +755,7 @@ async fn test_document_symbols_types_file() {
         translator
             .lock()
             .await
-            .handle_document_symbols(types_file.to_string_lossy().to_string()),
+            .handle_document_symbols(client_path(types_file.to_string_lossy().into_owned())),
     )
     .await;
 
@@ -793,7 +797,7 @@ async fn test_completions_basic() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_completions(
-            functions_file.to_string_lossy().to_string(),
+            client_path(functions_file.to_string_lossy().into_owned()),
             Position {
                 line: 23,
                 character: 11, // Position after "repo."
@@ -835,7 +839,7 @@ async fn test_format_document() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_format_document(
-            lib_file.to_string_lossy().to_string(),
+            client_path(lib_file.to_string_lossy().into_owned()),
             4,    // tab_size
             true, // insert_spaces
         ),
@@ -872,7 +876,7 @@ async fn test_invalid_file_path() {
         .lock()
         .await
         .handle_hover(
-            "/nonexistent/file.rs".to_string(),
+            client_path("/nonexistent/file.rs"),
             Position {
                 line: 1,
                 character: 1,
@@ -899,7 +903,7 @@ async fn test_out_of_bounds_position() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
-            lib_file.to_string_lossy().to_string(),
+            client_path(lib_file.to_string_lossy().into_owned()),
             Position {
                 line: 99999, // Way beyond file bounds
                 character: 1,

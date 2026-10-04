@@ -10,7 +10,7 @@ use crate::bridge::encoding::{
     ColumnFidelity, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position,
 };
 use crate::bridge::state::{DEFAULT_MAX_FILE_SIZE, ResourceLimits, uri_to_path};
-use crate::bridge::{DocumentTracker, lock_std};
+use crate::bridge::{DocumentTracker, WorkspaceRoots, lock_std};
 
 /// Multiple of `ResourceLimits::max_file_size` that [`read_line_text`]'s
 /// disk-read fallback (via [`DocumentTracker::read_line_checked`]) may scan
@@ -132,9 +132,9 @@ pub(super) struct EncodingCtx {
     pub(super) tracker: Arc<DocumentTracker>,
     /// Snapshot of the configured workspace roots, used only by
     /// [`Self::is_out_of_workspace`] to annotate (never filter) a read-only
-    /// navigation result -- see `crate::bridge::uri_in_workspace_roots`'s
-    /// docs for why filtering is deliberately not done here.
-    pub(super) workspace_roots: Arc<[PathBuf]>,
+    /// navigation result -- see [`WorkspaceRoots::admits_uri`] for why
+    /// filtering is deliberately not done here.
+    pub(super) workspace_roots: WorkspaceRoots,
     /// Memoizes [`read_line_text`]'s result (both the tracker hit and the
     /// disk-read fallback) per `(path, line)` for the lifetime of this
     /// context, and tracks the shared disk-read byte budget -- one
@@ -249,7 +249,7 @@ impl EncodingCtx {
     pub(super) fn new(
         encoding: PositionEncoding,
         tracker: Arc<DocumentTracker>,
-        workspace_roots: Arc<[PathBuf]>,
+        workspace_roots: WorkspaceRoots,
     ) -> Self {
         let line_cache = new_line_cache(line_read_budget(tracker.limits()));
         Self {
@@ -266,26 +266,23 @@ impl EncodingCtx {
     /// result location (`Location::out_of_workspace`,
     /// `CallHierarchyItemResult::out_of_workspace`) instead of rejecting it
     /// -- never a safety/security gate. Delegates to
-    /// [`crate::bridge::uri_in_workspace_roots`], which is a purely lexical
-    /// `starts_with` check: unlike
+    /// [`WorkspaceRoots::admits_uri`], a purely lexical check over the
+    /// canonical roots and their verified aliases: unlike
     /// [`Translator::validate_path`](super::Translator::validate_path) (via
-    /// `validate_path_against_roots`), it does **not** canonicalize `uri` or
-    /// the configured roots first. A location that resolves to a workspace
-    /// root through a symlink (e.g. macOS's `/var` -> `/private/var`, or a
-    /// package manager's symlinked dependency store) can therefore come back
-    /// `true` even though `validate_path` would accept the same path -- the
-    /// two checks are not equivalent, and this one is never used to decide
-    /// what mcpls will open or read.
+    /// `validate_path_against_roots`), it does **not** canonicalize `uri`. A
+    /// location that reaches a workspace root through a symlink other than a
+    /// recorded alias (e.g. a package manager's symlinked dependency store)
+    /// can therefore come back `true` even though `validate_path` would
+    /// accept the same path -- the two checks are not equivalent, and this
+    /// one is never used to decide what mcpls will open or read.
     ///
     /// Also always `true` when no workspace roots are configured at all
     /// (empty `workspace_roots`, e.g. a library embedder that never called
-    /// `Translator::set_workspace_roots`), consistent with
-    /// `uri_in_workspace_roots`'s fail-closed convention (see its doc
-    /// comment): without a configured root, nothing can be vouched for as
-    /// inside the workspace, so every location is honestly reported as not
-    /// provably contained.
+    /// `Translator::set_workspace_roots`): without a configured root,
+    /// nothing can be vouched for as inside the workspace, so every location
+    /// is honestly reported as not provably contained.
     pub(super) fn is_out_of_workspace(&self, uri: &lsp_types::Uri) -> bool {
-        !crate::bridge::uri_in_workspace_roots(uri, &self.workspace_roots)
+        !self.workspace_roots.admits_uri(uri)
     }
 
     /// Worst degradation among the position conversions made through this
@@ -422,8 +419,29 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
         let uri = path_to_uri(&path).unwrap();
 
-        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, vec![dir.path().to_path_buf()]);
+        let ctx = test_ctx_with_roots(
+            PositionEncoding::Utf16,
+            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+        );
         assert!(!ctx.is_out_of_workspace(&uri));
+    }
+
+    /// #558: a location under an alias spelling of a root is inside it.
+    #[cfg(unix)]
+    #[test]
+    fn test_is_out_of_workspace_false_under_alias_spelling() {
+        let dir = TempDir::new().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&link)).unwrap();
+        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, roots);
+
+        assert!(!ctx.is_out_of_workspace(&path_to_uri(&link.join("main.rs")).unwrap()));
+        assert!(!ctx.is_out_of_workspace(&path_to_uri(&real.join("main.rs")).unwrap()));
+        assert!(ctx.is_out_of_workspace(&path_to_uri(&base.join("other/main.rs")).unwrap()));
     }
 
     #[test]
@@ -436,12 +454,12 @@ mod tests {
         let other_dir = TempDir::new().unwrap();
         let ctx = test_ctx_with_roots(
             PositionEncoding::Utf16,
-            vec![other_dir.path().to_path_buf()],
+            WorkspaceRoots::from_configured(&[other_dir.path().to_path_buf()]).unwrap(),
         );
         assert!(ctx.is_out_of_workspace(&uri));
     }
 
-    /// Matches [`crate::bridge::uri_in_workspace_roots`]'s fail-closed
+    /// Matches [`WorkspaceRoots::admits_uri`]'s fail-closed
     /// convention -- see `is_out_of_workspace`'s doc for why an unconfigured
     /// workspace makes every location report as not provably contained.
     #[test]
@@ -451,7 +469,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
         let uri = path_to_uri(&path).unwrap();
 
-        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, Vec::new());
+        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, WorkspaceRoots::default());
         assert!(ctx.is_out_of_workspace(&uri));
     }
 
@@ -525,7 +543,7 @@ mod tests {
                 },
                 HashMap::new(),
             )),
-            Arc::from(Vec::new()),
+            WorkspaceRoots::default(),
         );
         assert!(
             read_line_text(&uri, 0, &ctx).await.is_none(),
@@ -553,7 +571,7 @@ mod tests {
         ));
         let uri = tracker.open(path.clone(), "héllo".to_string()).unwrap(); // live: accent
 
-        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::from(Vec::new()));
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, WorkspaceRoots::default());
         let lsp_pos = ctx
             .to_lsp(
                 &uri,
@@ -836,7 +854,7 @@ mod tests {
             HashMap::new(),
         ));
         let uri = tracker.open(path, content.to_string()).unwrap();
-        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::from(Vec::new()));
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, WorkspaceRoots::default());
         (ctx, uri, dir)
     }
 
@@ -978,7 +996,7 @@ mod tests {
             },
             HashMap::new(),
         ));
-        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, Arc::from(Vec::new()));
+        let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, WorkspaceRoots::default());
         assert_eq!(lock_std(&ctx.line_cache).bytes_remaining, 4 * 4096);
     }
 }

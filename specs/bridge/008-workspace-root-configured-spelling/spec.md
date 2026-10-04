@@ -10,7 +10,7 @@ tags:
   - security
   - regression
 created: 2026-10-04
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[config/001-config-discovery-and-heuristics/spec|config-discovery-and-heuristics]]"
@@ -162,7 +162,7 @@ THEN it is admitted, identically to the file-loaded config
 | FR-002 | WHEN a config file contains a relative `workspace.roots` entry THE SYSTEM SHALL admit paths under the absolute spelling formed by joining the entry to its resolution base as written (the config file's directory for the explicit and project-local configs, the process cwd for the auto-discovered global config), in addition to the canonical root | must |
 | FR-003 | WHEN `workspace.roots` is empty (cwd default) or a relative root is resolved against the cwd THE SYSTEM SHALL also admit the logical `$PWD` spelling, only when `$PWD` is absolute and names the same directory as the real cwd | must |
 | FR-004 | WHEN the server starts from a caller-built `ServerConfig` (`serve`, `serve_with`, `mcpls-bench`) THE SYSTEM SHALL admit the same spellings as in FR-001 through FR-003, with no dependence on whether the config passed through `load_from` | must |
-| FR-005 | THE SYSTEM SHALL decide admission in two steps: a lexical pre-check against the canonical roots and their aliases, then a physical check that the path's canonical form lies under a canonical root. An alias SHALL never admit a path whose canonical form is outside every canonical root | must |
+| FR-005 | THE SYSTEM SHALL decide admission in two steps: a lexical pre-check against the canonical roots and their aliases, then a physical check that the path's canonical form lies under a canonical root. An alias SHALL never admit a path whose canonical form is outside every canonical root. This covers client-supplied tool paths; server-supplied edit URIs follow the same two steps with a stricter lexical step ([[bridge/010-workspace-containment-single-predicate/spec|010]], FR-008) | must |
 | FR-006 | WHEN a path reaches a root through a symlink located inside the root that points outside it THE SYSTEM SHALL reject it with `PathOutsideWorkspace`, whether the path is spelled with the canonical form or any alias | must |
 | FR-007 | THE SYSTEM SHALL keep canonical roots as the only form used for LSP `rootUri` and workspace folders, project-marker heuristics (`should_spawn`), diagnostics keying and filtering, and any other consumer that compares physical paths | must |
 | FR-008 | THE SYSTEM SHALL apply the same admitted spellings to every path-taking tool and to `resources/subscribe` and the diagnostics resource URI, since all of them validate against the one `WorkspaceRoots` built at startup | must |
@@ -170,6 +170,8 @@ THEN it is admitted, identically to the file-loaded config
 | FR-010 | THE SYSTEM SHALL keep rejecting, before any filesystem access, a path that matches no canonical root and no alias, so the error does not reveal whether such a file exists (#533) | must |
 | FR-011 | THE configured spelling SHALL survive the load-to-serve hand-off as typed data in the config layer. It SHALL NOT be recovered by re-reading the file or by string heuristics over the canonical root | must |
 | FR-012 | WHEN the configured spelling equals the canonical root (no symlink involved) THE SYSTEM SHALL behave exactly as before, with no alias recorded | must |
+| FR-013 | WHEN the config file path is relative THE SYSTEM SHALL keep the rebased relative roots relative (a config path that is relative but drive- or root-qualified is made absolute first), so `WorkspaceRoots::from_configured` records the validated logical `$PWD` spelling | must |
+| FR-014 | THE SYSTEM SHALL record an alias only when the alias, in the exact form stored (simplified and lexically normalized), resolves on its longest existing prefix to the canonical path of its own root; a dropped alias is logged at debug level. This keeps `..` after a symlink from admitting an unrelated tree and from reopening the #533 existence oracle (FR-010) | must |
 
 ## 4. Non-Functional Requirements
 
@@ -207,9 +209,10 @@ THEN it is admitted, identically to the file-loaded config
 | Root symlink retargeted after startup | Canonical roots are fixed at startup, so the alias then resolves outside every canonical root and is rejected by the physical check (FR-005) |
 | Alias path names a file that does not exist | `Error::FileIo` from canonicalization, as for any admitted-but-missing path |
 | Absolute root that does not exist at startup | Existing fallback root kept; as-written spelling admitted (FR-009) |
-| Two roots whose aliases or canonical forms coincide | Duplicates dropped by `WorkspaceRoots::new`; no error |
+| Two roots whose aliases or canonical forms coincide | Duplicates dropped when the root set is built; no error |
 | `$PWD` unset, relative, or naming a different directory | No `$PWD` alias (FR-003); canonical and config-dir aliases still apply |
-| Relative root, config path given relative (`--config ./cfg.toml`) | Config-dir spelling is the cwd-joined absolute form. [NEEDS CLARIFICATION: should the logical `$PWD` spelling of the config directory also be admitted for ConfigDir-relative roots? Today only canonical-config-dir is used as the base, and the logical form is derived for Cwd-relative roots only.] |
+| Relative root, config path given relative (`--config mcpls.toml`, trusted project-local `mcpls.toml`) | The entry is joined to the relative config directory and stays relative, so startup resolution adds the logical `$PWD` spelling (FR-013). An absolute config path gives an absolute joined spelling and no `$PWD` alias |
+| Alias that climbs out of its root through a symlink (`roots = [".."]` in a config reached through a symlinked directory) | Not recorded (FR-014): the lexical parent is a different tree than the physical one |
 | Windows verbatim prefix or drive-letter case differences | Handled by existing `CaseRule` / `prefix_eq`; not changed |
 
 ## 7. Success Criteria
@@ -245,7 +248,16 @@ Add a live-testing playbook entry under `.local/testing/playbooks/` for the macO
 `/var` case and update `coverage-status.md` for the `config` and `bridge` subsystems, per
 `.claude/rules/continuous-improvement.md`.
 
-## 9. Design Notes (non-binding, for the plan phase)
+## 9. Design Notes
+
+> [!success] Decision
+> Option A. `ServerConfig::load_from` keeps `workspace.roots` as written: absolute entries verbatim,
+> relative entries joined to the config directory as given (absolute config path) or kept relative
+> (relative config path, and the global config tier, which resolves against the cwd). Every rebased
+> root must exist at load time. `WorkspaceRoots::from_configured` is the single place that
+> canonicalizes and derives aliases, for file-loaded and caller-built configs alike. No typed pair
+> was added to the config (B) and `load_from`'s signature is unchanged (C). The decision made in
+> the plan phase is recorded below for reference.
 
 The requirement is FR-011: the configured spelling must reach `build_workspace_roots`. Options:
 
@@ -284,11 +296,14 @@ between A, B and C. B is the recommendation of this spec but changes a public co
 
 ## 11. Open Questions
 
-> [!question] Open items
-> - [NEEDS CLARIFICATION: option A, B or C in section 9?]
-> - [NEEDS CLARIFICATION: should a ConfigDir-relative root also admit the logical `$PWD` spelling of the config directory when `--config` was given as a relative path (section 6)?]
-> - [NEEDS CLARIFICATION: should a one-time `info` log list each root's accepted spellings at startup, to make "path outside workspace" easier to diagnose?]
-> - [NEEDS CLARIFICATION: is a patch release needed, given the regression shipped in the released `ad90190`/#552 line?]
+> [!question] Resolved
+> - Option A (section 9).
+> - A ConfigDir-relative root admits the logical `$PWD` spelling when the config path is relative (FR-013); an absolute config path does not add it.
+> - No startup log of accepted spellings; only dropped aliases are logged, at debug level (FR-014).
+> - Whether a patch release is needed is left to the maintainer.
+
+> [!warning] Known limitation
+> Zero-config roots (empty `workspace.roots`) admit only the physical working directory and the validated `$PWD`. A client naming the directory through another symlinked spelling is not admitted; this follows the documented contract and is tracked in #579.
 
 ## 12. See Also
 

@@ -13,6 +13,7 @@ use super::dto::{
 };
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
+use crate::bridge::ClientPath;
 use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
 use crate::error::{Error, Result};
 
@@ -138,7 +139,7 @@ impl Translator {
     /// still indexing the workspace (see `wait_for_indexing_ready`).
     pub async fn handle_completions(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         position: Position,
         trigger: Option<String>,
     ) -> Result<CompletionsResult> {
@@ -206,7 +207,7 @@ impl Translator {
     /// or the routed server does not advertise `signatureHelpProvider` support.
     pub async fn handle_signature_help(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         position: Position,
     ) -> Result<SignatureHelpResult> {
         let doc = self
@@ -277,7 +278,7 @@ impl Translator {
     /// or the routed server does not advertise `inlayHintProvider` support.
     pub async fn handle_inlay_hints(
         &self,
-        file_path: String,
+        file_path: ClientPath,
         start: Position,
         end: Position,
     ) -> Result<InlayHintsResult> {
@@ -350,6 +351,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::translator::testing::*;
+    use crate::test_lsp::client_path;
 
     /// #309 M3: `trigger` has no cap of its own even though the LSP spec
     /// defines it as a single character.
@@ -404,7 +406,7 @@ mod tests {
 
         let err = translator
             .handle_completions(
-                path.to_string_lossy().to_string(),
+                client_path(path.to_string_lossy().into_owned()),
                 Position {
                     line: 1,
                     character: 1,
@@ -458,7 +460,7 @@ mod tests {
             tokio::spawn(async move {
                 translator
                     .handle_completions(
-                        path,
+                        client_path(path),
                         Position {
                             line: 1,
                             character: 1,
@@ -517,7 +519,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_inlay_hints(path, pos(1, 1), pos(1, 13))
+                    .handle_inlay_hints(client_path(path), pos(1, 1), pos(1, 13))
                     .await
             })
         };
@@ -574,7 +576,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_inlay_hints(path, pos(1, 1), pos(1, 13))
+                    .handle_inlay_hints(client_path(path), pos(1, 1), pos(1, 13))
                     .await
             })
         };
@@ -656,12 +658,12 @@ mod tests {
             tokio::spawn(async move {
                 if method == "textDocument/completion" {
                     translator
-                        .handle_completions(path, pos(line, character), None)
+                        .handle_completions(client_path(path), pos(line, character), None)
                         .await
                         .map(|r| serde_json::to_value(r).unwrap())
                 } else {
                     translator
-                        .handle_signature_help(path, pos(line, character))
+                        .handle_signature_help(client_path(path), pos(line, character))
                         .await
                         .map(|r| serde_json::to_value(r).unwrap())
                 }

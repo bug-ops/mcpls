@@ -1951,7 +1951,8 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
             &crate::test_lsp::with_read_preamble(
                 r#"body='{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"rejected by server"}}'
 printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
-sleep 0.02
+# Shell-only pause: an external `sleep` can take longer than the 100 ms EOF grace just to start on a loaded macOS runner.
+i=0; while [ $i -lt 300 ]; do i=$((i+1)); done
 echo 'fatal: bad toolchain' >&2
 "#,
             ),
@@ -2563,7 +2564,12 @@ sleep 5
             let temp_dir = TempDir::new().unwrap();
             let base = dunce::canonicalize(temp_dir.path()).unwrap();
             let workspace_roots =
-                crate::resolve_workspace_roots(&[PathBuf::from(".")], &base).unwrap();
+                crate::bridge::WorkspaceRoots::from_configured_with(&[PathBuf::from(".")], || {
+                    Ok(crate::bridge::ProcessCwd::new(base.clone(), None))
+                })
+                .unwrap()
+                .canonical()
+                .to_vec();
             assert_eq!(workspace_roots, vec![base.clone()]);
 
             let (client, mut server) = fake_lsp_client();

@@ -9,7 +9,7 @@ mod server;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ServerSettlement, ToolKind, ToolRouter};
@@ -21,7 +21,7 @@ pub use server::{
 
 use crate::bridge::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE,
-    INDEXING_STALENESS_BOUND, PROGRESS_SETTLE, ResourceLimits,
+    INDEXING_STALENESS_BOUND, PROGRESS_SETTLE, ResourceLimits, join_relative_root, probe_root,
 };
 use crate::error::{Error, Result};
 use crate::util::{BoundedReadOutcome, bounded_read_cap, check_bounded_utf8};
@@ -287,6 +287,11 @@ fn validate_tool_prefix(value: &str) -> std::result::Result<(), String> {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     /// Root directories for the workspace.
+    ///
+    /// Entries are kept as written (relative entries of a loaded config file
+    /// are rebased by [`ServerConfig::load_from`] but not canonicalized);
+    /// [`crate::bridge::WorkspaceRoots::from_configured`] derives the
+    /// canonical roots and the accepted alternative spellings from them.
     #[serde(default)]
     pub roots: Vec<PathBuf>,
 
@@ -716,6 +721,67 @@ pub enum ProjectConfigStatus {
 /// syscall.
 const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Rebases the relative `roots` of the config at `config_path` per `base`,
+/// keeping every spelling as written: nothing is canonicalized here.
+///
+/// An absolute config path gives absolute roots (the config directory as
+/// given, joined to the entry). A relative config path (the trusted
+/// project-local `mcpls.toml`) gives roots that stay relative, so the serve
+/// time resolution also admits the logical `$PWD` spelling; a config path
+/// that is relative but drive- or root-qualified (Windows `C:cfg\x.toml`)
+/// is made absolute first. Every rebased root must exist. The working
+/// directory is never read here except to make a drive-qualified relative
+/// config path absolute, so a removed cwd does not fail an absolute config
+/// (#348 case 4).
+fn rebase_relative_roots(
+    roots: &mut [PathBuf],
+    config_path: &Path,
+    base: RelativeRootBase,
+) -> Result<()> {
+    if !roots.iter().any(|root| root.is_relative()) {
+        return Ok(());
+    }
+    let config_dir = match base {
+        RelativeRootBase::Cwd => None,
+        RelativeRootBase::ConfigDir => Some(config_dir_as_given(config_path)?),
+    };
+    for root in roots.iter_mut().filter(|root| root.is_relative()) {
+        if let Some(dir) = config_dir.as_deref() {
+            let rebased = join_relative_root(dir, root);
+            probe_root(root, as_base_display(dir), &rebased)?;
+            *root = rebased;
+        } else {
+            let cwd = std::env::current_dir().map_err(Error::Io)?;
+            probe_root(root, &cwd, &join_relative_root(&cwd, root))?;
+        }
+    }
+    Ok(())
+}
+
+/// `dir` for display as a resolution base; the empty path reads as `.`.
+fn as_base_display(dir: &Path) -> &Path {
+    if dir.is_empty() { Path::new(".") } else { dir }
+}
+
+/// The directory containing `config_path`, spelled as the caller gave it.
+fn config_dir_as_given(config_path: &Path) -> Result<PathBuf> {
+    let drive_or_root_qualified = config_path
+        .components()
+        .next()
+        .is_some_and(|c| matches!(c, Component::Prefix(_) | Component::RootDir));
+    let path = if config_path.is_relative() && drive_or_root_qualified {
+        std::path::absolute(config_path).map_err(Error::Io)?
+    } else {
+        config_path.to_path_buf()
+    };
+    path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "configuration path has no parent directory: {}",
+            path.display()
+        ))
+    })
+}
+
 /// What a relative [`WorkspaceConfig::roots`] entry resolves against, for
 /// [`ServerConfig::load_from_with_root_base`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -801,12 +867,12 @@ impl ServerConfig {
     /// are always loaded: naming a path is itself the user's consent.
     ///
     /// Unlike [`load_from`](Self::load_from)'s documented default (relative
-    /// [`WorkspaceConfig::roots`] resolved against the config file's own
+    /// [`WorkspaceConfig::roots`] joined to the config file's own
     /// directory), the global/user config tier
-    /// (`~/.config/mcpls/mcpls.toml`, or the platform equivalent) resolves
-    /// relative roots against the process's current working directory
-    /// instead -- it isn't tied to any particular project, so cwd is the
-    /// more intuitive base (#348).
+    /// (`~/.config/mcpls/mcpls.toml`, or the platform equivalent) leaves
+    /// relative roots relative, so they resolve against the process's
+    /// current working directory at startup -- it isn't tied to any
+    /// particular project, so cwd is the more intuitive base (#348).
     ///
     /// # Errors
     ///
@@ -884,10 +950,14 @@ impl ServerConfig {
 
     /// Load configuration from a specific path.
     ///
-    /// Relative [`WorkspaceConfig::roots`] are resolved against the directory
-    /// containing `path`, then canonicalized. This keeps an explicitly named
+    /// Relative [`WorkspaceConfig::roots`] are joined to the directory
+    /// containing `path` and must exist, which keeps an explicitly named
     /// config portable when mcpls is launched from a different working
-    /// directory.
+    /// directory. Roots are kept as written, not canonicalized, so the
+    /// spelling an operator configured (for example through a symlink) stays
+    /// admissible; a relative `path` yields roots that stay relative.
+    /// [`crate::bridge::WorkspaceRoots::from_configured`] canonicalizes them
+    /// at startup.
     ///
     /// # Errors
     ///
@@ -939,47 +1009,7 @@ impl ServerConfig {
         let mut config: Self = toml::from_str(&content)?;
         config.validate()?;
 
-        if !config.workspace.roots.is_empty() {
-            config.workspace.roots = if config.workspace.roots.iter().any(|root| root.is_relative())
-            {
-                // A relative root needs an absolute base directory to
-                // resolve against -- compute `config_dir` (and, for `Cwd`,
-                // `current_dir()`) only in this branch: an all-absolute
-                // `workspace.roots` must not fail just because `path` needs
-                // `current_dir()` to become absolute, or because
-                // `config_dir` is unreadable/removed (#348 case 4; mirrors
-                // the analogous `serve_with` fix for case 1).
-                let absolute_config_path = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    std::env::current_dir().map_err(Error::Io)?.join(path)
-                };
-                let config_dir = absolute_config_path.parent().ok_or_else(|| {
-                    Error::InvalidConfig(format!(
-                        "configuration path has no parent directory: {}",
-                        absolute_config_path.display()
-                    ))
-                })?;
-
-                let base_dir = match relative_root_base {
-                    RelativeRootBase::ConfigDir => {
-                        dunce::canonicalize(config_dir).map_err(|source| {
-                            Error::InvalidConfig(format!(
-                                "configuration directory '{}' could not be canonicalized: {source}",
-                                config_dir.display()
-                            ))
-                        })?
-                    }
-                    RelativeRootBase::Cwd => std::env::current_dir().map_err(Error::Io)?,
-                };
-                crate::resolve_workspace_roots(&config.workspace.roots, &base_dir)?
-            } else {
-                // Every root is absolute already, so no base directory is
-                // ever joined against -- pass an arbitrary placeholder
-                // rather than computing one.
-                crate::canonicalize_workspace_roots(&config.workspace.roots, Path::new(""))?
-            };
-        }
+        rebase_relative_roots(&mut config.workspace.roots, path, relative_root_base)?;
 
         Ok(config)
     }
@@ -1282,10 +1312,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-
-    fn toml_path_literal(path: &Path) -> String {
-        toml::Value::String(path.to_string_lossy().into_owned()).to_string()
-    }
+    use crate::bridge::WorkspaceRoots;
+    #[cfg(unix)]
+    use crate::bridge::{ProcessCwd, validate_path_against_roots};
+    #[cfg(unix)]
+    use crate::test_lsp::client_path;
+    use crate::test_lsp::toml_path_literal;
 
     #[test]
     fn test_default_commands_match_builtin_servers() {
@@ -1365,10 +1397,7 @@ mod tests {
         fs::write(&config_path, &toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(
-            config.workspace.roots,
-            vec![dunce::canonicalize(workspace_root).unwrap()]
-        );
+        assert_eq!(config.workspace.roots, vec![workspace_root]);
         assert_eq!(config.workspace.position_encodings, vec!["utf-8"]);
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "rust");
@@ -1392,8 +1421,9 @@ mod tests {
 
         let config = ServerConfig::load_from(&config_path).unwrap();
 
-        assert_eq!(config.workspace.roots, vec![config_dir, project_root]);
         assert!(config.workspace.roots.iter().all(|root| root.is_absolute()));
+        let roots = WorkspaceRoots::from_configured(&config.workspace.roots).unwrap();
+        assert_eq!(roots.canonical(), [config_dir, project_root]);
     }
 
     /// #348 case 2: unlike `load_from`'s `ConfigDir` default (see
@@ -1422,7 +1452,12 @@ mod tests {
             ServerConfig::load_from_with_root_base(&config_path, RelativeRootBase::Cwd).unwrap()
         };
 
-        assert_eq!(config.workspace.roots, vec![expected_root]);
+        assert_eq!(config.workspace.roots, vec![PathBuf::from("relative-root")]);
+        let roots = {
+            let _guard = CwdGuard::enter(&cwd);
+            WorkspaceRoots::from_configured(&config.workspace.roots).unwrap()
+        };
+        assert_eq!(roots.canonical(), [expected_root]);
     }
 
     #[test]
@@ -1437,8 +1472,204 @@ mod tests {
             panic!("expected InvalidConfig, got {err:?}");
         };
         assert!(message.contains("workspace root 'missing'"));
-        let config_dir = dunce::canonicalize(tmp_dir.path()).unwrap();
-        assert!(message.contains(&config_dir.display().to_string()));
+        assert!(message.contains(&tmp_dir.path().display().to_string()));
+    }
+
+    /// A temp tree with `real/{src/main.rs, out -> outside}` and
+    /// `link -> real`, all under a canonical base.
+    #[cfg(unix)]
+    struct SymlinkTree {
+        _dir: TempDir,
+        base: PathBuf,
+        real: PathBuf,
+        link: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn symlink_tree() -> SymlinkTree {
+        let dir = TempDir::new().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir_all(real.join("src")).unwrap();
+        fs::write(real.join("src/main.rs"), "fn main() {}").unwrap();
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("out")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        SymlinkTree {
+            _dir: dir,
+            base,
+            real,
+            link,
+        }
+    }
+
+    #[cfg(unix)]
+    fn load_roots(config_path: &Path) -> WorkspaceRoots {
+        let config = ServerConfig::load_from(config_path).unwrap();
+        WorkspaceRoots::from_configured(&config.workspace.roots).unwrap()
+    }
+
+    /// #571 RT-001: the configured spelling of a file-loaded root survives
+    /// the hand-off to the path validator.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_symlinked_absolute_root_admits_configured_spelling() {
+        let tree = symlink_tree();
+        let config_path = tree.base.join("cfg.toml");
+        let literal = toml_path_literal(&tree.link);
+        fs::write(&config_path, format!("[workspace]\nroots = [{literal}]\n")).unwrap();
+
+        let config = ServerConfig::load_from(&config_path).unwrap();
+        assert_eq!(config.workspace.roots, vec![tree.link.clone()]);
+        let roots = WorkspaceRoots::from_configured(&config.workspace.roots).unwrap();
+
+        let via_link =
+            validate_path_against_roots(&client_path(tree.link.join("src/main.rs")), &roots);
+        assert_eq!(via_link.unwrap(), tree.real.join("src/main.rs"));
+        let via_real =
+            validate_path_against_roots(&client_path(tree.real.join("src/main.rs")), &roots);
+        assert!(via_real.is_ok());
+    }
+
+    /// #571 RT-003: an inside-root symlink pointing out stays rejected under
+    /// both spellings.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_symlinked_root_still_rejects_escape_symlink() {
+        let tree = symlink_tree();
+        let config_path = tree.base.join("cfg.toml");
+        let literal = toml_path_literal(&tree.link);
+        fs::write(&config_path, format!("[workspace]\nroots = [{literal}]\n")).unwrap();
+        let roots = load_roots(&config_path);
+
+        for root in [&tree.link, &tree.real] {
+            let err = validate_path_against_roots(&client_path(root.join("out/secret.rs")), &roots)
+                .unwrap_err();
+            assert_matches!(err, Error::PathOutsideWorkspace(_), "{err:?}");
+        }
+    }
+
+    /// #571 RT-004: a relative root joined to a config directory that is
+    /// itself reached through a symlink keeps that spelling.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_relative_root_keeps_symlinked_config_dir_spelling() {
+        let tree = symlink_tree();
+        let cfg_real = tree.base.join("cfg_real");
+        fs::create_dir(&cfg_real).unwrap();
+        std::os::unix::fs::symlink(&tree.real, cfg_real.join("proj")).unwrap();
+        let cfg_link = tree.base.join("cfg_link");
+        std::os::unix::fs::symlink(&cfg_real, &cfg_link).unwrap();
+        fs::write(
+            cfg_real.join("mcpls.toml"),
+            "[workspace]\nroots = [\"proj\"]\n",
+        )
+        .unwrap();
+
+        let roots = load_roots(&cfg_link.join("mcpls.toml"));
+
+        let admitted =
+            validate_path_against_roots(&client_path(cfg_link.join("proj/src/main.rs")), &roots);
+        assert_eq!(admitted.unwrap(), tree.real.join("src/main.rs"));
+    }
+
+    /// #571 S1: a relative config path (the trusted project-local
+    /// `mcpls.toml`) keeps `.` relative so the logical `$PWD` spelling is
+    /// admitted at serve time.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_relative_config_path_keeps_pwd_spelling() {
+        let tree = symlink_tree();
+        fs::write(
+            tree.real.join("mcpls.toml"),
+            "[workspace]\nroots = [\".\"]\n",
+        )
+        .unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(&tree.real);
+            ServerConfig::load_from(Path::new("mcpls.toml")).unwrap()
+        };
+        assert!(config.workspace.roots.iter().all(|root| root.is_relative()));
+
+        let roots = WorkspaceRoots::from_configured_with(&config.workspace.roots, || {
+            Ok(ProcessCwd::new(
+                tree.real.clone(),
+                Some(tree.link.clone().into_os_string()),
+            ))
+        })
+        .unwrap();
+
+        let admitted =
+            validate_path_against_roots(&client_path(tree.link.join("src/main.rs")), &roots);
+        assert_eq!(admitted.unwrap(), tree.real.join("src/main.rs"));
+    }
+
+    /// #348 class: an absolute config path with relative roots never needs
+    /// the working directory, so a removed cwd must not fail the load.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_absolute_config_path_does_not_read_removed_cwd() {
+        let tree = symlink_tree();
+        fs::create_dir(tree.base.join("proj")).unwrap();
+        let config_path = tree.base.join("mcpls.toml");
+        fs::write(&config_path, "[workspace]\nroots = [\"proj\"]\n").unwrap();
+        let doomed = TempDir::new().unwrap();
+
+        let config = {
+            let _guard = CwdGuard::enter(doomed.path());
+            fs::remove_dir(doomed.path()).unwrap();
+            ServerConfig::load_from(&config_path).unwrap()
+        };
+
+        assert_eq!(config.workspace.roots, vec![tree.base.join("proj")]);
+    }
+
+    /// #571 S2: `..` after a symlinked config directory must not admit the
+    /// lexical parent, which is a different tree than the physical one.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_parent_root_through_symlinked_config_dir_records_no_alias() {
+        let tree = symlink_tree();
+        let data = tree.base.join("data/a/b");
+        fs::create_dir_all(&data).unwrap();
+        let home = tree.base.join("home");
+        fs::create_dir(&home).unwrap();
+        let proj_link = home.join("proj_link");
+        std::os::unix::fs::symlink(&data, &proj_link).unwrap();
+        fs::write(data.join("mcpls.toml"), "[workspace]\nroots = [\"..\"]\n").unwrap();
+        fs::write(home.join("other.rs"), "").unwrap();
+
+        let roots = load_roots(&proj_link.join("mcpls.toml"));
+
+        assert_eq!(roots.canonical(), [tree.base.join("data/a")]);
+        let err =
+            validate_path_against_roots(&client_path(home.join("other.rs")), &roots).unwrap_err();
+        assert_matches!(err, Error::PathOutsideWorkspace(_), "{err:?}");
+    }
+
+    /// A missing root is reported as written, not as the rebased entry.
+    #[test]
+    fn test_load_from_relative_config_path_reports_missing_root_as_written() {
+        let tmp_dir = TempDir::new().unwrap();
+        fs::write(
+            tmp_dir.path().join("mcpls.toml"),
+            "[workspace]\nroots = [\"missing\"]\n",
+        )
+        .unwrap();
+
+        let err = {
+            let _guard = CwdGuard::enter(tmp_dir.path());
+            ServerConfig::load_from(Path::new("mcpls.toml")).unwrap_err()
+        };
+
+        let Error::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(message.contains("workspace root 'missing'"), "{message}");
     }
 
     #[test]
@@ -2516,10 +2747,7 @@ mod tests {
             ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap()
         };
 
-        assert_eq!(
-            config.workspace.roots,
-            vec![dunce::canonicalize(custom_root).unwrap()]
-        );
+        assert_eq!(config.workspace.roots, vec![custom_root]);
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "python");
     }

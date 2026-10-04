@@ -7,8 +7,15 @@
 //!
 //! [`validate_path_against_roots`]: crate::bridge::validate_path_against_roots
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf, Prefix, PrefixComponent};
 use std::sync::Arc;
+
+use lsp_types::Uri;
+use tracing::{debug, info, warn};
+
+use super::uri_to_path;
+use crate::error::Error;
 
 /// How path components are compared during containment checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +33,7 @@ impl CaseRule {
         Self::Exact
     };
 
-    fn eq(self, a: Component<'_>, b: Component<'_>) -> bool {
+    fn components_eq(self, a: Component<'_>, b: Component<'_>) -> bool {
         match (a, b) {
             (Component::Prefix(a), Component::Prefix(b)) => prefix_eq(a, b),
             _ => match self {
@@ -63,7 +70,7 @@ fn prefix_eq(a: PrefixComponent<'_>, b: PrefixComponent<'_>) -> bool {
 fn is_within(path: &Path, root: &Path, rule: CaseRule) -> bool {
     let mut components = path.components();
     root.components()
-        .all(|r| components.next().is_some_and(|c| rule.eq(c, r)))
+        .all(|r| components.next().is_some_and(|c| rule.components_eq(c, r)))
 }
 
 /// Resolves `.` and `..` without touching the filesystem; `..` never rises
@@ -100,6 +107,176 @@ pub fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
     })
 }
 
+/// The process working directory in its physical form plus the logical
+/// (`$PWD`) spelling when that names the same directory.
+///
+/// Injected into [`WorkspaceRoots::from_configured_with`] so tests can drive
+/// both spellings without changing the real environment.
+#[derive(Debug, Clone)]
+pub struct ProcessCwd {
+    physical: PathBuf,
+    logical: Option<PathBuf>,
+}
+
+impl ProcessCwd {
+    /// Reads the current directory and `$PWD` from the process environment.
+    pub(crate) fn current() -> Result<Self, Error> {
+        let physical = std::env::current_dir().map_err(Error::Io)?;
+        Ok(Self::new(physical, std::env::var_os("PWD")))
+    }
+
+    /// Pairs `physical` with `pwd`, which is accepted only when it is
+    /// absolute and names the same directory; a forged or stale value is
+    /// ignored.
+    pub(crate) fn new(physical: PathBuf, pwd: Option<OsString>) -> Self {
+        let logical = pwd.map(PathBuf::from).filter(|pwd| {
+            pwd.is_absolute()
+                && matches!(
+                    (dunce::canonicalize(pwd), dunce::canonicalize(&physical)),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        });
+        Self { physical, logical }
+    }
+}
+
+/// Canonicalizes `probe` (resolved through the process working directory when
+/// relative) and returns the canonical path, reporting a failure against the
+/// root entry as `written` and the `base_dir` it was resolved relative to.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidConfig`] when `probe` cannot be canonicalized.
+pub fn probe_root(written: &Path, base_dir: &Path, probe: &Path) -> Result<PathBuf, Error> {
+    dunce::canonicalize(probe).map_err(|source| {
+        Error::InvalidConfig(format!(
+            "workspace root '{}' resolved relative to '{}' as '{}' could not be canonicalized: {source}",
+            written.display(),
+            base_dir.display(),
+            probe.display()
+        ))
+    })
+}
+
+/// Join a relative `root` onto `base_dir`, correctly handling a root that
+/// [`Path::is_relative`] classifies `true` yet still carries a leading
+/// [`Component::Prefix`] and/or [`Component::RootDir`] -- on Windows,
+/// `is_absolute()` requires *both* a prefix and a root, so two distinct
+/// shapes are `is_relative() == true` despite being (partially) rooted:
+/// - no prefix, has root (e.g. `\workspace`) -- rooted on whichever drive is
+///   current.
+/// - has prefix, no root (e.g. `C:workspace`) -- drive-relative, resolved
+///   against that drive's own current directory.
+///
+/// Plain `base_dir.join(root)` would hit [`PathBuf::push`]'s documented
+/// special cases for both shapes, each discarding some or all of `base_dir`.
+/// Skipping any leading `Prefix`/`RootDir` components before joining
+/// sidesteps both: only the ordinary relative tail is ever appended to
+/// `base_dir`. Detected via `Component` iteration (not `#[cfg(windows)]`),
+/// so the logic is exercised by a unit test on any host -- see `#348`.
+pub fn join_relative_root(base_dir: &Path, root: &Path) -> PathBuf {
+    let mut joined = base_dir.to_path_buf();
+    joined.extend(
+        root.components()
+            .skip_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir)),
+    );
+    joined
+}
+
+/// The `file:` path of `uri` when it is absolute and free of `.`/`..`
+/// components (a prefix match would otherwise let `/ws/../etc` pass for `/ws`).
+fn plain_absolute_path(uri: &Uri) -> Option<PathBuf> {
+    let path = uri_to_path(uri)?;
+    let plain = path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir));
+    plain.then_some(path)
+}
+
+/// The simplified, lexically normalized form an alias is stored (and
+/// verified) in; `None` for a relative or empty alias.
+fn stored_alias_form(alias: &Path) -> Option<PathBuf> {
+    if !alias.is_absolute() {
+        return None;
+    }
+    let form = lexically_normalize(dunce::simplified(alias));
+    (!form.is_empty()).then_some(form)
+}
+
+/// One configured root: its canonical form plus the pre-canonical spellings
+/// a client may name it by.
+struct ResolvedRoot {
+    canonical: PathBuf,
+    aliases: Vec<PathBuf>,
+}
+
+impl ResolvedRoot {
+    fn from_absolute(root: &Path) -> Self {
+        let canonical = dunce::canonicalize(root).unwrap_or_else(|source| {
+            warn!(
+                "Failed to canonicalize absolute workspace root {}: {source}, using non-canonical path",
+                root.display()
+            );
+            canonicalize_existing_prefix(root).unwrap_or_else(|| root.to_path_buf())
+        });
+        Self {
+            canonical,
+            aliases: vec![root.to_path_buf()],
+        }
+    }
+
+    fn from_relative(root: &Path, cwd: &ProcessCwd) -> Result<Self, Error> {
+        let joined = join_relative_root(&cwd.physical, root);
+        let canonical = probe_root(root, &cwd.physical, &joined)?;
+        let mut aliases = vec![joined];
+        aliases.extend(
+            cwd.logical
+                .as_deref()
+                .map(|logical| join_relative_root(logical, root)),
+        );
+        Ok(Self { canonical, aliases })
+    }
+
+    fn from_cwd(cwd: &ProcessCwd) -> Self {
+        let canonical = dunce::canonicalize(&cwd.physical).unwrap_or_else(|e| {
+            warn!(
+                "Failed to canonicalize workspace base directory {}: {e}, using non-canonical absolute path",
+                cwd.physical.display()
+            );
+            cwd.physical.clone()
+        });
+        info!(
+            "Using workspace base directory as root: {}",
+            canonical.display()
+        );
+        let mut aliases = vec![cwd.physical.clone()];
+        aliases.extend(cwd.logical.clone());
+        Self { canonical, aliases }
+    }
+
+    /// Aliases whose stored form still resolves to this root's canonical
+    /// path. An alias that climbs out through a symlink (`link/..`) would
+    /// otherwise admit an unrelated tree and let `FileIo` errors probe it.
+    fn verified_aliases(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.aliases.iter().filter_map(|alias| {
+            let form = stored_alias_form(alias)?;
+            if form == self.canonical
+                || canonicalize_existing_prefix(&form).as_deref() == Some(self.canonical.as_path())
+            {
+                Some(form)
+            } else {
+                debug!(
+                    "dropping workspace root alias {} that does not resolve to {}",
+                    form.display(),
+                    self.canonical.display()
+                );
+                None
+            }
+        })
+    }
+}
+
 /// The canonical workspace roots plus the lexical aliases they may be named by.
 ///
 /// A path is admitted by `validate_path_against_roots` only if it passes the
@@ -119,19 +296,16 @@ pub struct WorkspaceRoots {
 impl WorkspaceRoots {
     /// Builds a root set from already-canonical roots and extra lexical aliases.
     ///
-    /// The caller vouches that `canonical` is already canonical (the
-    /// containment check trusts it); [`Self::resolve`] is the public
-    /// constructor that guarantees it. Aliases that are relative, empty after
-    /// normalization, duplicated, or equal to a canonical root are dropped.
-    #[must_use]
-    pub(crate) fn new(canonical: Vec<PathBuf>, aliases: Vec<PathBuf>) -> Self {
+    /// Performs no filesystem access and trusts the caller that `canonical`
+    /// is canonical. Aliases that are relative, empty after normalization,
+    /// duplicated, or equal to a canonical root are dropped.
+    fn from_parts(canonical: Vec<PathBuf>, aliases: Vec<PathBuf>) -> Self {
         let mut kept: Vec<PathBuf> = Vec::new();
         for alias in aliases {
-            if !alias.is_absolute() {
+            let Some(alias) = stored_alias_form(&alias) else {
                 continue;
-            }
-            let alias = lexically_normalize(dunce::simplified(&alias));
-            if alias.is_empty() || canonical.contains(&alias) || kept.contains(&alias) {
+            };
+            if canonical.contains(&alias) || kept.contains(&alias) {
                 continue;
             }
             kept.push(alias);
@@ -142,28 +316,71 @@ impl WorkspaceRoots {
         }
     }
 
-    /// Builds a root set from raw roots, canonicalizing each one.
+    /// Builds a root set for tests that exercise purely lexical behavior;
+    /// the caller vouches for `canonical` and nothing touches the filesystem.
+    #[cfg(test)]
+    pub(crate) fn for_test(canonical: Vec<PathBuf>, aliases: Vec<PathBuf>) -> Self {
+        Self::from_parts(canonical, aliases)
+    }
+
+    /// Builds the root set for the `workspace.roots` of a configuration.
     ///
-    /// Touches the filesystem once per root. The raw form is kept as a
-    /// lexical alias, so a client naming the root the way it was configured
-    /// (for example a `/var` temp dir that canonicalizes to `/private/var`)
-    /// is still admitted.
+    /// Relative roots are resolved against the process working directory and
+    /// must exist; an empty list means the working directory itself. Absolute
+    /// roots that cannot be canonicalized (for example a directory created
+    /// after startup) fall back to their longest existing prefix. The
+    /// configured spelling, the working-directory spelling and the logical
+    /// `$PWD` spelling are kept as aliases, but only when they verifiably
+    /// resolve to the same root, so a client naming a root the way it was
+    /// configured (for example a `/var` temp dir that canonicalizes to
+    /// `/private/var`) is still admitted.
+    ///
+    /// The working directory is read only when a root needs it, so a
+    /// fully-absolute list does not fail startup over an unreadable cwd.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] for a relative root that cannot be
+    /// canonicalized and [`Error::Io`] when the working directory is needed
+    /// but unreadable.
     ///
     /// # Examples
     ///
     /// ```
     /// use mcpls_core::bridge::WorkspaceRoots;
     ///
-    /// let roots = WorkspaceRoots::resolve(vec![std::env::temp_dir()]);
+    /// let roots = WorkspaceRoots::from_configured(&[std::env::temp_dir()])?;
     /// assert!(!roots.is_empty());
+    /// # Ok::<(), mcpls_core::Error>(())
     /// ```
-    #[must_use]
-    pub fn resolve(roots: Vec<PathBuf>) -> Self {
-        let canonical = roots
+    pub fn from_configured(roots: &[PathBuf]) -> Result<Self, Error> {
+        Self::from_configured_with(roots, ProcessCwd::current)
+    }
+
+    pub(crate) fn from_configured_with(
+        roots: &[PathBuf],
+        cwd: impl FnOnce() -> Result<ProcessCwd, Error>,
+    ) -> Result<Self, Error> {
+        let needs_cwd = roots.is_empty() || roots.iter().any(|root| root.is_relative());
+        let cwd = needs_cwd.then(cwd).transpose()?;
+
+        let resolved = match &cwd {
+            Some(cwd) if roots.is_empty() => vec![ResolvedRoot::from_cwd(cwd)],
+            _ => roots
+                .iter()
+                .map(|root| match &cwd {
+                    Some(cwd) if root.is_relative() => ResolvedRoot::from_relative(root, cwd),
+                    _ => Ok(ResolvedRoot::from_absolute(root)),
+                })
+                .collect::<Result<Vec<_>, Error>>()?,
+        };
+
+        let aliases = resolved
             .iter()
-            .map(|root| canonicalize_existing_prefix(root).unwrap_or_else(|| root.clone()))
+            .flat_map(ResolvedRoot::verified_aliases)
             .collect();
-        Self::new(canonical, roots)
+        let canonical = resolved.into_iter().map(|root| root.canonical).collect();
+        Ok(Self::from_parts(canonical, aliases))
     }
 
     /// The canonical roots, in configuration order.
@@ -172,25 +389,67 @@ impl WorkspaceRoots {
         &self.canonical
     }
 
-    /// A shared handle to the canonical roots for lock-free consumers.
-    #[must_use]
-    pub fn canonical_shared(&self) -> Arc<[PathBuf]> {
-        Arc::clone(&self.canonical)
-    }
-
     /// Whether no root is configured (path validation then fails closed).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.canonical.is_empty()
     }
 
+    /// Whether `uri` names an absolute, `.`/`..`-free `file:` path lying under
+    /// a canonical root or one of its aliases, compared with the platform's
+    /// lenient case rule.
+    ///
+    /// A lexical **pre-filter**, never a trust boundary: it neither touches
+    /// the filesystem nor resolves symlinks, and on case-insensitive
+    /// platforms it folds case. It suits callers that either follow it with a
+    /// canonical check (the diagnostics pump, via
+    /// `PublishedDiagnosticsUri::resolve`) or only annotate (the advisory
+    /// `out_of_workspace` flag). Anything that writes through a
+    /// server-supplied URI must use [`Self::admits_edit_uri`] instead.
+    /// Read-only navigation results are deliberately not filtered (standard
+    /// library and dependency locations are legitimately outside); opening
+    /// such a path still goes through the inbound `validate_path_against_roots`
+    /// gate. Empty roots admit nothing.
+    pub(crate) fn admits_uri(&self, uri: &Uri) -> bool {
+        plain_absolute_path(uri).is_some_and(|path| self.admits_lexically(&path))
+    }
+
+    /// Whether `uri` may be written through on behalf of a server.
+    ///
+    /// Stricter than [`Self::admits_uri`]: the path must lie under a canonical
+    /// root or alias by exact component comparison (no case folding), *and*
+    /// its canonical form (longest existing prefix resolved, so a symlink
+    /// pointing out of the workspace or a retargeted alias is seen through)
+    /// must lie under a canonical root. Aliases are only a spelling aid here.
+    /// Canonicalization runs on the blocking pool.
+    pub(crate) async fn admits_edit_uri(&self, uri: &Uri) -> bool {
+        let Some(path) = plain_absolute_path(uri) else {
+            return false;
+        };
+        if !self.admits_with(&path, CaseRule::Exact) {
+            return false;
+        }
+        match tokio::task::spawn_blocking(move || canonicalize_existing_prefix(&path)).await {
+            Ok(canonical) => canonical.is_some_and(|canonical| self.contains_canonical(&canonical)),
+            Err(error) => {
+                tracing::warn!(%error, uri = uri.as_ref(), "edit URI canonicalization task failed; dropping the edit");
+                false
+            }
+        }
+    }
+
     /// Whether the absolute, lexically normalized `path` lies under a
-    /// canonical root or one of its aliases. Never touches the filesystem.
+    /// canonical root or one of its aliases (lenient case rule). Never touches
+    /// the filesystem.
     pub(crate) fn admits_lexically(&self, normalized: &Path) -> bool {
+        self.admits_with(normalized, CaseRule::LEXICAL)
+    }
+
+    fn admits_with(&self, path: &Path, rule: CaseRule) -> bool {
         self.canonical
             .iter()
             .chain(self.aliases.iter())
-            .any(|root| is_within(normalized, root, CaseRule::LEXICAL))
+            .any(|root| is_within(path, root, rule))
     }
 
     /// Whether the canonical `path` lies under a canonical root.
@@ -204,7 +463,53 @@ impl WorkspaceRoots {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
+
+    /// An absolute path for the host platform (`/p` on Unix, `C:\p` on Windows).
+    fn abs(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", path.replace('/', "\\")))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
+    fn file_uri(path: &str) -> Uri {
+        let prefix = if cfg!(windows) {
+            "file:///C:"
+        } else {
+            "file://"
+        };
+        Uri::from(format!("{prefix}{path}").as_str())
+    }
+
+    fn resolve_in(roots: &[PathBuf], base: &Path) -> Result<WorkspaceRoots, Error> {
+        WorkspaceRoots::from_configured_with(roots, || {
+            Ok(ProcessCwd::new(base.to_path_buf(), None))
+        })
+    }
+
+    #[cfg(unix)]
+    fn resolve_in_with_pwd(
+        roots: &[PathBuf],
+        base: &Path,
+        pwd: &Path,
+    ) -> Result<WorkspaceRoots, Error> {
+        WorkspaceRoots::from_configured_with(roots, || {
+            Ok(ProcessCwd::new(
+                base.to_path_buf(),
+                Some(pwd.as_os_str().to_owned()),
+            ))
+        })
+    }
+
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        (dir, base)
+    }
 
     #[test]
     fn test_lexically_normalize_resolves_dots() {
@@ -222,18 +527,9 @@ mod tests {
         );
     }
 
-    /// An absolute path for the host platform (`/p` on Unix, `C:\p` on Windows).
-    fn abs(path: &str) -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(format!("C:{}", path.replace('/', "\\")))
-        } else {
-            PathBuf::from(path)
-        }
-    }
-
     #[test]
-    fn test_new_drops_relative_duplicate_and_canonical_aliases() {
-        let roots = WorkspaceRoots::new(
+    fn test_from_parts_drops_relative_duplicate_and_canonical_aliases() {
+        let roots = WorkspaceRoots::for_test(
             vec![abs("/real")],
             vec![
                 PathBuf::from("relative"),
@@ -247,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_admits_lexically_alias_and_canonical() {
-        let roots = WorkspaceRoots::new(vec![abs("/real/ws")], vec![abs("/alias/ws")]);
+        let roots = WorkspaceRoots::for_test(vec![abs("/real/ws")], vec![abs("/alias/ws")]);
         assert!(roots.admits_lexically(&abs("/real/ws/a.rs")));
         assert!(roots.admits_lexically(&abs("/alias/ws/a.rs")));
         assert!(!roots.admits_lexically(&abs("/other/a.rs")));
@@ -259,6 +555,30 @@ mod tests {
         let roots = WorkspaceRoots::default();
         assert!(roots.is_empty());
         assert!(!roots.admits_lexically(Path::new("/a")));
+        assert!(!roots.admits_uri(&file_uri("/anywhere/at/all.rs")));
+    }
+
+    #[test]
+    fn test_admits_uri_under_root_and_alias() {
+        let roots = WorkspaceRoots::for_test(vec![abs("/real/ws")], vec![abs("/alias/ws")]);
+        assert!(roots.admits_uri(&file_uri("/real/ws/src/main.rs")));
+        assert!(roots.admits_uri(&file_uri("/alias/ws/src/main.rs")));
+    }
+
+    #[test]
+    fn test_admits_uri_rejects_outside_sibling_and_non_file() {
+        let roots = WorkspaceRoots::for_test(vec![abs("/ws")], vec![]);
+        assert!(!roots.admits_uri(&file_uri("/etc/passwd")));
+        assert!(!roots.admits_uri(&file_uri("/ws2/a.rs")));
+        assert!(!roots.admits_uri(&Uri::from("untitled:Untitled-1")));
+    }
+
+    /// `Path::starts_with` does not resolve `.`/`..`: without the explicit
+    /// check `file:///ws/../etc/passwd` would pass for `/ws`.
+    #[test]
+    fn test_admits_uri_rejects_dot_components() {
+        let roots = WorkspaceRoots::for_test(vec![abs("/ws")], vec![]);
+        assert!(!roots.admits_uri(&file_uri("/ws/../../etc/passwd")));
     }
 
     #[test]
@@ -269,24 +589,9 @@ mod tests {
         assert_eq!(result, canonical.join("gone/x.rs"));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn test_resolve_keeps_symlinked_form_as_alias() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let roots = WorkspaceRoots::resolve(vec![link.clone()]);
-
-        assert_eq!(roots.canonical(), [dunce::canonicalize(&real).unwrap()]);
-        assert!(roots.admits_lexically(&link.join("a.rs")));
-    }
-
     #[test]
     fn test_contains_canonical_is_case_exact() {
-        let roots = WorkspaceRoots::new(vec![PathBuf::from("/Real")], vec![]);
+        let roots = WorkspaceRoots::for_test(vec![PathBuf::from("/Real")], vec![]);
         assert!(roots.contains_canonical(Path::new("/Real/a")));
         assert!(!roots.contains_canonical(Path::new("/real/a")));
     }
@@ -294,7 +599,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_verbatim_unc_equals_unc() {
-        let roots = WorkspaceRoots::new(vec![PathBuf::from(r"\\server\share\ws")], vec![]);
+        let roots = WorkspaceRoots::for_test(vec![PathBuf::from(r"\\server\share\ws")], vec![]);
         assert!(roots.contains_canonical(Path::new(r"\\?\UNC\server\share\ws\a.rs")));
         assert!(!roots.contains_canonical(Path::new(r"\\?\UNC\server\other\ws\a.rs")));
     }
@@ -302,7 +607,296 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_verbatim_disk_equals_disk() {
-        let roots = WorkspaceRoots::new(vec![PathBuf::from(r"C:\ws")], vec![]);
+        let roots = WorkspaceRoots::for_test(vec![PathBuf::from(r"C:\ws")], vec![]);
         assert!(roots.contains_canonical(Path::new(r"\\?\C:\ws\a.rs")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_admits_uri_accepts_verbatim_prefix_root() {
+        let roots = WorkspaceRoots::for_test(vec![PathBuf::from(r"\\?\C:\ws")], vec![]);
+        assert!(roots.admits_uri(&Uri::from("file:///C:/ws/a.rs")));
+    }
+
+    #[test]
+    fn test_from_configured_absolute_missing_root_keeps_alias() {
+        let (_dir, base) = canonical_tempdir();
+        let missing = base.join("missing");
+        let roots = resolve_in(std::slice::from_ref(&missing), &base).unwrap();
+        assert_eq!(roots.canonical(), std::slice::from_ref(&missing));
+        assert!(roots.admits_lexically(&missing.join("a.rs")));
+    }
+
+    #[test]
+    fn test_from_configured_rejects_nonexistent_relative_path() {
+        let (_dir, base) = canonical_tempdir();
+
+        let err = resolve_in(&[PathBuf::from("missing")], &base).unwrap_err();
+
+        let Error::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(message.contains("workspace root 'missing'"));
+        assert!(message.contains(&base.display().to_string()));
+    }
+
+    #[test]
+    fn test_from_configured_surfaces_unreadable_cwd_only_when_needed() {
+        let (_dir, base) = canonical_tempdir();
+        let broken = || Err(Error::Io(std::io::Error::other("cwd gone")));
+
+        assert_matches!(
+            WorkspaceRoots::from_configured_with(&[], broken),
+            Err(Error::Io(_))
+        );
+        assert_matches!(
+            WorkspaceRoots::from_configured_with(&[PathBuf::from("rel")], broken),
+            Err(Error::Io(_))
+        );
+        assert!(WorkspaceRoots::from_configured_with(&[base], broken).is_ok());
+    }
+
+    /// #234 round-3 regression: a symlinked workspace root must canonicalize
+    /// to its real path, matching what LSP servers report in diagnostics,
+    /// while its configured spelling stays admitted as an alias.
+    #[cfg(unix)]
+    #[test]
+    fn test_from_configured_symlinked_root_keeps_alias() {
+        let (_dir, base) = canonical_tempdir();
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let roots = resolve_in(std::slice::from_ref(&link), &base).unwrap();
+
+        assert_eq!(roots.canonical(), std::slice::from_ref(&real));
+        assert!(roots.admits_lexically(&link.join("a.rs")));
+        assert!(roots.admits_lexically(&real.join("a.rs")));
+        assert!(!roots.admits_lexically(&base.join("other/a.rs")));
+    }
+
+    #[test]
+    fn test_from_configured_empty_returns_cwd() {
+        let (_dir, base) = canonical_tempdir();
+        let roots = resolve_in(&[], &base).unwrap();
+        assert_eq!(roots.canonical(), [base]);
+    }
+
+    #[test]
+    fn test_from_configured_preserves_order_and_resolves_relative() {
+        let (_dir, base) = canonical_tempdir();
+        let absolute = base.join("absolute");
+        std::fs::create_dir(&absolute).unwrap();
+        std::fs::create_dir_all(base.join("relative/path")).unwrap();
+
+        let roots = resolve_in(&[absolute.clone(), PathBuf::from("relative/path")], &base).unwrap();
+
+        assert_eq!(roots.canonical(), [absolute, base.join("relative/path")]);
+    }
+
+    #[test]
+    fn test_from_configured_dot_and_parent() {
+        let (_dir, parent) = canonical_tempdir();
+        let nested = parent.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        let dot = resolve_in(&[PathBuf::from(".")], &nested).unwrap();
+        let up = resolve_in(&[PathBuf::from("..")], &nested).unwrap();
+
+        assert_eq!(dot.canonical(), [nested]);
+        assert_eq!(up.canonical(), [parent]);
+    }
+
+    #[test]
+    fn test_from_configured_unicode_and_spaces() {
+        let (_dir, base) = canonical_tempdir();
+        let config_roots = [
+            PathBuf::from("workspace/テスト"),
+            PathBuf::from("workspace/тест"),
+            PathBuf::from("another path/workspace"),
+        ];
+        for root in &config_roots {
+            std::fs::create_dir_all(base.join(root)).unwrap();
+        }
+
+        let roots = resolve_in(&config_roots, &base).unwrap();
+
+        let expected: Vec<PathBuf> = config_roots.iter().map(|r| base.join(r)).collect();
+        assert_eq!(roots.canonical(), expected);
+    }
+
+    /// #348 case 1: a fully-absolute list never reads the working directory.
+    #[test]
+    fn test_from_configured_ignores_cwd_when_all_absolute() {
+        let (_dir, base) = canonical_tempdir();
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+
+        let roots = WorkspaceRoots::from_configured_with(std::slice::from_ref(&root), || {
+            panic!("cwd must not be read")
+        })
+        .unwrap();
+
+        assert_eq!(roots.canonical(), [root]);
+    }
+
+    /// #348 case 3 (S2): platform-independent test of the `Component`
+    /// stripping; the rooted-without-prefix shape is only `is_relative()` on
+    /// Windows, but the helper can be driven directly on any host.
+    #[test]
+    fn test_join_relative_root_strips_leading_root_and_prefix_components() {
+        let base = Path::new("/base/dir");
+
+        assert_eq!(
+            join_relative_root(base, Path::new("/workspace")),
+            PathBuf::from("/base/dir/workspace")
+        );
+        assert_eq!(
+            join_relative_root(base, Path::new("/workspace/sub")),
+            PathBuf::from("/base/dir/workspace/sub")
+        );
+        assert_eq!(
+            join_relative_root(base, Path::new("workspace")),
+            PathBuf::from("/base/dir/workspace")
+        );
+        assert_eq!(
+            join_relative_root(base, Path::new("..")),
+            PathBuf::from("/base/dir/..")
+        );
+    }
+
+    /// #348 case 3: `\workspace` is relative on Windows despite being rooted.
+    #[cfg(windows)]
+    #[test]
+    fn test_from_configured_windows_root_without_prefix() {
+        let (_dir, base) = canonical_tempdir();
+        let nested = base.join("workspace");
+        std::fs::create_dir(&nested).unwrap();
+
+        let root = PathBuf::from(r"\workspace");
+        assert!(root.is_relative());
+
+        let roots = resolve_in(std::slice::from_ref(&root), &base).unwrap();
+        assert_eq!(roots.canonical(), [nested]);
+    }
+
+    /// #348 M2: a drive-relative root (`C:workspace`) is joined under the
+    /// base like every other relative root.
+    #[cfg(windows)]
+    #[test]
+    fn test_from_configured_windows_drive_relative_root() {
+        let (_dir, base) = canonical_tempdir();
+        let nested = base.join("workspace");
+        std::fs::create_dir(&nested).unwrap();
+
+        let Some(drive_prefix) = base.components().find_map(|c| match c {
+            Component::Prefix(p) => Some(p.as_os_str().to_owned()),
+            _ => None,
+        }) else {
+            panic!("temp dir path should have a Windows drive prefix");
+        };
+        let mut root = drive_prefix;
+        root.push("workspace");
+        let root = PathBuf::from(root);
+        assert!(root.is_relative());
+
+        let roots = resolve_in(std::slice::from_ref(&root), &base).unwrap();
+        assert_eq!(roots.canonical(), [nested]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_process_cwd_accepts_pwd_only_when_it_names_the_cwd() {
+        let (_dir, base) = canonical_tempdir();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        let logical = |pwd: Option<&std::ffi::OsStr>| {
+            ProcessCwd::new(base.clone(), pwd.map(ToOwned::to_owned)).logical
+        };
+
+        assert_eq!(logical(Some(link.as_os_str())), Some(link));
+        assert_eq!(logical(Some(other.path().as_os_str())), None);
+        assert_eq!(logical(Some(std::ffi::OsStr::new("."))), None);
+        assert_eq!(logical(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_from_configured_relative_root_admits_logical_cwd_spelling() {
+        let (_dir, base) = canonical_tempdir();
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("rel")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let roots = resolve_in_with_pwd(&[PathBuf::from("rel")], &real, &link).unwrap();
+        assert!(roots.admits_lexically(&link.join("rel/f.rs")));
+
+        let forged = resolve_in_with_pwd(&[PathBuf::from("rel")], &real, &base).unwrap();
+        assert!(!forged.admits_lexically(&link.join("rel/f.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_from_configured_empty_roots_admit_logical_cwd_spelling() {
+        let (_dir, base) = canonical_tempdir();
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let roots = resolve_in_with_pwd(&[], &real, &link).unwrap();
+
+        assert_eq!(roots.canonical(), [real]);
+        assert!(roots.admits_lexically(&link.join("f.rs")));
+    }
+
+    /// S2: `link/..` climbs out of the root through a symlink; the alias
+    /// would admit an unrelated tree, so it must not be recorded.
+    #[cfg(unix)]
+    #[test]
+    fn test_from_configured_drops_alias_that_climbs_out_through_symlink() {
+        let (_dir, base) = canonical_tempdir();
+        let data = base.join("data/a/b");
+        std::fs::create_dir_all(&data).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir(&home).unwrap();
+        let link = home.join("proj_link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+
+        let roots = resolve_in(&[link.join("..")], &base).unwrap();
+
+        assert_eq!(roots.canonical(), [base.join("data/a")]);
+        assert!(roots.aliases.is_empty());
+        assert!(!roots.admits_lexically(&home.join("anything")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_from_configured_keeps_alias_under_symlinked_ancestor() {
+        let (_dir, base) = canonical_tempdir();
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let configured = link.join("sub");
+
+        let roots = resolve_in(std::slice::from_ref(&configured), &base).unwrap();
+
+        assert_eq!(roots.canonical(), [real.join("sub")]);
+        assert!(roots.admits_lexically(&configured.join("a.rs")));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_from_configured_keeps_absolute_root_as_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().to_path_buf();
+
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&raw)).unwrap();
+
+        assert!(roots.admits_lexically(&raw.join("a.rs")));
     }
 }
