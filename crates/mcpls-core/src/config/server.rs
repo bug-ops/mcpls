@@ -260,6 +260,16 @@ const fn default_request_timeout() -> u64 {
 /// [`LspClient::request`]: crate::lsp::LspClient::request
 pub const MAX_TIMEOUT_SECONDS: u64 = 900;
 
+/// Upper bound on `workspace.heuristics_max_depth`.
+///
+/// A guard against typos and misconfiguration (e.g. `999999`), not a bound on
+/// walk cost: the recursive project-marker walk in
+/// [`ServerHeuristics::is_applicable_recursive`] does not follow links, so
+/// its cost is bounded by the size of the tree regardless of this value.
+/// 64 is several times the default of 10 and well beyond any realistic
+/// project nesting.
+pub const MAX_HEURISTICS_DEPTH: usize = 64;
+
 impl LspServerConfig {
     /// Check if this server should be spawned for the given workspace.
     ///

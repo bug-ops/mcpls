@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use super::dto::{Position2D, Range};
+use super::dto::{Position, Position2D, Range};
 use crate::bridge::encoding::{PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 use crate::bridge::state::{DEFAULT_MAX_FILE_SIZE, uri_to_path};
 use crate::bridge::{DocumentTracker, lock_std};
@@ -275,18 +275,17 @@ impl EncodingCtx {
     pub(super) async fn to_lsp(
         &self,
         uri: &lsp_types::Uri,
-        line: u32,
-        character: u32,
+        position: Position,
     ) -> lsp_types::Position {
         let line_text = if self.encoding == PositionEncoding::Utf16 {
             None
         } else {
-            let text = read_line_text(uri, line.saturating_sub(1), self).await;
+            let text = read_line_text(uri, position.line.saturating_sub(1), self).await;
             if text.is_none() {
                 lock_std(&self.line_cache).positions_degraded = true;
                 tracing::warn!(
                     uri = uri.as_ref(),
-                    line,
+                    line = position.line,
                     encoding = self.encoding.to_lsp(),
                     "could not resolve line text for position conversion; passing MCP column \
                      through unconverted, which is wrong for a non-UTF-16 server"
@@ -294,7 +293,7 @@ impl EncodingCtx {
             }
             text
         };
-        mcp_to_lsp_position(line, character, line_text.as_deref(), self.encoding)
+        mcp_to_lsp_position(position, line_text.as_deref(), self.encoding)
     }
 
     /// Convert an LSP position (in this context's negotiated encoding) from
@@ -320,8 +319,7 @@ impl EncodingCtx {
             }
             text
         };
-        let (line, character) = lsp_to_mcp_position(pos, line_text.as_deref(), self.encoding);
-        Position2D { line, character }
+        lsp_to_mcp_position(pos, line_text.as_deref(), self.encoding)
     }
 
     /// Convert an LSP range (in this context's negotiated encoding) from the
@@ -346,10 +344,8 @@ impl EncodingCtx {
         range: &Range,
     ) -> lsp_types::Range {
         lsp_types::Range {
-            start: self
-                .to_lsp(uri, range.start.line, range.start.character)
-                .await,
-            end: self.to_lsp(uri, range.end.line, range.end.character).await,
+            start: self.to_lsp(uri, range.start.clone().into()).await,
+            end: self.to_lsp(uri, range.end.clone().into()).await,
         }
     }
 }
@@ -440,7 +436,15 @@ mod tests {
         let uri = path_to_uri(&path).unwrap();
 
         let ctx = test_ctx_with(PositionEncoding::Utf8);
-        let lsp_pos = ctx.to_lsp(&uri, 1, 3).await;
+        let lsp_pos = ctx
+            .to_lsp(
+                &uri,
+                Position {
+                    line: 1,
+                    character: 3,
+                },
+            )
+            .await;
         // "hé" is 3 bytes in UTF-8 (h=1, é=2); MCP column 3 (UTF-16, after
         // "hé") must re-derive to that byte offset via the disk-read line
         // text, matching the `encoding.rs`-level math for the same input.
@@ -504,7 +508,15 @@ mod tests {
             workspace_roots: Arc::new(Vec::new()),
             line_cache: new_line_cache(),
         };
-        let lsp_pos = ctx.to_lsp(&uri, 1, 3).await;
+        let lsp_pos = ctx
+            .to_lsp(
+                &uri,
+                Position {
+                    line: 1,
+                    character: 3,
+                },
+            )
+            .await;
         assert_eq!(
             lsp_pos.character, 3,
             "must convert against the tracker's live content (\"héllo\" -> byte 3), not disk's \
@@ -666,7 +678,14 @@ mod tests {
 
         assert!(!ctx.positions_degraded(), "no lookup has happened yet");
 
-        ctx.to_lsp(&uri, 1, 3).await;
+        ctx.to_lsp(
+            &uri,
+            Position {
+                line: 1,
+                character: 3,
+            },
+        )
+        .await;
 
         assert!(
             ctx.positions_degraded(),

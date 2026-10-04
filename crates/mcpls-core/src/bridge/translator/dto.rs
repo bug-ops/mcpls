@@ -37,6 +37,17 @@ pub struct Position {
     pub character: u32,
 }
 
+impl From<Position2D> for Position {
+    /// Reuses an output position as a handler input position; both are
+    /// 1-based MCP positions.
+    fn from(position: Position2D) -> Self {
+        Self {
+            line: position.line,
+            character: position.character,
+        }
+    }
+}
+
 /// Range in a document (1-based for MCP).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Range {

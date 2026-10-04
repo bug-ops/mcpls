@@ -262,13 +262,13 @@ async fn resolve_code_action(
     server_id: &ServerId,
     mut action: lsp_types::CodeAction,
 ) -> lsp_types::CodeAction {
-    match client
+    let outcome = client
         .request_typed::<lsp_types::CodeActionResolveRequest>(
             action.clone(),
             client.code_action_resolve_timeout(),
         )
-        .await
-    {
+        .await;
+    match outcome {
         Ok(resolved) => {
             if resolved.edit.is_some() {
                 action.edit = resolved.edit;
@@ -279,7 +279,6 @@ async fn resolve_code_action(
                     "codeAction/resolve succeeded but returned no edit"
                 );
             }
-            action
         }
         Err(err) => {
             tracing::warn!(
@@ -288,9 +287,9 @@ async fn resolve_code_action(
                 error = %err,
                 "codeAction/resolve failed, returning action without edit"
             );
-            action
         }
     }
+    action
 }
 
 /// Resolves up to [`MAX_CODE_ACTION_RESOLVES`] deferred actions in `entries`
@@ -429,7 +428,6 @@ impl Translator {
         position: Position,
         new_name: String,
     ) -> Result<RenameResult> {
-        let Position { line, character } = position;
         validate_rename_params(&new_name)?;
 
         let (server_id, client, uri) = self
@@ -441,7 +439,7 @@ impl Translator {
             )
             .await?;
         let ctx = self.encoding_ctx(&server_id);
-        let lsp_position = ctx.to_lsp(&uri, line, character).await;
+        let lsp_position = ctx.to_lsp(&uri, position).await;
 
         let params = LspRenameParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -557,8 +555,8 @@ impl Translator {
         let response_uri = uri.clone();
 
         let range = lsp_types::Range {
-            start: ctx.to_lsp(&uri, start.line, start.character).await,
-            end: ctx.to_lsp(&uri, end.line, end.character).await,
+            start: ctx.to_lsp(&uri, start).await,
+            end: ctx.to_lsp(&uri, end).await,
         };
 
         // Build context with optional kind filter
