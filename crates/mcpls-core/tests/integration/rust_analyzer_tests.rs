@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Once};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{NotificationCache, Position, Translator};
@@ -520,6 +521,13 @@ async fn test_references_user_struct() {
     );
 }
 
+/// Upper bound on how long `test_diagnostics_with_error` re-pulls diagnostics
+/// waiting for the expected error to appear.
+const DIAGNOSTICS_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause between `test_diagnostics_with_error`'s diagnostics pulls.
+const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 #[tokio::test]
 #[ignore = "Requires rust-analyzer installed"]
 async fn test_diagnostics_with_error() {
@@ -542,31 +550,44 @@ async fn test_diagnostics_with_error() {
     // rust-analyzer's own native diagnostics — the missing-trait-item
     // error (E0046), not the flycheck error.
     let notification_cache = Mutex::new(NotificationCache::new());
-    let result = timeout(
-        Duration::from_secs(10),
-        translator
-            .lock()
-            .await
-            .handle_diagnostics(lib_file.to_string_lossy().to_string(), &notification_cache),
-    )
-    .await;
+    let lib_file = lib_file.to_string_lossy().to_string();
 
-    assert!(result.is_ok(), "Should not timeout");
-    let diag_result = result.unwrap();
-    assert!(
-        diag_result.is_ok(),
-        "Should successfully get diagnostics: {:?}",
-        diag_result.err()
-    );
+    // A single pull can return an empty report while rust-analyzer is still
+    // settling, so poll for the expected error within a bounded window.
+    let poll_deadline = Instant::now() + DIAGNOSTICS_POLL_TIMEOUT;
+    let mut attempts = 0u32;
+    let last_diag_str = loop {
+        attempts += 1;
+        let result = timeout(
+            Duration::from_secs(10),
+            translator
+                .lock()
+                .await
+                .handle_diagnostics(lib_file.clone(), &notification_cache),
+        )
+        .await;
 
-    let diag_json = diag_result.unwrap();
-    let diag_str = serde_json::to_string(&diag_json).unwrap();
+        assert!(result.is_ok(), "Should not timeout");
+        let diag_result = result.unwrap();
+        assert!(
+            diag_result.is_ok(),
+            "Should successfully get diagnostics: {:?}",
+            diag_result.err()
+        );
 
-    // Should contain the native "missing trait items" error reachable via pull
-    assert!(
-        diag_str.contains("not all trait items implemented") || diag_str.contains("E0046"),
-        "Diagnostics should report the intentional error, got: {}",
-        diag_str
+        let diag_str = serde_json::to_string(&diag_result.unwrap()).unwrap();
+        if diag_str.contains("not all trait items implemented") || diag_str.contains("E0046") {
+            return;
+        }
+        if Instant::now() >= poll_deadline {
+            break diag_str;
+        }
+        tokio::time::sleep(DIAGNOSTICS_POLL_INTERVAL).await;
+    };
+
+    panic!(
+        "Diagnostics should report the intentional error; not seen after {attempts} attempts, \
+         last result: {last_diag_str}"
     );
 }
 
@@ -800,23 +821,40 @@ async fn test_timeout_handling() {
 
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
-    let lib_file = workspace_path.join("src/lib.rs");
+    let lib_file = workspace_path
+        .join("src/lib.rs")
+        .to_string_lossy()
+        .to_string();
 
-    // Very short timeout to test timeout behavior
-    let result = timeout(
-        Duration::from_millis(1), // 1ms - should timeout
-        translator.lock().await.handle_hover(
-            lib_file.to_string_lossy().to_string(),
-            Position {
-                line: 20,
-                character: 19,
-            },
-        ),
+    let hover_position = Position {
+        line: 20,
+        character: 19,
+    };
+
+    // A handler cancelled after one poll models a timeout independent of rust-analyzer's
+    // speed: a single poll can never complete, as it needs a reply from another process.
+    let bridge = translator.lock().await;
+    let mut hover = Box::pin(bridge.handle_hover(lib_file.clone(), hover_position));
+    let first_poll = std::future::poll_fn(|cx| Poll::Ready(hover.as_mut().poll(cx))).await;
+    assert!(
+        first_poll.is_pending(),
+        "handle_hover cannot complete within a single poll"
+    );
+    drop(hover);
+    drop(bridge);
+
+    let follow_up = timeout(
+        Duration::from_secs(30),
+        translator
+            .lock()
+            .await
+            .handle_hover(lib_file, hover_position),
     )
     .await;
-
-    // Should timeout
-    assert!(result.is_err(), "Should timeout with 1ms timeout");
+    assert!(
+        matches!(&follow_up, Ok(Ok(_))),
+        "a cancelled request must not wedge the client: {follow_up:?}"
+    );
 }
 
 #[tokio::test]

@@ -25,10 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Translator::register_client`/`register_server`** — Breaking change: now crate-private; use the new `Translator::register_server_complete`, which registers the client, server and respawn config together. (#530)
 - **`LspClient::shutdown`/`LspServer::shutdown`** — Breaking change: now has an overall deadline of `lsp::SHUTDOWN_TIMEOUT` and may return the new `Error::ShutdownTimeout`; a wedged message loop is aborted and its pending requests failed. (#530)
 - **`Error::ServerNotFound`** — Breaking change: a missing server binary now yields this variant instead of `Error::ServerSpawnFailed`. (#530)
+- Breaking: `DroppedEdits` gains public `exceeds_item_cap` and `shadowed_by_changes` fields. (#487, #498, #519)
 
 ### Fixed
 
 - Columns past the end of a line now clamp to the line length, and column 1 or the empty line after a final newline no longer raise a false `positions_degraded`. (#520)
+- Call-hierarchy, inlay-hint, code-action, and rename handlers now cap normalized items with one shared budget, reporting overflow via `truncated` / `dropped.exceeds_item_cap`. (#487, #519)
+- Workspace-edit conversion now tallies `documentChanges` entries shadowed by a non-empty `changes` map and no longer lists a file whose edits were all dropped. (#498, #519)
+- `DocumentTracker` LRU eviction now skips a document whose handler is still awaiting its LSP response, returning `DocumentLimitExceeded` when no safe candidate exists. (#503, #519)
+- Test-only `raw_len` and `subscription_registry` helpers no longer trigger dead-code lints without the `transport-http` feature. (#491, #519)
+- `test_timeout_handling` now cancels the handler after a single poll and `test_diagnostics_with_error` a bounded retry, mitigating CI flakiness that was not reproduced locally. (#473, #466, #519)
 
 ## [0.6.0] - 2026-09-21
 

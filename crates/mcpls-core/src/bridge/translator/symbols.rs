@@ -108,7 +108,7 @@ impl Translator {
         &self,
         file_path: String,
     ) -> Result<DocumentSymbolsResult> {
-        let (server_id, client, uri) = self
+        let doc = self
             .prepare_gated_document(
                 &file_path,
                 ToolKind::DocumentSymbols,
@@ -116,11 +116,12 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
-        let ctx = self.encoding_ctx(&server_id);
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let ctx = self.encoding_ctx(server_id);
         let response_uri = uri.clone();
 
         let params = DocumentSymbolParams {
-            text_document: TextDocumentIdentifier { uri },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };

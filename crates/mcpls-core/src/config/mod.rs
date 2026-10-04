@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn test_workspace_config_defaults() {
         let workspace = WorkspaceConfig::default();
-        assert!(workspace.roots.is_empty());
+        assert_eq!(workspace.roots.len(), 0);
         assert_eq!(workspace.position_encodings, vec!["utf-8", "utf-16"]);
         assert!(!workspace.language_extensions.is_empty());
         assert_eq!(workspace.language_extensions.len(), 30);
@@ -2052,7 +2052,7 @@ mod tests {
         fs::write(&config_path, "").unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert!(config.workspace.roots.is_empty());
+        assert_eq!(config.workspace.roots.len(), 0);
         assert!(config.lsp_servers.is_empty());
     }
 
