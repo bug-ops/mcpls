@@ -363,6 +363,18 @@ max_file_size = 0  # unlimited
 
 Useful when a project contains files larger than 10MB (e.g. generated code, data fixtures) that still need LSP-backed tools to work against them.
 
+### `workspace.max_concurrent_server_starts`
+
+**Type**: Integer
+**Default**: `8`
+
+Maximum number of language servers started at the same time. Servers beyond the limit start as earlier ones finish `initialize`, in configuration order, and each server is usable as soon as its own startup completes. `0` is rejected at startup. Lower it on a small machine when many heavy servers (for example `OmniSharp` plus `jdtls`) are configured; mcpls logs an info line when more servers are configured than the limit.
+
+```toml
+[workspace]
+max_concurrent_server_starts = 2
+```
+
 ### `workspace.indexing_ready_timeout_seconds`
 
 **Type**: Integer (seconds)
@@ -728,7 +740,7 @@ mcpls
 >
 > The reverse proxy should also rewrite the `Host` header, as rmcp's host validation only allows `localhost`, `127.0.0.1`, or `::1` by default.
 >
-> A request carrying an `Origin` header is accepted only when it names `localhost`, `127.0.0.1` or `[::1]` on the bound port; anything else, including `Origin: null`, is answered with `403`. Requests without `Origin` (every non-browser client) are unaffected, so a proxy in front of browser clients must rewrite or strip `Origin`.
+> A request carrying an `Origin` header is accepted only when it names `localhost`, `127.0.0.1` or `[::1]` on the bound port, or one of the origins listed with `--http-allowed-origin` (`MCPLS_HTTP_ALLOWED_ORIGINS`); anything else, including `Origin: null`, is answered with `403`. Requests without `Origin` (every non-browser client) are unaffected. Allowed origins do not relax the `Host` check, which stays loopback-only, so they serve browser pages whose requests reach mcpls with a loopback `Host` (through a tunnel, or a proxy that rewrites `Host`).
 >
 > **Example (nginx):**
 > ```nginx
@@ -756,6 +768,17 @@ export MCPLS_HTTP_PATH=/api/mcp
 mcpls
 ```
 
+### `MCPLS_HTTP_ALLOWED_ORIGINS` (transport-http feature)
+
+Extra browser origins accepted by the HTTP transport besides the loopback origins on the bound port; repeat `--http-allowed-origin` or separate values with commas (spaces around a comma are ignored). Each value must be `http://` or `https://` followed by a host and an optional port; a missing port means the scheme default (80 or 443). A path, query, user information, wildcard, `null`, a non-numeric or out-of-range port or an unbracketed IPv6 host is a usage error (exit code 2). The host is matched case-insensitively. The `Host` header check is not affected and stays loopback-only (#597).
+
+**Default**: none
+
+```bash
+export MCPLS_HTTP_ALLOWED_ORIGINS="https://app.example.com,http://[::1]:8080"
+mcpls --listen 127.0.0.1:3000
+```
+
 ### `MCPLS_HTTP_STREAM_LIVENESS` (transport-http feature)
 
 Liveness probing of each session's HTTP GET (SSE) stream: `probe` or `off`.
@@ -774,9 +797,13 @@ the client closes the stream or sends `DELETE`. With `off` there is no proof of
 life, so an open GET stream does not hold its session: the session expires
 after 5 minutes without an inbound request, even while the stream receives
 notifications. Clients using `off` must send a request (for example `ping`)
-more often than that. A POST response stream whose peer vanished mid-write
-keeps its session until the connection fails (`TCP_USER_TIMEOUT` on Linux and
-Android, the OS default elsewhere, or the reverse proxy timeout).
+more often than that. A POST or request-wise resume response stream is cut
+after 1 hour (`ResponseStreamDeadline`, configurable only when embedding),
+whatever it is still sending: a stream lifetime bound that lets the session
+expire, so a vanished peer no longer pins it. While the server's write to a
+peer that stopped reading a response is stuck, the session slot and connection
+permit are held until the connection fails (`TCP_USER_TIMEOUT` on Linux and
+Android, the OS default elsewhere, or the reverse proxy timeout; #600).
 
 Stateless `subscriptions/listen` streams (MCP 2026-07-28) have no session and a
 client cannot answer a server `ping`, so they are bounded by a lease instead:
@@ -800,10 +827,18 @@ mcpls hides the values of secret-named environment variables, secret-named
 `--flag=value` / `--flag value` arguments and secret-keyed
 `initialization_options` strings (names containing `TOKEN`, `KEY`, `SECRET`,
 `PASSW`, `CRED` or `AUTH`, case-insensitive; values under 8 bytes are not
-redacted) from everything that reaches logs or MCP clients: server log and
-show messages, startup and request errors, trace-level wire logs, and the
-spawn argument list (only the count is logged at `info`; values appear
-redacted at `debug`). Replacements read `[redacted:NAME]`.
+redacted) from the text of a server that reaches logs or MCP clients: server
+log and show messages, startup and request errors (including malformed-frame
+protocol errors), diagnostics (message, `source`, string `code`, related
+information and every string value of `data`, in the cache, the diagnostics
+resource and `get_diagnostics` pull results), `$/progress` text, trace-level
+wire logs, and the spawn argument list (only the count is logged at `info`;
+values appear redacted at `debug`). Replacements read `[redacted:NAME]`.
+
+Not redacted: URIs (diagnostic related-location URIs and `codeDescription`
+links stay intact because they are cache keys and links), the keys of a
+diagnostic's `data` object, and tool results such as hover text, symbol names
+and code action titles (tracked in #599).
 
 Matching is by exact value, plus its JSON-escaped and `Debug`-escaped
 spellings. A server that re-encodes a secret, for example as a `\uXXXX`

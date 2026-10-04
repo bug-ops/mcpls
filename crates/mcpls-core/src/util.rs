@@ -124,8 +124,17 @@ pub const fn is_deceptive_format_char(c: char) -> bool {
     )
 }
 
-/// Whether `c` could forge a log line or reorder displayed text.
-const fn needs_escape(c: char) -> bool {
+/// Whether `c` could forge a log line or reorder displayed text, i.e. whether
+/// [`escape_control`] rewrites it.
+///
+/// # Examples
+///
+/// ```
+/// assert!(mcpls_core::needs_control_escape('\n'));
+/// assert!(!mcpls_core::needs_control_escape('a'));
+/// ```
+#[must_use]
+pub const fn needs_control_escape(c: char) -> bool {
     c.is_control() || is_deceptive_format_char(c)
 }
 
@@ -144,7 +153,7 @@ const fn needs_escape(c: char) -> bool {
 /// assert_eq!(mcpls_core::escape_control("plain"), "plain");
 /// ```
 pub fn escape_control(s: &str) -> Cow<'_, str> {
-    if !s.chars().any(needs_escape) {
+    if !s.chars().any(needs_control_escape) {
         return Cow::Borrowed(s);
     }
     let mut escaped = String::with_capacity(s.len());
@@ -153,7 +162,7 @@ pub fn escape_control(s: &str) -> Cow<'_, str> {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
-            c if needs_escape(c) => escaped.extend(c.escape_unicode()),
+            c if needs_control_escape(c) => escaped.extend(c.escape_unicode()),
             c => escaped.push(c),
         }
     }

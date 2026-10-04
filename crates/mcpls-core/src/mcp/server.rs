@@ -1088,10 +1088,10 @@ impl McplsServer {
         &self,
         Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
     ) -> Result<Json<ServerLogsResult>, McpError> {
-        to_structured_tool_result({
-            let cache = self.context.notification_cache.lock().await;
-            Translator::handle_server_logs(&cache, limit, min_level)
-        })
+        let cache = self.context.notification_cache.lock().await;
+        Ok(Json(Translator::handle_server_logs(
+            &cache, limit, min_level,
+        )))
     }
 
     /// Get recent LSP server messages.
@@ -1806,7 +1806,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::resources::ResourceSubscriptions;
-    use crate::bridge::{Capability, ResultContext};
+    use crate::bridge::{Capability, LogLevel, ResultContext};
     use crate::mcp::tool_support::ToolBackend;
     use crate::test_lsp::client_path;
 
@@ -3275,6 +3275,91 @@ mod tests {
         );
     }
 
+    /// #583: a configured secret echoed in a pushed diagnostic never reaches
+    /// the cached-diagnostics tool or the diagnostics resource, while the
+    /// URIs stay intact.
+    #[tokio::test]
+    async fn test_diagnostics_redacted_before_tool_and_resource_reads() {
+        use tempfile::TempDir;
+        use url::Url;
+
+        use crate::lsp::{LspClient, LspNotification};
+        use crate::redaction::Redactions;
+
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn main() {}").unwrap();
+        let server = create_test_server_with_workspace_roots(
+            ProjectConfigStatus::NotIgnored,
+            McpConfig::default(),
+            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
+        let uri = Url::from_file_path(test_file.canonicalize().unwrap())
+            .unwrap()
+            .to_string();
+        let range = serde_json::json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 1}
+        });
+        let mut notification = LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(serde_json::json!({
+                "uri": uri,
+                "diagnostics": [
+                    {
+                        "range": range,
+                        "message": "plain SuperSecretValue123",
+                        "data": {"hint": ["SuperSecretValue123"]}
+                    },
+                    {
+                        "range": range,
+                        "message": {"kind": "plaintext", "value": "markup SuperSecretValue123"},
+                        "relatedInformation": [{
+                            "location": {"uri": "file:///SuperSecretValue123/a.rs", "range": range},
+                            "message": "related SuperSecretValue123"
+                        }]
+                    }
+                ]
+            })),
+        );
+        LspClient::redact_notification(
+            &mut notification,
+            &Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]),
+        );
+        let LspNotification::PublishDiagnostics(params) = notification else {
+            panic!("expected publishDiagnostics");
+        };
+        {
+            let mut cache = server.context.notification_cache.lock().await;
+            cache.store_diagnostics(
+                &crate::config::ServerId::from("rust"),
+                &params.uri,
+                None,
+                params.diagnostics,
+            );
+        }
+
+        let tool = server
+            .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+                file_path: test_file.clone(),
+            }))
+            .await
+            .unwrap();
+        let tool = serde_json::to_string(&tool.0).unwrap();
+        let resource = server
+            .resource_diagnostics_response(&client_path(&test_file))
+            .await
+            .unwrap();
+        let resource = serde_json::to_string(&resource).unwrap();
+
+        let kept_uri = "file:///SuperSecretValue123/a.rs";
+        assert!(resource.contains(kept_uri), "{resource}");
+        for output in [tool, resource.replace(kept_uri, "")] {
+            assert!(output.contains("[redacted:API_TOKEN]"), "{output}");
+            assert!(!output.contains("SuperSecretValue123"), "{output}");
+        }
+    }
+
     /// Companion to the test above: when no server is registered under the
     /// cached entry's owner id (or no owner is tracked at all),
     /// `get_cached_diagnostics` must fall back to UTF-16 -- a raw,
@@ -3576,7 +3661,6 @@ sleep 0.3
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
-            notification_tx: None,
         };
 
         let seed = LspServer::spawn(config).await.unwrap();
@@ -3778,7 +3862,7 @@ sleep 0.3
         let server = create_test_server();
         let params = Parameters(ServerLogsParams {
             limit: 10,
-            min_level: Some("error".to_string()),
+            min_level: Some(LogLevel::Error),
         });
 
         let result = server.get_server_logs(params).await;
@@ -3795,7 +3879,7 @@ sleep 0.3
         let server = create_test_server();
         let params = Parameters(ServerLogsParams {
             limit: 100,
-            min_level: Some("warning".to_string()),
+            min_level: Some(LogLevel::Warning),
         });
 
         let result = server.get_server_logs(params).await;
@@ -3807,7 +3891,7 @@ sleep 0.3
         let server = create_test_server();
         let params = Parameters(ServerLogsParams {
             limit: 50,
-            min_level: Some("info".to_string()),
+            min_level: Some(LogLevel::Info),
         });
 
         let result = server.get_server_logs(params).await;
@@ -3819,23 +3903,24 @@ sleep 0.3
         let server = create_test_server();
         let params = Parameters(ServerLogsParams {
             limit: 20,
-            min_level: Some("debug".to_string()),
+            min_level: Some(LogLevel::Debug),
         });
 
         let result = server.get_server_logs(params).await;
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_server_logs_tool_with_invalid_level() {
-        let server = create_test_server();
-        let params = Parameters(ServerLogsParams {
-            limit: 10,
-            min_level: Some("invalid_level".to_string()),
-        });
-
-        let result = server.get_server_logs(params).await;
-        assert!(result.is_err());
+    #[test]
+    fn test_server_logs_params_reject_levels_outside_the_lowercase_enum() {
+        for level in ["verbose", "ERROR", "Error", "invalid_level"] {
+            let parsed = serde_json::from_value::<ServerLogsParams>(
+                serde_json::json!({"limit": 10, "min_level": level}),
+            );
+            assert!(parsed.is_err(), "{level} was accepted");
+        }
+        let parsed: ServerLogsParams =
+            serde_json::from_value(serde_json::json!({"min_level": "warning"})).unwrap();
+        assert_eq!(parsed.min_level, Some(LogLevel::Warning));
     }
 
     #[tokio::test]

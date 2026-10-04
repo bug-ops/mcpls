@@ -6,9 +6,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position, RestartTarget,
-    ResultContext, ServerIds, SymbolName, SymbolQuery, SymbolTarget, TypeHierarchyItemResult,
-    parse_symbol_kind,
+    LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position,
+    RestartTarget, ResultContext, ServerIds, SymbolName, SymbolQuery, SymbolTarget,
+    TypeHierarchyItemResult, parse_symbol_kind,
 };
 use crate::config::ServerId;
 
@@ -404,7 +404,7 @@ pub struct ServerLogsParams {
     /// Minimum log level to include: error, warning, info, debug.
     #[schemars(description = "Minimum log level to include: error, warning, info, debug.")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_level: Option<String>,
+    pub min_level: Option<LogLevel>,
 }
 
 const fn default_log_limit() -> usize {

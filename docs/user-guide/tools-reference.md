@@ -1024,7 +1024,7 @@ Get recent log messages from LSP servers.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `limit` | integer | No | Maximum entries to return (default: 50) |
-| `min_level` | string | No | Minimum level: error, warning, info, debug |
+| `min_level` | string | No | Minimum level, exactly one of the lowercase values `error`, `warning`, `info`, `debug`. Any other value, including a different casing such as `ERROR`, is rejected with an `isError` tool result naming the accepted values |
 
 ### Returns
 

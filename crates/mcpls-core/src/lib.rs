@@ -57,6 +57,7 @@ mod test_lsp;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,11 +67,10 @@ use bridge::{
     WorkspaceRoots,
 };
 pub use config::{ProjectConfigStatus, ProjectConfigTrust, ServerConfig};
-use config::{ServerId, ToolRouter};
+use config::{ServerId, ServerStartConcurrency, ToolRouter};
 pub use error::Error;
 use error::ServerSpawnFailure;
-use futures::stream::FuturesUnordered;
-use futures::{FutureExt as _, StreamExt as _};
+use futures::{FutureExt as _, Stream, StreamExt as _};
 use lsp::tsserver_pin::warn_if_pin_ignored;
 use lsp::{LspNotification, LspServer, ServerInitConfig, ServerStartOutcome};
 use mcp::SubscriptionRegistry;
@@ -84,11 +84,12 @@ use transport::run_http;
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 pub use transport::{
-    ConnectionLimit, HeaderReadTimeout, HttpConfig, HttpPath, InvalidHttpPath, LeaseWindow,
-    ListenLease, ProbeDeadline, ProbeInterval, SessionLimit, StreamLiveness,
+    AllowedOrigin, ConnectionLimit, HeaderReadTimeout, HttpConfig, HttpPath, InvalidAllowedOrigin,
+    InvalidHttpPath, LeaseWindow, ListenLease, ProbeDeadline, ProbeInterval, RequestBodyLimit,
+    ResponseStreamDeadline, SessionLimit, StreamLiveness,
 };
 use transport::{ShutdownSignal, run_stdio};
-pub use util::escape_control;
+pub use util::{escape_control, needs_control_escape};
 
 /// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
 /// `serve_with` run, factored out of `diagnostics_pump`'s parameter list to
@@ -621,7 +622,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
                     |key| std::env::var_os(key),
                 ),
                 position_encodings: config.workspace.position_encodings.clone(),
-                notification_tx: None,
             })
         })
         .collect();
@@ -656,6 +656,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         ));
     // moved, not cloned -- `config`'s last use is above
     let (project_config_status, mcp) = (config.project_config_status, config.mcp);
+    let max_concurrent_server_starts = config.workspace.max_concurrent_server_starts;
     translator.set_workspace_roots(workspace_roots.clone());
 
     // Mark applicable servers as "expected" so a tool call that arrives while
@@ -701,6 +702,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             subscription_registry.clone(),
             cancel_rx.clone(),
             workspace_roots.clone(),
+            max_concurrent_server_starts,
         ))
     };
 
@@ -755,14 +757,14 @@ const LSP_INIT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// `abort()` only *requests* cancellation; the task's locals (which may own
 /// not-yet-registered `tokio::process::Child` handles for LSP servers
-/// [`spawn_lsp_servers_background`] is still spawning via `spawn_batch`,
+/// [`spawn_lsp_servers_background`] is still starting servers,
 /// relying entirely on `kill_on_drop` to terminate them) are only actually
 /// dropped once the runtime polls the task to completion. `mcpls-cli`'s
 /// `main` calls `std::process::exit` right after `serve_with` returns (see
 /// #308), which skips the executor's own task teardown that used to do this
 /// polling implicitly — so this function awaits the aborted handle again,
 /// bounded, to drive that drop here instead of leaving it to chance.
-/// Otherwise a `SIGTERM` arriving mid-`spawn_batch` could orphan those LSP
+/// Otherwise a `SIGTERM` arriving mid-startup could orphan those LSP
 /// child processes, the exact failure mode #270 was filed to prevent.
 async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
     match tokio::time::timeout(timeout, &mut handle).await {
@@ -909,6 +911,7 @@ fn spawn_lsp_servers_background(
     subscription_registry: SubscriptionRegistry,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     workspace_roots: WorkspaceRoots,
+    max_concurrent_server_starts: ServerStartConcurrency,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let settle_registry = subscription_registry.clone();
@@ -919,6 +922,7 @@ fn spawn_lsp_servers_background(
             subscription_registry,
             cancel_rx,
             workspace_roots,
+            max_concurrent_server_starts,
         );
         if Box::pin(run_init_supervised(&translator, &applicable_configs, body)).await
             == InitOutcome::Panicked
@@ -986,8 +990,38 @@ async fn run_init_supervised(
     }
 }
 
-/// Spawns `configs` concurrently, registers each server the moment its own
-/// `initialize` settles, and runs their diagnostics pumps until shutdown.
+/// Outcomes of starting a batch of servers, in completion order.
+type StartStream<'a> = Pin<Box<dyn Stream<Item = ServerStartOutcome> + Send + 'a>>;
+
+/// Starts `configs` with at most `limit` in flight at once.
+fn start_servers(configs: &[ServerInitConfig], limit: ServerStartConcurrency) -> StartStream<'_> {
+    if configs.len() > limit.get() {
+        info!(
+            "Starting {} LSP server(s), at most {} at a time",
+            configs.len(),
+            limit.get()
+        );
+    }
+    Box::pin(
+        futures::stream::iter(configs.iter().map(LspServer::start_contained))
+            .buffer_unordered(limit.get()),
+    )
+}
+
+/// The next settled start, or never while there is no start stream.
+///
+/// `tokio::select!` still evaluates the future of a disabled branch, so an
+/// absent stream has to be a future that never completes rather than a guard.
+async fn next_start(pending: &mut Option<StartStream<'_>>) -> Option<ServerStartOutcome> {
+    match pending {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Starts `configs` with at most `max_concurrent_starts` in flight, registers
+/// each server the moment its own `initialize` settles, and runs their
+/// diagnostics pumps until shutdown.
 ///
 /// The start futures are polled on this (the supervised) task, so aborting it
 /// drops every not-yet-registered `Child`. Cancellation abandons whatever is
@@ -999,11 +1033,11 @@ async fn init_lsp_servers(
     subscription_registry: SubscriptionRegistry,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     workspace_roots: WorkspaceRoots,
+    max_concurrent_starts: ServerStartConcurrency,
 ) {
     if configs.is_empty() {
         return;
     }
-    let mut pending: FuturesUnordered<_> = configs.iter().map(LspServer::start_contained).collect();
     let pump_shared = PumpShared {
         notification_cache: Arc::clone(&notification_cache),
         subs: subscription_registry,
@@ -1038,11 +1072,9 @@ async fn init_lsp_servers(
 
     let mut cancel_rx = cancel_rx;
     let mut cancelled = *cancel_rx.borrow();
-    if cancelled {
-        pending = FuturesUnordered::new();
-    }
+    let mut pending = (!cancelled).then(|| start_servers(configs, max_concurrent_starts));
     loop {
-        if pending.is_empty() {
+        if pending.is_none() {
             drop(startup.take());
             if settler.pumps.is_empty() {
                 break;
@@ -1052,12 +1084,16 @@ async fn init_lsp_servers(
             biased;
             _ = cancel_rx.changed(), if !cancelled => {
                 cancelled = true;
-                pending = FuturesUnordered::new();
+                pending = None;
             }
-            Some(outcome) = pending.next(), if !pending.is_empty() => {
-                settler.settle(outcome).await;
-                if pending.is_empty() && !cancelled {
-                    settler.tally.log_summary();
+            outcome = next_start(&mut pending) => {
+                if let Some(outcome) = outcome {
+                    settler.settle(outcome).await;
+                } else {
+                    pending = None;
+                    if !cancelled {
+                        settler.tally.log_summary();
+                    }
                 }
             }
             Some(joined) = settler.pumps.join_next_with_id(), if !settler.pumps.is_empty() => {
@@ -1321,59 +1357,6 @@ mod tests {
     mod graceful_degradation_tests {
         use super::*;
         use crate::error::{ServerSpawnFailure, StartupFailure};
-        use crate::lsp::ServerInitResult;
-
-        #[test]
-        fn test_all_servers_failed_error_handling() {
-            let mut result = ServerInitResult::new();
-            result.add_failure(ServerSpawnFailure {
-                server_id: ServerId::from("rust"),
-                language_id: "rust".to_string(),
-                command: "rust-analyzer".to_string(),
-                reason: StartupFailure::InitTaskPanicked,
-            });
-            result.add_failure(ServerSpawnFailure {
-                server_id: ServerId::from("python"),
-                language_id: "python".to_string(),
-                command: "pyright".to_string(),
-                reason: StartupFailure::InitTaskPanicked,
-            });
-
-            assert!(result.all_failed());
-            assert_eq!(result.failure_count(), 2);
-            assert_eq!(result.server_count(), 0);
-        }
-
-        #[test]
-        fn test_partial_success_detection() {
-            use std::collections::HashMap;
-
-            let mut result = ServerInitResult::new();
-            // Simulate one success and one failure
-            result.servers = HashMap::new(); // Would have a real server in production
-            result.add_failure(ServerSpawnFailure {
-                server_id: ServerId::from("python"),
-                language_id: "python".to_string(),
-                command: "pyright".to_string(),
-                reason: StartupFailure::InitTaskPanicked,
-            });
-
-            // Without actual servers, we can verify the failure was recorded
-            assert_eq!(result.failure_count(), 1);
-            assert_eq!(result.server_count(), 0);
-        }
-
-        #[test]
-        fn test_all_servers_succeeded_detection() {
-            use std::collections::HashMap;
-
-            let mut result = ServerInitResult::new();
-            result.servers = HashMap::new(); // Would have real servers in production
-
-            assert_eq!(result.failure_count(), 0);
-            assert!(!result.all_failed());
-            assert!(!result.partial_success());
-        }
 
         #[test]
         fn test_all_servers_failed_to_init_error() {
@@ -1407,18 +1390,6 @@ mod tests {
         }
 
         #[test]
-        fn test_graceful_degradation_with_empty_config() {
-            let result = ServerInitResult::new();
-
-            // Empty config means no servers configured
-            assert!(!result.all_failed());
-            assert!(!result.partial_success());
-            assert!(!result.has_servers());
-            assert_eq!(result.server_count(), 0);
-            assert_eq!(result.failure_count(), 0);
-        }
-
-        #[test]
         fn test_server_spawn_failure_display() {
             let failure = ServerSpawnFailure {
                 server_id: ServerId::from("typescript"),
@@ -1433,31 +1404,9 @@ mod tests {
             assert!(display.contains("panicked"));
         }
 
-        #[test]
-        fn test_result_helpers_consistency() {
-            let mut result = ServerInitResult::new();
-
-            // Initially empty
-            assert!(!result.has_servers());
-            assert!(!result.all_failed());
-            assert!(!result.partial_success());
-
-            // Add a failure
-            result.add_failure(ServerSpawnFailure {
-                server_id: ServerId::from("go"),
-                language_id: "go".to_string(),
-                command: "gopls".to_string(),
-                reason: StartupFailure::InitTaskPanicked,
-            });
-
-            assert!(result.all_failed());
-            assert!(!result.has_servers());
-            assert!(!result.partial_success());
-        }
-
         #[tokio::test]
         async fn test_serve_degrades_when_all_servers_fail_to_spawn() {
-            use crate::config::{LspServerConfig, WorkspaceConfig};
+            use crate::config::{LspServerConfig, ServerStartConcurrency, WorkspaceConfig};
 
             // A configured server whose command cannot spawn used to make serve()
             // fail synchronously with AllServersFailedToInit.
@@ -1478,6 +1427,7 @@ mod tests {
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
                     indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                    max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -1533,6 +1483,7 @@ mod tests {
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
                     indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                    max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![],
                 project_config_status: ProjectConfigStatus::NotIgnored,
@@ -1590,6 +1541,7 @@ mod tests {
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
                     indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                    max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![],
                 project_config_status: ProjectConfigStatus::NotIgnored,
@@ -1630,7 +1582,7 @@ mod tests {
         /// so this returns immediately without needing a timeout guard.
         #[tokio::test]
         async fn test_serve_rejects_invalid_caller_supplied_config() {
-            use crate::config::{LspServerConfig, WorkspaceConfig};
+            use crate::config::{LspServerConfig, ServerStartConcurrency, WorkspaceConfig};
 
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
@@ -1642,6 +1594,7 @@ mod tests {
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
                     indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                    max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: "rust".to_string(),
@@ -2074,6 +2027,10 @@ mod tests {
         }
 
         fn start(configs: Vec<ServerInitConfig>) -> Startup {
+            start_limited(configs, ServerStartConcurrency::DEFAULT)
+        }
+
+        fn start_limited(configs: Vec<ServerInitConfig>, limit: ServerStartConcurrency) -> Startup {
             let router =
                 ToolRouter::from_configs(configs.iter().map(|c| &c.server_config)).unwrap();
             let translator = Arc::new(
@@ -2091,6 +2048,7 @@ mod tests {
                 SubscriptionRegistry::new(),
                 cancel_rx,
                 WorkspaceRoots::default(),
+                limit,
             );
             Startup {
                 translator,
@@ -2200,6 +2158,82 @@ mod tests {
                 .unwrap();
             std::assert_matches!(failure.reason, StartupFailure::Spawn(_));
 
+            startup.cancel_tx.send(true).unwrap();
+            startup.task.await.unwrap();
+        }
+
+        /// With fewer start slots than servers, the last failure still ends
+        /// the task and logs the aggregate outcome.
+        #[tokio::test]
+        async fn failures_beyond_the_start_limit_still_settle_and_end_the_task() {
+            use tracing_subscriber::prelude::*;
+
+            use crate::test_lsp::CapturedLogs;
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let configs = ["rust", "python", "go"]
+                .map(|language| {
+                    let mut config =
+                        named_sh_init_config(dir.path(), language, language, "exit 1\n");
+                    config.server_config.command = "mcpls-no-such-language-server".to_string();
+                    config
+                })
+                .to_vec();
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::registry().with(logs.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+            let startup = start_limited(configs, ServerStartConcurrency::new(2).unwrap());
+
+            tokio::time::timeout(std::time::Duration::from_secs(10), startup.task)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(guard);
+
+            assert_eq!(startup.translator.startup_failures().len(), 3);
+            assert!(
+                logs.messages()
+                    .iter()
+                    .any(|m| m.contains("All 3 configured LSP server(s) failed")),
+                "{:?}",
+                logs.messages()
+            );
+        }
+
+        /// With one start slot, the second server starts only after the first
+        /// has settled.
+        #[tokio::test]
+        async fn start_limit_holds_back_servers_until_a_slot_frees() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (a_up, b_up, gate) = (
+                dir.path().join("a_up"),
+                dir.path().join("b_up"),
+                dir.path().join("gate"),
+            );
+            let first = named_sh_init_config(
+                dir.path(),
+                "first",
+                "rust",
+                &answer_initialize_script(Some(&a_up), Some(&gate)),
+            );
+            let second = named_sh_init_config(
+                dir.path(),
+                "second",
+                "python",
+                &answer_initialize_script(Some(&b_up), None),
+            );
+            let startup =
+                start_limited(vec![first, second], ServerStartConcurrency::new(1).unwrap());
+
+            wait_until("the first server to start", || a_up.exists()).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                !b_up.exists(),
+                "second server started while the slot was taken"
+            );
+
+            std::fs::write(&gate, "").unwrap();
+            wait_until("the second server to start", || b_up.exists()).await;
             startup.cancel_tx.send(true).unwrap();
             startup.task.await.unwrap();
         }

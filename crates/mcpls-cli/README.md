@@ -55,6 +55,7 @@ See the main [README](../../README.md) for configuration examples and custom ext
 | `--listen <ADDR>` | `MCPLS_LISTEN` | Bind address for HTTP transport (`transport-http` feature) |
 | `--http-path <PATH>` | `MCPLS_HTTP_PATH` | URL prefix for HTTP transport (default: `/mcp`); must start with `/`, not be `/`, and use only letters, digits and `-._~` per segment, otherwise exit code 2 |
 | `--http-stream-liveness <MODE>` | `MCPLS_HTTP_STREAM_LIVENESS` | `probe` (default) or `off`: ping HTTP GET streams and close those whose client stops answering; with `off` an open GET stream no longer keeps a session alive past 5 minutes without requests |
+| `--http-allowed-origin <ORIGIN>` | `MCPLS_HTTP_ALLOWED_ORIGINS` | Extra browser origin (`http(s)://host[:port]`, repeatable or comma-separated) accepted besides loopback origins on the bound port; does not relax the `Host` check |
 
 > [!NOTE]
 > `MCPLS_TRUST_PROJECT_CONFIG` and `MCPLS_LOG_JSON` accept `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).

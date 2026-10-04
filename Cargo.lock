@@ -997,6 +997,7 @@ dependencies = [
  "clap",
  "mcpls-core",
  "predicates",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

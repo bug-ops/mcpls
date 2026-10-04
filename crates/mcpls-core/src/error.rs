@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::bridge::InvalidClientPath;
 use crate::config::{BuiltinServer, ServerId, ToolKind};
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
+pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
 use crate::util::{escape_control, truncate_str};
 
@@ -782,8 +783,8 @@ pub enum Error {
     },
 
     /// LSP protocol error during message parsing.
-    #[error("LSP protocol error: {}", escape_control(.0))]
-    LspProtocolError(String),
+    #[error("LSP protocol error: {}", escape_control(.0.as_str()))]
+    LspProtocolError(RedactedText),
 
     /// Invalid URI format.
     #[error("invalid URI: {0}")]
@@ -2200,7 +2201,7 @@ mod tests {
             "LSP server error: -32603 - boom\\nERROR forged\\u{1b}[31m"
         );
 
-        let protocol_error = Error::LspProtocolError("bad\nline".to_string());
+        let protocol_error = Error::LspProtocolError(RedactedText::fixed("bad\nline"));
         assert_eq!(protocol_error.to_string(), "LSP protocol error: bad\\nline");
     }
 

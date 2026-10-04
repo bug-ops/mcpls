@@ -54,10 +54,12 @@ mcpls bridges an AI client to potentially several LSP servers running as child p
    inherit mcpls's full process environment, which could otherwise leak secrets the server has no
    need to see).
 2. **Initialized** via the LSP handshake (`initialize` → capability negotiation, including position
-   encoding — see [[bridge/001-position-encoding-layer/spec|spec bridge/001]] — → `initialized`), with one
-   server's failure not blocking the others (**graceful degradation**: `spawn_batch` attempts every
-   configured server in sequence and returns both the servers that succeeded and the failures for
-   the ones that didn't, rather than failing all-or-nothing).
+   encoding — see [[bridge/001-position-encoding-layer/spec|spec bridge/001]] — → `initialized` →
+   an empty `workspace/didChangeConfiguration`, see [[lsp/010-workspace-configuration-push/spec|spec lsp/010]]),
+   with one server's failure not blocking the others (**graceful degradation**: startup attempts
+   every configured server, bounded by `workspace.max_concurrent_server_starts`, and records the
+   servers that succeeded and the failures for the ones that didn't, rather than failing
+   all-or-nothing; see [[lsp/009-incremental-server-registration/spec|spec lsp/009]]).
 3. **Monitored for crashes** during normal operation, since a language server can die at any time
    (OOM, a bug in the server itself, a signal from the OS). A crashed server must be distinguished
    from "still initializing" or "never configured," and a crash-looping server must not consume a
@@ -107,9 +109,9 @@ SO THAT a single misconfiguration doesn't make every language's tools unavailabl
 **Acceptance criteria:**
 ```
 GIVEN 6 configured LSP servers, one with a nonexistent command
-WHEN LspServer::spawn_batch runs
-THEN the result has_servers() is true, partial_success() is true, and the 5 valid servers are
-     usable for their respective languages while the failed one is reported in `failures`
+WHEN startup runs (init_lsp_servers over LspServer::start_contained)
+THEN the 5 valid servers register and are usable for their respective languages while the failed
+     one is recorded as that server's startup failure
 ```
 
 ### US-002: A crashed language server is transparently replaced
@@ -166,7 +168,8 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 |----|------------|----------|
 | FR-001 | WHEN spawning an LSP server child process THE SYSTEM SHALL clear the child's environment and pass through only an explicit allowlist (`PATH`, `HOME`/`USERPROFILE`, `TMPDIR`/`TEMP`/`TMP`, plus Windows-specific additions under `cfg(windows)`), then apply the server's configured `env` overrides last | must |
 | FR-002 | THE SYSTEM SHALL perform the `initialize` → capability-negotiation → `initialized` handshake for each server, using the server's configured `timeout_seconds` (clamped to `[1, MAX_TIMEOUT_SECONDS]`) as the handshake timeout | must |
-| FR-003 | WHEN spawning multiple configured servers (`spawn_batch`) THE SYSTEM SHALL attempt every server regardless of earlier failures and return both the successfully-initialized servers and a list of failures, never failing all-or-nothing | must |
+| FR-003 | WHEN starting multiple configured servers THE SYSTEM SHALL attempt every server regardless of earlier failures and settle each one as a registered server or a recorded failure, never failing all-or-nothing | must |
+| FR-015 | WHEN the `initialized` notification has been sent THE SYSTEM SHALL send `workspace/didChangeConfiguration` with `settings: null` once, failing the handshake with `Error::LspInitFailed` if it cannot be written ([[lsp/010-workspace-configuration-push/spec|lsp/010]]) | must |
 | FR-004 | THE SYSTEM SHALL expose `has_exited()` (non-blocking `try_wait`) so callers can detect a crashed child process without blocking on it, and `is_dead()`, which additionally reports a live child whose message loop has stopped (e.g. panicked); respawn is driven by `is_dead()` | must |
 | FR-005 | WHEN a tool call routes to a server whose child process has exited THE SYSTEM SHALL respawn and re-initialize it before the request proceeds, transparently to the caller | must |
 | FR-006 | WHEN two concurrent tool calls both route to the same dead server THE SYSTEM SHALL single-flight the respawn (via a per-server lock) so only one respawn attempt is made; the other caller waits for it and rechecks rather than racing a second, redundant spawn | must |
@@ -194,8 +197,8 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | Entity | Description | Key Attributes |
 |--------|-------------|-----------------|
 | `LspServer` | One managed, initialized LSP server instance | `client: LspClient`, `capabilities: ServerCapabilities`, `position_encoding: PositionEncodingKind`, `notification_rx`, `child: tokio::process::Child`, `init_config: ServerInitConfig` |
-| `ServerInitConfig` | Everything needed to spawn+initialize one server | `server_config`, `workspace_roots`, `initialization_options`, `position_encodings`, `notification_tx` |
-| `ServerInitResult` | Outcome of `spawn_batch` across all configured servers | `servers: HashMap<ServerId, LspServer>`, `failures: Vec<ServerSpawnFailure>` |
+| `ServerInitConfig` | Everything needed to spawn+initialize one server | `server_config`, `workspace_roots`, `initialization_options`, `position_encodings` |
+| `ServerStartOutcome` | Terminal outcome of starting one configured server | `Started(Box<LspServer>)` or `Failed(ServerSpawnFailure)` |
 | `ServerSpawnFailure` | Why one configured server never registered | `server_id`, `language_id`, `command`, `reason: StartupFailure` (`Spawn(Arc<Error>)` or `InitTaskPanicked`) |
 | `ServerState` | Coarse lifecycle state of a server connection | `Uninitialized`, `Initializing`, `Ready`, `ShuttingDown`, `Shutdown` |
 | `RespawnBackoff` (translator-internal) | Per-server respawn-attempt bookkeeping | `consecutive_failures: u32`, `last_attempt: Instant`, `last_attempt_succeeded: bool` |
@@ -204,7 +207,7 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 
 | Scenario | Expected Behavior |
 |----------|--------------------|
-| A server's command is not on `PATH` | `spawn` returns `Error::ServerNotFound` (other spawn errors stay `Error::ServerSpawnFailed`); `spawn_batch` records it as a failure and continues with the rest |
+| A server's command is not on `PATH` | `spawn` returns `Error::ServerNotFound` (other spawn errors stay `Error::ServerSpawnFailed`); startup records it as that server's failure and continues with the rest |
 | A configured server failed its initial spawn | The failure is recorded per server; tool calls that would route to it return `Error::ServerFailedToStart` (a live catch-all for the same language still wins), and workspace-wide tools return `Error::ServerFailedToStart` when the failed server would have claimed the tool, or `Error::AllServersFailedToInit` only when no server registered at all. Startup failures are never retried until mcpls restarts (#527) |
 | A server exits before answering `initialize` | `spawn` returns `Error::ServerExitedDuringInit` with the exit code (and a rustup-proxy hint for rust-analyzer) |
 | The background init task panics | The panic is caught on the init task itself; every unregistered config is recorded as `StartupFailure::InitTaskPanicked`, the router is rebound to what registered, and servers that did register are marked push-degraded with their indexing state reset. A panicking diagnostics pump degrades its own server the same way (#528) |
@@ -229,14 +232,14 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | ID | Metric | Target |
 |----|--------|--------|
 | SC-001 | `cargo nextest run -E 'package(mcpls-core) and (test(lifecycle) or test(respawn))'` | All existing spawn/initialize/shutdown/respawn unit tests pass |
-| SC-002 | `spawn_batch` with N configured servers, M of which are invalid | `has_servers()` true iff N-M > 0; `partial_success()` true iff both 0 < (N-M) and M > 0 |
+| SC-002 | Startup with N configured servers, M of which are invalid | N-M servers register and M failures are recorded, in any completion order |
 | SC-003 | Live repro: kill a spawned rust-analyzer mid-session, issue a hover call for a Rust file | Call succeeds against a freshly respawned rust-analyzer, no error surfaced to the MCP caller |
 | SC-004 | Live repro: repeatedly kill a server immediately after each respawn | Respawn attempts space out exponentially (1s, 2s, 4s, ... capped at 30s), not immediately retried each time |
 
 ## 8. Agent Boundaries
 
 ### Always (without asking)
-- Preserve graceful degradation in `spawn_batch` — never make one server's failure abort the whole
+- Preserve graceful degradation in startup — never make one server's failure abort the whole
   batch
 - Preserve the exponential-backoff respawn policy exactly (base 1s, cap 30s) unless explicitly
   asked to change it
@@ -269,11 +272,11 @@ None — this is a retroactive spec documenting stable, already-shipped, well-te
 - [[bridge/001-position-encoding-layer/spec|spec bridge/001]] — the conversion math for the `PositionEncodingKind`
   negotiated during this spec's `initialize` handshake
 - [[config/001-config-discovery-and-heuristics/spec|spec config/001]] — `LspServerConfig`/`ServerHeuristics`,
-  the configuration this spec's `spawn`/`spawn_batch` consume
+  the configuration this spec's `spawn` consumes
 - [[bridge/002-document-tracker-synchronization/spec|spec bridge/002]] — `DocumentTracker::forget_server`,
   invoked on respawn per FR-009
-- `crates/mcpls-core/src/lsp/lifecycle.rs` — `LspServer::spawn`/`spawn_batch`/`shutdown`,
-  `ServerInitConfig`, `ServerInitResult`
+- `crates/mcpls-core/src/lsp/lifecycle.rs` — `LspServer::spawn`/`start_contained`/`shutdown`,
+  `ServerInitConfig`, `ServerStartOutcome`
 - `crates/mcpls-core/src/lsp/client.rs` — `LspClient` JSON-RPC request/response, retry-on-cancel
 - `crates/mcpls-core/src/lsp/transport.rs` — stdio header-content framing
 - `crates/mcpls-core/src/bridge/translator/respawn.rs` — `respawn_if_dead`, `RespawnBackoff`

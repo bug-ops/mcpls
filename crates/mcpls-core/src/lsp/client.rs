@@ -236,6 +236,9 @@ pub struct LspClient {
 
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
+
+    /// Secrets hidden from text derived from server output.
+    redactions: Arc<Redactions>,
 }
 
 impl Clone for LspClient {
@@ -252,6 +255,7 @@ impl Clone for LspClient {
             pending_requests: Arc::clone(&self.pending_requests),
             pending_failure: Arc::clone(&self.pending_failure),
             receiver_task: None,
+            redactions: Arc::clone(&self.redactions),
         }
     }
 }
@@ -289,6 +293,7 @@ impl LspClient {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_failure: Arc::default(),
             receiver_task: None,
+            redactions: Arc::default(),
         }
     }
 
@@ -325,6 +330,7 @@ impl LspClient {
             pending_requests,
             pending_failure,
             receiver_task: Some(receiver_task),
+            redactions: Arc::default(),
         }
     }
 
@@ -357,7 +363,7 @@ impl LspClient {
             Arc::clone(&pending_failure),
             Some(notification_tx),
             Some(lifecycle_tx),
-            redactions,
+            Arc::clone(&redactions),
         ));
 
         Self {
@@ -368,7 +374,13 @@ impl LspClient {
             pending_requests,
             pending_failure,
             receiver_task: Some(receiver_task),
+            redactions,
         }
+    }
+
+    /// Secrets this client hides from text derived from server output.
+    pub(crate) fn redactions(&self) -> &Redactions {
+        &self.redactions
     }
 
     /// Get the language ID for this client.
@@ -408,8 +420,7 @@ impl LspClient {
     /// which rejects `request_timeout_seconds` that is `0` or greater than
     /// [`MAX_TIMEOUT_SECONDS`]) regardless of whether it came from
     /// [`ServerConfig::load_from`] or was built programmatically by the
-    /// caller. But `Self::new`, [`super::LspServer::spawn`], and
-    /// [`super::LspServer::spawn_batch`] are all `pub` and take an
+    /// caller. But `Self::new` and [`super::LspServer::spawn`] are `pub` and take an
     /// [`LspServerConfig`] (or [`super::ServerInitConfig`] wrapping one)
     /// directly, bypassing that top-level validation entirely — it operates
     /// on the top-level `ServerConfig`, not the per-server one. This clamp is
@@ -603,7 +614,8 @@ impl LspClient {
             match outcome {
                 Ok(result_value) => {
                     return serde_json::from_value(result_value).map_err(|e| {
-                        Error::LspProtocolError(format!("Failed to deserialize response: {e}"))
+                        self.redactions
+                            .protocol_error(format_args!("Failed to deserialize response: {e}"))
                     });
                 }
                 Err(Error::LspServerError {
@@ -1162,16 +1174,26 @@ impl LspClient {
     }
 
     /// Redacts the human-readable text a server controls before it reaches
-    /// the notification cache, from where MCP tools return it.
-    fn redact_notification(notification: &mut LspNotification, redactions: &Redactions) {
+    /// the notification cache, from where MCP tools and the diagnostics
+    /// resource return it.
+    pub(crate) fn redact_notification(notification: &mut LspNotification, redactions: &Redactions) {
+        if redactions.is_empty() {
+            return;
+        }
         match notification {
             LspNotification::LogMessage(params) => {
-                params.message = redactions.apply(&params.message).into_owned();
+                redactions.redact_in_place(&mut params.message);
             }
             LspNotification::ShowMessage(params) => {
-                params.message = redactions.apply(&params.message).into_owned();
+                redactions.redact_in_place(&mut params.message);
             }
-            _ => {}
+            LspNotification::PublishDiagnostics(params) => {
+                for diagnostic in &mut params.diagnostics {
+                    redactions.redact_diagnostic(diagnostic);
+                }
+            }
+            LspNotification::Progress(params) => redactions.redact_progress(&mut params.value),
+            LspNotification::Other { .. } => {}
         }
     }
 
@@ -1273,6 +1295,69 @@ mod tests {
         let output = logs.messages().join("\n");
         assert!(output.contains("Forwarding notification"), "{output}");
         assert!(!output.contains("SuperSecretValue123"), "{output}");
+    }
+
+    fn secret_diagnostics_params() -> Value {
+        let range = serde_json::json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 1}
+        });
+        serde_json::json!({
+            "uri": "file:///w/main.rs",
+            "diagnostics": [{
+                "range": range,
+                "message": "leak SuperSecretValue123",
+                "data": {"hint": ["SuperSecretValue123"]}
+            }]
+        })
+    }
+
+    /// #583: the reader task redacts a pushed diagnostic before it reaches the
+    /// notification lane, from where the cache and the MCP tools read it.
+    #[tokio::test]
+    async fn test_reader_task_forwards_pushed_diagnostics_redacted() {
+        use crate::test_lsp::{fake_lsp_client_with_redactions, write_notification};
+
+        let redactions =
+            Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]);
+        let (_client, mut server, mut lanes) = fake_lsp_client_with_redactions(redactions);
+
+        write_notification(
+            &mut server.read_half_stdin,
+            "textDocument/publishDiagnostics",
+            secret_diagnostics_params(),
+        )
+        .await;
+
+        let forwarded = timeout(Duration::from_secs(2), lanes.notification_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let shown = format!("{forwarded:?}");
+        assert!(shown.contains("[redacted:API_TOKEN]"), "{shown}");
+        assert!(!shown.contains("SuperSecretValue123"), "{shown}");
+    }
+
+    /// With nothing to hide the notification is forwarded as received.
+    #[test]
+    fn test_redact_notification_leaves_text_alone_without_secrets() {
+        let mut notification = LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(secret_diagnostics_params()),
+        );
+        let before = format!("{notification:?}");
+
+        LspClient::redact_notification(&mut notification, &Redactions::default());
+        assert_eq!(format!("{notification:?}"), before);
+
+        let unrelated = Redactions::new([("API_TOKEN".to_owned(), "NotInTheText99".to_owned())]);
+        LspClient::redact_notification(&mut notification, &unrelated);
+        assert_eq!(format!("{notification:?}"), before);
+
+        let matching =
+            Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]);
+        LspClient::redact_notification(&mut notification, &matching);
+        assert!(!format!("{notification:?}").contains("SuperSecretValue123"));
     }
 
     #[test]
@@ -1766,6 +1851,7 @@ mod tests {
             pending_requests: Arc::clone(&pending_requests),
             pending_failure: Arc::default(),
             receiver_task: None,
+            redactions: Arc::default(),
         };
 
         let (tx1, rx1) = oneshot::channel::<Result<Value>>();

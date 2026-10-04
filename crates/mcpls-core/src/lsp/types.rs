@@ -200,7 +200,9 @@ impl LspNotification {
         if let Some(p) = params {
             match serde_json::from_value(p) {
                 Ok(parsed) => return wrap(parsed),
-                Err(e) => debug!(method, error = %e, "failed to parse notification params"),
+                Err(e) => {
+                    debug!(method, error = ?e.classify(), "failed to parse notification params");
+                }
             }
         }
         Self::Other {

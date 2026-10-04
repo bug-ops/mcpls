@@ -3329,11 +3329,37 @@
           "type": "integer"
         },
         "min_level": {
-          "description": "Minimum log level to include: error, warning, info, debug.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "anyOf": [
+            {
+              "description": "Log severity level.",
+              "oneOf": [
+                {
+                  "const": "error",
+                  "description": "Error log level.",
+                  "type": "string"
+                },
+                {
+                  "const": "warning",
+                  "description": "Warning log level.",
+                  "type": "string"
+                },
+                {
+                  "const": "info",
+                  "description": "Info log level.",
+                  "type": "string"
+                },
+                {
+                  "const": "debug",
+                  "description": "Debug log level.",
+                  "type": "string"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Minimum log level to include: error, warning, info, debug."
         }
       },
       "type": "object"
@@ -3344,8 +3370,29 @@
           "description": "A log entry from the LSP server.",
           "properties": {
             "level": {
-              "$ref": "#/$defs/LogLevel",
-              "description": "Log level."
+              "description": "Log level.",
+              "oneOf": [
+                {
+                  "const": "error",
+                  "description": "Error log level.",
+                  "type": "string"
+                },
+                {
+                  "const": "warning",
+                  "description": "Warning log level.",
+                  "type": "string"
+                },
+                {
+                  "const": "info",
+                  "description": "Info log level.",
+                  "type": "string"
+                },
+                {
+                  "const": "debug",
+                  "description": "Debug log level.",
+                  "type": "string"
+                }
+              ]
             },
             "message": {
               "description": "Log message.",
@@ -3363,31 +3410,6 @@
             "timestamp"
           ],
           "type": "object"
-        },
-        "LogLevel": {
-          "description": "Log severity level.",
-          "oneOf": [
-            {
-              "const": "error",
-              "description": "Error log level.",
-              "type": "string"
-            },
-            {
-              "const": "warning",
-              "description": "Warning log level.",
-              "type": "string"
-            },
-            {
-              "const": "info",
-              "description": "Info log level.",
-              "type": "string"
-            },
-            {
-              "const": "debug",
-              "description": "Debug log level.",
-              "type": "string"
-            }
-          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
