@@ -1090,9 +1090,7 @@ impl StartupTally {
     }
 }
 
-/// What [`init_lsp_servers`] needs to settle servers one at a time: the
-/// translator it registers into, the pumps it starts, and each registered
-/// server's diagnostics role.
+/// Settles servers one at a time for [`init_lsp_servers`].
 struct StartupSettler<'a> {
     translator: &'a Translator,
     notification_cache: Arc<Mutex<NotificationCache>>,
@@ -1114,9 +1112,8 @@ impl StartupSettler<'_> {
         }
     }
 
-    /// Takes the notification receivers and applies the indexing policy
-    /// before the server becomes visible, registers it, recomputes every
-    /// diagnostics role, then starts its pump.
+    /// Receivers and indexing policy are taken before the server is visible;
+    /// cancel is re-checked right before registering.
     async fn settle_started(&mut self, mut server: LspServer) {
         if *self.cancel_rx.borrow() {
             return;
@@ -1129,6 +1126,9 @@ impl StartupSettler<'_> {
             .lock()
             .await
             .set_indexing_policy(config_id, policy);
+        if *self.cancel_rx.borrow() {
+            return;
+        }
 
         let (id, language) = self.translator.settle_started(server);
         let (role_tx, role_rx) = tokio::sync::watch::channel(self.diagnostics_role(&language, &id));
@@ -1148,9 +1148,8 @@ impl StartupSettler<'_> {
         self.pump_servers.insert(pump.id(), id);
     }
 
-    /// Tells subscribers of files now served by the freshly registered `id`
-    /// to re-read, so one that was told "starting" or "failed" while the route
-    /// was unbound learns it recovered. Re-reading is idempotent.
+    /// Notifies subscribers of files now served by `id`, which may have been
+    /// told "starting" while the route was unbound.
     async fn publish_routes_served_by(&self, id: &ServerId) {
         self.pump_shared
             .subs
@@ -1160,8 +1159,7 @@ impl StartupSettler<'_> {
             .await;
     }
 
-    /// Records the failure, then re-evaluates roles and tells subscribers of
-    /// every file whose route is now failed.
+    /// Records the failure, re-evaluates roles, notifies failed routes.
     async fn settle_failed(&mut self, failure: ServerSpawnFailure) {
         error!("Server initialization failed: {failure}");
         self.translator.settle_failed(&failure);
@@ -1178,10 +1176,8 @@ impl StartupSettler<'_> {
         }
     }
 
-    /// Re-evaluates each registered server's role against the current router
-    /// and gives the diagnostics cache the number of non-failed servers that
-    /// are a language's diagnostics route, pending ones included, so the
-    /// count equals the batch value once every server has settled.
+    /// Pending servers count toward the route count, so it equals the batch
+    /// value once every server has settled.
     async fn recompute_roles(&self) {
         for (id, (language, role_tx)) in &self.roles {
             let role = self.diagnostics_role(language, id);
@@ -1206,9 +1202,7 @@ impl StartupSettler<'_> {
     }
 }
 
-/// Handles one finished pump: a pump that panicked has stopped caching pushes
-/// for its server, so that server is marked push-degraded and its indexing
-/// state is reset instead of freezing at its last value.
+/// A panicked pump stops caching its server's pushes: mark it push-degraded.
 async fn handle_pump_exit(
     joined: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
     pump_servers: &HashMap<tokio::task::Id, ServerId>,
@@ -2429,6 +2423,32 @@ mod tests {
                 .expect("notified when the catch-all registered")
                 .unwrap();
             assert_eq!(got, uri.as_str());
+        }
+
+        /// Cancellation that lands while the cache lock is awaited also drops it.
+        #[tokio::test]
+        async fn settle_started_cancelled_during_cache_wait_does_not_register() {
+            let config = LspServerConfig::rust_analyzer();
+            let translator = Translator::new();
+            translator.set_expected_servers(std::iter::once(config.id()).collect());
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut settler =
+                settler_for(&translator, &cache, SubscriptionRegistry::new(), &[&config]);
+            settler.cancel_rx = cancel_rx;
+            let guard = cache.lock().await;
+
+            let settle = settler.settle(ServerStartOutcome::Started(Box::new(
+                crate::lsp::fake_lsp_server_with_config(config.clone()),
+            )));
+            let release = async {
+                tokio::task::yield_now().await;
+                cancel_tx.send(true).unwrap();
+                drop(guard);
+            };
+            tokio::join!(settle, release);
+
+            assert_eq!(translator.registered_server_count(), 0);
         }
 
         /// Cancellation that lands while a server finishes starting drops it

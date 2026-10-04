@@ -2023,37 +2023,21 @@ echo 'fatal: bad toolchain' >&2
     fn test_log_spawn_hides_argument_values() {
         use tracing_subscriber::prelude::*;
 
-        #[derive(Clone, Default)]
-        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
+        use crate::test_lsp::CapturedLogs;
 
-        let buf = SharedBuf::default();
         let mut config = LspServerConfig::rust_analyzer();
         config.args = vec!["--api-key=SuperSecretArg456".to_string()];
         let redactions = Redactions::for_server(&config, std::iter::empty());
+        let logs = CapturedLogs::default();
         let info_only = tracing_subscriber::registry()
             .with(tracing_subscriber::filter::LevelFilter::INFO)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer({
-                        let writer = buf.clone();
-                        move || writer.clone()
-                    })
-                    .with_ansi(false),
-            );
+            .with(logs.clone());
 
         tracing::subscriber::with_default(info_only, || {
             LspServer::log_spawn(&config, &redactions);
         });
-        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+
+        let output = logs.messages().join("\n");
         assert!(output.contains("(1 arg(s))"), "{output}");
         assert!(!output.contains("SuperSecretArg456"), "{output}");
     }

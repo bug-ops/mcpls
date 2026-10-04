@@ -357,16 +357,8 @@ impl Translator {
         *lock_std(&self.router) = Arc::new(router);
     }
 
-    /// Settle a server that initialized: register its client then the server,
-    /// re-derive the routes, then remove its id from the expected set.
-    /// Returns its routing identity and language.
-    ///
-    /// The write order lets a reader that reads the expected set first and the
-    /// router last (the `get_tool_support` snapshot) never see a server that is
-    /// neither expected, registered nor failed. Per-call lookups read the
-    /// router first, so one that races a settlement can transiently see the
-    /// previous routes together with the new expected set; that window is a
-    /// few instructions wide and the next call sees the settled state.
+    /// Registers the client then the server, re-derives routes, then clears the
+    /// expected id; that order keeps the snapshot's reads consistent.
     pub(crate) fn settle_started(&self, server: LspServer) -> (ServerId, String) {
         let id = server.init_config().server_config.id();
         let language = server.client().language_id().to_string();
@@ -376,9 +368,7 @@ impl Translator {
         (id, language)
     }
 
-    /// Settle a server that failed to start: record the failure, re-derive the
-    /// routes, then remove its id from the expected set, in that order (see
-    /// [`Self::settle_started`]).
+    /// As [`Self::settle_started`], with the failure recorded first.
     pub(crate) fn settle_failed(&self, failure: &ServerSpawnFailure) {
         let id = failure.server_id.clone();
         self.record_startup_failures(std::slice::from_ref(failure));

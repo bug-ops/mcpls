@@ -62,24 +62,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `validate_path_against_roots`, `Translator::set_workspace_roots`, `McplsServer::new` and `BridgeContext::new` take the new `WorkspaceRoots`; a path is accepted only under a canonical root, its configured form or the logical `$PWD`. (#533, #552)
 - **Breaking:** `Error::LspInitFailed` and `Error::ServerExitedDuringInit` gain `stderr: Option<StderrExcerpt>`, a bounded excerpt of the server's stderr with secret-named env, flag and option values redacted. (#534, #552)
 - Accepted HTTP sockets set `TCP_USER_TIMEOUT` to 60 s on Linux and Android, bounding half-open SSE streams; no effect elsewhere or behind a reverse proxy. (#531, #552)
-- **Breaking:** `HttpConfig::new` takes only the bind address, the mount path is `HttpPath` set through `with_path`, and `max_concurrent_sessions` is a `SessionLimit` (`DEFAULT_MAX_CONCURRENT_SESSIONS` removed). (#557, #561)
-- **Breaking:** HTTP bind failures are `Error::HttpBind` carrying the address and `io::Error`, and `Error::Timeout` carries a `Duration`. (#561)
-- **Breaking:** `ServerConfig::project_config_ignored` is `project_config_status: ProjectConfigStatus`, which `McplsServer::new` and `BridgeContext::new` take instead of a bool. (#561)
-- **Breaking:** the HTTP transport answers `403` to a request whose `Origin` is not a loopback origin on the bound port; requests without `Origin` are unaffected. (#556)
-- **Breaking:** with `--http-stream-liveness off` an open GET stream no longer keeps a session alive past 5 minutes without inbound requests, and a POST or resume stream whose peer stalls holds its session until the connection fails, since rmcp's `keep_alive` is off. (#573)
-- **Breaking:** an invalid `MCPLS_HTTP_PATH` now exits with a usage error even in stdio mode. (#557)
-- **Breaking:** `NotificationCache::{diagnostics, diagnostic_sources, has_diagnostics, diagnostics_owner}` take `&Uri` and `Translator::cached_diagnostics_uri` returns `Uri`. (#559)
-- **Breaking:** `LspServer::spawn_batch` starts servers concurrently, and `ToolRouter::rebind` with `ServerSettlement` re-derives routes per settled server; a dead explicit route waits for a pending catch-all. (#572)
-- `cargo-deny` now denies yanked crates. (#556)
+- **Breaking:** `HttpConfig::new` takes only the bind address; the path is a validated `HttpPath` and `max_concurrent_sessions` a `SessionLimit`.
+- **Breaking:** bind failures are `Error::HttpBind` and `Error::Timeout` carries a `Duration`.
+- **Breaking:** `project_config_ignored: bool` is now `ProjectConfigStatus` on `ServerConfig`, `McplsServer::new` and `BridgeContext::new`.
+- **Breaking:** the HTTP transport answers `403` to a non-loopback `Origin`.
+- **Breaking:** with `--http-stream-liveness off` an open GET stream no longer keeps a session alive past 5 minutes without requests.
+- **Breaking:** an invalid `MCPLS_HTTP_PATH` exits with a usage error even in stdio mode.
+- **Breaking:** `NotificationCache` diagnostics readers take `&Uri` and `Translator::cached_diagnostics_uri` returns `Uri`.
+- **Breaking:** `LspServer::spawn_batch` is concurrent and `ToolRouter::rebind` re-derives routes per `ServerSettlement`.
+- `cargo-deny` denies yanked crates.
 
 ### Fixed
 
-- Language servers start concurrently and each is usable as soon as its own `initialize` completes; a slow or failing server no longer blocks the others. A catch-all that registers after a diagnostics-owning sibling's pending or failed state drops the pushes it made while secondary, which refill at the next publish per file. (#572)
-- An invalid `--http-path` is rejected at argument parsing instead of panicking at startup. (#557)
-- An HTTP client that answers liveness probes on an open GET stream is no longer dropped by rmcp's 5-minute `keep_alive`. (#573)
-- HTTP session ids are no longer written to mcpls's own logs or to rmcp's session-creation event and spans at the default level; rare rmcp error lines outside mcpls's control may still print one. (#555)
-- Configured secrets are redacted from server log and show messages, initialize errors, trace-level wire logs and spawn arguments. (#554)
-- `escape_control` and stderr cleaning now share one set of deceptive format characters. (#560)
+- Language servers start concurrently and each is usable as soon as its own `initialize` completes.
+- An invalid `--http-path` is rejected at argument parsing instead of panicking.
+- A client answering liveness probes on an open GET stream is no longer dropped after 5 minutes.
+- HTTP session ids are no longer logged at the default level.
+- Configured secrets are redacted from server messages, errors, wire traces and spawn arguments.
+- `escape_control` and stderr cleaning share one deceptive-character set.
 - Abandoned HTTP sessions now expire after 5 min without client activity instead of living on while subscribed files change. (#536)
 - Columns past the end of a line now clamp to the line length, and column 1 or the empty line after a final newline no longer raise a false `positions_degraded`. (#520)
 - Call-hierarchy, inlay-hint, code-action, and rename handlers now cap normalized items with one shared budget, reporting overflow via `truncated` / `dropped.exceeds_item_cap`. (#487, #519)

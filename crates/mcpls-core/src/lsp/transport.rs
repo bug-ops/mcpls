@@ -331,39 +331,22 @@ mod tests {
     use super::*;
     use crate::lsp::types::RequestId;
 
-    #[derive(Clone, Default)]
-    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn test_trace_wire_logs_redact_secrets_in_both_directions() {
         use tracing_subscriber::prelude::*;
+
+        use crate::test_lsp::CapturedLogs;
 
         let secret = "pa\"ss\\word-12345";
         let redactions = Arc::new(Redactions::new([(
             "API_TOKEN".to_owned(),
             secret.to_owned(),
         )]));
-        let buf = SharedBuf::default();
-        let writer = buf.clone();
+        let logs = CapturedLogs::default();
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::registry()
                 .with(tracing_subscriber::filter::LevelFilter::TRACE)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(move || writer.clone())
-                        .with_ansi(false),
-                ),
+                .with(logs.clone()),
         );
         let frame = serde_json::json!({
             "jsonrpc": "2.0",
@@ -381,7 +364,7 @@ mod tests {
         writer_half.send(&frame).await.unwrap();
         reader_half.receive().await.unwrap();
 
-        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let output = logs.messages().join("\n");
         assert!(output.contains("Sending LSP message"), "{output}");
         assert!(output.contains("Received LSP message"), "{output}");
         assert!(!output.contains("word-12345"), "{output}");
@@ -396,20 +379,17 @@ mod tests {
     async fn test_skipped_non_object_frame_log_redacts_secrets() {
         use tracing_subscriber::prelude::*;
 
+        use crate::test_lsp::CapturedLogs;
+
         let redactions = Arc::new(Redactions::new([(
             "API_TOKEN".to_owned(),
             "SuperSecretValue123".to_owned(),
         )]));
-        let buf = SharedBuf::default();
-        let writer = buf.clone();
+        let logs = CapturedLogs::default();
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::registry()
                 .with(tracing_subscriber::filter::LevelFilter::DEBUG)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(move || writer.clone())
-                        .with_ansi(false),
-                ),
+                .with(logs.clone()),
         );
         let body = "\"echo SuperSecretValue123\"";
         let inbound = format!("Content-Length: {}\r\n\r\n{body}", body.len());
@@ -421,7 +401,7 @@ mod tests {
 
         assert!(reader.receive().await.is_err());
 
-        let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let output = logs.messages().join("\n");
         assert!(output.contains("Skipping non-object"), "{output}");
         assert!(!output.contains("SuperSecretValue123"), "{output}");
     }
