@@ -122,7 +122,7 @@ pub(super) struct RestartState {
 /// Everything the translator tracks for one server.
 #[derive(Debug)]
 pub(super) struct ServerSlot {
-    pub(super) status: ServerStatus,
+    status: ServerStatus,
     /// Single-flight lock for respawn and restart of this server.
     pub(super) respawn_lock: Arc<Mutex<()>>,
     /// Crash-loop backoff of automatic respawns.
@@ -403,16 +403,21 @@ impl Servers {
 
     /// Puts a backend taken by [`Self::take_for_restart`] back, unless the
     /// slot was settled by someone else meanwhile.
-    pub(super) fn restore(&mut self, id: &ServerId, backend: Backend) {
+    ///
+    /// Returns the backend when the slot was settled by someone else, so the
+    /// caller drops it after releasing the guard.
+    pub(super) fn restore(&mut self, id: &ServerId, backend: Backend) -> Option<Backend> {
         match self.0.get_mut(id) {
             Some(slot) if matches!(slot.status, ServerStatus::Expected { .. }) => {
                 slot.status = ServerStatus::Running(backend);
+                None
             }
             None => {
                 self.0
                     .insert(id.clone(), ServerSlot::new(ServerStatus::Running(backend)));
+                None
             }
-            Some(_) => {}
+            Some(_) => Some(backend),
         }
     }
 
@@ -492,16 +497,28 @@ impl Servers {
     }
 
     /// The slot of `id`, created running with `backend` when absent.
-    pub(super) fn slot_for_swap(&mut self, id: &ServerId, backend: Backend) -> Option<Backend> {
+    ///
+    /// A stopped slot is never revived: the new backend is handed back as the
+    /// `Err`, for the caller to drop outside the guard.
+    pub(super) fn slot_for_swap(
+        &mut self,
+        id: &ServerId,
+        backend: Backend,
+    ) -> Result<Option<Backend>, Box<Backend>> {
         if let Some(slot) = self.0.get_mut(id) {
-            return match std::mem::replace(&mut slot.status, ServerStatus::Running(backend)) {
-                ServerStatus::Running(old) => Some(old),
-                _ => None,
-            };
+            if matches!(slot.status, ServerStatus::Stopped(_)) {
+                return Err(Box::new(backend));
+            }
+            return Ok(
+                match std::mem::replace(&mut slot.status, ServerStatus::Running(backend)) {
+                    ServerStatus::Running(old) => Some(old),
+                    _ => None,
+                },
+            );
         }
         self.0
             .insert(id.clone(), ServerSlot::new(ServerStatus::Running(backend)));
-        None
+        Ok(None)
     }
 
     /// Test-only: registers a bare client, next to the server already there.

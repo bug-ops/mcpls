@@ -1348,7 +1348,7 @@ fn log_surfaced_error(method: &str, id: &RequestId, code: i32, message: &str) {
 /// into [`Error`], so `?` does not compile and the choice cannot be skipped.
 #[derive(Debug)]
 #[must_use = "call `surface()` or `handled()` to log and unwrap the error"]
-pub struct UnclassifiedError(Box<Unclassified>);
+pub struct UnclassifiedError(Option<Box<Unclassified>>);
 
 #[derive(Debug)]
 struct Unclassified {
@@ -1358,28 +1358,38 @@ struct Unclassified {
 
 impl UnclassifiedError {
     fn logged(error: Error) -> Self {
-        Self(Box::new(Unclassified {
+        Self(Some(Box::new(Unclassified {
             error,
             unlogged: None,
-        }))
+        })))
     }
 
     fn server_response(error: Error, method: &str, id: RequestId) -> Self {
-        Self(Box::new(Unclassified {
+        Self(Some(Box::new(Unclassified {
             error,
             unlogged: Some((method.to_owned(), id)),
-        }))
+        })))
+    }
+
+    fn take(mut self) -> Unclassified {
+        self.0.take().map_or_else(
+            || unreachable!("an UnclassifiedError holds its error until classified"),
+            |inner| *inner,
+        )
     }
 
     /// The wrapped error, for classification before logging.
     pub(crate) fn error(&self) -> &Error {
-        &self.0.error
+        self.0.as_ref().map_or_else(
+            || unreachable!("an UnclassifiedError holds its error until classified"),
+            |inner| &inner.error,
+        )
     }
 
     /// The error returned to the caller as a failure; a server error response
     /// is logged at ERROR.
     pub(crate) fn surface(self) -> Error {
-        let Unclassified { error, unlogged } = *self.0;
+        let Unclassified { error, unlogged } = self.take();
         if let (Some((method, id)), Error::LspServerError { code, message, .. }) =
             (&unlogged, &error)
         {
@@ -1391,7 +1401,7 @@ impl UnclassifiedError {
     /// The error of an expected outcome; a server error response is logged at
     /// DEBUG.
     pub(crate) fn handled(self) -> Error {
-        let Unclassified { error, unlogged } = *self.0;
+        let Unclassified { error, unlogged } = self.take();
         if let (Some((method, id)), Error::LspServerError { code, message, .. }) =
             (&unlogged, &error)
         {
@@ -1404,6 +1414,19 @@ impl UnclassifiedError {
             );
         }
         error
+    }
+}
+
+/// A dropped, unclassified server error response is logged at ERROR, so
+/// `.ok()`, `let _ =` or an ignoring match arm cannot hide it.
+impl Drop for UnclassifiedError {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take()
+            && let (Some((method, id)), Error::LspServerError { code, message, .. }) =
+                (&inner.unlogged, &inner.error)
+        {
+            log_surfaced_error(method, id, *code, message);
+        }
     }
 }
 

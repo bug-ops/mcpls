@@ -378,7 +378,7 @@ impl Translator {
             ),
             NotificationRouting::Discard => self.spawn_discard_consumer(id, receivers),
         };
-        let old_client = self.swap_in(id, new_server, consumer);
+        let old_client = self.swap_in(id, new_server, &consumer);
 
         self.document_tracker.forget_server(id);
 
@@ -401,18 +401,30 @@ impl Translator {
         &self,
         id: &ServerId,
         new_server: LspServer,
-        consumer: tokio::task::AbortHandle,
+        consumer: &tokio::task::AbortHandle,
     ) -> Option<LspClient> {
-        let old = {
+        let swapped = {
             let mut servers = lock_std(&self.servers);
-            let old = servers.slot_for_swap(id, Backend::Process(new_server));
-            if let Some(slot) = servers.get_mut(id) {
-                slot.notification_task = Some(consumer);
+            let swapped = servers.slot_for_swap(id, Backend::Process(new_server));
+            if swapped.is_ok()
+                && let Some(slot) = servers.get_mut(id)
+            {
+                slot.notification_task = Some(consumer.clone());
             }
             drop(servers);
-            old
+            swapped
         };
-        old.as_ref().map(|old| old.client().clone())
+        match swapped {
+            Ok(old) => old.as_ref().map(|old| old.client().clone()),
+            Err(refused) => {
+                tracing::warn!(
+                    "LSP server '{id}' was shut down while it respawned; dropping the replacement"
+                );
+                consumer.abort();
+                drop(refused);
+                None
+            }
+        }
     }
 
     /// Drain the replacement's notification lane and forward its lifecycle

@@ -653,6 +653,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
 
     let mut translator = Translator::new()
+        .with_startup_redactions(Arc::clone(&startup_redactions))
         .with_resource_limits(config.workspace.resource_limits())
         .with_extensions(extension_map)
         .with_router(router)

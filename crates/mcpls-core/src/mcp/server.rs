@@ -1339,6 +1339,19 @@ impl McplsServer {
 }
 
 impl McplsServer {
+    /// [`DiagnosticsResourceUri::resolve`] on the blocking pool, so a slow
+    /// filesystem cannot stall a runtime worker.
+    async fn resolve_resource(&self, raw: &str) -> crate::error::Result<ResolvedResource> {
+        let raw = raw.to_owned();
+        let roots = self.context.workspace_roots.clone();
+        tokio::task::spawn_blocking(move || DiagnosticsResourceUri::resolve(&raw, &roots))
+            .await
+            .map_err(|source| crate::error::Error::TaskFailed {
+                task: crate::error::BackgroundTask::PathValidation,
+                source,
+            })?
+    }
+
     /// [`render_error`] with the secrets of every live server.
     fn render_error(&self, error: crate::error::Error) -> McpError {
         render_error(error, &self.context.translator.server_text_redactions())
@@ -1409,8 +1422,7 @@ impl McplsServer {
         &self,
         request: ReadResourceRequestParams,
     ) -> Result<ReadResourceResponse, McpError> {
-        let path =
-            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let path = parse_uri(&request.uri).map_err(|e| map_bridge_error(e.into()))?;
         let response = self.resource_diagnostics_response(&path).await?;
 
         let json = serde_json::to_string(&response)
@@ -1537,13 +1549,59 @@ fn start_listen_lease(context: &SubscriptionContext) {
 /// Every other failure is a malformed URI or an internal fault.
 const fn is_unresolvable_resource(error: &crate::error::Error) -> bool {
     use crate::error::Error;
-    matches!(
-        error,
-        Error::PathOutsideWorkspace(_)
-            | Error::FileIo { .. }
-            | Error::MalformedPath { .. }
-            | Error::NoWorkspaceRoots(_)
-    )
+    match error {
+        Error::MalformedPath { .. }
+        | Error::FileIo { .. }
+        | Error::PathOutsideWorkspace(..)
+        | Error::NoWorkspaceRoots(..) => true,
+        Error::LspInitFailed { .. }
+        | Error::LspServerError { .. }
+        | Error::McpServerStart(..)
+        | Error::TaskFailed { .. }
+        | Error::StdioCapture(..)
+        | Error::HttpBind { .. }
+        | Error::DocumentNotFound(..)
+        | Error::NoServerForLanguage(..)
+        | Error::NoServerForTool { .. }
+        | Error::ServerFailedToStart(..)
+        | Error::ServerInitializing { .. }
+        | Error::ServerRestarted { .. }
+        | Error::SymbolResolution(..)
+        | Error::UnknownServers { .. }
+        | Error::WorkspaceServersInitializing
+        | Error::NoServerConfigured
+        | Error::NoServerForWorkspaceTool { .. }
+        | Error::ConfigNotFound(..)
+        | Error::InvalidConfig(..)
+        | Error::Io(..)
+        | Error::Json(..)
+        | Error::TomlDe(..)
+        | Error::TomlSer(..)
+        | Error::Timeout(..)
+        | Error::ServerSpawnFailed { .. }
+        | Error::ServerNotFound { .. }
+        | Error::LspProtocolError(..)
+        | Error::InvalidUri(..)
+        | Error::InvalidPositionInput(..)
+        | Error::InvalidRangeInput(..)
+        | Error::ResourceUri(..)
+        | Error::PathToUri(..)
+        | Error::ServerTerminated
+        | Error::ShutdownTimeout
+        | Error::ServerExitedDuringInit { .. }
+        | Error::ServerUnavailable { .. }
+        | Error::InvalidToolParams(..)
+        | Error::InvalidClientPath(..)
+        | Error::DocumentLimitExceeded { .. }
+        | Error::SubscriptionLimitReached { .. }
+        | Error::ListenStreamsExhausted { .. }
+        | Error::ListenFilterTooLarge { .. }
+        | Error::FileSizeLimitExceeded { .. }
+        | Error::NotARegularFile(..)
+        | Error::AllServersFailedToInit { .. }
+        | Error::CapabilityNotSupported { .. }
+        | Error::WorkspaceIndexing { .. } => false,
+    }
 }
 
 fn no_resolvable_listen_uris() -> crate::error::Error {
@@ -1651,7 +1709,9 @@ impl ServerHandler for McplsServer {
                 let ResolvedResource {
                     path: validated_path,
                     uri: canonical_uri,
-                } = DiagnosticsResourceUri::resolve(&request.uri, &self.context.workspace_roots)
+                } = self
+                    .resolve_resource(&request.uri)
+                    .await
                     .map_err(|e| self.render_error(e))?;
 
                 // Record the subscription *before* checking the cache. This closes the race where
@@ -1734,10 +1794,7 @@ impl ServerHandler for McplsServer {
                 let session = self.context.session.require_stateful(&context)?;
 
                 // Only a malformed URI errors; a deleted file resolves via its alias (#499).
-                let canonical = match DiagnosticsResourceUri::resolve(
-                    &request.uri,
-                    &self.context.workspace_roots,
-                ) {
+                let canonical = match self.resolve_resource(&request.uri).await {
                     Ok(resolved) => Some(resolved.uri),
                     Err(e) if is_unresolvable_resource(&e) => None,
                     Err(e) => return Err(self.render_error(e)),
@@ -2193,6 +2250,30 @@ mod tests {
             plain.message.contains("nothing secret"),
             "{}",
             plain.message
+        );
+    }
+
+    /// #612: with no live server at all, the translator still knows the
+    /// startup-wide secrets, so the funnel redacts.
+    #[tokio::test]
+    async fn test_render_error_redacts_with_no_live_client() {
+        let startup = std::sync::Arc::new(two_server_redactions("bravo-secret-222"));
+        let translator = Translator::new().with_startup_redactions(startup);
+        let server = McplsServer::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            WorkspaceRoots::default(),
+            SubscriptionRegistry::new(),
+            ProjectConfigStatus::NotIgnored,
+            McpConfig::default(),
+        );
+        let rendered = server.render_error(crate::error::Error::InvalidToolParams(
+            "token bravo-secret-222".to_owned(),
+        ));
+        assert!(
+            !rendered.message.contains("bravo-secret-222"),
+            "{}",
+            rendered.message
         );
     }
 

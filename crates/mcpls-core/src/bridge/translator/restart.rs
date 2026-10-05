@@ -390,7 +390,11 @@ impl<'a> Deregistered<'a> {
     /// Put the held backend back; idempotent.
     fn restore(&mut self) {
         if let Some(backend) = self.backend.take() {
-            lock_std(&self.translator.servers).restore(&self.id, backend);
+            let refused = lock_std(&self.translator.servers).restore(&self.id, backend);
+            if refused.is_some() {
+                tracing::warn!(id = %self.id, "restored server dropped: its slot was settled meanwhile");
+            }
+            drop(refused);
         }
     }
 }

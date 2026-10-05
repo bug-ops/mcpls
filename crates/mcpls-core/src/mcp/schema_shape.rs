@@ -182,7 +182,10 @@ fn shape_schema(object: &mut JsonObject, usage: &DefinitionUsage) {
     let shaped = definitions
         .into_iter()
         .map(|(name, definition)| {
-            let mut schema = Schema::try_from(definition).unwrap_or_default();
+            let Ok(mut schema) = Schema::try_from(definition.clone()) else {
+                // Not a schema object: keep it as the generator wrote it.
+                return (name, definition);
+            };
             if usage.is_shared(&name) {
                 shape_shared_definition(&mut schema);
             } else {

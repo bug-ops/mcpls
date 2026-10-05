@@ -358,6 +358,9 @@ impl Redactions {
 
     /// [`Self::apply`] in place; `text` is written only when a secret occurs.
     pub(crate) fn redact_in_place(&self, text: &mut String) {
+        if self.is_empty() {
+            return;
+        }
         if let Cow::Owned(redacted) = self.apply(text) {
             *text = redacted;
         }

@@ -177,8 +177,11 @@ pub struct HttpConfig {
     /// reads it too slowly: a write that goes pending opens a window of this
     /// length, which closes when a flush completes or the peer has taken at
     /// least 2 KiB per second of the window (between 4 KiB and 1 MiB); a
-    /// window that expires first closes the connection. Defaults to
-    /// [`WriteStallTimeout::DEFAULT`].
+    /// window that expires first closes the connection. A streamed (SSE)
+    /// response is flushed after every frame, so each flush closes the window
+    /// and the floor there is one frame per window, the same a quiet
+    /// legitimate subscriber gives; the rate floor binds responses written in
+    /// large buffers. Defaults to [`WriteStallTimeout::DEFAULT`].
     pub write_stall_timeout: WriteStallTimeout,
 }
 

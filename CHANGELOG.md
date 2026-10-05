@@ -119,9 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `Error::McpServer` and `Error::Transport` are replaced by `McpServerStart`, `TaskFailed` and `StdioCapture`, `ResourceUriError::DecodeFailed` is split, and `Error` gains `ResourceUri` and `PathToUri`; resource URI failures keep their source and the idle HTTP session close is time-bounded. (#PR)
 - **Breaking:** `validate_path_against_roots` is replaced by `WorkspaceRoots::validate` and `validate_blocking`, which return `WorkspacePath`; one canonicalization policy, path validation off the async workers, `Translator::cached_diagnostics_uri` is async and `pinned_initialization_options` takes `&WorkspaceRoots`. (#PR)
 - **Breaking:** `Position` holds non-zero integers built by `Position::from_client`, and a client line or column of 0 or above 1,000,000 is rejected by every position tool; `handle_format_range` and `handle_code_actions` take `BoundedRange`, `handle_inlay_hints` takes `PositionRange`. (#PR)
-- **Breaking:** `CallHierarchyItemResult` and `TypeHierarchyItemResult` are merged into `HierarchyItem`, the `item` of `get_incoming_calls` and `get_outgoing_calls` is typed, and `ContextualLocation` and `ContextualDiagnostic` are aliases of `Contextual<T>`. (#PR)
+- **Breaking:** `CallHierarchyItemResult` and `TypeHierarchyItemResult` are merged into `HierarchyItem`, a malformed call hierarchy `item` is now a tool-result error instead of `-32602`, the `item` of `get_incoming_calls` and `get_outgoing_calls` is typed, and `ContextualLocation` and `ContextualDiagnostic` are aliases of `Contextual<T>`. (#PR)
 - `tools/list` shrinks from about 181 KB to about 122 KB: schema descriptions drop rustdoc sections and are capped, with a size budget test. (#PR)
 - **Breaking:** `ServerInitConfig` gains a `redactions` field; `serve` hides the secrets of every configured server in tool and resource errors, and `Redactions` prints counts only in `Debug`. (#PR)
+- **Breaking:** `Translator::set_expected_servers` no longer marks an already registered server expected and keeps the failure of a failed one. (#PR)
 - `Translator` keeps each server's state in one slot and its lifecycle in one phase, so a respawn swaps the running server in one step and a startup failure survives clearing the expected set. (#PR)
 
 ### Fixed

@@ -419,7 +419,8 @@ mod tests {
         check("registered");
         let held = lock_std(&translator.servers).take_for_restart(&id);
         check("taken for restart");
-        lock_std(&translator.servers).restore(&id, held.unwrap());
+        let refused = lock_std(&translator.servers).restore(&id, held.unwrap());
+        assert!(refused.is_none());
         check("restored");
         translator.clear_expected_servers();
         check("expectation cleared");

@@ -43,12 +43,10 @@ approved this mechanism (spec section 8, "Ask First", satisfied; SC-001).
   `bridge/translator/routing.rs` are used by enforcement (`client_for_file`, `handle_workspace_symbol`,
   `require_capability`) and by the report, so the two cannot disagree (NFR-002: enforcement is
   unchanged and stays authoritative).
-- **Snapshot.** `Translator::tool_support_snapshot` copies `expected_servers`, `lsp_servers`,
-  `lsp_clients`, then the router, one lock at a time. Registration writes the client, the server,
-  the router rebind, then clears `expected_servers`; reading `expected_servers` first means a
-  server mid-registration is never seen as neither expected nor registered. The unit test
-  `healthy_server_never_misreported_for_any_write_read_interleaving` checks all 70 interleavings
-  of those four writes with the four reads. The snapshot holds the
+- **Snapshot.** `Translator::tool_support_snapshot` clones the router, then copies the expected,
+  registered and capability data from the translator's server slots under one lock. A server is
+  one slot, so it is never seen as neither expected nor registered; the unit test
+  `server_is_never_misreported_across_registration_and_restart_steps` walks its lifecycle. The snapshot holds the
   router as an `Arc` (copy-on-write on rebind) and each server's advertised `Capability` set, not
   a clone of its `ServerCapabilities`.
 - **Report.** `McpTool` (21 variants) declares each tool's name and backend (`Document`,

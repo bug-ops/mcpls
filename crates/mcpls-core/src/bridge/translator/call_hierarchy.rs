@@ -386,7 +386,7 @@ mod tests {
     }
 
     /// S4 lock-in for the documented `Uri`-validation-loss behavior change
-    /// (see the CHANGELOG entry for #297): `parse_mcp_call_hierarchy_item`
+    /// (see the CHANGELOG entry for #297): the call hierarchy item
     /// can no longer reject a malformed `uri` field at construction time
     /// (`gen-lsp-types`'s `Uri` has no validating parse). This drives a
     /// structurally-valid item whose `uri` field is `file://`-prefixed (so
@@ -445,7 +445,7 @@ mod tests {
     }
 
     /// As above, through `handle_outgoing_calls` -- same
-    /// `parse_mcp_call_hierarchy_item` code path, different caller.
+    /// item handling, different caller.
     #[tokio::test]
     async fn test_handle_outgoing_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
     {

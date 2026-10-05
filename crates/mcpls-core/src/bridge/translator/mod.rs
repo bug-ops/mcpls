@@ -95,7 +95,10 @@ pub struct Translator {
     servers: StdMutex<Servers>,
     /// The translator-wide lifecycle.
     phase: StdMutex<Phase>,
-    /// Union of the live clients' redaction sets, rebuilt on change.
+    /// Secrets of every configured server, known from startup, so error
+    /// text is redacted even while no server is live.
+    startup_redactions: Arc<Redactions>,
+    /// Union of the startup set and the live clients' sets, rebuilt on change.
     merged_redactions: StdMutex<Option<MergedRedactions>>,
     /// Document state tracker. Locks its own state internally, per path.
     document_tracker: Arc<DocumentTracker>,
@@ -160,6 +163,7 @@ impl Translator {
         Self {
             servers: StdMutex::new(Servers::default()),
             phase: StdMutex::new(Phase::default()),
+            startup_redactions: Arc::default(),
             merged_redactions: StdMutex::new(None),
             document_tracker: Arc::new(DocumentTracker::new(
                 ResourceLimits::default(),
@@ -211,6 +215,15 @@ impl Translator {
     #[must_use]
     pub fn with_notification_cache(mut self, cache: Arc<Mutex<NotificationCache>>) -> Self {
         self.notification_cache = Some(cache);
+        self
+    }
+
+    /// Give the translator the secrets of every configured server.
+    ///
+    /// Only called during single-owner setup, before the translator is shared.
+    #[must_use]
+    pub(crate) fn with_startup_redactions(mut self, redactions: Arc<Redactions>) -> Self {
+        self.startup_redactions = redactions;
         self
     }
 
@@ -508,9 +521,12 @@ impl Translator {
     /// redaction sets changes (registration, restart, respawn), outside the
     /// `servers` lock.
     pub(crate) fn server_text_redactions(&self) -> Arc<Redactions> {
-        let sources: Vec<Arc<Redactions>> = lock_std(&self.servers)
-            .clients()
-            .map(|client| Arc::clone(client.redactions()))
+        let sources: Vec<Arc<Redactions>> = std::iter::once(Arc::clone(&self.startup_redactions))
+            .chain(
+                lock_std(&self.servers)
+                    .clients()
+                    .map(|client| Arc::clone(client.redactions())),
+            )
             .filter(|set| !set.is_empty())
             .collect();
         let mut cache = lock_std(&self.merged_redactions);
