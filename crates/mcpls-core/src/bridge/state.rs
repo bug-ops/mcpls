@@ -1731,11 +1731,10 @@ impl Decision {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidUri`] if the path cannot be represented as a
+/// Returns [`Error::PathToUri`] if the path cannot be represented as a
 /// `file://` URI.
 pub fn path_to_uri(path: &Path) -> Result<Uri> {
-    try_path_to_uri(path)
-        .ok_or_else(|| Error::InvalidUri(format!("cannot convert path to URI: {}", path.display())))
+    try_path_to_uri(path).ok_or_else(|| Error::PathToUri(path.to_path_buf()))
 }
 
 /// Convert a file path to a URI, returning `None` if the path cannot be
@@ -2538,7 +2537,7 @@ mod tests {
     #[test]
     fn test_path_to_uri_returns_err_for_relative_path() {
         let err = path_to_uri(Path::new("relative/file.ts")).unwrap_err();
-        assert_matches!(err, Error::InvalidUri(_));
+        assert_matches!(err, Error::PathToUri(_));
     }
 
     #[cfg(windows)]

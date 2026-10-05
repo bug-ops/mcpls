@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::bridge::InvalidClientPath;
+use crate::bridge::resources::ResourceUriError;
 use crate::config::{BuiltinServer, ServerId, ToolKind};
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
@@ -589,6 +590,50 @@ impl fmt::Display for EarlyExitDetail<'_> {
     }
 }
 
+/// A background task whose failure surfaces as [`Error::TaskFailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackgroundTask {
+    /// The MCP service loop that serves one client connection.
+    McpService,
+    /// The task that reads an LSP server's messages.
+    LspReceiver,
+    /// The blocking resolution of `subscriptions/listen` URIs.
+    ListenResolution,
+}
+
+impl fmt::Display for BackgroundTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::McpService => "MCP service",
+            Self::LspReceiver => "LSP receiver",
+            Self::ListenResolution => "listen URI resolution",
+        })
+    }
+}
+
+/// A standard stream of a spawned LSP server process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StdioStream {
+    /// Standard input.
+    Stdin,
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+impl fmt::Display for StdioStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Stdin => "stdin",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
+    }
+}
+
 /// The main error type for mcpls-core operations.
 ///
 /// This enum is `#[non_exhaustive]`: downstream crates that match on it must
@@ -620,9 +665,23 @@ pub enum Error {
         data: Option<serde_json::Value>,
     },
 
-    /// MCP server error.
-    #[error("MCP server error: {0}")]
-    McpServer(String),
+    /// The MCP server could not complete its handshake with the client.
+    #[error("failed to start MCP server: {0}")]
+    McpServerStart(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// A background task panicked or was cancelled.
+    #[error("{task} task failed: {source}")]
+    TaskFailed {
+        /// The task that failed.
+        task: BackgroundTask,
+        /// The join failure, carrying the panic payload or cancellation.
+        #[source]
+        source: tokio::task::JoinError,
+    },
+
+    /// A standard stream of the spawned LSP server could not be captured.
+    #[error("failed to capture LSP server {0}")]
+    StdioCapture(StdioStream),
 
     /// The HTTP transport could not bind its listener.
     #[error("failed to bind HTTP listener on {addr}: {source}")]
@@ -751,10 +810,6 @@ pub enum Error {
     #[error("TOML serialization error: {0}")]
     TomlSer(#[from] toml::ser::Error),
 
-    /// LSP client transport error.
-    #[error("transport error: {0}")]
-    Transport(String),
-
     /// Request timeout, carrying the elapsed limit.
     #[error("request timed out after {0:?}")]
     Timeout(Duration),
@@ -786,9 +841,17 @@ pub enum Error {
     #[error("LSP protocol error: {}", escape_control(.0.as_str()))]
     LspProtocolError(RedactedText),
 
-    /// Invalid URI format.
+    /// Invalid URI text supplied by the client.
     #[error("invalid URI: {0}")]
     InvalidUri(String),
+
+    /// A client-supplied `lsp-diagnostics://` resource URI was rejected.
+    #[error(transparent)]
+    ResourceUri(#[from] ResourceUriError),
+
+    /// A path mcpls itself derived could not be represented as a URI.
+    #[error("cannot convert path to URI: {}", .0.display())]
+    PathToUri(PathBuf),
 
     /// Server process terminated unexpectedly.
     #[error("LSP server process terminated unexpectedly")]
@@ -1199,6 +1262,7 @@ impl Error {
             | Self::PathOutsideWorkspace(_)
             | Self::NotARegularFile(_)
             | Self::InvalidUri(_)
+            | Self::ResourceUri(_)
             | Self::ListenFilterTooLarge { .. }
             | Self::DocumentNotFound(_)
             | Self::FileSizeLimitExceeded { .. } => McpErrorKind::InvalidParams,
@@ -1267,7 +1331,10 @@ impl Error {
 
             Self::LspInitFailed { .. }
             | Self::LspServerError { .. }
-            | Self::McpServer(_)
+            | Self::McpServerStart(_)
+            | Self::TaskFailed { .. }
+            | Self::StdioCapture(_)
+            | Self::PathToUri(_)
             | Self::HttpBind { .. }
             | Self::NoServerForLanguage(_)
             | Self::NoServerForTool { .. }
@@ -1279,7 +1346,6 @@ impl Error {
             | Self::Json(_)
             | Self::TomlDe(_)
             | Self::TomlSer(_)
-            | Self::Transport(_)
             | Self::Timeout(_)
             | Self::ServerSpawnFailed { .. }
             | Self::ServerNotFound { .. }
@@ -1958,6 +2024,7 @@ mod tests {
             Error::PathOutsideWorkspace(PathBuf::from("/etc/passwd")),
             Error::NotARegularFile(PathBuf::from("/dev/null")),
             Error::InvalidUri("not a uri".to_string()),
+            Error::ResourceUri(ResourceUriError::InvalidScheme("x".to_string())),
             Error::DocumentNotFound(PathBuf::from("/missing.rs")),
             Error::FileSizeLimitExceeded { size: 100, max: 10 },
             Error::ListenFilterTooLarge { max: 1000 },
@@ -1971,6 +2038,42 @@ mod tests {
                 "expected {err:?} to classify as InvalidParams"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_mcp_error_kind_internal_failures_are_internal() {
+        let join_error = tokio::spawn(async { panic!("boom") }).await.unwrap_err();
+        let internal_errors = vec![
+            Error::TaskFailed {
+                task: BackgroundTask::McpService,
+                source: join_error,
+            },
+            Error::StdioCapture(StdioStream::Stdin),
+            Error::PathToUri(PathBuf::from("/x")),
+            Error::McpServerStart("handshake".into()),
+        ];
+
+        for err in internal_errors {
+            assert_eq!(
+                err.mcp_error_kind(),
+                McpErrorKind::Internal,
+                "expected {err:?} to classify as Internal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_failed_keeps_the_panic_payload_as_source() {
+        let join_error = tokio::spawn(async { panic!("secret boom") })
+            .await
+            .unwrap_err();
+        let err = Error::TaskFailed {
+            task: BackgroundTask::LspReceiver,
+            source: join_error,
+        };
+        let source = std::error::Error::source(&err).unwrap();
+        assert!(source.to_string().contains("secret boom"), "{source}");
+        assert!(err.to_string().starts_with("LSP receiver task failed"));
     }
 
     #[test]

@@ -1407,7 +1407,7 @@ pub(crate) async fn run_stdio(
 ) -> Result<(), crate::Error> {
     let service = tokio::select! {
         result = mcp_server.serve(rmcp::transport::stdio()) => {
-            result.map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?
+            result.map_err(|e| crate::Error::McpServerStart(Box::new(e)))?
         }
         () = shutdown_signal.recv() => {
             tracing::info!("shutdown signal received during handshake, stopping stdio transport");
@@ -1418,7 +1418,10 @@ pub(crate) async fn run_stdio(
     tokio::select! {
         result = service.waiting() => result
             .map(|_| ())
-            .map_err(|e| crate::Error::McpServer(format!("MCP server error: {e}"))),
+            .map_err(|source| crate::Error::TaskFailed {
+                task: crate::error::BackgroundTask::McpService,
+                source,
+            }),
         () = shutdown_signal.recv() => {
             tracing::info!("shutdown signal received, stopping stdio transport");
             Ok(())
@@ -2216,15 +2219,30 @@ impl CappedSessionManager {
             let inner = std::sync::Arc::clone(&self.inner);
             let id = id.clone();
             tokio::spawn(async move {
-                if let Err(e) = inner.close_session(&id).await {
-                    tracing::debug!(
-                        session = %SessionFingerprint(&id),
-                        "closing idle HTTP session failed: {e}"
-                    );
-                }
+                close_session_bounded(&id, inner.close_session(&id)).await;
             });
         }
         idle_ids.len()
+    }
+}
+
+/// Awaits `close` for at most [`liveness::SESSION_CLOSE_TIMEOUT`], so a wedged
+/// session worker cannot park the detached closing task forever.
+#[cfg(feature = "transport-http")]
+async fn close_session_bounded<E: std::fmt::Display>(
+    id: &SessionId,
+    close: impl std::future::Future<Output = Result<(), E>>,
+) {
+    match tokio::time::timeout(liveness::SESSION_CLOSE_TIMEOUT, close).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(
+            session = %SessionFingerprint(id),
+            "closing idle HTTP session failed: {e}"
+        ),
+        Err(_elapsed) => tracing::debug!(
+            session = %SessionFingerprint(id),
+            "closing idle HTTP session timed out"
+        ),
     }
 }
 
@@ -2689,8 +2707,8 @@ mod tests {
         let result = outcome.unwrap();
         assert_matches!(
             result,
-            Err(crate::Error::McpServer(_)),
-            "expected a McpServer error from the failed handshake, got: {result:?}"
+            Err(crate::Error::McpServerStart(_)),
+            "expected a McpServerStart error from the failed handshake, got: {result:?}"
         );
     }
 
@@ -4659,6 +4677,38 @@ mod tests {
             assert!(manager.activity(&idle_id).is_none());
             assert!(manager.activity(&busy_id).is_some());
             assert!(manager.create_session().await.is_ok());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_close_session_bounded_drops_a_wedged_close_at_the_timeout() {
+            struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for SetOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let guard = SetOnDrop(std::sync::Arc::clone(&dropped));
+            let id: rmcp::transport::streamable_http_server::session::SessionId = "wedged".into();
+            let closer = tokio::spawn(async move {
+                super::super::close_session_bounded(&id, async move {
+                    let _guard = guard;
+                    std::future::pending::<Result<(), std::convert::Infallible>>().await
+                })
+                .await;
+            });
+
+            tokio::task::yield_now().await;
+            tokio::time::advance(
+                super::super::liveness::SESSION_CLOSE_TIMEOUT + std::time::Duration::from_secs(1),
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), closer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         }
 
         // `manager` lives to the end of the test.

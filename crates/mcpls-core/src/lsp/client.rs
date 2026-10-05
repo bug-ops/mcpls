@@ -14,7 +14,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, error, trace, warn};
 
 use crate::config::{LspServerConfig, LspSettings, ServerId};
-use crate::error::{Error, Result};
+use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader};
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
@@ -872,7 +872,10 @@ impl LspClient {
             match task.as_mut() {
                 Some(task) => match task.await {
                     Ok(result) => result,
-                    Err(e) => Err(Error::Transport(format!("Receiver task failed: {e}"))),
+                    Err(source) => Err(Error::TaskFailed {
+                        task: BackgroundTask::LspReceiver,
+                        source,
+                    }),
                 },
                 None => Ok(()),
             }

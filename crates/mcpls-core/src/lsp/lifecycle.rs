@@ -27,7 +27,9 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, LspSettings};
-use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
+use crate::error::{
+    BackgroundTask, Error, Result, ServerSpawnFailure, StartupFailure, StdioStream,
+};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 #[cfg(unix)]
@@ -379,14 +381,14 @@ impl LspServer {
 
         let stdin = child
             .take_stdin()
-            .ok_or_else(|| Error::Transport("Failed to capture stdin".to_string()))?;
+            .ok_or(Error::StdioCapture(StdioStream::Stdin))?;
         let stdout = child
             .take_stdout()
-            .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
+            .ok_or(Error::StdioCapture(StdioStream::Stdout))?;
 
         let stderr = child
             .take_stderr()
-            .ok_or_else(|| Error::Transport("Failed to capture stderr".to_string()))?;
+            .ok_or(Error::StdioCapture(StdioStream::Stderr))?;
         let stderr_capture = StderrCapture::start(stderr);
 
         let transport = LspTransport::with_redactions(stdin, stdout, Arc::clone(&redactions));
@@ -1047,7 +1049,14 @@ where
 /// Whether `error` means the connection to the server is gone, as opposed to
 /// the server answering with a failure of its own.
 const fn is_connection_loss(error: &Error) -> bool {
-    matches!(error, Error::ServerTerminated | Error::Transport(_))
+    matches!(
+        error,
+        Error::ServerTerminated
+            | Error::TaskFailed {
+                task: BackgroundTask::LspReceiver,
+                ..
+            }
+    )
 }
 
 /// Exit status of `child` if it has exited (or does so within
@@ -1072,10 +1081,7 @@ fn spawn_error(command: String, source: std::io::Error) -> Error {
 /// would truncate the path into a URI fragment, and `[` / `]` are rejected
 /// outright by `Uri`.
 fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
-    let uri = try_path_to_uri(root).ok_or_else(|| {
-        let root_display = root.display();
-        Error::InvalidUri(format!("Invalid workspace root: {root_display}"))
-    })?;
+    let uri = try_path_to_uri(root).ok_or_else(|| Error::PathToUri(root.to_path_buf()))?;
     Ok(WorkspaceFolder {
         uri,
         name: root
@@ -1312,7 +1318,7 @@ mod tests {
     #[test]
     fn test_workspace_folder_rejects_relative_root() {
         let err = workspace_folder(Path::new("relative/root")).unwrap_err();
-        assert_matches!(err, Error::InvalidUri(_), "got {err:?}");
+        assert_matches!(err, Error::PathToUri(_), "got {err:?}");
     }
 
     #[test]
@@ -1601,10 +1607,19 @@ mod tests {
         assert_matches!(err, Error::ServerNotFound { .. }, "got {err:?}");
     }
 
-    #[test]
-    fn test_is_connection_loss_excludes_server_replies() {
+    #[tokio::test]
+    async fn test_is_connection_loss_excludes_server_replies() {
+        let join_error = tokio::spawn(async { panic!("receiver died") })
+            .await
+            .unwrap_err();
         assert!(is_connection_loss(&Error::ServerTerminated));
-        assert!(is_connection_loss(&Error::Transport("eof".to_string())));
+        assert!(is_connection_loss(&Error::TaskFailed {
+            task: BackgroundTask::LspReceiver,
+            source: join_error,
+        }));
+        assert!(!is_connection_loss(&Error::StdioCapture(
+            StdioStream::Stdin
+        )));
         assert!(!is_connection_loss(&Error::LspServerError {
             code: -32603,
             message: "bad".to_string(),

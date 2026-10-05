@@ -1434,7 +1434,7 @@ impl McplsServer {
         let accepted = accepted.to_vec();
         let uris = tokio::task::spawn_blocking(move || ListenUris::resolve(&accepted, &roots))
             .await
-            .map_err(|e| listen_join_error(&e))?;
+            .map_err(listen_join_error)?;
         if uris.is_empty() {
             return Err(no_resolvable_listen_uris());
         }
@@ -1496,14 +1496,31 @@ fn start_listen_lease(context: &SubscriptionContext) {
     }
 }
 
+/// A well-formed resource URI whose path cannot be resolved (deleted, outside
+/// the workspace): unsubscribing falls back to the recorded alias (#499).
+/// Every other failure is a malformed URI or an internal fault.
+const fn is_unresolvable_resource(error: &crate::error::Error) -> bool {
+    use crate::error::Error;
+    matches!(
+        error,
+        Error::PathOutsideWorkspace(_)
+            | Error::FileIo { .. }
+            | Error::MalformedPath { .. }
+            | Error::NoWorkspaceRoots(_)
+    )
+}
+
 fn no_resolvable_listen_uris() -> crate::error::Error {
     crate::error::Error::InvalidUri(
         "none of the requested resource URIs resolve inside the workspace".to_owned(),
     )
 }
 
-fn listen_join_error(e: &tokio::task::JoinError) -> crate::error::Error {
-    crate::error::Error::McpServer(format!("subscriptions/listen resolution: {e}"))
+const fn listen_join_error(source: tokio::task::JoinError) -> crate::error::Error {
+    crate::error::Error::TaskFailed {
+        task: crate::error::BackgroundTask::ListenResolution,
+        source,
+    }
 }
 
 // `list_resources` is synchronous (no `.await`), but `ServerHandler::list_resources`
@@ -1687,8 +1704,8 @@ impl ServerHandler for McplsServer {
                     &self.context.workspace_roots,
                 ) {
                     Ok(resolved) => Some(resolved.uri),
-                    Err(e @ crate::error::Error::InvalidUri(_)) => return Err(map_bridge_error(e)),
-                    Err(_) => None,
+                    Err(e) if is_unresolvable_resource(&e) => None,
+                    Err(e) => return Err(map_bridge_error(e)),
                 };
 
                 if !session.unsubscribe(canonical.as_ref(), &request.uri).await {
@@ -4840,6 +4857,28 @@ sleep 0.3
         assert!(!subscriptions.contains(&canonical_uri).await);
     }
 
+    #[test]
+    fn test_unsubscribe_resolution_failures_split_malformed_from_unresolvable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+
+        let malformed = DiagnosticsResourceUri::resolve("file:///a.rs", &roots).unwrap_err();
+        assert!(!is_unresolvable_resource(&malformed), "{malformed:?}");
+
+        let missing = make_uri(&base.join("gone.rs")).unwrap();
+        let deleted = DiagnosticsResourceUri::resolve(&missing, &roots).unwrap_err();
+        assert!(is_unresolvable_resource(&deleted), "{deleted:?}");
+
+        let outside = make_uri(std::path::Path::new("/definitely/outside.rs")).unwrap();
+        let escaped = DiagnosticsResourceUri::resolve(&outside, &roots).unwrap_err();
+        assert!(is_unresolvable_resource(&escaped), "{escaped:?}");
+
+        assert!(!is_unresolvable_resource(&crate::error::Error::PathToUri(
+            std::path::PathBuf::from("/x")
+        )));
+    }
+
     /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
     #[tokio::test]
     async fn test_subscription_cap_enforced_in_handler_context() {
@@ -4975,7 +5014,7 @@ sleep 0.3
     async fn test_listen_join_error_maps_to_internal_error() {
         let handle = tokio::spawn(std::future::pending::<()>());
         handle.abort();
-        let err = listen_join_error(&handle.await.unwrap_err());
+        let err = listen_join_error(handle.await.unwrap_err());
         assert_eq!(map_bridge_error(err).code, ErrorCode::INTERNAL_ERROR);
     }
 

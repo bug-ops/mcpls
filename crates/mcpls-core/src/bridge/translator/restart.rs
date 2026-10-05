@@ -169,7 +169,8 @@ impl RestartFailure {
             Error::LspInitFailed { .. }
             | Error::ServerExitedDuringInit { .. }
             | Error::ServerTerminated
-            | Error::Transport(_)
+            | Error::TaskFailed { .. }
+            | Error::StdioCapture(_)
             | Error::Timeout(_)
             | Error::LspServerError { .. }
             | Error::LspProtocolError(_)
@@ -178,7 +179,8 @@ impl RestartFailure {
             | Error::Json(_)
             // Spawning a replacement never yields the variants below; they are
             // reported as an initialization failure rather than a new reason.
-            | Error::McpServer(_)
+            | Error::McpServerStart(_)
+            | Error::PathToUri(_)
             | Error::HttpBind { .. }
             | Error::InvalidClientPath(_)
             | Error::MalformedPath { .. }
@@ -198,6 +200,7 @@ impl RestartFailure {
             | Error::TomlDe(_)
             | Error::TomlSer(_)
             | Error::InvalidUri(_)
+            | Error::ResourceUri(_)
             | Error::ServerUnavailable { .. }
             | Error::InvalidToolParams(_)
             | Error::FileIo { .. }
