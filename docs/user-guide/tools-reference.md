@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete reference for all 29 MCP tools provided by mcpls.
+Complete reference for all 31 MCP tools provided by mcpls.
 
 ## Overview
 
