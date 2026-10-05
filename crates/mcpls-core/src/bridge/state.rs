@@ -509,6 +509,17 @@ pub struct PendingCloseClaim<'a> {
     _path_guard: PathLockGuard<'a>,
 }
 
+/// Whether a tracked document has a given line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinePresence {
+    /// The document is not tracked, so its extent is unknown.
+    Untracked,
+    /// The document has the line.
+    Present,
+    /// The document is tracked and ends before the line.
+    Beyond,
+}
+
 /// Tracks document state across the workspace.
 ///
 /// Every method takes `&self`: the document map and the per-path locks used
@@ -622,6 +633,18 @@ impl DocumentTracker {
     pub fn line_text(&self, path: &Path, line: u32) -> Option<String> {
         let documents = lock_std(&self.documents);
         documents.get(path)?.text.line(line).map(str::to_string)
+    }
+
+    /// Whether `path`'s tracked content has a 0-based `line`'th line.
+    ///
+    /// Checked under the documents lock without copying any text.
+    #[must_use]
+    pub(crate) fn line_presence(&self, path: &Path, line: u32) -> LinePresence {
+        match lock_std(&self.documents).get(path) {
+            None => LinePresence::Untracked,
+            Some(document) if document.text.line(line).is_some() => LinePresence::Present,
+            Some(_) => LinePresence::Beyond,
+        }
     }
 
     /// Up to `max_lines` of `path`'s tracked lines from the 0-based
@@ -2288,6 +2311,25 @@ mod tests {
         assert_eq!(cloned.language_id(), state.language_id());
         assert_eq!(cloned.version(), 5);
         assert_eq!(cloned.content(), state.content());
+    }
+
+    #[test]
+    fn test_line_presence_distinguishes_untracked_present_and_beyond() {
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/test/lines.rs");
+        assert_eq!(tracker.line_presence(&path, 0), LinePresence::Untracked);
+
+        tracker.open(path.clone(), "a\r\nb\n".to_string()).unwrap();
+        assert_eq!(tracker.line_presence(&path, 0), LinePresence::Present);
+        assert_eq!(tracker.line_presence(&path, 1), LinePresence::Present);
+        assert_eq!(tracker.line_presence(&path, 2), LinePresence::Present);
+        assert_eq!(tracker.line_presence(&path, 3), LinePresence::Beyond);
+        assert_eq!(tracker.line_presence(&path, u32::MAX), LinePresence::Beyond);
+
+        let empty = PathBuf::from("/test/empty.rs");
+        tracker.open(empty.clone(), String::new()).unwrap();
+        assert_eq!(tracker.line_presence(&empty, 0), LinePresence::Present);
+        assert_eq!(tracker.line_presence(&empty, 1), LinePresence::Beyond);
     }
 
     #[test]

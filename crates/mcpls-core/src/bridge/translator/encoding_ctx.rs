@@ -444,6 +444,22 @@ mod tests {
         assert!(ctx.is_out_of_workspace(&path_to_uri(&base.join("other/main.rs")).unwrap()));
     }
 
+    /// #605: a server location under the `/tmp` spelling of a root configured
+    /// as `/private/tmp/..` is inside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_is_out_of_workspace_false_under_system_symlink_alias() {
+        let dir = TempDir::new_in("/tmp").unwrap();
+        let canonical = dunce::canonicalize(dir.path()).unwrap();
+        assert!(canonical.starts_with("/private/tmp"));
+        let roots = WorkspaceRoots::from_configured(&[canonical]).unwrap();
+        let ctx = test_ctx_with_roots(PositionEncoding::Utf16, roots);
+
+        let alias_spelling = dir.path().join("a.rs");
+        assert!(alias_spelling.starts_with("/tmp"));
+        assert!(!ctx.is_out_of_workspace(&path_to_uri(&alias_spelling).unwrap()));
+    }
+
     #[test]
     fn test_is_out_of_workspace_true_when_uri_outside_configured_roots() {
         let dir = TempDir::new().unwrap();

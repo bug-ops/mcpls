@@ -319,9 +319,10 @@ and no configured or logical spelling covers it. Status: implemented.
 | FR-021 | Any `read_dir("/")` or `read_link` failure SHALL yield no aliases, be logged at debug level, and SHALL NOT fail startup (#348) | must |
 | FR-022 | THE SYSTEM SHALL keep the lexical pre-check and the canonical containment check unchanged. Edit URIs from servers stay behind `contains_canonical` | must |
 
-Non-goals: links not located directly under `/` (`~/link`) stay unadmitted unless configured, and
-`Location.out_of_workspace` stays canonical-only, so a `/tmp`-spelled server location may still read
-`out_of_workspace: true` (alias-aware flag: #605). Non-Unix platforms add no system aliases.
+Non-goals: links not located directly under `/` (`~/link`) stay unadmitted unless configured.
+`Location.out_of_workspace` goes through the same admitted spellings (`admits_uri`), so a
+`/tmp`-spelled server location reads `out_of_workspace: false` (#605). Non-Unix platforms add no
+system aliases.
 
 Tests: a unix symlink-table test over a tempdir standing in for `/`, a forged-alias test
 (`p/a/../b` lexically vs physically), an unreadable-directory test, `..`/sibling rejection without

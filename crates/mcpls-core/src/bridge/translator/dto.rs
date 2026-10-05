@@ -44,6 +44,88 @@ pub enum InvalidPosition {
     TooLarge,
 }
 
+/// Largest tab size a client may request for formatting.
+pub const MAX_TAB_SIZE: u32 = 32;
+
+/// Tab size used when a formatting request gives none.
+const DEFAULT_TAB_SIZE: u32 = 4;
+
+/// A tab size outside 1 to [`MAX_TAB_SIZE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("tab_size must be between 1 and {MAX_TAB_SIZE}, got {0}")]
+pub struct InvalidTabSize(pub u32);
+
+/// The tab size a formatting request asks the server for: 1 to
+/// [`MAX_TAB_SIZE`], 4 by default.
+///
+/// Deserializes from a JSON integer and rejects out-of-range values as
+/// invalid params, so an unbounded `u32` never reaches a language server.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{InvalidTabSize, MAX_TAB_SIZE, TabSize};
+///
+/// assert_eq!(TabSize::default().get(), 4);
+/// assert_eq!(TabSize::try_from(MAX_TAB_SIZE)?.get(), MAX_TAB_SIZE);
+/// assert_eq!(TabSize::try_from(0), Err(InvalidTabSize(0)));
+/// assert_eq!(TabSize::try_from(MAX_TAB_SIZE + 1), Err(InvalidTabSize(MAX_TAB_SIZE + 1)));
+/// # Ok::<(), InvalidTabSize>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct TabSize(NonZeroU32);
+
+impl TabSize {
+    /// The wrapped tab size, within 1 to [`MAX_TAB_SIZE`].
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl Default for TabSize {
+    fn default() -> Self {
+        const DEFAULT: TabSize = match NonZeroU32::new(DEFAULT_TAB_SIZE) {
+            Some(size) => TabSize(size),
+            None => panic!("the default tab size must be non-zero"),
+        };
+        DEFAULT
+    }
+}
+
+impl TryFrom<u32> for TabSize {
+    type Error = InvalidTabSize;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match NonZeroU32::new(value) {
+            Some(size) if value <= MAX_TAB_SIZE => Ok(Self(size)),
+            _ => Err(InvalidTabSize(value)),
+        }
+    }
+}
+
+impl From<TabSize> for u32 {
+    fn from(size: TabSize) -> Self {
+        size.get()
+    }
+}
+
+impl JsonSchema for TabSize {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TabSize".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_TAB_SIZE,
+            "default": DEFAULT_TAB_SIZE,
+        })
+    }
+}
+
 /// Why a client-supplied range was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum InvalidRange {

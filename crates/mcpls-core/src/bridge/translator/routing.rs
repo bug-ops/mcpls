@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use super::Translator;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
-use crate::bridge::{ClientPath, InFlightGuard, WorkspacePath, lock_std};
+use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, WorkspacePath, lock_std};
 use crate::config::{LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
@@ -28,6 +28,7 @@ pub(super) struct PreparedDocument {
     server_id: ServerId,
     client: LspClient,
     uri: lsp_types::Uri,
+    path: PathBuf,
     _in_flight: InFlightGuard,
 }
 
@@ -42,6 +43,10 @@ impl PreparedDocument {
 
     pub(super) const fn uri(&self) -> &lsp_types::Uri {
         &self.uri
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -948,8 +953,41 @@ impl Translator {
             server_id,
             client,
             uri,
+            path: validated_path.to_path_buf(),
             _in_flight: in_flight,
         })
+    }
+
+    /// Rejects a position whose line lies beyond the end of `doc`'s tracked
+    /// content, before any LSP request is made.
+    ///
+    /// Runs after the gates in `prepare_gated_document`, so an indexing wait
+    /// precedes the check. A document that is no longer tracked passes: its
+    /// extent is unknown, and the server stays the authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PositionBeyondDocument`] when the line is past the end.
+    pub(super) fn require_line_in_document(
+        &self,
+        doc: &PreparedDocument,
+        position: Position,
+    ) -> Result<()> {
+        let line = position.line();
+        match self
+            .document_tracker
+            .line_presence(doc.path(), line.get().saturating_sub(1))
+        {
+            LinePresence::Present => Ok(()),
+            LinePresence::Beyond => Err(Error::PositionBeyondDocument { line }),
+            LinePresence::Untracked => {
+                tracing::debug!(
+                    line = line.get(),
+                    "skipping the line check for an untracked document"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Like [`Self::prepare_document`], but checks `capability` against the
@@ -3048,7 +3086,11 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_format_document(client_path(path.to_string_lossy().into_owned()), 4, true)
+            .handle_format_document(
+                client_path(path.to_string_lossy().into_owned()),
+                crate::bridge::TabSize::default(),
+                true,
+            )
             .await;
 
         assert_matches!(
@@ -3375,7 +3417,11 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_declaration(client_path(&path), Position::at(1, 1))
+            .handle_declaration(
+                client_path(&path),
+                Position::at(1, 1),
+                crate::bridge::ResultContext::None,
+            )
             .await;
 
         assert_matches!(

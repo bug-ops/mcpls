@@ -4,6 +4,14 @@
     "title": "Format Document",
     "description": "Format document with language-specific rules. Returns text edits for indentation, spacing, and style. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact.",
     "inputSchema": {
+      "$defs": {
+        "TabSize": {
+          "default": 4,
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "file_path": {
@@ -16,11 +24,9 @@
           "type": "boolean"
         },
         "tab_size": {
+          "$ref": "#/$defs/TabSize",
           "default": 4,
-          "description": "Tab size for formatting (default: 4).",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+          "description": "Tab size for formatting (1 to 32, default: 4)."
         }
       },
       "required": [
@@ -137,8 +143,16 @@
   {
     "name": "format_range",
     "title": "Format Range",
-    "description": "Format only a range with language-specific rules. Returns text edits the server reports for that range; edits are not filtered or applied. Keep the range end inside the file. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Format only a range with language-specific rules. Returns text edits the server reports for that range; edits are not filtered or applied. A line past the end of the file is rejected. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
+      "$defs": {
+        "TabSize": {
+          "default": 4,
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "end_character": {
@@ -175,11 +189,9 @@
           "type": "integer"
         },
         "tab_size": {
+          "$ref": "#/$defs/TabSize",
           "default": 4,
-          "description": "Tab size for formatting (default: 4).",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+          "description": "Tab size for formatting (1 to 32, default: 4)."
         }
       },
       "required": [
@@ -4343,8 +4355,23 @@
   {
     "name": "go_to_declaration",
     "title": "Go to Declaration",
-    "description": "Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
+    "description": "Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
+      "$defs": {
+        "ResultContext": {
+          "description": "Extra context a tool can attach to each returned item.",
+          "oneOf": [
+            {
+              "const": "none",
+              "type": "string"
+            },
+            {
+              "const": "enclosing_symbol",
+              "type": "string"
+            }
+          ]
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -4352,6 +4379,11 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "context": {
+          "$ref": "#/$defs/ResultContext",
+          "default": "none",
+          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
         },
         "file_path": {
           "description": "Absolute path to the file.",

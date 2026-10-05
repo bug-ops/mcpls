@@ -126,6 +126,7 @@ fn full_caps() -> lsp_types::ServerCapabilities {
         definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
         implementation_provider: Some(lsp_types::ImplementationProvider::Bool(true)),
         type_definition_provider: Some(lsp_types::TypeDefinitionProvider::Bool(true)),
+        declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
         document_symbol_provider: Some(lsp_types::DocumentSymbolProvider::Bool(true)),
         ..Default::default()
     }
@@ -587,16 +588,23 @@ enum Goto {
     Definition,
     Implementation,
     TypeDefinition,
+    Declaration,
 }
 
 impl Goto {
-    const ALL: [Self; 3] = [Self::Definition, Self::Implementation, Self::TypeDefinition];
+    const ALL: [Self; 4] = [
+        Self::Definition,
+        Self::Implementation,
+        Self::TypeDefinition,
+        Self::Declaration,
+    ];
 
     const fn method(self) -> &'static str {
         match self {
             Self::Definition => "textDocument/definition",
             Self::Implementation => "textDocument/implementation",
             Self::TypeDefinition => "textDocument/typeDefinition",
+            Self::Declaration => "textDocument/declaration",
         }
     }
 }
@@ -629,6 +637,12 @@ async fn run_goto(
                 Goto::TypeDefinition => serde_json::to_value(
                     translator
                         .handle_type_definition(client_path(path), pos(1, 1), context)
+                        .await
+                        .unwrap(),
+                ),
+                Goto::Declaration => serde_json::to_value(
+                    translator
+                        .handle_declaration(client_path(path), pos(1, 1), context)
                         .await
                         .unwrap(),
                 ),

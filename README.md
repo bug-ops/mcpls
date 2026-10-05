@@ -165,7 +165,7 @@ Position-based tools (`get_hover`, `get_definition`, `get_references`, `go_to_im
 | Tool | What it does |
 |------|--------------|
 | `get_hover` | Type signatures, documentation, inferred types at any position |
-| `get_definition` | Jump to where a symbol is defined — across files, across crates (also accepts `context: "enclosing_symbol"`, like `go_to_implementation`, `go_to_type_definition` and `get_diagnostics`) |
+| `get_definition` | Jump to where a symbol is defined — across files, across crates (also accepts `context: "enclosing_symbol"`, like `go_to_implementation`, `go_to_type_definition`, `go_to_declaration` and `get_diagnostics`) |
 | `get_references` | Every usage of a symbol in your workspace; opt in to the enclosing symbol of each hit with `context: "enclosing_symbol"` |
 | `get_completions` | Context-aware suggestions that respect types and scope |
 | `get_document_symbols` | Structured outline — functions, types, constants, imports |

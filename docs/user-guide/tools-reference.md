@@ -59,11 +59,12 @@ neither blocks or filters the result, they just tell the caller when to apply ex
 
 ### Enclosing-Symbol Context
 
-`get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and
-`get_diagnostics` accept an optional `context` parameter: `"none"` (the default) or
-`"enclosing_symbol"`. With the default, the response is exactly what it was before the parameter
-existed and mcpls issues no extra LSP request. `get_cached_diagnostics` does not accept it, because
-it promises no new analysis. `go_to_declaration` does not accept it either (#608); other tools ignore an unknown `context` field. With `symbol_name` addressing the context applies to the returned locations as usual.
+`get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition`,
+`go_to_declaration` and `get_diagnostics` accept an optional `context` parameter: `"none"` (the
+default) or `"enclosing_symbol"`. With the default, the response is exactly what it was before the
+parameter existed and mcpls issues no extra LSP request. `get_cached_diagnostics` does not accept
+it, because it promises no new analysis. Other tools ignore an unknown `context` field. With
+`symbol_name` addressing the context applies to the returned locations as usual.
 
 With `"enclosing_symbol"`, each location or diagnostic gains an `enclosing_symbol` field naming the
 innermost symbol of its file that contains it, found with one `textDocument/documentSymbol` request
@@ -769,7 +770,7 @@ Format a document according to language server rules.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `tab_size` | integer | No | Tab size for formatting (default: 4); not bounded yet (#606) |
+| `tab_size` | integer | No | Tab size for formatting, 1 to 32 (default: 4); other values are rejected as invalid params |
 | `insert_spaces` | boolean | No | Use spaces instead of tabs (default: true) |
 
 ### Returns
@@ -1289,7 +1290,8 @@ without a declaration concept may return the definition; an empty result is vali
 {
   "file_path": "/path/to/file.cpp",
   "line": 10,
-  "character": 5
+  "character": 5,
+  "context": "none"
 }
 ```
 
@@ -1298,11 +1300,13 @@ without a declaration concept may return the definition; an empty result is vali
 | `file_path` | string | Yes | Absolute path to the file |
 | `line` | integer | Yes | Line number (1-based) |
 | `character` | integer | Yes | Character position (1-based) |
+| `context` | string | No | `none` (default) or `enclosing_symbol`; see [Enclosing-Symbol Context](#enclosing-symbol-context) |
 
 ### Returns
 
 Locations in the same shape as [go_to_implementation](#go_to_implementation), including
-`truncated` and `positions_degraded`.
+`truncated`, `positions_degraded` and, with `context: "enclosing_symbol"`, `enclosing_symbol` and `enrichment`.
+`go_to_declaration` takes a position only, not `symbol_name` addressing.
 
 ---
 
@@ -1411,7 +1415,7 @@ Format only a range of a document.
 | `file_path` | string | Yes | Absolute path to the file |
 | `start_line`, `start_character` | integer | Yes | Start of the range (1-based) |
 | `end_line`, `end_character` | integer | Yes | End of the range (1-based) |
-| `tab_size` | integer | No | Tab size for formatting (default: 4); not bounded yet (#606) |
+| `tab_size` | integer | No | Tab size for formatting, 1 to 32 (default: 4); other values are rejected as invalid params |
 | `insert_spaces` | boolean | No | Use spaces instead of tabs (default: true) |
 
 ### Returns
@@ -1422,7 +1426,7 @@ Same shape as `format_document`: an `edits` array of `{ range, new_text }` plus 
 
 - Returns an edit plan; nothing is applied
 - Edits are not capped, like `format_document`
-- The range is not checked against the document length: keep it inside the file (#607)
+- A start or end line beyond the end of the document is rejected as invalid params before the request; a character past the end of its line is forwarded and the server clamps it to the line length (LSP 3.17), so `end_character: 999` means through the end of the line
 - Verified live on clangd and typescript-language-server; rust-analyzer does not advertise range formatting, so the call reports `capability_not_advertised` (see `get_tool_support`)
 
 ---
@@ -1453,8 +1457,8 @@ A `status` field selects the shape:
 
 - Requires a server advertising `prepareProvider`; mcpls advertises `rename.prepareSupport` so servers such as typescript-language-server answer with a range
 - Waits for indexing like `rename_symbol`, so a mid-index "not renameable" cannot mislead
-- An out-of-range position stays an error and is not reported as `not_renameable`; servers that answer an out-of-range line with `null` read as `not_renameable` (#607)
-- clangd reports "no symbol here" and "line out of range" as server error `-32001`, so on clangd a non-renameable position can surface as a server error rather than `not_renameable`
+- A line beyond the end of the document is rejected as invalid params before the request; a character past the end of its line is forwarded and clamped by the server
+- A server error `-32602` or `-32001` (LSP's catch-all `UnknownErrorCode`, which clangd uses for "no symbol here") reads as `not_renameable` with the server's text in `server_message`; a genuine server failure reported with `-32001` reads the same way. rust-analyzer's "Invalid offset" `-32602` stays an error
 
 ---
 
@@ -1590,7 +1594,7 @@ One entry per targeted server, sorted by id:
 **Format**: Absolute path
 **Validation**: Must be non-empty, free of NUL bytes, and exist within workspace roots
 
-A path is accepted when it names a location under a workspace root through one of these spellings: the root's canonical (symlink-free) path, the root exactly as configured, or the logical working directory (`$PWD`) when it resolves to the same directory as the real working directory. The path is then resolved on disk and must still lie under a root, so a symlink inside a root that points elsewhere is rejected. Root-level system symlinks are admitted too: when a root lies under a link directly below `/` (for example `/tmp` on macOS, which points to `/private/tmp`), the link spelling of that root is accepted, after checking that it resolves to the same directory. Every other symlink spelling, including a link deeper in the tree such as `~/link`, is rejected with `PathOutsideWorkspace`, even though earlier versions accepted it; use one of the spellings above. The `out_of_workspace` result flag stays canonical-only (alias-aware flag: #605), so a location a server reports under a `/tmp` spelling can read `true` even though that spelling is admitted as input. Paths outside every root are rejected before the filesystem is consulted, so the error does not reveal whether such a file exists.
+A path is accepted when it names a location under a workspace root through one of these spellings: the root's canonical (symlink-free) path, the root exactly as configured, or the logical working directory (`$PWD`) when it resolves to the same directory as the real working directory. The path is then resolved on disk and must still lie under a root, so a symlink inside a root that points elsewhere is rejected. Root-level system symlinks are admitted too: when a root lies under a link directly below `/` (for example `/tmp` on macOS, which points to `/private/tmp`), the link spelling of that root is accepted, after checking that it resolves to the same directory. Every other symlink spelling, including a link deeper in the tree such as `~/link`, is rejected with `PathOutsideWorkspace`, even though earlier versions accepted it; use one of the spellings above. The `out_of_workspace` result flag uses the same admitted spellings, so a location a server reports under a `/tmp` spelling reads `false` when its root lies under `/private/tmp`. Paths outside every root are rejected before the filesystem is consulted, so the error does not reveal whether such a file exists.
 
 ```json
 {

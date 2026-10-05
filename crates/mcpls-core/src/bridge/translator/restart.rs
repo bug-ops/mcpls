@@ -203,6 +203,7 @@ impl RestartFailure {
             | Error::InvalidPositionInput(_)
             | Error::InvalidRangeInput(_)
             | Error::InvalidHierarchyItemInput(_)
+            | Error::PositionBeyondDocument { .. }
             | Error::ServerUnavailable { .. }
             | Error::InvalidToolParams(_)
             | Error::FileIo { .. }
