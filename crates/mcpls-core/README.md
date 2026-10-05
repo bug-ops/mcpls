@@ -47,6 +47,8 @@ flowchart LR
 | `bridge/` | Position encoding, document state, notification cache, request translation |
 | `lsp/` | JSON-RPC 2.0 client, process management, notification handling, protocol types |
 | `config/` | TOML parsing, server discovery, workspace configuration |
+| `runtime/` | Internal: diagnostics pump, background server startup, shutdown sequence |
+| `transport/` | Stdio and HTTP runners; HTTP config, `Host`/`Origin` allowlists, session management |
 
 ## Usage
 
