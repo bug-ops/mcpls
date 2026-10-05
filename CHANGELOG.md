@@ -122,6 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `CallHierarchyItemResult` and `TypeHierarchyItemResult` are merged into `HierarchyItem`, the `item` of `get_incoming_calls` and `get_outgoing_calls` is typed, and `ContextualLocation` and `ContextualDiagnostic` are aliases of `Contextual<T>`. (#PR)
 - `tools/list` shrinks from about 181 KB to about 122 KB: schema descriptions drop rustdoc sections and are capped, with a size budget test. (#PR)
 - **Breaking:** `ServerInitConfig` gains a `redactions` field; `serve` hides the secrets of every configured server in tool and resource errors, and `Redactions` prints counts only in `Debug`. (#PR)
+- `Translator` keeps each server's state in one slot and its lifecycle in one phase, so a respawn swaps the running server in one step and a startup failure survives clearing the expected set. (#PR)
 
 ### Fixed
 
