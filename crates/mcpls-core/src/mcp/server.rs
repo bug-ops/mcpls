@@ -3168,7 +3168,9 @@ mod tests {
                 "end": {"line": 0, "character": 10}
             }
         });
-        let params = Parameters(CallHierarchyCallsParams { item });
+        let params = Parameters(CallHierarchyCallsParams {
+            item: serde_json::from_value(item).unwrap(),
+        });
         let result = server.get_incoming_calls(params).await;
         assert!(result.is_err());
     }
@@ -3190,7 +3192,9 @@ mod tests {
                 "end": {"line": 0, "character": 10}
             }
         });
-        let params = Parameters(CallHierarchyCallsParams { item });
+        let params = Parameters(CallHierarchyCallsParams {
+            item: serde_json::from_value(item).unwrap(),
+        });
         let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
     }
@@ -5636,17 +5640,18 @@ sleep 0.3
                 "end": {"line": 0, "character": 10}
             });
             CallHierarchyCallsParams {
-                item: serde_json::json!({
+                item: serde_json::from_value(serde_json::json!({
                     "name": "f", "kind": 12, "uri": uri,
                     "range": range, "selectionRange": range
-                }),
+                }))
+                .unwrap(),
             }
         };
         let type_item = || {
             let uri = url::Url::from_file_path(file).unwrap().to_string();
             let at = |character| crate::bridge::Position2D { line: 1, character };
             TypeHierarchyWalkParams {
-                item: crate::bridge::TypeHierarchyItemResult {
+                item: crate::bridge::HierarchyItem {
                     name: "T".to_string(),
                     kind: 5,
                     detail: None,

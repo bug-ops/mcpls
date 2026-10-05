@@ -360,3 +360,8 @@ pub(super) use sh_servers::{
     pid_is_running, stub_server_config, write_crash_after_init_script,
     write_protocol_server_script, write_responder_script, write_slow_exit_server_script,
 };
+
+/// A hierarchy item parsed from JSON, panicking on a malformed one.
+pub(super) fn hierarchy_item(json: serde_json::Value) -> super::dto::HierarchyItem {
+    serde_json::from_value(json).expect("fixture hierarchy item is valid")
+}

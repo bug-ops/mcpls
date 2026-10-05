@@ -14,7 +14,7 @@ use super::dto::{
     DefinitionResult, HoverResult, Location, LocationsResult, Position, PositionDegradation,
     ReferencesResult,
 };
-use super::enclosing::{ContextualLocation, ContextualLocations, ResultContext};
+use super::enclosing::{ContextualLocation, Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::indexing::{
@@ -522,7 +522,7 @@ impl Translator {
         &self,
         normalized: NormalizedLocations,
         context: ResultContext,
-    ) -> ContextualLocations {
+    ) -> Contextualized<Location> {
         self.contextualize_locations(normalized.locations, context, normalized.positions_degraded)
             .await
     }
@@ -592,8 +592,8 @@ impl Translator {
             )
             .await?;
         let truncated = normalized.truncated;
-        let ContextualLocations {
-            locations,
+        let Contextualized {
+            items: locations,
             enrichment,
             positions_degraded,
         } = self.contextualize(normalized, context).await;
@@ -646,8 +646,8 @@ impl Translator {
 
         let normalized = lsp_locations_to_mcp(response.unwrap_or_default(), &ctx).await;
         let truncated = normalized.truncated;
-        let ContextualLocations {
-            locations,
+        let Contextualized {
+            items: locations,
             enrichment,
             positions_degraded,
         } = self.contextualize(normalized, context).await;
@@ -684,8 +684,8 @@ impl Translator {
             )
             .await?;
         let truncated = normalized.truncated;
-        let ContextualLocations {
-            locations,
+        let Contextualized {
+            items: locations,
             enrichment,
             positions_degraded,
         } = self.contextualize(normalized, context).await;
@@ -723,8 +723,8 @@ impl Translator {
             )
             .await?;
         let truncated = normalized.truncated;
-        let ContextualLocations {
-            locations,
+        let Contextualized {
+            items: locations,
             enrichment,
             positions_degraded,
         } = self.contextualize(normalized, context).await;

@@ -1054,7 +1054,7 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.\n\nSerializes as the item's own fields with `enclosing_symbol` alongside, so\nthe default output of a tool is unchanged.",
           "properties": {
             "enclosing_symbol": {
               "$ref": "#/$defs/EnclosingSymbolOutcome",
@@ -1462,7 +1462,7 @@
     "outputSchema": {
       "$defs": {
         "ContextualDiagnostic": {
-          "description": "A [`Diagnostic`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.\n\nSerializes as the item's own fields with `enclosing_symbol` alongside, so\nthe default output of a tool is unchanged.",
           "properties": {
             "code": {
               "description": "Optional diagnostic code.",
@@ -2330,24 +2330,12 @@
     "title": "Incoming Calls",
     "description": "Functions calling the specified item. Takes call hierarchy item, returns callers, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "item": {
-          "description": "The call hierarchy item to get calls for (from prepare response)."
-        }
-      },
-      "required": [
-        "item"
-      ],
-      "type": "object"
-    },
-    "outputSchema": {
       "$defs": {
-        "CallHierarchyItemResult": {
-          "description": "A call hierarchy item.",
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
           "properties": {
             "data": {
-              "description": "Opaque data to pass to incoming/outgoing calls."
+              "description": "Opaque data to pass back unchanged."
             },
             "detail": {
               "description": "More detail for this item.",
@@ -2357,7 +2345,7 @@
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2367,7 +2355,7 @@
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
               "type": "boolean"
             },
             "range": {
@@ -2376,7 +2364,111 @@
             },
             "selectionRange": {
               "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/HierarchyItem",
+          "description": "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy, get_incoming_calls or get_outgoing_calls."
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass back unchanged."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
             },
             "uri": {
               "description": "URI of the document.",
@@ -2396,7 +2488,7 @@
           "description": "An incoming call (caller of the current item).",
           "properties": {
             "from": {
-              "$ref": "#/$defs/CallHierarchyItemResult",
+              "$ref": "#/$defs/HierarchyItem",
               "description": "The item that calls the current item."
             },
             "from_ranges": {
@@ -2681,24 +2773,12 @@
     "title": "Outgoing Calls",
     "description": "Functions called by the specified item. Takes call hierarchy item, returns callees, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "item": {
-          "description": "The call hierarchy item to get calls for (from prepare response)."
-        }
-      },
-      "required": [
-        "item"
-      ],
-      "type": "object"
-    },
-    "outputSchema": {
       "$defs": {
-        "CallHierarchyItemResult": {
-          "description": "A call hierarchy item.",
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
           "properties": {
             "data": {
-              "description": "Opaque data to pass to incoming/outgoing calls."
+              "description": "Opaque data to pass back unchanged."
             },
             "detail": {
               "description": "More detail for this item.",
@@ -2708,7 +2788,7 @@
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2718,7 +2798,7 @@
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
               "type": "boolean"
             },
             "range": {
@@ -2727,7 +2807,111 @@
             },
             "selectionRange": {
               "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/HierarchyItem",
+          "description": "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy, get_incoming_calls or get_outgoing_calls."
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass back unchanged."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
             },
             "uri": {
               "description": "URI of the document.",
@@ -2754,7 +2938,7 @@
               "type": "array"
             },
             "to": {
-              "$ref": "#/$defs/CallHierarchyItemResult",
+              "$ref": "#/$defs/HierarchyItem",
               "description": "The item being called."
             }
           },
@@ -2948,7 +3132,7 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.\n\nSerializes as the item's own fields with `enclosing_symbol` alongside, so\nthe default output of a tool is unchanged.",
           "properties": {
             "enclosing_symbol": {
               "$ref": "#/$defs/EnclosingSymbolOutcome",
@@ -3679,6 +3863,55 @@
     "description": "Subtypes (derived classes, implementors) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass back unchanged."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
@@ -3718,9 +3951,24 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/HierarchyItem",
+          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
           "properties": {
             "data": {
               "description": "Opaque data to pass back unchanged."
@@ -3733,26 +3981,26 @@
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "Name of the type.",
+              "description": "Name of the symbol.",
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
               "type": "boolean"
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Range of the type."
+              "description": "Range of the symbol."
             },
             "selectionRange": {
               "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
             },
             "uri": {
               "description": "URI of the document.",
@@ -3767,22 +4015,7 @@
             "selectionRange"
           ],
           "type": "object"
-        }
-      },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "item": {
-          "$ref": "#/$defs/TypeHierarchyItemResult",
-          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
-        }
-      },
-      "required": [
-        "item"
-      ],
-      "type": "object"
-    },
-    "outputSchema": {
-      "$defs": {
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
@@ -3837,55 +4070,6 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
-          "properties": {
-            "data": {
-              "description": "Opaque data to pass back unchanged."
-            },
-            "detail": {
-              "description": "More detail for this item.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "name": {
-              "description": "Name of the type.",
-              "type": "string"
-            },
-            "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
-              "type": "boolean"
-            },
-            "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the type."
-            },
-            "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
-            },
-            "uri": {
-              "description": "URI of the document.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "name",
-            "kind",
-            "uri",
-            "range",
-            "selectionRange"
-          ],
-          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3893,7 +4077,7 @@
         "items": {
           "description": "Type hierarchy items at the position, or the supertypes/subtypes of\nthe queried item.",
           "items": {
-            "$ref": "#/$defs/TypeHierarchyItemResult"
+            "$ref": "#/$defs/HierarchyItem"
           },
           "type": "array"
         },
@@ -3924,6 +4108,55 @@
     "description": "Supertypes (base classes, implemented interfaces) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass back unchanged."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
@@ -3963,9 +4196,24 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/HierarchyItem",
+          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
           "properties": {
             "data": {
               "description": "Opaque data to pass back unchanged."
@@ -3978,26 +4226,26 @@
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "Name of the type.",
+              "description": "Name of the symbol.",
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
               "type": "boolean"
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Range of the type."
+              "description": "Range of the symbol."
             },
             "selectionRange": {
               "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
             },
             "uri": {
               "description": "URI of the document.",
@@ -4012,22 +4260,7 @@
             "selectionRange"
           ],
           "type": "object"
-        }
-      },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "item": {
-          "$ref": "#/$defs/TypeHierarchyItemResult",
-          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
-        }
-      },
-      "required": [
-        "item"
-      ],
-      "type": "object"
-    },
-    "outputSchema": {
-      "$defs": {
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
@@ -4082,55 +4315,6 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
-          "properties": {
-            "data": {
-              "description": "Opaque data to pass back unchanged."
-            },
-            "detail": {
-              "description": "More detail for this item.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "name": {
-              "description": "Name of the type.",
-              "type": "string"
-            },
-            "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
-              "type": "boolean"
-            },
-            "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the type."
-            },
-            "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
-            },
-            "uri": {
-              "description": "URI of the document.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "name",
-            "kind",
-            "uri",
-            "range",
-            "selectionRange"
-          ],
-          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4138,7 +4322,7 @@
         "items": {
           "description": "Type hierarchy items at the position, or the supertypes/subtypes of\nthe queried item.",
           "items": {
-            "$ref": "#/$defs/TypeHierarchyItemResult"
+            "$ref": "#/$defs/HierarchyItem"
           },
           "type": "array"
         },
@@ -4399,7 +4583,7 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.\n\nSerializes as the item's own fields with `enclosing_symbol` alongside, so\nthe default output of a tool is unchanged.",
           "properties": {
             "enclosing_symbol": {
               "$ref": "#/$defs/EnclosingSymbolOutcome",
@@ -4795,7 +4979,7 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.\n\nSerializes as the item's own fields with `enclosing_symbol` alongside, so\nthe default output of a tool is unchanged.",
           "properties": {
             "enclosing_symbol": {
               "$ref": "#/$defs/EnclosingSymbolOutcome",
@@ -5254,7 +5438,7 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.\n\nSerializes as the item's own fields with `enclosing_symbol` alongside, so\nthe default output of a tool is unchanged.",
           "properties": {
             "enclosing_symbol": {
               "$ref": "#/$defs/EnclosingSymbolOutcome",
@@ -5690,11 +5874,11 @@
     },
     "outputSchema": {
       "$defs": {
-        "CallHierarchyItemResult": {
-          "description": "A call hierarchy item.",
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
           "properties": {
             "data": {
-              "description": "Opaque data to pass to incoming/outgoing calls."
+              "description": "Opaque data to pass back unchanged."
             },
             "detail": {
               "description": "More detail for this item.",
@@ -5704,7 +5888,7 @@
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -5714,7 +5898,7 @@
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
               "type": "boolean"
             },
             "range": {
@@ -5723,7 +5907,7 @@
             },
             "selectionRange": {
               "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
             },
             "uri": {
               "description": "URI of the document.",
@@ -5852,7 +6036,7 @@
         "items": {
           "description": "List of callable items at the position.",
           "items": {
-            "$ref": "#/$defs/CallHierarchyItemResult"
+            "$ref": "#/$defs/HierarchyItem"
           },
           "type": "array"
         },
@@ -6093,6 +6277,55 @@
     },
     "outputSchema": {
       "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.\n\nReturned by the hierarchy tools and accepted back as the typed `item`\ninput of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,\n`get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape\nserves both. `data` is opaque to the caller and meaningful only to the\nserver that produced the item.\n\n# Examples\n\n```\nuse mcpls_core::bridge::HierarchyItem;\n\nlet item: HierarchyItem = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());\n```",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass back unchanged."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware). Ignored on\ninput.",
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that a returned item\nround-trips when the MCP client passes it back to a walking tool."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
@@ -6147,55 +6380,6 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
-          "properties": {
-            "data": {
-              "description": "Opaque data to pass back unchanged."
-            },
-            "detail": {
-              "description": "More detail for this item.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "name": {
-              "description": "Name of the type.",
-              "type": "string"
-            },
-            "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
-              "type": "boolean"
-            },
-            "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the type."
-            },
-            "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
-            },
-            "uri": {
-              "description": "URI of the document.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "name",
-            "kind",
-            "uri",
-            "range",
-            "selectionRange"
-          ],
-          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6203,7 +6387,7 @@
         "items": {
           "description": "Type hierarchy items at the position, or the supertypes/subtypes of\nthe queried item.",
           "items": {
-            "$ref": "#/$defs/TypeHierarchyItemResult"
+            "$ref": "#/$defs/HierarchyItem"
           },
           "type": "array"
         },

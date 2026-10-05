@@ -2923,7 +2923,7 @@ mod tests {
             }
         });
 
-        let result = translator.handle_incoming_calls(item).await;
+        let result = translator.handle_incoming_calls(hierarchy_item(item)).await;
 
         assert_matches!(
             result,
@@ -2962,7 +2962,7 @@ mod tests {
             }
         });
 
-        let result = translator.handle_outgoing_calls(item).await;
+        let result = translator.handle_outgoing_calls(hierarchy_item(item)).await;
 
         assert_matches!(
             result,

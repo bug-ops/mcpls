@@ -6,9 +6,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    InvalidPosition, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES,
-    Position, RestartTarget, ResultContext, ServerIds, SymbolName, SymbolQuery, SymbolTarget,
-    TypeHierarchyItemResult, parse_symbol_kind,
+    HierarchyItem, InvalidPosition, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
+    MAX_SYMBOL_NAME_BYTES, Position, RestartTarget, ResultContext, ServerIds, SymbolName,
+    SymbolQuery, SymbolTarget, parse_symbol_kind,
 };
 use crate::config::ServerId;
 
@@ -380,8 +380,10 @@ pub struct CodeActionsParams {
 )]
 pub struct CallHierarchyCallsParams {
     /// The call hierarchy item to get calls for (from prepare response).
-    #[schemars(description = "The call hierarchy item to get calls for (from prepare response).")]
-    pub item: serde_json::Value,
+    #[schemars(
+        description = "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy, get_incoming_calls or get_outgoing_calls."
+    )]
+    pub item: HierarchyItem,
 }
 
 /// Parameters for the `get_supertypes` and `get_subtypes` tools.
@@ -394,7 +396,7 @@ pub struct TypeHierarchyWalkParams {
     #[schemars(
         description = "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
     )]
-    pub item: TypeHierarchyItemResult,
+    pub item: HierarchyItem,
 }
 
 /// Parameters for the `format_range` tool.

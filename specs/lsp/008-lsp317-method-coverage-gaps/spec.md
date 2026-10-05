@@ -40,8 +40,9 @@ related:
 
 - **Tools (open question 1).** Six tools, one per concern: `prepare_type_hierarchy`,
   `get_supertypes`, `get_subtypes`, `prepare_rename`, `get_document_highlights`, `format_range`.
-  The supertypes and subtypes `item` input is the typed `TypeHierarchyItemResult`, not untyped
-  JSON (NFR-002); call hierarchy keeps its existing untyped `item`.
+  The supertypes and subtypes `item` input is the typed `HierarchyItem`, not untyped
+  JSON (NFR-002). Call hierarchy shares the same `HierarchyItem` for output and for the `item` input
+  of incoming and outgoing calls (#618); a malformed item fails at deserialization.
 - **Routing (question 2).** One `ToolKind::TypeHierarchy` covers prepare, supertypes and subtypes
   (FR-014: the item is producer-bound). `prepare_rename` routes through `ToolKind::Rename`, so the
   verdict comes from the server that performs the rename. New kinds `TypeHierarchy`,

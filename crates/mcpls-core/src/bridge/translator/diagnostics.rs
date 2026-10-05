@@ -14,7 +14,7 @@ use super::dto::{
     Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentDiagnosticsResult, Position2D,
     Range, ServerLogsResult, ServerMessagesResult,
 };
-use super::enclosing::{ContextualDiagnostics, ResultContext};
+use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::notifications::{LogLevel, message_as_str};
@@ -255,8 +255,8 @@ impl Translator {
             }
         }?;
 
-        let ContextualDiagnostics {
-            diagnostics,
+        let Contextualized {
+            items: diagnostics,
             enrichment,
             positions_degraded,
         } = self

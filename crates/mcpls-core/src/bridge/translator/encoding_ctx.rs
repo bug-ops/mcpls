@@ -264,7 +264,7 @@ impl EncodingCtx {
     ///
     /// Advisory only, for a read-only navigation handler to annotate a
     /// result location (`Location::out_of_workspace`,
-    /// `CallHierarchyItemResult::out_of_workspace`) instead of rejecting it
+    /// `HierarchyItem::out_of_workspace`) instead of rejecting it
     /// -- never a safety/security gate. Delegates to
     /// [`WorkspaceRoots::admits_uri`], a purely lexical check over the
     /// canonical roots and their verified aliases: unlike

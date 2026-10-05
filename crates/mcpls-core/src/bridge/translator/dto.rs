@@ -664,43 +664,11 @@ pub struct CodeActionsResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// A call hierarchy item.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CallHierarchyItemResult {
-    /// Name of the symbol.
-    pub name: String,
-    /// LSP numeric symbol kind (e.g. 12 for Function).
-    pub kind: u32,
-    /// More detail for this item.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    /// URI of the document.
-    pub uri: String,
-    /// Range of the symbol.
-    pub range: Range,
-    /// Selection range (identifier location).
-    ///
-    /// Serialized as `selectionRange` (camelCase) so that the value returned by
-    /// `prepare_call_hierarchy` round-trips correctly when the MCP client passes
-    /// it back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize
-    /// it as `lsp_types::CallHierarchyItem` (camelCase).
-    #[serde(rename = "selectionRange")]
-    pub selection_range: Range,
-    /// Opaque data to pass to incoming/outgoing calls.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-    /// Whether this item is not provably inside any configured workspace
-    /// root -- see [`Location::out_of_workspace`] for the exact semantics
-    /// and caveats (advisory only, lexical, symlink-unaware).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub out_of_workspace: bool,
-}
-
 /// Result of call hierarchy prepare request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CallHierarchyPrepareResult {
     /// List of callable items at the position.
-    pub items: Vec<CallHierarchyItemResult>,
+    pub items: Vec<HierarchyItem>,
     /// Whether `items` was capped below the LSP server's full response (see
     /// `MAX_NORMALIZED_LOCATIONS`, #516). Omitted (defaults to `false`) when
     /// serialized.
@@ -717,7 +685,7 @@ pub struct CallHierarchyPrepareResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IncomingCall {
     /// The item that calls the current item.
-    pub from: CallHierarchyItemResult,
+    pub from: HierarchyItem,
     /// Ranges where the call occurs.
     pub from_ranges: Vec<Range>,
 }
@@ -743,7 +711,7 @@ pub struct IncomingCallsResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OutgoingCall {
     /// The item being called.
-    pub to: CallHierarchyItemResult,
+    pub to: HierarchyItem,
     /// Ranges where the call occurs.
     pub from_ranges: Vec<Range>,
 }
@@ -885,48 +853,54 @@ pub struct InlayHintsResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// A type hierarchy item, returned by `prepare_type_hierarchy`,
-/// `get_supertypes` and `get_subtypes` and accepted back as the typed `item`
-/// input of the latter two.
+/// A call or type hierarchy item.
+///
+/// Returned by the hierarchy tools and accepted back as the typed `item`
+/// input of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,
+/// `get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape
+/// serves both. `data` is opaque to the caller and meaningful only to the
+/// server that produced the item.
 ///
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::bridge::TypeHierarchyItemResult;
+/// use mcpls_core::bridge::HierarchyItem;
 ///
-/// let item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({
+/// let item: HierarchyItem = serde_json::from_value(serde_json::json!({
 ///     "name": "Base", "kind": 5, "uri": "file:///a.cpp",
 ///     "range": {"start": {"line": 1, "character": 1}, "end": {"line": 2, "character": 1}},
 ///     "selectionRange": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 11}},
 /// }))
 /// .unwrap();
 /// assert_eq!(item.name, "Base");
-/// assert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());
+/// assert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());
 /// ```
-///
-/// Same shape as a call hierarchy item; `data` is opaque to the caller
-/// and meaningful only to the server that produced the item.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TypeHierarchyItemResult {
-    /// Name of the type.
+pub struct HierarchyItem {
+    /// Name of the symbol.
     pub name: String,
-    /// LSP numeric symbol kind (e.g. 5 for Class).
+    /// LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).
     pub kind: u32,
     /// More detail for this item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// URI of the document.
     pub uri: String,
-    /// Range of the type.
+    /// Range of the symbol.
     pub range: Range,
     /// Selection range (identifier location).
+    ///
+    /// Serialized as `selectionRange` (camelCase) so that a returned item
+    /// round-trips when the MCP client passes it back to a walking tool.
     #[serde(rename = "selectionRange")]
     pub selection_range: Range,
     /// Opaque data to pass back unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
     /// Whether this item is not provably inside any configured workspace
-    /// root -- see [`Location::out_of_workspace`]. Ignored on input.
+    /// root -- see [`Location::out_of_workspace`] for the exact semantics
+    /// and caveats (advisory only, lexical, symlink-unaware). Ignored on
+    /// input.
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_workspace: bool,
 }
@@ -936,7 +910,7 @@ pub struct TypeHierarchyItemResult {
 pub struct TypeHierarchyResult {
     /// Type hierarchy items at the position, or the supertypes/subtypes of
     /// the queried item.
-    pub items: Vec<TypeHierarchyItemResult>,
+    pub items: Vec<HierarchyItem>,
     /// Whether `items` was capped below the LSP server's full response (see
     /// `MAX_NORMALIZED_LOCATIONS`). Omitted (defaults to `false`) when
     /// serialized.
@@ -1300,29 +1274,6 @@ impl ServerText for CodeActionsResult {
     }
 }
 
-impl ServerText for CallHierarchyItemResult {
-    fn redact_server_text(&mut self, redactions: &Redactions) {
-        let Self {
-            name,
-            kind: _,
-            detail,
-            uri,
-            range: _,
-            selection_range: _,
-            data,
-            out_of_workspace: _,
-        } = self;
-        redactions.note_payload(name);
-        if let Some(detail) = detail {
-            redactions.note_payload(detail);
-        }
-        redactions.note_payload(uri);
-        if let Some(data) = data {
-            redactions.note_payload_json(data);
-        }
-    }
-}
-
 impl ServerText for CallHierarchyPrepareResult {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         let Self {
@@ -1453,7 +1404,7 @@ impl ServerText for InlayHintsResult {
     }
 }
 
-impl ServerText for TypeHierarchyItemResult {
+impl ServerText for HierarchyItem {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         let Self {
             name,
@@ -1694,7 +1645,7 @@ mod tests {
             }],
             positions_degraded: None,
         };
-        let mut item = CallHierarchyItemResult {
+        let mut item = HierarchyItem {
             name: format!("call_{SECRET}"),
             kind: 12,
             detail: Some(format!("detail {SECRET}")),
@@ -1704,7 +1655,7 @@ mod tests {
             data: Some(serde_json::json!({ "id": SECRET })),
             out_of_workspace: false,
         };
-        let mut type_item = TypeHierarchyItemResult {
+        let mut type_item = HierarchyItem {
             name: format!("type_{SECRET}"),
             kind: 5,
             detail: None,

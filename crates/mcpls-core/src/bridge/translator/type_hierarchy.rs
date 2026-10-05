@@ -7,7 +7,7 @@ use lsp_types::{
 };
 
 use super::Translator;
-use super::dto::{Position, TypeHierarchyItemResult, TypeHierarchyResult};
+use super::dto::{HierarchyItem, Position, TypeHierarchyResult};
 use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
@@ -31,7 +31,7 @@ async fn convert_items(
     let lsp_items = budget.admit(response.unwrap_or_default());
     let mut items = Vec::with_capacity(lsp_items.len());
     for item in lsp_items {
-        items.push(hierarchy_item_to_mcp::<_, TypeHierarchyItemResult>(item, ctx).await);
+        items.push(hierarchy_item_to_mcp(item, ctx).await);
     }
     TypeHierarchyResult {
         items,
@@ -93,10 +93,7 @@ impl Translator {
     /// request fails, the routed server does not advertise
     /// `typeHierarchyProvider` support, or the server is still indexing the
     /// workspace after `INDEXING_READY_TIMEOUT`.
-    pub async fn handle_supertypes(
-        &self,
-        item: TypeHierarchyItemResult,
-    ) -> Result<TypeHierarchyResult> {
+    pub async fn handle_supertypes(&self, item: HierarchyItem) -> Result<TypeHierarchyResult> {
         self.walk_type_hierarchy(item, WalkDirection::Supertypes)
             .await
     }
@@ -106,17 +103,14 @@ impl Translator {
     /// # Errors
     ///
     /// See [`Self::handle_supertypes`].
-    pub async fn handle_subtypes(
-        &self,
-        item: TypeHierarchyItemResult,
-    ) -> Result<TypeHierarchyResult> {
+    pub async fn handle_subtypes(&self, item: HierarchyItem) -> Result<TypeHierarchyResult> {
         self.walk_type_hierarchy(item, WalkDirection::Subtypes)
             .await
     }
 
     async fn walk_type_hierarchy(
         &self,
-        item: TypeHierarchyItemResult,
+        item: HierarchyItem,
         direction: WalkDirection,
     ) -> Result<TypeHierarchyResult> {
         let uri = lsp_types::Uri::from(item.uri.as_str());
@@ -202,9 +196,9 @@ mod tests {
         })
     }
 
-    fn item_dto(uri: &str) -> TypeHierarchyItemResult {
+    fn item_dto(uri: &str) -> HierarchyItem {
         let at = |line, character| Position2D { line, character };
-        TypeHierarchyItemResult {
+        HierarchyItem {
             name: "Derived".to_string(),
             kind: 5,
             detail: None,
@@ -488,14 +482,13 @@ mod tests {
         let dto = item_dto("file:///a.rs");
         let wire = serde_json::to_value(&dto).unwrap();
         assert!(wire.get("selectionRange").is_some());
-        let back: TypeHierarchyItemResult = serde_json::from_value(wire).unwrap();
+        let back: HierarchyItem = serde_json::from_value(wire).unwrap();
         assert_eq!(back.data, dto.data);
     }
 
     #[test]
     fn malformed_item_is_rejected_at_the_type_boundary() {
-        let parsed =
-            serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({"name": "x"}));
+        let parsed = serde_json::from_value::<HierarchyItem>(serde_json::json!({"name": "x"}));
         assert!(parsed.is_err());
     }
 }

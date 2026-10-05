@@ -4,7 +4,7 @@
 //! do their MCP-facing DTOs, so both families convert through one pair of
 //! functions instead of two copies.
 
-use super::dto::{CallHierarchyItemResult, Range, TypeHierarchyItemResult, lsp_kind_to_u32};
+use super::dto::{HierarchyItem, lsp_kind_to_u32};
 use super::encoding_ctx::EncodingCtx;
 
 /// The fields common to an LSP call or type hierarchy item, in the routed
@@ -19,98 +19,76 @@ pub(super) struct LspHierarchyItem {
     pub(super) data: Option<serde_json::Value>,
 }
 
-/// The fields common to an MCP-facing call or type hierarchy item, in 1-based
-/// coordinates.
-pub(super) struct McpHierarchyItem {
-    pub(super) name: String,
-    pub(super) kind: u32,
-    pub(super) detail: Option<String>,
-    pub(super) uri: String,
-    pub(super) range: Range,
-    pub(super) selection_range: Range,
-    pub(super) data: Option<serde_json::Value>,
-    pub(super) out_of_workspace: bool,
+impl From<lsp_types::CallHierarchyItem> for LspHierarchyItem {
+    fn from(item: lsp_types::CallHierarchyItem) -> Self {
+        Self {
+            name: item.name,
+            kind: item.kind,
+            detail: item.detail,
+            uri: item.uri,
+            range: item.range,
+            selection_range: item.selection_range,
+            data: item.data,
+        }
+    }
 }
 
-macro_rules! impl_hierarchy_conversions {
-    ($lsp:ident, $dto:ident) => {
-        impl From<lsp_types::$lsp> for LspHierarchyItem {
-            fn from(item: lsp_types::$lsp) -> Self {
-                Self {
-                    name: item.name,
-                    kind: item.kind,
-                    detail: item.detail,
-                    uri: item.uri,
-                    range: item.range,
-                    selection_range: item.selection_range,
-                    data: item.data,
-                }
-            }
+impl From<lsp_types::TypeHierarchyItem> for LspHierarchyItem {
+    fn from(item: lsp_types::TypeHierarchyItem) -> Self {
+        Self {
+            name: item.name,
+            kind: item.kind,
+            detail: item.detail,
+            uri: item.uri,
+            range: item.range,
+            selection_range: item.selection_range,
+            data: item.data,
         }
-
-        impl From<LspHierarchyItem> for lsp_types::$lsp {
-            fn from(item: LspHierarchyItem) -> Self {
-                Self {
-                    name: item.name,
-                    kind: item.kind,
-                    tags: None,
-                    detail: item.detail,
-                    uri: item.uri,
-                    range: item.range,
-                    selection_range: item.selection_range,
-                    data: item.data,
-                }
-            }
-        }
-
-        impl From<McpHierarchyItem> for $dto {
-            fn from(item: McpHierarchyItem) -> Self {
-                Self {
-                    name: item.name,
-                    kind: item.kind,
-                    detail: item.detail,
-                    uri: item.uri,
-                    range: item.range,
-                    selection_range: item.selection_range,
-                    data: item.data,
-                    out_of_workspace: item.out_of_workspace,
-                }
-            }
-        }
-
-        impl From<$dto> for McpHierarchyItem {
-            fn from(item: $dto) -> Self {
-                Self {
-                    name: item.name,
-                    kind: item.kind,
-                    detail: item.detail,
-                    uri: item.uri,
-                    range: item.range,
-                    selection_range: item.selection_range,
-                    data: item.data,
-                    out_of_workspace: item.out_of_workspace,
-                }
-            }
-        }
-    };
+    }
 }
 
-impl_hierarchy_conversions!(CallHierarchyItem, CallHierarchyItemResult);
-impl_hierarchy_conversions!(TypeHierarchyItem, TypeHierarchyItemResult);
+impl From<LspHierarchyItem> for lsp_types::CallHierarchyItem {
+    fn from(item: LspHierarchyItem) -> Self {
+        Self {
+            name: item.name,
+            kind: item.kind,
+            tags: None,
+            detail: item.detail,
+            uri: item.uri,
+            range: item.range,
+            selection_range: item.selection_range,
+            data: item.data,
+        }
+    }
+}
+
+impl From<LspHierarchyItem> for lsp_types::TypeHierarchyItem {
+    fn from(item: LspHierarchyItem) -> Self {
+        Self {
+            name: item.name,
+            kind: item.kind,
+            tags: None,
+            detail: item.detail,
+            uri: item.uri,
+            range: item.range,
+            selection_range: item.selection_range,
+            data: item.data,
+        }
+    }
+}
 
 /// Convert an LSP hierarchy item into its MCP form, normalizing both ranges
 /// into 1-based coordinates through `ctx`.
-pub(super) async fn hierarchy_item_to_mcp<Lsp, Dto>(item: Lsp, ctx: &EncodingCtx) -> Dto
+pub(super) async fn hierarchy_item_to_mcp<Lsp>(item: Lsp, ctx: &EncodingCtx) -> HierarchyItem
 where
     Lsp: Into<LspHierarchyItem>,
-    Dto: From<McpHierarchyItem>,
 {
     let item = item.into();
     let out_of_workspace = ctx.is_out_of_workspace(&item.uri);
     let range = ctx.normalize_range(&item.uri, item.range).await;
     let selection_range = ctx.normalize_range(&item.uri, item.selection_range).await;
 
-    Dto::from(McpHierarchyItem {
+    HierarchyItem {
         name: item.name,
         kind: lsp_kind_to_u32(item.kind),
         detail: item.detail,
@@ -119,23 +97,21 @@ where
         selection_range,
         data: item.data,
         out_of_workspace,
-    })
+    }
 }
 
 /// Convert an MCP hierarchy item (1-based) back into an LSP item in `ctx`'s
 /// negotiated encoding -- the inverse of [`hierarchy_item_to_mcp`].
 ///
 /// `uri` is the already-parsed form of `item`'s own URI.
-pub(super) async fn hierarchy_item_to_lsp<Lsp, Dto>(
-    item: Dto,
+pub(super) async fn hierarchy_item_to_lsp<Lsp>(
+    item: HierarchyItem,
     uri: lsp_types::Uri,
     ctx: &EncodingCtx,
 ) -> Lsp
 where
-    Dto: Into<McpHierarchyItem>,
     Lsp: From<LspHierarchyItem>,
 {
-    let item = item.into();
     // TODO(critic): hierarchy item input ranges bypass Position validation (line 0 saturates to 1); follow-up of #617
     let range = ctx.denormalize_range(&uri, &item.range).await;
     let selection_range = ctx.denormalize_range(&uri, &item.selection_range).await;
@@ -189,7 +165,7 @@ mod tests {
         let uri = lsp_types::Uri::from("file:///a.cpp");
         let original = lsp_type_item(&uri);
 
-        let dto: TypeHierarchyItemResult = hierarchy_item_to_mcp(original.clone(), &ctx).await;
+        let dto: HierarchyItem = hierarchy_item_to_mcp(original.clone(), &ctx).await;
         assert_eq!(dto.kind, 5);
         assert_eq!(
             dto.range.start,
@@ -219,7 +195,7 @@ mod tests {
             data: item.data,
         };
 
-        let dto: CallHierarchyItemResult = hierarchy_item_to_mcp(call.clone(), &ctx).await;
+        let dto: HierarchyItem = hierarchy_item_to_mcp(call.clone(), &ctx).await;
         let back: lsp_types::CallHierarchyItem =
             hierarchy_item_to_lsp(dto, call.uri.clone(), &ctx).await;
         assert_eq!(back, call);

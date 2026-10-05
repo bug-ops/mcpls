@@ -61,7 +61,7 @@ pub use addressing::{
 };
 pub use dto::*;
 pub use enclosing::{
-    ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,
+    Contextual, ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,
     EnrichmentSummary, NotComputedReason, ResultContext, SymbolFidelity, UnavailableReason,
 };
 pub use restart::{
