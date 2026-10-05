@@ -115,16 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Listen replay is paced (burst 32, 320 per second, best effort) and the eviction record is a capped map; use `listen_with_capacity` of at least 2000 for a guarantee. (#593, #614)
 - Tool results redact configured secrets in server display text as `[redacted:NAME]`; edits, URIs, identifiers and command arguments are unchanged, so redaction is partial. (#599, #614)
 - `SECURITY.md` trust model names `settings` and `initialization_options`. (#598, #614)
-- **Breaking:** an unknown `--log-level` or `MCPLS_LOG` level is rejected at startup; a bare word must be a level (use `mcpls_core=trace`, not `mcpls_core`). (#PR)
-- **Breaking:** `Error` variants carry typed sources: `McpServer` and `Transport` are replaced. (#PR)
-- **Breaking:** `validate_path_against_roots` is replaced by `WorkspaceRoots::validate`, which returns `WorkspacePath`. (#PR)
-- **Breaking:** client positions are validated at the MCP boundary; line or column 0 or above 1,000,000 is `-32602`. (#PR)
-- **Breaking:** call and type hierarchy items share one `HierarchyItem`; a malformed call hierarchy `item` is a tool error, not `-32602`. (#PR)
-- `tools/list` payload shrinks from about 181 KB to about 122 KB. (#PR)
-- **Breaking:** `ServerInitConfig` gains `redactions`; tool and resource errors hide every configured server's secrets. (#PR)
-- **Breaking:** `Translator::set_expected_servers` no longer marks a registered server expected. (#PR)
-- An idle HTTP session close is bounded, and an unresolvable internal URI is classified as an internal error. (#PR)
-- `Translator` keeps each server's state in one slot and its lifecycle in one phase. (#PR)
+- **Breaking:** an unknown `--log-level` or `MCPLS_LOG` level is rejected at startup; a bare word must be a level (use `mcpls_core=trace`, not `mcpls_core`). (#637)
+- **Breaking:** `Error` variants carry typed sources: `McpServer` and `Transport` are replaced. (#637)
+- **Breaking:** `validate_path_against_roots` is replaced by `WorkspaceRoots::validate`, which returns `WorkspacePath`. (#637)
+- **Breaking:** client positions are validated at the MCP boundary; line or column 0 or above 1,000,000 is `-32602`. (#637)
+- **Breaking:** call and type hierarchy items share one `HierarchyItem`; a malformed call hierarchy `item` is a tool error, not `-32602`. (#637)
+- `tools/list` payload shrinks from about 181 KB to about 122 KB. (#637)
+- **Breaking:** `ServerInitConfig` gains `redactions`; tool and resource errors hide every configured server's secrets. (#637)
+- **Breaking:** `Translator::set_expected_servers` no longer marks a registered server expected. (#637)
+- An idle HTTP session close is bounded, and an unresolvable internal URI is classified as an internal error. (#637)
+- `Translator` keeps each server's state in one slot and its lifecycle in one phase. (#637)
 
 ### Fixed
 
@@ -159,11 +159,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Servers that wait for a configuration push, such as pyright, answer requests: `workspace/didChangeConfiguration` with null settings follows `initialized`. (#610)
 - Configured secrets echoed in pushed and pulled diagnostics (message, source, code, related information, `data`) and `$/progress` text are redacted before caching. (#610)
 - POST and resume response streams are cut 1 hour after they open (`ResponseStreamDeadline`), so a vanished peer no longer pins its session slot; a peer that stops reading a response still holds it until TCP gives up (#600). (#610)
-- An empty top-level `settings` key is rejected. (#PR)
-- `workspace/configuration` answers a non-object item with `null`. (#PR)
-- A not-renameable `prepare_rename` reply no longer logs at ERROR. (#PR)
-- Slow HTTP readers and request bodies are cut instead of holding a connection. (#PR)
-- `GIT_AUTHOR_NAME`, `SSH_AUTH_SOCK` and `XAUTHORITY` are no longer redacted as secrets. (#PR)
+- An empty top-level `settings` key is rejected. (#637)
+- `workspace/configuration` answers a non-object item with `null`. (#637)
+- A not-renameable `prepare_rename` reply no longer logs at ERROR. (#637)
+- Slow HTTP readers and request bodies are cut instead of holding a connection. (#637)
+- `GIT_AUTHOR_NAME`, `SSH_AUTH_SOCK` and `XAUTHORITY` are no longer redacted as secrets. (#637)
 
 ## [0.6.0] - 2026-09-21
 
