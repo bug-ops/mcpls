@@ -26,16 +26,72 @@ const MAX_LABEL_CHARS: usize = 64;
 
 /// Upper-case substrings that make an environment variable, flag or JSON key
 /// name denote a secret.
-// TODO(#611): exclude well-known non-secret env names that match AUTH/KEY (GIT_AUTHOR_*, SSH_AUTH_SOCK, XAUTHORITY); they over-redact tool display text
 const SECRET_NAME_PATTERNS: [&str; 6] = ["TOKEN", "KEY", "SECRET", "PASSW", "CRED", "AUTH"];
+
+/// Whole name segments (upper-case) that contain a secret pattern but name
+/// something benign, such as the `AUTH` of `GIT_AUTHOR_NAME`.
+const BENIGN_SEGMENTS: [&str; 7] = [
+    "AUTHOR",
+    "AUTHORS",
+    "AUTHORITY",
+    "XAUTHORITY",
+    "KEYBOARD",
+    "KEYMAP",
+    "TOKENIZERS",
+];
+
+/// Whole names (upper-case) that are benign although their segments joined
+/// would match: `SSH_AUTH_SOCK` holds a socket path.
+const BENIGN_NAMES: [&str; 1] = ["SSH_AUTH_SOCK"];
+
+/// Splits `name` into segments at `_`, `-` and `.`, and at camel-case
+/// boundaries (`proxyAuth`, and the end of an acronym in `XMLHttp`).
+fn name_segments(name: &str) -> impl Iterator<Item = &str> {
+    name.split(['_', '-', '.']).flat_map(|piece| {
+        let mut starts = vec![0];
+        let chars: Vec<(usize, char)> = piece.char_indices().collect();
+        for (index, window) in chars.windows(2).enumerate() {
+            let [(_, before), (start, after)] = window else {
+                continue;
+            };
+            let next_is_lower = chars
+                .get(index.saturating_add(2))
+                .is_some_and(|(_, next)| next.is_lowercase());
+            let lower_to_upper =
+                (before.is_lowercase() || before.is_ascii_digit()) && after.is_uppercase();
+            let acronym_end = before.is_uppercase() && after.is_uppercase() && next_is_lower;
+            if lower_to_upper || acronym_end {
+                starts.push(*start);
+            }
+        }
+        starts.push(piece.len());
+        starts
+            .windows(2)
+            .filter_map(|bounds| match bounds {
+                [from, to] => piece.get(*from..*to),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    })
+}
 
 /// Whether `name` (an environment variable, a flag without its dashes, or a
 /// JSON key) denotes a secret, ignoring case.
+///
+/// Fails closed: the segments that are exactly a benign word are dropped, the
+/// rest are joined and matched by substring, so `passWord` and `AUTHORIZATION`
+/// stay secret while `GIT_AUTHOR_NAME` and `XAUTHORITY` do not.
 pub fn is_secret_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
+    if BENIGN_NAMES.contains(&name.to_ascii_uppercase().as_str()) {
+        return false;
+    }
+    let kept: String = name_segments(name)
+        .map(str::to_ascii_uppercase)
+        .filter(|segment| !BENIGN_SEGMENTS.contains(&segment.as_str()))
+        .collect();
     SECRET_NAME_PATTERNS
         .iter()
-        .any(|pattern| upper.contains(pattern))
+        .any(|pattern| kept.contains(pattern))
 }
 
 /// Text known to carry no configured secret: it was redacted when built or is
@@ -673,6 +729,58 @@ mod tests {
         for name in ["RUSTUP_TOOLCHAIN", "JAVA_HOME", "GOFLAGS", "PATH"] {
             assert!(!is_secret_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn test_secret_name_stays_fail_closed_across_segment_boundaries() {
+        for name in [
+            "AUTHORIZATION",
+            "HTTP_PROXY_AUTHORIZATION",
+            "http.proxyAuthorization",
+            "GIT_AUTHOR_TOKEN",
+            "OPENAI_API_KEY",
+            "apiKey",
+            "APIKEY",
+            "AUTHTOKEN",
+            "db_passwd",
+            "passWord",
+            "passWd",
+            "dbPassWord",
+            "myToKen",
+            "XMLHttpKey",
+        ] {
+            assert!(is_secret_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_secret_name_skips_well_known_benign_names() {
+        for name in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "SSH_AUTH_SOCK",
+            "ssh_auth_sock",
+            "XAUTHORITY",
+            "XAuthority",
+            "TOKENIZERS_PARALLELISM",
+            "KEYBOARD_LAYOUT",
+            "keymap",
+        ] {
+            assert!(!is_secret_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_name_segments_split_on_separators_and_camel_case() {
+        let segments = |name| name_segments(name).collect::<Vec<_>>();
+        assert_eq!(
+            segments("GIT_AUTHOR-NAME.x"),
+            ["GIT", "AUTHOR", "NAME", "x"]
+        );
+        assert_eq!(segments("proxyAuthorization"), ["proxy", "Authorization"]);
+        assert_eq!(segments("XMLHttpKey"), ["XML", "Http", "Key"]);
+        assert_eq!(segments("v2Key"), ["v2", "Key"]);
+        assert_eq!(segments(""), [""]);
     }
 
     #[test]
