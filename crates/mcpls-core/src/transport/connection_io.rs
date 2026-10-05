@@ -394,6 +394,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn test_stalled_vectored_write_times_out_after_the_deadline() {
+        let mut io = wrap(Stuck);
+        let start = Instant::now();
+        let bufs = [io::IoSlice::new(b"head"), io::IoSlice::new(b"body")];
+
+        let err = io.write_vectored(&bufs).await.unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), STALL);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_stalled_shutdown_times_out_after_the_deadline() {
         let mut io = wrap(Stuck);
         let start = Instant::now();

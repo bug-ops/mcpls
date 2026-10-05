@@ -602,6 +602,7 @@ impl Phase {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
@@ -653,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expected_and_failed_register_replaces_expected_and_ignores_failures_on_running() {
+    fn test_failure_of_an_expected_server_settles_it_as_failed() {
         let mut servers = Servers::default();
         let id = ServerId::from("rust");
         servers.set_expected(&HashSet::from([id.clone()]));
@@ -661,6 +662,87 @@ mod tests {
         assert!(servers.failure(&id).is_some());
         assert!(!servers.is_expected(&id));
         assert_eq!(servers.failures().len(), 1);
+    }
+
+    fn running_backend() -> Backend {
+        Backend::Process(LspServer::new_for_test(
+            lsp_types::ServerCapabilities::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_failure_on_a_running_or_stopped_slot_is_ignored() {
+        let mut servers = Servers::default();
+        let id = ServerId::from("rust");
+        servers.register(id.clone(), running_backend());
+
+        assert!(!servers.record_failure(&failure("rust")));
+        assert!(servers.failure(&id).is_none());
+        assert!(servers.server(&id).is_some());
+
+        let stopped = servers.remove_server(&id);
+        assert!(stopped.is_some());
+        assert!(!servers.record_failure(&failure("rust")));
+        assert!(servers.failure(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stopped_slot_keeps_the_dead_client_and_is_never_revived_by_a_swap() {
+        let mut servers = Servers::default();
+        let id = ServerId::from("rust");
+        servers.register(id.clone(), running_backend());
+        drop(servers.remove_server(&id));
+
+        assert!(servers.client(&id).is_some());
+        assert!(servers.server(&id).is_none());
+        assert!(servers.slot_for_swap(&id, running_backend()).is_err());
+        assert!(servers.server(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_swap_replaces_the_backend_in_one_assignment_and_returns_the_old_one() {
+        let mut servers = Servers::default();
+        let id = ServerId::from("rust");
+        servers.register(id.clone(), running_backend());
+
+        let old = servers.slot_for_swap(&id, running_backend()).unwrap();
+
+        assert!(old.is_some());
+        let server = servers.server(&id).unwrap();
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(server.client()),
+            std::ptr::from_ref(server.client())
+        ));
+        assert!(servers.client(&id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_take_and_restore_round_trip_and_refuse_a_settled_slot() {
+        let mut servers = Servers::default();
+        let id = ServerId::from("rust");
+        servers.register(id.clone(), running_backend());
+
+        let held = servers.take_for_restart(&id).unwrap();
+        assert!(servers.is_expected(&id));
+        assert!(servers.restore(&id, held).is_none());
+        assert!(servers.server(&id).is_some());
+
+        let held = servers.take_for_restart(&id).unwrap();
+        servers.register(id.clone(), running_backend());
+        assert!(servers.restore(&id, held).is_some());
+    }
+
+    #[test]
+    fn test_clear_expected_keeps_failed_and_drops_plain_expected() {
+        let mut servers = Servers::default();
+        let (failed, plain) = (ServerId::from("failed"), ServerId::from("plain"));
+        servers.record_failure(&failure("failed"));
+        servers.set_expected(&HashSet::from([failed.clone(), plain.clone()]));
+
+        servers.clear_expected();
+
+        assert!(servers.failure(&failed).is_some());
+        assert!(servers.get(&plain).is_none());
     }
 
     #[test]

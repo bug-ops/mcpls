@@ -493,51 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn test_init_with_valid_trace_level() {
-        let result = init(&filter("trace"), false);
-        assert!(
-            result.is_ok(),
-            "Should initialize successfully with trace level"
-        );
-    }
-
-    #[test]
-    fn test_init_with_valid_debug_level() {
-        let result = init(&filter("debug"), false);
-        assert!(
-            result.is_ok(),
-            "Should initialize successfully with debug level"
-        );
-    }
-
-    #[test]
-    fn test_init_with_valid_info_level() {
-        let result = init(&filter("info"), false);
-        assert!(
-            result.is_ok(),
-            "Should initialize successfully with info level"
-        );
-    }
-
-    #[test]
-    fn test_init_with_valid_warn_level() {
-        let result = init(&filter("warn"), false);
-        assert!(
-            result.is_ok(),
-            "Should initialize successfully with warn level"
-        );
-    }
-
-    #[test]
-    fn test_init_with_valid_error_level() {
-        let result = init(&filter("error"), false);
-        assert!(
-            result.is_ok(),
-            "Should initialize successfully with error level"
-        );
-    }
-
-    #[test]
     fn test_log_filter_rejects_misspelt_level_and_empty() {
         assert_eq!(
             "debgu".parse::<LogFilter>(),
@@ -599,21 +554,10 @@ mod tests {
     }
 
     #[test]
-    fn test_init_with_uppercase_level() {
-        let result = init(&filter("DEBUG"), false);
-        assert!(
-            result.is_ok(),
-            "Should handle uppercase log levels (fallback to info if not recognized)"
-        );
-    }
-
-    #[test]
-    fn test_init_with_numeric_level() {
-        let result = init(&filter("3"), false);
-        assert!(
-            result.is_ok(),
-            "Should handle numeric levels or fall back to info"
-        );
+    fn test_init_accepts_every_level_spelling() {
+        for level in ["trace", "debug", "info", "warn", "error", "DEBUG", "3"] {
+            assert!(init(&filter(level), false).is_ok(), "{level}");
+        }
     }
 
     #[test]

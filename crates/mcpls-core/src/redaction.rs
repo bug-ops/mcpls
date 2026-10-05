@@ -825,6 +825,10 @@ mod tests {
             "dbPassWord",
             "myToKen",
             "XMLHttpKey",
+            "SSH_AUTH_SOCK_TOKEN",
+            "AUTHORS_KEY",
+            "tokenizers_apikey",
+            "ключ_TOKEN",
         ] {
             assert!(is_secret_name(name), "{name}");
         }

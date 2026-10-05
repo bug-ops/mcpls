@@ -1078,6 +1078,58 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn test_restart_permit_classifies_in_order() {
+            let id = ServerId::from("rust");
+            let translator = Translator::new();
+            assert_matches!(
+                translator.restart_permit(&id),
+                Err(RestartOutcome::NotRunning { .. })
+            );
+
+            translator.set_expected_servers(HashSet::from([id.clone()]));
+            assert_matches!(
+                translator.restart_permit(&id),
+                Err(RestartOutcome::Initializing)
+            );
+
+            translator.clear_expected_servers();
+            translator.record_startup_failures(&[ServerSpawnFailure {
+                server_id: id.clone(),
+                language_id: "rust".to_string(),
+                command: "missing".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
+            }]);
+            assert_matches!(
+                translator.restart_permit(&id),
+                Err(RestartOutcome::NotRunning { .. })
+            );
+
+            let config = crate::config::LspServerConfig::rust_analyzer();
+            let running = Translator::new();
+            running
+                .register_server_complete(crate::lsp::fake_lsp_server_with_config(config.clone()));
+            let rid = config.id();
+            assert_matches!(
+                running.restart_permit(&rid),
+                Err(RestartOutcome::Initializing)
+            );
+
+            lock_std(&running.phase).init_panicked();
+            assert_matches!(
+                running.restart_permit(&rid),
+                Err(RestartOutcome::NotRunning { .. })
+            );
+
+            running.begin_shutdown();
+            assert_matches!(
+                running.restart_permit(&rid),
+                Err(RestartOutcome::Failed {
+                    reason: RestartFailure::ShuttingDown
+                })
+            );
+        }
+
         #[test]
         fn test_dropping_the_startup_guard_clears_the_flag() {
             let translator = Translator::new();

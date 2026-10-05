@@ -2216,7 +2216,9 @@ mod tests {
             .map(ToString::to_string)
             .unwrap_or_default();
         for text in [rendered.message.to_string(), data] {
-            assert!(!text.contains(&secret[..4]), "{text}");
+            for len in 4..=secret.len() {
+                assert!(!text.contains(&secret[..len]), "{len}: {text}");
+            }
         }
     }
 
@@ -2314,6 +2316,115 @@ mod tests {
             "{}",
             rendered.message
         );
+    }
+
+    /// #617: the remaining position tools reject out-of-range input too, and a
+    /// valid position is not mistaken for invalid parameters.
+    #[tokio::test]
+    async fn test_remaining_position_tools_reject_bad_input_and_accept_valid_input() {
+        let server = create_test_server();
+        let position = |line: u32, character: u32| PositionParams {
+            file_path: PathBuf::from("/ws/a.rs"),
+            line,
+            character,
+        };
+        let range = |start: (u32, u32), end: (u32, u32)| RangeParams {
+            start_line: start.0,
+            start_character: start.1,
+            end_line: end.0,
+            end_character: end.1,
+        };
+        for (line, character) in [(0, 1), (1, 0), (1_000_001, 1)] {
+            let results = [
+                server
+                    .get_signature_help(Parameters(position(line, character)))
+                    .await
+                    .map(|_| ()),
+                server
+                    .go_to_implementation(nav(Parameters(position(line, character))))
+                    .await
+                    .map(|_| ()),
+                server
+                    .go_to_type_definition(nav(Parameters(position(line, character))))
+                    .await
+                    .map(|_| ()),
+                server
+                    .go_to_declaration(Parameters(position(line, character)))
+                    .await
+                    .map(|_| ()),
+                server
+                    .prepare_call_hierarchy(at(Parameters(position(line, character))))
+                    .await
+                    .map(|_| ()),
+                server
+                    .prepare_type_hierarchy(Parameters(position(line, character)))
+                    .await
+                    .map(|_| ()),
+                server
+                    .prepare_rename(Parameters(position(line, character)))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_document_highlights(Parameters(position(line, character)))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_code_actions(Parameters(CodeActionsParams {
+                        file_path: PathBuf::from("/ws/a.rs"),
+                        range: range((line, character), (line, character)),
+                        kind_filter: None,
+                    }))
+                    .await
+                    .map(|_| ()),
+                server
+                    .format_range(Parameters(FormatRangeParams {
+                        file_path: PathBuf::from("/ws/a.rs"),
+                        range: range((line, character), (line, character)),
+                        tab_size: 4,
+                        insert_spaces: true,
+                    }))
+                    .await
+                    .map(|_| ()),
+            ];
+            for result in results {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    ErrorCode::INVALID_PARAMS,
+                    "({line}, {character})"
+                );
+            }
+        }
+
+        let control = server
+            .get_hover(at(Parameters(position(1, 1))))
+            .await
+            .map(|_| ());
+        assert_ne!(control.unwrap_err().code, ErrorCode::INVALID_PARAMS);
+    }
+
+    /// #622: a malformed resource URI is not an unresolvable one, so the
+    /// unsubscribe path reports it as invalid params, off the async worker.
+    #[tokio::test]
+    async fn test_resolve_resource_reports_a_malformed_uri_as_invalid_params() {
+        let server = create_test_server();
+        let error = server.resolve_resource("file:///a.rs").await.unwrap_err();
+        assert!(!is_unresolvable_resource(&error), "{error:?}");
+        assert_eq!(map_bridge_error(error).code, ErrorCode::INVALID_PARAMS);
+    }
+
+    /// #618: a malformed call hierarchy `item` fails at the parameter
+    /// boundary, before any handler runs.
+    #[test]
+    fn test_malformed_call_hierarchy_item_is_rejected_when_deserializing() {
+        for item in [
+            serde_json::json!({"invalid": "structure"}),
+            serde_json::json!({"name": "f", "kind": "function", "uri": "file:///a.rs"}),
+        ] {
+            let parsed = serde_json::from_value::<CallHierarchyCallsParams>(
+                serde_json::json!({ "item": item }),
+            );
+            assert!(parsed.is_err());
+        }
     }
 
     /// #617: a zero or oversized line, or a malformed range, is `-32602` for

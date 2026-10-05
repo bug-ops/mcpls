@@ -545,6 +545,21 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_id_has_a_detached_lock_and_no_backoff() {
+        let translator = Translator::new();
+        let id = ServerId::from("ghost");
+
+        assert!(!Arc::ptr_eq(
+            &translator.respawn_lock(&id),
+            &translator.respawn_lock(&id)
+        ));
+        translator.record_respawn_failure(&id);
+        translator.record_respawn_success(&id);
+        assert!(translator.backoff_of(&id).is_none());
+        assert!(translator.respawn_backoff_remaining(&id).is_none());
+    }
+
+    #[test]
     fn test_respawn_lock_differs_across_ids() {
         let translator = Translator::new();
 

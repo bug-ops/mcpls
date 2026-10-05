@@ -552,6 +552,31 @@ impl<T: ServerText> ServerText for Contextual<T> {
 }
 
 #[cfg(test)]
+mod contextual_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn test_contextual_serializes_flat_for_any_inner_type() {
+        let item = Contextual {
+            inner: serde_json::json!({"name": "f"}),
+            enclosing_symbol: Some(EnclosingSymbolOutcome::TopLevel),
+        };
+        let value = serde_json::to_value(&item).unwrap();
+        assert_eq!(value["name"], "f");
+        assert_eq!(value["enclosing_symbol"]["status"], "top_level");
+
+        let plain = Contextual::from(serde_json::json!({"name": "f"}));
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("enclosing_symbol")
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

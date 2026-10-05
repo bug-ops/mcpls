@@ -159,6 +159,38 @@ mod tests {
         }
     }
 
+    /// Pins the #617 follow-up marker: an input range at line 0 is clamped
+    /// to line 1 (LSP line 0) instead of being rejected.
+    #[tokio::test]
+    async fn input_range_at_line_zero_clamps_to_the_first_line() {
+        let ctx = test_ctx();
+        let uri = lsp_types::Uri::from("file:///a.cpp");
+        let zero = crate::bridge::translator::dto::Range {
+            start: Position2D {
+                line: 0,
+                character: 0,
+            },
+            end: Position2D {
+                line: 0,
+                character: 0,
+            },
+        };
+        let item = HierarchyItem {
+            name: "x".into(),
+            kind: 5,
+            detail: None,
+            uri: uri.to_string(),
+            range: zero.clone(),
+            selection_range: zero,
+            data: None,
+            out_of_workspace: false,
+        };
+
+        let lsp: lsp_types::TypeHierarchyItem = hierarchy_item_to_lsp(item, uri, &ctx).await;
+
+        assert_eq!(lsp.range.start.line, 0);
+    }
+
     #[tokio::test]
     async fn type_item_round_trips_through_mcp_form() {
         let ctx = test_ctx();
