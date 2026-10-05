@@ -1268,7 +1268,8 @@ impl LspClient {
     /// Without settings every item gets `Null`, whatever its shape and even
     /// when `items` is absent (the reply before settings existed). With
     /// settings an item gets its section (the whole object when `section` is
-    /// absent, `Null` when it is unknown or not a string); only a missing
+    /// absent, `Null` when it is unknown, not a string, or the item is not an
+    /// object); only a missing
     /// `items` list is answered with `-32602`. `scopeUri` is never read.
     fn workspace_configuration_result(
         params: Option<&Value>,
@@ -1287,13 +1288,33 @@ impl LspClient {
         })?;
         let sections = items
             .iter()
-            .map(|item| match item.get("section") {
-                None | Some(Value::Null) => settings.section(None),
-                Some(Value::String(section)) => settings.section(Some(section)),
-                Some(_) => Value::Null,
+            .map(|item| match ConfigurationItem::parse(item) {
+                ConfigurationItem::Whole => settings.section(None),
+                ConfigurationItem::Section(section) => settings.section(Some(section)),
+                ConfigurationItem::Uninterpretable => Value::Null,
             })
             .collect();
         Ok(Value::Array(sections))
+    }
+}
+
+/// How one `workspace/configuration` item selects part of the settings.
+enum ConfigurationItem<'a> {
+    Whole,
+    Section(&'a str),
+    Uninterpretable,
+}
+
+impl<'a> ConfigurationItem<'a> {
+    fn parse(item: &'a Value) -> Self {
+        let Value::Object(object) = item else {
+            return Self::Uninterpretable;
+        };
+        match object.get("section") {
+            None | Some(Value::Null) => Self::Whole,
+            Some(Value::String(section)) => Self::Section(section),
+            Some(_) => Self::Uninterpretable,
+        }
     }
 }
 
@@ -1586,6 +1607,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_workspace_configuration_non_object_item_gets_null() {
+        let settings = sample_settings();
+        let result = LspClient::workspace_configuration_result(
+            Some(&serde_json::json!({
+                "items": [
+                    { "section": "python.analysis" },
+                    { "section": "missing.x" },
+                    {},
+                    { "section": 5 },
+                    "x",
+                    null,
+                    7
+                ]
+            })),
+            Some(&settings),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!([
+                { "typeCheckingMode": "strict" },
+                null,
+                settings.to_value(),
+                null,
+                null,
+                null,
+                null
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn test_message_loop_answers_workspace_configuration_from_settings() {
         use tokio::io::BufReader;
@@ -1633,7 +1687,7 @@ mod tests {
             serde_json::json!([
                 null,
                 settings.to_value(),
-                settings.to_value(),
+                null,
                 { "ui.semanticTokens": true }
             ])
         );
