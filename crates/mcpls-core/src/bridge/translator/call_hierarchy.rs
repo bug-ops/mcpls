@@ -151,7 +151,7 @@ impl Translator {
         let parsed = parse_mcp_call_hierarchy_item(item)?;
 
         // Same ToolKind/route as `handle_call_hierarchy_prepare`.
-        let path = self.parse_file_uri(&parsed.uri)?;
+        let path = self.parse_file_uri(&parsed.uri).await?;
         let doc = self
             .prepare_gated_document_for_path(
                 &path,
@@ -228,7 +228,7 @@ impl Translator {
         // Parse the URI and gate through the same chokepoint as
         // `handle_incoming_calls` -- see that function's comment (#423).
         // Same ToolKind/route as `prepare`.
-        let path = self.parse_file_uri(&parsed.uri)?;
+        let path = self.parse_file_uri(&parsed.uri).await?;
         let doc = self
             .prepare_gated_document_for_path(
                 &path,

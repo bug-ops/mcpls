@@ -269,7 +269,7 @@ impl EncodingCtx {
     /// [`WorkspaceRoots::admits_uri`], a purely lexical check over the
     /// canonical roots and their verified aliases: unlike
     /// [`Translator::validate_path`](super::Translator::validate_path) (via
-    /// `validate_path_against_roots`), it does **not** canonicalize `uri`. A
+    /// `WorkspaceRoots::validate`), it does **not** canonicalize `uri`. A
     /// location that reaches a workspace root through a symlink other than a
     /// recorded alias (e.g. a package manager's symlinked dependency store)
     /// can therefore come back `true` even though `validate_path` would

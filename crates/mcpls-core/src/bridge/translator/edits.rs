@@ -1592,7 +1592,7 @@ mod tests {
     }
 
     /// #558: an edit whose URI uses an alias spelling of a root (configured
-    /// symlink, logical `$PWD`) is kept, like `validate_path_against_roots`
+    /// symlink, logical `$PWD`) is kept, like `WorkspaceRoots::validate`
     /// would admit it; an unrelated URI is still dropped.
     #[cfg(unix)]
     #[tokio::test]

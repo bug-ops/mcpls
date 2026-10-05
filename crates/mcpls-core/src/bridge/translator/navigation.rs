@@ -185,7 +185,7 @@ impl ItemBudget {
 /// (e.g. the standard library or a crates.io dependency) -- dropping those
 /// would break ordinary navigation. Any subsequent attempt to open or read
 /// the path this location names still goes through the inbound
-/// `validate_path_against_roots` gate (`mcp/server.rs`), which fails closed,
+/// `WorkspaceRoots::validate` gate (`mcp/server.rs`), which fails closed,
 /// so the untrusted-URI concern is already covered downstream.
 async fn lsp_locations_to_mcp(
     locs: Vec<lsp_types::Location>,
@@ -1540,7 +1540,7 @@ mod tests {
     /// goto-definition into the standard library or a crates.io dependency
     /// is normal, expected navigation, not an attack. The untrusted-URI
     /// concern is instead covered downstream, by the inbound
-    /// `validate_path_against_roots` gate any subsequent open/read of the
+    /// `WorkspaceRoots::validate` gate any subsequent open/read of the
     /// path would hit.
     #[tokio::test]
     async fn test_handle_definition_does_not_filter_out_of_workspace_location() {

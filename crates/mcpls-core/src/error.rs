@@ -600,6 +600,8 @@ pub enum BackgroundTask {
     LspReceiver,
     /// The blocking resolution of `subscriptions/listen` URIs.
     ListenResolution,
+    /// The blocking canonicalization of a client path.
+    PathValidation,
 }
 
 impl fmt::Display for BackgroundTask {
@@ -608,6 +610,7 @@ impl fmt::Display for BackgroundTask {
             Self::McpService => "MCP service",
             Self::LspReceiver => "LSP receiver",
             Self::ListenResolution => "listen URI resolution",
+            Self::PathValidation => "path validation",
         })
     }
 }
@@ -902,7 +905,7 @@ pub enum Error {
     /// through a regular file, or has an invalid or over-long name.
     ///
     /// Produced only while validating the client path
-    /// (`validate_path_against_roots`); the same IO kinds raised later, while
+    /// (`WorkspaceRoots::validate`); the same IO kinds raised later, while
     /// reading or opening an already validated file, stay [`Error::FileIo`]
     /// because there they are environmental.
     #[error("malformed file path {path:?}: {source}")]
@@ -2213,7 +2216,7 @@ mod tests {
     }
 
     /// #479 regression: a client-supplied path that doesn't exist (the
-    /// common case behind `validate_path_against_roots`'s `canonicalize()`
+    /// common case behind `WorkspaceRoots::validate`'s `canonicalize()`
     /// failure) must classify as caller-fault, matching `DocumentNotFound`.
     #[test]
     fn test_mcp_error_kind_file_io_not_found_is_invalid_params() {

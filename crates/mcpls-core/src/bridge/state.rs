@@ -1749,12 +1749,12 @@ pub fn try_path_to_uri(path: &Path) -> Option<Uri> {
 }
 
 #[cfg(not(windows))]
-fn file_url(path: &Path) -> Option<Url> {
+pub(super) fn file_url(path: &Path) -> Option<Url> {
     Url::from_file_path(path).ok()
 }
 
 #[cfg(windows)]
-fn file_url(path: &Path) -> Option<Url> {
+pub(super) fn file_url(path: &Path) -> Option<Url> {
     match Url::from_file_path(path) {
         Ok(file_url) => Some(file_url),
         Err(()) if path.has_root() => windows_rooted_path_to_file_url(path),

@@ -519,7 +519,7 @@ impl Translator {
         if remaining.is_zero() {
             return not_computed(NotComputedReason::Deadline);
         }
-        let Some(path) = self.parse_file_uri(&lsp_types::Uri::from(uri)).ok() else {
+        let Ok(path) = self.parse_file_uri(&lsp_types::Uri::from(uri)).await else {
             return not_computed(NotComputedReason::OutOfWorkspace);
         };
         *attempted = attempted.saturating_add(1);

@@ -241,9 +241,12 @@ impl Translator {
     /// # Errors
     ///
     /// Returns the same path-validation errors as every document tool.
-    pub(crate) fn language_for_path(&self, path: &ClientPath) -> Result<String> {
-        let validated = self.validate_path(path)?;
-        Ok(self.language_candidates(&validated).language().to_string())
+    pub(crate) async fn language_for_path(&self, path: &ClientPath) -> Result<String> {
+        let validated = self.validate_path(path).await?;
+        Ok(self
+            .language_candidates(validated.as_path())
+            .language()
+            .to_string())
     }
 }
 
@@ -639,12 +642,16 @@ mod tests {
         let file = dir.path().join("a.rs");
         std::fs::write(&file, "").unwrap();
         assert_eq!(
-            translator.language_for_path(&client_path(&file)).unwrap(),
+            translator
+                .language_for_path(&client_path(&file))
+                .await
+                .unwrap(),
             "rust"
         );
         assert!(
             translator
                 .language_for_path(&client_path("/definitely/missing.rs"))
+                .await
                 .is_err()
         );
     }

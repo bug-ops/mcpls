@@ -69,7 +69,7 @@ pub use restart::{
     RestartFailure, RestartOutcome, RestartServerResult, RestartTarget, ServerIds, ServerIdsError,
     ServerRestartEntry,
 };
-pub use routing::{Capability, validate_path_against_roots};
+pub use routing::Capability;
 pub use support::{RouteSupport, ToolSupportSnapshot};
 pub use symbols::parse_symbol_kind;
 

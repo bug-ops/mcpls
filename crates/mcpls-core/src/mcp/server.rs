@@ -47,7 +47,7 @@ use crate::bridge::{
     LocationsResult, NotificationCache, OutgoingCallsResult, Position, PositionEncoding,
     PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult, ServerLogsResult,
     ServerMessagesResult, SignatureHelpResult, Translator, TypeHierarchyResult, WorkspaceRoots,
-    WorkspaceSymbolResult, validate_path_against_roots,
+    WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -673,15 +673,14 @@ impl McplsServer {
         // `false` here and fails properly inside `handle_diagnostics` below,
         // and a failed-to-start server's `ServerFailedToStart` is likewise
         // reported there by the pull request itself.
-        let route_id = validate_path_against_roots(&file_path, &self.context.workspace_roots)
-            .ok()
-            .and_then(|validated_path| {
-                self.context
-                    .translator
-                    .diagnostics_route_for_path(&validated_path)
-                    .server_id()
-                    .cloned()
-            });
+        let validated = self.context.translator.validate_path(&file_path).await;
+        let route_id = validated.as_ref().ok().and_then(|validated_path| {
+            self.context
+                .translator
+                .diagnostics_route_for_path(validated_path.as_path())
+                .server_id()
+                .cloned()
+        });
 
         // Sampled before and after the pull: indexing may finish, or a respawn may mark push-degraded, mid-pull.
         let before = {
@@ -692,11 +691,15 @@ impl McplsServer {
         // Merging push-model (flycheck/clippy) diagnostics into the pull
         // result, including the pull-error-but-cache-has-data fallback, is
         // handled inside handle_diagnostics itself -- see its doc comment.
-        let result = self
-            .context
-            .translator
-            .handle_diagnostics(file_path, context, &self.context.notification_cache)
-            .await;
+        let result = match validated {
+            Ok(path) => {
+                self.context
+                    .translator
+                    .handle_validated_diagnostics(&path, context, &self.context.notification_cache)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
 
         let after = {
             let cache = self.context.notification_cache.lock().await;
@@ -1065,11 +1068,12 @@ impl McplsServer {
         // not an empty list (#535).
         let resolved =
             Translator::cached_diagnostics_path_and_uri(&self.context.workspace_roots, &file_path)
+                .await
                 .and_then(|(validated_path, uri)| {
                     let route_id = self
                         .context
                         .translator
-                        .diagnostics_route_for_path(&validated_path)
+                        .diagnostics_route_for_path(validated_path.as_path())
                         .into_read_result()?;
                     Ok((route_id, uri))
                 });
@@ -1256,16 +1260,16 @@ impl McplsServer {
         description = "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
         title = "Tool Support"
     )]
-    fn get_tool_support(
+    async fn get_tool_support(
         &self,
         Parameters(ToolSupportParams { file_path }): Parameters<ToolSupportParams>,
     ) -> Result<Json<ToolSupportReport>, McpError> {
         let file_path = file_path.map(parse_client_path).transpose()?;
         let translator = &self.context.translator;
-        let file_language = file_path
-            .as_ref()
-            .map(|path| translator.language_for_path(path))
-            .transpose();
+        let file_language = match file_path.as_ref() {
+            Some(path) => translator.language_for_path(path).await.map(Some),
+            None => Ok(None),
+        };
         let snapshot = translator.tool_support_snapshot();
         self.structured_result(file_language.map(|file_language| {
             let languages =
@@ -1332,18 +1336,23 @@ impl McplsServer {
         // Enforce workspace-root containment — mirrors the guard in every LSP tool.
         // Validated against a lock-free snapshot of workspace_roots (fixed at
         // startup) so this cache-only read never needs to touch `translator` at all.
-        let validated_path = validate_path_against_roots(path, &self.context.workspace_roots)
+        let validated_path = self
+            .context
+            .workspace_roots
+            .validate(path)
+            .await
             .map_err(map_bridge_error)?;
 
         // Build the URI from the canonicalized path (not the raw input path):
         // it must match what `diagnostics_pump` stores from LSP notifications,
         // which are always keyed by the canonical form.
-        let lsp_uri = crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
+        let lsp_uri =
+            crate::bridge::path_to_uri(validated_path.as_path()).map_err(map_bridge_error)?;
 
         let route_id = self
             .context
             .translator
-            .diagnostics_route_for_path(&validated_path)
+            .diagnostics_route_for_path(validated_path.as_path())
             .into_read_result()
             .map_err(map_bridge_error)?;
 
@@ -1359,7 +1368,9 @@ impl McplsServer {
         };
         let diag_info = sources.merge();
         Ok(build_resource_diagnostics_response(
-            self.context.translator.is_document_open(&validated_path),
+            self.context
+                .translator
+                .is_document_open(validated_path.as_path()),
             diag_info.as_ref(),
             signals,
         ))
@@ -1939,7 +1950,7 @@ mod tests {
 
     /// Like [`create_test_server_with_mcp_config`], for tests that exercise a
     /// path-taking tool (e.g. `get_cached_diagnostics`) and so need a real
-    /// workspace root -- an empty one now makes `validate_path_against_roots`
+    /// workspace root -- an empty one now makes `WorkspaceRoots::validate`
     /// fail closed with `Error::NoWorkspaceRoots`.
     fn create_test_server_with_workspace_roots(
         project_config_status: ProjectConfigStatus,
@@ -2290,7 +2301,7 @@ mod tests {
     /// #417: the fail-closed `Error::NoWorkspaceRoots` path must propagate
     /// correctly through a `#[tool]` handler's full error-mapping chain
     /// (`to_structured_tool_result`/`McpError::internal_error`), not just through the
-    /// lower-level `Translator::validate_path`/`validate_path_against_roots`
+    /// lower-level `Translator::validate_path`/`WorkspaceRoots::validate`
     /// unit tests -- `create_test_server()` here deliberately keeps the
     /// empty roots that `create_test_server_with_real_file()` (used by the
     /// rest of this test group) sets up a real root to avoid.
@@ -4587,7 +4598,7 @@ sleep 0.3
     }
 
     /// Regression test for `read_resource`'s canonical-path fix: a path reached
-    /// through a symlink must resolve, via `validate_path_against_roots`, to the
+    /// through a symlink must resolve, via `WorkspaceRoots::validate`, to the
     /// same URI as its canonical (symlink-resolved) form -- matching what
     /// `diagnostics_pump` stores from LSP notifications. Building `lsp_uri` from
     /// the raw (symlinked) path (the pre-fix behavior) would produce a
@@ -4625,11 +4636,11 @@ sleep 0.3
         let noncanonical = link_dir.join("test.rs");
         assert_ne!(noncanonical, test_file);
 
-        let validated = validate_path_against_roots(
-            &client_path(&noncanonical),
-            &WorkspaceRoots::from_configured(&[base]).unwrap(),
-        )
-        .unwrap();
+        let validated = WorkspaceRoots::from_configured(&[base])
+            .unwrap()
+            .validate_blocking(&client_path(&noncanonical))
+            .map(crate::bridge::WorkspacePath::into_path_buf)
+            .unwrap();
         assert_eq!(validated, test_file.canonicalize().unwrap());
 
         let uri_from_raw_path = crate::bridge::path_to_uri(&noncanonical).unwrap();
@@ -4651,8 +4662,9 @@ sleep 0.3
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
-        let result =
-            translator.validate_path(&client_path(dir.path().join("this/path/does/not/exist.rs")));
+        let result = translator
+            .validate_path(&client_path(dir.path().join("this/path/does/not/exist.rs")))
+            .await;
         assert_matches!(result, Err(Error::FileIo { .. }));
     }
 
@@ -4661,7 +4673,7 @@ sleep 0.3
     /// client-supplied path that doesn't exist. Exercised at the same
     /// logic level as the rest of this test group (constructing a live
     /// `rmcp::service::RequestContext` isn't possible in a unit test, see
-    /// the note above "Resource handler tests"): `validate_path_against_roots`
+    /// the note above "Resource handler tests"): `WorkspaceRoots::validate`
     /// is the exact call both handlers make, and `map_bridge_error` is the
     /// exact function both now pipe its `Err` through.
     #[test]
@@ -4670,7 +4682,9 @@ sleep 0.3
         let roots = WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap();
         let missing = temp_dir.path().join("does-not-exist.rs");
 
-        let result = validate_path_against_roots(&client_path(missing), &roots);
+        let result = roots
+            .validate_blocking(&client_path(missing))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
         assert_matches!(result, Err(crate::error::Error::FileIo { .. }));
 
         let mcp_err = map_bridge_error(result.unwrap_err());
@@ -4686,7 +4700,10 @@ sleep 0.3
         std::fs::write(&file, "fn main() {}").unwrap();
         let roots = WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap();
 
-        let err = validate_path_against_roots(&client_path(file.join("x")), &roots).unwrap_err();
+        let err = roots
+            .validate_blocking(&client_path(file.join("x")))
+            .map(crate::bridge::WorkspacePath::into_path_buf)
+            .unwrap_err();
 
         assert_matches!(
             err,
@@ -4828,7 +4845,10 @@ sleep 0.3
         let noncanonical = link_dir.join("test.rs");
 
         let roots = &WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
-        let validated = validate_path_against_roots(&client_path(&noncanonical), roots).unwrap();
+        let validated = roots
+            .validate_blocking(&client_path(&noncanonical))
+            .map(crate::bridge::WorkspacePath::into_path_buf)
+            .unwrap();
         let raw_uri = make_uri(&noncanonical).unwrap();
         let canonical_uri = DiagnosticsResourceUri::resolve(&raw_uri, roots)
             .unwrap()
@@ -4848,7 +4868,12 @@ sleep 0.3
         // Delete the file (through the real path, not the symlink) so
         // canonicalizing the symlinked path at unsubscribe time fails.
         fs::remove_file(&test_file).unwrap();
-        assert!(validate_path_against_roots(&client_path(&noncanonical), roots).is_err());
+        assert!(
+            roots
+                .validate_blocking(&client_path(&noncanonical))
+                .map(crate::bridge::WorkspacePath::into_path_buf)
+                .is_err()
+        );
 
         // Mirrors `unsubscribe`'s handler: no canonical URI once
         // canonicalization fails, only the raw one.
@@ -5721,6 +5746,7 @@ sleep 0.3
                 .map(|_| ()),
             McpTool::GetToolSupport => server
                 .get_tool_support(Parameters(ToolSupportParams::default()))
+                .await
                 .map(|_| ()),
             McpTool::RestartServer => server
                 .restart_server(Parameters(
@@ -5798,9 +5824,10 @@ sleep 0.3
         }
     }
 
-    fn report_json(server: &McplsServer, file_path: Option<PathBuf>) -> serde_json::Value {
+    async fn report_json(server: &McplsServer, file_path: Option<PathBuf>) -> serde_json::Value {
         let text = server
             .get_tool_support(Parameters(ToolSupportParams { file_path }))
+            .await
             .unwrap();
         serde_json::to_value(&text.0).unwrap()
     }
@@ -5827,7 +5854,7 @@ sleep 0.3
             ],
             McpConfig::default(),
         );
-        let report = report_json(&fixture.server, None);
+        let report = report_json(&fixture.server, None).await;
 
         assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
         assert_eq!(report["tools"].as_array().unwrap().len(), 29);
@@ -5865,14 +5892,15 @@ sleep 0.3
             ],
             McpConfig::default(),
         );
-        let report = report_json(&fixture.server, Some(PathBuf::from(&fixture.file)));
+        let report = report_json(&fixture.server, Some(PathBuf::from(&fixture.file))).await;
         assert_eq!(report["languages"], serde_json::json!(["rust"]));
 
         let outside = fixture
             .server
             .get_tool_support(Parameters(ToolSupportParams {
                 file_path: Some(PathBuf::from("/definitely/not/in/workspace.rs")),
-            }));
+            }))
+            .await;
         assert!(outside.is_err());
         drop(fixture.dir);
     }
@@ -5887,14 +5915,14 @@ sleep 0.3
             vec![("rust", "rust", lsp_types::ServerCapabilities::default())],
             mcp,
         );
-        let report = report_json(&fixture.server, None);
+        let report = report_json(&fixture.server, None).await;
         assert_eq!(tool_entry(&report, "p_get_hover")["coverage"], "none");
     }
 
-    #[test]
-    fn test_get_tool_support_with_nothing_configured_reports_no_languages() {
+    #[tokio::test]
+    async fn test_get_tool_support_with_nothing_configured_reports_no_languages() {
         let server = create_test_server();
-        let report = report_json(&server, None);
+        let report = report_json(&server, None).await;
         assert_eq!(report["languages"], serde_json::json!([]));
         assert_eq!(tool_entry(&report, "get_hover")["coverage"], "none");
         assert_eq!(tool_entry(&report, "get_server_logs")["coverage"], "always");
@@ -5920,7 +5948,7 @@ sleep 0.3
             .context
             .translator
             .rebind_router(&HashSet::from([ServerId::from("rust")]));
-        let report = report_json(&fixture.server, None);
+        let report = report_json(&fixture.server, None).await;
         assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
         assert_eq!(
             tool_entry(&report, "get_hover")["routes"][0],
@@ -5940,7 +5968,7 @@ sleep 0.3
             ],
             McpConfig::default(),
         );
-        let report = report_json(&fixture.server, None);
+        let report = report_json(&fixture.server, None).await;
         let routes = tool_entry(&report, "get_hover")["routes"]
             .as_array()
             .unwrap()
@@ -5952,7 +5980,7 @@ sleep 0.3
             .context
             .translator
             .rebind_router(&std::collections::HashSet::new());
-        let report = report_json(&fixture.server, None);
+        let report = report_json(&fixture.server, None).await;
         assert_eq!(
             tool_entry(&report, "get_hover")["routes"],
             serde_json::json!([
@@ -6022,8 +6050,8 @@ sleep 0.3
 
     /// Before registration completes, an expected server reads as
     /// `initializing`/`unknown`, not as unsupported.
-    #[test]
-    fn test_get_tool_support_reports_expected_unregistered_server_as_unknown() {
+    #[tokio::test]
+    async fn test_get_tool_support_reports_expected_unregistered_server_as_unknown() {
         use std::collections::HashSet;
 
         use crate::config::{ServerId, ToolRouter};
@@ -6041,7 +6069,7 @@ sleep 0.3
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
-        let report = report_json(&server, None);
+        let report = report_json(&server, None).await;
         let hover = tool_entry(&report, "get_hover");
         assert_eq!(hover["coverage"], "unknown");
         assert_eq!(hover["routes"][0]["status"], "initializing");

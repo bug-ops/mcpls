@@ -32,7 +32,7 @@ pub use notifications::{
 };
 pub(crate) use notifications::{DiagnosticsKey, diagnostics_cache_key};
 #[cfg(test)]
-pub(crate) use published_uri::{CanonicalizeFn, resolve_one};
+pub(crate) use published_uri::resolve_one;
 pub(crate) use published_uri::{Publication, PublicationKind, PublishedPathResolver};
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, ResourceLimits, path_to_uri,
@@ -57,11 +57,11 @@ pub(crate) use translator::{
     CallHierarchyPrepareResult, Capability, CodeActionsResult, IncomingCallsResult,
     InlayHintsResult, LocationsResult, NotificationReceivers, NotificationWiring,
     OutgoingCallsResult, RouteSupport, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
-    ToolSupportSnapshot, WorkspaceSymbolResult, validate_path_against_roots,
+    ToolSupportSnapshot, WorkspaceSymbolResult,
 };
 #[cfg(test)]
-pub(crate) use workspace_roots::ProcessCwd;
-pub use workspace_roots::WorkspaceRoots;
+pub(crate) use workspace_roots::{CanonicalizeFn, ProcessCwd};
+pub use workspace_roots::{WorkspacePath, WorkspaceRoots};
 pub(crate) use workspace_roots::{join_relative_root, lexically_normalize, probe_root};
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

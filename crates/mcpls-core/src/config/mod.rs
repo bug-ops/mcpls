@@ -1387,9 +1387,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::bridge::WorkspaceRoots;
     #[cfg(unix)]
-    use crate::bridge::{ProcessCwd, validate_path_against_roots};
+    use crate::bridge::ProcessCwd;
+    use crate::bridge::WorkspaceRoots;
     #[cfg(unix)]
     use crate::test_lsp::client_path;
     use crate::test_lsp::toml_path_literal;
@@ -1601,11 +1601,13 @@ mod tests {
         assert_eq!(config.workspace.roots, vec![tree.link.clone()]);
         let roots = WorkspaceRoots::from_configured(&config.workspace.roots).unwrap();
 
-        let via_link =
-            validate_path_against_roots(&client_path(tree.link.join("src/main.rs")), &roots);
+        let via_link = roots
+            .validate_blocking(&client_path(tree.link.join("src/main.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
         assert_eq!(via_link.unwrap(), tree.real.join("src/main.rs"));
-        let via_real =
-            validate_path_against_roots(&client_path(tree.real.join("src/main.rs")), &roots);
+        let via_real = roots
+            .validate_blocking(&client_path(tree.real.join("src/main.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
         assert!(via_real.is_ok());
     }
 
@@ -1621,7 +1623,9 @@ mod tests {
         let roots = load_roots(&config_path);
 
         for root in [&tree.link, &tree.real] {
-            let err = validate_path_against_roots(&client_path(root.join("out/secret.rs")), &roots)
+            let err = roots
+                .validate_blocking(&client_path(root.join("out/secret.rs")))
+                .map(crate::bridge::WorkspacePath::into_path_buf)
                 .unwrap_err();
             assert_matches!(err, Error::PathOutsideWorkspace(_), "{err:?}");
         }
@@ -1646,8 +1650,9 @@ mod tests {
 
         let roots = load_roots(&cfg_link.join("mcpls.toml"));
 
-        let admitted =
-            validate_path_against_roots(&client_path(cfg_link.join("proj/src/main.rs")), &roots);
+        let admitted = roots
+            .validate_blocking(&client_path(cfg_link.join("proj/src/main.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
         assert_eq!(admitted.unwrap(), tree.real.join("src/main.rs"));
     }
 
@@ -1678,8 +1683,9 @@ mod tests {
         })
         .unwrap();
 
-        let admitted =
-            validate_path_against_roots(&client_path(tree.link.join("src/main.rs")), &roots);
+        let admitted = roots
+            .validate_blocking(&client_path(tree.link.join("src/main.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
         assert_eq!(admitted.unwrap(), tree.real.join("src/main.rs"));
     }
 
@@ -1721,8 +1727,10 @@ mod tests {
         let roots = load_roots(&proj_link.join("mcpls.toml"));
 
         assert_eq!(roots.canonical(), [tree.base.join("data/a")]);
-        let err =
-            validate_path_against_roots(&client_path(home.join("other.rs")), &roots).unwrap_err();
+        let err = roots
+            .validate_blocking(&client_path(home.join("other.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf)
+            .unwrap_err();
         assert_matches!(err, Error::PathOutsideWorkspace(_), "{err:?}");
     }
 

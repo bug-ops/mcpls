@@ -70,6 +70,10 @@ predicates: a lexical pre-filter (`admits_uri`) and a strict write gate (`admits
 | FR-006 | `PublishedDiagnosticsUri::resolve` SHALL take `&WorkspaceRoots` and decide containment on the canonical path with `contains_canonical` | must |
 | FR-007 | Test fixtures SHALL build roots through `from_configured` for real directories, and through a `cfg(test)` constructor (`for_test`) for pure-lexical unit tests that name literal paths | must |
 | FR-008 | WHEN a server supplies a URI that mcpls would write through (rename and code-action edits) THE SYSTEM SHALL use `WorkspaceRoots::admits_edit_uri`: exact component comparison against the canonical roots and aliases (no case folding) AND a canonical form of the path (longest existing prefix resolved) under a canonical root. Aliases are then only a spelling aid | must |
+| FR-009 | THE SYSTEM SHALL canonicalize a path through one routine, `canonicalize_existing_prefix`, which falls through to the next ancestor only on `NotFound` and `NotADirectory`, reports every other error as `Unresolved::Transient` and refuses `..` components; `admits_edit_uri` SHALL treat any `Unresolved` as not admitted | must |
+| FR-010 | THE SYSTEM SHALL validate client paths only through `WorkspaceRoots::validate` (async, canonicalization on the blocking pool) or `validate_blocking`, which return a `WorkspacePath`; a handler validates a request path once and passes the `WorkspacePath` on | must |
+| FR-011 | THE tsserver pin SHALL decide whether the pinned tsserver lies inside the workspace with `WorkspaceRoots::contains_canonical` on the canonicalized tsserver path | must |
+| FR-012 | `resources::make_uri` SHALL encode through the same `file_url` as `try_path_to_uri`, so every path the bridge can open has a resource URI on Windows | must |
 
 ## 3. Behavior Changes
 

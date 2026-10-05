@@ -7,7 +7,7 @@ use super::Translator;
 use super::dto::Position;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
-use crate::bridge::{ClientPath, InFlightGuard, WorkspaceRoots, lexically_normalize, lock_std};
+use crate::bridge::{ClientPath, InFlightGuard, WorkspacePath, lock_std};
 use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
@@ -83,68 +83,6 @@ impl PreparedDocument {
 
     pub(super) const fn uri(&self) -> &lsp_types::Uri {
         &self.uri
-    }
-}
-
-/// Validate that `path` is within one of `workspace_roots`.
-///
-/// Free function (rather than a `Translator` method) so callers that only need
-/// path validation — e.g. cache-only MCP handlers — can validate against a
-/// cloned, lock-free snapshot of the workspace roots instead of locking the
-/// full `Arc<Mutex<Translator>>`, which may be held elsewhere across a slow
-/// in-flight LSP round-trip.
-///
-/// The lexical check (absolute, `.`/`..` resolved, against the canonical roots
-/// and their aliases) is only a pre-filter: it rejects an out-of-workspace path
-/// without touching the filesystem, and it can only reject, never accept. The
-/// decision that counts uses the physical path: the original `path` is
-/// canonicalized (so `..` after a symlink is resolved against the real
-/// directory) and that canonical form must lie under a canonical root. The
-/// returned path is the canonical one.
-///
-/// # Errors
-///
-/// Returns `Error::NoWorkspaceRoots` if `workspace_roots` is empty -- fails
-/// closed rather than allowing unrestricted access -- and
-/// `Error::PathOutsideWorkspace` if the path is outside all configured
-/// workspace roots. When the lexical check admitted the path but it cannot be
-/// canonicalized, `Error::FileIo` is returned (for example it does not exist),
-/// or `Error::MalformedPath` when the path itself is malformed (it runs
-/// through a regular file, or has an invalid or over-long name).
-/// Empty and NUL-containing paths cannot reach this function: they are
-/// rejected when the [`ClientPath`] is parsed.
-pub fn validate_path_against_roots(
-    path: &ClientPath,
-    workspace_roots: &WorkspaceRoots,
-) -> Result<PathBuf> {
-    let path = path.as_path();
-    if workspace_roots.is_empty() {
-        return Err(Error::NoWorkspaceRoots(path.to_path_buf()));
-    }
-
-    let io_error = |source: std::io::Error| match source.kind() {
-        std::io::ErrorKind::NotADirectory
-        | std::io::ErrorKind::InvalidFilename
-        | std::io::ErrorKind::InvalidInput => Error::MalformedPath {
-            path: path.to_path_buf(),
-            source,
-        },
-        _ => Error::FileIo {
-            path: path.to_path_buf(),
-            source,
-        },
-    };
-    let absolute = std::path::absolute(path).map_err(io_error)?;
-    let normalized = lexically_normalize(dunce::simplified(&absolute));
-    if !workspace_roots.admits_lexically(&normalized) {
-        return Err(Error::PathOutsideWorkspace(path.to_path_buf()));
-    }
-
-    let canonical = dunce::canonicalize(path).map_err(io_error)?;
-    if workspace_roots.contains_canonical(&canonical) {
-        Ok(canonical)
-    } else {
-        Err(Error::PathOutsideWorkspace(path.to_path_buf()))
     }
 }
 
@@ -757,8 +695,8 @@ impl Translator {
     /// Returns `Error::NoWorkspaceRoots` if no workspace roots are
     /// configured (fails closed), or `Error::PathOutsideWorkspace` if the
     /// path is outside all configured workspace roots.
-    pub(crate) fn validate_path(&self, path: &ClientPath) -> Result<PathBuf> {
-        validate_path_against_roots(path, &self.workspace_roots)
+    pub(crate) async fn validate_path(&self, path: &ClientPath) -> Result<WorkspacePath> {
+        self.workspace_roots.validate(path).await
     }
 
     /// Resolve the client and routing identity for `path`/`tool`, giving the
@@ -955,9 +893,11 @@ impl Translator {
         file_path: &ClientPath,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient, PathBuf)> {
-        let validated_path = self.validate_path(file_path)?;
-        let (server_id, client) = self.resolve_client_for_file(&validated_path, tool).await?;
-        Ok((server_id, client, validated_path))
+        let validated_path = self.validate_path(file_path).await?;
+        let (server_id, client) = self
+            .resolve_client_for_file(validated_path.as_path(), tool)
+            .await?;
+        Ok((server_id, client, validated_path.into_path_buf()))
     }
 
     /// As [`Self::resolve_validated_client_for_file`], but for a caller that
@@ -968,11 +908,11 @@ impl Translator {
     /// input from scratch.
     async fn resolve_validated_client_for_path(
         &self,
-        path: &Path,
+        path: &WorkspacePath,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient, PathBuf)> {
-        let (server_id, client) = self.resolve_client_for_file(path, tool).await?;
-        Ok((server_id, client, path.to_path_buf()))
+        let (server_id, client) = self.resolve_client_for_file(path.as_path(), tool).await?;
+        Ok((server_id, client, path.as_path().to_path_buf()))
     }
 
     /// Resolve the LSP client and ensure the document is open.
@@ -993,14 +933,24 @@ impl Translator {
     /// file can be routed to more than one server; a wedged server-A notify
     /// still holds this path's lock and can therefore delay a healthy
     /// server-B call for that *same* file.)
+    #[cfg(test)]
     pub(super) async fn prepare_document(
         &self,
         file_path: &ClientPath,
         tool: ToolKind,
     ) -> Result<PreparedDocument> {
-        let (server_id, client, validated_path) = self
-            .resolve_validated_client_for_file(file_path, tool)
-            .await?;
+        let path = self.validate_path(file_path).await?;
+        self.prepare_document_for_path(&path, tool).await
+    }
+
+    /// As [`Self::prepare_document`], for a path that is already validated.
+    pub(super) async fn prepare_document_for_path(
+        &self,
+        path: &WorkspacePath,
+        tool: ToolKind,
+    ) -> Result<PreparedDocument> {
+        let (server_id, client, validated_path) =
+            self.resolve_validated_client_for_path(path, tool).await?;
         self.open_prepared(server_id, client, &validated_path).await
     }
 
@@ -1076,7 +1026,7 @@ impl Translator {
     /// doc for why this skips re-validation.
     pub(super) async fn prepare_gated_document_for_path(
         &self,
-        path: &Path,
+        path: &WorkspacePath,
         capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
@@ -1254,7 +1204,7 @@ impl Translator {
     ///   otherwise cannot be converted to a path (see
     ///   [`crate::bridge::state::uri_to_path`])
     /// - The path is outside workspace boundaries
-    pub(super) fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
+    pub(super) async fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<WorkspacePath> {
         let path = crate::bridge::state::uri_to_path(uri).ok_or_else(|| {
             Error::InvalidToolParams(format!(
                 "Invalid URI, expected an absolute file:// URI but got: {}",
@@ -1262,7 +1212,7 @@ impl Translator {
             ))
         })?;
 
-        self.validate_path(&ClientPath::try_from(path)?)
+        self.validate_path(&ClientPath::try_from(path)?).await
     }
 }
 
@@ -1284,7 +1234,7 @@ mod tests {
     use crate::bridge::translator::dto::Position;
     use crate::bridge::translator::edits::MAX_NEW_NAME_LENGTH;
     use crate::bridge::translator::testing::*;
-    use crate::bridge::{NotificationCache, ResultContext};
+    use crate::bridge::{NotificationCache, ResultContext, WorkspaceRoots};
     use crate::config::{LspServerConfig, ToolRouter};
     use crate::error::Error;
     use crate::lsp::LspServer;
@@ -1493,20 +1443,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_validate_path_no_workspace_roots_rejects_any_path() {
+    #[tokio::test]
+    async fn test_validate_path_no_workspace_roots_rejects_any_path() {
         let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
         // With no workspace roots configured, access is rejected (fail closed)
-        let result = translator.validate_path(&client_path(test_file));
+        let result = translator.validate_path(&client_path(test_file)).await;
         assert_matches!(result, Err(Error::NoWorkspaceRoots(_)));
     }
 
-    #[test]
-    fn test_validate_path_within_workspace() {
+    #[tokio::test]
+    async fn test_validate_path_within_workspace() {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().to_path_buf();
@@ -1515,12 +1465,12 @@ mod tests {
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result = translator.validate_path(&client_path(test_file));
+        let result = translator.validate_path(&client_path(test_file)).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_path_outside_workspace() {
+    #[tokio::test]
+    async fn test_validate_path_outside_workspace() {
         let mut translator = Translator::new();
         let temp_dir1 = TempDir::new().unwrap();
         let temp_dir2 = TempDir::new().unwrap();
@@ -1534,7 +1484,7 @@ mod tests {
         let test_file = temp_dir2.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result = translator.validate_path(&client_path(test_file));
+        let result = translator.validate_path(&client_path(test_file)).await;
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
@@ -1546,8 +1496,9 @@ mod tests {
         let outside = TempDir::new().unwrap();
         let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(outside.path().join("missing.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(outside.path().join("missing.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1557,8 +1508,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(root.path().join("../escape.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(root.path().join("../escape.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1570,8 +1522,9 @@ mod tests {
         fs::write(root.path().join("b.rs"), "").unwrap();
         let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(root.path().join("./a/../b.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(root.path().join("./a/../b.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_eq!(
             result.unwrap(),
@@ -1592,7 +1545,9 @@ mod tests {
         } = alias_fixture();
         fs::write(real.join("a.rs"), "").unwrap();
 
-        let result = validate_path_against_roots(&client_path(alias.join("a.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(alias.join("a.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_eq!(
             result.unwrap(),
@@ -1610,7 +1565,9 @@ mod tests {
         } = alias_fixture();
         fs::write(dir.path().join("outside.rs"), "").unwrap();
 
-        let result = validate_path_against_roots(&client_path(alias.join("../outside.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(alias.join("../outside.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1627,7 +1584,9 @@ mod tests {
             ..
         } = alias_fixture();
 
-        let result = validate_path_against_roots(&client_path(alias.join("missing.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(alias.join("missing.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::FileIo { .. }), "{result:?}");
     }
@@ -1647,8 +1606,9 @@ mod tests {
         fs::write(outside.path().join("secret.rs"), "").unwrap();
         std::os::unix::fs::symlink(outside.path(), real.join("link")).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(alias.join("link/secret.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(alias.join("link/secret.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1664,8 +1624,9 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
         let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(root.path().join("link/secret.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(root.path().join("link/secret.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1712,7 +1673,7 @@ mod tests {
     async fn test_parse_file_uri_invalid_scheme() {
         let translator = Translator::new();
         let uri: lsp_types::Uri = lsp_types::Uri::from("http://example.com/file.rs");
-        let result = translator.parse_file_uri(&uri);
+        let result = translator.parse_file_uri(&uri).await;
         assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
@@ -1729,7 +1690,7 @@ mod tests {
         // Use url crate for cross-platform file URI creation
         let file_url = Url::from_file_path(&test_file).unwrap();
         let uri: lsp_types::Uri = lsp_types::Uri::from(file_url.as_str());
-        let result = translator.parse_file_uri(&uri);
+        let result = translator.parse_file_uri(&uri).await;
         assert!(result.is_ok());
     }
 
@@ -1753,8 +1714,8 @@ mod tests {
             "test fixture must exercise percent-encoding"
         );
         let uri: lsp_types::Uri = lsp_types::Uri::from(file_url.as_str());
-        let result = translator.parse_file_uri(&uri).unwrap();
-        assert_eq!(result, dunce::canonicalize(&test_file).unwrap());
+        let result = translator.parse_file_uri(&uri).await.unwrap();
+        assert_eq!(result.as_path(), dunce::canonicalize(&test_file).unwrap());
     }
 
     /// #411: an authority-bearing `file://` URI (e.g. `file://host/path`)
@@ -1764,7 +1725,7 @@ mod tests {
     async fn test_parse_file_uri_rejects_authority() {
         let translator = Translator::new();
         let uri: lsp_types::Uri = lsp_types::Uri::from("file://host/some/path.rs");
-        let result = translator.parse_file_uri(&uri);
+        let result = translator.parse_file_uri(&uri).await;
         assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 

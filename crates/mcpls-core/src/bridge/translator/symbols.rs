@@ -367,7 +367,7 @@ impl Translator {
             // comment), a legitimate workspace-symbol result routinely
             // points outside the workspace (stdlib, a dependency), and any
             // subsequent open/read of it still hits the inbound
-            // `validate_path_against_roots` gate.
+            // `WorkspaceRoots::validate` gate.
             Some(lsp_types::WorkspaceSymbolResponse::SymbolInformationList(list)) => {
                 for sym in list {
                     raw_symbols.push(RawWorkspaceSymbol {

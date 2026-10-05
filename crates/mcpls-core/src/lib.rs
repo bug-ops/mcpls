@@ -619,7 +619,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
                 workspace_roots: workspace_roots.canonical().to_vec(),
                 initialization_options: lsp::tsserver_pin::pinned_initialization_options(
                     lsp_config,
-                    workspace_roots.canonical(),
+                    &workspace_roots,
                     |key| std::env::var_os(key),
                 ),
                 position_encodings: config.workspace.position_encodings.clone(),

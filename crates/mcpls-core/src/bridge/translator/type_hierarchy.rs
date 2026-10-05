@@ -122,7 +122,7 @@ impl Translator {
         direction: WalkDirection,
     ) -> Result<TypeHierarchyResult> {
         let uri = lsp_types::Uri::from(item.uri.as_str());
-        let path = self.parse_file_uri(&uri)?;
+        let path = self.parse_file_uri(&uri).await?;
         let doc = self
             .prepare_gated_document_for_path(
                 &path,

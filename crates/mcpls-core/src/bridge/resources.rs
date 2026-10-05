@@ -13,8 +13,8 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use url::Url;
 
-use super::state::{encode_rfc3986_path_chars, uri_to_path};
-use super::{ClientPath, InvalidClientPath, WorkspaceRoots, validate_path_against_roots};
+use super::state::{encode_rfc3986_path_chars, file_url, uri_to_path};
+use super::{ClientPath, InvalidClientPath, WorkspaceRoots};
 
 /// URI scheme used for diagnostic resources.
 const SCHEME: &str = "lsp-diagnostics";
@@ -111,8 +111,8 @@ impl From<SubscriptionError> for crate::error::Error {
 /// assert!(uri.starts_with("lsp-diagnostics:///"));
 /// ```
 pub fn make_uri(path: &Path) -> Result<String, ResourceUriError> {
-    let file_url = Url::from_file_path(path)
-        .map_err(|()| ResourceUriError::InvalidPath(path.display().to_string()))?;
+    let file_url =
+        file_url(path).ok_or_else(|| ResourceUriError::InvalidPath(path.display().to_string()))?;
 
     // Replace the "file" scheme with our custom scheme while keeping the
     // percent-encoded path and authority (empty) components.
@@ -298,8 +298,8 @@ impl DiagnosticsResourceUri {
         let parsed = parse_uri(raw)?;
         // `canonicalize` yields a `\\?\` verbatim path on Windows, which LSP
         // servers never publish; `dunce` strips it where that is safe.
-        let validated = validate_path_against_roots(&parsed, roots)?;
-        let path = dunce::simplified(&validated).to_path_buf();
+        let validated = roots.validate_blocking(&parsed)?;
+        let path = dunce::simplified(validated.as_path()).to_path_buf();
         let uri = Self(make_uri(&path).map_err(|_| crate::Error::PathToUri(path.clone()))?);
         Ok(ResolvedResource { path, uri })
     }
@@ -508,6 +508,13 @@ mod tests {
     // ------------------------------------------------------------------
     // URI codec
     // ------------------------------------------------------------------
+
+    #[cfg(windows)]
+    #[test]
+    fn test_make_uri_encodes_a_windows_rooted_path_without_a_drive() {
+        let uri = make_uri(Path::new(r"\ws\main.rs")).unwrap();
+        assert_eq!(uri, "lsp-diagnostics:///ws/main.rs");
+    }
 
     #[test]
     fn test_make_uri_rejects_relative_path() {
@@ -807,6 +814,7 @@ mod tests {
             &roots_of(&root),
             &client_path(&link),
         )
+        .await
         .unwrap();
         assert_eq!(published.canonical(), &client_side);
     }
