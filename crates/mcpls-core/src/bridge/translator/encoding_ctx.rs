@@ -394,8 +394,12 @@ impl EncodingCtx {
         range: &Range,
     ) -> lsp_types::Range {
         lsp_types::Range {
-            start: self.to_lsp(uri, range.start.clone().into()).await,
-            end: self.to_lsp(uri, range.end.clone().into()).await,
+            start: self
+                .to_lsp(uri, Position::from_server_output(range.start.clone()))
+                .await,
+            end: self
+                .to_lsp(uri, Position::from_server_output(range.end.clone()))
+                .await,
         }
     }
 }

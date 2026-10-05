@@ -87,8 +87,9 @@ pub struct Args {
     /// Logging level or filter directives
     ///
     /// A level (trace, debug, info, warn, error, off) or comma-separated
-    /// `target=level` directives such as `info,mcpls_core=debug`. An unknown
-    /// level is rejected at startup.
+    /// `target=level` directives such as `info,mcpls_core=debug`. A bare word
+    /// must be a level (`mcpls_core` alone is rejected; use `mcpls_core=trace`),
+    /// and an unknown level is rejected at startup.
     #[arg(short, long, default_value = "info", env = "MCPLS_LOG", value_parser = LogFilter::from_str)]
     pub log_level: LogFilter,
 

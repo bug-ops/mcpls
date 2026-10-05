@@ -701,7 +701,7 @@ Log level for mcpls output.
 **Values**: `trace`, `debug`, `info`, `warn`, `error`, `off` (any case), or comma-separated `target=level` directives such as `info,mcpls_core=debug`
 **Default**: `info`
 
-An unknown level (for example `debgu`) is rejected at startup instead of silently disabling logging.
+An unknown level (for example `debgu`) is rejected at startup instead of silently disabling logging. A bare word must be a level: `mcpls_core` alone is rejected, write `mcpls_core=trace`.
 
 The HTTP session id is a bearer secret, so mcpls caps the rmcp log targets that
 print it (`rmcp::transport::streamable_http_server::session` at `warn`,

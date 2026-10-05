@@ -68,7 +68,7 @@ pub enum InvalidRange {
 /// exist and a call site that swaps `line` and `character` still names them
 /// (#322). A position typed by a client goes through [`Self::from_client`],
 /// the only fallible constructor; positions derived from server output
-/// convert infallibly through [`From<Position2D>`].
+/// convert infallibly through `Position::from_server_output`.
 ///
 /// # Examples
 ///
@@ -128,24 +128,24 @@ impl Position {
         self.character.get().saturating_sub(1)
     }
 
-    /// Builds a fixture position, panicking on an invalid one.
-    #[cfg(test)]
-    #[allow(clippy::expect_used)]
-    pub(crate) fn at(line: u32, character: u32) -> Self {
-        Self::from_client(line, character).expect("fixture position is valid")
-    }
-}
-
-impl From<Position2D> for Position {
-    /// Reuses an output position as a handler input position; both are
-    /// 1-based MCP positions. A zero, which converted LSP output never
+    /// Reuses a position taken from server output, which is already 1-based
+    /// MCP form, as a handler input position. Deliberately not a `From`
+    /// impl: a position typed by a client must go through
+    /// [`Self::from_client`]. A zero, which converted LSP output never
     /// carries, clamps to 1.
-    fn from(position: Position2D) -> Self {
+    pub(crate) fn from_server_output(position: Position2D) -> Self {
         let clamp = |value: u32| NonZeroU32::new(value).unwrap_or(NonZeroU32::MIN);
         Self {
             line: clamp(position.line),
             character: clamp(position.character),
         }
+    }
+
+    /// Builds a fixture position, panicking on an invalid one.
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn at(line: u32, character: u32) -> Self {
+        Self::from_client(line, character).expect("fixture position is valid")
     }
 }
 
@@ -1809,12 +1809,12 @@ mod tests {
 
     #[test]
     fn test_position_from_output_position_is_not_capped_and_clamps_zero() {
-        let big = Position::from(Position2D {
+        let big = Position::from_server_output(Position2D {
             line: MAX_POSITION_VALUE + 7,
             character: 2_000_000,
         });
         assert_eq!(big.line().get(), MAX_POSITION_VALUE + 7);
-        let clamped = Position::from(Position2D {
+        let clamped = Position::from_server_output(Position2D {
             line: 0,
             character: 0,
         });
