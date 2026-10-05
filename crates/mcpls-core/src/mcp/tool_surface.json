@@ -2021,6 +2021,145 @@
     }
   },
   {
+    "name": "get_folding_ranges",
+    "title": "Folding Ranges",
+    "description": "Foldable regions of a file (blocks, imports, comments, marked regions): 1-based lines, optional columns, `kind`, collapsed text. Sorted by start line, longest first. Capped at a fixed maximum; `truncated: true` means more exist.",
+    "inputSchema": {
+      "$defs": {
+        "FoldingKindFilter": {
+          "enum": [
+            "all",
+            "comment",
+            "imports",
+            "region"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/FoldingKindFilter",
+          "description": "`all` (default), `comment`, `imports` or `region`; regions without a kind match only `all`."
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "FoldingKind": {
+          "enum": [
+            "comment",
+            "imports",
+            "region",
+            "unspecified"
+          ],
+          "type": "string"
+        },
+        "FoldingRegion": {
+          "description": "One foldable region of a file, 1-based.",
+          "properties": {
+            "collapsed_text": {
+              "description": "Text shown in place of the fold, when the server gives it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "end_character": {
+              "description": "Where the fold ends, when the server says; absent means line end.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "end_line": {
+              "description": "Last line.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "$ref": "#/$defs/FoldingKind",
+              "description": "Region kind."
+            },
+            "start_character": {
+              "description": "Where the fold starts, when the server says; absent means line end.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "start_line": {
+              "description": "First line.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "start_line",
+            "end_line",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "positions_degraded": {
+          "$ref": "#/$defs/PositionDegradation",
+          "description": "Set only when some `character` offsets in this result are inexact\n(non-UTF-16 servers only);"
+        },
+        "regions": {
+          "description": "The regions, by ascending start line then descending end line.",
+          "items": {
+            "$ref": "#/$defs/FoldingRegion"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "description": "Whether more matching regions exist than are returned. Omitted when\n`false`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "regions"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Folding Ranges",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
     "name": "get_hover",
     "title": "Hover",
     "description": "Type and documentation info for a symbol. Returns signatures, docs, and inferred types. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
@@ -3330,6 +3469,122 @@
     },
     "annotations": {
       "title": "Find References",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "get_selection_ranges",
+    "title": "Selection Ranges",
+    "description": "Ranges enclosing a position, innermost first, as the server reports them; their values can be passed to get_code_actions or format_range. Capped at a fixed maximum; `truncated: true` means the outermost were dropped. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was inexact: do not trust the result.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "positions_degraded": {
+          "$ref": "#/$defs/PositionDegradation",
+          "description": "Set only when the queried position or some returned `character`\noffsets are inexact (non-UTF-16"
+        },
+        "ranges": {
+          "description": "Ranges enclosing the position, innermost first, as the server reported\nthem (not merged, reordered",
+          "items": {
+            "$ref": "#/$defs/Range"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "description": "Whether the chain was longer than `MAX_SELECTION_CHAIN` and the\noutermost ranges were dropped.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ranges"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Selection Ranges",
       "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": true

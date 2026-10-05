@@ -633,9 +633,9 @@ To opt back in to the workspace's TypeScript, set `tsserver.path` to a workspace
 
 ### `capability_not_advertised` for newer tools
 
-**Cause**: `prepare_type_hierarchy`, `get_supertypes`, `get_subtypes`, `format_range`, `prepare_rename` and `get_document_highlights` depend on the routed server advertising the LSP capability. rust-analyzer advertises neither type hierarchy nor range formatting; typescript-language-server does not advertise type hierarchy. Call `get_tool_support` to see per-language coverage.
+**Cause**: `prepare_type_hierarchy`, `get_supertypes`, `get_subtypes`, `format_range`, `get_selection_ranges`, `get_folding_ranges`, `prepare_rename` and `get_document_highlights` depend on the routed server advertising the LSP capability. rust-analyzer advertises neither type hierarchy nor range formatting; typescript-language-server does not advertise type hierarchy. Call `get_tool_support` to see per-language coverage.
 
-If every server for a language lists `handles` explicitly (no catch-all), add `type_hierarchy`, `document_highlights` or `format_range` to a server's list; see [`handles`](configuration.md#handles).
+If every server for a language lists `handles` explicitly (no catch-all), add `type_hierarchy`, `document_highlights`, `format_range`, `selection_range` or `folding_range` to a server's list; see [`handles`](configuration.md#handles).
 
 ### "Position out of bounds"
 

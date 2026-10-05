@@ -637,7 +637,7 @@ Restricts a server to exactly the listed routing values. Valid values:
 `hover`, `definition`, `type_definition`, `declaration`, `implementation`, `references`,
 `diagnostics`, `rename`, `completions`, `signature_help`,
 `document_symbols`, `workspace_symbols`, `format_document`, `format_range`, `code_actions`,
-`call_hierarchy`, `type_hierarchy`, `document_highlights`, `inlay_hints`. These are routing identifiers, not MCP tool
+`call_hierarchy`, `type_hierarchy`, `document_highlights`, `inlay_hints`, `selection_range`, `folding_range`. These are routing identifiers, not MCP tool
 names — several MCP tools map to a shorter routing value:
 
 | `handles` value | MCP tool(s) it governs |
@@ -647,6 +647,8 @@ names — several MCP tools map to a shorter routing value:
 | `implementation` | `go_to_implementation` |
 | `document_highlights` | `get_document_highlights` |
 | `format_range` | `format_range` |
+| `selection_range` | `get_selection_ranges` |
+| `folding_range` | `get_folding_ranges` |
 | `type_definition` | `go_to_type_definition` |
 | `declaration` | `go_to_declaration` |
 | `call_hierarchy` | `prepare_call_hierarchy`, `get_incoming_calls`, `get_outgoing_calls` (one route: the item `prepare_call_hierarchy` returns is only meaningful to the server that produced it) |
@@ -655,7 +657,7 @@ names — several MCP tools map to a shorter routing value:
 
 Every other value matches its MCP tool name directly (`hover` → `hover`, etc.).
 
-When a language has no catch-all server, mcpls logs a warning naming the routing values no server claims; those tools then have no server for that language. After upgrading, add `type_hierarchy`, `document_highlights` and `format_range` to a server's list to enable the newer tools there.
+When a language has no catch-all server, mcpls logs a warning naming the routing values no server claims; those tools then have no server for that language. After upgrading, add `type_hierarchy`, `document_highlights`, `format_range`, `selection_range` and `folding_range` to a server's list to enable the newer tools there.
 
 At most one server per language may omit `handles` (the catch-all). A tool
 may be claimed by only one server per language. In the example above,

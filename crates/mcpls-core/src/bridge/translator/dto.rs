@@ -1169,6 +1169,163 @@ pub struct DocumentHighlightEntry {
     pub kind: DocumentHighlightKind,
 }
 
+/// Most ranges one selection chain returns; a longer chain is cut to its
+/// innermost ranges.
+pub const MAX_SELECTION_CHAIN: usize = 32;
+
+/// Result of a selection range request: the ranges enclosing a position.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{MAX_SELECTION_CHAIN, SelectionRangesResult};
+///
+/// let result: SelectionRangesResult = serde_json::from_value(serde_json::json!({
+///     "ranges": [],
+/// }))?;
+/// assert!(result.ranges.is_empty() && !result.truncated);
+/// assert_eq!(MAX_SELECTION_CHAIN, 32);
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SelectionRangesResult {
+    /// Ranges enclosing the position, innermost first, as the server reported
+    /// them (not merged, reordered or added).
+    pub ranges: Vec<Range>,
+    /// Whether the chain was longer than `MAX_SELECTION_CHAIN` and the
+    /// outermost ranges were dropped. Omitted when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Set only when the queried position or some returned `character`
+    /// offsets are inexact (non-UTF-16 servers only); omitted when all are
+    /// exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
+}
+
+/// Largest `collapsed_text` returned for a folding region, in bytes before the
+/// truncation marker.
+pub const MAX_COLLAPSED_TEXT_BYTES: usize = 256;
+
+/// What a folding region covers, from the LSP's open-string kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoldingKind {
+    /// A comment block.
+    Comment,
+    /// An import group.
+    Imports,
+    /// A marked region.
+    Region,
+    /// No kind, or a server-defined one.
+    Unspecified,
+}
+
+/// Which folding regions to return.
+///
+/// `Unspecified` regions are returned only by [`Self::All`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoldingKindFilter {
+    /// Every region.
+    #[default]
+    All,
+    /// Comment blocks only.
+    Comment,
+    /// Import groups only.
+    Imports,
+    /// Marked regions only.
+    Region,
+}
+
+/// Schema of the closed string sets, compact on the wire.
+impl JsonSchema for FoldingKind {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FoldingKind".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "enum": ["comment", "imports", "region", "unspecified"],
+        })
+    }
+}
+
+impl JsonSchema for FoldingKindFilter {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FoldingKindFilter".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "enum": ["all", "comment", "imports", "region"],
+        })
+    }
+}
+
+impl FoldingKindFilter {
+    /// Whether a region of `kind` passes this filter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::{FoldingKind, FoldingKindFilter};
+    ///
+    /// assert!(FoldingKindFilter::All.admits(FoldingKind::Unspecified));
+    /// assert!(FoldingKindFilter::Imports.admits(FoldingKind::Imports));
+    /// assert!(!FoldingKindFilter::Imports.admits(FoldingKind::Unspecified));
+    /// ```
+    #[must_use]
+    pub const fn admits(self, kind: FoldingKind) -> bool {
+        matches!(
+            (self, kind),
+            (Self::All, _)
+                | (Self::Comment, FoldingKind::Comment)
+                | (Self::Imports, FoldingKind::Imports)
+                | (Self::Region, FoldingKind::Region)
+        )
+    }
+}
+
+/// One foldable region of a file, 1-based.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FoldingRegion {
+    /// First line.
+    pub start_line: u32,
+    /// Last line.
+    pub end_line: u32,
+    /// Where the fold starts, when the server says; absent means line end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_character: Option<u32>,
+    /// Where the fold ends, when the server says; absent means line end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_character: Option<u32>,
+    /// Region kind.
+    pub kind: FoldingKind,
+    /// Text shown in place of the fold, when the server gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapsed_text: Option<String>,
+}
+
+/// Result of a folding range request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FoldingRangesResult {
+    /// The regions, by ascending start line then descending end line.
+    pub regions: Vec<FoldingRegion>,
+    /// Whether more matching regions exist than are returned. Omitted when
+    /// `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Set only when some `character` offsets in this result are inexact
+    /// (non-UTF-16 servers only); omitted when all are exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
+}
+
 /// Result of a document highlights request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentHighlightsResult {
@@ -1652,6 +1809,33 @@ impl ServerText for DocumentHighlightsResult {
     }
 }
 
+impl ServerText for FoldingRangesResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            regions,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+        for region in regions {
+            if let Some(text) = &mut region.collapsed_text {
+                redactions.redact_in_place(text);
+                *text =
+                    crate::util::truncate_string(std::mem::take(text), MAX_COLLAPSED_TEXT_BYTES);
+            }
+        }
+    }
+}
+
+impl ServerText for SelectionRangesResult {
+    fn redact_server_text(&mut self, _redactions: &Redactions) {
+        let Self {
+            ranges: _,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn hierarchy_wire(range: [u32; 4], selection: [u32; 4]) -> HierarchyItem {
@@ -2071,5 +2255,101 @@ mod tests {
             BoundedRange::try_from(beyond),
             Err(InvalidRange::TooManyLines)
         );
+    }
+
+    #[test]
+    fn test_folding_kind_schema_lists_exactly_the_serde_names() {
+        let kinds = |k: FoldingKind| match k {
+            FoldingKind::Comment
+            | FoldingKind::Imports
+            | FoldingKind::Region
+            | FoldingKind::Unspecified => k,
+        };
+        let variants = [
+            FoldingKind::Comment,
+            FoldingKind::Imports,
+            FoldingKind::Region,
+            FoldingKind::Unspecified,
+        ]
+        .map(kinds);
+        let mut generator = schemars::SchemaGenerator::default();
+        let schema = FoldingKind::json_schema(&mut generator);
+        let listed: Vec<String> = schema
+            .get("enum")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect();
+        let serialized: Vec<String> = variants
+            .iter()
+            .map(|k| {
+                serde_json::to_value(k)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(listed, serialized);
+    }
+
+    #[test]
+    fn test_folding_kind_filter_schema_lists_exactly_the_serde_names() {
+        let filters = |f: FoldingKindFilter| match f {
+            FoldingKindFilter::All
+            | FoldingKindFilter::Comment
+            | FoldingKindFilter::Imports
+            | FoldingKindFilter::Region => f,
+        };
+        let variants = [
+            FoldingKindFilter::All,
+            FoldingKindFilter::Comment,
+            FoldingKindFilter::Imports,
+            FoldingKindFilter::Region,
+        ]
+        .map(filters);
+        let mut generator = schemars::SchemaGenerator::default();
+        let schema = FoldingKindFilter::json_schema(&mut generator);
+        let listed: Vec<FoldingKindFilter> = schema
+            .get("enum")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| serde_json::from_value(name.clone()).unwrap())
+            .collect();
+        assert_eq!(listed, variants);
+    }
+
+    #[test]
+    fn test_folding_collapsed_text_is_redacted_before_it_is_cut() {
+        use crate::redaction::{Redactions, ServerText as _};
+
+        let secret = "bravo-secret-222";
+        let redactions = Redactions::new([("B_TOKEN".to_owned(), secret.to_owned())]);
+        let straddling = format!("{}{secret}tail", "x".repeat(MAX_COLLAPSED_TEXT_BYTES - 8));
+        let region = |text: String| FoldingRegion {
+            start_line: 1,
+            end_line: 2,
+            start_character: None,
+            end_character: None,
+            kind: FoldingKind::Region,
+            collapsed_text: Some(text),
+        };
+        let mut result = FoldingRangesResult {
+            regions: vec![region(straddling), region("short".to_string())],
+            truncated: false,
+            positions_degraded: None,
+        };
+
+        result.redact_server_text(&redactions);
+
+        let text = result.regions[0].collapsed_text.as_deref().unwrap();
+        assert!(!text.contains("bravo"), "{text}");
+        assert!(text.ends_with("... (truncated)"), "{text}");
+        assert!(text.len() <= MAX_COLLAPSED_TEXT_BYTES + "... (truncated)".len());
+        assert_eq!(result.regions[1].collapsed_text.as_deref(), Some("short"));
     }
 }

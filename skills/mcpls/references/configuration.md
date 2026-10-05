@@ -73,6 +73,8 @@ a few map many-to-one:
 | `workspace_symbols` | `workspace_symbol_search` (see the special case below) |
 | `format_document` | `format_document` |
 | `format_range` | `format_range` |
+| `selection_range` | `get_selection_ranges` |
+| `folding_range` | `get_folding_ranges` |
 | `code_actions` | `get_code_actions` |
 | `call_hierarchy` | `prepare_call_hierarchy`, `get_incoming_calls`, `get_outgoing_calls`, sharing one route: an incoming/outgoing-calls lookup only makes sense against the server that produced the originating call-hierarchy item |
 | `inlay_hints` | `get_inlay_hints` |

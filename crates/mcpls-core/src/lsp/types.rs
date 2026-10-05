@@ -85,6 +85,14 @@ pub enum InboundMessage {
     Request(JsonRpcRequest),
     /// Notification from server.
     Notification(JsonRpcNotification),
+    /// A response whose body could not be decoded (for example a result
+    /// nested deeper than the JSON parser allows) but whose framing and `id`
+    /// were intact: only the request it answers fails, the connection stays
+    /// up.
+    UndecodableResponse {
+        /// Identifier of the request the response answers.
+        id: RequestId,
+    },
 }
 
 /// Typed LSP notification variants.

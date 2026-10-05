@@ -199,6 +199,8 @@ Position-based tools (`get_hover`, `get_definition`, `get_references`, `go_to_im
 | `prepare_rename` | Check whether a position can be renamed, and the range and placeholder, before `rename_symbol` |
 | `format_document` | Apply language-specific formatting rules |
 | `format_range` | Format only a range of a document |
+| `get_folding_ranges` | Foldable regions of a file (blocks, imports, comments), optionally filtered by kind |
+| `get_selection_ranges` | Ranges enclosing a position, innermost first; pick the range for `get_code_actions` or `format_range` |
 | `prepare_call_hierarchy` | Get callable items at a position for call hierarchy |
 | `get_incoming_calls` | Find all callers of a function (who calls this?) |
 | `get_outgoing_calls` | Find all callees of a function (what does this call?) |

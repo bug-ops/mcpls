@@ -17,7 +17,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tracing::{Level, debug, trace, warn};
 
 use crate::error::{Error, RedactedText, Result};
-use crate::lsp::types::{InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use crate::lsp::types::{
+    InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
+};
 use crate::redaction::Redactions;
 
 /// Maximum allowed Content-Length (10 MB)
@@ -206,7 +208,16 @@ impl LspTransportReader {
                 trace!("Received LSP message: {}", self.redactions.apply(&content));
             }
 
-            let value: Value = serde_json::from_str(&content)?;
+            // TODO(#643): a request or notification that cannot be decoded is still fatal.
+            let value: Value = match serde_json::from_str(&content) {
+                Ok(value) => value,
+                Err(error) => {
+                    return undecodable_response_id(&content).map_or_else(
+                        || Err(error.into()),
+                        |id| Ok(InboundMessage::UndecodableResponse { id }),
+                    );
+                }
+            };
 
             // Some servers (notably OmniSharp) occasionally emit a bare `null`
             // (or other non-object) JSON-RPC message. Skip it and read the next
@@ -297,6 +308,43 @@ impl LspTransportReader {
                 .protocol_error(format_args!("Invalid UTF-8 in content: {e}"))
         })
     }
+}
+
+/// Whether a key is present, whatever its value (`null` included), the way
+/// `parse_inbound_message` tests `value.get(key).is_some()`.
+#[derive(Default)]
+struct Present(bool);
+
+impl<'de> serde::Deserialize<'de> for Present {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_ignored_any(serde::de::IgnoredAny)?;
+        Ok(Self(true))
+    }
+}
+
+/// The `id` of a framed message that `parse_inbound_message` would take for a
+/// response (no `method`, a `result` or an `error`), recovered without
+/// building its body: skipping values with `IgnoredAny` is iterative and
+/// tolerant, so what made the full decode fail (nesting past the parser's
+/// recursion limit, a lone surrogate escape, an out-of-range number) does not
+/// stop it.
+fn undecodable_response_id(content: &str) -> Option<RequestId> {
+    #[derive(serde::Deserialize)]
+    struct ResponseEnvelope {
+        id: Option<RequestId>,
+        #[serde(default)]
+        method: Present,
+        #[serde(default)]
+        result: Present,
+        #[serde(default)]
+        error: Present,
+    }
+
+    let envelope: ResponseEnvelope = serde_json::from_str(content).ok()?;
+    let is_response = !envelope.method.0 && (envelope.result.0 || envelope.error.0);
+    is_response.then_some(envelope.id).flatten()
 }
 
 fn parse_inbound_message(value: Value, redactions: &Redactions) -> Result<InboundMessage> {
@@ -509,6 +557,106 @@ mod tests {
         let content = serde_json::to_string(&notification).unwrap();
         assert!(content.contains("\"method\""));
         assert!(!content.contains("\"id\""));
+    }
+
+    fn deeply_nested(depth: usize) -> String {
+        format!("{}1{}", "{\"parent\":".repeat(depth), "}".repeat(depth))
+    }
+
+    async fn receive_all(inbound: String) -> Vec<Result<InboundMessage>> {
+        let (_, mut reader) = LspTransport::new(
+            tokio::io::sink(),
+            std::io::Cursor::new(inbound.into_bytes()),
+        );
+        let mut received = Vec::new();
+        loop {
+            let message = reader.receive().await;
+            let failed = message.is_err();
+            received.push(message);
+            if failed || received.len() == 2 {
+                return received;
+            }
+        }
+    }
+
+    fn frame(body: &str) -> String {
+        format!("Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    #[tokio::test]
+    async fn test_response_nested_past_the_recursion_limit_is_attributed_to_its_request() {
+        let deep = frame(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"result":{}}}"#,
+            deeply_nested(200)
+        ));
+        let next = frame(r#"{"jsonrpc":"2.0","id":8,"result":null}"#);
+
+        let received = receive_all(format!("{deep}{next}")).await;
+
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableResponse {
+                id: RequestId::Number(7)
+            })
+        );
+        assert_matches!(&received[1], Ok(InboundMessage::Response(response)) if response.id == RequestId::Number(8));
+    }
+
+    #[tokio::test]
+    async fn test_response_with_a_lone_surrogate_escape_is_attributed_to_its_request() {
+        let body = frame(r#"{"jsonrpc":"2.0","id":9,"result":"\ud800"}"#);
+
+        let received = receive_all(body).await;
+
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableResponse {
+                id: RequestId::Number(9)
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_string_id_is_recovered_from_an_undecodable_response() {
+        let deep = frame(&format!(
+            r#"{{"jsonrpc":"2.0","id":"abc","error":{}}}"#,
+            deeply_nested(200)
+        ));
+
+        let received = receive_all(deep).await;
+
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableResponse { id: RequestId::String(id) }) if id == "abc"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_undecodable_requests_notifications_and_syntax_errors_stay_fatal() {
+        let bodies = [
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"m","params":{}}}"#,
+                deeply_nested(200)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"m","params":{}}}"#,
+                deeply_nested(200)
+            ),
+            r#"{"jsonrpc":"2.0","id":1,"result":{"a":}"#.to_string(),
+            format!(r#"{{"jsonrpc":"2.0","result":{}}}"#, deeply_nested(200)),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":null,"result":{}}}"#,
+                deeply_nested(200)
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"extra":{}}}"#,
+                deeply_nested(200)
+            ),
+        ];
+        for body in bodies {
+            let received = receive_all(frame(&body)).await;
+            assert_matches!(&received[0], Err(_), "{body:.80}");
+        }
     }
 
     #[test]

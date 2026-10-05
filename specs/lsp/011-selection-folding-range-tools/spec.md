@@ -10,7 +10,7 @@ tags:
   - lsp
   - mcp
 created: 2026-10-05
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[lsp/008-lsp317-method-coverage-gaps/spec|lsp317-method-coverage-gaps]]"
@@ -24,6 +24,16 @@ related:
 ---
 
 # Feature: Expose Selection Range and Folding Range as MCP Tools
+
+> [!important] Decision (implemented, #616)
+> - **Tools:** `get_selection_ranges` (`file_path`, `line`, `character`) and `get_folding_ranges` (`file_path`, `kind`: `all` | `comment` | `imports` | `region`), routed by the new `handles` values `selection_range` and `folding_range`; both listed in `get_tool_support`. Tool count 29 -> 31.
+> - **Bounds:** a selection chain is cut to its 32 innermost ranges (`MAX_SELECTION_CHAIN`); folding regions use the shared 10,000-item `ItemBudget`, after the kind filter, ordered by start line then longest first. `truncated` reports either cut.
+> - **Collapsed text:** returned, escaped, redacted first and then cut to 256 bytes (`MAX_COLLAPSED_TEXT_BYTES`) so a half-cut secret cannot leak.
+> - **Range values:** returned in the existing 1-based shape, so their values can be passed as the range of `get_code_actions` and `format_range` (the round trip is a playbook check, SC-003).
+> - **No batch positions, no source-text context line;** `unspecified` regions match only `all`; both tools are `IndexingGate::NotRequired`.
+> - **Client capabilities:** `selectionRange` and `foldingRange` (columns on, `lineFoldingOnly: false`, the three standard kinds, `collapsedText: true`) are advertised at `initialize`.
+> - **Deep chains:** a response nested past the JSON recursion limit (about 125 levels) fails only its own request with `undecodable response`; the connection stays up (#642).
+> - **Live matrix (SC-002 to SC-004)** is recorded in the testing playbook, not here.
 
 > [!info] Metadata
 > **Type**: enhancement / competitor-gap
@@ -314,21 +324,23 @@ No persistent state.
 - Represent kind or filter as strings or untyped JSON.
 - Fall back to document symbols or a parser when a server lacks the capability.
 
-## 9. Open Questions
+## 9. Resolved Questions
 
-> [!question] Items for the plan, or for the caller
-> - [NEEDS CLARIFICATION: **Tool names and count.** Two tools (selection range, folding range) are assumed. Names are not fixed here; they should follow the existing `get_*` convention. Confirm two tools and the names.]
-> - [NEEDS CLARIFICATION: **Which of rust-analyzer, typescript-language-server, pyright and gopls advertise each provider.** Not verified in this spec. Needed to choose the live fixtures of SC-002 and to size real-world value; if pyright advertises neither, the value of the pair for Python rests on other servers.]
-> - [NEEDS CLARIFICATION: **Client capabilities.** mcpls does not advertise `textDocument.selectionRange` or `textDocument.foldingRange` today. Do any servers of the matrix gate or shape their answer on them? In particular `foldingRange.lineFoldingOnly` and `rangeLimit` change whether characters are present and how many regions come back, and `foldingRange.foldingRange.collapsedText` governs collapsed text. Decide the advertised values (NFR-007); the default proposal is to advertise support without `lineFoldingOnly`, so characters are available.]
-> - [NEEDS CLARIFICATION: **Chain and region bounds.** The shared bounded-result mechanism caps list tools at one fixed item count. A selection chain of that size is absurd for an agent; is a much smaller dedicated chain bound (tens of ranges) warranted for FR-006, and is the shared region bound right for FR-015 or too large for a context window?]
-> - [NEEDS CLARIFICATION: **Source text in selection results.** A comparable bridge adds the first source line of each range as context. This helps an agent pick a range without reading the file, but costs a file read and puts file text (not server text) into the result, and the existing enclosing-symbol enrichment ([[bridge/007-enclosing-symbol-context/spec|bridge/007]]) shows the cost pattern of opt-in enrichment. Options: (a) none, (b) opt-in `context` input, (c) always. Default proposal: (a).]
-> - [NEEDS CLARIFICATION: **Collapsed text.** Expose it as the server sends it (FR-011), or omit to keep results small? It is only meaningful if the client capability advertises support for it.]
-> - [NEEDS CLARIFICATION: **Kind filter shape.** The comparable bridge filters by all, comment, imports or region. Should a filter value select the unspecified variant (plain blocks) as well, for an agent that wants only code blocks?]
-> - [NEEDS CLARIFICATION: **Batch positions.** Would an agent want selection ranges for several positions in one call (the LSP request is a list)? This spec says one position. Revisit only with an agent task that needs it.]
-> - [NEEDS CLARIFICATION: **Indexing gate.** FR-035 chooses NotRequired on the reasoning that both answers are syntactic. Confirm per server in SC-002 (SC-004); a server that answers an empty or partial result mid-index would need Required.]
-> - [NEEDS CLARIFICATION: **Overlap with `get_document_symbols`.** If live testing shows the folding tool adds little beyond symbols plus imports for the four servers, should it be dropped and only selection range shipped? FR-040 allows either.]
-> - [NEEDS CLARIFICATION: **Default `handles` for existing configs** (FR-031). Warning only, or extend the default 30-language mapping to claim the new tools where the default server supports them? Same question as lsp/008.]
-> - [NEEDS CLARIFICATION: **Stale lsp/008 text.** Its Out of Scope entry for `selectionRange`, `foldingRange` and `codeLens` ("no parity pressure", "value is editor interaction") becomes stale for the first two when this ships, and its Ask First list names them as non-goals. This spec does not edit lsp/008; the maintainer decides whether to annotate it on implementation.]
+All questions raised in the draft were settled when the tools shipped (#616); see the Decision callout at the top.
+
+- **Tool names and count:** two tools, `get_selection_ranges` and `get_folding_ranges`.
+- **Provider support:** rust-analyzer and typescript-language-server advertise both; pyright advertises neither (`capability_not_advertised`); gopls is recorded in the playbook when available.
+- **Client capabilities:** `selectionRange` and `foldingRange` are advertised with columns on (`lineFoldingOnly: false`), the three standard kinds and `collapsedText`.
+- **Bounds:** 32 selection ranges; folding uses the shared 10,000-item budget.
+- **Source text in selection results:** none; no opt-in `context`.
+- **Collapsed text:** returned, escaped, redacted, cut to 256 bytes.
+- **Kind filter:** `all`, `comment`, `imports`, `region`; `unspecified` regions match only `all`.
+- **Batch positions:** not offered.
+- **Indexing gate:** `NotRequired` for both tools.
+- **Overlap with `get_document_symbols`:** both tools ship (FR-040).
+- **Default `handles`:** warning only; the new routing values are unclaimed under explicit `handles`.
+- **lsp/008 text:** annotated.
+- **Deliberate deviation from NFR-001:** a region's start and end characters are independently optional, as in LSP, not "both or neither"; an absent character stays absent.
 
 ## 10. See Also
 

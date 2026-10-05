@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Complete reference for all 29 MCP tools provided by mcpls.
+Complete reference for all 31 MCP tools provided by mcpls.
 
 ## Overview
 
@@ -135,6 +135,8 @@ array, `selectionRange` on call hierarchy items (so they round-trip into `get_in
 | [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications only |
 | [format_document](#format_document) | `textDocument/formatting` | Document formatting |
 | [format_range](#format_range) | `textDocument/rangeFormatting` | Formatting of a range |
+| [get_selection_ranges](#get_selection_ranges) | `textDocument/selectionRange` | Ranges enclosing a position, innermost first |
+| [get_folding_ranges](#get_folding_ranges) | `textDocument/foldingRange` | Foldable regions of a file |
 
 ### Refactoring Tools
 
@@ -1428,6 +1430,79 @@ Same shape as `format_document`: an `edits` array of `{ range, new_text }` plus 
 - Edits are not capped, like `format_document`
 - A start or end line beyond the end of the document is rejected as invalid params before the request; a character past the end of its line is forwarded and the server clamps it to the line length (LSP 3.17), so `end_character: 999` means through the end of the line
 - Verified live on clangd and typescript-language-server; rust-analyzer does not advertise range formatting, so the call reports `capability_not_advertised` (see `get_tool_support`)
+
+---
+
+## get_selection_ranges
+
+Get the chain of ranges enclosing a position, innermost first (identifier, expression, statement, block, item), to choose the range for `get_code_actions` or `format_range`.
+
+### Parameters
+
+Same as `get_hover`: `file_path`, `line`, `character`.
+
+### Returns
+
+```json
+{
+  "ranges": [
+    { "start": { "line": 3, "character": 9 }, "end": { "line": 3, "character": 10 } },
+    { "start": { "line": 3, "character": 9 }, "end": { "line": 3, "character": 14 } },
+    { "start": { "line": 3, "character": 5 }, "end": { "line": 3, "character": 16 } }
+  ]
+}
+```
+
+`truncated` (omitted when `false`) is `true` when the server's chain was longer than 32 ranges and the outermost were dropped. `positions_degraded` is set on non-UTF-16 servers when the queried position or a returned offset is inexact.
+
+### Notes
+
+- Ranges are returned as the server reported them: not merged, deduplicated, reordered or extended to the whole file; its values can be passed as the range of `get_code_actions` or `format_range`
+- An empty `ranges` is valid (the server had no answer for the position)
+- One position per call; the request does not wait for indexing
+- A response nested more than about 125 levels fails only this call, not the server connection
+- Requires `selectionRangeProvider`; routed by the `selection_range` `handles` value
+
+---
+
+## get_folding_ranges
+
+Get the foldable regions of a file (blocks, functions, import groups, comment blocks, marked regions): a cheap structural overview without names or bodies.
+
+### Parameters
+
+```json
+{
+  "file_path": "/absolute/path/to/file.rs",
+  "kind": "imports"
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `kind` | string | No | `all` (default), `comment`, `imports` or `region`; regions without a kind or with a server-defined one are returned only by `all` |
+
+### Returns
+
+```json
+{
+  "regions": [
+    { "start_line": 1, "end_line": 4, "kind": "imports" },
+    { "start_line": 6, "end_line": 20, "start_character": 12, "kind": "unspecified", "collapsed_text": "{...}" }
+  ]
+}
+```
+
+`kind` is `comment`, `imports`, `region` or `unspecified`. Lines are 1-based; `start_character` and `end_character` appear only when the server sends them (an absent one means the end of that line). `truncated` (omitted when `false`) is `true` when more than 10,000 matching regions exist. `positions_degraded` is set on non-UTF-16 servers when a returned offset is inexact.
+
+### Notes
+
+- Regions are ordered by start line, then longest first, whatever order the server used; regions that end before they start are dropped
+- The kind filter applies before the cap
+- `collapsed_text` is escaped, has configured secrets redacted, and is cut to 256 bytes
+- The request does not wait for indexing
+- Requires `foldingRangeProvider`; routed by the `folding_range` `handles` value
 
 ---
 

@@ -6,9 +6,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    HierarchyItem, InvalidPosition, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
-    MAX_SYMBOL_NAME_BYTES, Position, RestartTarget, ResultContext, ServerIds, SymbolName,
-    SymbolQuery, SymbolTarget, TabSize, parse_symbol_kind,
+    FoldingKindFilter, HierarchyItem, InvalidPosition, LogLevel, MAX_RESTART_SERVER_IDS,
+    MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position, RestartTarget, ResultContext, ServerIds,
+    SymbolName, SymbolQuery, SymbolTarget, TabSize, parse_symbol_kind,
 };
 use crate::config::ServerId;
 
@@ -308,6 +308,21 @@ pub struct CompletionsParams {
     /// Optional trigger character (e.g., '.', ':', '->').
     #[schemars(description = "Optional trigger character (e.g., '.', ':', '->').")]
     pub trigger: Option<String>,
+}
+
+/// Parameters for the `get_folding_ranges` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for getting the foldable regions of a file.")]
+pub struct FoldingRangesParams {
+    /// Absolute path to the file.
+    #[schemars(description = "Absolute path to the file.")]
+    pub file_path: PathBuf,
+    /// Which regions to return.
+    #[schemars(
+        description = "`all` (default), `comment`, `imports` or `region`; regions without a kind match only `all`."
+    )]
+    #[serde(default)]
+    pub kind: FoldingKindFilter,
 }
 
 /// Parameters for the `get_document_symbols` tool.
@@ -776,6 +791,24 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn folding_range_params_default_to_all_kinds_and_reject_unknown_ones() {
+        let params = |kind: Option<&str>| {
+            let mut json = serde_json::json!({ "file_path": "/a.rs" });
+            if let Some(kind) = kind {
+                json["kind"] = kind.into();
+            }
+            serde_json::from_value::<FoldingRangesParams>(json)
+        };
+        assert_eq!(params(None).unwrap().kind, FoldingKindFilter::All);
+        assert_eq!(
+            params(Some("imports")).unwrap().kind,
+            FoldingKindFilter::Imports
+        );
+        assert!(params(Some("unspecified")).is_err());
+        assert!(params(Some("Imports")).is_err());
     }
 
     #[test]

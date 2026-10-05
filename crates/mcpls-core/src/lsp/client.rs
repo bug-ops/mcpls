@@ -20,7 +20,7 @@ use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     LspNotification, RequestId,
 };
-use crate::redaction::Redactions;
+use crate::redaction::{RedactedText, Redactions};
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -1158,6 +1158,15 @@ impl LspClient {
                     );
                 }
             }
+            InboundMessage::UndecodableResponse { id } => {
+                warn!("Failed the request answered by an undecodable response: id={id:?}");
+                let sender = pending_requests.lock().await.remove(&id);
+                if let Some(sender) = sender {
+                    let _ = sender.send(Err(Error::LspProtocolError(RedactedText::fixed(
+                        "undecodable response",
+                    ))));
+                }
+            }
             InboundMessage::Request(request) => {
                 debug!(
                     "Received server request: {} (id={:?})",
@@ -2246,6 +2255,42 @@ mod tests {
             .await;
 
             assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("fresh"));
+            assert!(client.pending_requests.lock().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_undecodable_response_fails_only_its_request() {
+            use crate::test_lsp::write_raw_frame;
+
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let first = spawn_hover(&client);
+            let first_request = read_framed_message(&mut reader).await;
+            let deep = format!("{}1{}", "{\"parent\":".repeat(200), "}".repeat(200));
+            write_raw_frame(
+                &mut server.read_half_stdin,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{deep}}}"#,
+                    first_request["id"]
+                ),
+            )
+            .await;
+
+            assert_matches!(
+                first.await.unwrap(),
+                Err(Error::LspProtocolError(message)) if message.as_str() == "undecodable response"
+            );
+
+            let second = spawn_hover(&client);
+            let second_request = read_framed_message(&mut reader).await;
+            write_response(
+                &mut server.read_half_stdin,
+                &second_request["id"],
+                serde_json::json!("alive"),
+            )
+            .await;
+            assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("alive"));
             assert!(client.pending_requests.lock().await.is_empty());
         }
 

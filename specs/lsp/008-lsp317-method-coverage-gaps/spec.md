@@ -171,7 +171,8 @@ than the existing tools.
 - **`textDocument/selectionRange`, `textDocument/foldingRange`, `textDocument/codeLens`.** Not
   implemented by the comparable bridge that ships the methods above, so no parity pressure.
   Their value is editor interaction (expand selection, collapse, run buttons), not
-  agent navigation.
+  agent navigation. (Selection range and folding range have since shipped as
+  `get_selection_ranges` and `get_folding_ranges`, see [[lsp/011-selection-folding-range-tools/spec|lsp/011]]; code lens stays out of scope.)
 - **`workspace/executeCommand` and the equivalent command-execution tool of a comparable bridge.** Executes
   server-defined commands that can run workspace-supplied code. Governed by
   [[runtime/003-workspace-supplied-code-execution/spec|runtime/003]]; not a coverage gap to
@@ -407,7 +408,7 @@ No persistent state. New or extended concepts:
 ### Ask First
 - Merging several methods into one MCP tool, or splitting one method across tools (see Open Questions).
 - Any change to the existing call hierarchy tool shapes, including typing its item input.
-- Raising semanticTokens, selectionRange, foldingRange, or codeLens out of the Non-Goals.
+- Raising semanticTokens or codeLens out of the Non-Goals (selectionRange and foldingRange were raised by lsp/011).
 - Changing default routing so that unclaimed tools fall back to a catch-all in a new way.
 - Adding a dependency.
 

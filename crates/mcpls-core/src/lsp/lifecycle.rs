@@ -544,6 +544,26 @@ impl LspServer {
         command
     }
 
+    /// Folding ranges with columns (`lineFoldingOnly: false`), the three
+    /// standard kinds, and collapsed text.
+    fn folding_range_capabilities() -> lsp_types::FoldingRangeClientCapabilities {
+        lsp_types::FoldingRangeClientCapabilities {
+            dynamic_registration: Some(false),
+            line_folding_only: Some(false),
+            folding_range_kind: Some(lsp_types::ClientFoldingRangeKindOptions {
+                value_set: Some(vec![
+                    lsp_types::FoldingRangeKind::Comment,
+                    lsp_types::FoldingRangeKind::Imports,
+                    lsp_types::FoldingRangeKind::Region,
+                ]),
+            }),
+            folding_range: Some(lsp_types::ClientFoldingRangeOptions {
+                collapsed_text: Some(true),
+            }),
+            ..Default::default()
+        }
+    }
+
     /// Build the `capabilities` mcpls advertises in the `initialize`
     /// request, given the configured position-encoding preference order.
     ///
@@ -618,6 +638,10 @@ impl LspServer {
                         lsp_types::PrepareSupportDefaultBehavior::Identifier,
                     ),
                     ..Default::default()
+                }),
+                folding_range: Some(Self::folding_range_capabilities()),
+                selection_range: Some(lsp_types::SelectionRangeClientCapabilities {
+                    dynamic_registration: Some(false),
                 }),
                 code_action: Some(lsp_types::CodeActionClientCapabilities {
                     dynamic_registration: Some(false),
@@ -1247,6 +1271,32 @@ mod tests {
             rename.prepare_support_default_behavior,
             Some(lsp_types::PrepareSupportDefaultBehavior::Identifier)
         );
+    }
+
+    #[test]
+    fn test_client_capabilities_advertises_folding_range_with_columns_and_collapsed_text() {
+        let folding = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
+            .text_document
+            .and_then(|t| t.folding_range)
+            .unwrap();
+
+        assert_eq!(folding.line_folding_only, Some(false));
+        assert_eq!(
+            folding
+                .folding_range
+                .and_then(|options| options.collapsed_text),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_client_capabilities_advertises_selection_range() {
+        let capabilities = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
+            .text_document
+            .and_then(|t| t.selection_range)
+            .unwrap();
+
+        assert_eq!(capabilities.dynamic_registration, Some(false));
     }
 
     #[test]

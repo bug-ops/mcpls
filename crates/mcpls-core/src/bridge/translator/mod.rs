@@ -38,6 +38,7 @@ mod enclosing;
 #[cfg(test)]
 mod enclosing_tests;
 mod encoding_ctx;
+mod folding_range;
 mod hierarchy;
 mod highlights;
 mod navigation;
@@ -46,6 +47,7 @@ mod prepare_range_tests;
 mod respawn;
 mod restart;
 mod routing;
+mod selection_range;
 mod servers;
 mod support;
 mod symbols;
