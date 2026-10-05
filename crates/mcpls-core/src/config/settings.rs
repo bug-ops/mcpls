@@ -78,11 +78,11 @@ impl LspSettings {
         let mut dotted = Vec::new();
         for (key, value) in raw {
             reject_datetime(&key, &value)?;
-            if key.contains('.') {
-                let segments: Vec<String> = key.split('.').map(str::to_owned).collect();
-                if segments.iter().any(String::is_empty) {
-                    return Err(InvalidLspSettings::EmptySegment { key });
-                }
+            let segments: Vec<String> = key.split('.').map(str::to_owned).collect();
+            if segments.iter().any(String::is_empty) {
+                return Err(InvalidLspSettings::EmptySegment { key });
+            }
+            if segments.len() > 1 {
                 dotted.push((segments, value));
             } else {
                 plain.insert(key, value);
@@ -247,6 +247,12 @@ mod tests {
     #[test]
     fn rejects_empty_segment() {
         let err = parse(r#"{"a..b": 1}"#).unwrap_err().to_string();
+        assert!(err.contains("empty segment"), "{err}");
+    }
+
+    #[test]
+    fn rejects_empty_top_level_key() {
+        let err = parse(r#"{"": 1}"#).unwrap_err().to_string();
         assert!(err.contains("empty segment"), "{err}");
     }
 

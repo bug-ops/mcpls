@@ -91,6 +91,7 @@ THEN the first get_hover answers within about one second
 | Server with `initialization_options` and no `settings` | Options are sent in `initialize` and are not overwritten by the push (FR-002) |
 | `settings` with `python.x = 1` and `python = { x = 2 }` | Rejected as a conflict (FR-006) |
 | `settings = {}` | Rejected (FR-005) |
+| `"" = 1` (empty top-level key) | Rejected as an empty segment (FR-005) |
 
 ## 7. Success Criteria
 
