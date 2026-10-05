@@ -26,11 +26,10 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
-use crate::config::{LspServerConfig, LspSettings};
+use crate::config::{LspServerConfig, LspSettings, PositionEncodings};
 use crate::error::{
-    BackgroundTask, Error, Result, ServerSpawnFailure, StartupFailure, StdioStream,
+    BackgroundTask, Error, InitFailureHint, Result, ServerSpawnFailure, StartupFailure, StdioStream,
 };
-use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 #[cfg(unix)]
 use crate::lsp::process::Binding;
@@ -38,6 +37,7 @@ use crate::lsp::process::{MarkOutcome, ServerProcess};
 use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
+use crate::lsp::{CONTENT_MODIFIED_RETRY_METHODS, tsserver_pin};
 use crate::redaction::Redactions;
 
 /// Environment variables passed through to a spawned LSP server even though
@@ -199,16 +199,8 @@ pub struct ServerInitConfig {
     /// [`crate::config::WorkspaceConfig::position_encodings`].
     ///
     /// Sent as `capabilities.general.positionEncodings` during [`LspServer::spawn`]'s
-    /// `initialize` handshake, in the configured order. Values that don't parse
-    /// as a valid [`PositionEncodingKind`] are skipped with a warning rather than
-    /// failing the handshake: `serve`/`serve_with` validate the top-level
-    /// `ServerConfig` via [`crate::config::ServerConfig::validate`] before this
-    /// is ever built, but `LspServer::spawn` is `pub` and
-    /// reachable directly by a library embedder bypassing that validation
-    /// entirely (same reasoning as the `initialize` timeout clamp below), so
-    /// this can't assume the value was already checked. If nothing parses,
-    /// falls back to `config::default_position_encodings()`'s default.
-    pub position_encodings: Vec<String>,
+    /// `initialize` handshake, in the configured order.
+    pub position_encodings: PositionEncodings,
     /// Secrets of every configured server, hidden in this server's output.
     ///
     /// [`LspServer::spawn`] adds the secrets of this server's own
@@ -412,26 +404,14 @@ impl LspServer {
             match Self::initialize_as(&client, &config, process_id).await {
                 Ok(negotiated) => negotiated,
                 Err(init_error) if is_connection_loss(&init_error) => {
-                    let exit_status = early_exit_status(&mut child).await;
-                    let eof_wait = if exit_status.is_some() {
-                        EofWait::Grace
-                    } else {
-                        EofWait::Skip
-                    };
-                    let stderr = stderr_capture.finish(eof_wait, &redactions).await;
-                    return Err(match exit_status {
-                        Some(status) => Error::ServerExitedDuringInit {
-                            command: config.server_config.command.clone(),
-                            exit_code: status.code(),
-                            stderr,
-                        },
-                        None => Error::LspInitFailed {
-                            message: redactions
-                                .apply(&format!("Initialize request failed: {init_error}"))
-                                .into_owned(),
-                            stderr,
-                        },
-                    });
+                    return Err(Self::connection_loss_error(
+                        &config,
+                        &mut child,
+                        stderr_capture,
+                        &redactions,
+                        &init_error,
+                    )
+                    .await);
                 }
                 Err(Error::LspInitFailed { message, .. }) => {
                     // The server may be about to exit after printing its reason,
@@ -439,7 +419,12 @@ impl LspServer {
                     // has exited yet.
                     let stderr = stderr_capture.finish(EofWait::Grace, &redactions).await;
                     let message = redactions.apply(&message).into_owned();
-                    return Err(Error::LspInitFailed { message, stderr });
+                    let hint = Self::init_failure_hint(&config);
+                    return Err(Error::LspInitFailed {
+                        message,
+                        hint,
+                        stderr,
+                    });
                 }
                 Err(init_error) => return Err(init_error),
             };
@@ -455,6 +440,52 @@ impl LspServer {
             child: Some(child),
             init_config: config,
         })
+    }
+
+    /// The error for an `initialize` that ended in a lost connection: the
+    /// server exited (with its exit status) or the pipe closed first.
+    async fn connection_loss_error(
+        config: &ServerInitConfig,
+        child: &mut ServerProcess,
+        stderr_capture: StderrCapture,
+        redactions: &Redactions,
+        init_error: &Error,
+    ) -> Error {
+        let exit_status = early_exit_status(child).await;
+        let eof_wait = if exit_status.is_some() {
+            EofWait::Grace
+        } else {
+            EofWait::Skip
+        };
+        let stderr = stderr_capture.finish(eof_wait, redactions).await;
+        let hint = Self::init_failure_hint(config);
+        match exit_status {
+            Some(status) => Error::ServerExitedDuringInit {
+                command: config.server_config.command.clone(),
+                exit_code: status.code(),
+                hint,
+                stderr,
+            },
+            None => Error::LspInitFailed {
+                message: redactions
+                    .apply(&format!("Initialize request failed: {init_error}"))
+                    .into_owned(),
+                hint,
+                stderr,
+            },
+        }
+    }
+
+    /// The guidance for a failed `initialize` of `config`, if its cause is known.
+    ///
+    /// Runs on the failure path only and reads nothing but package manifests.
+    fn init_failure_hint(config: &ServerInitConfig) -> Option<InitFailureHint> {
+        tsserver_pin::init_failure_hint(
+            &config.server_config,
+            config.initialization_options.as_ref(),
+            &config.workspace_roots,
+            |key| std::env::var_os(key),
+        )
     }
 
     /// Logs the command and argument count at `info`, and the argument values
@@ -528,12 +559,18 @@ impl LspServer {
     /// configured: without them mcpls has nothing to answer with.
     #[allow(clippy::too_many_lines)]
     fn client_capabilities(
-        position_encodings: &[String],
+        position_encodings: &PositionEncodings,
         settings: Option<&LspSettings>,
     ) -> ClientCapabilities {
         ClientCapabilities {
             general: Some(GeneralClientCapabilities {
-                position_encodings: Some(resolve_position_encodings(position_encodings)),
+                position_encodings: Some(
+                    position_encodings
+                        .as_slice()
+                        .iter()
+                        .map(|encoding| encoding.to_kind())
+                        .collect(),
+                ),
                 stale_request_support: Some(StaleRequestSupportOptions {
                     // mcpls does not implement active in-flight request
                     // cancellation.
@@ -696,21 +733,7 @@ impl LspServer {
         let result: InitializeResult = client
             .request_typed::<InitializeRequest>(
                 params,
-                // Clamped for the same reason as `LspClient::request_timeout`:
-                // `serve()`/`serve_with()` now validate the top-level
-                // `ServerConfig` via `ServerConfig::validate()`, but this call
-                // operates on the per-server `config.server_config` reached
-                // through `LspServer::spawn`, which bypasses that
-                // top-level validation entirely, so an out-of-range value (0,
-                // or an unbounded one that would silently disable the timeout
-                // via tokio's `Instant::far_future()` fallback) is still
-                // reachable here and needs a last-line-of-defense clamp.
-                Duration::from_secs(
-                    config
-                        .server_config
-                        .timeout_seconds
-                        .clamp(1, crate::config::MAX_TIMEOUT_SECONDS),
-                ),
+                config.server_config.timeout_seconds.as_duration(),
             )
             .await
             .map_err(|e| {
@@ -719,6 +742,7 @@ impl LspServer {
                 } else {
                     Error::LspInitFailed {
                         message: format!("Initialize request failed: {e}"),
+                        hint: None,
                         stderr: None,
                     }
                 }
@@ -1004,36 +1028,6 @@ fn initialize_process_id(binding: Binding) -> Option<i32> {
     }
 }
 
-/// Convert configured position-encoding strings into the ordered
-/// [`PositionEncodingKind`] list offered during the `initialize` handshake.
-///
-/// Values that don't parse are skipped with a warning instead of failing the
-/// handshake (see [`ServerInitConfig::position_encodings`] for why this can't
-/// assume [`crate::config::ServerConfig::validate`] already ran). Falls back
-/// to `config::default_position_encodings()` -- the same default used when
-/// nothing is configured at all -- if no configured value parses.
-fn resolve_position_encodings(configured: &[String]) -> Vec<PositionEncodingKind> {
-    let encodings: Vec<PositionEncodingKind> = configured
-        .iter()
-        .filter_map(|value| {
-            let kind = crate::config::parse_position_encoding(value);
-            if kind.is_none() {
-                warn!(value = %value, "ignoring invalid configured position encoding");
-            }
-            kind
-        })
-        .collect();
-
-    if encodings.is_empty() {
-        crate::config::default_position_encodings()
-            .iter()
-            .filter_map(|value| crate::config::parse_position_encoding(value))
-            .collect()
-    } else {
-        encodings
-    }
-}
-
 /// Sends one handshake notification, mapping a failed write to
 /// [`Error::LspInitFailed`] naming the notification's method.
 async fn notify_handshake<N>(client: &LspClient, params: N::Params) -> Result<()>
@@ -1045,6 +1039,7 @@ where
         .await
         .map_err(|e| Error::LspInitFailed {
             message: format!("{} notification failed: {e}", N::METHOD.as_str()),
+            hint: None,
             stderr: None,
         })
 }
@@ -1200,37 +1195,22 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::bridge::PositionEncoding;
+    use crate::config::{LanguageId, TimeoutSecs};
 
     #[test]
-    fn test_resolve_position_encodings_preserves_configured_order() {
-        let result = resolve_position_encodings(&["utf-32".to_string(), "utf-8".to_string()]);
+    fn test_client_capabilities_offer_configured_encodings_in_order() {
+        let encodings =
+            PositionEncodings::new(vec![PositionEncoding::Utf32, PositionEncoding::Utf8]).unwrap();
+        let general = LspServer::client_capabilities(&encodings, None)
+            .general
+            .unwrap();
         assert_eq!(
-            result,
-            vec![PositionEncodingKind::UTF32, PositionEncodingKind::UTF8]
-        );
-    }
-
-    #[test]
-    fn test_resolve_position_encodings_skips_invalid_and_keeps_valid() {
-        let result = resolve_position_encodings(&["utf-7".to_string(), "utf-16".to_string()]);
-        assert_eq!(result, vec![PositionEncodingKind::UTF16]);
-    }
-
-    #[test]
-    fn test_resolve_position_encodings_falls_back_when_all_invalid() {
-        let result = resolve_position_encodings(&["utf-7".to_string(), "bogus".to_string()]);
-        assert_eq!(
-            result,
-            vec![PositionEncodingKind::UTF8, PositionEncodingKind::UTF16]
-        );
-    }
-
-    #[test]
-    fn test_resolve_position_encodings_falls_back_when_empty() {
-        let result = resolve_position_encodings(&[]);
-        assert_eq!(
-            result,
-            vec![PositionEncodingKind::UTF8, PositionEncodingKind::UTF16]
+            general.position_encodings,
+            Some(vec![
+                PositionEncodingKind::UTF32,
+                PositionEncodingKind::UTF8
+            ])
         );
     }
 
@@ -1241,8 +1221,7 @@ mod tests {
     /// whole feature with an otherwise-green suite.
     #[test]
     fn test_client_capabilities_advertises_work_done_progress() {
-        let capabilities =
-            LspServer::client_capabilities(&["utf-8".to_string(), "utf-16".to_string()], None);
+        let capabilities = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None);
 
         assert_eq!(
             capabilities.window.and_then(|w| w.work_done_progress),
@@ -1255,7 +1234,7 @@ mod tests {
     /// unreachable on them.
     #[test]
     fn test_client_capabilities_advertises_prepare_rename_support() {
-        let rename = LspServer::client_capabilities(&["utf-16".to_string()], None)
+        let rename = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
             .text_document
             .and_then(|t| t.rename)
             .unwrap();
@@ -1370,7 +1349,7 @@ mod tests {
             server_config: LspServerConfig::rust_analyzer(),
             workspace_roots: vec![PathBuf::from("/tmp/workspace")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
-            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            position_encodings: PositionEncodings::DEFAULT,
             redactions: std::sync::Arc::default(),
         };
 
@@ -1386,7 +1365,7 @@ mod tests {
             server_config: LspServerConfig::pyright(),
             workspace_roots: vec![],
             initialization_options: None,
-            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            position_encodings: PositionEncodings::DEFAULT,
             redactions: std::sync::Arc::default(),
         };
 
@@ -1414,15 +1393,15 @@ mod tests {
 
         let config = ServerInitConfig {
             server_config: LspServerConfig {
-                language_id: "python".to_string(),
+                language_id: LanguageId::from_static("python"),
                 command: "pyright-langserver".to_string(),
                 args: vec!["--stdio".to_string()],
                 env,
                 file_patterns: vec!["**/*.py".to_string()],
                 initialization_options: Some(init_opts.clone()),
                 settings: None,
-                timeout_seconds: 10,
-                request_timeout_seconds: 10,
+                timeout_seconds: TimeoutSecs::new(10).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(10).unwrap(),
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -1430,7 +1409,7 @@ mod tests {
             },
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
-            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            position_encodings: PositionEncodings::DEFAULT,
             redactions: std::sync::Arc::default(),
         };
 
@@ -1444,7 +1423,7 @@ mod tests {
             server_config: LspServerConfig::typescript(),
             workspace_roots: vec![],
             initialization_options: None,
-            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            position_encodings: PositionEncodings::DEFAULT,
             redactions: std::sync::Arc::default(),
         };
 
@@ -1461,7 +1440,7 @@ mod tests {
                 PathBuf::from("/workspace3"),
             ],
             initialization_options: None,
-            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            position_encodings: PositionEncodings::DEFAULT,
             redactions: std::sync::Arc::default(),
         };
 
@@ -1616,7 +1595,7 @@ mod tests {
             server_config,
             workspace_roots: vec![],
             initialization_options: None,
-            position_encodings: vec![],
+            position_encodings: PositionEncodings::DEFAULT,
             redactions: std::sync::Arc::default(),
         };
         let err = LspServer::spawn(config).await.unwrap_err();
@@ -1795,7 +1774,7 @@ echo 'fatal: bad toolchain' >&2
             dir.path(),
             "echo 'indexing forever' >&2\nsleep 5\n",
         );
-        config.server_config.timeout_seconds = 1;
+        config.server_config.timeout_seconds = TimeoutSecs::new(1).unwrap();
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2055,6 +2034,7 @@ sleep 5
     /// `fake_lsp_client`/`FakeServer` pattern in
     /// `client.rs::tests::retry_behavior`.
     mod initialize_wire {
+
         use tempfile::TempDir;
         use tokio::io::BufReader;
 
@@ -2071,7 +2051,11 @@ sleep 5
                 server_config: LspServerConfig::rust_analyzer(),
                 workspace_roots: vec![],
                 initialization_options: None,
-                position_encodings: vec!["utf-32".to_string(), "utf-8".to_string()],
+                position_encodings: PositionEncodings::new(vec![
+                    PositionEncoding::Utf32,
+                    PositionEncoding::Utf8,
+                ])
+                .unwrap(),
                 redactions: std::sync::Arc::default(),
             };
 
@@ -2192,7 +2176,7 @@ sleep 5
 
         #[test]
         fn test_workspace_configuration_not_advertised_without_settings() {
-            let workspace = LspServer::client_capabilities(&["utf-16".to_string()], None)
+            let workspace = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
                 .workspace
                 .unwrap();
             assert_eq!(workspace.configuration, None);
@@ -2206,7 +2190,7 @@ sleep 5
                 server_config: LspServerConfig::rust_analyzer(),
                 workspace_roots: vec![],
                 initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                position_encodings: PositionEncodings::DEFAULT,
                 redactions: std::sync::Arc::default(),
             };
 
@@ -2257,7 +2241,7 @@ sleep 5
                 server_config: LspServerConfig::rust_analyzer(),
                 workspace_roots: vec![],
                 initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                position_encodings: PositionEncodings::DEFAULT,
                 redactions: std::sync::Arc::default(),
             };
 
@@ -2294,7 +2278,7 @@ sleep 5
                 server_config: LspServerConfig::rust_analyzer(),
                 workspace_roots: vec![],
                 initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                position_encodings: PositionEncodings::DEFAULT,
                 redactions: std::sync::Arc::default(),
             };
 
@@ -2351,7 +2335,7 @@ sleep 5
                 server_config: LspServerConfig::rust_analyzer(),
                 workspace_roots,
                 initialization_options: None,
-                position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                position_encodings: PositionEncodings::DEFAULT,
                 redactions: std::sync::Arc::default(),
             };
 
@@ -2381,15 +2365,15 @@ sleep 5
     /// `command`/`args`/`env` matter.
     fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
         LspServerConfig {
-            language_id: "test".to_string(),
+            language_id: LanguageId::from_static("test"),
             command: "irrelevant-for-build-command".to_string(),
             args: vec![],
             env,
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
-            timeout_seconds: 5,
-            request_timeout_seconds: 5,
+            timeout_seconds: TimeoutSecs::new(5).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
             heuristics: None,
             name: None,
             handles: None,
@@ -2517,30 +2501,30 @@ sleep 5
         let pylsp_id = ServerId::from("pylsp");
         let configs = vec![
             LspServerConfig {
-                language_id: "python".to_string(),
+                language_id: LanguageId::from_static("python"),
                 command: "pyright-langserver".to_string(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: Some("pyright-diag".to_string()),
                 handles: Some(vec![ToolKind::Diagnostics]),
                 indexing: crate::bridge::IndexingPolicy::Auto,
             },
             LspServerConfig {
-                language_id: "python".to_string(),
+                language_id: LanguageId::from_static("python"),
                 command: "pylsp".to_string(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: Some("pylsp".to_string()),
                 handles: None,
@@ -2557,7 +2541,7 @@ sleep 5
 
         translator.settle_failed(&ServerSpawnFailure {
             server_id: ServerId::from("pyright-diag"),
-            language_id: "python".to_string(),
+            language_id: LanguageId::from_static("python"),
             command: "pyright-langserver".to_string(),
             reason: StartupFailure::InitTaskPanicked,
         });

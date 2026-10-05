@@ -664,7 +664,7 @@ mod tests {
     fn failure(id: &str) -> ServerSpawnFailure {
         ServerSpawnFailure {
             server_id: ServerId::from(id),
-            language_id: "rust".to_string(),
+            language_id: crate::config::LanguageId::from_static("rust"),
             command: "x".to_string(),
             reason: StartupFailure::InitTaskPanicked,
         }

@@ -163,9 +163,9 @@ pub struct Args {
     ///
     /// A host name or IP address with an optional port, for example
     /// `mcp.example.com` or `mcp.example.com:8443`; without a port any port
-    /// matches, with one a request must send that port. Never pin `:80` or
-    /// `:443`: clients omit them, so list the host without a port. No
-    /// wildcards, user information, scheme, path, trailing dot or non-ASCII
+    /// matches, with one a request must send that port. Ports 80, 443 and 0
+    /// are rejected: clients omit the default ports, so list the host without
+    /// a port. No wildcards, user information, scheme, path, trailing dot or non-ASCII
     /// (use punycode). For deployments
     /// reached through a name (a reverse proxy, a tunnel) or when binding to
     /// `0.0.0.0`; browser origins are allowed separately with
@@ -604,6 +604,12 @@ mod tests {
                 "a.example.com:",
                 "a.example.com:99999",
                 "a.example.com,*",
+                "x.example:443",
+                "[::1]:443",
+                "1.2.3.4:80",
+                "x.example:0",
+                "x.example:0443",
+                "a.example,b.example:443",
             ] {
                 let err = Args::try_parse_from(["mcpls", "--http-allowed-host", bad]).unwrap_err();
                 assert_eq!(

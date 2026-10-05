@@ -66,8 +66,8 @@ use bridge::{
     NotificationCache, Publication, PublicationKind, PublishedPathResolver, Translator,
     WorkspaceRoots,
 };
+use config::{LanguageId, ServerId, ServerStartConcurrency, ToolRouter};
 pub use config::{ProjectConfigStatus, ProjectConfigTrust, ServerConfig};
-use config::{ServerId, ServerStartConcurrency, ToolRouter};
 pub use error::Error;
 use error::ServerSpawnFailure;
 use futures::{FutureExt as _, Stream, StreamExt as _};
@@ -658,9 +658,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         .with_extensions(extension_map)
         .with_router(router)
         .with_notification_cache(Arc::clone(&notification_cache))
-        .with_indexing_ready_timeout(Duration::from_secs(
-            config.workspace.indexing_ready_timeout_seconds,
-        ));
+        .with_indexing_ready_timeout(config.workspace.indexing_ready_timeout_seconds);
     // moved, not cloned -- `config`'s last use is above
     let (project_config_status, mcp) = (config.project_config_status, config.mcp);
     let max_concurrent_server_starts = config.workspace.max_concurrent_server_starts;
@@ -1139,8 +1137,8 @@ struct StartupSettler<'a> {
     pump_shared: PumpShared,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     /// `(id, language)` of every configured server, settled or not.
-    configured: Vec<(ServerId, String)>,
-    roles: HashMap<ServerId, (String, tokio::sync::watch::Sender<DiagnosticsRole>)>,
+    configured: Vec<(ServerId, LanguageId)>,
+    roles: HashMap<ServerId, (LanguageId, tokio::sync::watch::Sender<DiagnosticsRole>)>,
     pumps: JoinSet<()>,
     pump_servers: HashMap<tokio::task::Id, ServerId>,
     tally: StartupTally,
@@ -1182,7 +1180,8 @@ impl StartupSettler<'_> {
             .respawn_lock(&server.init_config().server_config.id());
         let serialized = respawn_lock.lock().await;
         let (id, language) = self.translator.settle_started(server);
-        let (role_tx, role_rx) = tokio::sync::watch::channel(self.diagnostics_role(&language, &id));
+        let (role_tx, role_rx) =
+            tokio::sync::watch::channel(self.diagnostics_role(language.as_str(), &id));
         self.roles.insert(id.clone(), (language, role_tx));
         self.recompute_roles().await;
         let pump = self.pumps.spawn(diagnostics_pump(
@@ -1229,7 +1228,7 @@ impl StartupSettler<'_> {
     /// value once every server has settled.
     async fn recompute_roles(&self) {
         for (id, (language, role_tx)) in &self.roles {
-            let role = self.diagnostics_role(language, id);
+            let role = self.diagnostics_role(language.as_str(), id);
             role_tx.send_if_modified(|current| {
                 let changed = *current != role;
                 *current = role;
@@ -1241,7 +1240,7 @@ impl StartupSettler<'_> {
             .iter()
             .filter(|(id, language)| {
                 self.translator.startup_failure(id).is_none()
-                    && self.translator.is_diagnostics_route(language, id)
+                    && self.translator.is_diagnostics_route(language.as_str(), id)
             })
             .count();
         self.notification_cache
@@ -1353,15 +1352,14 @@ mod tests {
     use std::assert_matches;
     use std::path::PathBuf;
 
-    use bridge::{
-        DEFAULT_INDEXING_READY_TIMEOUT_SECS, DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE,
-    };
+    use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
 
     use super::*;
 
     // Tests for graceful degradation behavior
     mod graceful_degradation_tests {
         use super::*;
+        use crate::config::{IndexingReadyTimeoutSecs, PositionEncodings, TimeoutSecs};
         use crate::error::{ServerSpawnFailure, StartupFailure};
 
         #[test]
@@ -1369,13 +1367,13 @@ mod tests {
             let failures = vec![
                 ServerSpawnFailure {
                     server_id: ServerId::from("rust"),
-                    language_id: "rust".to_string(),
+                    language_id: LanguageId::from_static("rust"),
                     command: "rust-analyzer".to_string(),
                     reason: StartupFailure::InitTaskPanicked,
                 },
                 ServerSpawnFailure {
                     server_id: ServerId::from("python"),
-                    language_id: "python".to_string(),
+                    language_id: LanguageId::from_static("python"),
                     command: "pyright".to_string(),
                     reason: StartupFailure::InitTaskPanicked,
                 },
@@ -1399,7 +1397,7 @@ mod tests {
         fn test_server_spawn_failure_display() {
             let failure = ServerSpawnFailure {
                 server_id: ServerId::from("typescript"),
-                language_id: "typescript".to_string(),
+                language_id: LanguageId::from_static("typescript"),
                 command: "tsserver".to_string(),
                 reason: StartupFailure::InitTaskPanicked,
             };
@@ -1427,24 +1425,24 @@ mod tests {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
-                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
-                    indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                    indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![LspServerConfig {
-                    language_id: "rust".to_string(),
+                    language_id: LanguageId::from_static("rust"),
                     command: "nonexistent-command-that-will-fail-12345".to_string(),
                     args: vec![],
                     env: std::collections::HashMap::new(),
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     settings: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
+                    timeout_seconds: TimeoutSecs::new(10).unwrap(),
+                    request_timeout_seconds: TimeoutSecs::new(10).unwrap(),
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -1484,12 +1482,12 @@ mod tests {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
-                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
-                    indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                    indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![],
@@ -1542,12 +1540,12 @@ mod tests {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
                     roots: vec![workspace_root],
-                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
-                    indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                    indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![],
@@ -1595,24 +1593,24 @@ mod tests {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
-                    position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                    position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: 10,
                     max_documents: DEFAULT_MAX_DOCUMENTS,
                     max_file_size: DEFAULT_MAX_FILE_SIZE,
-                    indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                    indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![LspServerConfig {
-                    language_id: "rust".to_string(),
+                    language_id: LanguageId::from_static("rust"),
                     command: String::new(),
                     args: vec![],
                     env: std::collections::HashMap::new(),
                     file_patterns: vec!["**/*.rs".to_string()],
                     initialization_options: None,
                     settings: None,
-                    timeout_seconds: 10,
-                    request_timeout_seconds: 10,
+                    timeout_seconds: TimeoutSecs::new(10).unwrap(),
+                    request_timeout_seconds: TimeoutSecs::new(10).unwrap(),
                     heuristics: None,
                     name: None,
                     handles: None,
@@ -2006,7 +2004,7 @@ mod tests {
             settler
                 .settle(ServerStartOutcome::Failed(ServerSpawnFailure {
                     server_id: explicit.id(),
-                    language_id: "rust".to_string(),
+                    language_id: LanguageId::from_static("rust"),
                     command: explicit.command.clone(),
                     reason: StartupFailure::InitTaskPanicked,
                 }))
@@ -2348,7 +2346,10 @@ mod tests {
             let id = config.server_config.id();
             let translator = Translator::new()
                 .with_extensions(crate::test_lsp::test_extensions())
-                .with_router(ToolRouter::catch_all([(id, "rust".to_string())]));
+                .with_router(ToolRouter::catch_all([(
+                    id,
+                    LanguageId::from_static("rust"),
+                )]));
             translator.set_expected_servers(HashSet::from([config.server_config.id()]));
             let registry = SubscriptionRegistry::new();
             let session = SessionHandle::new(registry.clone());
@@ -2400,7 +2401,7 @@ mod tests {
             let id = config.server_config.id();
             translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
                 server_id: id.clone(),
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 command: "rust-analyzer".to_string(),
                 reason: StartupFailure::Spawn(Arc::new(Error::ServerTerminated)),
             }]);
@@ -3793,7 +3794,7 @@ mod tests {
                     .with_extensions(crate::test_lsp::test_extensions())
                     .with_router(config::ToolRouter::catch_all([(
                         id.clone(),
-                        "rust".to_string(),
+                        LanguageId::from_static("rust"),
                     )]));
                 translator.set_workspace_roots(
                     WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
@@ -3859,7 +3860,7 @@ mod tests {
                 self.translator
                     .record_startup_failures(&[crate::error::ServerSpawnFailure {
                         server_id: ServerId::from("rust"),
-                        language_id: "rust".to_string(),
+                        language_id: LanguageId::from_static("rust"),
                         command: "rust-analyzer".to_string(),
                         reason: crate::error::StartupFailure::Spawn(Arc::new(
                             Error::ServerNotFound {

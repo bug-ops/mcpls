@@ -795,7 +795,7 @@ mod tests {
     use crate::bridge::encoding::PositionEncoding;
     use crate::bridge::translator::testing::*;
     use crate::bridge::{NotificationCache, lock_std, path_to_uri};
-    use crate::config::ServerId;
+    use crate::config::{IndexingReadyTimeoutSecs, ServerId};
     use crate::test_lsp::client_path;
 
     // -----------------------------------------------------------------
@@ -859,7 +859,7 @@ mod tests {
         );
         let translator = Translator::new()
             .with_notification_cache(cache)
-            .with_indexing_ready_timeout(Duration::from_secs(5));
+            .with_indexing_ready_timeout(IndexingReadyTimeoutSecs::new(5).unwrap());
 
         let start = Instant::now();
         let err = translator
@@ -1060,7 +1060,7 @@ mod tests {
         assert_eq!(first_request["method"], "textDocument/hover");
 
         let timeout_secs = crate::config::LspServerConfig::rust_analyzer().request_timeout_seconds;
-        tokio::time::advance(Duration::from_secs(timeout_secs + 1)).await;
+        tokio::time::advance(Duration::from_secs(timeout_secs.get() + 1)).await;
         assert_matches!(first.await.unwrap().unwrap_err(), Error::Timeout(_));
 
         let second = spawn_hover();

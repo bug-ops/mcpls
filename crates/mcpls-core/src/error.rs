@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::bridge::resources::ResourceUriError;
 use crate::bridge::{InvalidClientPath, InvalidPosition, InvalidRange};
-use crate::config::{BuiltinServer, ServerId, ToolKind};
+use crate::config::{BuiltinServer, LanguageId, ServerId, ToolKind};
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
@@ -183,7 +183,7 @@ pub struct ServerSpawnFailure {
     /// Routing identity of the failed server.
     pub server_id: ServerId,
     /// Language ID of the failed server.
-    pub language_id: String,
+    pub language_id: LanguageId,
     /// Command that was attempted.
     pub command: String,
     /// Why the server never registered.
@@ -435,7 +435,7 @@ impl fmt::Display for IdList<'_> {
 ///     }
 /// }
 ///
-/// let err = Error::LspInitFailed { message: "timed out".into(), stderr: None };
+/// let err = Error::LspInitFailed { message: "timed out".into(), hint: None, stderr: None };
 /// assert_eq!(server_output(&err), None);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -573,6 +573,51 @@ impl fmt::Display for StderrSuffix<'_> {
     }
 }
 
+/// Guidance attached to an `initialize` failure whose likely cause is known.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::InitFailureHint;
+///
+/// let text = InitFailureHint::NativeTypescriptOnly.to_string();
+/// assert!(text.contains("TypeScript 7"));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InitFailureHint {
+    /// typescript-language-server found only TypeScript 7 or later, which
+    /// ships no `tsserver` for it to start.
+    NativeTypescriptOnly,
+}
+
+impl fmt::Display for InitFailureHint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NativeTypescriptOnly => write!(
+                f,
+                "typescript-language-server found only TypeScript 7 or later, which ships no \
+                 tsserver; install the TypeScript version the server supports next to it (for a \
+                 global install: `{}`), or change the `command` of your existing `typescript` \
+                 server entry to the absolute path of the `tsc` of a TypeScript 7 install \
+                 outside the workspace, with `args = [\"--lsp\", \"--stdio\"]` (a `tsc` from the \
+                 workspace, or a bare `tsc` that PATH may resolve into the workspace, is \
+                 workspace-supplied code)",
+                BuiltinServer::TypescriptLanguageServer.install_hint()
+            ),
+        }
+    }
+}
+
+/// `Display` suffix appending an [`InitFailureHint`] to a startup error.
+struct HintSuffix<'a>(&'a Option<InitFailureHint>);
+
+impl fmt::Display for HintSuffix<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.map_or(Ok(()), |hint| write!(f, "; {hint}"))
+    }
+}
+
 /// `Display` suffix for [`Error::ServerExitedDuringInit`] carrying the exit
 /// status and, for builtin servers with a known early-exit cause, a hint.
 struct EarlyExitDetail<'a>(&'a str, Option<i32>);
@@ -646,10 +691,12 @@ impl fmt::Display for StdioStream {
 #[non_exhaustive]
 pub enum Error {
     /// LSP server failed to initialize.
-    #[error("LSP server initialization failed: {message}{}", StderrSuffix(.stderr))]
+    #[error("LSP server initialization failed: {message}{}{}", HintSuffix(.hint), StderrSuffix(.stderr))]
     LspInitFailed {
         /// Description of the initialization failure.
         message: String,
+        /// The likely cause and remedy, when one is known.
+        hint: Option<InitFailureHint>,
         /// What the server wrote to stderr before failing, if anything.
         stderr: Option<StderrExcerpt>,
     },
@@ -874,12 +921,14 @@ pub enum Error {
 
     /// LSP server process exited before completing the `initialize`
     /// handshake.
-    #[error("LSP server '{command}' exited during initialization{}{}", EarlyExitDetail(.command, *.exit_code), StderrSuffix(.stderr))]
+    #[error("LSP server '{command}' exited during initialization{}{}{}", EarlyExitDetail(.command, *.exit_code), HintSuffix(.hint), StderrSuffix(.stderr))]
     ServerExitedDuringInit {
         /// Command that was spawned.
         command: String,
         /// Exit code, or `None` if the process was terminated by a signal.
         exit_code: Option<i32>,
+        /// The likely cause and remedy, when one is known.
+        hint: Option<InitFailureHint>,
         /// What the server wrote to stderr before exiting, if anything.
         stderr: Option<StderrExcerpt>,
     },
@@ -1425,6 +1474,7 @@ mod tests {
     fn test_error_display_lsp_init_failed() {
         let err = Error::LspInitFailed {
             message: "server not found".to_string(),
+            hint: None,
             stderr: None,
         };
         assert_eq!(
@@ -1606,6 +1656,7 @@ mod tests {
         let stderr = StderrExcerpt::complete(b"fatal: bad config", &Redactions::default());
         let failed = Error::LspInitFailed {
             message: "boom".to_string(),
+            hint: None,
             stderr: stderr.clone(),
         };
         assert_eq!(
@@ -1615,6 +1666,7 @@ mod tests {
         let exited = Error::ServerExitedDuringInit {
             command: "gopls".to_string(),
             exit_code: Some(2),
+            hint: None,
             stderr,
         };
         assert_eq!(
@@ -1864,7 +1916,7 @@ mod tests {
     fn spawn_failure(id: &str, command: &str, error: Error) -> ServerSpawnFailure {
         ServerSpawnFailure {
             server_id: ServerId::from(id),
-            language_id: id.to_string(),
+            language_id: LanguageId::new(id).unwrap(),
             command: command.to_string(),
             reason: StartupFailure::Spawn(Arc::new(error)),
         }
@@ -1877,6 +1929,7 @@ mod tests {
             "rust-analyzer",
             Error::LspInitFailed {
                 message: "boom".to_string(),
+                hint: None,
                 stderr: None,
             },
         );
@@ -1915,7 +1968,7 @@ mod tests {
     fn test_server_failed_to_start_init_task_panicked_display() {
         let err = Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
             server_id: ServerId::from("rust"),
-            language_id: "rust".to_string(),
+            language_id: LanguageId::from_static("rust"),
             command: "rust-analyzer".to_string(),
             reason: StartupFailure::InitTaskPanicked,
         }));
@@ -1933,6 +1986,7 @@ mod tests {
             Error::ServerExitedDuringInit {
                 command: "x".to_string(),
                 exit_code: Some(1),
+                hint: None,
                 stderr: None,
             },
             Error::ServerUnavailable {
@@ -1945,10 +1999,38 @@ mod tests {
     }
 
     #[test]
+    fn test_init_failure_hint_renders_between_detail_and_stderr() {
+        let stderr = StderrExcerpt::complete(b"boom", &Redactions::default());
+        let hint = Some(InitFailureHint::NativeTypescriptOnly);
+        let failed = Error::LspInitFailed {
+            message: "x".to_string(),
+            hint,
+            stderr: stderr.clone(),
+        }
+        .to_string();
+        let exited = Error::ServerExitedDuringInit {
+            command: "typescript-language-server".to_string(),
+            exit_code: Some(1),
+            hint,
+            stderr,
+        }
+        .to_string();
+        for text in [failed, exited] {
+            let hint_at = text.find("TypeScript 7").unwrap();
+            assert!(hint_at < text.find("; stderr: boom").unwrap(), "{text}");
+            assert!(
+                text.contains(BuiltinServer::TypescriptLanguageServer.install_hint()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn test_server_exited_during_init_display_hints_only_for_rust_analyzer() {
         let hinted = Error::ServerExitedDuringInit {
             command: "rust-analyzer".to_string(),
             exit_code: Some(1),
+            hint: None,
             stderr: None,
         }
         .to_string();
@@ -1961,6 +2043,7 @@ mod tests {
         let plain = Error::ServerExitedDuringInit {
             command: "gopls".to_string(),
             exit_code: None,
+            hint: None,
             stderr: None,
         }
         .to_string();
@@ -1990,6 +2073,7 @@ mod tests {
                     "pyright",
                     Error::LspInitFailed {
                         message: "denied".to_string(),
+                        hint: None,
                         stderr: None,
                     },
                 ),

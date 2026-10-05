@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, error, trace, warn};
 
-use crate::config::{LspServerConfig, LspSettings, ServerId};
+use crate::config::{LanguageId, LspServerConfig, LspSettings, ServerId};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader};
 use crate::lsp::types::{
@@ -392,7 +392,7 @@ impl LspClient {
 
     /// Get the language ID for this client.
     #[must_use]
-    pub fn language_id(&self) -> &str {
+    pub const fn language_id(&self) -> &LanguageId {
         &self.config.language_id
     }
 
@@ -421,46 +421,28 @@ impl LspClient {
     /// `(4 * request_timeout() + 3.5s) + (4 * code_action_resolve_timeout() + 3.5s)`,
     /// not a multiple scaling with the number of resolved actions.
     ///
-    /// The configured value is clamped to the range from 1 second to
-    /// [`MAX_TIMEOUT_SECONDS`]. [`crate::serve`]/[`crate::serve_with`] now
-    /// validate the top-level `ServerConfig` (via [`ServerConfig::validate`],
-    /// which rejects `request_timeout_seconds` that is `0` or greater than
-    /// [`MAX_TIMEOUT_SECONDS`]) regardless of whether it came from
-    /// [`ServerConfig::load_from`] or was built programmatically by the
-    /// caller. But `Self::new` and [`super::LspServer::spawn`] are `pub` and take an
-    /// [`LspServerConfig`] (or [`super::ServerInitConfig`] wrapping one)
-    /// directly, bypassing that top-level validation entirely — it operates
-    /// on the top-level `ServerConfig`, not the per-server one. This clamp is
-    /// the last line of defense against a zero-duration timeout that would
-    /// fail every request instantly, or an astronomically large one that
-    /// tokio's `timeout`/`sleep` would silently treat as unbounded (they fall
-    /// back to `Instant::far_future()` rather than panicking), for a caller
-    /// reaching either of these levels directly.
+    /// The value is a [`TimeoutSecs`], so it is already within 1 second to
+    /// [`MAX_TIMEOUT_SECONDS`] and needs no clamping here.
     ///
-    /// [`ServerConfig::load_from`]: crate::config::ServerConfig::load_from
-    /// [`ServerConfig::validate`]: crate::config::ServerConfig::validate
+    /// [`TimeoutSecs`]: crate::config::TimeoutSecs
     /// [`MAX_TIMEOUT_SECONDS`]: crate::config::MAX_TIMEOUT_SECONDS
     ///
     /// # Examples
     ///
     /// ```
     /// use std::time::Duration;
-    /// use mcpls_core::config::LspServerConfig;
+    /// use mcpls_core::config::{LspServerConfig, TimeoutSecs};
     /// use mcpls_core::lsp::LspClient;
     ///
     /// let mut config = LspServerConfig::rust_analyzer();
-    /// config.request_timeout_seconds = 45;
+    /// config.request_timeout_seconds = TimeoutSecs::new(45).unwrap();
     /// let client = LspClient::new(config);
     ///
     /// assert_eq!(client.request_timeout(), Duration::from_secs(45));
     /// ```
     #[must_use]
-    pub fn request_timeout(&self) -> Duration {
-        Duration::from_secs(
-            self.config
-                .request_timeout_seconds
-                .clamp(1, crate::config::MAX_TIMEOUT_SECONDS),
-        )
+    pub const fn request_timeout(&self) -> Duration {
+        self.config.request_timeout_seconds.as_duration()
     }
 
     /// The timeout applied to completion (`textDocument/completion`) requests.
@@ -475,11 +457,11 @@ impl LspClient {
     ///
     /// ```
     /// use std::time::Duration;
-    /// use mcpls_core::config::LspServerConfig;
+    /// use mcpls_core::config::{LspServerConfig, TimeoutSecs};
     /// use mcpls_core::lsp::LspClient;
     ///
     /// let mut config = LspServerConfig::rust_analyzer();
-    /// config.request_timeout_seconds = 300;
+    /// config.request_timeout_seconds = TimeoutSecs::new(300).unwrap();
     /// let client = LspClient::new(config);
     ///
     /// // Capped at 10s even though request_timeout_seconds is 300.
@@ -499,11 +481,11 @@ impl LspClient {
     ///
     /// ```
     /// use std::time::Duration;
-    /// use mcpls_core::config::LspServerConfig;
+    /// use mcpls_core::config::{LspServerConfig, TimeoutSecs};
     /// use mcpls_core::lsp::LspClient;
     ///
     /// let mut config = LspServerConfig::rust_analyzer();
-    /// config.request_timeout_seconds = 300;
+    /// config.request_timeout_seconds = TimeoutSecs::new(300).unwrap();
     /// let client = LspClient::new(config);
     ///
     /// // Capped at 10s even though request_timeout_seconds is 300.
@@ -1456,6 +1438,7 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::config::TimeoutSecs;
 
     /// The `trace!` of a forwarded notification must not print a configured
     /// secret that the server echoed into an unrecognized notification.
@@ -1612,7 +1595,7 @@ mod tests {
     fn test_completion_timeout_clamps_to_ten_seconds() {
         for secs in [1, 2, 3, 30, 300] {
             let mut config = LspServerConfig::rust_analyzer();
-            config.request_timeout_seconds = secs;
+            config.request_timeout_seconds = TimeoutSecs::new(secs).unwrap();
             let client = LspClient::new(config);
 
             assert_eq!(
@@ -1628,7 +1611,7 @@ mod tests {
     fn test_code_action_resolve_timeout_clamps_to_ten_seconds() {
         for secs in [1, 2, 3, 30, 300] {
             let mut config = LspServerConfig::rust_analyzer();
-            config.request_timeout_seconds = secs;
+            config.request_timeout_seconds = TimeoutSecs::new(secs).unwrap();
             let client = LspClient::new(config);
 
             assert_eq!(
@@ -1641,33 +1624,11 @@ mod tests {
     }
 
     #[test]
-    fn test_request_timeout_clamps_zero_to_one_second() {
-        let mut config = LspServerConfig::rust_analyzer();
-        config.request_timeout_seconds = 0;
-        let client = LspClient::new(config);
-
-        assert_eq!(client.request_timeout(), Duration::from_secs(1));
-        assert_eq!(client.completion_timeout(), Duration::from_secs(1));
-    }
-
-    #[test]
-    fn test_request_timeout_clamps_above_max_to_max() {
-        let mut config = LspServerConfig::rust_analyzer();
-        config.request_timeout_seconds = u64::MAX;
-        let client = LspClient::new(config);
-
-        assert_eq!(
-            client.request_timeout(),
-            Duration::from_secs(crate::config::MAX_TIMEOUT_SECONDS)
-        );
-    }
-
-    #[test]
     fn test_request_timeout_independent_per_server() {
         let mut config_a = LspServerConfig::rust_analyzer();
-        config_a.request_timeout_seconds = 5;
+        config_a.request_timeout_seconds = TimeoutSecs::new(5).unwrap();
         let mut config_b = LspServerConfig::pyright();
-        config_b.request_timeout_seconds = 15;
+        config_b.request_timeout_seconds = TimeoutSecs::new(15).unwrap();
 
         let client_a = LspClient::new(config_a);
         let client_b = LspClient::new(config_b);

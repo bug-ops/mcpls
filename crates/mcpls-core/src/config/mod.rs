@@ -3,7 +3,10 @@
 //! This module provides configuration structures for MCPLS,
 //! including LSP server definitions and workspace settings.
 
+mod bounded_secs;
 mod language;
+mod language_id;
+mod position_encodings;
 mod routing;
 mod server;
 mod settings;
@@ -13,7 +16,10 @@ use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 
+pub use bounded_secs::{BoundedSecs, IndexingReadyTimeoutSecs, InvalidSecs, TimeoutSecs};
 pub use language::{base_language_id, react_variant_language_id};
+pub use language_id::{InvalidLanguageId, LanguageId};
+pub use position_encodings::{InvalidPositionEncodings, PositionEncodings};
 pub use routing::{NoServerReason, ServerId, ServerSettlement, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
@@ -23,8 +29,7 @@ pub use server::{
 pub use settings::{InvalidLspSettings, LspSettings};
 
 use crate::bridge::{
-    DEFAULT_INDEXING_READY_TIMEOUT_SECS, DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE,
-    INDEXING_STALENESS_BOUND, PROGRESS_SETTLE, ResourceLimits, join_relative_root, probe_root,
+    DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits, join_relative_root, probe_root,
 };
 use crate::error::{Error, Result};
 use crate::util::{BoundedReadOutcome, bounded_read_cap, check_bounded_utf8};
@@ -38,7 +43,7 @@ pub struct LanguageExtensionMapping {
     /// Array of extensions and their corresponding language ID.
     pub extensions: Vec<String>,
     /// Language ID to report to the LSP server.
-    pub language_id: String,
+    pub language_id: LanguageId,
 }
 
 /// Main configuration for the MCPLS server.
@@ -304,10 +309,10 @@ pub struct WorkspaceConfig {
     /// order configured here.
     ///
     /// Valid values: `"utf-8"`, `"utf-16"`, `"utf-32"`. Must be non-empty;
-    /// [`ServerConfig::validate`] rejects an empty list or an unrecognized
-    /// value.
-    #[serde(default = "default_position_encodings")]
-    pub position_encodings: Vec<String>,
+    /// an empty list or an unrecognized value is rejected when the config is
+    /// loaded.
+    #[serde(default)]
+    pub position_encodings: PositionEncodings,
 
     /// File extension to language ID mappings.
     /// Allows users to customize which file extensions map to which language servers.
@@ -358,10 +363,11 @@ pub struct WorkspaceConfig {
     /// takes effect once a readiness signal has actually shown indexing is
     /// in progress -- a server that never reports one is never delayed.
     /// Must be strictly between `PROGRESS_SETTLE` (3s) and
-    /// `INDEXING_STALENESS_BOUND` (60s); see [`ServerConfig::validate`].
+    /// `INDEXING_STALENESS_BOUND` (60s); anything else is rejected when the
+    /// config is loaded.
     /// Default: 30
-    #[serde(default = "default_indexing_ready_timeout_seconds")]
-    pub indexing_ready_timeout_seconds: u64,
+    #[serde(default)]
+    pub indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs,
 
     /// Maximum number of LSP servers started at the same time; the rest
     /// start as earlier ones settle.
@@ -439,12 +445,12 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             roots: Vec::new(),
-            position_encodings: default_position_encodings(),
+            position_encodings: PositionEncodings::DEFAULT,
             language_extensions: default_language_extensions(),
             heuristics_max_depth: default_heuristics_max_depth(),
             max_documents: default_max_documents(),
             max_file_size: default_max_file_size(),
-            indexing_ready_timeout_seconds: default_indexing_ready_timeout_seconds(),
+            indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
             max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         }
     }
@@ -469,10 +475,6 @@ const fn default_max_file_size() -> u64 {
     DEFAULT_MAX_FILE_SIZE
 }
 
-const fn default_indexing_ready_timeout_seconds() -> u64 {
-    DEFAULT_INDEXING_READY_TIMEOUT_SECS
-}
-
 impl WorkspaceConfig {
     /// Build a map of file extensions to language IDs from the configuration.
     ///
@@ -480,12 +482,13 @@ impl WorkspaceConfig {
     ///
     /// A `HashMap` where keys are file extensions (without the dot) and values
     /// are the corresponding language IDs to report to LSP servers.
+    // TODO(#633): type extension-map values and detected language ids as LanguageId
     #[must_use]
     pub fn build_extension_map(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for mapping in &self.language_extensions {
             for ext in &mapping.extensions {
-                map.insert(ext.clone(), mapping.language_id.clone());
+                map.insert(ext.clone(), mapping.language_id.to_string());
             }
         }
         map
@@ -504,7 +507,7 @@ impl WorkspaceConfig {
     pub fn language_for_extension(&self, extension: &str) -> Option<String> {
         for mapping in &self.language_extensions {
             if mapping.extensions.contains(&extension.to_string()) {
-                return Some(mapping.language_id.clone());
+                return Some(mapping.language_id.to_string());
             }
         }
         None
@@ -547,48 +550,10 @@ fn extract_extension_from_pattern(pattern: &str) -> Option<String> {
     }
 }
 
-fn language_id_for_pattern_extension(server_language_id: &str, extension: &str) -> String {
-    react_variant_language_id(server_language_id, extension)
-        .unwrap_or(server_language_id)
+fn language_id_for_pattern_extension(server_language_id: &LanguageId, extension: &str) -> String {
+    react_variant_language_id(server_language_id.as_str(), extension)
+        .unwrap_or(server_language_id.as_str())
         .to_string()
-}
-
-/// The client-preference order offered to every spawned server during
-/// `initialize`.
-///
-/// `utf-8` is listed first deliberately, not just historically: probing both
-/// rust-analyzer and clangd (this project's two flagship servers) against
-/// exactly this offer shows both negotiate down to `utf-8`, so it is the
-/// common case, not a rare fallback. Earlier revisions of this file
-/// (`#290`/`#291`) treated the non-UTF-16 conversion path in
-/// `bridge/encoding.rs` as an edge case on that (false) assumption, which
-/// hid a char-boundary panic and an uncached-disk-read cost on what turned
-/// out to be the default path for both servers. Both are now fixed
-/// (`bridge/encoding.rs`'s boundary guards; `bridge/translator.rs`'s
-/// `EncodingCtx` preferring `DocumentTracker`'s in-memory content over
-/// disk), so there is no longer a correctness or performance reason to
-/// prefer `utf-16` here -- reordering would only reintroduce UTF-16 by
-/// default bias, undoing the point of negotiating an encoding at all.
-pub(crate) fn default_position_encodings() -> Vec<String> {
-    vec!["utf-8".to_string(), "utf-16".to_string()]
-}
-
-/// Parse a configured position-encoding string into an [`lsp_types::PositionEncodingKind`].
-///
-/// Recognizes the three values the LSP spec defines for
-/// `PositionEncodingKind`: `"utf-8"`, `"utf-16"`, `"utf-32"`. Returns `None`
-/// for anything else, letting the caller decide how to handle an invalid
-/// value (see [`ServerConfig::validate`], which rejects it at load time, and
-/// [`crate::lsp::LspServer::spawn`], which falls back to a default rather
-/// than failing the handshake for a config built without going through
-/// `validate`).
-pub(crate) fn parse_position_encoding(value: &str) -> Option<lsp_types::PositionEncodingKind> {
-    match value {
-        "utf-8" => Some(lsp_types::PositionEncodingKind::UTF8),
-        "utf-16" => Some(lsp_types::PositionEncodingKind::UTF16),
-        "utf-32" => Some(lsp_types::PositionEncodingKind::UTF32),
-        _ => None,
-    }
 }
 
 /// Build default language extension mappings.
@@ -600,35 +565,35 @@ fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
     vec![
         LanguageExtensionMapping {
             extensions: vec!["rs".to_string()],
-            language_id: "rust".to_string(),
+            language_id: const { LanguageId::from_static("rust") },
         },
         LanguageExtensionMapping {
             extensions: vec!["py".to_string(), "pyw".to_string(), "pyi".to_string()],
-            language_id: "python".to_string(),
+            language_id: const { LanguageId::from_static("python") },
         },
         LanguageExtensionMapping {
             extensions: vec!["js".to_string(), "mjs".to_string(), "cjs".to_string()],
-            language_id: "javascript".to_string(),
+            language_id: const { LanguageId::from_static("javascript") },
         },
         LanguageExtensionMapping {
             extensions: vec!["ts".to_string(), "mts".to_string(), "cts".to_string()],
-            language_id: "typescript".to_string(),
+            language_id: const { LanguageId::from_static("typescript") },
         },
         LanguageExtensionMapping {
             extensions: vec!["tsx".to_string()],
-            language_id: "typescriptreact".to_string(),
+            language_id: const { LanguageId::from_static("typescriptreact") },
         },
         LanguageExtensionMapping {
             extensions: vec!["jsx".to_string()],
-            language_id: "javascriptreact".to_string(),
+            language_id: const { LanguageId::from_static("javascriptreact") },
         },
         LanguageExtensionMapping {
             extensions: vec!["go".to_string()],
-            language_id: "go".to_string(),
+            language_id: const { LanguageId::from_static("go") },
         },
         LanguageExtensionMapping {
             extensions: vec!["c".to_string(), "h".to_string()],
-            language_id: "c".to_string(),
+            language_id: const { LanguageId::from_static("c") },
         },
         LanguageExtensionMapping {
             extensions: vec![
@@ -639,91 +604,91 @@ fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
                 "hh".to_string(),
                 "hxx".to_string(),
             ],
-            language_id: "cpp".to_string(),
+            language_id: const { LanguageId::from_static("cpp") },
         },
         LanguageExtensionMapping {
             extensions: vec!["java".to_string()],
-            language_id: "java".to_string(),
+            language_id: const { LanguageId::from_static("java") },
         },
         LanguageExtensionMapping {
             extensions: vec!["rb".to_string()],
-            language_id: "ruby".to_string(),
+            language_id: const { LanguageId::from_static("ruby") },
         },
         LanguageExtensionMapping {
             extensions: vec!["php".to_string()],
-            language_id: "php".to_string(),
+            language_id: const { LanguageId::from_static("php") },
         },
         LanguageExtensionMapping {
             extensions: vec!["swift".to_string()],
-            language_id: "swift".to_string(),
+            language_id: const { LanguageId::from_static("swift") },
         },
         LanguageExtensionMapping {
             extensions: vec!["kt".to_string(), "kts".to_string()],
-            language_id: "kotlin".to_string(),
+            language_id: const { LanguageId::from_static("kotlin") },
         },
         LanguageExtensionMapping {
             extensions: vec!["scala".to_string(), "sc".to_string()],
-            language_id: "scala".to_string(),
+            language_id: const { LanguageId::from_static("scala") },
         },
         LanguageExtensionMapping {
             extensions: vec!["zig".to_string()],
-            language_id: "zig".to_string(),
+            language_id: const { LanguageId::from_static("zig") },
         },
         LanguageExtensionMapping {
             extensions: vec!["lua".to_string()],
-            language_id: "lua".to_string(),
+            language_id: const { LanguageId::from_static("lua") },
         },
         LanguageExtensionMapping {
             extensions: vec!["sh".to_string(), "bash".to_string(), "zsh".to_string()],
-            language_id: "shellscript".to_string(),
+            language_id: const { LanguageId::from_static("shellscript") },
         },
         LanguageExtensionMapping {
             extensions: vec!["json".to_string()],
-            language_id: "json".to_string(),
+            language_id: const { LanguageId::from_static("json") },
         },
         LanguageExtensionMapping {
             extensions: vec!["toml".to_string()],
-            language_id: "toml".to_string(),
+            language_id: const { LanguageId::from_static("toml") },
         },
         LanguageExtensionMapping {
             extensions: vec!["yaml".to_string(), "yml".to_string()],
-            language_id: "yaml".to_string(),
+            language_id: const { LanguageId::from_static("yaml") },
         },
         LanguageExtensionMapping {
             extensions: vec!["xml".to_string()],
-            language_id: "xml".to_string(),
+            language_id: const { LanguageId::from_static("xml") },
         },
         LanguageExtensionMapping {
             extensions: vec!["html".to_string(), "htm".to_string()],
-            language_id: "html".to_string(),
+            language_id: const { LanguageId::from_static("html") },
         },
         LanguageExtensionMapping {
             extensions: vec!["css".to_string()],
-            language_id: "css".to_string(),
+            language_id: const { LanguageId::from_static("css") },
         },
         LanguageExtensionMapping {
             extensions: vec!["scss".to_string()],
-            language_id: "scss".to_string(),
+            language_id: const { LanguageId::from_static("scss") },
         },
         LanguageExtensionMapping {
             extensions: vec!["less".to_string()],
-            language_id: "less".to_string(),
+            language_id: const { LanguageId::from_static("less") },
         },
         LanguageExtensionMapping {
             extensions: vec!["md".to_string(), "markdown".to_string()],
-            language_id: "markdown".to_string(),
+            language_id: const { LanguageId::from_static("markdown") },
         },
         LanguageExtensionMapping {
             extensions: vec!["cs".to_string()],
-            language_id: "csharp".to_string(),
+            language_id: const { LanguageId::from_static("csharp") },
         },
         LanguageExtensionMapping {
             extensions: vec!["fs".to_string(), "fsi".to_string(), "fsx".to_string()],
-            language_id: "fsharp".to_string(),
+            language_id: const { LanguageId::from_static("fsharp") },
         },
         LanguageExtensionMapping {
             extensions: vec!["r".to_string(), "R".to_string()],
-            language_id: "r".to_string(),
+            language_id: const { LanguageId::from_static("r") },
         },
     ]
 }
@@ -1123,10 +1088,12 @@ impl ServerConfig {
     /// [`crate::serve_with`] for every `ServerConfig` regardless of origin —
     /// a caller-constructed config (not loaded via TOML) gets the same
     /// diagnosable [`Error::InvalidConfig`] rejection as one loaded from
-    /// disk, instead of only failing later via silent accessor-level
-    /// clamping (see [`crate::lsp::LspClient::request_timeout`]). Remains
-    /// `pub` so a caller can also validate a config up front, before handing
-    /// it to `serve`/`serve_with` (which consume it by value and run until
+    /// disk. Value ranges (timeouts, `position_encodings`, `language_id`)
+    /// are not checked here: their types ([`TimeoutSecs`],
+    /// [`IndexingReadyTimeoutSecs`], [`PositionEncodings`], [`LanguageId`])
+    /// reject invalid values at construction. Remains `pub` so a caller can
+    /// also validate a config up front, before handing it to
+    /// `serve`/`serve_with` (which consume it by value and run until
     /// shutdown).
     ///
     /// # Errors
@@ -1145,19 +1112,6 @@ impl ServerConfig {
         self.validate_mcp()?;
         self.validate_workspace_bounds()?;
 
-        if self.workspace.position_encodings.is_empty() {
-            return Err(Error::InvalidConfig(
-                "workspace.position_encodings cannot be empty".to_string(),
-            ));
-        }
-        for encoding in &self.workspace.position_encodings {
-            if parse_position_encoding(encoding).is_none() {
-                return Err(Error::InvalidConfig(format!(
-                    "invalid workspace.position_encodings value '{encoding}'; expected one of \
-                     \"utf-8\", \"utf-16\", \"utf-32\""
-                )));
-            }
-        }
         // `Path::is_relative()` is `true` for an empty path, and joining it
         // onto a base directory silently yields that base directory
         // unchanged rather than the empty string the user presumably meant
@@ -1168,42 +1122,12 @@ impl ServerConfig {
                 "workspace.roots entries cannot be empty".to_string(),
             ));
         }
-        let mut seen_names: HashMap<&str, &str> = HashMap::new();
+        let mut seen_names: HashMap<&str, &LanguageId> = HashMap::new();
         for server in &self.lsp_servers {
-            if server.language_id.is_empty() {
-                return Err(Error::InvalidConfig(
-                    "language_id cannot be empty".to_string(),
-                ));
-            }
             if server.command.is_empty() {
                 return Err(Error::InvalidConfig(format!(
                     "command cannot be empty for language '{}'",
                     server.language_id
-                )));
-            }
-            if server.timeout_seconds == 0 {
-                return Err(Error::InvalidConfig(format!(
-                    "timeout_seconds cannot be 0 for language '{}'",
-                    server.language_id
-                )));
-            }
-            if server.timeout_seconds > MAX_TIMEOUT_SECONDS {
-                return Err(Error::InvalidConfig(format!(
-                    "timeout_seconds ({}) exceeds the maximum of {} seconds for language '{}'",
-                    server.timeout_seconds, MAX_TIMEOUT_SECONDS, server.language_id
-                )));
-            }
-            if server.request_timeout_seconds == 0 {
-                return Err(Error::InvalidConfig(format!(
-                    "request_timeout_seconds cannot be 0 for language '{}'",
-                    server.language_id
-                )));
-            }
-            if server.request_timeout_seconds > MAX_TIMEOUT_SECONDS {
-                return Err(Error::InvalidConfig(format!(
-                    "request_timeout_seconds ({}) exceeds the maximum of {} seconds for \
-                     language '{}'",
-                    server.request_timeout_seconds, MAX_TIMEOUT_SECONDS, server.language_id
                 )));
             }
             if let Some(name) = &server.name {
@@ -1254,7 +1178,6 @@ impl ServerConfig {
     /// [`Self::validate`] to keep that function under clippy's line count
     /// threshold.
     fn validate_workspace_bounds(&self) -> Result<()> {
-        self.validate_indexing_ready_timeout()?;
         self.validate_heuristics_max_depth()?;
         self.validate_max_file_size()
     }
@@ -1279,35 +1202,6 @@ impl ServerConfig {
             return Err(Error::InvalidConfig(format!(
                 "workspace.heuristics_max_depth ({depth}) exceeds the maximum of \
                  {MAX_HEURISTICS_DEPTH}"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Validates `workspace.indexing_ready_timeout_seconds` against the same
-    /// bounds pinned at compile time in `bridge::translator::navigation` for
-    /// the *built-in default* (`INDEXING_STALENESS_BOUND` >
-    /// `INDEXING_READY_TIMEOUT` > `PROGRESS_SETTLE`) -- re-checked here since
-    /// a configured override is a runtime value and can't be asserted at
-    /// compile time. Violating either bound would either reopen the
-    /// cross-caller self-heal race `INDEXING_STALENESS_BOUND` exists to
-    /// prevent, or make `wait_for_indexing_ready` time out while the entry
-    /// is merely mid-settle, not actually still loading. Split out of
-    /// [`Self::validate`] to keep that function under clippy's line count
-    /// threshold.
-    fn validate_indexing_ready_timeout(&self) -> Result<()> {
-        if self.workspace.indexing_ready_timeout_seconds <= PROGRESS_SETTLE.as_secs() {
-            return Err(Error::InvalidConfig(format!(
-                "workspace.indexing_ready_timeout_seconds ({}) must be greater than {} seconds",
-                self.workspace.indexing_ready_timeout_seconds,
-                PROGRESS_SETTLE.as_secs()
-            )));
-        }
-        if self.workspace.indexing_ready_timeout_seconds >= INDEXING_STALENESS_BOUND.as_secs() {
-            return Err(Error::InvalidConfig(format!(
-                "workspace.indexing_ready_timeout_seconds ({}) must be less than {} seconds",
-                self.workspace.indexing_ready_timeout_seconds,
-                INDEXING_STALENESS_BOUND.as_secs()
             )));
         }
         Ok(())
@@ -1389,7 +1283,9 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::bridge::ProcessCwd;
-    use crate::bridge::WorkspaceRoots;
+    use crate::bridge::{
+        INDEXING_STALENESS_BOUND, PROGRESS_SETTLE, PositionEncoding, WorkspaceRoots,
+    };
     #[cfg(unix)]
     use crate::test_lsp::client_path;
     use crate::test_lsp::toml_path_literal;
@@ -1439,13 +1335,18 @@ mod tests {
         assert_eq!(config.lsp_servers[3].language_id, "go");
         assert_eq!(config.lsp_servers[4].language_id, "cpp");
         assert_eq!(config.lsp_servers[5].language_id, "zig");
-        assert_eq!(config.workspace.position_encodings, vec!["utf-8", "utf-16"]);
+        assert_eq!(
+            config.workspace.position_encodings,
+            PositionEncodings::DEFAULT
+        );
     }
 
     #[test]
     fn test_default_position_encodings() {
-        let encodings = default_position_encodings();
-        assert_eq!(encodings, vec!["utf-8", "utf-16"]);
+        assert_eq!(
+            PositionEncodings::DEFAULT.as_slice(),
+            [PositionEncoding::Utf8, PositionEncoding::Utf16]
+        );
     }
 
     #[test]
@@ -1473,7 +1374,10 @@ mod tests {
 
         let config = ServerConfig::load_from(&config_path).unwrap();
         assert_eq!(config.workspace.roots, vec![workspace_root]);
-        assert_eq!(config.workspace.position_encodings, vec!["utf-8"]);
+        assert_eq!(
+            config.workspace.position_encodings.as_slice(),
+            [PositionEncoding::Utf8]
+        );
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "rust");
     }
@@ -1772,58 +1676,7 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.lsp_servers[0].request_timeout_seconds, 30);
-    }
-
-    #[test]
-    fn test_validate_rejects_zero_timeout_seconds() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = r#"
-            [[lsp_servers]]
-            language_id = "rust"
-            command = "rust-analyzer"
-            timeout_seconds = 0
-        "#;
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            // `contains("timeout_seconds cannot be 0")` would also match the
-            // `request_timeout_seconds` message below (it ends in the same
-            // suffix), so assert the exact message to actually discriminate
-            // which field triggered the error.
-            assert_eq!(msg, "timeout_seconds cannot be 0 for language 'rust'");
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
-    }
-
-    #[test]
-    fn test_validate_rejects_zero_request_timeout_seconds() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = r#"
-            [[lsp_servers]]
-            language_id = "rust"
-            command = "rust-analyzer"
-            request_timeout_seconds = 0
-        "#;
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert_eq!(
-                msg,
-                "request_timeout_seconds cannot be 0 for language 'rust'"
-            );
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
+        assert_eq!(config.lsp_servers[0].request_timeout_seconds.get(), 30);
     }
 
     #[test]
@@ -1885,32 +1738,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_request_timeout_seconds_above_max() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = format!(
-            r#"
-            [[lsp_servers]]
-            language_id = "rust"
-            command = "rust-analyzer"
-            request_timeout_seconds = {}
-        "#,
-            MAX_TIMEOUT_SECONDS + 1
-        );
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("request_timeout_seconds"));
-            assert!(msg.contains("exceeds the maximum"));
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
-    }
-
-    #[test]
     fn test_validate_accepts_request_timeout_seconds_at_max() {
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("config.toml");
@@ -1928,32 +1755,6 @@ mod tests {
 
         let result = ServerConfig::load_from(&config_path);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
-    }
-
-    #[test]
-    fn test_validate_rejects_timeout_seconds_above_max() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = format!(
-            r#"
-            [[lsp_servers]]
-            language_id = "rust"
-            command = "rust-analyzer"
-            timeout_seconds = {}
-        "#,
-            MAX_TIMEOUT_SECONDS + 1
-        );
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("timeout_seconds"));
-            assert!(msg.contains("exceeds the maximum"));
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
     }
 
     #[test]
@@ -1977,52 +1778,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_indexing_ready_timeout_seconds_at_or_below_progress_settle() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = format!(
-            r"
-            [workspace]
-            indexing_ready_timeout_seconds = {}
-        ",
-            PROGRESS_SETTLE.as_secs()
-        );
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("indexing_ready_timeout_seconds"));
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
-    }
-
-    #[test]
-    fn test_validate_rejects_indexing_ready_timeout_seconds_at_or_above_staleness_bound() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = format!(
-            r"
-            [workspace]
-            indexing_ready_timeout_seconds = {}
-        ",
-            INDEXING_STALENESS_BOUND.as_secs()
-        );
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("indexing_ready_timeout_seconds"));
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
-    }
-
-    #[test]
     fn test_validate_accepts_indexing_ready_timeout_seconds_within_bounds() {
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("config.toml");
@@ -2038,7 +1793,14 @@ mod tests {
 
         let result = ServerConfig::load_from(&config_path);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
-        assert_eq!(result.unwrap().workspace.indexing_ready_timeout_seconds, 45);
+        assert_eq!(
+            result
+                .unwrap()
+                .workspace
+                .indexing_ready_timeout_seconds
+                .get(),
+            45
+        );
     }
 
     #[test]
@@ -2046,7 +1808,7 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(
             config.workspace.indexing_ready_timeout_seconds,
-            DEFAULT_INDEXING_READY_TIMEOUT_SECS
+            IndexingReadyTimeoutSecs::DEFAULT
         );
     }
 
@@ -2068,6 +1830,122 @@ mod tests {
         let err = toml::from_str::<ServerConfig>("[workspace]\nmax_concurrent_server_starts = 0")
             .unwrap_err();
         assert!(err.to_string().contains("at least 1"), "{err}");
+    }
+
+    /// Loads `toml_content` and asserts it is rejected during deserialization
+    /// with a message containing every one of `needles`.
+    fn assert_toml_rejected(toml_content: &str, needles: &[&str]) {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+        fs::write(&config_path, toml_content).unwrap();
+
+        let err = ServerConfig::load_from(&config_path).unwrap_err();
+        let Error::TomlDe(source) = err else {
+            panic!("expected TomlDe, got {err:?}");
+        };
+        let message = source.to_string();
+        for needle in needles {
+            assert!(message.contains(needle), "{needle:?} not in {message}");
+        }
+    }
+
+    #[test]
+    fn test_load_rejects_out_of_range_timeouts() {
+        for field in ["timeout_seconds", "request_timeout_seconds"] {
+            for value in [0, MAX_TIMEOUT_SECONDS + 1] {
+                assert_toml_rejected(
+                    &format!(
+                        "[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"rust-analyzer\"\n{field} = {value}\n"
+                    ),
+                    &["must be between 1 and 900 seconds", &format!("got {value}")],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_load_accepts_timeouts_at_bounds() {
+        for value in [1, MAX_TIMEOUT_SECONDS] {
+            let config: ServerConfig = toml::from_str(&format!(
+                "[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"rust-analyzer\"\n\
+                 timeout_seconds = {value}\nrequest_timeout_seconds = {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.lsp_servers[0].timeout_seconds.get(), value);
+            assert_eq!(config.lsp_servers[0].request_timeout_seconds.get(), value);
+        }
+    }
+
+    #[test]
+    fn test_load_rejects_indexing_ready_timeout_outside_open_interval() {
+        for value in [
+            PROGRESS_SETTLE.as_secs(),
+            INDEXING_STALENESS_BOUND.as_secs(),
+        ] {
+            assert_toml_rejected(
+                &format!("[workspace]\nindexing_ready_timeout_seconds = {value}\n"),
+                &["must be between", &format!("got {value}")],
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_accepts_indexing_ready_timeout_at_bounds() {
+        for value in [
+            PROGRESS_SETTLE.as_secs() + 1,
+            INDEXING_STALENESS_BOUND.as_secs() - 1,
+        ] {
+            let config: ServerConfig = toml::from_str(&format!(
+                "[workspace]\nindexing_ready_timeout_seconds = {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.workspace.indexing_ready_timeout_seconds.get(), value);
+        }
+    }
+
+    #[test]
+    fn test_load_rejects_empty_language_id() {
+        assert_toml_rejected(
+            "[[lsp_servers]]\nlanguage_id = \"\"\ncommand = \"x\"\n",
+            &["language_id cannot be empty"],
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_empty_position_encodings() {
+        assert_toml_rejected(
+            "[workspace]\nposition_encodings = []\n",
+            &["position_encodings cannot be empty"],
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_unrecognized_position_encoding() {
+        assert_toml_rejected(
+            "[workspace]\nposition_encodings = [\"utf-8\", \"utf-7\"]\n",
+            &["utf-7", "utf-8", "utf-16", "utf-32"],
+        );
+    }
+
+    #[test]
+    fn test_default_config_round_trips_through_toml() {
+        let original = ServerConfig::default();
+        let text = toml::to_string(&original).unwrap();
+        let reloaded: ServerConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            reloaded.workspace.position_encodings,
+            original.workspace.position_encodings
+        );
+        assert_eq!(
+            reloaded.workspace.indexing_ready_timeout_seconds,
+            original.workspace.indexing_ready_timeout_seconds
+        );
+        assert_eq!(reloaded.lsp_servers.len(), original.lsp_servers.len());
+        for (a, b) in reloaded.lsp_servers.iter().zip(&original.lsp_servers) {
+            assert_eq!(a.language_id, b.language_id);
+            assert_eq!(a.timeout_seconds, b.timeout_seconds);
+            assert_eq!(a.request_timeout_seconds, b.request_timeout_seconds);
+        }
     }
 
     #[test]
@@ -2152,29 +2030,6 @@ mod tests {
             result,
             Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
         );
-    }
-
-    #[test]
-    fn test_validate_empty_language_id() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = r#"
-            [[lsp_servers]]
-            language_id = ""
-            command = "test"
-        "#;
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        assert!(result.is_err());
-
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("language_id cannot be empty"));
-        } else {
-            panic!("Expected InvalidConfig error");
-        }
     }
 
     #[test]
@@ -2273,26 +2128,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_rejects_empty_position_encodings() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = r"
-            [workspace]
-            position_encodings = []
-        ";
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert_eq!(msg, "workspace.position_encodings cannot be empty");
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
-    }
-
     /// #348 M4: `roots = [""]` previously reached workspace-root resolution
     /// (an empty path is `is_relative() == true`) and silently resolved to
     /// `base_dir` unchanged -- almost certainly not what an empty string in
@@ -2315,43 +2150,6 @@ mod tests {
         } else {
             panic!("Expected InvalidConfig error, got {result:?}");
         }
-    }
-
-    #[test]
-    fn test_validate_rejects_unrecognized_position_encoding() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = r#"
-            [workspace]
-            position_encodings = ["utf-8", "utf-7"]
-        "#;
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("invalid workspace.position_encodings value 'utf-7'"));
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
-    }
-
-    #[test]
-    fn test_parse_position_encoding_maps_valid_values_and_rejects_unknown() {
-        assert_eq!(
-            parse_position_encoding("utf-8"),
-            Some(lsp_types::PositionEncodingKind::UTF8)
-        );
-        assert_eq!(
-            parse_position_encoding("utf-16"),
-            Some(lsp_types::PositionEncodingKind::UTF16)
-        );
-        assert_eq!(
-            parse_position_encoding("utf-32"),
-            Some(lsp_types::PositionEncodingKind::UTF32)
-        );
-        assert_eq!(parse_position_encoding("utf-7"), None);
     }
 
     #[test]
@@ -2385,7 +2183,7 @@ mod tests {
     fn test_workspace_config_defaults() {
         let workspace = WorkspaceConfig::default();
         assert_eq!(workspace.roots.len(), 0);
-        assert_eq!(workspace.position_encodings, vec!["utf-8", "utf-16"]);
+        assert_eq!(workspace.position_encodings, PositionEncodings::DEFAULT);
         assert!(!workspace.language_extensions.is_empty());
         assert_eq!(workspace.language_extensions.len(), 30);
         assert_eq!(workspace.heuristics_max_depth, DEFAULT_HEURISTICS_MAX_DEPTH);
@@ -2512,21 +2310,21 @@ mod tests {
     fn test_build_extension_map() {
         let workspace = WorkspaceConfig {
             roots: vec![],
-            position_encodings: vec![],
+            position_encodings: PositionEncodings::DEFAULT,
             language_extensions: vec![
                 LanguageExtensionMapping {
                     extensions: vec!["cpp".to_string(), "cc".to_string(), "cxx".to_string()],
-                    language_id: "cpp".to_string(),
+                    language_id: LanguageId::from_static("cpp"),
                 },
                 LanguageExtensionMapping {
                     extensions: vec!["nu".to_string()],
-                    language_id: "nushell".to_string(),
+                    language_id: LanguageId::from_static("nushell"),
                 },
             ],
             heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
             max_documents: DEFAULT_MAX_DOCUMENTS,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
-            indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+            indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
             max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         };
 
@@ -2567,15 +2365,15 @@ mod tests {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
-                language_id: "cpp".to_string(),
+                language_id: LanguageId::from_static("cpp"),
                 command: "clangd".to_string(),
                 args: vec![],
                 env: HashMap::new(),
                 file_patterns: vec!["**/*.c".to_string(), "**/*.h".to_string()],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -2595,15 +2393,15 @@ mod tests {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
-                language_id: "typescript".to_string(),
+                language_id: LanguageId::from_static("typescript"),
                 command: "tsgo".to_string(),
                 args: vec!["--lsp".to_string(), "--stdio".to_string()],
                 env: HashMap::new(),
                 file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -2623,15 +2421,15 @@ mod tests {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
-                language_id: "javascript".to_string(),
+                language_id: LanguageId::from_static("javascript"),
                 command: "typescript-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
                 env: HashMap::new(),
                 file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -2651,15 +2449,15 @@ mod tests {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
-                language_id: "cpp".to_string(),
+                language_id: LanguageId::from_static("cpp"),
                 command: "clangd".to_string(),
                 args: vec![],
                 env: HashMap::new(),
                 file_patterns: vec!["**/*".to_string(), "**/*.{h,hpp}".to_string()],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -2677,21 +2475,21 @@ mod tests {
     fn test_language_for_extension() {
         let workspace = WorkspaceConfig {
             roots: vec![],
-            position_encodings: vec![],
+            position_encodings: PositionEncodings::DEFAULT,
             language_extensions: vec![
                 LanguageExtensionMapping {
                     extensions: vec!["hpp".to_string(), "hh".to_string()],
-                    language_id: "cpp".to_string(),
+                    language_id: LanguageId::from_static("cpp"),
                 },
                 LanguageExtensionMapping {
                     extensions: vec!["py".to_string()],
-                    language_id: "python".to_string(),
+                    language_id: LanguageId::from_static("python"),
                 },
             ],
             heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
             max_documents: DEFAULT_MAX_DOCUMENTS,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
-            indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+            indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
             max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         };
 
@@ -3155,15 +2953,15 @@ mod tests {
     fn test_workspace_config_toml_round_trip() {
         let original = WorkspaceConfig {
             roots: vec![PathBuf::from("/tmp/round-trip")],
-            position_encodings: vec!["utf-8".to_string()],
+            position_encodings: PositionEncodings::new(vec![PositionEncoding::Utf8]).unwrap(),
             language_extensions: vec![LanguageExtensionMapping {
                 extensions: vec!["nu".to_string()],
-                language_id: "nushell".to_string(),
+                language_id: LanguageId::from_static("nushell"),
             }],
             heuristics_max_depth: 5,
             max_documents: 500,
             max_file_size: 0,
-            indexing_ready_timeout_seconds: 45,
+            indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::new(45).unwrap(),
             max_concurrent_server_starts: ServerStartConcurrency::new(3).unwrap(),
         };
 

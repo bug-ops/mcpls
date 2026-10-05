@@ -21,7 +21,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexS
 use tokio::time::Duration;
 
 use crate::bridge::WorkspaceRoots;
-use crate::config::LspServerConfig;
+#[cfg(unix)]
+use crate::config::{LanguageId, TimeoutSecs};
+use crate::config::{LspServerConfig, PositionEncodings};
 use crate::lsp::{LspClient, LspTransport, LspTransportReader, ServerInitConfig};
 
 /// Duplex buffer capacity for the mock pipes below. Framed JSON-RPC
@@ -303,7 +305,7 @@ pub fn init_config_for(server_config: LspServerConfig) -> ServerInitConfig {
         server_config,
         workspace_roots: vec![],
         initialization_options: None,
-        position_encodings: vec![],
+        position_encodings: PositionEncodings::DEFAULT,
         redactions: std::sync::Arc::default(),
     }
 }
@@ -361,8 +363,8 @@ pub fn named_sh_init_config(
     std::fs::create_dir_all(&sub).unwrap();
     let mut config = sh_script_init_config(&sub, script_body);
     config.server_config.name = Some(name.to_string());
-    config.server_config.language_id = language.to_string();
-    config.server_config.timeout_seconds = 10;
+    config.server_config.language_id = LanguageId::new(language).unwrap();
+    config.server_config.timeout_seconds = TimeoutSecs::new(10).unwrap();
     config
 }
 

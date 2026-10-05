@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use mcpls_core::ServerConfig;
 use mcpls_core::bridge::IndexingPolicy;
-use mcpls_core::config::LspServerConfig;
+use mcpls_core::config::{LspServerConfig, TimeoutSecs};
 use rmcp::model::{ContentBlock, ErrorCode};
 use rmcp::service::{RunningService, ServiceError};
 use rmcp::{RoleClient, ServiceExt};
@@ -30,7 +30,10 @@ use crate::stderr_log::{DRAIN_GRACE, StderrDrain, StderrLogCap};
 use crate::target::{ProbeCall, Target};
 
 const READY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const LSP_TIMEOUT_SECS: u64 = 60;
+const LSP_TIMEOUT_SECS: TimeoutSecs = match TimeoutSecs::new(60) {
+    Some(secs) => secs,
+    None => panic!("the LSP timeout must be in range"),
+};
 
 /// Options of one `run` invocation.
 #[derive(Debug, Clone)]

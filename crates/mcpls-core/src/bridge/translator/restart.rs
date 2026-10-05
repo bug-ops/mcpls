@@ -638,7 +638,8 @@ impl Translator {
         let language_id = config.server_config.language_id.clone();
 
         if self.is_shutting_down() {
-            self.invalidate_stopped_server(id, &language_id).await;
+            self.invalidate_stopped_server(id, language_id.as_str())
+                .await;
             return RestartOutcome::Failed {
                 reason: RestartFailure::ShuttingDown,
             };
@@ -655,7 +656,8 @@ impl Translator {
         self.note_restart_attempt(id);
         if let Err(error) = respawned {
             tracing::warn!(%id, %error, "LSP server restart failed");
-            self.invalidate_stopped_server(id, &language_id).await;
+            self.invalidate_stopped_server(id, language_id.as_str())
+                .await;
             return RestartOutcome::Failed {
                 reason: RestartFailure::from_error(&error),
             };
@@ -852,7 +854,7 @@ mod tests {
             write_responder_script, write_slow_exit_server_script,
         };
         use crate::bridge::{NotificationCache, WorkspaceRoots};
-        use crate::config::ToolRouter;
+        use crate::config::{LanguageId, ToolRouter};
         use crate::error::{ServerSpawnFailure, StartupFailure};
         use crate::mcp::SubscriptionRegistry;
 
@@ -876,7 +878,10 @@ mod tests {
             let cache = Arc::new(Mutex::new(NotificationCache::new()));
             let clock = Arc::new(FakeClock::new());
             let mut translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_notification_cache(Arc::clone(&cache))
                 .with_clock(clock.clone());
             translator.set_workspace_roots(
@@ -1028,11 +1033,13 @@ mod tests {
         #[tokio::test]
         async fn test_restart_of_a_startup_failed_server_reports_not_running() {
             let id = ServerId::from("rust");
-            let translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            let translator = Translator::new().with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id.clone(),
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 command: "missing".to_string(),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
@@ -1097,7 +1104,7 @@ mod tests {
             translator.clear_expected_servers();
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id.clone(),
-                language_id: "rust".to_string(),
+                language_id: crate::config::LanguageId::from_static("rust"),
                 command: "missing".to_string(),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
@@ -1144,11 +1151,13 @@ mod tests {
         async fn test_restart_of_a_startup_failed_server_while_startup_settles_reports_not_running()
         {
             let id = ServerId::from("rust");
-            let translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            let translator = Translator::new().with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id,
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 command: "missing".to_string(),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
@@ -1169,8 +1178,10 @@ mod tests {
         #[tokio::test]
         async fn test_restart_of_a_still_expected_server_reports_initializing() {
             let id = ServerId::from("rust");
-            let translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            let translator = Translator::new().with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
             translator.set_expected_servers(HashSet::from([id]));
 
             let result = translator
@@ -1558,7 +1569,7 @@ mod tests {
             translator.clear_expected_servers();
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id,
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 command: "missing".to_string(),
                 reason: StartupFailure::InitTaskPanicked,
             }]);

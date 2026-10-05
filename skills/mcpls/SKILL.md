@@ -102,7 +102,7 @@ no environment variable equivalent.
 | `--listen <ADDR>` | — | `MCPLS_LISTEN` | unset | HTTP transport bind address (e.g. `127.0.0.1:3000`). Only exists when built with `--features transport-http` — see [HTTP transport caveats](#registering-with-an-mcp-client). |
 | `--http-path <PATH>` | — | `MCPLS_HTTP_PATH` | `/mcp` | URL path the MCP service mounts at. Must start with `/`, must not be `/`, and may use only ASCII letters, digits and `-._~` per segment; an invalid value exits with code 2 before any server starts, even without `--listen`. Only used with `--listen`; same `transport-http` feature gate. HTTP requests carrying an `Origin` other than a loopback origin on the bound port or one listed with `--http-allowed-origin` get `403`. |
 | `--http-allowed-origin <ORIGIN>` | — | `MCPLS_HTTP_ALLOWED_ORIGINS` | none | Extra browser origin (`http(s)://host[:port]`, repeatable or comma-separated) accepted besides loopback origins on the bound port. The request's `Host` must be allowed too (`--http-allowed-host`). |
-| `--http-allowed-host <HOST>` | — | `MCPLS_HTTP_ALLOWED_HOSTS` | none | Extra `Host` header value (`host[:port]`, no wildcards, repeatable or comma-separated) accepted besides `localhost`, `127.0.0.1`, `::1` and the bound IP address; without a port any port matches; never pin `:80` or `:443` (clients omit them). Needed when reaching mcpls by name or when bound to `0.0.0.0`. |
+| `--http-allowed-host <HOST>` | — | `MCPLS_HTTP_ALLOWED_HOSTS` | none | Extra `Host` header value (`host[:port]`, no wildcards, repeatable or comma-separated) accepted besides `localhost`, `127.0.0.1`, `::1` and the bound IP address; without a port any port matches; ports 80, 443 and 0 are rejected (clients omit the default ports). Needed when reaching mcpls by name or when bound to `0.0.0.0`. |
 
 Plus standard `--version` / `--help`. No subcommands.
 
@@ -199,7 +199,8 @@ analyze an untrusted checkout only inside a container or disposable VM. For the 
 server, mcpls pins `tsserver` to the one bundled with `typescript-language-server` on symlink
 installs (`npm -g` style, verified with Homebrew's node) with a global `typescript`; Windows
 `.cmd`, pnpm, Volta, asdf, mise and `npx`/`bunx` launchers are not covered (#604), and `initialization_options.tsserver.path` overrides
-the pin. See [SECURITY.md](https://github.com/bug-ops/mcpls/blob/main/SECURITY.md).
+the pin. TypeScript 7 ships no `tsserver`, so the server needs `typescript@6` next to it (or
+configure `tsc --lsp --stdio` explicitly). See [SECURITY.md](https://github.com/bug-ops/mcpls/blob/main/SECURITY.md).
 
 When a project config is found but ignored, mcpls does not just log a `tracing::warn!`
 to stderr (which a stdio-based agent typically can't see) — it also appends a NOTE to

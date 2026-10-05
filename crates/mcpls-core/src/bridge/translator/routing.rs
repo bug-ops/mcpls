@@ -1200,7 +1200,10 @@ mod tests {
     use crate::bridge::translator::edits::MAX_NEW_NAME_LENGTH;
     use crate::bridge::translator::testing::*;
     use crate::bridge::{NotificationCache, ResultContext, WorkspaceRoots};
-    use crate::config::{LspServerConfig, ToolRouter};
+    use crate::config::{
+        IndexingReadyTimeoutSecs, LanguageId, LspServerConfig, PositionEncodings, TimeoutSecs,
+        ToolRouter,
+    };
     use crate::error::Error;
     use crate::lsp::LspServer;
     use crate::test_lsp::client_path;
@@ -1216,7 +1219,10 @@ mod tests {
         let lang = detect_language(&path, &HashMap::new());
         let id = ServerId::from(lang.clone());
 
-        let translator = Translator::new().with_router(ToolRouter::catch_all([(id.clone(), lang)]));
+        let translator = Translator::new().with_router(ToolRouter::catch_all([(
+            id.clone(),
+            LanguageId::new(lang).unwrap(),
+        )]));
         let mut expected = HashSet::new();
         expected.insert(id.clone());
         translator.set_expected_servers(expected);
@@ -1246,7 +1252,7 @@ mod tests {
     fn not_found_failure(id: &ServerId, language: &str, command: &str) -> ServerSpawnFailure {
         ServerSpawnFailure {
             server_id: id.clone(),
-            language_id: language.to_string(),
+            language_id: LanguageId::new(language).unwrap(),
             command: command.to_string(),
             reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
                 command: command.to_string(),
@@ -1261,15 +1267,15 @@ mod tests {
         handles: Option<Vec<ToolKind>>,
     ) -> LspServerConfig {
         LspServerConfig {
-            language_id: language.to_string(),
+            language_id: LanguageId::new(language).unwrap(),
             command: "sh".to_string(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
-            timeout_seconds: 5,
-            request_timeout_seconds: 5,
+            timeout_seconds: TimeoutSecs::new(5).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
             heuristics: None,
             name: Some(name.to_string()),
             handles,
@@ -1285,7 +1291,10 @@ mod tests {
         let id = ServerId::from("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.record_startup_failures(&[not_found_failure(&id, "rust", "rust-analyzer")]);
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
@@ -1310,7 +1319,10 @@ mod tests {
         let id = ServerId::from("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.record_startup_failures(&[not_found_failure(&id, "rust", "rust-analyzer")]);
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
@@ -1389,7 +1401,7 @@ mod tests {
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
                 id.clone(),
-                "typescript".to_string(),
+                LanguageId::from_static("typescript"),
             )]));
         translator.record_startup_failures(&[not_found_failure(
             &id,
@@ -1749,7 +1761,7 @@ mod tests {
             .with_extensions(extension_map)
             .with_router(ToolRouter::catch_all([(
                 ServerId::from("typescript"),
-                "typescript".to_string(),
+                LanguageId::from_static("typescript"),
             )]));
         translator.register_client(
             "typescript".to_string(),
@@ -1772,15 +1784,15 @@ mod tests {
         extension_map.insert("tsx".to_string(), "typescriptreact".to_string());
 
         let typescript_react_config = crate::config::LspServerConfig {
-            language_id: "typescriptreact".to_string(),
+            language_id: LanguageId::from_static("typescriptreact"),
             command: "typescript-language-server".to_string(),
             args: vec!["--stdio".to_string()],
             env: HashMap::new(),
             file_patterns: vec!["**/*.tsx".to_string()],
             initialization_options: None,
             settings: None,
-            timeout_seconds: 30,
-            request_timeout_seconds: 30,
+            timeout_seconds: TimeoutSecs::new(30).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
             name: None,
             handles: None,
@@ -1790,10 +1802,13 @@ mod tests {
         let translator = Translator::new()
             .with_extensions(extension_map)
             .with_router(ToolRouter::catch_all([
-                (ServerId::from("typescript"), "typescript".to_string()),
+                (
+                    ServerId::from("typescript"),
+                    LanguageId::from_static("typescript"),
+                ),
                 (
                     ServerId::from("typescriptreact"),
-                    "typescriptreact".to_string(),
+                    LanguageId::from_static("typescriptreact"),
                 ),
             ]));
         translator.register_client(
@@ -1801,7 +1816,7 @@ mod tests {
             LspClient::new(crate::config::LspServerConfig::typescript()),
         );
         translator.register_client(
-            "typescriptreact".to_string(),
+            LanguageId::from_static("typescriptreact"),
             LspClient::new(typescript_react_config),
         );
 
@@ -1819,7 +1834,10 @@ mod tests {
         let id = ServerId::from("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.register_client(
             id.clone(),
             LspClient::new(crate::config::LspServerConfig::rust_analyzer()),
@@ -1841,7 +1859,10 @@ mod tests {
         let id = ServerId::from("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_expected_servers(HashSet::from([id.clone()]));
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
@@ -1862,7 +1883,10 @@ mod tests {
         let id = ServerId::from("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.record_startup_failures(&[not_found_failure(&id, "rust", "rust-analyzer")]);
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
@@ -1884,7 +1908,10 @@ mod tests {
         let id = ServerId::from("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.record_startup_failures(&[not_found_failure(&id, "rust", "rust-analyzer")]);
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
@@ -1902,7 +1929,10 @@ mod tests {
         let id = ServerId::from("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
-            .with_router(ToolRouter::catch_all([(id, "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id,
+                LanguageId::from_static("rust"),
+            )]));
 
         let route = translator.diagnostics_route_for_path(Path::new("/ws/main.rs"));
 
@@ -1944,7 +1974,7 @@ mod tests {
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
                 id.clone(),
-                "typescript".to_string(),
+                LanguageId::from_static("typescript"),
             )]));
         translator.record_startup_failures(&[not_found_failure(
             &id,
@@ -1993,7 +2023,10 @@ mod tests {
         let id = ServerId::from("rust");
         let mut translator = Translator::new()
             .with_extensions(test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
@@ -2052,15 +2085,15 @@ mod tests {
         extension_map.insert("jsx".to_string(), "javascriptreact".to_string());
 
         let javascript_config = crate::config::LspServerConfig {
-            language_id: "javascript".to_string(),
+            language_id: LanguageId::from_static("javascript"),
             command: "typescript-language-server".to_string(),
             args: vec!["--stdio".to_string()],
             env: HashMap::new(),
             file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
             initialization_options: None,
             settings: None,
-            timeout_seconds: 30,
-            request_timeout_seconds: 30,
+            timeout_seconds: TimeoutSecs::new(30).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
             name: None,
             handles: None,
@@ -2070,7 +2103,7 @@ mod tests {
             .with_extensions(extension_map)
             .with_router(ToolRouter::catch_all([(
                 ServerId::from("javascript"),
-                "javascript".to_string(),
+                LanguageId::from_static("javascript"),
             )]));
         translator.register_client("javascript".to_string(), LspClient::new(javascript_config));
 
@@ -2082,18 +2115,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_serve_initializes_translator_with_extensions() {
-        use crate::bridge::indexing::DEFAULT_INDEXING_READY_TIMEOUT_SECS;
         use crate::bridge::state::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
         use crate::config::{LanguageExtensionMapping, WorkspaceConfig};
 
         let language_extensions = vec![
             LanguageExtensionMapping {
                 extensions: vec!["nu".to_string()],
-                language_id: "nushell".to_string(),
+                language_id: LanguageId::from_static("nushell"),
             },
             LanguageExtensionMapping {
                 extensions: vec!["rs".to_string()],
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
             },
         ];
 
@@ -2101,12 +2133,12 @@ mod tests {
             mcp: crate::config::McpConfig::default(),
             workspace: WorkspaceConfig {
                 roots: vec![PathBuf::from("/tmp/test-workspace")],
-                position_encodings: vec!["utf-8".to_string()],
+                position_encodings: PositionEncodings::DEFAULT,
                 language_extensions: language_extensions.clone(),
                 heuristics_max_depth: 10,
                 max_documents: DEFAULT_MAX_DOCUMENTS,
                 max_file_size: DEFAULT_MAX_FILE_SIZE,
-                indexing_ready_timeout_seconds: DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+                indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                 max_concurrent_server_starts: crate::config::ServerStartConcurrency::DEFAULT,
             },
             lsp_servers: vec![],
@@ -2146,8 +2178,8 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([
-                    (ServerId::from("lang_a"), "lang_a".to_string()),
-                    (ServerId::from("lang_b"), "lang_b".to_string()),
+                    (ServerId::from("lang_a"), LanguageId::from_static("lang_a")),
+                    (ServerId::from("lang_b"), LanguageId::from_static("lang_b")),
                 ]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -2237,7 +2269,7 @@ mod tests {
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
                     ServerId::from("lang_a"),
-                    "lang_a".to_string(),
+                    LanguageId::from_static("lang_a"),
                 )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -2300,7 +2332,7 @@ mod tests {
             .with_extensions(extensions)
             .with_router(ToolRouter::catch_all([(
                 ServerId::from("lang_a"),
-                "lang_a".to_string(),
+                LanguageId::from_static("lang_a"),
             )]))
             .with_resource_limits(ResourceLimits {
                 max_documents: 1,
@@ -2524,7 +2556,7 @@ mod tests {
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
                     ServerId::from("lang_b"),
-                    "lang_b".to_string(),
+                    LanguageId::from_static("lang_b"),
                 )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -2570,8 +2602,8 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(extensions)
             .with_router(ToolRouter::catch_all([
-                (ServerId::from("lang_a"), "lang_a".to_string()),
-                (ServerId::from("lang_b"), "lang_b".to_string()),
+                (ServerId::from("lang_a"), LanguageId::from_static("lang_a")),
+                (ServerId::from("lang_b"), LanguageId::from_static("lang_b")),
             ]))
             .with_resource_limits(ResourceLimits {
                 max_documents: 1,
@@ -2645,30 +2677,30 @@ mod tests {
         let pylsp_id = ServerId::from("pylsp");
         let configs = vec![
             LspServerConfig {
-                language_id: "python".to_string(),
+                language_id: LanguageId::from_static("python"),
                 command: "pyright-langserver".to_string(),
                 args: vec![],
                 env: HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: Some("pyright".to_string()),
                 handles: Some(vec![ToolKind::Hover]),
                 indexing: crate::bridge::IndexingPolicy::Auto,
             },
             LspServerConfig {
-                language_id: "python".to_string(),
+                language_id: LanguageId::from_static("python"),
                 command: "pylsp".to_string(),
                 args: vec![],
                 env: HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: Some("pylsp".to_string()),
                 handles: Some(vec![ToolKind::Diagnostics]),

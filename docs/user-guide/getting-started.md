@@ -183,8 +183,10 @@ npm install -g pyright
 
 ### TypeScript (typescript-language-server)
 ```bash
-npm install -g typescript-language-server
+npm install -g typescript-language-server typescript@6
 ```
+
+TypeScript 7 ships no `tsserver`, so the server needs `typescript@6`. See [TypeScript 7 (native server)](configuration.md#typescript-7-native-server) to run the native server instead.
 
 ### Go (gopls)
 ```bash

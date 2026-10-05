@@ -92,7 +92,7 @@ after a bounded time, without changing any default behavior for existing deploym
 | `Origin: http://app.example.com` against a stored `https` entry | `403` |
 | Request with an unlisted `Host` and an allowed `Origin` | `403` from the `Host` check |
 | `Host: pinned.example` against a stored `pinned.example:8443` | `403` (a pinned port must match and be present) |
-| `Host: mcp.example.com` (default port omitted) against a stored `mcp.example.com` | Accepted; never pin `:80` or `:443` |
+| `Host: mcp.example.com` (default port omitted) against a stored `mcp.example.com` | Accepted; a pin to `:80` or `:443` is rejected at parse time ([[mcp/013-http-allowed-host-default-port-rejection/spec\|mcp/013]]) |
 | `--http-allowed-host example.com.` or `bücher.example` | Rejected (trailing dot; use punycode) |
 | `--http-allowed-host example.com:` | Rejected with a validation error |
 | Peer stops reading a streamed response | Connection closed after the write-stall timeout; permit freed |

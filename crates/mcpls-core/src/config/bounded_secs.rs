@@ -1,0 +1,190 @@
+//! Bounded whole-second durations for configuration values.
+//!
+//! A value of these types is in range by construction, so neither
+//! `ServerConfig::validate` nor the use sites need to re-check or clamp it.
+
+use std::num::NonZeroU64;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use super::server::MAX_TIMEOUT_SECONDS;
+use crate::bridge::{
+    DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_SETTLE,
+};
+
+/// Why a number of seconds is not a valid [`BoundedSecs`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("must be between {min} and {max} seconds, got {value}")]
+pub struct InvalidSecs {
+    /// The rejected value.
+    pub value: u64,
+    /// Smallest accepted value.
+    pub min: u64,
+    /// Largest accepted value.
+    pub max: u64,
+}
+
+/// A whole number of seconds in `MIN..=MAX`, with `MIN >= 1`.
+///
+/// Deserializes from a TOML integer and rejects out-of-range values at load
+/// time, so an embedder cannot build an out-of-range value either.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use mcpls_core::config::TimeoutSecs;
+///
+/// assert!(TimeoutSecs::new(0).is_none());
+/// assert!(TimeoutSecs::new(901).is_none());
+/// assert_eq!(TimeoutSecs::new(45).unwrap().as_duration(), Duration::from_secs(45));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct BoundedSecs<const MIN: u64, const MAX: u64>(NonZeroU64);
+
+impl<const MIN: u64, const MAX: u64> BoundedSecs<MIN, MAX> {
+    /// `None` when `secs` is outside `MIN..=MAX`.
+    #[must_use]
+    pub const fn new(secs: u64) -> Option<Self> {
+        const { assert!(MIN >= 1 && MIN <= MAX, "MIN must satisfy 1 <= MIN <= MAX") };
+        // RangeInclusive::contains is not const.
+        #[allow(clippy::manual_range_contains)]
+        if secs < MIN || secs > MAX {
+            return None;
+        }
+        match NonZeroU64::new(secs) {
+            Some(secs) => Some(Self(secs)),
+            None => None,
+        }
+    }
+
+    /// The wrapped number of seconds, within `MIN..=MAX`.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The wrapped number of seconds as a [`Duration`].
+    #[must_use]
+    pub const fn as_duration(self) -> Duration {
+        Duration::from_secs(self.0.get())
+    }
+}
+
+impl<const MIN: u64, const MAX: u64> TryFrom<u64> for BoundedSecs<MIN, MAX> {
+    type Error = InvalidSecs;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or(InvalidSecs {
+            value,
+            min: MIN,
+            max: MAX,
+        })
+    }
+}
+
+impl<const MIN: u64, const MAX: u64> From<BoundedSecs<MIN, MAX>> for u64 {
+    fn from(secs: BoundedSecs<MIN, MAX>) -> Self {
+        secs.get()
+    }
+}
+
+/// A server handshake or request timeout: 1 to [`MAX_TIMEOUT_SECONDS`] seconds.
+pub type TimeoutSecs = BoundedSecs<1, MAX_TIMEOUT_SECONDS>;
+
+impl TimeoutSecs {
+    /// Thirty seconds.
+    pub const DEFAULT: Self = match Self::new(30) {
+        Some(secs) => secs,
+        None => panic!("the default timeout must be in range"),
+    };
+}
+
+impl Default for TimeoutSecs {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// How long a whole-workspace query waits for indexing readiness: strictly
+/// between `PROGRESS_SETTLE` and `INDEXING_STALENESS_BOUND`.
+///
+/// Violating either bound would reopen the cross-caller self-heal race
+/// `INDEXING_STALENESS_BOUND` exists to prevent, or time out while the entry
+/// is merely mid-settle.
+pub type IndexingReadyTimeoutSecs =
+    BoundedSecs<{ PROGRESS_SETTLE.as_secs() + 1 }, { INDEXING_STALENESS_BOUND.as_secs() - 1 }>;
+
+impl IndexingReadyTimeoutSecs {
+    /// The built-in default, `DEFAULT_INDEXING_READY_TIMEOUT_SECS`.
+    pub const DEFAULT: Self = match Self::new(DEFAULT_INDEXING_READY_TIMEOUT_SECS) {
+        Some(secs) => secs,
+        None => panic!("the default indexing-ready timeout must be in range"),
+    };
+}
+
+impl Default for IndexingReadyTimeoutSecs {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timeout_bounds() {
+        assert!(TimeoutSecs::new(0).is_none());
+        assert_eq!(TimeoutSecs::new(1).unwrap().get(), 1);
+        assert_eq!(
+            TimeoutSecs::new(MAX_TIMEOUT_SECONDS).unwrap().get(),
+            MAX_TIMEOUT_SECONDS
+        );
+        assert!(TimeoutSecs::new(MAX_TIMEOUT_SECONDS + 1).is_none());
+    }
+
+    #[test]
+    fn test_indexing_ready_timeout_bounds_are_exclusive() {
+        let settle = PROGRESS_SETTLE.as_secs();
+        let stale = INDEXING_STALENESS_BOUND.as_secs();
+        assert!(IndexingReadyTimeoutSecs::new(settle).is_none());
+        assert!(IndexingReadyTimeoutSecs::new(settle + 1).is_some());
+        assert!(IndexingReadyTimeoutSecs::new(stale - 1).is_some());
+        assert!(IndexingReadyTimeoutSecs::new(stale).is_none());
+    }
+
+    #[test]
+    fn test_defaults_match_documented_values() {
+        assert_eq!(TimeoutSecs::default().get(), 30);
+        assert_eq!(
+            IndexingReadyTimeoutSecs::default().get(),
+            DEFAULT_INDEXING_READY_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn test_try_from_error_reports_range() {
+        let err = TimeoutSecs::try_from(0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("must be between 1 and {MAX_TIMEOUT_SECONDS} seconds, got 0")
+        );
+    }
+
+    #[test]
+    fn test_serde_round_trip_and_rejection() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Holder {
+            secs: TimeoutSecs,
+        }
+
+        let holder: Holder = toml::from_str("secs = 12").unwrap();
+        assert_eq!(holder.secs.get(), 12);
+        assert_eq!(toml::to_string(&holder).unwrap().trim(), "secs = 12");
+        assert!(toml::from_str::<Holder>("secs = -1").is_err());
+    }
+}

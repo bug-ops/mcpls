@@ -8,7 +8,7 @@ tags:
   - http
   - security
 created: 2026-10-05
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/012-http-typed-limits-origins-stream-deadline/spec|http-typed-limits-origins-stream-deadline]]"
@@ -20,7 +20,7 @@ related:
 > **Type**: enhancement
 > **Priority**: P3
 > **Author**: Andrei G.
-> **Issues**: [NEEDS CLARIFICATION: issue number not yet filed]
+> **Issues**: #629
 > **Observed at**: `517cb53`
 > **Breaking**: yes (inputs accepted today become a parse error); document in `CHANGELOG.md`
 
@@ -136,7 +136,7 @@ THEN it returns Err(InvalidAllowedHost::DefaultPort) and no AllowedHost value ex
 | `AllowedHost` | A `Host` value allowed to reach the HTTP transport | lowercase host (IPv6 bracketed), optional pinned port in 1..=65535 excluding 80 and 443 |
 | `InvalidAllowedHost` | Typed parse failure | gains `DefaultPort`; `InvalidPort` covers empty, above 65535 and 0 |
 
-[NEEDS CLARIFICATION: should the public accessor `AllowedHost::port()` keep returning `Option<u16>` (recommended: no churn for embedders, the value is already validated) or change to a non-zero type? Pre-1.0, so either is allowed.]
+Resolved: `AllowedHost::port()` keeps returning `Option<u16>`; the value is validated by the private `PinnedPort` newtype.
 
 ## 6. Edge Cases and Error Handling
 
@@ -187,7 +187,7 @@ teaching the operator, and widens a DNS-rebinding allowlist without consent. Rej
 guidance message gives the same end state (the operator writes the portless form) with an explicit
 decision.
 
-[NEEDS CLARIFICATION: is any supported deployment known to send an explicit `:80` or `:443` in `Host` to a plain HTTP listener and rely on the pin to exclude other ports on the same host? If so, option A removes the only way to express that, and the answer would be to list the host portless; confirm that is acceptable.]
+Resolved: option A. A client that sends an explicit `:80` or `:443` in `Host` is accepted as a loss; list the host without a port.
 
 ## 9. Agent Boundaries
 
@@ -211,10 +211,7 @@ decision.
 
 ## 10. Open Questions
 
-- [NEEDS CLARIFICATION: issue number and PR link for `CHANGELOG.md` and the MOC row]
-- [NEEDS CLARIFICATION: accessor return type, see section 5]
-- [NEEDS CLARIFICATION: explicit-default-port clients, see section 8]
-- [NEEDS CLARIFICATION: after this lands, mcp/012 FR-011, its edge-case rows and the "never pin" wording should point here; amend 012 in the same PR or leave it as history]
+None. mcp/012 now points here from its edge-case row.
 
 ## 11. See Also
 

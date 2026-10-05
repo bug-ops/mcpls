@@ -18,7 +18,9 @@ use mcpls_core::bridge::{
     ClientPath, IndexingState, NotificationCache, Position, Translator, WorkspaceRoots,
     apply_lifecycle_notification,
 };
-use mcpls_core::config::{LspServerConfig, ServerId, ToolRouter};
+use mcpls_core::config::{
+    LanguageId, LspServerConfig, PositionEncodings, ServerId, TimeoutSecs, ToolRouter,
+};
 use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -84,7 +86,7 @@ fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
         .with_extensions(extension_map)
         .with_router(ToolRouter::catch_all([(
             ServerId::from("rust"),
-            "rust".to_string(),
+            LanguageId::from_static("rust"),
         )]));
     translator.set_workspace_roots(WorkspaceRoots::from_configured(&[workspace_path]).unwrap());
     translator.register_server_complete(server);
@@ -97,15 +99,15 @@ async fn spawn_rust_analyzer() -> LspServer {
     let workspace_path = rust_workspace_path();
 
     let lsp_config = LspServerConfig {
-        language_id: "rust".to_string(),
+        language_id: LanguageId::from_static("rust"),
         command: "rust-analyzer".to_string(),
         args: vec![],
         env: std::collections::HashMap::new(),
         file_patterns: vec!["**/*.rs".to_string()],
         initialization_options: None,
         settings: None,
-        timeout_seconds: 30,
-        request_timeout_seconds: 30,
+        timeout_seconds: TimeoutSecs::new(30).unwrap(),
+        request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
         heuristics: None,
         name: None,
         handles: None,
@@ -116,7 +118,7 @@ async fn spawn_rust_analyzer() -> LspServer {
         server_config: lsp_config,
         workspace_roots: vec![workspace_path.clone()],
         initialization_options: None,
-        position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+        position_encodings: PositionEncodings::DEFAULT,
         redactions: std::sync::Arc::default(),
     };
 
@@ -1073,15 +1075,15 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
 
     let workspace_path = rust_workspace_path();
     let lsp_config = LspServerConfig {
-        language_id: "rust".to_string(),
+        language_id: LanguageId::from_static("rust"),
         command: "rust-analyzer".to_string(),
         args: vec![],
         env: std::collections::HashMap::new(),
         file_patterns: vec!["**/*.rs".to_string()],
         initialization_options: None,
         settings: None,
-        timeout_seconds: 30,
-        request_timeout_seconds: 30,
+        timeout_seconds: TimeoutSecs::new(30).unwrap(),
+        request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
         heuristics: None,
         name: None,
         handles: None,
@@ -1092,7 +1094,7 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         server_config: lsp_config,
         workspace_roots: vec![workspace_path],
         initialization_options: None,
-        position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+        position_encodings: PositionEncodings::DEFAULT,
         redactions: std::sync::Arc::default(),
     };
 

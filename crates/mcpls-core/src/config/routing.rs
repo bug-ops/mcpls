@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::language_id::LanguageId;
 use super::server::LspServerConfig;
 use crate::error::{Error, Result};
 
@@ -49,6 +50,12 @@ impl std::fmt::Display for ServerId {
 impl From<String> for ServerId {
     fn from(id: String) -> Self {
         Self(id)
+    }
+}
+
+impl From<LanguageId> for ServerId {
+    fn from(id: LanguageId) -> Self {
+        Self(id.into())
     }
 }
 
@@ -240,9 +247,9 @@ pub enum NoServerReason {
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::config::{ServerId, ServerSettlement, ToolKind, ToolRouter};
+/// use mcpls_core::config::{LanguageId, ServerId, ServerSettlement, ToolKind, ToolRouter};
 ///
-/// let mut router = ToolRouter::catch_all([(ServerId::from("pyright"), "python".to_string())]);
+/// let mut router = ToolRouter::catch_all([(ServerId::from("pyright"), LanguageId::from_static("python"))]);
 /// router.rebind(|_| ServerSettlement::Failed);
 /// assert!(router.resolve("python", ToolKind::Hover).is_none());
 /// ```
@@ -264,7 +271,7 @@ pub enum ServerSettlement {
 /// route ever points at a server known to have failed to spawn.
 #[derive(Debug, Default, Clone)]
 pub struct ToolRouter {
-    by_language: HashMap<String, LanguageRoutes>,
+    by_language: HashMap<LanguageId, LanguageRoutes>,
     /// Config declaration order, used by `resolve_any` for a deterministic
     /// choice among candidates. Pruned to non-failed servers by `rebind`.
     order: Vec<ServerId>,
@@ -293,7 +300,7 @@ impl ToolRouter {
     where
         I: IntoIterator<Item = &'a LspServerConfig>,
     {
-        let mut by_language: HashMap<String, LanguageRoutes> = HashMap::new();
+        let mut by_language: HashMap<LanguageId, LanguageRoutes> = HashMap::new();
         let mut order: Vec<ServerId> = Vec::new();
         let mut seen_ids: HashMap<ServerId, String> = HashMap::new();
 
@@ -371,9 +378,9 @@ impl ToolRouter {
     #[must_use]
     pub fn catch_all<I>(entries: I) -> Self
     where
-        I: IntoIterator<Item = (ServerId, String)>,
+        I: IntoIterator<Item = (ServerId, LanguageId)>,
     {
-        let mut by_language: HashMap<String, LanguageRoutes> = HashMap::new();
+        let mut by_language: HashMap<LanguageId, LanguageRoutes> = HashMap::new();
         let mut order = Vec::new();
         for (id, language) in entries {
             order.push(id.clone());
@@ -453,8 +460,8 @@ impl ToolRouter {
     /// The configured languages with a route (explicit or catch-all) naming
     /// `id`, sorted.
     #[must_use]
-    pub fn languages_routed_to(&self, id: &ServerId) -> Vec<String> {
-        let mut languages: Vec<String> = self
+    pub fn languages_routed_to(&self, id: &ServerId) -> Vec<LanguageId> {
+        let mut languages: Vec<LanguageId> = self
             .by_language
             .iter()
             .filter(|(_, routes)| {
@@ -551,17 +558,17 @@ impl ToolRouter {
     /// # Examples
     ///
     /// ```
-    /// use mcpls_core::config::{ServerId, ToolRouter};
+    /// use mcpls_core::config::{LanguageId, ServerId, ToolRouter};
     ///
     /// let router = ToolRouter::catch_all([
-    ///     (ServerId::from("pyright"), "python".to_string()),
-    ///     (ServerId::from("rust-analyzer"), "rust".to_string()),
+    ///     (ServerId::from("pyright"), LanguageId::from_static("python")),
+    ///     (ServerId::from("rust-analyzer"), LanguageId::from_static("rust")),
     /// ]);
     /// assert_eq!(router.configured_languages(), ["python", "rust"]);
     /// ```
     #[must_use]
-    pub fn configured_languages(&self) -> Vec<String> {
-        let mut languages: Vec<String> = self.by_language.keys().cloned().collect();
+    pub fn configured_languages(&self) -> Vec<LanguageId> {
+        let mut languages: Vec<LanguageId> = self.by_language.keys().cloned().collect();
         languages.sort_unstable();
         languages
     }
@@ -573,6 +580,7 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::config::TimeoutSecs;
 
     fn cfg(
         language_id: &str,
@@ -580,15 +588,15 @@ mod tests {
         handles: Option<Vec<ToolKind>>,
     ) -> LspServerConfig {
         LspServerConfig {
-            language_id: language_id.to_string(),
+            language_id: LanguageId::new(language_id).unwrap(),
             command: "cmd".to_string(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
-            timeout_seconds: 30,
-            request_timeout_seconds: 30,
+            timeout_seconds: TimeoutSecs::new(30).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
             name: name.map(str::to_string),
             handles,
@@ -672,30 +680,30 @@ mod tests {
         // entries"). The message must let a user tell the two entries apart.
         let configs = vec![
             LspServerConfig {
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 command: "rust-analyzer".to_string(),
                 args: vec![],
                 env: HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
             },
             LspServerConfig {
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 command: "rust-analyzer".to_string(),
                 args: vec!["--dummy-second-instance".to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 30,
-                request_timeout_seconds: 30,
+                timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
                 name: None,
                 handles: None,
@@ -934,8 +942,11 @@ mod tests {
     #[test]
     fn test_catch_all_helper_registers_two_entries() {
         let router = ToolRouter::catch_all([
-            (ServerId::from("ts"), "typescript".to_string()),
-            (ServerId::from("tsx"), "typescriptreact".to_string()),
+            (ServerId::from("ts"), LanguageId::from_static("typescript")),
+            (
+                ServerId::from("tsx"),
+                LanguageId::from_static("typescriptreact"),
+            ),
         ]);
         assert_eq!(
             router.resolve("typescript", ToolKind::Hover),

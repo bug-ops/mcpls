@@ -297,8 +297,9 @@ impl HttpConfig {
     /// Accept requests whose `Host` is one of `hosts` in addition to the
     /// loopback names and the bound IP literal.
     ///
-    /// Clients and proxies omit the default port from `Host`, so never pin
-    /// `:80` or `:443`: list the host without a port, which matches any port.
+    /// Clients and proxies omit the default port from `Host`, so a pin to
+    /// `:80` or `:443` is rejected when the [`AllowedHost`] is parsed: list the
+    /// host without a port, which matches any port.
     ///
     /// # Examples
     ///
@@ -861,6 +862,7 @@ impl AuthorityPort {
 ///
 /// assert_eq!("*".parse::<AllowedHost>(), Err(InvalidAllowedHost::Wildcard));
 /// assert_eq!("example.com:".parse::<AllowedHost>(), Err(InvalidAllowedHost::InvalidPort));
+/// assert_eq!("example.com:443".parse::<AllowedHost>(), Err(InvalidAllowedHost::DefaultPort));
 /// ```
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
@@ -880,9 +882,16 @@ pub enum InvalidAllowedHost {
     /// The host is empty.
     #[error("the host is missing")]
     MissingHost,
-    /// The port is empty (`host:`) or is not a number up to 65535.
-    #[error("the port must be a number up to 65535")]
+    /// The port is empty (`host:`), `0`, or is not a number up to 65535.
+    #[error("the port must be a number from 1 to 65535")]
     InvalidPort,
+    /// The port is `80` or `443`. Clients and proxies omit these from `Host`,
+    /// so a pin to one would answer `403` to nearly every client.
+    #[error(
+        "ports 80 and 443 are omitted from `Host` by clients, so the pin would never match; \
+         list the host without a port"
+    )]
+    DefaultPort,
     /// The string has a non-ASCII character; `Host` carries the punycode
     /// (`xn--`) form of an internationalized name.
     #[error("only ASCII is allowed; write an internationalized name in punycode (`xn--...`)")]
@@ -892,6 +901,30 @@ pub enum InvalidAllowedHost {
     /// are different hosts; list the form clients send, without the dot.
     #[error("a trailing dot is not allowed; list the name without it")]
     TrailingDot,
+}
+
+/// A port an [`AllowedHost`] can be pinned to: 1 to 65535, never `80` or `443`.
+///
+/// Clients and proxies omit the default ports from `Host`, and `0` never
+/// appears in it, so none of the three can match a request.
+#[cfg(feature = "transport-http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinnedPort(std::num::NonZeroU16);
+
+#[cfg(feature = "transport-http")]
+impl PinnedPort {
+    fn new(port: u16) -> Result<Self, InvalidAllowedHost> {
+        match port {
+            80 | 443 => Err(InvalidAllowedHost::DefaultPort),
+            _ => std::num::NonZeroU16::new(port)
+                .map(Self)
+                .ok_or(InvalidAllowedHost::InvalidPort),
+        }
+    }
+
+    const fn get(self) -> u16 {
+        self.0.get()
+    }
 }
 
 /// A `Host` header value allowed to reach the HTTP transport, validated so it
@@ -905,7 +938,8 @@ pub enum InvalidAllowedHost {
 /// (use punycode) are rejected rather than normalized. Without a port, any
 /// port matches; with one, only that port does, and a request that omits the
 /// port (clients and proxies omit `:80` and `:443`) does not match, so list
-/// the host without a port unless a non-default port is really meant.
+/// the host without a port unless a non-default port is really meant. A pin to
+/// `80`, `443` or `0` is therefore rejected at parse time.
 /// Surrounding whitespace is ignored.
 ///
 /// # Examples
@@ -921,13 +955,14 @@ pub enum InvalidAllowedHost {
 /// assert_eq!(pinned.to_string(), "[::1]:8080");
 /// assert_eq!(pinned.port(), Some(8080));
 /// assert!("https://example.com".parse::<AllowedHost>().is_err());
+/// assert!("example.com:443".parse::<AllowedHost>().is_err());
 /// ```
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowedHost {
     host: Box<str>,
-    port: Option<u16>,
+    port: Option<PinnedPort>,
 }
 
 #[cfg(feature = "transport-http")]
@@ -956,10 +991,11 @@ impl AllowedHost {
         &self.host
     }
 
-    /// The port the host is pinned to, or `None` for any port.
+    /// The port the host is pinned to, or `None` for any port. Never `0`,
+    /// `80` or `443`.
     #[must_use]
-    pub const fn port(&self) -> Option<u16> {
-        self.port
+    pub fn port(&self) -> Option<u16> {
+        self.port.map(PinnedPort::get)
     }
 
     /// An IP literal on any port: a client reaching a `:80` or `:443` bind
@@ -979,7 +1015,7 @@ impl AllowedHost {
 #[cfg(feature = "transport-http")]
 impl std::fmt::Display for AllowedHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.port {
+        match self.port() {
             Some(port) => write!(f, "{}:{port}", self.host),
             None => f.write_str(&self.host),
         }
@@ -1014,7 +1050,7 @@ impl std::str::FromStr for AllowedHost {
         let port = match AuthorityPort::of(&authority).ok_or(InvalidAllowedHost::InvalidPort)? {
             AuthorityPort::Absent => None,
             AuthorityPort::Empty => return Err(InvalidAllowedHost::InvalidPort),
-            AuthorityPort::Number(port) => Some(port),
+            AuthorityPort::Number(port) => Some(PinnedPort::new(port)?),
         };
         Ok(Self {
             host: host.to_ascii_lowercase().into(),
@@ -2758,6 +2794,7 @@ mod tests {
             SessionManager as _, StreamLiveness, Transport, run_idle_reaper,
         };
         use crate::bridge::WorkspaceRoots;
+        use crate::config::LanguageId;
         use crate::test_lsp::CapturedLogs;
 
         #[test]
@@ -3870,7 +3907,7 @@ mod tests {
                 ("example.com", "example.com", None),
                 ("Example.COM:8080", "example.com:8080", Some(8080)),
                 ("[::1]", "[::1]", None),
-                ("[2001:DB8::1]:443", "[2001:db8::1]:443", Some(443)),
+                ("[2001:DB8::1]:8443", "[2001:db8::1]:8443", Some(8443)),
                 ("127.0.0.1:3000", "127.0.0.1:3000", Some(3000)),
                 ("  a.example  ", "a.example", None),
             ] {
@@ -3909,6 +3946,65 @@ mod tests {
                     "{input:?}"
                 );
             }
+        }
+
+        #[test]
+        fn test_allowed_host_rejects_default_and_zero_ports_on_the_parsed_value() {
+            use crate::InvalidAllowedHost as Invalid;
+
+            for (input, expected) in [
+                ("x.example:80", Invalid::DefaultPort),
+                ("x.example:443", Invalid::DefaultPort),
+                ("[::1]:443", Invalid::DefaultPort),
+                ("[2001:db8::1]:80", Invalid::DefaultPort),
+                ("1.2.3.4:80", Invalid::DefaultPort),
+                ("localhost:443", Invalid::DefaultPort),
+                ("X.EXAMPLE:443", Invalid::DefaultPort),
+                ("  x.example:443  ", Invalid::DefaultPort),
+                ("x.example:0443", Invalid::DefaultPort),
+                ("x.example:080", Invalid::DefaultPort),
+                ("x.example:000080", Invalid::DefaultPort),
+                ("x.example:0", Invalid::InvalidPort),
+                ("x.example:00", Invalid::InvalidPort),
+                ("x.example:65536", Invalid::InvalidPort),
+                ("x.example:", Invalid::InvalidPort),
+                (":443", Invalid::MissingHost),
+                ("*.example:443", Invalid::Wildcard),
+                ("u@x.example:443", Invalid::UserInfo),
+                ("::1:443", Invalid::Malformed),
+                ("[::1:443", Invalid::Malformed),
+            ] {
+                assert_eq!(
+                    input.parse::<crate::AllowedHost>(),
+                    Err(expected),
+                    "{input:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_allowed_host_accepts_every_other_port_unchanged() {
+            for input in [
+                "x.example",
+                "x.example:8443",
+                "x.example:81",
+                "x.example:442",
+                "x.example:1",
+                "x.example:65535",
+                "[::1]:8080",
+            ] {
+                let host: crate::AllowedHost = input.parse().unwrap();
+                assert_eq!(host.to_string(), input, "{input}");
+            }
+        }
+
+        #[test]
+        fn test_default_port_error_carries_the_guidance() {
+            let message = crate::InvalidAllowedHost::DefaultPort.to_string();
+            assert!(
+                message.contains("list the host without a port"),
+                "{message}"
+            );
         }
 
         #[test]
@@ -4947,7 +5043,7 @@ mod tests {
                 .with_extensions(crate::test_lsp::test_extensions())
                 .with_router(ToolRouter::catch_all([(
                     ServerId::from("rust"),
-                    "rust".to_string(),
+                    LanguageId::from_static("rust"),
                 )]));
             translator.set_workspace_roots(roots.clone());
             let (client, fake_lsp) = crate::test_lsp::fake_lsp_client();
