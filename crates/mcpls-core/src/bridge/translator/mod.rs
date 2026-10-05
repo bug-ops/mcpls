@@ -8,21 +8,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use tokio::sync::Mutex;
 
 use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
-use self::respawn::RespawnBackoff;
-use self::restart::RestartGeneration;
+use self::servers::{Backend, Phase, Servers};
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots, lock_std};
 use crate::config::{ServerId, ServerSettlement, ToolKind, ToolRouter};
 use crate::error::{ServerSpawnFailure, StartupFailure};
-use crate::lsp::{LspClient, LspServer, ServerInitConfig};
+use crate::lsp::{LspServer, ServerInitConfig};
 use crate::redaction::Redactions;
 
 mod addressing;
@@ -48,6 +46,7 @@ mod prepare_range_tests;
 mod respawn;
 mod restart;
 mod routing;
+mod servers;
 mod support;
 mod symbols;
 #[cfg(test)]
@@ -90,11 +89,12 @@ pub use symbols::parse_symbol_kind;
 /// `textDocument/didOpen`/`didChange` notify.
 #[derive(Debug)]
 pub struct Translator {
-    /// LSP clients indexed by routing identity. Locked only for the map
-    /// lookup/insert itself, never across an LSP request.
-    lsp_clients: Arc<StdMutex<HashMap<ServerId, LspClient>>>,
-    /// LSP servers indexed by routing identity (held for lifetime management).
-    lsp_servers: Arc<StdMutex<HashMap<ServerId, LspServer>>>,
+    /// Per-server state, one slot per routing identity. Locked only for a
+    /// short synchronous section, never across an LSP request, and never
+    /// together with `router`.
+    servers: StdMutex<Servers>,
+    /// The translator-wide lifecycle.
+    phase: StdMutex<Phase>,
     /// Union of the live clients' redaction sets, rebuilt on change.
     merged_redactions: StdMutex<Option<MergedRedactions>>,
     /// Document state tracker. Locks its own state internally, per path.
@@ -111,10 +111,6 @@ pub struct Translator {
     /// Custom file extension to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
     extension_map: Arc<HashMap<String, String>>,
-    /// Servers that are configured + applicable but may not have finished
-    /// initializing yet (background init). Used to return a clear "still
-    /// initializing" error instead of "no server configured".
-    expected_servers: Arc<StdMutex<HashSet<ServerId>>>,
     /// Per-tool routing table: resolves `(language, tool)` to a `ServerId`.
     /// Locked independently so a rebind (called from the background init task
     /// as each server settles) never contends with an in-flight LSP round
@@ -126,21 +122,6 @@ pub struct Translator {
     /// settlement, and it lets a failed lookup be traced back to the server
     /// that would have served it, to report that server's [`StartupFailure`].
     configured_router: Arc<ToolRouter>,
-    /// Why each configured server that never registered failed to start,
-    /// keyed by routing identity. Written once, when initialization settles
-    /// (see [`Self::record_startup_failures`]).
-    startup_failures: Arc<StdMutex<HashMap<ServerId, ServerSpawnFailure>>>,
-    /// Per-server single-flight lock so concurrent callers that both observe
-    /// a dead process don't race to respawn it independently -- the loser
-    /// waits for the winner's attempt to finish (success or failure) and
-    /// then re-reads whatever ended up registered. See
-    /// [`Self::respawn_if_dead`].
-    respawn_locks: Arc<StdMutex<HashMap<ServerId, Arc<Mutex<()>>>>>,
-    /// Consecutive respawn failures and last-attempt time per server, so a
-    /// crash-looping server backs off instead of eating a fresh
-    /// `timeout_seconds` on every tool call that arrives while it is down.
-    /// See [`Self::respawn_if_dead`].
-    respawn_backoffs: Arc<StdMutex<HashMap<ServerId, RespawnBackoff>>>,
     /// Diagnostics cache, shared with `serve_with`'s notification pump.
     ///
     /// `None` for a `Translator` built without [`Self::with_notification_cache`]
@@ -148,28 +129,10 @@ pub struct Translator {
     /// it to invalidate a respawned server's stale cached diagnostics --
     /// see that method's docs for why that matters.
     notification_cache: Option<Arc<Mutex<NotificationCache>>>,
-    /// `AbortHandle` of the task currently consuming each server's
-    /// notification lanes: the initial diagnostics pump, or the consumer
-    /// started by the most recent respawn or restart. Aborting the previous
-    /// one before installing a new one bounds a stale write from an earlier
-    /// generation (see [`Self::respawn_locked`]).
-    notification_tasks: Arc<StdMutex<HashMap<ServerId, tokio::task::AbortHandle>>>,
     /// How to re-start a diagnostics pump for a restarted server. Installed
     /// once initialization has registered the initial pumps; until then a
     /// manual restart reports the server as still initializing.
     wiring: OnceLock<Arc<dyn NotificationWiring>>,
-    /// Count of manual restarts per server, to coalesce requests that queued
-    /// behind another restart of the same server.
-    restart_generations: Arc<StdMutex<HashMap<ServerId, RestartGeneration>>>,
-    /// When each server's last manual restart attempt started.
-    restart_attempts: Arc<StdMutex<HashMap<ServerId, std::time::Instant>>>,
-    /// Set once shutdown has begun; a restart then declines to start a server.
-    shutting_down: AtomicBool,
-    /// Set while the initial servers are still settling; see [`Translator::begin_startup`].
-    startup_settling: AtomicBool,
-    /// Set when the background init task panicked, so a restart that finds no
-    /// notification wiring knows none will ever be installed.
-    init_panicked: AtomicBool,
     /// Time source for respawn-backoff bookkeeping ([`respawn`](self::respawn)).
     /// Always [`SystemClock`] in production; overridden via
     /// [`Self::with_clock`] in tests so backoff-window tests can advance
@@ -195,8 +158,8 @@ impl Translator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            lsp_clients: Arc::new(StdMutex::new(HashMap::new())),
-            lsp_servers: Arc::new(StdMutex::new(HashMap::new())),
+            servers: StdMutex::new(Servers::default()),
+            phase: StdMutex::new(Phase::default()),
             merged_redactions: StdMutex::new(None),
             document_tracker: Arc::new(DocumentTracker::new(
                 ResourceLimits::default(),
@@ -205,20 +168,10 @@ impl Translator {
             resource_limits: ResourceLimits::default(),
             workspace_roots: WorkspaceRoots::default(),
             extension_map: Arc::new(HashMap::new()),
-            expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(Arc::new(ToolRouter::default()))),
             configured_router: Arc::new(ToolRouter::default()),
-            startup_failures: Arc::new(StdMutex::new(HashMap::new())),
-            respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
-            respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
-            notification_tasks: Arc::new(StdMutex::new(HashMap::new())),
             wiring: OnceLock::new(),
-            restart_generations: Arc::new(StdMutex::new(HashMap::new())),
-            restart_attempts: Arc::new(StdMutex::new(HashMap::new())),
-            shutting_down: AtomicBool::new(false),
-            startup_settling: AtomicBool::new(false),
-            init_panicked: AtomicBool::new(false),
             clock: Arc::new(SystemClock),
             indexing_ready_timeout: navigation::INDEXING_READY_TIMEOUT,
         }
@@ -277,13 +230,17 @@ impl Translator {
 
     /// Mark the set of servers that are expected (configured + applicable)
     /// but may still be initializing in the background.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public API: callers hand over the set they built"
+    )]
     pub fn set_expected_servers(&self, servers: HashSet<ServerId>) {
-        *lock_std(&self.expected_servers) = servers;
+        lock_std(&self.servers).set_expected(&servers);
     }
 
     /// Clear the expected-servers set (e.g. after background init failed).
     pub fn clear_expected_servers(&self) {
-        lock_std(&self.expected_servers).clear();
+        lock_std(&self.servers).clear_expected();
     }
 
     /// Install the per-tool routing table built from the applicable configs.
@@ -300,24 +257,24 @@ impl Translator {
 
     /// Remember why each of `failures` never registered, so later tool calls
     /// can report it instead of a generic "no server configured".
+    ///
+    /// A server that is already running keeps running: its failure is stale.
+    #[cfg(test)]
     pub(crate) fn record_startup_failures(&self, failures: &[ServerSpawnFailure]) {
-        lock_std(&self.startup_failures).extend(
-            failures
-                .iter()
-                .map(|failure| (failure.server_id.clone(), failure.clone())),
-        );
+        let mut servers = lock_std(&self.servers);
+        for failure in failures {
+            servers.record_failure(failure);
+        }
     }
 
     /// The recorded startup failure of the server `id`, if it failed to start.
     pub(crate) fn startup_failure(&self, id: &ServerId) -> Option<ServerSpawnFailure> {
-        lock_std(&self.startup_failures).get(id).cloned()
+        lock_std(&self.servers).failure(id).cloned()
     }
 
     /// Every recorded startup failure, ordered by routing identity.
     pub(crate) fn startup_failures(&self) -> Vec<ServerSpawnFailure> {
-        let mut failures: Vec<_> = lock_std(&self.startup_failures).values().cloned().collect();
-        failures.sort_by(|a, b| a.server_id.as_str().cmp(b.server_id.as_str()));
-        failures
+        lock_std(&self.servers).failures()
     }
 
     /// Settle the translator after the background init task panicked.
@@ -330,27 +287,24 @@ impl Translator {
     /// pumps of registered servers died with the task, so those servers are
     /// marked push-degraded and their indexing state is reset.
     pub(crate) async fn settle_after_init_panic(&self, configs: &[ServerInitConfig]) {
-        self.init_panicked
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let registered: HashSet<ServerId> = lock_std(&self.lsp_clients).keys().cloned().collect();
-        {
-            let mut failures = lock_std(&self.startup_failures);
-            for config in configs {
+        lock_std(&self.phase).init_panicked();
+        let registered: HashSet<ServerId> = {
+            let mut servers = lock_std(&self.servers);
+            servers.fail_unsettled(configs.iter().map(|config| {
                 let server_config = &config.server_config;
-                let id = server_config.id();
-                if registered.contains(&id) {
-                    continue;
+                ServerSpawnFailure {
+                    server_id: server_config.id(),
+                    language_id: server_config.language_id.clone(),
+                    command: server_config.command.clone(),
+                    reason: StartupFailure::InitTaskPanicked,
                 }
-                failures
-                    .entry(id.clone())
-                    .or_insert_with(|| ServerSpawnFailure {
-                        server_id: id,
-                        language_id: server_config.language_id.clone(),
-                        command: server_config.command.clone(),
-                        reason: StartupFailure::InitTaskPanicked,
-                    });
-            }
-        }
+            }));
+            servers
+                .ids()
+                .filter(|id| servers.client(id).is_some())
+                .cloned()
+                .collect()
+        };
         self.rebind_router_to_settled();
         self.clear_expected_servers();
 
@@ -382,16 +336,12 @@ impl Translator {
     /// still `Pending` and keep their routes. A pure function of that state,
     /// so it does not matter in which order servers settled.
     pub(crate) fn rebind_router_to_settled(&self) {
-        let registered: HashSet<ServerId> = lock_std(&self.lsp_clients).keys().cloned().collect();
-        let failed: HashSet<ServerId> = lock_std(&self.startup_failures).keys().cloned().collect();
+        let settlements = lock_std(&self.servers).settlements();
         self.install_router(|id| {
-            if registered.contains(id) {
-                ServerSettlement::Registered
-            } else if failed.contains(id) {
-                ServerSettlement::Failed
-            } else {
-                ServerSettlement::Pending
-            }
+            settlements
+                .get(id)
+                .copied()
+                .unwrap_or(ServerSettlement::Pending)
         });
     }
 
@@ -401,30 +351,33 @@ impl Translator {
         *lock_std(&self.router) = Arc::new(router);
     }
 
-    /// Registers the client then the server, re-derives routes, then clears the
-    /// expected id; that order keeps the snapshot's reads consistent.
+    /// The routing table as of now. The `router` lock is released before it
+    /// returns, so callers can then lock `servers` without holding both.
+    pub(super) fn router_snapshot(&self) -> Arc<ToolRouter> {
+        Arc::clone(&lock_std(&self.router))
+    }
+
+    /// Registers the server in one step, then re-derives routes.
     pub(crate) fn settle_started(&self, server: LspServer) -> (ServerId, String) {
         let id = server.init_config().server_config.id();
         let language = server.client().language_id().to_string();
-        self.register_server_complete(server);
+        let was_expected = lock_std(&self.servers).register(id.clone(), Backend::Process(server));
+        if !was_expected {
+            tracing::error!("LSP server '{id}' settled twice or was never expected");
+        }
         self.rebind_router_to_settled();
-        self.remove_settled_expected(&id);
         (id, language)
     }
 
-    /// As [`Self::settle_started`], with the failure recorded first.
+    /// As [`Self::settle_started`], with the failure recorded.
     pub(crate) fn settle_failed(&self, failure: &ServerSpawnFailure) {
         let id = failure.server_id.clone();
-        self.record_startup_failures(std::slice::from_ref(failure));
-        self.rebind_router_to_settled();
-        self.warn_failed_routes(&id);
-        self.remove_settled_expected(&id);
-    }
-
-    fn remove_settled_expected(&self, id: &ServerId) {
-        if !lock_std(&self.expected_servers).remove(id) {
+        let was_expected = lock_std(&self.servers).record_failure(failure);
+        if !was_expected {
             tracing::error!("LSP server '{id}' settled twice or was never expected");
         }
+        self.rebind_router_to_settled();
+        self.warn_failed_routes(&id);
     }
 
     /// Logs which languages lost a route to the failed server `id` and what
@@ -437,7 +390,7 @@ impl Translator {
                 let state = match self.configured_router.catch_all_for(language) {
                     None => "no catch-all".to_string(),
                     Some(catch_all) if catch_all == id => "it was the catch-all".to_string(),
-                    Some(catch_all) if lock_std(&self.lsp_clients).contains_key(catch_all) => {
+                    Some(catch_all) if lock_std(&self.servers).client(catch_all).is_some() => {
                         format!("catch-all '{catch_all}' registered")
                     }
                     Some(catch_all) if self.startup_failure(catch_all).is_some() => {
@@ -475,8 +428,8 @@ impl Translator {
     /// default, which exists only for `PositionEncoding`'s own internal use.
     #[must_use]
     pub(crate) fn position_encoding_for(&self, server_id: &ServerId) -> PositionEncoding {
-        lock_std(&self.lsp_servers)
-            .get(server_id)
+        lock_std(&self.servers)
+            .server(server_id)
             .and_then(|server| PositionEncoding::from_lsp(server.position_encoding().as_str()))
             .unwrap_or(PositionEncoding::Utf16)
     }
@@ -540,24 +493,20 @@ impl Translator {
         self
     }
 
-    /// Register an LSP client under its routing identity.
-    ///
-    /// Used by [`Self::register_server_complete`] during initial background
-    /// init, and directly by tests. The respawn path does not reuse this method: it
-    /// needs the previous client back (to fail its pending requests) and
-    /// must also reset `document_tracker` for the swapped-in server, neither
-    /// of which this method does.
-    pub(crate) fn register_client(&self, id: impl Into<ServerId>, client: LspClient) {
-        lock_std(&self.lsp_clients).insert(id.into(), client);
+    /// Test-only: register a bare LSP client under its routing identity, next
+    /// to the server already registered for it, if any.
+    #[cfg(test)]
+    pub(crate) fn register_client(&self, id: impl Into<ServerId>, client: crate::lsp::LspClient) {
+        lock_std(&self.servers).register_test_client(id.into(), client);
     }
 
     /// The secrets of every live server's client, for hiding them in tool
     /// results. The merged set is rebuilt only when the set of client
     /// redaction sets changes (registration, restart, respawn), outside the
-    /// `lsp_clients` lock.
+    /// `servers` lock.
     pub(crate) fn server_text_redactions(&self) -> Arc<Redactions> {
-        let sources: Vec<Arc<Redactions>> = lock_std(&self.lsp_clients)
-            .values()
+        let sources: Vec<Arc<Redactions>> = lock_std(&self.servers)
+            .clients()
             .map(|client| Arc::clone(client.redactions()))
             .filter(|set| !set.is_empty())
             .collect();
@@ -576,13 +525,14 @@ impl Translator {
         merged
     }
 
-    /// Register an LSP server under its routing identity.
+    /// Test-only: register a bare LSP server under its routing identity, next
+    /// to the client already registered for it, if any.
+    #[cfg(test)]
     pub(crate) fn register_server(&self, id: impl Into<ServerId>, server: LspServer) {
-        lock_std(&self.lsp_servers).insert(id.into(), server);
+        lock_std(&self.servers).register_test_server(id.into(), server);
     }
 
-    /// Register a spawned server in every map that needs it: its routing
-    /// client and the server itself.
+    /// Register a spawned server under its routing identity, in one step.
     ///
     /// The routing identity and client are both derived from `server`
     /// itself, so they cannot be registered out of sync. The server also owns
@@ -600,20 +550,19 @@ impl Translator {
     /// ```
     pub fn register_server_complete(&self, server: LspServer) {
         let id = server.init_config().server_config.id();
-        self.register_client(id.clone(), server.client().clone());
-        self.register_server(id, server);
+        lock_std(&self.servers).register(id, Backend::Process(server));
     }
 
     /// Number of currently registered LSP servers.
     ///
-    /// Test-only: `lsp_servers` is private, so this is the one way a test
+    /// Test-only: the server slots are private, so this is the one way a test
     /// outside this module (e.g. `crate::tests`, exercising
     /// [`Translator::shutdown_servers`] indirectly through `serve_with`'s
     /// shutdown sequence) can observe that a registered server was actually
     /// drained.
     #[cfg(test)]
     pub(crate) fn registered_server_count(&self) -> usize {
-        lock_std(&self.lsp_servers).len()
+        lock_std(&self.servers).running_servers().count()
     }
 
     /// Snapshot of currently open document paths, used for MCP resource listing.
@@ -665,12 +614,12 @@ impl Translator {
     /// `pub(crate)` rather than `pub`: this is meant for exactly one call
     /// site (`serve_with`'s post-transport shutdown sequence), after the MCP
     /// transport is already down. An external caller invoking it mid-session
-    /// would drain `lsp_servers` while `lsp_clients` (routing table) still
+    /// would stop the servers while their slots (routing table) still
     /// points at the now-shut-down servers, so in-flight tool calls would
     /// resolve to a client whose server is gone.
     pub(crate) async fn shutdown_servers(&self) {
         self.begin_shutdown();
-        let servers: Vec<(ServerId, LspServer)> = lock_std(&self.lsp_servers).drain().collect();
+        let servers: Vec<(ServerId, LspServer)> = lock_std(&self.servers).drain_servers();
         if servers.is_empty() {
             return;
         }
@@ -814,8 +763,10 @@ mod tests {
         let id = config.id();
         translator.register_server_complete(crate::lsp::fake_lsp_server_with_config(config));
 
-        assert!(lock_std(&translator.lsp_clients).contains_key(&id));
-        assert!(lock_std(&translator.lsp_servers).contains_key(&id));
+        let servers = lock_std(&translator.servers);
+        assert!(servers.client(&id).is_some());
+        assert!(servers.server(&id).is_some());
+        drop(servers);
     }
 
     fn named_config(
@@ -922,7 +873,7 @@ mod tests {
                     .filter(|id| !registered.contains(id))
                     .collect();
                 assert_eq!(failed, expected_failed);
-                assert!(lock_std(&translator.expected_servers).is_empty());
+                assert!(!lock_std(&translator.servers).any_expected());
             }
         }
     }
@@ -1119,8 +1070,7 @@ mod tests {
     fn test_translator_new() {
         let translator = Translator::new();
         assert!(translator.workspace_roots.is_empty());
-        assert_eq!(lock_std(&translator.lsp_clients).len(), 0);
-        assert_eq!(lock_std(&translator.lsp_servers).len(), 0);
+        assert_eq!(translator.registered_server_count(), 0);
     }
 
     #[test]
@@ -1136,7 +1086,7 @@ mod tests {
         let translator = Translator::new();
 
         // Initial state: no servers registered
-        assert_eq!(lock_std(&translator.lsp_servers).len(), 0);
+        assert_eq!(translator.registered_server_count(), 0);
 
         // The register_server method exists and is callable
         // Full integration testing with real LspServer is done in integration tests
@@ -1175,7 +1125,7 @@ mod tests {
         let translator = Translator::new();
         translator.register_server("server-a", crate::lsp::fake_lsp_server());
         translator.register_server("server-b", crate::lsp::fake_lsp_server());
-        assert_eq!(lock_std(&translator.lsp_servers).len(), 2);
+        assert_eq!(translator.registered_server_count(), 2);
 
         // Bounded well above `lsp::SHUTDOWN_TIMEOUT` (10s) so a genuine
         // regression (a hang) still fails the test instead of the harness
@@ -1188,7 +1138,7 @@ mod tests {
             "shutdown_servers must not hang against non-responsive mock servers"
         );
         assert_eq!(
-            lock_std(&translator.lsp_servers).len(),
+            translator.registered_server_count(),
             0,
             "all registered servers must be drained"
         );

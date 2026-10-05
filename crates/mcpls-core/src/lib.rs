@@ -1193,8 +1193,7 @@ impl StartupSettler<'_> {
             pinned_tsserver,
             self.pump_shared.clone(),
         ));
-        self.translator
-            .set_notification_task(id.clone(), pump.clone());
+        self.translator.set_notification_task(&id, pump.clone());
         drop(serialized);
         self.pump_servers.insert(pump.id(), id.clone());
         self.tally.registered = self.tally.registered.saturating_add(1);

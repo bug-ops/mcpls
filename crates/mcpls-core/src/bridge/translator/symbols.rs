@@ -288,16 +288,17 @@ impl Translator {
         // rather than a per-language route. If the resolved server is not
         // registered yet but is expected, tell the caller to wait and retry
         // rather than implying nothing is configured.
-        let server_id = match lookup_workspace_route(
-            || {
-                lock_std(&self.router)
-                    .resolve_any(ToolKind::WorkspaceSymbols)
-                    .cloned()
-            },
-            |id| lock_std(&self.lsp_clients).contains_key(id),
-            |id| lock_std(&self.expected_servers).contains(id),
-            || lock_std(&self.expected_servers).is_empty(),
-        ) {
+        let router = self.router_snapshot();
+        let lookup = {
+            let servers = lock_std(&self.servers);
+            lookup_workspace_route(
+                || router.resolve_any(ToolKind::WorkspaceSymbols).cloned(),
+                |id| servers.client(id).is_some(),
+                |id| servers.is_expected(id),
+                || !servers.any_expected(),
+            )
+        };
+        let server_id = match lookup {
             WorkspaceRouteLookup::Registered(id) => id,
             WorkspaceRouteLookup::Initializing(server_id) => {
                 return Err(Error::ServerInitializing { server_id });
@@ -331,9 +332,12 @@ impl Translator {
             }
         };
         self.respawn_if_dead(&server_id).await?;
-        let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
+        let (client, expected) = {
+            let servers = lock_std(&self.servers);
+            (servers.client(&server_id), servers.is_expected(&server_id))
+        };
         let client = client.ok_or_else(|| {
-            if lock_std(&self.expected_servers).contains(&server_id) {
+            if expected {
                 Error::ServerInitializing {
                     server_id: server_id.clone(),
                 }
@@ -558,7 +562,7 @@ mod tests {
     /// #242/S4 regression: a server is configured and still spawning (large
     /// project load) rather than never having existed -- the router alone
     /// cannot tell these apart (both look like "nothing registered"), so
-    /// `handle_workspace_symbol` must consult `expected_servers` to report
+    /// `handle_workspace_symbol` must consult the expected servers to report
     /// "still initializing" instead of the misleading "no server configured".
     #[tokio::test]
     async fn test_handle_workspace_symbol_reports_initializing_when_expected_but_not_registered() {

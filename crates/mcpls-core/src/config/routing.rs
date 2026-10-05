@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 ///
 /// Derived from [`LspServerConfig::id`]: a server's explicit `name` if set,
 /// otherwise its `language_id`. This is the key used throughout the bridge
-/// layer (`Translator::lsp_clients`, `lsp_servers`, notification receivers)
+/// layer (the translator's server slots, notification receivers)
 /// instead of a raw language string, so two servers sharing a language no
 /// longer silently overwrite each other.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -226,7 +226,7 @@ pub enum NoServerReason {
     /// `mcpls.toml` — a server that is still initializing, or one that was
     /// configured but failed to spawn, is indistinguishable from "nothing
     /// configured" at this layer. Callers with access to the set of servers
-    /// still expected to register (e.g. `Translator::expected_servers`) can
+    /// still expected to register (e.g. an expected server slot) can
     /// tell these apart.
     NothingRegistered,
     /// At least one server is registered, but none explicitly claims the

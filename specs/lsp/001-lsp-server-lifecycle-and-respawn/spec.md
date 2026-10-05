@@ -181,6 +181,7 @@ THEN it sends `shutdown`+`exit`, waits up to a fixed grace period for the child 
 | FR-012 | THE SYSTEM SHALL perform the graceful-shutdown sequence (FR-011) even if the `shutdown`/`exit` handshake itself fails or times out — the child process must still be torn down (killed if necessary) regardless of handshake outcome | must |
 | FR-013 | WHEN an in-flight LSP request receives a `-32802` (`ServerCancelled`) response, or a `-32801` (`ContentModified`) response for a read-only/idempotent method THE SYSTEM SHALL retry it, sharing one combined attempt budget across both error codes (e.g. a request that hits `-32801` then `-32802` does not get separate budgets, only one shared one); mutating requests (rename, formatting, code actions) are excluded from the `-32801` retry allowlist | must |
 | FR-014 | WHEN a transient error (`-32802`/allowlisted `-32801`) is about to be retried THE SYSTEM SHALL log it at `warn!`, and reserve `error!` for the case where retries are exhausted and the error actually surfaces to the caller — a request that is retried and then succeeds must never log at `error!` | must |
+| FR-015 | THE translator SHALL keep each server's state (status expected, running, failed or stopped, respawn lock, backoff, restart bookkeeping, notification task) in one slot read and replaced under one lock, so a respawn swaps the running backend in one assignment and no reader sees a client next to the wrong server; a failure recorded for an expected server survives clearing the expectation (#619) | must |
 
 ## 4. Non-Functional Requirements
 

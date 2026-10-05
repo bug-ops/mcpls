@@ -7,7 +7,7 @@ use super::Translator;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
 use crate::bridge::{ClientPath, InFlightGuard, WorkspacePath, lock_std};
-use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
+use crate::config::{NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
 
@@ -530,6 +530,19 @@ pub(super) fn lookup_route<T>(
     RouteLookup::Unrouted
 }
 
+/// The catch-all of `language` if it is still expected to register, read from
+/// the same `servers` guard as the rest of the lookup.
+fn pending_catch_all(
+    router: &ToolRouter,
+    servers: &super::servers::Servers,
+    language: &str,
+) -> Option<ServerId> {
+    router
+        .catch_all_for(language)
+        .filter(|catch_all| servers.is_expected(catch_all))
+        .cloned()
+}
+
 /// Where a file's diagnostics-route server stands, as seen by the cache-only
 /// diagnostics readers.
 ///
@@ -673,10 +686,7 @@ impl Translator {
     ) -> Result<(ServerId, LspClient)> {
         let (id, client) = self.client_for_file(path, tool)?;
         self.respawn_if_dead(&id).await?;
-        let client = lock_std(&self.lsp_clients)
-            .get(&id)
-            .cloned()
-            .unwrap_or(client);
+        let client = lock_std(&self.servers).client(&id).unwrap_or(client);
         Ok((id, client))
     }
 
@@ -689,8 +699,8 @@ impl Translator {
     /// explicit `typescriptreact` server still wins over the `typescript`
     /// fallback when both are configured.
     ///
-    /// Locks `router`, `lsp_clients`, and (on the not-yet-registered path)
-    /// `expected_servers` only for their respective lookups — every guard is
+    /// Clones the router, then reads every closure's answer from one `servers`
+    /// guard (registered, expected, pending catch-all, failure) — every guard is
     /// dropped before this method returns.
     pub(super) fn client_for_file(
         &self,
@@ -698,14 +708,18 @@ impl Translator {
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient)> {
         let candidates = self.language_candidates(path);
-        let lookup = lookup_route(
-            &candidates,
-            |lang| lock_std(&self.router).resolve(lang, tool).cloned(),
-            |id| lock_std(&self.lsp_clients).get(id).cloned(),
-            |id| lock_std(&self.expected_servers).contains(id),
-            |lang| self.pending_catch_all(lang),
-            |id| self.startup_failure(id),
-        );
+        let router = self.router_snapshot();
+        let lookup = {
+            let servers = lock_std(&self.servers);
+            lookup_route(
+                &candidates,
+                |lang| router.resolve(lang, tool).cloned(),
+                |id| servers.client(id),
+                |id| servers.is_expected(id),
+                |lang| pending_catch_all(&router, &servers, lang),
+                |id| servers.failure(id).cloned(),
+            )
+        };
         match lookup {
             RouteLookup::Registered(id, client) => Ok((id, client)),
             // A route naming a server that is still initializing (e.g. a
@@ -753,14 +767,6 @@ impl Translator {
         }
     }
 
-    /// The catch-all of `language` if it is still expected to register.
-    fn pending_catch_all(&self, language: &str) -> Option<ServerId> {
-        let catch_all = lock_std(&self.router).catch_all_for(language).cloned()?;
-        lock_std(&self.expected_servers)
-            .contains(&catch_all)
-            .then_some(catch_all)
-    }
-
     /// The detected language of `path` plus its React base-language fallback.
     pub(super) fn language_candidates(&self, path: &Path) -> LanguageCandidates {
         LanguageCandidates::new(detect_language(path, &self.extension_map))
@@ -796,18 +802,18 @@ impl Translator {
     #[must_use]
     pub(crate) fn diagnostics_route_for_path(&self, path: &Path) -> DiagnosticsRoute {
         let candidates = self.language_candidates(path);
-        let lookup = lookup_route(
-            &candidates,
-            |lang| {
-                lock_std(&self.router)
-                    .resolve(lang, ToolKind::Diagnostics)
-                    .cloned()
-            },
-            |id| lock_std(&self.lsp_clients).contains_key(id).then_some(()),
-            |id| lock_std(&self.expected_servers).contains(id),
-            |lang| self.pending_catch_all(lang),
-            |id| self.startup_failure(id),
-        );
+        let router = self.router_snapshot();
+        let lookup = {
+            let servers = lock_std(&self.servers);
+            lookup_route(
+                &candidates,
+                |lang| router.resolve(lang, ToolKind::Diagnostics).cloned(),
+                |id| servers.client(id).map(|_| ()),
+                |id| servers.is_expected(id),
+                |lang| pending_catch_all(&router, &servers, lang),
+                |id| servers.failure(id).cloned(),
+            )
+        };
         match lookup {
             RouteLookup::Registered(id, ()) => DiagnosticsRoute::Live(id),
             RouteLookup::Initializing(id) => DiagnosticsRoute::Initializing(id),
@@ -1026,7 +1032,7 @@ impl Translator {
     /// tracking has stopped counting the document.
     ///
     /// `DocumentTracker` has no access to any server's [`LspClient`] --
-    /// `self.lsp_clients` is the registry for that, kept one layer up in
+    /// `self.servers` is the registry for that, kept one layer up in
     /// `Translator` -- so this is the chokepoint that reconciles its pending
     /// closes against it. Called after every `ensure_open` that could have
     /// triggered eviction, unconditionally, even when `ensure_open` itself
@@ -1050,7 +1056,7 @@ impl Translator {
                     continue;
                 };
                 for server_id in &claim.servers {
-                    let Some(client) = lock_std(&self.lsp_clients).get(server_id).cloned() else {
+                    let Some(client) = lock_std(&self.servers).client(server_id) else {
                         continue;
                     };
                     if let Err(err) = client
@@ -1115,11 +1121,11 @@ impl Translator {
         server_id: &ServerId,
         capability: Capability,
     ) -> Result<()> {
-        let servers = lock_std(&self.lsp_servers);
+        let servers = lock_std(&self.servers);
         check_capability(
             server_id,
             servers
-                .get(server_id)
+                .server(server_id)
                 .map(crate::lsp::LspServer::capabilities),
             capability,
         )
@@ -1139,10 +1145,10 @@ impl Translator {
     /// information is unavailable is to skip the extra round-trip, not to
     /// risk it against a server that may not implement it.
     pub(super) fn code_action_resolve_supported(&self, server_id: &ServerId) -> bool {
-        let servers = lock_std(&self.lsp_servers);
+        let servers = lock_std(&self.servers);
         matches!(
             servers
-                .get(server_id)
+                .server(server_id)
                 .map(crate::lsp::LspServer::capabilities)
                 .and_then(|caps| caps.code_action_provider.as_ref()),
             Some(lsp_types::CodeActionProvider::CodeActionOptions(
@@ -2322,9 +2328,8 @@ mod tests {
         std::fs::write(&path, "p").unwrap();
         let other = dir.path().join("q.aa");
         std::fs::write(&other, "q").unwrap();
-        let client_a = lock_std(&translator.lsp_clients)
-            .get(&ServerId::from("lang_a"))
-            .cloned()
+        let client_a = lock_std(&translator.servers)
+            .client(&ServerId::from("lang_a"))
             .unwrap();
         tracker
             .ensure_open(&path, &ServerId::from("lang_a"), &client_a)

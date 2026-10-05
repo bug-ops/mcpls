@@ -12,12 +12,13 @@ use tokio::time::Duration;
 
 use super::Translator;
 use super::restart::{NotificationReceivers, NotificationRouting};
+use super::servers::Backend;
 use crate::DiagnosticsRole;
 use crate::bridge::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::tsserver_pin::{configured_tsserver_path, warn_if_pin_ignored};
-use crate::lsp::{LspServer, ServerInitConfig};
+use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
 /// Tracks respawn attempts for one server, so [`Translator::respawn_if_dead`]
 /// can back off a crash-looping process instead of retrying it on every
@@ -55,7 +56,7 @@ impl Translator {
     /// stopped while the process is still running.
     ///
     /// The config is read from the registered [`LspServer`] itself, under the
-    /// same `lsp_servers` lock as the liveness check, so the two cannot
+    /// same `servers` lock as the liveness check, so the two cannot
     /// disagree. Returns `None` ("not dead") for an `id` that isn't
     /// registered at all -- that's the separate `ServerInitializing`/
     /// `NoServerForTool` concern callers already handle, not something the
@@ -63,8 +64,8 @@ impl Translator {
     /// conservative assumption that a health check that itself failed should
     /// not trigger a respawn.
     fn dead_server_config(&self, id: &ServerId) -> Option<ServerInitConfig> {
-        let mut servers = lock_std(&self.lsp_servers);
-        let server = servers.get_mut(id)?;
+        let mut servers = lock_std(&self.servers);
+        let server = servers.server_mut(id)?;
         let config = server.is_dead().ok()?.then(|| server.init_config().clone());
         drop(servers);
         config
@@ -77,11 +78,7 @@ impl Translator {
     /// clone of the *same* underlying `Mutex`, so awaiting it actually
     /// serializes them instead of letting both proceed independently.
     pub(crate) fn respawn_lock(&self, id: &ServerId) -> Arc<Mutex<()>> {
-        Arc::clone(
-            lock_std(&self.respawn_locks)
-                .entry(id.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
+        lock_std(&self.servers).respawn_lock(id)
     }
 
     /// Remaining backoff delay before `id` may be respawned again, or
@@ -95,7 +92,7 @@ impl Translator {
     /// this runs, a lingering "succeeded" entry never reaches here.
     fn respawn_backoff_remaining(&self, id: &ServerId) -> Option<Duration> {
         let (consecutive_failures, last_attempt) = {
-            let entry = lock_std(&self.respawn_backoffs).get(id).copied()?;
+            let entry = self.backoff_of(id)?;
             (entry.consecutive_failures, entry.last_attempt)
         };
         if consecutive_failures == 0 {
@@ -109,20 +106,39 @@ impl Translator {
         (elapsed < delay).then(|| delay.saturating_sub(elapsed))
     }
 
+    fn backoff_of(&self, id: &ServerId) -> Option<RespawnBackoff> {
+        lock_std(&self.servers).get(id)?.backoff
+    }
+
+    /// Applies `update` to the backoff state of `id`, creating it with
+    /// `initial` first; a server without a slot has no backoff to keep.
+    fn update_backoff(
+        &self,
+        id: &ServerId,
+        initial: RespawnBackoff,
+        update: impl FnOnce(&mut RespawnBackoff),
+    ) {
+        if let Some(slot) = lock_std(&self.servers).get_mut(id) {
+            update(slot.backoff.get_or_insert(initial));
+        }
+    }
+
     /// Records a failed respawn attempt for `id`, extending its backoff.
     fn record_respawn_failure(&self, id: &ServerId) {
-        let mut backoffs = lock_std(&self.respawn_backoffs);
-        let entry = backoffs
-            .entry(id.clone())
-            .or_insert_with(|| RespawnBackoff {
+        let now = self.clock.now();
+        self.update_backoff(
+            id,
+            RespawnBackoff {
                 consecutive_failures: 0,
-                last_attempt: self.clock.now(),
+                last_attempt: now,
                 last_attempt_succeeded: false,
-            });
-        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-        entry.last_attempt = self.clock.now();
-        entry.last_attempt_succeeded = false;
-        drop(backoffs);
+            },
+            |entry| {
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                entry.last_attempt = now;
+                entry.last_attempt_succeeded = false;
+            },
+        );
     }
 
     /// Records that a respawn attempt for `id` completed `initialize`
@@ -134,17 +150,19 @@ impl Translator {
     /// [`Self::reconcile_respawn_stability`], which is what acts on this
     /// entry.
     fn record_respawn_success(&self, id: &ServerId) {
-        let mut backoffs = lock_std(&self.respawn_backoffs);
-        let entry = backoffs
-            .entry(id.clone())
-            .or_insert_with(|| RespawnBackoff {
+        let now = self.clock.now();
+        self.update_backoff(
+            id,
+            RespawnBackoff {
                 consecutive_failures: 0,
-                last_attempt: self.clock.now(),
+                last_attempt: now,
                 last_attempt_succeeded: true,
-            });
-        entry.last_attempt = self.clock.now();
-        entry.last_attempt_succeeded = true;
-        drop(backoffs);
+            },
+            |entry| {
+                entry.last_attempt = now;
+                entry.last_attempt_succeeded = true;
+            },
+        );
     }
 
     /// Reconciles `id`'s backoff state against a *newly observed* death,
@@ -163,7 +181,7 @@ impl Translator {
     ///   fresh, unbacked-off start, spawning one child process per tool
     ///   call forever.
     fn reconcile_respawn_stability(&self, id: &ServerId) {
-        let Some(entry) = lock_std(&self.respawn_backoffs).get(id).copied() else {
+        let Some(entry) = self.backoff_of(id) else {
             return;
         };
         if !entry.last_attempt_succeeded {
@@ -175,14 +193,15 @@ impl Translator {
             .saturating_duration_since(entry.last_attempt)
             >= RESPAWN_BACKOFF_BASE
         {
-            lock_std(&self.respawn_backoffs).remove(id);
-        } else {
-            let mut backoffs = lock_std(&self.respawn_backoffs);
-            if let Some(current) = backoffs.get_mut(id) {
-                current.consecutive_failures = current.consecutive_failures.saturating_add(1);
-                current.last_attempt = self.clock.now();
-                current.last_attempt_succeeded = false;
+            if let Some(slot) = lock_std(&self.servers).get_mut(id) {
+                slot.backoff = None;
             }
+        } else if let Some(slot) = lock_std(&self.servers).get_mut(id)
+            && let Some(current) = slot.backoff.as_mut()
+        {
+            current.consecutive_failures = current.consecutive_failures.saturating_add(1);
+            current.last_attempt = self.clock.now();
+            current.last_attempt_succeeded = false;
         }
     }
 
@@ -236,7 +255,7 @@ impl Translator {
         };
 
         // A panicked message loop never drains its own pending requests.
-        let dead_client = lock_std(&self.lsp_clients).get(id).cloned();
+        let dead_client = lock_std(&self.servers).client(id);
         if let Some(client) = dead_client {
             client.fail_pending_requests().await;
         }
@@ -313,14 +332,15 @@ impl Translator {
                 return Err(err);
             }
         };
-        let new_client = new_server.client().clone();
         let receivers = NotificationReceivers {
             notifications: new_server.take_notification_rx(),
             lifecycle: new_server.take_lifecycle_rx(),
             pinned_tsserver,
         };
 
-        let stale_task = lock_std(&self.notification_tasks).remove(id);
+        let stale_task = lock_std(&self.servers)
+            .get_mut(id)
+            .and_then(|slot| slot.notification_task.take());
         if let Some(handle) = stale_task {
             handle.abort();
         }
@@ -358,11 +378,7 @@ impl Translator {
             ),
             NotificationRouting::Discard => self.spawn_discard_consumer(id, receivers),
         };
-        lock_std(&self.notification_tasks).insert(id.clone(), consumer);
-
-        let old_client = lock_std(&self.lsp_clients).insert(id.clone(), new_client);
-        let old_server = lock_std(&self.lsp_servers).insert(id.clone(), new_server);
-        drop(old_server); // dropped after the `lsp_servers` guard, not under it
+        let old_client = self.swap_in(id, new_server, consumer);
 
         self.document_tracker.forget_server(id);
 
@@ -376,6 +392,27 @@ impl Translator {
 
         tracing::info!("LSP server '{id}' respawned successfully");
         Ok(())
+    }
+
+    /// Installs `new_server` and its consumer in `id`'s slot in one step and
+    /// returns the replaced client. Synchronous so the replaced server is
+    /// dropped here, after the `servers` guard, never held across an await.
+    fn swap_in(
+        &self,
+        id: &ServerId,
+        new_server: LspServer,
+        consumer: tokio::task::AbortHandle,
+    ) -> Option<LspClient> {
+        let old = {
+            let mut servers = lock_std(&self.servers);
+            let old = servers.slot_for_swap(id, Backend::Process(new_server));
+            if let Some(slot) = servers.get_mut(id) {
+                slot.notification_task = Some(consumer);
+            }
+            drop(servers);
+            old
+        };
+        old.as_ref().map(|old| old.client().clone())
     }
 
     /// Drain the replacement's notification lane and forward its lifecycle
@@ -436,6 +473,7 @@ mod tests {
         let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
         let id = ServerId::from("rust");
 
+        translator.set_expected_servers(std::collections::HashSet::from([id.clone()]));
         translator.record_respawn_failure(&id);
         assert!(
             translator.respawn_backoff_remaining(&id).is_some(),
@@ -456,10 +494,11 @@ mod tests {
         let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
         let id = ServerId::from("rust");
 
+        translator.set_expected_servers(std::collections::HashSet::from([id.clone()]));
         translator.record_respawn_failure(&id);
         translator.record_respawn_success(&id);
         assert!(
-            lock_std(&translator.respawn_backoffs).contains_key(&id),
+            translator.backoff_of(&id).is_some(),
             "a recorded success must still leave a backoff entry pending reconciliation"
         );
 
@@ -467,7 +506,7 @@ mod tests {
         translator.reconcile_respawn_stability(&id);
 
         assert!(
-            !lock_std(&translator.respawn_backoffs).contains_key(&id),
+            translator.backoff_of(&id).is_none(),
             "once proven stable (survived at least RESPAWN_BACKOFF_BASE), \
              the backoff entry must be cleared entirely"
         );
@@ -481,6 +520,7 @@ mod tests {
     fn test_respawn_lock_is_shared_across_lookups_for_same_id() {
         let translator = Translator::new();
         let id = ServerId::from("rust");
+        translator.set_expected_servers(std::collections::HashSet::from([id.clone()]));
 
         let first = translator.respawn_lock(&id);
         let second = translator.respawn_lock(&id);
@@ -538,8 +578,8 @@ mod tests {
         /// Replaces the registered server's `init_config`, i.e. the config
         /// the next respawn will use.
         fn set_respawn_config(translator: &Translator, id: &ServerId, config: ServerInitConfig) {
-            lock_std(&translator.lsp_servers)
-                .get_mut(id)
+            lock_std(&translator.servers)
+                .server_mut(id)
                 .unwrap()
                 .set_init_config(config);
         }
@@ -1186,8 +1226,10 @@ sleep 1
             wait_until_dead(&translator, &id).await;
 
             let never_completes = tokio::spawn(std::future::pending::<()>());
-            lock_std(&translator.notification_tasks)
-                .insert(id.clone(), never_completes.abort_handle());
+            lock_std(&translator.servers)
+                .get_mut(&id)
+                .unwrap()
+                .notification_task = Some(never_completes.abort_handle());
 
             let respawn_script = write_responder_script(dir.path(), 1);
             set_respawn_config(
@@ -1207,8 +1249,9 @@ sleep 1
             );
 
             assert!(
-                lock_std(&translator.notification_tasks)
+                lock_std(&translator.servers)
                     .get(&id)
+                    .and_then(|slot| slot.notification_task.as_ref())
                     .is_some_and(|current| !current.is_finished()),
                 "the new respawn's own forwarder must be registered and still running"
             );

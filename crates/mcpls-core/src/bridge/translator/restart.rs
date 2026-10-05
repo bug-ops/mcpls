@@ -9,7 +9,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -21,11 +20,12 @@ use tokio::task::AbortHandle;
 
 use super::Translator;
 use super::respawn::BackoffPolicy;
+use super::servers::{Backend, Phase};
 use crate::DiagnosticsRole;
 use crate::bridge::{DiagnosticsKey, IndexingState, lock_std};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
-use crate::lsp::{ExitGrace, LspClient, LspNotification, LspServer, ServerInitConfig};
+use crate::lsp::{ExitGrace, LspNotification, ServerInitConfig};
 use crate::redaction::{Redactions, ServerText};
 
 /// Minimum interval between two manual restart attempts of the same server.
@@ -340,42 +340,40 @@ pub struct StartupGuard<'a>(&'a Translator);
 
 impl Drop for StartupGuard<'_> {
     fn drop(&mut self) {
-        self.0.startup_settling.store(false, Ordering::SeqCst);
+        lock_std(&self.0.phase).finish_startup();
     }
 }
 
-/// A server taken out of the registries for termination, restored on every
-/// exit path (error, early return, panic, cancelled future).
+/// A server taken out of its slot for termination, restored on every exit
+/// path (error, early return, panic, cancelled future).
 struct Deregistered<'a> {
     translator: &'a Translator,
     id: ServerId,
-    server: Option<LspServer>,
-    client: Option<LspClient>,
+    backend: Option<Backend>,
 }
 
 impl<'a> Deregistered<'a> {
-    /// Mark `id` as expected before removing it from the maps, so no caller
-    /// ever finds it in neither (which would read as a missing server).
+    /// Marks `id` expected while taking its backend, in one step, so no caller
+    /// ever finds it in neither state (which would read as a missing server).
     fn take(translator: &'a Translator, id: &ServerId) -> Option<Self> {
-        lock_std(&translator.expected_servers).insert(id.clone());
-        let server = lock_std(&translator.lsp_servers).remove(id);
-        let client = lock_std(&translator.lsp_clients).remove(id);
+        let backend = lock_std(&translator.servers).take_for_restart(id)?;
         let held = Self {
             translator,
             id: id.clone(),
-            server,
-            client,
+            backend: Some(backend),
         };
-        held.server.is_some().then_some(held)
+        held.backend
+            .as_ref()
+            .is_some_and(|backend| backend.server().is_some())
+            .then_some(held)
     }
 
     /// Stop the held server and return the config to respawn it from.
     /// Termination errors (a wedged server times out) are not fatal.
     async fn terminate(&mut self) -> Option<ServerInitConfig> {
-        let server = self.server.as_mut()?;
-        if let Some(client) = &self.client {
-            client.mark_restarted(self.id.clone());
-        }
+        let backend = self.backend.as_mut()?;
+        backend.client().mark_restarted(self.id.clone());
+        let server = backend.server_mut()?;
         let config = server.init_config().clone();
         let stopped = server
             .terminate(
@@ -389,15 +387,11 @@ impl<'a> Deregistered<'a> {
         Some(config)
     }
 
-    /// Put the held parts back and clear the expectation; idempotent.
+    /// Put the held backend back; idempotent.
     fn restore(&mut self) {
-        if let Some(server) = self.server.take() {
-            lock_std(&self.translator.lsp_servers).insert(self.id.clone(), server);
+        if let Some(backend) = self.backend.take() {
+            lock_std(&self.translator.servers).restore(&self.id, backend);
         }
-        if let Some(client) = self.client.take() {
-            lock_std(&self.translator.lsp_clients).insert(self.id.clone(), client);
-        }
-        lock_std(&self.translator.expected_servers).remove(&self.id);
     }
 }
 
@@ -486,19 +480,15 @@ impl Translator {
     /// Every server a restart may address: registered, still expected, or
     /// failed at startup. Sorted by id.
     fn known_server_ids(&self) -> Vec<ServerId> {
-        let mut ids: HashSet<ServerId> = lock_std(&self.lsp_servers).keys().cloned().collect();
-        ids.extend(lock_std(&self.lsp_clients).keys().cloned());
-        ids.extend(lock_std(&self.expected_servers).iter().cloned());
-        ids.extend(lock_std(&self.startup_failures).keys().cloned());
-        let mut ids: Vec<ServerId> = ids.into_iter().collect();
+        let mut ids: Vec<ServerId> = lock_std(&self.servers).ids().cloned().collect();
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         ids
     }
 
     fn restart_generation(&self, id: &ServerId) -> RestartGeneration {
-        lock_std(&self.restart_generations)
+        lock_std(&self.servers)
             .get(id)
-            .copied()
+            .map(|slot| slot.restart.generation)
             .unwrap_or_default()
     }
 
@@ -516,8 +506,10 @@ impl Translator {
 
     /// Record the task consuming `id`'s notification lanes, so a restart can
     /// stop it before starting its replacement.
-    pub(crate) fn set_notification_task(&self, id: ServerId, handle: AbortHandle) {
-        lock_std(&self.notification_tasks).insert(id, handle);
+    pub(crate) fn set_notification_task(&self, id: &ServerId, handle: AbortHandle) {
+        if let Some(slot) = lock_std(&self.servers).get_mut(id) {
+            slot.notification_task = Some(handle);
+        }
     }
 
     /// Declare that the initial server startup is still settling; restarts
@@ -525,22 +517,22 @@ impl Translator {
     /// restarted pump's diagnostics role is fixed at spawn and routes still
     /// change while servers settle.
     pub(crate) fn begin_startup(&self) -> StartupGuard<'_> {
-        self.startup_settling.store(true, Ordering::SeqCst);
+        lock_std(&self.phase).begin_startup();
         StartupGuard(self)
     }
 
     /// Declare that shutdown has begun; no restart starts a server after this.
     pub(crate) fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
+        lock_std(&self.phase).begin_shutdown();
     }
 
     fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::SeqCst)
+        *lock_std(&self.phase) == Phase::ShuttingDown
     }
 
     /// The cooldown still to wait before `id` may be restarted again.
     fn restart_cooldown_remaining(&self, id: &ServerId) -> Option<Duration> {
-        let last = lock_std(&self.restart_attempts).get(id).copied()?;
+        let last = lock_std(&self.servers).get(id)?.restart.last_attempt?;
         let elapsed = self.clock.now().saturating_duration_since(last);
         RESTART_COOLDOWN.checked_sub(elapsed)
     }
@@ -560,39 +552,54 @@ impl Translator {
         }
     }
 
-    /// Why `id` cannot be restarted right now, in classification order:
-    /// shutting down, never started or failed to start, init panicked, startup
-    /// still settling or not yet wired, then the cooldown.
-    fn restart_blocker(&self, id: &ServerId) -> Option<RestartOutcome> {
-        if self.is_shutting_down() {
-            return Some(RestartOutcome::Failed {
+    /// The notification wiring a restart of `id` needs, or why it cannot be
+    /// restarted right now, in classification order: shutting down, never
+    /// started or failed to start, init panicked, startup still settling or not
+    /// yet wired, then the cooldown.
+    fn restart_permit(
+        &self,
+        id: &ServerId,
+    ) -> std::result::Result<&Arc<dyn NotificationWiring>, RestartOutcome> {
+        let phase = *lock_std(&self.phase);
+        if phase == Phase::ShuttingDown {
+            return Err(RestartOutcome::Failed {
                 reason: RestartFailure::ShuttingDown,
             });
         }
-        if !lock_std(&self.lsp_servers).contains_key(id) {
-            return Some(match self.startup_failure(id) {
-                Some(failure) => RestartOutcome::NotRunning {
-                    message: Error::ServerFailedToStart(Box::new(failure)).to_string(),
-                },
-                None if lock_std(&self.expected_servers).contains(id) => {
-                    RestartOutcome::Initializing
-                }
-                None => RestartOutcome::NotRunning {
-                    message: format!("LSP server '{id}' is not running"),
-                },
-            });
+        let not_running = {
+            let servers = lock_std(&self.servers);
+            let outcome = servers
+                .server(id)
+                .is_none()
+                .then(|| match servers.failure(id) {
+                    Some(failure) => RestartOutcome::NotRunning {
+                        message: Error::ServerFailedToStart(Box::new(failure.clone())).to_string(),
+                    },
+                    None if servers.is_expected(id) => RestartOutcome::Initializing,
+                    None => RestartOutcome::NotRunning {
+                        message: format!("LSP server '{id}' is not running"),
+                    },
+                });
+            drop(servers);
+            outcome
+        };
+        if let Some(outcome) = not_running {
+            return Err(outcome);
         }
-        if self.init_panicked.load(Ordering::SeqCst) {
-            return Some(RestartOutcome::NotRunning {
+        if phase == Phase::InitPanicked {
+            return Err(RestartOutcome::NotRunning {
                 message: "startup was interrupted by a panic, so servers cannot be restarted; restart mcpls".to_string(),
             });
         }
-        if self.startup_settling.load(Ordering::SeqCst) || self.wiring.get().is_none() {
-            return Some(RestartOutcome::Initializing);
-        }
+        let wiring = match (phase, self.wiring.get()) {
+            (Phase::Settling, _) | (_, None) => return Err(RestartOutcome::Initializing),
+            (_, Some(wiring)) => wiring,
+        };
         self.restart_cooldown_remaining(id)
-            .map(|remaining| RestartOutcome::Throttled {
-                retry_in_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+            .map_or(Ok(wiring), |remaining| {
+                Err(RestartOutcome::Throttled {
+                    retry_in_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                })
             })
     }
 
@@ -603,14 +610,12 @@ impl Translator {
         if self.restart_generation(id) != seen {
             return self.restarted_outcome(id, true).await;
         }
-        if let Some(blocker) = self.restart_blocker(id) {
-            return blocker;
-        }
-        let Some(wiring) = self.wiring.get() else {
-            return RestartOutcome::Initializing;
+        let wiring = match self.restart_permit(id) {
+            Ok(wiring) => wiring,
+            Err(outcome) => return outcome,
         };
 
-        lock_std(&self.restart_attempts).insert(id.clone(), self.clock.now());
+        self.note_restart_attempt(id);
         tracing::info!(%id, "restarting LSP server on request");
 
         let Some(mut old) = Deregistered::take(self, id) else {
@@ -642,7 +647,7 @@ impl Translator {
             )
             .await;
         // Counted from completion too, so a slow restart cannot be chained at once.
-        lock_std(&self.restart_attempts).insert(id.clone(), self.clock.now());
+        self.note_restart_attempt(id);
         if let Err(error) = respawned {
             tracing::warn!(%id, %error, "LSP server restart failed");
             self.invalidate_stopped_server(id, &language_id).await;
@@ -657,12 +662,17 @@ impl Translator {
                 reason: RestartFailure::ShuttingDown,
             };
         }
-        lock_std(&self.restart_generations)
-            .entry(id.clone())
-            .or_default()
-            .bump();
+        if let Some(slot) = lock_std(&self.servers).get_mut(id) {
+            slot.restart.generation.bump();
+        }
         tracing::info!(%id, "LSP server restarted");
         self.restarted_outcome(id, false).await
+    }
+
+    fn note_restart_attempt(&self, id: &ServerId) {
+        if let Some(slot) = lock_std(&self.servers).get_mut(id) {
+            slot.restart.last_attempt = Some(self.clock.now());
+        }
     }
 
     /// The old process is gone and no replacement runs: drop what it cached
@@ -671,7 +681,9 @@ impl Translator {
         // Best effort: the old pump goes first, and an aborted task stops at its
         // next await, so it cannot re-cache what the dead server buffered
         // once the cache below is cleared.
-        let stale_pump = lock_std(&self.notification_tasks).remove(id);
+        let stale_pump = lock_std(&self.servers)
+            .get_mut(id)
+            .and_then(|slot| slot.notification_task.take());
         if let Some(pump) = stale_pump {
             pump.abort();
             tokio::task::yield_now().await;
@@ -693,8 +705,7 @@ impl Translator {
     /// Shut down and deregister the server just registered under `id`, after
     /// shutdown began while its replacement was starting.
     async fn discard_registered(&self, id: &ServerId) {
-        let server = lock_std(&self.lsp_servers).remove(id);
-        lock_std(&self.lsp_clients).remove(id);
+        let server = lock_std(&self.servers).remove_server(id);
         if let Some(server) = server
             && let Err(error) = server.shutdown().await
         {
@@ -867,7 +878,7 @@ mod tests {
                 WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             );
 
-            let mut server = LspServer::spawn(stub_server_config("rust", script))
+            let mut server = crate::lsp::LspServer::spawn(stub_server_config("rust", script))
                 .await
                 .unwrap();
             let receivers = NotificationReceivers {
@@ -887,7 +898,7 @@ mod tests {
                 cancel_rx,
             };
             let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Authoritative);
-            translator.set_notification_task(id.clone(), pump);
+            translator.set_notification_task(&id, pump);
             if wired {
                 translator.install_wiring(Arc::new(wiring));
             }
@@ -919,17 +930,17 @@ mod tests {
 
         impl Fixture {
             fn registered(&self) -> bool {
-                lock_std(&self.translator.lsp_servers).contains_key(&self.id)
-                    && lock_std(&self.translator.lsp_clients).contains_key(&self.id)
+                let servers = lock_std(&self.translator.servers);
+                servers.server(&self.id).is_some() && servers.client(&self.id).is_some()
             }
 
             fn expected(&self) -> bool {
-                lock_std(&self.translator.expected_servers).contains(&self.id)
+                lock_std(&self.translator.servers).is_expected(&self.id)
             }
 
             fn is_dead(&self) -> bool {
-                lock_std(&self.translator.lsp_servers)
-                    .get_mut(&self.id)
+                lock_std(&self.translator.servers)
+                    .server_mut(&self.id)
                     .unwrap()
                     .is_dead()
                     .unwrap()
@@ -1067,9 +1078,9 @@ mod tests {
         fn test_dropping_the_startup_guard_clears_the_flag() {
             let translator = Translator::new();
             let startup = translator.begin_startup();
-            assert!(translator.startup_settling.load(Ordering::SeqCst));
+            assert_eq!(*lock_std(&translator.phase), Phase::Settling);
             drop(startup);
-            assert!(!translator.startup_settling.load(Ordering::SeqCst));
+            assert_eq!(*lock_std(&translator.phase), Phase::Settled);
         }
 
         #[tokio::test]
@@ -1249,10 +1260,7 @@ mod tests {
         #[tokio::test]
         async fn test_restart_fails_requests_in_flight_with_server_restarted() {
             let (fx, _log) = protocol_fixture(None).await;
-            let client = lock_std(&fx.translator.lsp_clients)
-                .get(&fx.id)
-                .cloned()
-                .unwrap();
+            let client = lock_std(&fx.translator.servers).client(&fx.id).unwrap();
             let in_flight = tokio::spawn(async move {
                 client
                     .request::<_, serde_json::Value>(
@@ -1328,8 +1336,8 @@ mod tests {
             let fx = fixture(dir, &script, true).await;
             let mut broken = stub_server_config("rust", &script);
             broken.server_config.command = "mcpls-test-missing-server".to_string();
-            lock_std(&fx.translator.lsp_servers)
-                .get_mut(&fx.id)
+            lock_std(&fx.translator.servers)
+                .server_mut(&fx.id)
                 .unwrap()
                 .set_init_config(broken);
 
@@ -1350,30 +1358,28 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_take_marks_the_server_expected_before_removing_it_from_the_maps() {
+        async fn test_take_leaves_the_server_expected_in_the_same_step_and_restore_runs_it_again() {
             let config = crate::config::LspServerConfig::rust_analyzer();
             let id = config.id();
             let translator = Translator::new();
             translator.register_server_complete(crate::lsp::fake_lsp_server_with_config(config));
 
-            // While the servers map is locked, `take` is blocked on removing the server;
-            // by then the id must already be expected, or callers would find it nowhere.
-            let servers = lock_std(&translator.lsp_servers);
-            std::thread::scope(|scope| {
-                let taker = scope.spawn(|| Deregistered::take(&translator, &id).is_some());
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                while !lock_std(&translator.expected_servers).contains(&id) {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "take must insert into expected_servers before removing from the maps"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+            let held = Deregistered::take(&translator, &id).unwrap();
+            {
+                let servers = lock_std(&translator.servers);
+                assert!(
+                    servers.is_expected(&id),
+                    "the id must never be in neither state"
+                );
+                assert!(servers.server(&id).is_none());
                 drop(servers);
-                assert!(taker.join().unwrap());
-            });
-            assert!(!lock_std(&translator.expected_servers).contains(&id));
-            assert!(lock_std(&translator.lsp_servers).contains_key(&id));
+            }
+            drop(held);
+
+            let servers = lock_std(&translator.servers);
+            assert!(!servers.is_expected(&id));
+            assert!(servers.server(&id).is_some());
+            drop(servers);
         }
 
         /// Six servers, two overlapping `All` requests: ids queued behind the
@@ -1403,7 +1409,7 @@ mod tests {
                 let script_dir = dir.path().join(&name);
                 fs::create_dir(&script_dir).unwrap();
                 let script = write_protocol_server_script(&script_dir, &log, None);
-                let mut server = LspServer::spawn(stub_server_config(&name, &script))
+                let mut server = crate::lsp::LspServer::spawn(stub_server_config(&name, &script))
                     .await
                     .unwrap();
                 let receivers = NotificationReceivers {
@@ -1413,10 +1419,8 @@ mod tests {
                 };
                 translator.register_server_complete(server);
                 let id = ServerId::from(name.as_str());
-                translator.set_notification_task(
-                    id.clone(),
-                    wiring.spawn_pump(id, receivers, DiagnosticsRole::Secondary),
-                );
+                let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Secondary);
+                translator.set_notification_task(&id, pump);
                 logs.push(log);
             }
             translator.install_wiring(Arc::new(wiring));
@@ -1482,9 +1486,12 @@ mod tests {
             let id = ServerId::from("rust");
             let clock = Arc::new(FakeClock::new());
             let translator = Translator::new().with_clock(clock.clone());
-            lock_std(&translator.restart_attempts).insert(id.clone(), clock.now());
-
             translator.set_expected_servers(HashSet::from([id.clone()]));
+            lock_std(&translator.servers)
+                .get_mut(&id)
+                .unwrap()
+                .restart
+                .last_attempt = Some(clock.now());
             let starting = translator
                 .restart_servers(server_ids(&["rust"]))
                 .await
@@ -1569,8 +1576,8 @@ mod tests {
             .expect("the seed server's diagnostics reach the cache");
             let mut broken = stub_server_config("rust", &script);
             broken.server_config.command = "mcpls-test-missing-server".to_string();
-            lock_std(&fx.translator.lsp_servers)
-                .get_mut(&fx.id)
+            lock_std(&fx.translator.servers)
+                .server_mut(&fx.id)
                 .unwrap()
                 .set_init_config(broken);
 
@@ -1588,7 +1595,9 @@ mod tests {
             assert!(!stale, "stale diagnostics must go");
             assert!(degraded);
             assert!(
-                !lock_std(&fx.translator.notification_tasks).contains_key(&fx.id),
+                lock_std(&fx.translator.servers)
+                    .get(&fx.id)
+                    .is_none_or(|slot| slot.notification_task.is_none()),
                 "the dead server's pump handle must be dropped"
             );
         }
