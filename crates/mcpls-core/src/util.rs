@@ -273,10 +273,12 @@ mod tests {
     #[test]
     fn read_regular_file_bounded_rejects_directory() {
         let dir = tempfile::tempdir().unwrap();
-        assert_matches!(
-            read_regular_file_bounded(dir.path(), limit(10)),
-            Err(BoundedFileError::NotRegular)
-        );
+        let result = read_regular_file_bounded(dir.path(), limit(10));
+        #[cfg(unix)]
+        assert_matches!(result, Err(BoundedFileError::NotRegular));
+        // Windows refuses to open a directory as a file before the type check runs.
+        #[cfg(windows)]
+        assert_matches!(result, Err(BoundedFileError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied);
     }
 
     #[cfg(unix)]

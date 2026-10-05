@@ -1095,7 +1095,9 @@ file_patterns = ["**/*.ts", "**/*.tsx"]"#;
             || std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             Into::into,
         );
-        std::fs::read_to_string(manifest.join("../..").join(relative)).unwrap()
+        std::fs::read_to_string(manifest.join("../..").join(relative))
+            .unwrap()
+            .replace("\r\n", "\n")
     }
 
     fn native_entries(extra: &str) -> Vec<LspServerConfig> {
