@@ -310,6 +310,15 @@ async fn apply_notification(
     }
 }
 
+/// Stops trusting a panicked pump's server: marks it push-degraded and resets
+/// its indexing state, so callers poll instead of waiting on pushes that no
+/// longer arrive.
+pub async fn degrade_after_pump_panic(cache: &Mutex<NotificationCache>, id: &ServerId) {
+    let mut cache = cache.lock().await;
+    cache.mark_push_degraded(id);
+    cache.reset_indexing_state(id);
+}
+
 /// Re-starts diagnostics pumps for manually restarted servers over the same
 /// shared state and shutdown watch the initial pumps use.
 #[derive(Clone)]
@@ -360,9 +369,7 @@ impl bridge::NotificationWiring for PumpWiring {
                     "Diagnostics pump for LSP server '{id}' panicked: {}",
                     panic_message(payload.as_ref())
                 );
-                let mut cache = cache.lock().await;
-                cache.mark_push_degraded(&id);
-                cache.reset_indexing_state(&id);
+                degrade_after_pump_panic(&cache, &id).await;
             }
         })
         .abort_handle()

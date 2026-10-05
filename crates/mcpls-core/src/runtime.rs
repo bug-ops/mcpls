@@ -16,4 +16,4 @@ pub mod shutdown;
 pub mod startup;
 
 pub use shutdown::shutdown;
-pub use startup::spawn_lsp_servers_background;
+pub use startup::{plan_server_starts, spawn_lsp_servers_background};

@@ -64,9 +64,8 @@ use bridge::{NotificationCache, Translator, WorkspaceRoots};
 pub use config::{ProjectConfigStatus, ProjectConfigTrust, ServerConfig};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
-use lsp::ServerInitConfig;
 use mcp::SubscriptionRegistry;
-use runtime::{shutdown, spawn_lsp_servers_background};
+use runtime::{plan_server_starts, shutdown, spawn_lsp_servers_background};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 pub use transport::Transport;
@@ -200,42 +199,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     let workspace_roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
     let extension_map = config.build_effective_extension_map();
-    let max_depth = Some(config.workspace.heuristics_max_depth);
 
     let startup_redactions = Arc::new(redaction::Redactions::for_servers(
         &config.lsp_servers,
         lsp::current_environment(),
     ));
-    let applicable_configs: Vec<ServerInitConfig> = config
-        .lsp_servers
-        .iter()
-        .filter_map(|lsp_config| {
-            let should_spawn = workspace_roots
-                .canonical()
-                .iter()
-                .any(|root| lsp_config.should_spawn(root, max_depth));
-
-            if !should_spawn {
-                info!(
-                    "Skipping LSP server '{}' ({}): no project markers found",
-                    lsp_config.language_id, lsp_config.command
-                );
-                return None;
-            }
-
-            Some(ServerInitConfig {
-                server_config: lsp_config.clone(),
-                workspace_roots: workspace_roots.canonical().to_vec(),
-                initialization_options: lsp::tsserver_pin::pinned_initialization_options(
-                    lsp_config,
-                    &workspace_roots,
-                    |key| std::env::var_os(key),
-                ),
-                position_encodings: config.workspace.position_encodings.clone(),
-                redactions: Arc::clone(&startup_redactions),
-            })
-        })
-        .collect();
+    let applicable_configs = plan_server_starts(&config, &workspace_roots, &startup_redactions);
 
     info!(
         "Attempting to spawn {} applicable LSP server(s)...",

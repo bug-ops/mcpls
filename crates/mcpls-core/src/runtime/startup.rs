@@ -12,13 +12,56 @@ use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
-use super::pump::{PumpShared, PumpWiring, diagnostics_pump};
+use super::pump::{PumpShared, PumpWiring, degrade_after_pump_panic, diagnostics_pump};
 use crate::bridge::{DiagnosticsRole, NotificationCache, Translator, WorkspaceRoots};
-use crate::config::{LanguageId, ServerId, ServerStartConcurrency};
+use crate::config::{LanguageId, ServerConfig, ServerId, ServerStartConcurrency};
 use crate::error::ServerSpawnFailure;
 use crate::lsp::{self, LspServer, ServerInitConfig, ServerStartOutcome};
 use crate::mcp::SubscriptionRegistry;
+use crate::redaction::Redactions;
 use crate::util::panic_message;
+
+/// The servers worth starting for this run: every configured server whose
+/// project markers are found under at least one workspace root, paired with
+/// the roots, position encodings and (for the TypeScript server) the pinned
+/// `tsserver` it is initialized with.
+pub fn plan_server_starts(
+    config: &ServerConfig,
+    roots: &WorkspaceRoots,
+    redactions: &Arc<Redactions>,
+) -> Vec<ServerInitConfig> {
+    let max_depth = Some(config.workspace.heuristics_max_depth);
+    config
+        .lsp_servers
+        .iter()
+        .filter_map(|lsp_config| {
+            let should_spawn = roots
+                .canonical()
+                .iter()
+                .any(|root| lsp_config.should_spawn(root, max_depth));
+
+            if !should_spawn {
+                info!(
+                    "Skipping LSP server '{}' ({}): no project markers found",
+                    lsp_config.language_id, lsp_config.command
+                );
+                return None;
+            }
+
+            Some(ServerInitConfig {
+                server_config: lsp_config.clone(),
+                workspace_roots: roots.canonical().to_vec(),
+                initialization_options: lsp::tsserver_pin::pinned_initialization_options(
+                    lsp_config,
+                    roots,
+                    |key| std::env::var_os(key),
+                ),
+                position_encodings: config.workspace.position_encodings.clone(),
+                redactions: Arc::clone(redactions),
+            })
+        })
+        .collect()
+}
 
 /// Spawn the applicable LSP servers in a background task and register them into
 /// the shared `translator` once ready.
@@ -380,9 +423,7 @@ async fn handle_pump_exit(
         return;
     };
     error!("Diagnostics pump for LSP server '{server_id}' panicked: {join_error}");
-    let mut cache = notification_cache.lock().await;
-    cache.mark_push_degraded(server_id);
-    cache.reset_indexing_state(server_id);
+    degrade_after_pump_panic(notification_cache, server_id).await;
 }
 
 #[cfg(test)]
@@ -1070,5 +1111,47 @@ mod init_supervision_tests {
         }
 
         assert!(!cache.lock().await.is_push_degraded(&id));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod plan_tests {
+    use super::*;
+    use crate::config::LspServerConfig;
+
+    fn config_with_rust_analyzer() -> ServerConfig {
+        ServerConfig {
+            lsp_servers: vec![LspServerConfig::rust_analyzer()],
+            ..ServerConfig::default()
+        }
+    }
+
+    fn plan(config: &ServerConfig, roots: &WorkspaceRoots) -> Vec<ServerInitConfig> {
+        let redactions = Arc::new(Redactions::for_servers(
+            &config.lsp_servers,
+            lsp::current_environment(),
+        ));
+        plan_server_starts(config, roots, &redactions)
+    }
+
+    #[test]
+    fn plan_skips_server_without_project_markers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+
+        assert!(plan(&config_with_rust_analyzer(), &roots).is_empty());
+    }
+
+    #[test]
+    fn plan_keeps_server_with_project_markers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+
+        let plan = plan(&config_with_rust_analyzer(), &roots);
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].workspace_roots, roots.canonical());
     }
 }
