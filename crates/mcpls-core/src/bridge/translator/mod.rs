@@ -374,8 +374,9 @@ impl Translator {
     pub(crate) fn settle_started(&self, server: LspServer) -> (ServerId, String) {
         let id = server.init_config().server_config.id();
         let language = server.client().language_id().to_string();
-        let was_expected = lock_std(&self.servers).register(id.clone(), Backend::Process(server));
-        if !was_expected {
+        let registered = lock_std(&self.servers).register(id.clone(), Backend::Process(server));
+        drop(registered.displaced);
+        if !registered.was_expected {
             tracing::error!("LSP server '{id}' settled twice or was never expected");
         }
         self.rebind_router_to_settled();
@@ -569,7 +570,8 @@ impl Translator {
     /// ```
     pub fn register_server_complete(&self, server: LspServer) {
         let id = server.init_config().server_config.id();
-        lock_std(&self.servers).register(id, Backend::Process(server));
+        let registered = lock_std(&self.servers).register(id, Backend::Process(server));
+        drop(registered.displaced);
     }
 
     /// Number of currently registered LSP servers.

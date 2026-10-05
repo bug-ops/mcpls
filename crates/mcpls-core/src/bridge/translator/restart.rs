@@ -353,8 +353,9 @@ struct Deregistered<'a> {
 }
 
 impl<'a> Deregistered<'a> {
-    /// Marks `id` expected while taking its backend, in one step, so no caller
-    /// ever finds it in neither state (which would read as a missing server).
+    /// Marks `id` restarting while taking its backend, in one step, so no
+    /// caller ever finds it in neither state (which would read as a missing
+    /// server).
     fn take(translator: &'a Translator, id: &ServerId) -> Option<Self> {
         let backend = lock_std(&translator.servers).take_for_restart(id)?;
         let held = Self {

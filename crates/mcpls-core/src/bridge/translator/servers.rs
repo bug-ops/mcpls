@@ -382,20 +382,32 @@ impl Servers {
     }
 
     /// Registers `backend` under `id`, replacing whatever the slot held.
-    /// Returns whether the server was expected.
-    pub(super) fn register(&mut self, id: ServerId, backend: Backend) -> bool {
+    ///
+    /// Returns whether the server was expected, and the running backend it
+    /// displaced, so the caller drops it after releasing the guard.
+    pub(super) fn register(&mut self, id: ServerId, backend: Backend) -> Registered {
         if let Some(slot) = self.0.get_mut(&id) {
             let was_expected = matches!(slot.status, ServerStatus::Expected { .. });
-            slot.status = ServerStatus::Running(backend);
-            return was_expected;
+            let displaced =
+                match std::mem::replace(&mut slot.status, ServerStatus::Running(backend)) {
+                    ServerStatus::Running(previous) => Some(previous),
+                    _ => None,
+                };
+            return Registered {
+                was_expected,
+                displaced,
+            };
         }
         self.0
             .insert(id, ServerSlot::new(ServerStatus::Running(backend)));
-        false
+        Registered {
+            was_expected: false,
+            displaced: None,
+        }
     }
 
     /// Takes the backend of a running `id` out for a restart, leaving the slot
-    /// expected so no caller finds the server in neither state.
+    /// `Restarting` so no caller finds the server in neither state.
     pub(super) fn take_for_restart(&mut self, id: &ServerId) -> Option<Backend> {
         let slot = self.0.get_mut(id)?;
         if !matches!(slot.status, ServerStatus::Running(_)) {
@@ -568,6 +580,15 @@ impl Servers {
         };
         self.register(id, backend);
     }
+}
+
+/// What [`Servers::register`] found in the slot it overwrote.
+#[derive(Debug)]
+pub(super) struct Registered {
+    /// The server was waiting for its startup to settle.
+    pub(super) was_expected: bool,
+    /// A running backend that the registration replaced.
+    pub(super) displaced: Option<Backend>,
 }
 
 /// The translator-wide lifecycle, one value instead of three flags.

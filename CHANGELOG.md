@@ -123,6 +123,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tools/list` payload shrinks from about 181 KB to about 122 KB. (#PR)
 - **Breaking:** `ServerInitConfig` gains `redactions`; tool and resource errors hide every configured server's secrets. (#PR)
 - **Breaking:** `Translator::set_expected_servers` no longer marks a registered server expected. (#PR)
+- An idle HTTP session close is bounded, and an unresolvable internal URI is classified as an internal error. (#PR)
 - `Translator` keeps each server's state in one slot and its lifecycle in one phase. (#PR)
 
 ### Fixed

@@ -112,7 +112,7 @@ pub(super) async fn hierarchy_item_to_lsp<Lsp>(
 where
     Lsp: From<LspHierarchyItem>,
 {
-    // TODO(critic): hierarchy item input ranges bypass Position validation (line 0 saturates to 1); follow-up of #617
+    // TODO(#636): hierarchy item input ranges bypass Position validation (line 0 saturates to 1)
     let range = ctx.denormalize_range(&uri, &item.range).await;
     let selection_range = ctx.denormalize_range(&uri, &item.selection_range).await;
 
