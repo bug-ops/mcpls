@@ -996,6 +996,61 @@ mod tests {
         assert_eq!(served_by, configs[1].id());
     }
 
+    /// The registry is read before the router, so a router already moved off
+    /// a failing server never pairs with the registry from before the move.
+    #[tokio::test]
+    async fn test_snapshot_between_rebind_and_failure_record_still_routes_to_the_catch_all() {
+        let configs = [
+            named_config("a", "rust", Some(vec![ToolKind::Hover])),
+            named_config("b", "rust", None),
+        ];
+        let translator = Translator::new()
+            .with_extensions(crate::test_lsp::test_extensions())
+            .with_router(ToolRouter::from_configs(&configs).unwrap());
+        translator.set_expected_servers(
+            configs
+                .iter()
+                .map(crate::config::LspServerConfig::id)
+                .collect(),
+        );
+        translator.settle_started(crate::lsp::fake_lsp_server_with_config(configs[1].clone()));
+
+        lock_std(&translator.servers).announce_failure(&spawn_failure(&configs[0]));
+        translator.rebind_router_to_settled();
+
+        assert_matches!(
+            translator
+                .tool_support_snapshot()
+                .document_support("rust", ToolKind::Hover),
+            RouteSupport::Supported { server } | RouteSupport::CapabilityNotAdvertised { server, .. }
+                if server == configs[1].id()
+        );
+    }
+
+    /// An init-task panic while a server is mid-restart leaves its slot alone:
+    /// the restart's backend is restored to a running server, and the slot's
+    /// bookkeeping survives.
+    #[tokio::test]
+    async fn test_init_panic_during_a_restart_does_not_fail_or_drop_the_restarting_server() {
+        let config = crate::config::LspServerConfig::rust_analyzer();
+        let id = config.id();
+        let translator = Translator::new();
+        translator
+            .register_server_complete(crate::lsp::fake_lsp_server_with_config(config.clone()));
+        let lock_before = translator.respawn_lock(&id);
+        let held = lock_std(&translator.servers).take_for_restart(&id).unwrap();
+
+        translator
+            .settle_after_init_panic(&[crate::test_lsp::init_config_for(config)])
+            .await;
+
+        assert!(translator.startup_failure(&id).is_none());
+        assert!(Arc::ptr_eq(&lock_before, &translator.respawn_lock(&id)));
+        let refused = lock_std(&translator.servers).restore(&id, held);
+        assert!(refused.is_none());
+        assert_eq!(translator.registered_server_count(), 1);
+    }
+
     /// A settlement that finds an earlier failure keeps it and records only
     /// the servers that never settled.
     #[tokio::test]

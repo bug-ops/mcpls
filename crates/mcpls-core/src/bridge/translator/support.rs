@@ -167,13 +167,12 @@ impl ToolSupportSnapshot {
 }
 
 impl Translator {
-    /// Copy the registries `get_tool_support` reads: one `servers` guard and
+    /// Copy the registries `get_tool_support` reads: one `servers` guard, then
     /// one router clone. A server is a single slot, so a healthy server is
     /// seen as registered or expected, never as neither (which would be
     /// misreported as `no_server`), whatever registration or restart is
     /// doing at the same moment.
     pub(crate) fn tool_support_snapshot(&self) -> ToolSupportSnapshot {
-        let router = self.router_snapshot();
         let servers = lock_std(&self.servers);
         let expected = servers.expected();
         let capabilities = servers
@@ -186,6 +185,10 @@ impl Translator {
             .cloned()
             .collect();
         drop(servers);
+        // Read after the registry: a settlement writes the registry first and
+        // the router after, so a router that is newer than the registry only
+        // moves routes toward servers that are already registered or expected.
+        let router = self.router_snapshot();
         ToolSupportSnapshot {
             router,
             expected,

@@ -15,7 +15,7 @@ use tokio::task::AbortHandle;
 use super::respawn::RespawnBackoff;
 use super::restart::RestartGeneration;
 use crate::config::ServerId;
-use crate::error::{ServerSpawnFailure, StartupFailure};
+use crate::error::ServerSpawnFailure;
 use crate::lsp::{LspClient, LspServer};
 
 /// What a running slot holds.
@@ -95,14 +95,18 @@ impl Backend {
     reason = "one value per configured server; boxing the backend buys nothing"
 )]
 pub(super) enum ServerStatus {
-    /// Configured and applicable, not registered yet (or taken out for a
-    /// restart). Keeps the failure it had before, if any, so clearing the
-    /// expectation does not lose it.
+    /// Configured and applicable, not registered yet. Keeps the failure it
+    /// had before, if any, so clearing the expectation does not lose it.
     Expected {
         prior_failure: Option<ServerSpawnFailure>,
     },
     /// Registered and serving.
     Running(Backend),
+    /// Taken out for a manual restart; its backend is held by the restart.
+    /// Reads as expected, but startup settlement and expectation clearing
+    /// leave it alone, so a restart in flight is never mistaken for a
+    /// pending startup.
+    Restarting,
     /// Failed to start; terminal until mcpls restarts.
     Failed(ServerSpawnFailure),
     /// Shut down; its client is kept so late callers fail with
@@ -130,6 +134,13 @@ pub(super) struct ServerSlot {
     pub(super) restart: RestartState,
     /// The task consuming this server's notification lanes.
     pub(super) notification_task: Option<AbortHandle>,
+}
+
+impl ServerStatus {
+    /// Whether the server is yet to register: pending startup or restarting.
+    const fn awaits_registration(&self) -> bool {
+        matches!(self, Self::Expected { .. } | Self::Restarting)
+    }
 }
 
 impl ServerSlot {
@@ -167,7 +178,9 @@ impl Servers {
         match &self.0.get(id)?.status {
             ServerStatus::Running(backend) => Some(backend.client().clone()),
             ServerStatus::Stopped(client) => Some(client.clone()),
-            ServerStatus::Expected { .. } | ServerStatus::Failed(_) => None,
+            ServerStatus::Expected { .. } | ServerStatus::Restarting | ServerStatus::Failed(_) => {
+                None
+            }
         }
     }
 
@@ -176,7 +189,9 @@ impl Servers {
         self.0.values().filter_map(|slot| match &slot.status {
             ServerStatus::Running(backend) => Some(backend.client()),
             ServerStatus::Stopped(client) => Some(client),
-            ServerStatus::Expected { .. } | ServerStatus::Failed(_) => None,
+            ServerStatus::Expected { .. } | ServerStatus::Restarting | ServerStatus::Failed(_) => {
+                None
+            }
         })
     }
 
@@ -205,24 +220,23 @@ impl Servers {
     }
 
     pub(super) fn is_expected(&self, id: &ServerId) -> bool {
-        matches!(
-            self.0.get(id).map(|slot| &slot.status),
-            Some(ServerStatus::Expected { .. })
-        )
+        self.0
+            .get(id)
+            .is_some_and(|slot| slot.status.awaits_registration())
     }
 
     /// Whether any server is still expected to register.
     pub(super) fn any_expected(&self) -> bool {
         self.0
             .values()
-            .any(|slot| matches!(slot.status, ServerStatus::Expected { .. }))
+            .any(|slot| slot.status.awaits_registration())
     }
 
     /// The ids of every expected server.
     pub(super) fn expected(&self) -> HashSet<ServerId> {
         self.0
             .iter()
-            .filter(|(_, slot)| matches!(slot.status, ServerStatus::Expected { .. }))
+            .filter(|(_, slot)| slot.status.awaits_registration())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -334,7 +348,7 @@ impl Servers {
                     slot.status = ServerStatus::Failed(failure.clone());
                     false
                 }
-                ServerStatus::Running(_) | ServerStatus::Stopped(_) => {
+                ServerStatus::Running(_) | ServerStatus::Restarting | ServerStatus::Stopped(_) => {
                     tracing::debug!(
                         id = %failure.server_id,
                         "startup failure ignored: the server is registered"
@@ -353,6 +367,7 @@ impl Servers {
                 self.0.get(&failure.server_id).map(|slot| &slot.status),
                 Some(
                     ServerStatus::Running(_)
+                        | ServerStatus::Restarting
                         | ServerStatus::Stopped(_)
                         | ServerStatus::Failed(_)
                         | ServerStatus::Expected {
@@ -361,7 +376,6 @@ impl Servers {
                 )
             );
             if !settled {
-                debug_assert!(matches!(failure.reason, StartupFailure::InitTaskPanicked));
                 self.record_failure(&failure);
             }
         }
@@ -387,12 +401,7 @@ impl Servers {
         if !matches!(slot.status, ServerStatus::Running(_)) {
             return None;
         }
-        match std::mem::replace(
-            &mut slot.status,
-            ServerStatus::Expected {
-                prior_failure: None,
-            },
-        ) {
+        match std::mem::replace(&mut slot.status, ServerStatus::Restarting) {
             ServerStatus::Running(backend) => Some(backend),
             other => {
                 slot.status = other;
@@ -408,7 +417,7 @@ impl Servers {
     /// caller drops it after releasing the guard.
     pub(super) fn restore(&mut self, id: &ServerId, backend: Backend) -> Option<Backend> {
         match self.0.get_mut(id) {
-            Some(slot) if matches!(slot.status, ServerStatus::Expected { .. }) => {
+            Some(slot) if matches!(slot.status, ServerStatus::Restarting) => {
                 slot.status = ServerStatus::Running(backend);
                 None
             }
@@ -480,7 +489,8 @@ impl Servers {
                     } => ServerSettlement::Failed,
                     ServerStatus::Expected {
                         prior_failure: None,
-                    } => ServerSettlement::Pending,
+                    }
+                    | ServerStatus::Restarting => ServerSettlement::Pending,
                 };
                 (id.clone(), settlement)
             })
@@ -604,6 +614,7 @@ impl Phase {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::error::StartupFailure;
 
     #[test]
     fn test_phase_shutdown_is_terminal_and_init_panic_survives_settling() {
