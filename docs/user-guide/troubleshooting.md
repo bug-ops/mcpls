@@ -604,6 +604,12 @@ file_patterns = ["**/*.go"]
 - `ServerFailedToStart`: the message names the command and the reason; install the server or fix its `command`/`args` in the config, then restart mcpls
 - `resources/subscribe` on such a file fails the same way, except during startup, where it succeeds and you receive one `resources/updated` if startup then fails; re-read the resource to get the error
 
+### "was not started: the workspace is untrusted"
+
+**Cause**: mcpls runs with `--workspace-trust untrusted`, which starts only the servers named with `--allow-server`. The error names the server, the kind of workspace code it may run, and the flag that starts it.
+
+**Fix**: restart mcpls with `--allow-server <id>` for each server you accept to run workspace code (the id is shown in the error). If the error says the executable "lies inside the workspace", "was not found on a PATH outside the workspace" or that its tsserver "lies inside the workspace", the binary comes from the workspace itself or cannot be found, and no flag overrides that: install it outside the workspace, or fix `PATH` (workspace, relative and empty `PATH` entries are ignored in this mode). A startup error that a config file "lies inside the workspace or the current directory" means `--config` or `MCPLS_CONFIG` points at a file the analyzed checkout controls; move it elsewhere.
+
 ### "tsserver pin" warnings for TypeScript
 
 **Cause**: mcpls pins the TypeScript server's `tsserver` to the one bundled with `typescript-language-server` so a workspace's own `node_modules` tsserver does not run. When it cannot, it logs a warning naming the reason.

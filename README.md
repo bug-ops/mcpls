@@ -291,6 +291,13 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 > asdf, mise and `npx`/`bunx`/`deno npm:` launchers are not covered; set
 > `initialization_options.tsserver.path` for them. See [SECURITY.md](SECURITY.md) for the trust model.
 
+> [!WARNING]
+> `--workspace-trust untrusted` starts only the servers you name with
+> `--allow-server <id>` (repeatable) and refuses a config file or server
+> executable inside the workspace. It is not a sandbox: an allowed server still
+> runs workspace code. Set it in your user-scoped MCP client config, because a
+> project-scoped one is controlled by the repository. See [SECURITY.md](SECURITY.md#untrusted-workspace-mode).
+
 </details>
 
 <details>

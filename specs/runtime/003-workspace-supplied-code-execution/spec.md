@@ -28,8 +28,8 @@ related:
 ## Decision (#566): documentation plus a best-effort tsserver pin
 
 > [!important] Resolved
-> Scope: FR-001 to FR-006, FR-009 implemented. FR-007 and FR-008 (untrusted-workspace mode, #603) are
-> deferred to a follow-up issue. Open questions 1 to 3, 7 and 8 are answered below.
+> Scope: FR-001 to FR-009 implemented; FR-007 and FR-008 (untrusted-workspace mode) in #603. Open
+> questions 1 to 5, 7 and 8 are answered below.
 
 - **Docs.** `SECURITY.md` carries the per-server trust table, the `--trust-project-config`
   disclaimer (FR-001, FR-002), the private reporting route (FR-009) and the pin coverage. Only the
@@ -51,7 +51,35 @@ related:
   Volta, asdf, mise shims and relative-script wrappers as `UnsupportedLauncher`; both name
   `initialization_options.tsserver.path`. A missing or invalid `typescript` package is logged as
   `NoTypescriptNextToServer`, a missing executable as `ServerNotOnPath`. None blocks startup
-  (NFR-005). Version-manager shims remain a follow-up.
+  (NFR-005). Version-manager shims are tracked in #645.
+- **Untrusted-workspace mode (#603, FR-007, FR-008).** `WorkspaceTrust { Trusted, Untrusted(ServerAllowlist) }`
+  (`config/trust.rs`) is a closed typed value on `ServerConfig::workspace_trust`, never read from a
+  config file. It is set only by `--workspace-trust untrusted` and repeatable `--allow-server <id>`;
+  there is no environment variable and no config key, so a planted config cannot grant consent.
+  Untrusted conflicts with `--trust-project-config` (also through its environment variable), and
+  `--allow-server` without untrusted is a usage error (exit 2). An allowed id that names no configured
+  server fails `validate`. `plan_server_starts` returns a `StartPlan { admitted, refused }`: a refused
+  server never becomes a `ServerInitConfig`, so startup, restart and respawn cannot reach a spawn. Each
+  refusal is recorded as `StartupFailure::RefusedUntrustedWorkspace(UntrustedRefusal)` and routing is
+  rebound away from it (`Translator::record_refusals`); a tool call routed to it returns
+  `Error::ServerFailedToStart` (kind Internal) naming the server and `--allow-server <id>`, and
+  `restart_server` reports `not_running`. Every server is refused unless allowed: the classification
+  (`BuiltinServer::workspace_code`) only words the message, so unclassified and user-defined servers
+  are refused as well (US-004, open question 5).
+- **Untrusted-mode executable and config checks.** An allowed server's executable is resolved
+  (`lsp/command_path.rs`, mirroring the standard library's lookup). One that is not found is refused
+  as `UnresolvedExecutable`, one that canonicalizes inside a workspace root as `WorkspaceExecutable`;
+  `--allow-server` overrides neither. The admitted config then spawns the resolved absolute path (so
+  restart and respawn do not re-resolve) with a `PATH` stripped of workspace, relative and empty
+  entries (always set, and a fixed system path when none is left) and `HOME` and `USERPROFILE` set to the login home from the account database (when that is unknown or not UTF-8, an inherited one inside a root is refused as `WorkspaceHome`), which also governs `#!/usr/bin/env` interpreters and the tools the server starts. A pinned
+  tsserver inside a root is refused as `WorkspaceTsserver`. Not covered: interpreter arguments,
+  directories above a configured root, case-insensitive file systems, hardlinks, the Windows
+  application-directory search. The config file that was actually loaded (`--config`,
+  `MCPLS_CONFIG`, or the auto-discovered user config) must lie outside the roots, and outside the
+  working directory when its path is relative or environment-derived, except that `/` and the login home
+  directory (account database, never `$HOME`) are never taken for a checkout; violation is a startup error
+  (`Error::ConfigInsideWorkspace`), and no default config file is created. Trusted mode runs none of
+  this and logs nothing new.
 - **Inside the workspace.** A server installed inside the workspace is still pinned and a warning is
   logged: skipping would let the server walk the `rootUri` ancestors and pick the workspace tsserver.
 - **User options (FR-006).** A user `tsserver.path` wins. User options without `tsserver.path` skip
@@ -189,7 +217,7 @@ WHEN a tool call would spawn a server classified as executing workspace code
 THEN mcpls reports a typed, actionable refusal and spawns nothing
 ```
 
-This story is conditional on the option decision in Open Questions.
+Implemented by #603: `--workspace-trust untrusted` with `--allow-server <id>` consent per server.
 
 ### US-005: Reporter knows how to file a security report
 
@@ -253,7 +281,7 @@ No persistent storage is introduced.
 | Workspace-supplied `./mcpls.toml` sets `initialization_options` to repoint tsserver | Governed by the existing config trust gate; the pin does not defend a trusted config |
 | Symlinked or relocated workspace-local TypeScript installation pointing outside the workspace | Resolution is by the server, not mcpls; documented as outside mcpls control |
 | Server other than TypeScript (rust-analyzer build scripts, proc macros) | No upstream pin exists that avoids the behavior without breaking the server; documentation only (FR-001) |
-| Untrusted-workspace mode enabled and a configured server is not classified | [NEEDS CLARIFICATION: treat unclassified (including user-defined) servers as executing workspace code, or as safe] |
+| Untrusted-workspace mode enabled and a configured server is not classified | Refused like every other server unless allowed; the message says the workspace code it may run is unknown |
 | Windows path and extension differences for tsserver | Pin must be resolved with platform-correct paths (NFR-002) |
 
 ## 7. Success Criteria
@@ -291,8 +319,8 @@ No persistent storage is introduced.
 > - [NEEDS CLARIFICATION: scope decision — documentation only (FR-001 to FR-003, FR-009), documentation plus typescript pinning (FR-004, FR-005), or additionally an untrusted-workspace mode (FR-007, FR-008)? Recommended default for P3: documentation plus a best-effort typescript pin.]
 > - [NEEDS CLARIFICATION: can the bundled tsserver be resolved reliably and portably (relative to the resolved typescript-language-server install, across global package-manager installs, one-off runners and Windows), or is any hard-coded path inherently non-portable? If not reliably resolvable, FR-004 drops to documentation only.]
 > - [NEEDS CLARIFICATION: is the behavior change acceptable for projects relying on a workspace-pinned TypeScript version, given NFR-003 and the opt-out in US-003?]
-> - [NEEDS CLARIFICATION: how should an untrusted-workspace mode be activated (CLI flag, environment variable, config key) and does it relate to the existing global `--trust-project-config` flag, which is not scoped per project?]
-> - [NEEDS CLARIFICATION: classification of user-defined and unclassified servers in untrusted mode.]
+> - [RESOLVED: activated by the `--workspace-trust untrusted` command-line flag only (no environment variable, no config key); it conflicts with `--trust-project-config`, which stays a separate, global gate for the mcpls config.]
+> - [RESOLVED: user-defined and unclassified servers are refused unless allowed with `--allow-server`.]
 > - [NEEDS CLARIFICATION: which of the non-TypeScript rows were verified live; rust-analyzer, pyright, gopls and clangd claims come from the finding's class list and need per-server confirmation before they are published as fact.]
 > - [NEEDS CLARIFICATION: SECURITY.md contents: supported versions, private contact or GitHub private vulnerability reporting enabled on the repository, and disclosure timeline.]
 > - [NEEDS CLARIFICATION: issue number to record in the Metadata callout once filed.]

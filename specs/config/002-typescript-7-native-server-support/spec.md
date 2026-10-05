@@ -107,7 +107,7 @@ widening the workspace-code-execution surface, mcpls selects the native server i
 - Bundling, vendoring or installing TypeScript, `typescript-language-server` or the native server on the user's behalf (guidance only, consistent with [[lsp/006-server-spawn-install-hint/spec|lsp/006]]).
 - Supporting `typescript-language-server` against TypeScript 7 (an upstream concern).
 - Type hierarchy for TypeScript: neither server supports it; the existing unsupported-capability behavior stands.
-- Untrusted-workspace mode (#603, deferred by [[runtime/003-workspace-supplied-code-execution/spec|runtime/003]]).
+- Untrusted-workspace mode (#603, implemented by [[runtime/003-workspace-supplied-code-execution/spec|runtime/003]]).
 - Pin support for Volta, asdf and mise shims and for `npx`/`bunx`/`pnpm dlx`/`deno npm:` package runners (documented: set `initialization_options.tsserver.path`).
 - Changes to non-TypeScript built-in servers.
 - Technical design: recorded in a plan after this spec is approved.
@@ -350,7 +350,7 @@ Delivered scope: automatic selection (FR-007, FR-011 to FR-013).
 - When the native server is chosen, `command` and `args` are replaced (`--lsp --stdio`); user edits to them are dropped, so remove `selection` to keep them. `initialization_options` and the rest of the entry are unchanged; no `tsserver.path` pin is generated for the native command (FR-009).
 - "Not runnable" is checked cheaply: an executable bit, and `node` on the effective `PATH` when `bin/tsc` has a `node` shebang (`TsserverKept::NodeNotOnPath`). A wrong-platform package is not detected; its spawn failure surfaces through the existing typed errors.
 - The choice and its reason are logged at info level (FR-012). Any failed selection keeps `typescript-language-server` and never aborts startup (FR-013). Selection runs once per startup; respawn and restart reuse the stored config.
-- Unix only: on Windows `bin/tsc` is a script and npm installs `.cmd` shims, so the flavor stays `typescript-language-server` (`TsserverKept::UnsupportedPlatform`); native auto-selection on Windows is a follow-up.
+- Unix only: on Windows `bin/tsc` is a script and npm installs `.cmd` shims, so the flavor stays `typescript-language-server` (`TsserverKept::UnsupportedPlatform`); native auto-selection on Windows is tracked in #646.
 - Existing on-disk configs lack the key and never auto-select; adding `selection = "auto"` opts in, and older mcpls versions reject the key.
 
 ## 10. See Also

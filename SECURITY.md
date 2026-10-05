@@ -89,5 +89,108 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   `PATH` resolves into the workspace, is workspace-supplied code. The tsserver pin
   does not apply to it.
 
-An untrusted-workspace mode is tracked in #603. Run `mcpls` against untrusted code only inside an environment you are willing to
+## Untrusted-workspace mode
+
+`--workspace-trust untrusted` starts only the language servers you name with
+`--allow-server <id>` (repeatable; the id is the server's `name`, else its
+`language_id`, such as `rust`). Every other applicable server is refused before
+it is spawned, restarted or respawned, and a tool call routed to it returns an
+error that names the server and the flag that would start it. The flags are
+command-line only: there is no environment variable and no config key, so a
+config file planted in the workspace cannot grant consent. The mode conflicts
+with `--trust-project-config` (also when set by `MCPLS_TRUST_PROJECT_CONFIG`),
+and `--allow-server` without it is a usage error (exit code 2).
+
+This is not a sandbox. An allowed server still runs the workspace code listed
+above, so allow a server only when you accept that. The mode additionally
+enforces the following, and nothing more:
+
+- **Config file.** The file that was actually loaded must lie outside the
+  workspace: `--config`, `MCPLS_CONFIG` and the auto-discovered user config
+  (found through `$HOME` or `$XDG_CONFIG_HOME`, which a checkout's tooling can
+  set) are all checked. It is checked against the configured roots (or the
+  working directory when none are configured). The working directory is also
+  checked when the path is relative or came from the environment. A working
+  directory that is `/` or your login home directory (taken from the account
+  database, never from `$HOME`, which a checkout's tooling can set) is never
+  treated as a checkout.
+  No default config file is created in this mode.
+- **Executable.** The server's executable is resolved the way a spawn would
+  find it and must exist outside the workspace roots; one that cannot be
+  resolved is refused. mcpls then spawns that resolved absolute path (also on
+  restart and respawn, so a binary added to a workspace directory later is not
+  picked up) with a `PATH` that has the workspace, relative and empty entries
+  removed. A server always gets such a `PATH`, even when mcpls itself has none,
+  and a fixed system path if nothing is left, since an empty or missing `PATH`
+  makes shells and `execvp` search the current directory. A `#!/usr/bin/env node` interpreter, and any tool the
+  server itself looks up on `PATH`, therefore cannot resolve into the
+  workspace through `PATH`.
+- **Environment.** Servers start with a cleared environment. What is passed
+  on from mcpls's own is `PATH` (sanitized as above), `HOME`, `USERPROFILE`,
+  `TMPDIR`, `TEMP`, `TMP` and the Windows system variables. `NODE_OPTIONS`,
+  `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `PYTHONPATH`, `RUSTC_WRAPPER` and
+  `XDG_CONFIG_HOME` are not passed unless the server's own `env` sets them. In
+  this mode `HOME` and `USERPROFILE` are replaced by the login home directory
+  (from the account database) unless the server's `env` sets them, so a
+  `$HOME` that names the workspace cannot steer rustup, cargo or npm
+  configuration; mcpls itself also rejects a config file reached through such
+  a `$HOME` or `$XDG_CONFIG_HOME`. If the login home cannot be determined (or
+  is not valid UTF-8), a server whose inherited `HOME` or `USERPROFILE` lies
+  inside the workspace, or is empty (tools resolve an empty home against the
+  working directory, which is the checkout), is refused, and so is an unset
+  `HOME` on Unix (`~` would resolve against the working directory); only an
+  existing value outside the workspace is passed on unchecked. The `USERPROFILE` replacement was not
+  verified on Windows. Where `$HOME` legitimately differs from the account home
+  (CI container jobs with `HOME=/github/home`, `sudo`, Nix or Bazel sandboxes),
+  servers see the account home, so toolchains installed under the overridden
+  `$HOME` are not found: set `HOME` in that server's `env` to opt in.
+- **tsserver pin.** A TypeScript server whose pinned tsserver lies inside the
+  workspace is refused instead of started.
+
+What the mode does not cover:
+
+- Interpreter arguments: `node <workspace>/cli.mjs` runs workspace code, and
+  only the `node` executable is checked.
+- With no configured `workspace.roots`, the working directory is the checkout
+  unless it is `/` or the login home. With no account entry, or a `$HOME` that
+  differs from it and equals the working directory, binaries under it (such as
+  `~/.cargo/bin`) and a config found there are refused: configure
+  `workspace.roots`.
+- Directories above a configured root, such as a monorepo around the
+  configured package, count as outside the workspace.
+- Case-insensitive file systems and hardlinks are not specifically handled or
+  tested: a hardlinked binary has no distinguishable location.
+- On Windows the standard library also searches the application directory and
+  the system directories; mcpls resolves only the child `PATH`, so a command it
+  cannot resolve is refused rather than guessed.
+- The mode is not surfaced to MCP clients through `get_info`; the refusals are
+  in the error text of the affected tool calls and in the log.
+- `TMPDIR`, `TEMP` and `TMP` are passed on as inherited, and values a
+  server's own `env` sets are used as written. When the login home is
+  unknown, a `HOME` set to the parent of a configured root (roots
+  `[<ws>/pkg]`, `HOME=<ws>`) is not refused: it falls under the directories
+  above a configured root listed below.
+- Launchers that choose the real server from files in the workspace: rustup
+  honors a workspace `rust-toolchain.toml` whose `path` names a toolchain
+  inside it, so the `rust-analyzer` proxy outside the workspace can run a
+  binary from the workspace; asdf, mise and Volta pick versions from workspace
+  files; Go switches toolchains from `go.mod`. The executable check sees only
+  the launcher.
+- A server restarted or respawned runs the path resolved at startup. If that
+  path goes through a symlink inside the workspace, the symlink can be
+  repointed later; only the resolved path's own directory is checked, not
+  every link of a chain.
+- TypeScript pin: a pin that resolves inside the workspace is refused, an
+  unresolved one (package runner, unknown wrapper) is not. mcpls starts the
+  server without a `rootUri`, so it does not look up a workspace tsserver on
+  its own, which is why this is not treated as a bypass.
+- Code the allowed servers run on their own (build scripts, procedural macros,
+  tsconfig plugins) is outside every check above.
+
+A project-scoped MCP client config (for example a `.mcp.json` in the analyzed
+repository) controls the arguments mcpls is launched with, so it can drop
+`--workspace-trust untrusted` or add `--allow-server`. Set the mode in your
+user-scoped client configuration.
+
+Run `mcpls` against untrusted code only inside an environment you are willing to
 have that code execute in (a container or a disposable VM).

@@ -41,6 +41,27 @@ e.g. a `Cargo.toml` in the workspace still spawns rust-analyzer. An explicit
 `--config <path>` or `$MCPLS_CONFIG` is always trusted, since naming a path is
 itself the user's consent.
 
+#### Untrusted workspace mode
+
+`--workspace-trust untrusted` starts only the servers you allow with `--allow-server <id>`
+(repeatable). The id is the server's `name`, else its `language_id` (`rust`, `python`, ...); an id
+that matches no configured server is rejected at startup. Every other applicable server is refused
+before it can spawn, and a tool call routed to it returns an error naming the server and the flag
+that would start it. Neither flag has an environment variable or a config key, so a config file in
+the workspace cannot grant consent. The mode conflicts with `--trust-project-config`, and
+`--allow-server` without it is a usage error.
+
+It also refuses a config file inside a workspace root (the `--config` or `$MCPLS_CONFIG` file, or
+the auto-discovered user config; a relative or environment-derived path is also checked against the
+current directory, unless that is `/` or your login home directory from the account database), refuses a server whose executable
+cannot be found or lies inside a workspace root, and spawns the resolved executable with a `PATH`
+stripped of workspace, relative and empty entries (and `HOME` and `USERPROFILE` set to the login home; set `HOME` in a server's `env` where `$HOME` legitimately differs, and configure `workspace.roots` when the working directory is your home directory and no account entry exists). No default config file is created. It is not a
+sandbox: an allowed server still runs workspace code, and interpreter arguments such as
+`node <workspace>/cli.mjs` are not checked, nor are launchers that pick the real server from
+workspace files (rustup's `rust-toolchain.toml` `path`, asdf, mise, Volta, `go.mod` toolchains). Configure it in a user-scoped MCP client config; a
+project-scoped one is controlled by the repository. See
+[SECURITY.md](https://github.com/bug-ops/mcpls/blob/main/SECURITY.md).
+
 #### Trust model
 
 `--trust-project-config` governs only the mcpls config. It does not make the workspace itself safe

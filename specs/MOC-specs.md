@@ -73,7 +73,7 @@ neither belongs to a single `config`/`lsp`/`mcp`/`bridge` module.
 |---|------|------|----------|--------|-------|
 | 001 | [[runtime/001-log-json-bool-env-parsing/spec\|log-json-bool-env-parsing]] | bug | P2 | implemented (#314) | — |
 | 002 | [[runtime/002-sigterm-stdin-blocking-pool-hang/spec\|sigterm-stdin-blocking-pool-hang]] | bug | P1 | implemented (#321, #328) | — |
-| 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | implemented (tsserver pin, docs, SECURITY.md); untrusted-workspace mode deferred | #566 |
+| 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | implemented (tsserver pin, docs, SECURITY.md, untrusted-workspace mode) | #566 |
 | 004 | [[runtime/004-server-text-hygiene/spec\|server-text-hygiene]] | bug | P3 | implemented | #581, #582, #583; #599 |
 
 ## testing
