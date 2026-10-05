@@ -370,6 +370,24 @@ impl BuiltinServer {
         }
     }
 
+    /// The workspace-supplied code this server can run, for the message that
+    /// explains why untrusted mode refused it.
+    #[must_use]
+    pub const fn workspace_code(self) -> &'static str {
+        match self {
+            Self::RustAnalyzer => "Cargo build scripts and procedural macros",
+            Self::Pyright => {
+                "the project's Python environment, plugins and configured interpreters"
+            }
+            Self::TypescriptLanguageServer => {
+                "the workspace's tsserver and tsconfig plugins, unless pinned"
+            }
+            Self::Gopls => "the Go toolchain, including toolchain downloads requested by go.mod",
+            Self::Clangd => "commands from compile_commands.json and .clangd configuration",
+            Self::Zls => "build.zig through its build runner",
+        }
+    }
+
     /// One-line instruction for installing this server.
     #[must_use]
     pub const fn install_hint(self) -> &'static str {

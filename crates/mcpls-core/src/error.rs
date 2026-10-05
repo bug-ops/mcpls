@@ -164,6 +164,147 @@ pub enum StartupFailure {
     /// Starting this server, or the background initialization task as a whole,
     /// panicked before the server registered.
     InitTaskPanicked,
+    /// The workspace is untrusted and this server was not started.
+    RefusedUntrustedWorkspace(UntrustedRefusal),
+}
+
+/// An environment variable that names the user's home directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeVariable {
+    /// `HOME`.
+    Home,
+    /// `USERPROFILE`.
+    UserProfile,
+}
+
+impl HomeVariable {
+    /// Every home variable untrusted mode manages.
+    pub const ALL: [Self; 2] = [Self::Home, Self::UserProfile];
+
+    /// The variable's name in the environment.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Home => "HOME",
+            Self::UserProfile => "USERPROFILE",
+        }
+    }
+}
+
+impl fmt::Display for HomeVariable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Why untrusted-workspace mode refused to start a server.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::BuiltinServer;
+/// use mcpls_core::error::UntrustedRefusal;
+///
+/// let refusal = UntrustedRefusal::NotAllowed {
+///     builtin: Some(BuiltinServer::RustAnalyzer),
+/// };
+/// assert!(refusal.to_string().contains("Cargo build scripts"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UntrustedRefusal {
+    /// The server was not named with `--allow-server`.
+    NotAllowed {
+        /// The built-in server this is, whose workspace-code class is named
+        /// in the message; `None` for a custom server.
+        builtin: Option<BuiltinServer>,
+    },
+    /// The server's executable lies inside the workspace. Naming the server
+    /// does not consent to running a binary the workspace supplies.
+    WorkspaceExecutable {
+        /// The canonical path of the executable.
+        executable: PathBuf,
+    },
+    /// The executable was not found on a search path outside the workspace,
+    /// so untrusted mode cannot tell what would run.
+    UnresolvedExecutable {
+        /// The configured `command`.
+        command: String,
+    },
+    /// The login home directory is unknown and the inherited `HOME` lies
+    /// inside the workspace, where rustup, cargo and npm would read their
+    /// configuration from.
+    WorkspaceHome {
+        /// The variable that names the home directory.
+        variable: HomeVariable,
+        /// The path the server would inherit, inside the workspace.
+        home: PathBuf,
+    },
+    /// The login home directory is unknown and a home variable is empty, so
+    /// tools resolve it against the working directory, which is the checkout.
+    EmptyHome {
+        /// The variable that is empty.
+        variable: HomeVariable,
+    },
+    /// The login home directory is unknown and `HOME` is not set, so tools
+    /// would resolve `~` against the working directory, which is the
+    /// checkout.
+    UnknownHome,
+    /// The tsserver the TypeScript server would use lies inside the
+    /// workspace.
+    WorkspaceTsserver {
+        /// The canonical path of the tsserver.
+        tsserver: PathBuf,
+    },
+}
+
+impl fmt::Display for UntrustedRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAllowed {
+                builtin: Some(builtin),
+            } => write!(
+                f,
+                "the workspace is untrusted and it may run workspace code ({})",
+                builtin.workspace_code()
+            ),
+            Self::NotAllowed { builtin: None } => f.write_str(
+                "the workspace is untrusted and it is not a built-in server, so the workspace \
+                 code it may run is unknown",
+            ),
+            Self::WorkspaceExecutable { executable } => write!(
+                f,
+                "its executable {} lies inside the workspace, which untrusted mode never runs",
+                executable.display()
+            ),
+            Self::UnresolvedExecutable { command } => write!(
+                f,
+                "its executable '{command}' was not found on a PATH outside the workspace, \
+                 which untrusted mode requires"
+            ),
+            Self::UnknownHome => f.write_str(
+                "HOME is not set and the login home directory is unknown, so untrusted mode \
+                 cannot give it a safe one",
+            ),
+            Self::EmptyHome { variable } => write!(
+                f,
+                "its {variable} is empty, which resolves inside the workspace, and the login \
+                 home directory is unknown, so untrusted mode cannot give it a safe one"
+            ),
+            Self::WorkspaceHome { variable, home } => write!(
+                f,
+                "its {variable}, {}, lies inside the workspace and the login home directory is \
+                 unknown, so untrusted mode cannot give it a safe one",
+                home.display()
+            ),
+            Self::WorkspaceTsserver { tsserver } => write!(
+                f,
+                "the tsserver it would use, {}, lies inside the workspace, which untrusted \
+                 mode never runs",
+                tsserver.display()
+            ),
+        }
+    }
 }
 
 impl fmt::Display for StartupFailure {
@@ -173,6 +314,7 @@ impl fmt::Display for StartupFailure {
             Self::InitTaskPanicked => {
                 f.write_str("the initialization task panicked (see the mcpls log)")
             }
+            Self::RefusedUntrustedWorkspace(refusal) => refusal.fmt(f),
         }
     }
 }
@@ -197,6 +339,49 @@ impl fmt::Display for ServerSpawnFailure {
             "{} [{}] ({}): {}",
             self.server_id, self.language_id, self.command, self.reason
         )
+    }
+}
+
+impl ServerSpawnFailure {
+    /// The caller-facing text of [`Error::ServerFailedToStart`]. A refusal
+    /// was a decision, not a failure, so it names the remedy instead of the
+    /// startup-failure tail.
+    pub(crate) const fn failed_to_start(&self) -> FailedToStart<'_> {
+        FailedToStart(self)
+    }
+}
+
+/// `Display` adapter for [`ServerSpawnFailure::failed_to_start`].
+pub(crate) struct FailedToStart<'a>(&'a ServerSpawnFailure);
+
+impl fmt::Display for FailedToStart<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let failure = self.0;
+        let (id, language) = (&failure.server_id, &failure.language_id);
+        match &failure.reason {
+            StartupFailure::RefusedUntrustedWorkspace(refusal) => {
+                write!(
+                    f,
+                    "LSP server '{id}' for language '{language}' was not started: {refusal}"
+                )?;
+                match refusal {
+                    UntrustedRefusal::NotAllowed { .. } => {
+                        write!(f, "; restart mcpls with `--allow-server {id}` to start it")
+                    }
+                    UntrustedRefusal::WorkspaceExecutable { .. }
+                    | UntrustedRefusal::UnresolvedExecutable { .. }
+                    | UntrustedRefusal::WorkspaceHome { .. }
+                    | UntrustedRefusal::EmptyHome { .. }
+                    | UntrustedRefusal::UnknownHome
+                    | UntrustedRefusal::WorkspaceTsserver { .. } => Ok(()),
+                }
+            }
+            reason @ (StartupFailure::Spawn(_) | StartupFailure::InitTaskPanicked) => write!(
+                f,
+                "LSP server '{id}' for language '{language}' failed to start: {reason}; restart \
+                 mcpls after fixing it (startup failures are not retried)"
+            ),
+        }
     }
 }
 
@@ -771,10 +956,7 @@ pub enum Error {
     /// mcpls is restarted.
     ///
     /// Boxed to keep [`Error`] small.
-    #[error(
-        "LSP server '{}' for language '{}' failed to start: {}; restart mcpls after fixing it (startup failures are not retried)",
-        .0.server_id, .0.language_id, .0.reason
-    )]
+    #[error("{}", .0.failed_to_start())]
     ServerFailedToStart(Box<ServerSpawnFailure>),
 
     /// LSP server for the language is configured but still initializing.
@@ -842,6 +1024,18 @@ pub enum Error {
     /// Configuration file not found.
     #[error("configuration file not found: {0}")]
     ConfigNotFound(PathBuf),
+
+    /// Untrusted-workspace mode refused a config file that lies inside the
+    /// workspace or the current directory, because the analyzed checkout
+    /// controls it. A startup error; never reaches a tool response.
+    #[error(
+        "config file {} lies inside the workspace or the current directory, which untrusted mode does not trust; move it elsewhere",
+        .path.display()
+    )]
+    ConfigInsideWorkspace {
+        /// The canonical path of the config file.
+        path: PathBuf,
+    },
 
     /// Invalid configuration format.
     #[error("invalid configuration: {0}")]
@@ -1424,6 +1618,7 @@ impl Error {
             | Self::NoServerConfigured
             | Self::NoServerForWorkspaceTool { .. }
             | Self::ConfigNotFound(_)
+            | Self::ConfigInsideWorkspace { .. }
             | Self::InvalidConfig(_)
             | Self::Io(_)
             | Self::Json(_)
@@ -2506,6 +2701,61 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_subscription_limit_reached_stays_internal() {
         let err = Error::SubscriptionLimitReached { max: 1000 };
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
+    }
+
+    fn refusal_failure(refusal: UntrustedRefusal) -> ServerSpawnFailure {
+        ServerSpawnFailure {
+            server_id: ServerId::from("rust"),
+            language_id: LanguageId::new("rust").unwrap(),
+            command: "rust-analyzer".to_string(),
+            reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
+        }
+    }
+
+    #[test]
+    fn test_not_allowed_refusal_names_the_server_class_and_the_remedy() {
+        let err =
+            Error::ServerFailedToStart(Box::new(refusal_failure(UntrustedRefusal::NotAllowed {
+                builtin: Some(BuiltinServer::RustAnalyzer),
+            })));
+        assert_eq!(
+            err.to_string(),
+            "LSP server 'rust' for language 'rust' was not started: the workspace is untrusted \
+             and it may run workspace code (Cargo build scripts and procedural macros); restart \
+             mcpls with `--allow-server rust` to start it"
+        );
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
+    }
+
+    #[test]
+    fn test_workspace_executable_refusal_offers_no_allow_remedy() {
+        let err = Error::ServerFailedToStart(Box::new(refusal_failure(
+            UntrustedRefusal::WorkspaceExecutable {
+                executable: PathBuf::from("/ws/bin/rust-analyzer"),
+            },
+        )));
+        let text = err.to_string();
+        assert!(
+            text.contains("its executable /ws/bin/rust-analyzer lies inside the workspace"),
+            "{text}"
+        );
+        assert!(!text.contains("--allow-server"), "{text}");
+        assert!(!text.contains("not retried"), "{text}");
+    }
+
+    #[test]
+    fn test_custom_server_refusal_says_its_workspace_code_is_unknown() {
+        let text = UntrustedRefusal::NotAllowed { builtin: None }.to_string();
+        assert!(text.contains("not a built-in server"), "{text}");
+    }
+
+    #[test]
+    fn test_config_inside_workspace_is_a_startup_error_of_kind_internal() {
+        let err = Error::ConfigInsideWorkspace {
+            path: PathBuf::from("/ws/mcpls.toml"),
+        };
+        assert!(err.to_string().contains("/ws/mcpls.toml"));
         assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
     }
 }

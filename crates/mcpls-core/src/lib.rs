@@ -60,11 +60,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use bridge::{NotificationCache, Translator, WorkspaceRoots};
-pub use config::{ProjectConfigStatus, ProjectConfigTrust, ServerConfig};
+pub use config::{
+    ProjectConfigStatus, ProjectConfigTrust, ServerAllowlist, ServerConfig, WorkspaceTrust,
+};
 use config::{ServerId, ToolRouter};
 pub use error::Error;
 use mcp::SubscriptionRegistry;
-use runtime::{plan_server_starts, shutdown, spawn_lsp_servers_background};
+use runtime::{StartPlan, plan_server_starts, shutdown, spawn_lsp_servers_background};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 pub use transport::Transport;
@@ -202,7 +204,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         &config.lsp_servers,
         lsp::current_environment(),
     ));
-    let applicable_configs = plan_server_starts(&config, &workspace_roots, &startup_redactions);
+    let plan = plan_server_starts(&config, &workspace_roots, &startup_redactions);
+    let refusals = plan.failures();
+    let StartPlan {
+        admitted: applicable_configs,
+        refused,
+    } = plan;
 
     info!(
         "Attempting to spawn {} applicable LSP server(s)...",
@@ -213,7 +220,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // #174's workspace-scoped routing rules (duplicate ServerId, conflicting
     // `handles` claims) are enforced -- a startup error naming the
     // conflicting `[[lsp_servers]]` entries, not a silent drop.
-    let router = ToolRouter::from_configs(applicable_configs.iter().map(|c| &c.server_config))?;
+    let router = ToolRouter::from_configs(
+        applicable_configs
+            .iter()
+            .map(|c| &c.server_config)
+            .chain(refused.iter().map(|r| &r.config)),
+    )?;
 
     // Built here (rather than alongside `subscription_registry` below) so
     // it can be handed to the translator, which uses it to invalidate a
@@ -244,6 +256,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         .map(|c| c.server_config.id())
         .collect();
     translator.set_expected_servers(expected_servers);
+    translator.record_refusals(&refusals);
 
     // Shared state, built BEFORE LSP initialization so the MCP server can answer
     // `initialize` immediately. LSP servers (which can take minutes to initialize
@@ -265,7 +278,14 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
     let lsp_init_handle = if applicable_configs.is_empty() {
-        warn!("No applicable LSP servers configured — starting in protocol-only mode");
+        if refusals.is_empty() {
+            warn!("No applicable LSP servers configured — starting in protocol-only mode");
+        } else {
+            warn!(
+                "The workspace is untrusted and no applicable LSP server was allowed — starting \
+                 in protocol-only mode; allow servers with `--allow-server <id>`"
+            );
+        }
         None
     } else {
         info!(
@@ -368,6 +388,7 @@ mod tests {
                     selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
+                workspace_trust: crate::config::WorkspaceTrust::default(),
             };
 
             // serve() proceeds to run the MCP server and blocks on the stdio
@@ -411,6 +432,7 @@ mod tests {
                 },
                 lsp_servers: vec![],
                 project_config_status: ProjectConfigStatus::NotIgnored,
+                workspace_trust: crate::config::WorkspaceTrust::default(),
             };
 
             let result = serve(config).await;
@@ -469,6 +491,7 @@ mod tests {
                 },
                 lsp_servers: vec![],
                 project_config_status: ProjectConfigStatus::NotIgnored,
+                workspace_trust: crate::config::WorkspaceTrust::default(),
             };
 
             // serve() with no LSP servers configured blocks on the stdio
@@ -537,6 +560,7 @@ mod tests {
                     selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
+                workspace_trust: crate::config::WorkspaceTrust::default(),
             };
 
             // `validate()` runs before any spawn/transport work and should

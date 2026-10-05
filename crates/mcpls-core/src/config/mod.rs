@@ -10,6 +10,7 @@ mod position_encodings;
 mod routing;
 mod server;
 mod settings;
+mod trust;
 
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -26,9 +27,12 @@ pub use server::{
     MAX_TIMEOUT_SECONDS, ServerHeuristics, ServerSelection,
 };
 pub use settings::{InvalidLspSettings, LspSettings};
+pub(crate) use trust::login_home_dir;
+pub use trust::{ServerAllowlist, WorkspaceTrust};
 
 use crate::bridge::{
-    DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits, join_relative_root, probe_root,
+    DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits, WorkspaceRoots,
+    join_relative_root, probe_root,
 };
 use crate::error::{Error, Result};
 use crate::util::{OpenRegularFileError, ReadBoundedError, RegularFile};
@@ -72,6 +76,14 @@ pub struct ServerConfig {
     /// typically invisible to an MCP client).
     #[serde(skip)]
     pub project_config_status: ProjectConfigStatus,
+
+    /// Whether the analyzed workspace is trusted (see [`WorkspaceTrust`]).
+    ///
+    /// Never read from or written to a TOML file: consent comes only from the
+    /// command line of whoever launches mcpls, so a config file planted in the
+    /// workspace cannot grant it.
+    #[serde(skip)]
+    pub workspace_trust: WorkspaceTrust,
 }
 
 /// Optional overrides for the text mcpls reports about itself over MCP.
@@ -694,6 +706,25 @@ fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
     ]
 }
 
+/// Where a config file path came from, which decides whether the working
+/// directory counts as part of the workspace it must stay out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOrigin {
+    /// Given on the command line as an absolute or relative path.
+    Argument,
+    /// Taken from the environment (`MCPLS_CONFIG`, `$HOME`, `$XDG_CONFIG_HOME`),
+    /// which a checkout's tooling (direnv, a project-scoped client config)
+    /// can set.
+    Environment,
+}
+
+/// Whether discovery writes a default config file when none exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateDefault {
+    Yes,
+    No,
+}
+
 /// Trust level applied to a `./mcpls.toml` discovered relative to the
 /// process's current working directory.
 ///
@@ -916,6 +947,42 @@ impl ServerConfig {
     /// Returns an error if parsing an existing config fails.
     /// If config creation fails, returns default config with graceful degradation.
     pub fn load_with_trust(trust: ProjectConfigTrust) -> Result<Self> {
+        Self::discover(trust, CreateDefault::Yes).map(|(config, _)| config)
+    }
+
+    /// Discovers the configuration like [`load_with_trust`](Self::load_with_trust)
+    /// for a workspace trusted as `workspace`, applying that trust to the result.
+    ///
+    /// With [`WorkspaceTrust::Untrusted`] the file that was actually loaded is
+    /// checked with [`ensure_outside_workspace`](Self::ensure_outside_workspace)
+    /// (it is environment-derived: `$HOME`, `$XDG_CONFIG_HOME`,
+    /// `$MCPLS_CONFIG`), and no default config file is created, so nothing is
+    /// written on behalf of an untrusted checkout.
+    ///
+    /// # Errors
+    ///
+    /// As [`load_with_trust`](Self::load_with_trust), plus
+    /// [`Error::ConfigInsideWorkspace`] when the loaded file is inside the
+    /// workspace.
+    pub fn load_discovered(trust: ProjectConfigTrust, workspace: &WorkspaceTrust) -> Result<Self> {
+        let create = match workspace {
+            WorkspaceTrust::Trusted => CreateDefault::Yes,
+            WorkspaceTrust::Untrusted(_) => CreateDefault::No,
+        };
+        let (mut config, source) = Self::discover(trust, create)?;
+        config.workspace_trust = workspace.clone();
+        if let (WorkspaceTrust::Untrusted(_), Some(source)) = (workspace, source) {
+            config.ensure_outside_workspace(&source, ConfigOrigin::Environment)?;
+        }
+        Ok(config)
+    }
+
+    /// The discovery behind [`load_with_trust`](Self::load_with_trust): the
+    /// loaded config and the file it came from, if any.
+    fn discover(
+        trust: ProjectConfigTrust,
+        create: CreateDefault,
+    ) -> Result<(Self, Option<PathBuf>)> {
         // This `$MCPLS_CONFIG` check is unreachable from the `mcpls` binary:
         // `crates/mcpls-cli/src/args.rs` already binds `env = "MCPLS_CONFIG"`
         // to `--config`, so the CLI resolves that variable before `load`/
@@ -924,7 +991,8 @@ impl ServerConfig {
         // `Args`. The actual, CLI-enforced guarantee that `$MCPLS_CONFIG` is
         // always trusted lives in `main.rs`'s `--config` branch, not here.
         if let Ok(path) = std::env::var("MCPLS_CONFIG") {
-            return Self::load_from(Path::new(&path));
+            return Self::load_from(Path::new(&path))
+                .map(|config| (config, Some(PathBuf::from(path))));
         }
 
         let mut project_config_status = ProjectConfigStatus::NotIgnored;
@@ -932,7 +1000,10 @@ impl ServerConfig {
         let local_config = PathBuf::from("mcpls.toml");
         if local_config.exists() {
             match trust {
-                ProjectConfigTrust::Trusted => return Self::load_from(&local_config),
+                ProjectConfigTrust::Trusted => {
+                    return Self::load_from(&local_config)
+                        .map(|config| (config, Some(local_config.clone())));
+                }
                 ProjectConfigTrust::Untrusted => {
                     project_config_status = ProjectConfigStatus::IgnoredUntrusted;
                     let display_path = local_config.canonicalize().unwrap_or_else(|_| {
@@ -963,26 +1034,30 @@ impl ServerConfig {
                 let mut config =
                     Self::load_from_with_root_base(&user_config, RelativeRootBase::Cwd)?;
                 config.project_config_status = project_config_status;
-                return Ok(config);
+                return Ok((config, Some(user_config)));
             }
 
-            // No config found - create default config file
-            if let Err(e) = Self::create_default_config_file(&user_config) {
-                tracing::warn!(
-                    "Failed to create default config at {}: {}. Using in-memory defaults.",
-                    user_config.display(),
-                    e
-                );
-            } else {
-                tracing::info!("Created default config at {}", user_config.display());
+            if create == CreateDefault::Yes {
+                if let Err(e) = Self::create_default_config_file(&user_config) {
+                    tracing::warn!(
+                        "Failed to create default config at {}: {}. Using in-memory defaults.",
+                        user_config.display(),
+                        e
+                    );
+                } else {
+                    tracing::info!("Created default config at {}", user_config.display());
+                }
             }
         }
 
         // Return default configuration
-        Ok(Self {
-            project_config_status,
-            ..Self::default()
-        })
+        Ok((
+            Self {
+                project_config_status,
+                ..Self::default()
+            },
+            None,
+        ))
     }
 
     /// Load configuration from a specific path.
@@ -1096,6 +1171,7 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<()> {
         self.validate_mcp()?;
         self.validate_workspace_bounds()?;
+        self.validate_workspace_trust()?;
 
         // `Path::is_relative()` is `true` for an empty path, and joining it
         // onto a base directory silently yields that base directory
@@ -1201,6 +1277,63 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// Rejects an allowed server id that names no configured server, so a typo
+    /// in `--allow-server` cannot silently leave a server refused. A server
+    /// that heuristics later skip is still a configured one.
+    fn validate_workspace_trust(&self) -> Result<()> {
+        let WorkspaceTrust::Untrusted(allowlist) = &self.workspace_trust else {
+            return Ok(());
+        };
+        let configured: Vec<ServerId> = self.lsp_servers.iter().map(LspServerConfig::id).collect();
+        let unknown = allowlist
+            .as_slice()
+            .iter()
+            .find(|id| !configured.contains(id));
+        unknown.map_or(Ok(()), |unknown| {
+            Err(Error::InvalidConfig(format!(
+                "allowed server '{unknown}' is not a configured server (configured: {})",
+                configured
+                    .iter()
+                    .map(ServerId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        })
+    }
+
+    /// Rejects a config file that the analyzed checkout controls.
+    ///
+    /// Untrusted mode must not run such a config. The file chooses the roots,
+    /// so it is always checked against the configured roots (or, with none,
+    /// the working directory); checking only those would let
+    /// `roots = ["/elsewhere"]` evade it. The working directory is also
+    /// checked when `origin` is the environment or `source` is relative, since
+    /// a project-scoped client config or `.envrc` launches mcpls there. A
+    /// working directory that is the filesystem root or the home directory is
+    /// never taken for a checkout.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ConfigInsideWorkspace`] when `source` is inside; [`Error::Io`]
+    /// when `source` or the working directory cannot be resolved.
+    pub fn ensure_outside_workspace(&self, source: &Path, origin: ConfigOrigin) -> Result<()> {
+        let canonical = dunce::canonicalize(source).map_err(Error::Io)?;
+        let roots = WorkspaceRoots::from_configured(&self.workspace.roots)?;
+        let home = trust::login_home_dir();
+        let roots = roots.untrusted_boundary(!self.workspace.roots.is_empty(), home.as_deref());
+        let cwd_matters = origin == ConfigOrigin::Environment || !source.is_absolute();
+        let cwd = cwd_matters
+            .then(|| WorkspaceRoots::from_configured(&[]))
+            .transpose()?
+            .map(|cwd| cwd.checkout_scoped(home.as_deref()));
+        if roots.contains_canonical(&canonical)
+            || cwd.is_some_and(|cwd| cwd.contains_canonical(&canonical))
+        {
+            return Err(Error::ConfigInsideWorkspace { path: canonical });
+        }
+        Ok(())
+    }
+
     /// Validates the `[mcp]` section: each configured field is rejected if
     /// whitespace-only or over its `MAX_MCP_*` byte cap. Split out of
     /// [`Self::validate`] to keep that function under clippy's line count
@@ -1263,6 +1396,7 @@ impl Default for ServerConfig {
                 LspServerConfig::zls(),
             ],
             project_config_status: ProjectConfigStatus::NotIgnored,
+            workspace_trust: WorkspaceTrust::default(),
         }
     }
 }
@@ -2456,6 +2590,7 @@ mod tests {
                 selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
+            workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
         let map = config.build_effective_extension_map();
@@ -2485,6 +2620,7 @@ mod tests {
                 selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
+            workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
         let map = config.build_effective_extension_map();
@@ -2517,6 +2653,7 @@ mod tests {
                 selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
+            workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
         let map = config.build_effective_extension_map();
@@ -2549,6 +2686,7 @@ mod tests {
                 selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
+            workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
         let map = config.build_effective_extension_map();
@@ -3487,5 +3625,113 @@ mod tests {
         // `Error::InvalidConfig` fields (`title`/`description`/
         // `instructions`) get.
         assert!(msg.contains("line 2"), "{msg}");
+    }
+
+    mod trust_tests {
+        use super::*;
+
+        fn config_with_servers(trust: WorkspaceTrust) -> ServerConfig {
+            ServerConfig {
+                workspace_trust: trust,
+                ..ServerConfig::default()
+            }
+        }
+
+        #[test]
+        fn test_validate_accepts_allowed_ids_of_configured_servers() {
+            let config = config_with_servers(WorkspaceTrust::untrusted([ServerId::from("rust")]));
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn test_validate_rejects_an_allowed_id_that_names_no_configured_server() {
+            let config = config_with_servers(WorkspaceTrust::untrusted([ServerId::from("rsut")]));
+            let err = config.validate().unwrap_err();
+            let text = err.to_string();
+            assert_matches!(err, Error::InvalidConfig(_));
+            assert!(text.contains("'rsut'") && text.contains("rust"), "{text}");
+        }
+
+        #[test]
+        fn test_validate_ignores_the_allowlist_when_trusted() {
+            assert!(
+                config_with_servers(WorkspaceTrust::Trusted)
+                    .validate()
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn test_workspace_trust_is_never_read_from_toml() {
+            let config: ServerConfig = toml::from_str("").unwrap();
+            assert_eq!(config.workspace_trust, WorkspaceTrust::Trusted);
+            let err = toml::from_str::<ServerConfig>("workspace_trust = \"untrusted\"");
+            assert!(err.is_err(), "an unknown key is rejected");
+            assert!(!toml::to_string(&config).unwrap().contains("trust"));
+        }
+
+        fn temp_roots_config(root: &Path) -> ServerConfig {
+            let mut config = ServerConfig::default();
+            config.workspace.roots = vec![root.to_path_buf()];
+            config
+        }
+
+        #[test]
+        fn test_ensure_outside_workspace_rejects_a_config_inside_a_root() {
+            let dir = TempDir::new().unwrap();
+            let file = dir.path().join("mcpls.toml");
+            fs::write(&file, "").unwrap();
+            let err = temp_roots_config(dir.path())
+                .ensure_outside_workspace(&file, ConfigOrigin::Argument)
+                .unwrap_err();
+            assert_matches!(err, Error::ConfigInsideWorkspace { .. });
+        }
+
+        #[test]
+        fn test_ensure_outside_workspace_rejects_a_config_inside_the_process_cwd() {
+            let cwd = std::env::current_dir().unwrap();
+            let dir = tempfile::tempdir_in(&cwd).unwrap();
+            let file = dir.path().join("mcpls.toml");
+            fs::write(&file, "").unwrap();
+            let elsewhere = TempDir::new().unwrap();
+            let config = temp_roots_config(elsewhere.path());
+            let err = config
+                .ensure_outside_workspace(&file, ConfigOrigin::Environment)
+                .unwrap_err();
+            assert_matches!(err, Error::ConfigInsideWorkspace { .. });
+            assert!(
+                config
+                    .ensure_outside_workspace(&file, ConfigOrigin::Argument)
+                    .is_ok(),
+                "an absolute path given as an argument is only checked against the roots"
+            );
+        }
+
+        #[test]
+        fn test_ensure_outside_workspace_checks_cwd_for_a_relative_path() {
+            let cwd = std::env::current_dir().unwrap();
+            let dir = tempfile::tempdir_in(&cwd).unwrap();
+            let file = dir.path().join("mcpls.toml");
+            fs::write(&file, "").unwrap();
+            let relative = file.strip_prefix(&cwd).unwrap();
+            let elsewhere = TempDir::new().unwrap();
+            let err = temp_roots_config(elsewhere.path())
+                .ensure_outside_workspace(relative, ConfigOrigin::Argument)
+                .unwrap_err();
+            assert_matches!(err, Error::ConfigInsideWorkspace { .. });
+        }
+
+        #[test]
+        fn test_ensure_outside_workspace_admits_a_config_outside_roots_and_cwd() {
+            let roots = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let file = outside.path().join("mcpls.toml");
+            fs::write(&file, "").unwrap();
+            assert!(
+                temp_roots_config(roots.path())
+                    .ensure_outside_workspace(&file, ConfigOrigin::Environment)
+                    .is_ok()
+            );
+        }
     }
 }

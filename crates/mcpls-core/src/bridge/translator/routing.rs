@@ -2219,6 +2219,7 @@ mod tests {
             },
             lsp_servers: vec![],
             project_config_status: crate::ProjectConfigStatus::NotIgnored,
+            workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
         let extension_map = config.build_effective_extension_map();

@@ -655,7 +655,7 @@ pub fn select_typescript_server(
     if configured_tsserver_path(config.initialization_options.as_ref()).is_some() {
         return kept(TsserverKept::UserTsserverPath);
     }
-    // TODO(#604): auto-select native tsc on Windows (.cmd shims)
+    // TODO(#646): auto-select native tsc on Windows (.cmd shims)
     if !cfg!(unix) {
         return kept(TsserverKept::UnsupportedPlatform);
     }
@@ -832,6 +832,30 @@ pub fn pinned_initialization_options(
             None
         }
     }
+}
+
+/// The canonical tsserver `config` would be pinned to, when it lies inside
+/// `roots`: the pin then names workspace code, which untrusted mode refuses.
+///
+/// `None` when a user-set `tsserver.path` wins, when nothing is pinned, or
+/// when the pin lies outside `roots`.
+pub fn pinned_inside_workspace(
+    config: &LspServerConfig,
+    roots: &WorkspaceRoots,
+    parent_env: impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    if config
+        .initialization_options
+        .as_ref()
+        .is_some_and(has_user_tsserver_path)
+    {
+        return None;
+    }
+    let TsserverResolution::Pinned(tsserver) = resolve(config, parent_env)? else {
+        return None;
+    };
+    let canonical = dunce::canonicalize(&tsserver).ok()?;
+    roots.contains_canonical(&canonical).then_some(canonical)
 }
 
 /// The `tsserver.path` configured in `options`, if any.

@@ -494,6 +494,36 @@ impl WorkspaceRoots {
         }
     }
 
+    /// The directories untrusted mode treats as the workspace: the configured
+    /// roots, or, when none are configured and the roots are only the
+    /// working directory, [`Self::checkout_scoped`] of them.
+    pub(crate) fn untrusted_boundary(&self, roots_configured: bool, home: Option<&Path>) -> Self {
+        if roots_configured {
+            self.clone()
+        } else {
+            self.checkout_scoped(home)
+        }
+    }
+
+    /// The roots that can plausibly be one checkout: those that are neither
+    /// the filesystem root nor `home`.
+    ///
+    /// For a root that was only defaulted from the working directory, which
+    /// is `/` for many GUI clients and often the home directory, treating it
+    /// as the analyzed checkout would make every binary under it a workspace
+    /// binary.
+    pub(crate) fn checkout_scoped(&self, home: Option<&Path>) -> Self {
+        let scoped = |path: &Path| path.parent().is_some() && home != Some(path);
+        Self::from_parts(
+            self.canonical
+                .iter()
+                .filter(|r| scoped(r))
+                .cloned()
+                .collect(),
+            self.aliases.iter().filter(|a| scoped(a)).cloned().collect(),
+        )
+    }
+
     /// Builds a root set for tests that exercise purely lexical behavior;
     /// the caller vouches for `canonical` and nothing touches the filesystem.
     #[cfg(test)]
@@ -728,6 +758,14 @@ impl WorkspaceRoots {
             .any(|root| is_within(path, root, rule))
     }
 
+    /// Whether `path`, resolved through its longest existing prefix, lies under
+    /// a canonical root. A path that cannot be resolved counts as inside, so a
+    /// caller excluding workspace paths fails closed.
+    pub(crate) fn contains_resolved_prefix(&self, path: &Path) -> bool {
+        canonicalize_existing_prefix(path, &canonicalize_on_disk)
+            .map_or(true, |canonical| self.contains_canonical(&canonical))
+    }
+
     /// Whether the canonical `path` lies under a canonical root.
     pub(crate) fn contains_canonical(&self, path: &Path) -> bool {
         self.canonical
@@ -784,6 +822,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(dir.path()).unwrap();
         (dir, base)
+    }
+
+    #[test]
+    fn test_checkout_scoped_drops_the_filesystem_root_and_home() {
+        let (home, project) = (abs("/home/me"), abs("/home/me/project"));
+        let roots = WorkspaceRoots::for_test(vec![abs("/"), home.clone(), project.clone()], vec![]);
+
+        let scoped = roots.checkout_scoped(Some(&home));
+
+        assert_eq!(scoped.canonical(), [project]);
+        assert_eq!(roots.checkout_scoped(None).canonical().len(), 2);
     }
 
     #[test]
