@@ -23,7 +23,7 @@ use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
 use crate::error::{Error, McpErrorKind, Result};
 use crate::escape_control;
-use crate::lsp::LspClient;
+use crate::lsp::{LspClient, UnclassifiedError};
 
 /// Validate parameters for `handle_code_actions`.
 fn validate_code_action_params(
@@ -518,17 +518,22 @@ const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// out-of-range position as `-32602` with its "Invalid offset" text, so
 /// `mcp_error_kind` is consulted first: a caller-fault position stays an
 /// error and is never read as "not renameable".
-fn prepare_rename_rejection(err: Error) -> Result<PrepareRenameOutcome> {
-    let message = match &err {
+fn prepare_rename_rejection(err: UnclassifiedError) -> Result<PrepareRenameOutcome> {
+    let message = match err.error() {
         Error::LspServerError {
             code: JSONRPC_INVALID_PARAMS,
             message,
             ..
-        } if !matches!(err.mcp_error_kind(), McpErrorKind::InvalidPosition(_)) => {
+        } if !matches!(
+            err.error().mcp_error_kind(),
+            McpErrorKind::InvalidPosition(_)
+        ) =>
+        {
             escape_control(message).into_owned()
         }
-        _ => return Err(err),
+        _ => return Err(err.surface()),
     };
+    drop(err.handled());
     Ok(PrepareRenameOutcome::NotRenameable {
         server_message: Some(message),
     })
@@ -637,7 +642,10 @@ impl Translator {
         };
 
         let response = client
-            .request_typed::<lsp_types::PrepareRenameRequest>(params, client.request_timeout())
+            .request_typed_classified::<lsp_types::PrepareRenameRequest>(
+                params,
+                client.request_timeout(),
+            )
             .await;
         let outcome = match response {
             Ok(Some(lsp_types::PrepareRenameResult::Range(range))) => {

@@ -164,6 +164,56 @@ async fn prepare_rename_invalid_params_error_is_not_renameable() {
     );
 }
 
+async fn logs_of(answer: Answer) -> Vec<(tracing::Level, String)> {
+    use tracing_subscriber::prelude::*;
+
+    let captured = crate::test_lsp::CapturedLogs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(captured.clone())
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    drop(prepare_rename_with(answer).await);
+    captured.entries()
+}
+
+fn error_response_logs(
+    logs: &[(tracing::Level, String)],
+    level: tracing::Level,
+) -> Vec<&(tracing::Level, String)> {
+    logs.iter()
+        .filter(|(l, msg)| *l == level && msg.contains("LSP error response"))
+        .collect()
+}
+
+#[tokio::test]
+async fn prepare_rename_not_renameable_does_not_log_an_error() {
+    let logs = logs_of(Answer::Error(-32602, "No references found at position")).await;
+    assert!(
+        error_response_logs(&logs, tracing::Level::ERROR).is_empty(),
+        "{logs:?}"
+    );
+    assert_eq!(
+        error_response_logs(&logs, tracing::Level::DEBUG).len(),
+        1,
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn prepare_rename_invalid_offset_still_logs_an_error() {
+    let logs = logs_of(Answer::Error(
+        -32602,
+        "Invalid offset LineCol { line: 9, col: 0 } (line index length: 16)",
+    ))
+    .await;
+    assert_eq!(
+        error_response_logs(&logs, tracing::Level::ERROR).len(),
+        1,
+        "{logs:?}"
+    );
+}
+
 #[tokio::test]
 async fn prepare_rename_out_of_range_position_stays_an_error() {
     let err = prepare_rename_with(Answer::Error(
