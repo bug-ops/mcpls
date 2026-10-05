@@ -598,7 +598,7 @@ impl Translator {
                 let located = locate_identifier(self, &fetched.ctx, &uri, entry).await;
                 match located {
                     IdentifierPosition::Verified(position, source) => Ok(ResolvedTarget {
-                        position: Position::from_server_output(position.clone()),
+                        position: Position::from_server_output(&position),
                         resolved: Some(ResolvedSymbol {
                             name: entry.name.clone(),
                             kind: u32::from(entry.kind),

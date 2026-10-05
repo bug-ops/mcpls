@@ -133,7 +133,7 @@ impl Position {
     /// impl: a position typed by a client must go through
     /// [`Self::from_client`]. A zero, which converted LSP output never
     /// carries, clamps to 1.
-    pub(crate) fn from_server_output(position: Position2D) -> Self {
+    pub(crate) fn from_server_output(position: &Position2D) -> Self {
         let clamp = |value: u32| NonZeroU32::new(value).unwrap_or(NonZeroU32::MIN);
         Self {
             line: clamp(position.line),
@@ -1809,12 +1809,12 @@ mod tests {
 
     #[test]
     fn test_position_from_output_position_is_not_capped_and_clamps_zero() {
-        let big = Position::from_server_output(Position2D {
+        let big = Position::from_server_output(&Position2D {
             line: MAX_POSITION_VALUE + 7,
             character: 2_000_000,
         });
         assert_eq!(big.line().get(), MAX_POSITION_VALUE + 7);
-        let clamped = Position::from_server_output(Position2D {
+        let clamped = Position::from_server_output(&Position2D {
             line: 0,
             character: 0,
         });

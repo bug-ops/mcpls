@@ -395,10 +395,10 @@ impl EncodingCtx {
     ) -> lsp_types::Range {
         lsp_types::Range {
             start: self
-                .to_lsp(uri, Position::from_server_output(range.start.clone()))
+                .to_lsp(uri, Position::from_server_output(&range.start))
                 .await,
             end: self
-                .to_lsp(uri, Position::from_server_output(range.end.clone()))
+                .to_lsp(uri, Position::from_server_output(&range.end))
                 .await,
         }
     }
