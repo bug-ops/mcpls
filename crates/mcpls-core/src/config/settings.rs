@@ -172,7 +172,6 @@ fn reject_datetime(path: &str, value: &Value) -> Result<(), InvalidLspSettings> 
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use serde_json::json;
 

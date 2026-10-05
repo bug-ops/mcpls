@@ -472,8 +472,8 @@ mod major_tests {
     }
 }
 
-#[cfg(all(test, unix))]
-#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::{assert_matches, fs};
 

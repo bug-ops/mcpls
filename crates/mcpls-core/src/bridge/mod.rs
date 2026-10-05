@@ -55,10 +55,10 @@ pub use translator::{
     TypeHierarchyResult, UnavailableReason, parse_symbol_kind,
 };
 pub(crate) use translator::{
-    CallHierarchyPrepareResult, Capability, CodeActionsResult, IncomingCallsResult,
-    InlayHintsResult, LocationsResult, NotificationReceivers, NotificationWiring,
-    OutgoingCallsResult, RouteSupport, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
-    ToolSupportSnapshot, WorkspaceSymbolResult,
+    CallHierarchyPrepareResult, Capability, CodeActionsResult, DiagnosticsRole,
+    IncomingCallsResult, InlayHintsResult, LocationsResult, NotificationReceivers,
+    NotificationWiring, OutgoingCallsResult, RouteSupport, ServerLogsResult, ServerMessagesResult,
+    SignatureHelpResult, ToolSupportSnapshot, WorkspaceSymbolResult,
 };
 #[cfg(test)]
 pub(crate) use workspace_roots::{CanonicalizeFn, ProcessCwd};

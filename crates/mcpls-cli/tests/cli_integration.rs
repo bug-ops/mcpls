@@ -1,7 +1,6 @@
 //! Integration tests for the mcpls CLI binary.
 
-#![allow(clippy::unwrap_used)]
-#![allow(deprecated)]
+#![allow(deprecated, reason = "`assert_cmd::Command::cargo_bin` is deprecated")]
 
 use std::fs;
 use std::process::Command;

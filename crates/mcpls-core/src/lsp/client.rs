@@ -905,7 +905,7 @@ impl LspClient {
         let (reader_handle, mut msg_rx) = spawn_reader_task(reader);
         let result = {
             // Aborts the reader task the instant `message_loop_inner` returns, even via `?` (#451).
-            let _abort_reader_on_drop = crate::AbortOnDrop(&reader_handle);
+            let _abort_reader_on_drop = crate::util::AbortOnDrop(&reader_handle);
             Self::message_loop_inner(
                 &mut transport,
                 &mut msg_rx,
@@ -1433,7 +1433,6 @@ impl<'a> ConfigurationItem<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 
@@ -1572,7 +1571,7 @@ mod tests {
         let config = LspServerConfig::rust_analyzer();
         let client = LspClient::new(config);
 
-        #[allow(clippy::redundant_clone)]
+        #[allow(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
         let cloned = client.clone();
         assert_eq!(cloned.language_id(), "rust");
 

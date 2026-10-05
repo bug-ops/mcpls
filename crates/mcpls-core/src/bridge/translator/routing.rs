@@ -146,9 +146,8 @@ pub enum Capability {
     FormatRange,
 }
 
-#[allow(
+#[expect(
     clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
     reason = "compile-time check; the loop condition keeps `i` below `ALL.len()`"
 )]
 const _: () = {
@@ -1182,7 +1181,6 @@ impl Translator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -3354,13 +3352,13 @@ mod tests {
             .handle_declaration(client_path(&path), Position::at(1, 1))
             .await;
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
                 capability: "declarationProvider",
                 ..
             })
-        ));
+        );
     }
 
     /// Explicit `Some(RenameProvider::Bool(false))` -- as distinct from an absent

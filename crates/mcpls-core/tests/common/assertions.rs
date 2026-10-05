@@ -1,5 +1,8 @@
 //! Assertion helpers for e2e test sub-cases.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared e2e helpers; not every test binary calls each of them"
+)]
 
 use serde_json::Value;
 

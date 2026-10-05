@@ -29,23 +29,15 @@ use rmcp::transport::streamable_http_server::session::{ServerSseMessage, Session
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use super::{ProbeDeadline, ProbeInterval, StreamGuard};
+use super::config::{ProbeDeadline, ProbeInterval};
+use super::saturating_deadline;
+use super::session_manager::{SessionFingerprint, StreamGuard};
 use crate::bridge::lock_std;
 
 const PROBE_ID_PREFIX: &str = "mcpls-liveness-";
 const OUTBOUND_CAPACITY: usize = 16;
 /// Bound on closing one session, shared by every detached close.
 pub(super) const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const FAR_FUTURE: Duration = Duration::from_hours(262_800);
-
-/// `delay` from now, saturating at [`FAR_FUTURE`] so an absurd configured
-/// duration cannot overflow `Instant`.
-pub(super) fn after(delay: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(delay)
-        .or_else(|| now.checked_add(FAR_FUTURE))
-        .unwrap_or(now)
-}
 
 /// Identifier of one liveness probe, unique within a session.
 ///
@@ -247,7 +239,7 @@ impl StreamProbe {
         let mut inner_done = false;
         let mut outstanding: Option<Outstanding> = None;
         let mut expires_at: Option<Instant> = None;
-        let mut next_probe_at = after(self.interval.get());
+        let mut next_probe_at = saturating_deadline(Instant::now(), self.interval.get());
 
         let exit = loop {
             if inner_done && held.is_none() && ping.is_none() {
@@ -259,12 +251,12 @@ impl StreamProbe {
                 () = answer_or_never(outstanding.as_mut()) => {
                     outstanding = None;
                     expires_at = None;
-                    next_probe_at = after(self.interval.get());
+                    next_probe_at = saturating_deadline(Instant::now(), self.interval.get());
                 }
                 () = tokio::time::sleep_until(next_probe_at), if outstanding.is_none() => {
                     let (id, answered) = self.liveness.register_probe();
                     outstanding = Some(Outstanding { id, answered });
-                    expires_at = Some(after(self.deadline.get()));
+                    expires_at = Some(saturating_deadline(Instant::now(), self.deadline.get()));
                     ping = Some(ping_message(id));
                 }
                 item = inner.next(), if held.is_none() && !inner_done => {
@@ -294,7 +286,7 @@ impl StreamProbe {
         let was_primary = self.liveness.release(token);
         drop(inner);
         drop(guard);
-        tracing::debug!(session = %super::SessionFingerprint(&self.session), ?exit, was_primary, "standalone stream ended");
+        tracing::debug!(session = %SessionFingerprint(&self.session), ?exit, was_primary, "standalone stream ended");
         if exit == Exit::Unresponsive && was_primary {
             self.close_standalone_stream();
         }
@@ -322,10 +314,10 @@ impl StreamProbe {
             match closed {
                 Ok(None) => {}
                 Ok(Some(e)) => {
-                    tracing::debug!(session = %super::SessionFingerprint(&self.session), "closing standalone stream failed: {e}");
+                    tracing::debug!(session = %SessionFingerprint(&self.session), "closing standalone stream failed: {e}");
                 }
                 Err(_) => {
-                    tracing::debug!(session = %super::SessionFingerprint(&self.session), "closing standalone stream timed out");
+                    tracing::debug!(session = %SessionFingerprint(&self.session), "closing standalone stream timed out");
                 }
             }
         });
@@ -333,11 +325,10 @@ impl StreamProbe {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use super::super::SessionActivity;
+    use super::super::session_manager::SessionActivity;
     use super::*;
 
     const STEP: Duration = Duration::from_millis(100);
@@ -363,7 +354,7 @@ mod tests {
     }
 
     fn open_streams(activity: &SessionActivity) -> usize {
-        lock_std(&activity.0).open_streams
+        activity.open_stream_count()
     }
 
     fn ping_id(message: &ServerSseMessage) -> ProbeId {

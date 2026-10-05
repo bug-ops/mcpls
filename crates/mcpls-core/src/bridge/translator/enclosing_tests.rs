@@ -1,8 +1,8 @@
 //! Tests for the opt-in enclosing-symbol enrichment.
 
-use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{assert_matches, fs};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -418,10 +418,7 @@ async fn test_references_file_cap_skips_later_files_and_reports_cut_short() {
     )
     .await;
 
-    assert!(matches!(
-        outcome(&result, 0),
-        EnclosingSymbolOutcome::Resolved(_)
-    ));
+    assert_matches!(outcome(&result, 0), EnclosingSymbolOutcome::Resolved(_));
     assert_eq!(
         outcome(&result, 1),
         EnclosingSymbolOutcome::NotComputed {
@@ -538,7 +535,7 @@ async fn test_diagnostics_enclosing_symbol() {
         .iter()
         .map(|d| d.enclosing_symbol.clone().unwrap())
         .collect();
-    assert!(matches!(&outcomes[0], EnclosingSymbolOutcome::Resolved(s) if s.name_path == ["a"]));
+    assert_matches!(&outcomes[0], EnclosingSymbolOutcome::Resolved(s) if s.name_path == ["a"]);
     assert_eq!(outcomes[1], EnclosingSymbolOutcome::TopLevel);
     assert_eq!(result.enrichment.unwrap().files_enriched, 1);
 }
@@ -804,10 +801,10 @@ async fn test_enrichment_deadline_skips_remaining_files() {
     }
     let result = handle.await.unwrap().unwrap();
 
-    assert!(matches!(
+    assert_matches!(
         outcome(&result, 0),
         EnclosingSymbolOutcome::Unavailable { .. }
-    ));
+    );
     assert_eq!(
         outcome(&result, 1),
         EnclosingSymbolOutcome::NotComputed {

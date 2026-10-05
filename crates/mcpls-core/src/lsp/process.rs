@@ -250,8 +250,8 @@ impl ServerProcess {
     }
 }
 
-#[cfg(all(test, windows))]
-#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+#[cfg(windows)]
 mod tests {
     use std::process::Stdio;
     use std::time::Duration;

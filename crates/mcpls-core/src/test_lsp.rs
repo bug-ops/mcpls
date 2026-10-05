@@ -388,7 +388,7 @@ pub fn with_read_preamble(body: &str) -> String {
     format!("{READ_REQUEST_SH}{body}")
 }
 
-/// Spawns a real [`crate::diagnostics_pump`] over `subs` and returns the
+/// Spawns a real [`crate::runtime::pump::diagnostics_pump`] over `subs` and returns the
 /// sender feeding it plus the cancel sender (keep it alive: dropping it stops
 /// the pump).
 pub fn spawn_test_pump(
@@ -488,19 +488,19 @@ fn spawn_pump<K: Send + 'static>(
     tokio::sync::watch::Sender<bool>,
 ) {
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let shared = crate::PumpShared {
+    let shared = crate::runtime::pump::PumpShared {
         notification_cache: std::sync::Arc::clone(&notification_cache),
         subs,
         workspace_roots,
     };
     tokio::spawn(async move {
         let _keep_alive = keep_alive;
-        crate::diagnostics_pump(
+        crate::runtime::pump::diagnostics_pump(
             crate::config::ServerId::from("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
-            tokio::sync::watch::channel(crate::DiagnosticsRole::Authoritative).1,
+            tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             pinned_tsserver,
             shared,
         )

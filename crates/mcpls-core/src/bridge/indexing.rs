@@ -95,8 +95,10 @@ impl IndexingPolicy {
     /// every other optional field in that struct, which is omitted at its
     /// default. Takes `&self`, not `self`, since `skip_serializing_if`
     /// requires `fn(&T) -> bool` (matching `Option::is_none`'s convention).
-    // serde needs `&self` here despite Self being a trivially-Copy 1-byte enum.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's `skip_serializing_if` requires `fn(&T) -> bool`"
+    )]
     #[must_use]
     pub(crate) const fn is_auto(&self) -> bool {
         matches!(self, Self::Auto)
@@ -555,7 +557,6 @@ impl IndexingTracker {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

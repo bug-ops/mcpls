@@ -49,8 +49,6 @@ impl<const MIN: u64, const MAX: u64> BoundedSecs<MIN, MAX> {
     #[must_use]
     pub const fn new(secs: u64) -> Option<Self> {
         const { assert!(MIN >= 1 && MIN <= MAX, "MIN must satisfy 1 <= MIN <= MAX") };
-        // RangeInclusive::contains is not const.
-        #[allow(clippy::manual_range_contains)]
         if secs < MIN || secs > MAX {
             return None;
         }
@@ -132,7 +130,6 @@ impl Default for IndexingReadyTimeoutSecs {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

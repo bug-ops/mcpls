@@ -3,7 +3,7 @@ use std::assert_matches;
 use mcpls_core::bridge::{Translator, WorkspaceRoots};
 use mcpls_core::config::{ServerConfig, ServerId, ToolKind, ToolRouter};
 
-#[allow(unused)]
+#[allow(unused, reason = "shared helpers; not every test uses all of them")]
 use crate::common::test_utils::{
     config_fixture_path, rust_analyzer_available, rust_workspace_path,
 };
@@ -15,7 +15,6 @@ fn test_translator_creation() {
 }
 
 #[test]
-#[allow(clippy::expect_used)]
 fn test_config_loading_minimal() {
     let config_path = config_fixture_path("minimal.toml");
     assert!(config_path.exists(), "Config fixture should exist");
@@ -28,7 +27,6 @@ fn test_config_loading_minimal() {
 }
 
 #[test]
-#[allow(clippy::expect_used)]
 fn test_config_loading_multi_language() {
     let config_path = config_fixture_path("multi_language.toml");
     assert!(config_path.exists(), "Config fixture should exist");
@@ -58,7 +56,6 @@ fn test_rust_workspace_fixture_exists() {
 }
 
 #[test]
-#[allow(clippy::expect_used)]
 fn test_workspace_roots_configuration() {
     let mut translator = Translator::new();
     let first = tempfile::tempdir().expect("tempdir");
@@ -82,7 +79,6 @@ fn test_document_tracker_lazy_opening() {
 /// #174 §11/§12: two servers sharing one language, routed via explicit
 /// `name`/`handles`, load correctly and produce the expected per-tool router.
 #[test]
-#[allow(clippy::expect_used)]
 fn test_two_server_routing_fixture_loads_and_routes() {
     let config_path = config_fixture_path("two_server_routing.toml");
     let config = ServerConfig::load_from(&config_path).expect("fixture should load");
@@ -108,7 +104,6 @@ fn test_two_server_routing_fixture_loads_and_routes() {
 /// the workspace-scoped ambiguity rules apply only to servers that are both
 /// applicable in the same workspace, and at most one of these ever is.
 #[test]
-#[allow(clippy::expect_used)]
 fn test_mutually_exclusive_heuristics_fixture_loads() {
     let config_path = config_fixture_path("mutually_exclusive_heuristics.toml");
     let config = ServerConfig::load_from(&config_path)
@@ -143,7 +138,6 @@ fn test_mutually_exclusive_heuristics_fixture_loads() {
 /// catch-all rule) -- `ToolRouter::from_configs` must reject this with a
 /// startup error rather than silently picking one.
 #[test]
-#[allow(clippy::expect_used)]
 fn test_mutually_exclusive_heuristics_fixture_errors_when_both_applicable() {
     let config_path = config_fixture_path("mutually_exclusive_heuristics.toml");
     let config = ServerConfig::load_from(&config_path).expect("fixture should load");

@@ -89,7 +89,6 @@ impl From<PositionEncodings> for Vec<PositionEncoding> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

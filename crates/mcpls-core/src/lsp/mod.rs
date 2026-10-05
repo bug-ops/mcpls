@@ -15,7 +15,8 @@ pub(crate) use client::{
     CONTENT_MODIFIED_RETRY_METHODS, MAX_ERROR_MESSAGE_CALLER_BYTES, UnclassifiedError,
 };
 pub use client::{LspClient, SHUTDOWN_TIMEOUT};
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) use lifecycle::fake_lsp_server_with_dead_loop_and_live_child;
 pub(crate) use lifecycle::{
     ExitGrace, SUPPORTED_SYMBOL_KINDS, ServerStartOutcome, child_env_var, current_environment,

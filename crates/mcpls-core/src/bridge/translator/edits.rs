@@ -546,7 +546,6 @@ impl Translator {
     /// indexing the workspace (see `Translator::wait_for_indexing_ready`) --
     /// a rename needs the same whole-workspace reference index as
     /// `get_references`.
-    #[allow(clippy::too_many_lines)]
     pub async fn handle_rename(
         &self,
         file_path: ClientPath,
@@ -874,7 +873,6 @@ impl Translator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::{assert_matches, fs};
 
@@ -891,7 +889,10 @@ mod tests {
     /// ordinary replacement text -- `handle_rename` is the one tool that
     /// rewrites the user's files.
     #[tokio::test]
-    #[allow(clippy::literal_string_with_formatting_args)]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "LSP snippet placeholders, not format arguments"
+    )]
     async fn test_handle_rename_drops_snippet_text_edit_and_keeps_plain_edits() {
         use std::sync::Arc;
         use std::time::Duration;
@@ -1287,7 +1288,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scenario covering every severity"
+    )]
     async fn test_convert_code_action_with_diagnostics_all_severities() {
         let lsp_diagnostics = vec![
             lsp_types::Diagnostic {
@@ -1405,7 +1409,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::mutable_key_type)]
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "`lsp_types::Uri` keys are never mutated"
+    )]
     async fn test_convert_code_action_with_workspace_edit() {
         use std::collections::HashMap;
 
@@ -1674,7 +1681,10 @@ mod tests {
     /// tallied as shadowed -- matching the precedence `convert_workspace_edit`
     /// already applies for `handle_rename`.
     #[tokio::test]
-    #[allow(clippy::mutable_key_type)]
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "`lsp_types::Uri` keys are never mutated"
+    )]
     async fn test_convert_code_action_changes_takes_precedence_over_document_changes() {
         use std::collections::HashMap;
 
@@ -1939,7 +1949,10 @@ mod tests {
     /// resulting `changes` list is empty just like "nothing to rename" would
     /// be -- `dropped` is what makes the two cases distinguishable.
     #[tokio::test]
-    #[allow(clippy::mutable_key_type)]
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "`lsp_types::Uri` keys are never mutated"
+    )]
     async fn test_convert_workspace_edit_everything_dropped_is_distinguishable_from_no_edits() {
         use std::collections::HashMap;
 
@@ -2009,7 +2022,10 @@ mod tests {
     /// twice -- `changes` takes precedence, and a `documentChanges` entry
     /// mirroring one of its URIs is not tallied again.
     #[tokio::test]
-    #[allow(clippy::mutable_key_type)]
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "`lsp_types::Uri` keys are never mutated"
+    )]
     async fn test_convert_workspace_edit_changes_precedence_avoids_double_counting_drops() {
         use std::collections::HashMap;
 
@@ -2089,7 +2105,10 @@ mod tests {
     /// genuinely withheld. `changes` being present must keep its own drop
     /// count intact regardless of what `documentChanges` separately contains.
     #[tokio::test]
-    #[allow(clippy::mutable_key_type)]
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "`lsp_types::Uri` keys are never mutated"
+    )]
     async fn test_convert_workspace_edit_changes_precedence_keeps_drops_when_document_changes_would_succeed()
      {
         use std::collections::HashMap;
@@ -2192,7 +2211,10 @@ mod tests {
     /// `documentChanges` and returning a result indistinguishable from
     /// "nothing to rename".
     #[tokio::test]
-    #[allow(clippy::mutable_key_type)]
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "`lsp_types::Uri` keys are never mutated"
+    )]
     async fn test_convert_workspace_edit_falls_back_to_document_changes_when_changes_map_is_present_but_empty()
      {
         use std::collections::HashMap;

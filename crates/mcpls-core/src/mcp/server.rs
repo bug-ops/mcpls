@@ -216,9 +216,10 @@ pub struct McplsServer {
 /// `WorkspaceIndexing`, `ServerInitializing`) get their own bespoke code plus
 /// a structured `data` payload, and everything else falls back to
 /// `INTERNAL_ERROR`.
-// By-value `e` matches `Result::map_err`'s `FnOnce(E) -> F`, letting this be
-// passed directly as `.map_err(map_bridge_error)` at every call site.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "by-value `e` lets this be passed straight to `Result::map_err`"
+)]
 fn map_bridge_error(e: crate::error::Error) -> McpError {
     let message = e.to_string();
     match e.mcp_error_kind() {
@@ -242,7 +243,6 @@ fn map_bridge_error(e: crate::error::Error) -> McpError {
 /// The one funnel for errors that can embed server text: a tool error, a
 /// resource error carrying a spawn failure's stderr, a listen failure. An
 /// error built from client input only keeps the plain [`map_bridge_error`].
-#[allow(clippy::needless_pass_by_value)]
 fn render_error(error: crate::error::Error, redactions: &Redactions) -> McpError {
     let mut mapped = map_bridge_error(error);
     if redactions.is_empty() {
@@ -1445,7 +1445,7 @@ async fn contain_panic<T>(
         Err(payload) => {
             tracing::error!(
                 "{operation} handler panicked: {}",
-                crate::panic_message(payload.as_ref())
+                crate::util::panic_message(payload.as_ref())
             );
             Err(McpError::internal_error(
                 format!("{operation} handler panicked"),
@@ -1617,10 +1617,10 @@ const fn listen_join_error(source: tokio::task::JoinError) -> crate::error::Erro
     }
 }
 
-// `list_resources` is synchronous (no `.await`), but `ServerHandler::list_resources`
-// requires `async fn`; `#[tool_handler]` also expands other trait methods without
-// `.await`, so the lint is suppressed for the whole impl block.
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "`#[tool_handler]` expands trait methods without `.await`"
+)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McplsServer {
     async fn list_resources(
@@ -1952,7 +1952,6 @@ impl ServerHandler for McplsServer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::path::Path;
@@ -2213,11 +2212,7 @@ mod tests {
         let error = request.await.unwrap().unwrap_err();
         let rendered = render_error(error, &union);
 
-        let data = rendered
-            .data
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let data = rendered.data.as_ref().map_or_default(ToString::to_string);
         for text in [rendered.message.to_string(), data] {
             for len in 4..=secret.len() {
                 assert!(!text.contains(&secret[..len]), "{len}: {text}");
@@ -6004,8 +5999,10 @@ sleep 0.3
     /// Calls the real handler for `tool` with canned params against `file`,
     /// discarding the payload. The exhaustive match makes a new `McpTool`
     /// variant fail to compile until it is wired into the parity matrix.
-    // One arm per tool; splitting it would only scatter the exhaustive match.
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per tool; splitting would only scatter the exhaustive match"
+    )]
     async fn call_tool(server: &McplsServer, tool: McpTool, file: &Path) -> Result<(), McpError> {
         let file_path = file.to_str().unwrap().to_string();
         let position = || PositionParams {

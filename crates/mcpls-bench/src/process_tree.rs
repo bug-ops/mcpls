@@ -475,8 +475,7 @@ impl TreeWatch {
         let tree = self
             .leader
             .as_ref()
-            .map(|leader| table.tree_of(leader, link))
-            .unwrap_or_default();
+            .map_or_default(|leader| table.tree_of(leader, link));
         if tree.is_empty() {
             return RssReading::Unavailable {
                 reason: format!(
@@ -527,7 +526,6 @@ fn process_rss(row: &ProcessRow) -> ProcessRss {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 

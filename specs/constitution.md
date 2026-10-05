@@ -34,7 +34,10 @@ The codebase is organized into four modules that match the four-block spec numbe
   - `encoding.rs` — position conversion: MCP uses 1-based lines/columns, LSP uses 0-based
   - `notifications.rs` — caches push-based LSP notifications (diagnostics, log messages) for polling via MCP tools
 
-Cross-cutting concerns (CLI argument parsing, signal handling, transport-level shutdown) live in `mcpls-cli` and `mcpls-core`'s top-level modules under the `runtime` block.
+Cross-cutting concerns (CLI argument parsing, signal handling, transport-level shutdown) live in `mcpls-cli` and `mcpls-core`'s top-level modules under the `runtime` block:
+
+- **`runtime/`** — what `serve_with` drives after configuration is resolved: `pump.rs` (diagnostics pump and its restart wiring), `startup.rs` (background server startup and settling), `shutdown.rs` (post-transport cleanup)
+- **`transport/`** — the stdio and HTTP runners; HTTP is split into `config.rs`, `allowlist.rs`, `session_manager.rs`, `body.rs`, `shutdown.rs` (signal registration) plus `connection_io.rs`, `lease.rs` and `liveness.rs`
 
 **Non-negotiable design constraints:**
 
