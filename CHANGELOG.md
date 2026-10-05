@@ -140,6 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `out_of_workspace` is documented and tested as alias-aware: a `/tmp` spelling of a root under `/private/tmp` reads `false`. (#PR)
 - The TypeScript install hint and docs pin `typescript@6`; a TypeScript-7-only install is named in the init-failure error (`InitFailureHint`), and next to the server also in the tsserver pin warning. (#635)
 - `test_run_http_enforces_loopback_origin` no longer fails intermittently on a connection reset after the `403` response. (#601)
 - Language servers start concurrently and each is usable as soon as its own `initialize` completes. (#590)
