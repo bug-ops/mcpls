@@ -40,8 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** `AllowedHost` rejects ports 0, 80 and 443 (`InvalidAllowedHost::DefaultPort`), so `--http-allowed-host x.example:443` fails at startup instead of answering `403`; `AllowedHost::port()` is no longer `const`. (#TBD)
-- **Breaking:** server timeouts, `position_encodings` and `language_id` are typed (`TimeoutSecs`, `IndexingReadyTimeoutSecs`, `PositionEncodings`, `LanguageId`) and rejected when the config is loaded, and the use-site clamps are gone; field and type changes in `ServerInitConfig`, `ServerSpawnFailure`, `ToolRouter`, `LspClient` and `Translator`, and a new `hint` field on `Error::LspInitFailed` and `Error::ServerExitedDuringInit`, affect embedders. (#TBD)
+- **Breaking:** `AllowedHost` rejects ports 0, 80 and 443 (`InvalidAllowedHost::DefaultPort`), so `--http-allowed-host x.example:443` fails at startup instead of answering `403`; `AllowedHost::port()` is no longer `const`. (#635)
+- **Breaking:** server timeouts, `position_encodings` and `language_id` are typed (`TimeoutSecs`, `IndexingReadyTimeoutSecs`, `PositionEncodings`, `LanguageId`) and rejected when the config is loaded, and the use-site clamps are gone; field and type changes in `ServerInitConfig`, `ServerSpawnFailure`, `ToolRouter`, `LspClient` and `Translator`, and a new `hint` field on `Error::LspInitFailed` and `Error::ServerExitedDuringInit`, affect embedders. (#635)
 - **Breaking:** the default TypeScript server pins `tsserver` to the one next to `typescript-language-server` instead of a workspace `node_modules`, for `npm -g` style symlink installs with a global `typescript`; Windows `.cmd`, pnpm, Volta, asdf, mise and `npx`/`bunx`/`node` launchers are not covered and log a warning. Opt out with `initialization_options.tsserver.path`. (#609)
 - **Breaking:** `get_diagnostics` returns the new `DocumentDiagnosticsResult`; `Translator::handle_references`, `handle_definition`, `handle_implementation`, `handle_type_definition` and `handle_diagnostics` take a `ResultContext`, and result `locations` are `ContextualLocation`. (#609)
 - **Breaking:** `ToolKind` gains `TypeHierarchy`, `DocumentHighlights` and `FormatRange`, and an explicit `handles` config now warns about those uncovered tools; `rename` also routes `prepare_rename`. (#609)
@@ -120,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The TypeScript install hint and docs pin `typescript@6`; a TypeScript-7-only install is named in the init-failure error (`InitFailureHint`), and next to the server also in the tsserver pin warning. (#TBD)
+- The TypeScript install hint and docs pin `typescript@6`; a TypeScript-7-only install is named in the init-failure error (`InitFailureHint`), and next to the server also in the tsserver pin warning. (#635)
 - `test_run_http_enforces_loopback_origin` no longer fails intermittently on a connection reset after the `403` response. (#601)
 - Language servers start concurrently and each is usable as soon as its own `initialize` completes. (#590)
 - An invalid `--http-path` is rejected at argument parsing instead of panicking. (#590)
