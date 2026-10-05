@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `get_folding_ranges` tool (`textDocument/foldingRange`) with a `kind` filter and the `folding_range` `handles` value; collapsed text is redacted and cut to 256 bytes. (#PR)
-- `get_selection_ranges` tool (`textDocument/selectionRange`) and the `selection_range` `handles` value; chains are capped at 32 ranges. (#PR)
+- `get_folding_ranges` tool (`textDocument/foldingRange`) with a `kind` filter and the `folding_range` `handles` value; collapsed text is redacted and cut to 256 bytes. (#644)
+- `get_selection_ranges` tool (`textDocument/selectionRange`) and the `selection_range` `handles` value; chains are capped at 32 ranges. (#644)
 - HTTP sessions now receive `resources/updated` on their GET stream for the resources they subscribed to. (#525)
 - `get_tool_support` tool reporting which tools are usable for which languages, per configured server capabilities. (#540)
 - Default server `instructions` now point to `get_tool_support`; `ToolRouter` is `Clone` and gains `configured_languages()`. (#540)
@@ -146,7 +146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A language-server response that cannot be decoded (for example nested past the JSON recursion limit) now fails only its own request instead of tearing down the connection; new `InboundMessage::UndecodableResponse`. (#PR)
+- A language-server response that cannot be decoded (for example nested past the JSON recursion limit) now fails only its own request instead of tearing down the connection; new `InboundMessage::UndecodableResponse`. (#644)
 - `out_of_workspace` is documented and tested as alias-aware: a `/tmp` spelling of a root under `/private/tmp` reads `false`. (#640)
 - The TypeScript install hint and docs pin `typescript@6`; a TypeScript-7-only install is named in the init-failure error (`InitFailureHint`), and next to the server also in the tsserver pin warning. (#635)
 - `test_run_http_enforces_loopback_origin` no longer fails intermittently on a connection reset after the `403` response. (#601)
