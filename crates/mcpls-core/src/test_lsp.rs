@@ -239,7 +239,13 @@ pub async fn write_notification(writer: &mut DuplexStream, method: &str, params:
 }
 
 async fn write_framed(writer: &mut DuplexStream, message: &Value) {
-    let content = serde_json::to_string(message).unwrap();
+    write_raw_frame(writer, &serde_json::to_string(message).unwrap()).await;
+}
+
+/// Writes `content` as one frame without parsing it, so a test can send a
+/// body no `serde_json::Value` could hold, such as one nested past the
+/// parser's recursion limit.
+pub async fn write_raw_frame(writer: &mut DuplexStream, content: &str) {
     let header = format!("Content-Length: {}\r\n\r\n", content.len());
     writer.write_all(header.as_bytes()).await.unwrap();
     writer.write_all(content.as_bytes()).await.unwrap();

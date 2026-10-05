@@ -144,6 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A language-server response that cannot be decoded (for example nested past the JSON recursion limit) now fails only its own request instead of tearing down the connection; new `InboundMessage::UndecodableResponse`. (#PR)
 - `out_of_workspace` is documented and tested as alias-aware: a `/tmp` spelling of a root under `/private/tmp` reads `false`. (#640)
 - The TypeScript install hint and docs pin `typescript@6`; a TypeScript-7-only install is named in the init-failure error (`InitFailureHint`), and next to the server also in the tsserver pin warning. (#635)
 - `test_run_http_enforces_loopback_origin` no longer fails intermittently on a connection reset after the `403` response. (#601)
