@@ -579,11 +579,13 @@ mod tests {
     #[test]
     fn test_debug_never_prints_a_secret_value() {
         let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
+        let other_value = redactions(&[("API_TOKEN", "zzzz_ijklmnop")]);
 
         let printed = format!("{set:?} {:?}", set.0[0]);
+        let printed_other = format!("{other_value:?} {:?}", other_value.0[0]);
 
-        assert!(!printed.contains("ghp_abcdefgh"), "{printed}");
-        assert!(printed.contains("secrets: 1"), "{printed}");
+        assert!(printed.eq(&printed_other));
+        assert!(printed.contains("secrets: 1"));
     }
 
     #[test]

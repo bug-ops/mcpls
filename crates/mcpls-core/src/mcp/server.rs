@@ -5327,7 +5327,12 @@ sleep 0.3
         let deleted = DiagnosticsResourceUri::resolve(&missing, &roots).unwrap_err();
         assert!(is_unresolvable_resource(&deleted), "{deleted:?}");
 
-        let outside = make_uri(std::path::Path::new("/definitely/outside.rs")).unwrap();
+        let outside_path = if cfg!(windows) {
+            r"C:\definitely\outside.rs"
+        } else {
+            "/definitely/outside.rs"
+        };
+        let outside = make_uri(std::path::Path::new(outside_path)).unwrap();
         let escaped = DiagnosticsResourceUri::resolve(&outside, &roots).unwrap_err();
         assert!(is_unresolvable_resource(&escaped), "{escaped:?}");
 

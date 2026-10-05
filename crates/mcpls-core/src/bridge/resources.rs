@@ -530,7 +530,8 @@ mod tests {
 
     #[test]
     fn test_parse_uri_rejects_decoded_nul() {
-        let result = parse_uri("lsp-diagnostics:///ws/a%00b.rs");
+        let drive = if cfg!(windows) { "C:/" } else { "" };
+        let result = parse_uri(&format!("lsp-diagnostics:///{drive}ws/a%00b.rs"));
         assert_matches!(result, Err(ResourceUriError::ClientPath(_)));
     }
 
