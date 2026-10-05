@@ -708,10 +708,10 @@ mod tests {
             CappedSessionManager::new(crate::SessionLimit::new(2).unwrap(), idle_secs(10));
         let (idle_id, _idle_transport) = manager.create_session().await.unwrap();
         let (busy_id, _busy_transport) = manager.create_session().await.unwrap();
-        assert!(matches!(
-            manager.create_session().await,
-            Err(CappedSessionManagerError::CapReached)
-        ));
+        assert_matches!(
+            manager.create_session().await.err(),
+            Some(CappedSessionManagerError::CapReached)
+        );
 
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
         manager.touch(&busy_id);
@@ -960,7 +960,7 @@ mod tests {
     /// A one-session manager with a 10 s idle timeout whose probes are far
     /// enough apart that they never fire within a test.
     fn quietly_probing_manager() -> CappedSessionManager {
-        let hour = std::time::Duration::from_secs(3600);
+        let hour = std::time::Duration::from_hours(1);
         CappedSessionManager::new(crate::SessionLimit::new(1).unwrap(), idle_secs(10))
             .with_stream_liveness(StreamLiveness::Probe {
                 interval: ProbeInterval::new(hour).unwrap(),

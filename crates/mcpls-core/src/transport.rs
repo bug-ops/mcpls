@@ -39,6 +39,7 @@
 ///     std::process::exit(if result.is_ok() { 0 } else { 1 });
 /// }
 /// ```
+#[derive(Debug)]
 #[non_exhaustive]
 #[allow(
     clippy::large_enum_variant,
@@ -125,13 +126,15 @@ fn saturating_deadline(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     /// `Transport::Stdio` is always constructible regardless of feature flags.
     #[test]
     fn test_transport_stdio_variant() {
         let t = Transport::Stdio;
-        assert!(matches!(t, Transport::Stdio));
+        assert_matches!(t, Transport::Stdio);
     }
 
     #[cfg(feature = "transport-http")]
@@ -158,6 +161,6 @@ mod tests {
     fn test_transport_http_variant() {
         let cfg = HttpConfig::new("127.0.0.1:3002".parse().unwrap());
         let t = Transport::Http(cfg);
-        assert!(matches!(t, Transport::Http(_)));
+        assert_matches!(t, Transport::Http(_));
     }
 }

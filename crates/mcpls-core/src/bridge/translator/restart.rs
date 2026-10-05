@@ -523,8 +523,7 @@ impl Translator {
     fn restart_generation(&self, id: &ServerId) -> RestartGeneration {
         lock_std(&self.servers)
             .get(id)
-            .map(|slot| slot.restart.generation)
-            .unwrap_or_default()
+            .map_or_default(|slot| slot.restart.generation)
     }
 
     /// Install how restarted servers get their diagnostics pump back.

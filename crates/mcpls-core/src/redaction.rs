@@ -177,12 +177,7 @@ impl Secret {
         let debug = format!("{value:?}");
         let mut escaped: Vec<String> = [json, debug]
             .into_iter()
-            .filter_map(|quoted| {
-                quoted
-                    .strip_prefix('"')
-                    .and_then(|rest| rest.strip_suffix('"'))
-                    .map(str::to_owned)
-            })
+            .filter_map(|quoted| quoted.strip_circumfix('"', '"').map(str::to_owned))
             .filter(|spelling| *spelling != value)
             .collect();
         escaped.sort();

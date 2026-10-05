@@ -176,7 +176,7 @@ mod tests {
 
         let deadline = |idle: Duration| body_deadline(HeaderReadTimeout::new(idle).unwrap());
         assert_eq!(deadline(Duration::from_secs(5)), Duration::from_mins(2));
-        assert_eq!(deadline(Duration::from_secs(60)), Duration::from_mins(4));
+        assert_eq!(deadline(Duration::from_mins(1)), Duration::from_mins(4));
         assert_eq!(deadline(Duration::MAX), Duration::MAX);
     }
 }

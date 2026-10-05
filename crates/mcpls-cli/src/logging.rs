@@ -503,10 +503,10 @@ mod tests {
             Err(InvalidLogFilter::NotALevel("warnn".into()))
         );
         assert_eq!("".parse::<LogFilter>(), Err(InvalidLogFilter::Empty));
-        assert!(matches!(
+        assert_matches!(
             "foo=bar=baz".parse::<LogFilter>(),
             Err(InvalidLogFilter::Syntax(_))
-        ));
+        );
     }
 
     #[test]

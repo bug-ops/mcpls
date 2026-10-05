@@ -589,7 +589,7 @@ impl Translator {
         );
         let fetched = self.request_document_symbols(file_path).await?;
         let uri = fetched.doc.uri().clone();
-        let entries = fetched.response.map(flatten_symbols).unwrap_or_default();
+        let entries = fetched.response.map_or_default(flatten_symbols);
         let selection = select_candidates(&entries, &query);
 
         match selection.matched.as_slice() {

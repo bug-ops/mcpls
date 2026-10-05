@@ -2009,10 +2009,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             Error::WorkspaceIndexing { server_id: id, .. } if id == server_id
-        ));
+        );
     }
 
     /// Success-path coverage for `handle_type_definition` through the

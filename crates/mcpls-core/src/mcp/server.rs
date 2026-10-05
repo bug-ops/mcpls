@@ -2213,11 +2213,7 @@ mod tests {
         let error = request.await.unwrap().unwrap_err();
         let rendered = render_error(error, &union);
 
-        let data = rendered
-            .data
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let data = rendered.data.as_ref().map_or_default(ToString::to_string);
         for text in [rendered.message.to_string(), data] {
             for len in 4..=secret.len() {
                 assert!(!text.contains(&secret[..len]), "{len}: {text}");

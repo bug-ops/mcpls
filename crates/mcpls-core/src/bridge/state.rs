@@ -972,8 +972,7 @@ impl DocumentTracker {
         let path_guard = self.try_lock_path(path)?;
         let synced: HashSet<ServerId> = lock_std(&self.documents)
             .get(path)
-            .map(|st| st.synced.keys().cloned().collect())
-            .unwrap_or_default();
+            .map_or_default(|st| st.synced.keys().cloned().collect());
         let pending = lock_std(&self.pending_closes).remove(path)?;
         let servers: Vec<ServerId> = pending.servers.difference(&synced).cloned().collect();
         if servers.is_empty() {
@@ -2059,8 +2058,7 @@ mod tests {
     fn pending_servers(tracker: &DocumentTracker, path: &Path) -> HashSet<ServerId> {
         lock_std(&tracker.pending_closes)
             .get(path)
-            .map(|pending| pending.servers.clone())
-            .unwrap_or_default()
+            .map_or_default(|pending| pending.servers.clone())
     }
 
     /// Opens `name` through `ensure_open` so it is disk-verified (the only

@@ -352,7 +352,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_data(&mut body).await.unwrap(), b"a");
-        tokio::time::sleep(Duration::from_secs(3600)).await;
+        tokio::time::sleep(Duration::from_hours(1)).await;
         tx.send(Ok(axum::body::Bytes::from_static(b"b")))
             .await
             .unwrap();
