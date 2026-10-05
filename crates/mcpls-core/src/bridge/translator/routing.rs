@@ -3048,7 +3048,11 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_format_document(client_path(path.to_string_lossy().into_owned()), 4, true)
+            .handle_format_document(
+                client_path(path.to_string_lossy().into_owned()),
+                crate::bridge::TabSize::default(),
+                true,
+            )
             .await;
 
         assert_matches!(

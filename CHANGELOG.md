@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `tab_size` of `format_document` and `format_range` is the typed `TabSize` (1 to 32, `MAX_TAB_SIZE`); other values are rejected as invalid params, and `handle_format_document` and `handle_format_range` take a `TabSize`. (#PR)
 - `lib.rs` split into `runtime/` and `transport.rs` into submodules; no behavior change. (#638)
 - Log targets move to `mcpls_core::runtime::*` and `mcpls_core::transport::*`; `Transport` implements `Debug`. (#638)
 - Connection I/O deadlines saturate at 30 years instead of one. (#638)

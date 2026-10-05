@@ -769,7 +769,7 @@ Format a document according to language server rules.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
-| `tab_size` | integer | No | Tab size for formatting (default: 4); not bounded yet (#606) |
+| `tab_size` | integer | No | Tab size for formatting, 1 to 32 (default: 4); other values are rejected as invalid params |
 | `insert_spaces` | boolean | No | Use spaces instead of tabs (default: true) |
 
 ### Returns
@@ -1411,7 +1411,7 @@ Format only a range of a document.
 | `file_path` | string | Yes | Absolute path to the file |
 | `start_line`, `start_character` | integer | Yes | Start of the range (1-based) |
 | `end_line`, `end_character` | integer | Yes | End of the range (1-based) |
-| `tab_size` | integer | No | Tab size for formatting (default: 4); not bounded yet (#606) |
+| `tab_size` | integer | No | Tab size for formatting, 1 to 32 (default: 4); other values are rejected as invalid params |
 | `insert_spaces` | boolean | No | Use spaces instead of tabs (default: true) |
 
 ### Returns

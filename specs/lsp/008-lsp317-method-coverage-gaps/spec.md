@@ -78,7 +78,7 @@ related:
   (rust-analyzer's "Invalid offset" text) is checked first and stays a caller-fault error.
 - **Highlights (FR-025).** `kind` is `text`, `read` or `write`; an omitted or custom kind maps to
   `text`.
-- **Known deviations.** (Position and range bounds against document content: #607; `tab_size` bound: #606.) FR-027 rejects zero, oversized and reversed ranges but does not check the
+- **Known deviations.** (Position and range bounds against document content: #607.) FR-027 rejects zero, oversized and reversed ranges but does not check the
   range against the document's length, like `get_code_actions` and `get_inlay_hints`. clangd reports
   both "no symbol at this position" and "line out of range" as `-32001` with different messages, so
   its non-renameable answer surfaces as a server error rather than `not_renameable`.
@@ -312,7 +312,7 @@ several is decided in the plan (see Open Questions).
 | FR-023 | WHEN the routed server advertises `renameProvider` without preparation support THE SYSTEM SHALL report prepare rename as not supported while `rename_symbol` stays supported | should |
 | FR-024 | WHEN an agent requests highlights at a 1-based position THE SYSTEM SHALL return every range the server reports for `textDocument/documentHighlight`, each with its kind (text, read, or write) | should |
 | FR-025 | WHEN the server omits a highlight kind THE SYSTEM SHALL surface it as the LSP default (text), not as an absent or unknown value | should |
-| FR-026 | WHEN an agent requests formatting for a 1-based line and column range, plus tab size and insert-spaces options THE SYSTEM SHALL return the text edits the server reports for `textDocument/rangeFormatting`, under the same options semantics as `format_document` | should |
+| FR-026 | WHEN an agent requests formatting for a 1-based line and column range, plus tab size (1 to 32, `TabSize`; any other value is rejected as invalid params, #606) and insert-spaces options THE SYSTEM SHALL return the text edits the server reports for `textDocument/rangeFormatting`, under the same options semantics as `format_document` | should |
 | FR-027 | WHEN the start of a formatting range is after its end, or either lies outside the document THE SYSTEM SHALL reject the request with an invalid-parameters error and issue no LSP request | should |
 | FR-028 | WHEN the routed server does not advertise the capability a Group C tool needs (`documentHighlightProvider`, `documentRangeFormattingProvider`, or rename preparation) THE SYSTEM SHALL return the typed capability-not-supported error | should |
 | FR-029 | WHEN a not-renameable answer is returned as a normal result THE SYSTEM SHALL log the underlying server error response below ERROR (an expected outcome), while a position rejected as invalid stays an ERROR-logged tool error | should |

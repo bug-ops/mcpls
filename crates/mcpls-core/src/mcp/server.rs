@@ -2405,7 +2405,7 @@ mod tests {
                     .format_range(Parameters(FormatRangeParams {
                         file_path: PathBuf::from("/ws/a.rs"),
                         range: range((line, character), (line, character)),
-                        tab_size: 4,
+                        tab_size: crate::bridge::TabSize::default(),
                         insert_spaces: true,
                     }))
                     .await
@@ -2619,7 +2619,7 @@ mod tests {
             .format_range(Parameters(FormatRangeParams {
                 file_path: PathBuf::from("/ws/a.rs"),
                 range: range((1, 1), (10_002, 1)),
-                tab_size: 4,
+                tab_size: crate::bridge::TabSize::default(),
                 insert_spaces: true,
             }))
             .await;
@@ -3590,7 +3590,7 @@ mod tests {
         let (server, _temp_dir, test_file) = create_test_server_with_real_file();
         let params = Parameters(FormatDocumentParams {
             file_path: PathBuf::from(test_file.to_str().unwrap()),
-            tab_size: 4,
+            tab_size: crate::bridge::TabSize::default(),
             insert_spaces: true,
         });
 
@@ -6243,7 +6243,7 @@ sleep 0.3
             McpTool::FormatDocument => server
                 .format_document(Parameters(FormatDocumentParams {
                     file_path: PathBuf::from(file_path.clone()),
-                    tab_size: 4,
+                    tab_size: crate::bridge::TabSize::default(),
                     insert_spaces: true,
                 }))
                 .await
@@ -6300,7 +6300,7 @@ sleep 0.3
                 .format_range(Parameters(FormatRangeParams {
                     file_path: PathBuf::from(file_path.clone()),
                     range: range(),
-                    tab_size: 4,
+                    tab_size: crate::bridge::TabSize::default(),
                     insert_spaces: true,
                 }))
                 .await

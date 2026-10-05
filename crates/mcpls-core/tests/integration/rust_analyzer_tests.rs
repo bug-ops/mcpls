@@ -16,7 +16,7 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{
-    ClientPath, IndexingState, NotificationCache, Position, Translator, WorkspaceRoots,
+    ClientPath, IndexingState, NotificationCache, Position, TabSize, Translator, WorkspaceRoots,
     apply_lifecycle_notification,
 };
 use mcpls_core::config::{
@@ -828,8 +828,8 @@ async fn test_format_document() {
         Duration::from_secs(10),
         translator.lock().await.handle_format_document(
             client_path(lib_file.to_string_lossy().into_owned()),
-            4,    // tab_size
-            true, // insert_spaces
+            TabSize::default(), // tab_size
+            true,               // insert_spaces
         ),
     )
     .await;

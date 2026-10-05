@@ -14,7 +14,7 @@ use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
     BoundedRange, CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, DroppedEdits,
     FormatDocumentResult, Position, PrepareRenameOutcome, PrepareRenameResult, RenameResult,
-    TextEdit, WorkspaceEditDescription,
+    TabSize, TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
@@ -681,7 +681,7 @@ impl Translator {
     pub async fn handle_format_document(
         &self,
         file_path: ClientPath,
-        tab_size: u32,
+        tab_size: TabSize,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
         let doc = self
@@ -698,7 +698,7 @@ impl Translator {
         let params = DocumentFormattingParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             options: FormattingOptions {
-                tab_size,
+                tab_size: tab_size.get(),
                 insert_spaces,
                 ..Default::default()
             },
@@ -727,7 +727,7 @@ impl Translator {
         &self,
         file_path: ClientPath,
         range: BoundedRange,
-        tab_size: u32,
+        tab_size: TabSize,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
         let (start, end) = (range.range().start(), range.range().end());
@@ -749,7 +749,7 @@ impl Translator {
                 end: ctx.to_lsp(uri, end).await,
             },
             options: FormattingOptions {
-                tab_size,
+                tab_size: tab_size.get(),
                 insert_spaces,
                 ..Default::default()
             },

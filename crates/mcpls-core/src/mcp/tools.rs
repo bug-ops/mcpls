@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::{
     HierarchyItem, InvalidPosition, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
     MAX_SYMBOL_NAME_BYTES, Position, RestartTarget, ResultContext, ServerIds, SymbolName,
-    SymbolQuery, SymbolTarget, parse_symbol_kind,
+    SymbolQuery, SymbolTarget, TabSize, parse_symbol_kind,
 };
 use crate::config::ServerId;
 
@@ -305,18 +305,14 @@ pub struct FormatDocumentParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: PathBuf,
-    /// Tab size for formatting (default: 4).
-    #[schemars(description = "Tab size for formatting (default: 4).")]
-    #[serde(default = "default_tab_size")]
-    pub tab_size: u32,
+    /// Tab size for formatting (1 to 32, default: 4).
+    #[schemars(description = "Tab size for formatting (1 to 32, default: 4).")]
+    #[serde(default)]
+    pub tab_size: TabSize,
     /// Whether to use spaces instead of tabs (default: true).
     #[schemars(description = "Whether to use spaces instead of tabs (default: true).")]
     #[serde(default = "default_insert_spaces")]
     pub insert_spaces: bool,
-}
-
-const fn default_tab_size() -> u32 {
-    4
 }
 
 const fn default_insert_spaces() -> bool {
@@ -409,10 +405,10 @@ pub struct FormatRangeParams {
     /// Range in the file to format.
     #[serde(flatten)]
     pub range: RangeParams,
-    /// Tab size for formatting (default: 4).
-    #[schemars(description = "Tab size for formatting (default: 4).")]
-    #[serde(default = "default_tab_size")]
-    pub tab_size: u32,
+    /// Tab size for formatting (1 to 32, default: 4).
+    #[schemars(description = "Tab size for formatting (1 to 32, default: 4).")]
+    #[serde(default)]
+    pub tab_size: TabSize,
     /// Whether to use spaces instead of tabs (default: true).
     #[schemars(description = "Whether to use spaces instead of tabs (default: true).")]
     #[serde(default = "default_insert_spaces")]
@@ -714,8 +710,51 @@ mod tests {
         });
         let params: FormatRangeParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.range.end_line, 2);
-        assert_eq!(params.tab_size, 4);
+        assert_eq!(params.tab_size, TabSize::default());
         assert!(params.insert_spaces);
+    }
+
+    #[test]
+    fn format_params_reject_tab_sizes_outside_the_bounds() {
+        let params = |tab_size: u32| {
+            serde_json::from_value::<FormatDocumentParams>(
+                serde_json::json!({ "file_path": "/a.rs", "tab_size": tab_size }),
+            )
+        };
+        assert_eq!(
+            params(crate::bridge::MAX_TAB_SIZE).unwrap().tab_size.get(),
+            crate::bridge::MAX_TAB_SIZE
+        );
+        assert_eq!(params(1).unwrap().tab_size.get(), 1);
+        for rejected in [0, crate::bridge::MAX_TAB_SIZE + 1, u32::MAX] {
+            let error = params(rejected).unwrap_err().to_string();
+            assert!(
+                error.contains("tab_size must be between 1 and 32"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_range_params_reject_tab_sizes_outside_the_bounds() {
+        let params = |tab_size: u32| {
+            serde_json::from_value::<FormatRangeParams>(serde_json::json!({
+                "file_path": "/a.rs",
+                "start_line": 1,
+                "start_character": 1,
+                "end_line": 2,
+                "end_character": 3,
+                "tab_size": tab_size,
+            }))
+        };
+        assert_eq!(params(32).unwrap().tab_size.get(), 32);
+        for rejected in [0, 33] {
+            let error = params(rejected).unwrap_err().to_string();
+            assert!(
+                error.contains("tab_size must be between 1 and 32"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

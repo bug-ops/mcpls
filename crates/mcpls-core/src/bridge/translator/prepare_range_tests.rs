@@ -9,7 +9,9 @@ use tokio::io::BufReader;
 use tokio::time::timeout;
 
 use super::Translator;
-use super::dto::{FormatDocumentResult, Position2D, PrepareRenameOutcome, PrepareRenameResult};
+use super::dto::{
+    FormatDocumentResult, Position2D, PrepareRenameOutcome, PrepareRenameResult, TabSize,
+};
 use super::testing::*;
 use crate::bridge::{IndexingPolicy, WorkspaceRoots};
 use crate::config::{LanguageId, LspServerConfig, ServerId, TimeoutSecs, ToolKind, ToolRouter};
@@ -392,7 +394,12 @@ async fn format_range_with(
         let path = path.to_string_lossy().into_owned();
         tokio::spawn(async move {
             translator
-                .handle_format_range(client_path(path), bounded(pos(2, 1), pos(3, 6)), 2, false)
+                .handle_format_range(
+                    client_path(path),
+                    bounded(pos(2, 1), pos(3, 6)),
+                    TabSize::try_from(2).unwrap(),
+                    false,
+                )
                 .await
         })
     };
@@ -487,7 +494,7 @@ async fn format_range_without_capability_is_rejected() {
         .handle_format_range(
             client_path(path.to_string_lossy().into_owned()),
             bounded(pos(1, 1), pos(2, 1)),
-            4,
+            TabSize::default(),
             true,
         )
         .await
