@@ -41,13 +41,17 @@ related:
   absolute path is shipped (NFR-002, SC-004).
 - **Identification** is by the command's file stem, so absolute paths and `.cmd` names are recognized.
   `PATH` is read as the child sees it (config `env` override, else the parent environment).
-- **Coverage (SC-002 scope).** `npm -g` style symlink installs (verified with Homebrew's node; the
-  Homebrew formula layout and bun were not checked) with a `typescript` package next to the server
-  whose `package.json` has a `version`, which the server requires of an install before it honors
-  it. Windows `.cmd` shims, script launchers (pnpm, Volta, asdf/mise) and `npx`/`bunx`/`node cli.mjs`
-  wrappers that only name the server in `args` are logged as `UnsupportedLauncher` and not pinned.
-  A missing or invalid `typescript` package is logged as `NoTypescriptNextToServer`, a missing
-  executable as `ServerNotOnPath`. None blocks startup (NFR-005). Follow-up filed for shim support.
+- **Coverage (SC-002 scope).** `npm -g` style symlink installs (verified with Homebrew's node),
+  npm `.cmd`/`.ps1`/extensionless shims (`<exe dir>/node_modules/typescript-language-server`), pnpm
+  global installs (`<exe dir>/global/<version>/node_modules`, verified live with pnpm 10; more than
+  one match or more than 16 entries is ambiguous) and `node`/`bun` running an absolute `cli.mjs`,
+  each with a `typescript` package next to the server whose `package.json` has a `version`, which the
+  server requires of an install before it honors it. Shims are never executed or parsed. Package
+  runners (`npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `deno npm:`) are logged as `PackageRunner`;
+  Volta, asdf, mise shims and relative-script wrappers as `UnsupportedLauncher`; both name
+  `initialization_options.tsserver.path`. A missing or invalid `typescript` package is logged as
+  `NoTypescriptNextToServer`, a missing executable as `ServerNotOnPath`. None blocks startup
+  (NFR-005). Version-manager shims remain a follow-up.
 - **Inside the workspace.** A server installed inside the workspace is still pinned and a warning is
   logged: skipping would let the server walk the `rootUri` ancestors and pick the workspace tsserver.
 - **User options (FR-006).** A user `tsserver.path` wins. User options without `tsserver.path` skip

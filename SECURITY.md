@@ -44,14 +44,27 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
 
 - **tsserver pin.** By default `mcpls` passes the tsserver bundled next to
   typescript-language-server as `initializationOptions.tsserver.path`, so the
-  workspace's own tsserver is not selected. The pin applies to `npm -g` style
-  symlink installs (verified with Homebrew's node) that have a global
-  `typescript` package, with a `package.json` carrying a `version`, next to the
-  server. It is not applied, and a warning is logged, when:
-  - the server is started through a Windows `.cmd` shim or a script launcher
-    (pnpm, Volta, asdf/mise);
-  - the server is started through `npx`, `bunx`, `node cli.mjs` or another
-    wrapper that only names it in the arguments;
+  workspace's own tsserver is not selected. The pin applies to these installs,
+  each with a `typescript` package, with a `package.json` carrying a `version`,
+  next to the server:
+  - `npm -g` style symlink installs (verified with Homebrew's node);
+  - npm `.cmd`, `.ps1` and extensionless shims beside a `node_modules` that holds
+    the server (verified live only for the Unix shell shim; the Windows layouts
+    are covered by unit tests);
+  - pnpm global installs (verified live on macOS; the Windows layout is covered
+    by unit tests), found under `<PNPM_HOME>/global`, where more than one match
+    or more than 16 entries is ambiguous and not pinned;
+  - `node` or `bun` running the server's absolute `cli.mjs`.
+
+  Shims are located by file existence only and are never executed or parsed.
+  On Windows a bare command is looked up as written, so an install that only
+  provides `typescript-language-server.cmd` needs that name as `command`.
+  It is not applied, and a warning is logged, when:
+  - the server is started through Volta, asdf, mise or another version-manager
+    shim;
+  - the server is started through `npx`, `bunx`, `pnpm dlx`, `yarn dlx`,
+    `deno npm:` or another wrapper that only names it in the arguments, including
+    `node` or `bun` with a relative script path;
   - no valid `typescript` package is found next to the server;
   - you set `initialization_options` for the server without `tsserver.path`.
 

@@ -610,8 +610,9 @@ file_patterns = ["**/*.go"]
 
 **Reasons and fixes**:
 - Server not found on `PATH` (resolved from the server's own `env` override, else the mcpls environment): install `typescript-language-server` or fix `command`
-- Windows `.cmd` shim or script launcher (pnpm, Volta, asdf, mise): not covered (#604), so the workspace's tsserver can be selected; point `initialization_options.tsserver.path` at a trusted `tsserver.js` yourself
-- `npx`, `bunx`, `node cli.mjs` or another wrapper that only names the server in `args`: not covered (#604); use the `typescript-language-server` executable as `command`, or set `initialization_options.tsserver.path` yourself
+- Version-manager shim (Volta, asdf, mise) or another wrapper script: not covered, so the workspace's tsserver can be selected; point `initialization_options.tsserver.path` at a trusted `tsserver.js` yourself
+- Package runner (`npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `deno npm:`) or `node`/`bun` with a relative script path: not covered; use the `typescript-language-server` executable or an absolute `cli.mjs` path, or set `initialization_options.tsserver.path` yourself
+- A pnpm global install with more than one `global/<version>` entry holding the server, or more than 16 entries, is ambiguous and not pinned; remove the stale entries or set `initialization_options.tsserver.path`
 - No valid `typescript` package (with a `package.json` `version`) next to the server: install it globally (`npm install -g typescript@6`)
 - Only TypeScript 7 or later next to the server, which ships no `tsserver`: install `typescript@6` next to the server (for a global install, `npm install -g typescript-language-server typescript@6`), or run the native server (see [TypeScript 7 (native server)](configuration.md#typescript-7-native-server)). If the server then fails to start, the error repeats this guidance
 - You set `initialization_options` for the server without `tsserver.path`: the pin is skipped; add `tsserver.path` to keep it

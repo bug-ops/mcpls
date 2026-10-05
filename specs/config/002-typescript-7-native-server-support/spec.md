@@ -108,7 +108,7 @@ widening the workspace-code-execution surface, mcpls selects the native server i
 - Supporting `typescript-language-server` against TypeScript 7 (an upstream concern).
 - Type hierarchy for TypeScript: neither server supports it; the existing unsupported-capability behavior stands.
 - Untrusted-workspace mode (#603, deferred by [[runtime/003-workspace-supplied-code-execution/spec|runtime/003]]).
-- Pin support for Windows `.cmd` shims, script launchers and `npx`/`bunx`/`node` wrappers (#604).
+- Pin support for Volta, asdf and mise shims and for `npx`/`bunx`/`pnpm dlx`/`deno npm:` package runners (documented: set `initialization_options.tsserver.path`).
 - Changes to non-TypeScript built-in servers.
 - Technical design: recorded in a plan after this spec is approved.
 
@@ -252,7 +252,7 @@ No persistent data. In-memory typed values only.
 | `typescript` 7 found in an ancestor `node_modules` after a nearer package without `tsserver.js` | Resolution follows the same node lookup order as the pin; the nearest valid install decides |
 | User-defined TypeScript server entry with `tsc --lsp --stdio` | Honored unchanged (US-005); no pin generated since the command is not `typescript-language-server`; `initialization_options` forwarded as given |
 | User-defined entry for `typescript-language-server` with TypeScript 7 only | Not replaced; guidance added to its failure (FR-005) |
-| Native server installed through a launcher (pnpm, Volta, asdf, mise, `npx`) | Not auto-detected; reported as unsupported launcher; explicit config still works |
+| Native server installed through a launcher (Volta, asdf, mise, `npx`) | Not auto-detected; reported as unsupported launcher or package runner; explicit config still works. pnpm global installs are resolved |
 | Native server starts but advertises no diagnostics capability | `get_diagnostics` degrades per existing diagnostics behavior; documented by FR-008 outcome |
 | Native executable found but not runnable (permissions, wrong platform package) | Fallback per FR-013; spawn failure surfaces through the existing typed errors of [[lsp/006-server-spawn-install-hint/spec|lsp/006]] |
 | Windows | `tsc` is a shim (`tsc.cmd`); resolution handles or explicitly reports it (NFR-005) |
@@ -335,7 +335,7 @@ provenance of the default entry is lost; #634 delivers it (see "Resolutions (imp
 - Typed detection is the only trigger for the guidance; the upstream error text is not matched.
 - Detection reads manifests only: capped at 64 KiB and opened with `O_NONBLOCK` and a file-type check on the handle (`GetFileType` on Windows), so on Unix a FIFO or a symlink to one cannot block startup (Windows has no non-blocking open, #442).
 - The hint is attached to an initialize failure when only TypeScript 7 is reachable next to the server, or, with no TypeScript next to the server, in a workspace root's node lookup path (monorepo parents included).
-- Windows: the explicit entry uses the absolute `tsc.cmd` path. A `.cmd` shim launcher of `typescript-language-server` is `UnsupportedLauncher` and gets no hint (#604).
+- Windows: the explicit entry uses the absolute `tsc.cmd` path. An npm `.cmd`, `.ps1` or extensionless shim and a pnpm global install are resolved like a symlink install, so they get the hint; package runners and version-manager shims get none.
 - Live results (2026-10-05, TypeScript 6.0.3 and 7.0.2): hover, definition, references and `get_diagnostics` (pull, `textDocument/diagnostic`) are correct on the native server; it accepts `initialize`, the configuration push and shutdown (FR-008, FR-009); type hierarchy is reported as not advertised (FR-010). `bin/tsc` resolves its platform binary from the `typescript` package's own path, not from the cwd or workspace, then `execve`s into it (needs `node` on `PATH`). Neither the native `tsc` nor `typescript-language-server` loads tsconfig `plugins`.
 - Consent for a workspace-local `tsc` is the user's own `[[lsp_servers]]` entry; the existing project-config trust gate already covers a project-local `mcpls.toml`.
 - Explicit native entry: replace the existing `typescript` entry; adding a second entry fails with "duplicate server id" (unnamed) or "two catch-all servers" (named).
@@ -350,7 +350,7 @@ Delivered scope: automatic selection (FR-007, FR-011 to FR-013).
 - When the native server is chosen, `command` and `args` are replaced (`--lsp --stdio`); user edits to them are dropped, so remove `selection` to keep them. `initialization_options` and the rest of the entry are unchanged; no `tsserver.path` pin is generated for the native command (FR-009).
 - "Not runnable" is checked cheaply: an executable bit, and `node` on the effective `PATH` when `bin/tsc` has a `node` shebang (`TsserverKept::NodeNotOnPath`). A wrong-platform package is not detected; its spawn failure surfaces through the existing typed errors.
 - The choice and its reason are logged at info level (FR-012). Any failed selection keeps `typescript-language-server` and never aborts startup (FR-013). Selection runs once per startup; respawn and restart reuse the stored config.
-- Unix only: on Windows `bin/tsc` is a script and npm installs `.cmd` shims, so the flavor stays `typescript-language-server` (`TsserverKept::UnsupportedPlatform`, #604).
+- Unix only: on Windows `bin/tsc` is a script and npm installs `.cmd` shims, so the flavor stays `typescript-language-server` (`TsserverKept::UnsupportedPlatform`); native auto-selection on Windows is a follow-up.
 - Existing on-disk configs lack the key and never auto-select; adding `selection = "auto"` opts in, and older mcpls versions reject the key.
 
 ## 10. See Also

@@ -63,10 +63,11 @@ willing to have that code execute in (a container or a disposable VM).
 **tsserver pin (TypeScript).** By default mcpls passes the tsserver bundled next to
 `typescript-language-server` as `initializationOptions.tsserver.path`, so a workspace's own
 `node_modules` tsserver is not selected. Covered: `npm -g` style symlink installs (verified with
-Homebrew's node) that have a global `typescript` package with a `package.json` `version` next to
-the server. Not covered (#604), with a warning logged: Windows `.cmd` shims, script launchers (pnpm,
-Volta, asdf, mise), `npx`/`bunx`/`node cli.mjs` wrappers, and installs with no valid `typescript`
-package. A server installed inside the workspace is pinned with a warning, but that narrows
+Homebrew's node), npm `.cmd`/`.ps1`/extensionless shims, pnpm global installs and `node`/`bun`
+running an absolute `cli.mjs`, each with a `typescript` package with a `package.json` `version`
+next to the server. Not covered, with a warning logged: Volta, asdf and mise shims,
+`npx`/`bunx`/`pnpm dlx`/`deno npm:` launchers, relative-script wrappers, and installs with no valid
+`typescript` package. A server installed inside the workspace is pinned with a warning, but that narrows
 nothing because the server itself is workspace code. A
 `tsserver.path` in your own `initialization_options` always wins; set it to a workspace path to opt
 back in to the workspace's TypeScript. Other `initialization_options` that do not set
