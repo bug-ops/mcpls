@@ -14,7 +14,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate, validate_position};
+use super::routing::{Capability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::{Error, Result};
 
@@ -81,8 +81,6 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<CallHierarchyPrepareResult> {
-        validate_position(position)?;
-
         let doc = self
             .prepare_gated_document(
                 &file_path,
@@ -298,63 +296,11 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::{Position, Position2D, Range};
+    use crate::bridge::translator::dto::{Position2D, Range};
     use crate::bridge::translator::testing::*;
     use crate::bridge::{NotificationCache, WorkspaceRoots};
     use crate::config::ServerId;
     use crate::test_lsp::client_path;
-
-    #[tokio::test]
-    async fn test_handle_call_hierarchy_prepare_invalid_position_zero() {
-        let translator = Translator::new();
-        let result = translator
-            .handle_call_hierarchy_prepare(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 0,
-                    character: 1,
-                },
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-
-        let result = translator
-            .handle_call_hierarchy_prepare(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 1,
-                    character: 0,
-                },
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[tokio::test]
-    async fn test_handle_call_hierarchy_prepare_invalid_position_too_large() {
-        let translator = Translator::new();
-        let result = translator
-            .handle_call_hierarchy_prepare(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 1_000_001,
-                    character: 1,
-                },
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-
-        let result = translator
-            .handle_call_hierarchy_prepare(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 1,
-                    character: 1_000_001,
-                },
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
 
     #[tokio::test]
     async fn test_handle_incoming_calls_invalid_json() {

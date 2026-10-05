@@ -265,14 +265,6 @@ async fn prepare_rename_requires_prepare_provider_not_just_rename() {
     assert_matches!(err, Error::CapabilityNotSupported { .. });
 }
 
-#[tokio::test]
-async fn prepare_rename_rejects_zero_position() {
-    let result = Translator::new()
-        .handle_prepare_rename(client_path("a.rs"), pos(0, 1))
-        .await;
-    assert_matches!(result, Err(Error::InvalidToolParams(_)));
-}
-
 fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
     LspServerConfig {
         language_id: "rust".to_string(),
@@ -381,7 +373,7 @@ async fn format_range_with(
         let path = path.to_string_lossy().into_owned();
         tokio::spawn(async move {
             translator
-                .handle_format_range(client_path(path), pos(2, 1), pos(3, 6), 2, false)
+                .handle_format_range(client_path(path), bounded(pos(2, 1), pos(3, 6)), 2, false)
                 .await
         })
     };
@@ -463,21 +455,6 @@ async fn format_range_null_response_has_no_edits() {
 }
 
 #[tokio::test]
-async fn format_range_rejects_reversed_and_zero_ranges() {
-    let translator = Translator::new();
-    for (start, end) in [
-        (pos(3, 1), pos(2, 1)),
-        (pos(2, 5), pos(2, 4)),
-        (pos(0, 1), pos(2, 1)),
-    ] {
-        let result = translator
-            .handle_format_range(client_path("a.rs"), start, end, 4, true)
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-}
-
-#[tokio::test]
 async fn format_range_without_capability_is_rejected() {
     let dir = TempDir::new().unwrap();
     let (translator, _server) = translator_with_capabilities(
@@ -490,8 +467,7 @@ async fn format_range_without_capability_is_rejected() {
     let err = translator
         .handle_format_range(
             client_path(path.to_string_lossy().into_owned()),
-            pos(1, 1),
-            pos(2, 1),
+            bounded(pos(1, 1), pos(2, 1)),
             4,
             true,
         )

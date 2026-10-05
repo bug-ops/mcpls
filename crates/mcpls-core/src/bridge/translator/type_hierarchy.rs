@@ -11,7 +11,7 @@ use super::dto::{Position, TypeHierarchyItemResult, TypeHierarchyResult};
 use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate, validate_position};
+use super::routing::{Capability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
 
@@ -53,8 +53,6 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<TypeHierarchyResult> {
-        validate_position(position)?;
-
         let doc = self
             .prepare_gated_document(
                 &file_path,
@@ -222,14 +220,6 @@ mod tests {
             data: Some(serde_json::json!({"id": "Derived"})),
             out_of_workspace: false,
         }
-    }
-
-    #[tokio::test]
-    async fn prepare_rejects_zero_position_without_a_request() {
-        let result = Translator::new()
-            .handle_type_hierarchy_prepare(client_path("/tmp/a.cpp"), pos(0, 1))
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]

@@ -40,17 +40,18 @@ pub use state::{
 };
 pub(crate) use state::{InFlightGuard, try_path_to_uri};
 pub use translator::{
-    AddressableTool, Addressed, Completion, CompletionsResult, ContextualDiagnostic,
+    AddressableTool, Addressed, BoundedRange, Completion, CompletionsResult, ContextualDiagnostic,
     ContextualLocation, DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult,
     DocumentChanges, DocumentDiagnosticsResult, DocumentHighlightEntry, DocumentHighlightKind,
     DocumentHighlightsResult, DocumentSymbolsResult, DroppedEdits, EnclosingSymbol,
-    EnclosingSymbolOutcome, EnrichmentSummary, FormatDocumentResult, HoverResult, Location,
-    MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, NotComputedReason,
-    Position, Position2D, PositionDegradation, PositionSource, PrepareRenameOutcome,
-    PrepareRenameResult, Range, ReferencesResult, RenameResult, ResolvedSymbol, ResolvedTarget,
-    RestartFailure, RestartOutcome, RestartServerResult, RestartTarget, ResultContext, ServerIds,
-    ServerIdsError, ServerRestartEntry, Symbol, SymbolFidelity, SymbolName, SymbolNameError,
-    SymbolQuery, SymbolTarget, TextEdit, Translator, TypeHierarchyItemResult, TypeHierarchyResult,
+    EnclosingSymbolOutcome, EnrichmentSummary, FormatDocumentResult, HoverResult, InvalidPosition,
+    InvalidRange, Location, MAX_POSITION_VALUE, MAX_RANGE_LINES, MAX_RESTART_SERVER_IDS,
+    MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, NotComputedReason, Position, Position2D,
+    PositionDegradation, PositionRange, PositionSource, PrepareRenameOutcome, PrepareRenameResult,
+    Range, ReferencesResult, RenameResult, ResolvedSymbol, ResolvedTarget, RestartFailure,
+    RestartOutcome, RestartServerResult, RestartTarget, ResultContext, ServerIds, ServerIdsError,
+    ServerRestartEntry, Symbol, SymbolFidelity, SymbolName, SymbolNameError, SymbolQuery,
+    SymbolTarget, TextEdit, Translator, TypeHierarchyItemResult, TypeHierarchyResult,
     UnavailableReason, parse_symbol_kind,
 };
 pub(crate) use translator::{

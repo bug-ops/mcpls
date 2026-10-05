@@ -1,8 +1,11 @@
 //! Public MCP-facing result/data-transfer types returned by the tool-call
 //! handlers in the sibling domain modules.
 
+use std::num::NonZeroU32;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSummary};
 use crate::redaction::{Redactions, ServerText};
@@ -24,29 +27,211 @@ pub struct Position2D {
     pub character: u32,
 }
 
+/// Largest line or character value a client may supply.
+pub const MAX_POSITION_VALUE: u32 = 1_000_000;
+
+/// Largest line span of a range given to a range-taking tool.
+pub const MAX_RANGE_LINES: u32 = 10_000;
+
+/// Why a client-supplied position was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InvalidPosition {
+    /// A line or character below 1; positions are 1-based.
+    #[error("Line and character positions must be >= 1")]
+    ZeroBased,
+    /// A line or character above [`MAX_POSITION_VALUE`].
+    #[error("Position values must be <= {MAX_POSITION_VALUE}")]
+    TooLarge,
+}
+
+/// Why a client-supplied range was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InvalidRange {
+    /// The start position is invalid.
+    #[error("invalid range start: {0}")]
+    Start(InvalidPosition),
+    /// The end position is invalid.
+    #[error("invalid range end: {0}")]
+    End(InvalidPosition),
+    /// The start lies after the end.
+    #[error("Start position must be before or equal to end position")]
+    Reversed,
+    /// The range spans more than [`MAX_RANGE_LINES`] lines.
+    #[error("Range size must be <= {MAX_RANGE_LINES} lines")]
+    TooManyLines,
+}
+
 /// A 1-based MCP position taken as input by `Translator::handle_*` methods.
 ///
 /// Kept distinct from [`Position2D`] (which carries an *output* position back
-/// to the caller) so passing a position into a handler always goes through a
-/// named-field struct literal (`Position { line, character }`) instead of two
-/// adjacent bare `u32` arguments -- a call site that swaps `line` and
-/// `character` no longer compiles instead of silently sending a wrong
-/// position to the LSP server (#322).
+/// to the caller) and made of two [`NonZeroU32`]s, so a zero position cannot
+/// exist and a call site that swaps `line` and `character` still names them
+/// (#322). A position typed by a client goes through [`Self::from_client`],
+/// the only fallible constructor; positions derived from server output
+/// convert infallibly through [`From<Position2D>`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{InvalidPosition, Position};
+///
+/// let position = Position::from_client(3, 5)?;
+/// assert_eq!((position.line().get(), position.character().get()), (3, 5));
+/// assert_eq!(Position::from_client(0, 1), Err(InvalidPosition::ZeroBased));
+/// # Ok::<(), InvalidPosition>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
+    line: NonZeroU32,
+    character: NonZeroU32,
+}
+
+impl Position {
+    /// Builds a position from client-supplied 1-based numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPosition::ZeroBased`] for a zero line or character
+    /// and [`InvalidPosition::TooLarge`] above [`MAX_POSITION_VALUE`].
+    pub const fn from_client(line: u32, character: u32) -> Result<Self, InvalidPosition> {
+        let (Some(line), Some(character)) = (NonZeroU32::new(line), NonZeroU32::new(character))
+        else {
+            return Err(InvalidPosition::ZeroBased);
+        };
+        if line.get() > MAX_POSITION_VALUE || character.get() > MAX_POSITION_VALUE {
+            return Err(InvalidPosition::TooLarge);
+        }
+        Ok(Self { line, character })
+    }
+
     /// Line number (1-based).
-    pub line: u32,
+    #[must_use]
+    pub const fn line(self) -> NonZeroU32 {
+        self.line
+    }
+
     /// Character offset (1-based).
-    pub character: u32,
+    #[must_use]
+    pub const fn character(self) -> NonZeroU32 {
+        self.character
+    }
+
+    /// Zero-based LSP line.
+    #[must_use]
+    pub const fn lsp_line(self) -> u32 {
+        self.line.get().saturating_sub(1)
+    }
+
+    /// Zero-based character offset, still in UTF-16 units.
+    #[must_use]
+    pub const fn lsp_character(self) -> u32 {
+        self.character.get().saturating_sub(1)
+    }
+
+    /// Builds a fixture position, panicking on an invalid one.
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn at(line: u32, character: u32) -> Self {
+        Self::from_client(line, character).expect("fixture position is valid")
+    }
 }
 
 impl From<Position2D> for Position {
     /// Reuses an output position as a handler input position; both are
-    /// 1-based MCP positions.
+    /// 1-based MCP positions. A zero, which converted LSP output never
+    /// carries, clamps to 1.
     fn from(position: Position2D) -> Self {
+        let clamp = |value: u32| NonZeroU32::new(value).unwrap_or(NonZeroU32::MIN);
         Self {
-            line: position.line,
-            character: position.character,
+            line: clamp(position.line),
+            character: clamp(position.character),
+        }
+    }
+}
+
+/// An ordered pair of positions, `start <= end`.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{InvalidRange, Position, PositionRange};
+///
+/// let start = Position::from_client(1, 1).unwrap();
+/// let end = Position::from_client(2, 4).unwrap();
+/// assert!(PositionRange::new(start, end).is_ok());
+/// assert_eq!(PositionRange::new(end, start), Err(InvalidRange::Reversed));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionRange {
+    start: Position,
+    end: Position,
+}
+
+impl PositionRange {
+    /// Builds an ordered range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidRange::Reversed`] when `start` lies after `end`.
+    pub fn new(start: Position, end: Position) -> Result<Self, InvalidRange> {
+        let ordered = (start.line, start.character) <= (end.line, end.character);
+        if ordered {
+            Ok(Self { start, end })
+        } else {
+            Err(InvalidRange::Reversed)
+        }
+    }
+
+    /// Builds a range from client-supplied 1-based numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the invalid endpoint or [`InvalidRange::Reversed`].
+    pub fn from_client(
+        (start_line, start_character): (u32, u32),
+        (end_line, end_character): (u32, u32),
+    ) -> Result<Self, InvalidRange> {
+        let start =
+            Position::from_client(start_line, start_character).map_err(InvalidRange::Start)?;
+        let end = Position::from_client(end_line, end_character).map_err(InvalidRange::End)?;
+        Self::new(start, end)
+    }
+
+    /// First position of the range.
+    #[must_use]
+    pub const fn start(self) -> Position {
+        self.start
+    }
+
+    /// Last position of the range.
+    #[must_use]
+    pub const fn end(self) -> Position {
+        self.end
+    }
+}
+
+/// A [`PositionRange`] spanning at most [`MAX_RANGE_LINES`] lines, taken by
+/// the tools whose server-side cost grows with the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedRange(PositionRange);
+
+impl BoundedRange {
+    /// The underlying ordered range.
+    #[must_use]
+    pub const fn range(self) -> PositionRange {
+        self.0
+    }
+}
+
+impl TryFrom<PositionRange> for BoundedRange {
+    type Error = InvalidRange;
+
+    fn try_from(range: PositionRange) -> Result<Self, Self::Error> {
+        let span = range.end.line.get().saturating_sub(range.start.line.get());
+        if span > MAX_RANGE_LINES {
+            Err(InvalidRange::TooManyLines)
+        } else {
+            Ok(Self(range))
         }
     }
 }
@@ -1653,5 +1838,65 @@ mod tests {
     fn test_lsp_kind_to_u32_preserves_custom_values_above_u8_range() {
         let kind = lsp_types::InlayHintKind::Custom(300);
         assert_eq!(lsp_kind_to_u32(kind), 300u32);
+    }
+
+    #[test]
+    fn test_position_from_client_bounds() {
+        assert_eq!(Position::from_client(0, 1), Err(InvalidPosition::ZeroBased));
+        assert_eq!(Position::from_client(1, 0), Err(InvalidPosition::ZeroBased));
+        assert_eq!(
+            Position::from_client(MAX_POSITION_VALUE + 1, 1),
+            Err(InvalidPosition::TooLarge)
+        );
+        assert_eq!(
+            Position::from_client(1, MAX_POSITION_VALUE + 1),
+            Err(InvalidPosition::TooLarge)
+        );
+        let max = Position::from_client(MAX_POSITION_VALUE, MAX_POSITION_VALUE).unwrap();
+        assert_eq!((max.lsp_line(), max.lsp_character()), (999_999, 999_999));
+    }
+
+    #[test]
+    fn test_position_from_output_position_is_not_capped_and_clamps_zero() {
+        let big = Position::from(Position2D {
+            line: MAX_POSITION_VALUE + 7,
+            character: 2_000_000,
+        });
+        assert_eq!(big.line().get(), MAX_POSITION_VALUE + 7);
+        let clamped = Position::from(Position2D {
+            line: 0,
+            character: 0,
+        });
+        assert_eq!((clamped.line().get(), clamped.character().get()), (1, 1));
+    }
+
+    #[test]
+    fn test_position_range_orders_and_bounds() {
+        let at = Position::at;
+        assert!(PositionRange::new(at(1, 5), at(1, 5)).is_ok());
+        assert_eq!(
+            PositionRange::new(at(2, 1), at(1, 9)),
+            Err(InvalidRange::Reversed)
+        );
+        assert_eq!(
+            PositionRange::new(at(1, 5), at(1, 4)),
+            Err(InvalidRange::Reversed)
+        );
+        assert_eq!(
+            PositionRange::from_client((0, 1), (1, 1)),
+            Err(InvalidRange::Start(InvalidPosition::ZeroBased))
+        );
+        assert_eq!(
+            PositionRange::from_client((1, 1), (1, 0)),
+            Err(InvalidRange::End(InvalidPosition::ZeroBased))
+        );
+
+        let within = PositionRange::new(at(1, 1), at(1 + MAX_RANGE_LINES, 1)).unwrap();
+        assert!(BoundedRange::try_from(within).is_ok());
+        let beyond = PositionRange::new(at(1, 1), at(2 + MAX_RANGE_LINES, 1)).unwrap();
+        assert_eq!(
+            BoundedRange::try_from(beyond),
+            Err(InvalidRange::TooManyLines)
+        );
     }
 }

@@ -133,6 +133,7 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | FR-011 | THE SYSTEM SHALL split `line_text` and disk reads into lines per the LSP 3.17 line model (`\n`, `\r\n` and a lone `\r` end a line, the terminator is excluded, the empty line after a final terminator exists); servers that split only on `\n`/`\r\n` disagree on files containing a lone `\r` | must |
 | FR-012 | THE SYSTEM SHALL bound a tracked-document line lookup by line checkpoints (`DocumentText`), not a whole-document scan | must |
 | FR-013 | THE SYSTEM SHALL cap one response's disk-read I/O for position conversion at 4 times `workspace.max_file_size` (4 times the default when the limit is `0`) and at most 256 MiB, and reject `workspace.max_file_size` above 1 GiB | must |
+| FR-014 | THE SYSTEM SHALL reject a client-supplied line or character that is 0 or above 1,000,000 with invalid parameters (`-32602`) for every position- or range-taking tool, before any server is asked. `Position` holds non-zero integers and is built from client input only by `Position::from_client`; a `PositionRange` has `start <= end`, and `format_range` and `get_code_actions` additionally take a `BoundedRange` of at most 10,000 lines | must |
 
 ## 4. Non-Functional Requirements
 

@@ -201,6 +201,8 @@ impl RestartFailure {
             | Error::TomlSer(_)
             | Error::InvalidUri(_)
             | Error::ResourceUri(_)
+            | Error::InvalidPositionInput(_)
+            | Error::InvalidRangeInput(_)
             | Error::ServerUnavailable { .. }
             | Error::InvalidToolParams(_)
             | Error::FileIo { .. }

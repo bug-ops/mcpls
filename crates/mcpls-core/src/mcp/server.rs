@@ -33,21 +33,21 @@ use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
     DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, FormatRangeParams,
     InlayHintsParams, NavigationParams, PositionParams, RangeParams, ReferencesParams,
-    RenameParams, RestartServerParams, ServerLogsParams, ServerMessagesParams, SymbolTargetParams,
-    ToolSupportParams, TypeHierarchyWalkParams, WorkspaceSymbolParams,
+    RenameParams, RestartServerParams, ServerLogsParams, ServerMessagesParams, SymbolTargetInput,
+    SymbolTargetParams, ToolSupportParams, TypeHierarchyWalkParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
 };
 use crate::bridge::{
-    AddressableTool, Addressed, CallHierarchyPrepareResult, ClientPath, CodeActionsResult,
-    CompletionsResult, DefinitionResult, DiagnosticInfo, DiagnosticsResult,
+    AddressableTool, Addressed, BoundedRange, CallHierarchyPrepareResult, ClientPath,
+    CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo, DiagnosticsResult,
     DocumentDiagnosticsResult, DocumentHighlightsResult, DocumentSymbolsResult,
     FormatDocumentResult, HoverResult, IncomingCallsResult, IndexingState, InlayHintsResult,
     LocationsResult, NotificationCache, OutgoingCallsResult, Position, PositionEncoding,
-    PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult, ServerLogsResult,
-    ServerMessagesResult, SignatureHelpResult, Translator, TypeHierarchyResult, WorkspaceRoots,
-    WorkspaceSymbolResult,
+    PositionRange, PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator,
+    TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -234,6 +234,37 @@ fn map_bridge_error(e: crate::error::Error) -> McpError {
 /// a JSON-RPC `-32602`.
 fn parse_client_path(path: PathBuf) -> Result<ClientPath, McpError> {
     ClientPath::try_from(path).map_err(|e| map_bridge_error(e.into()))
+}
+
+/// Parses the file path and target of an addressed tool; a bad path or
+/// position is `-32602`.
+fn parse_target(
+    file_path: PathBuf,
+    target: SymbolTargetInput,
+) -> Result<(ClientPath, SymbolTarget), McpError> {
+    let target = target
+        .into_target()
+        .map_err(|e| map_bridge_error(e.into()))?;
+    Ok((parse_client_path(file_path)?, target))
+}
+
+/// Parses a client-supplied 1-based position, so a bad value is `-32602`.
+fn parse_position(line: u32, character: u32) -> Result<Position, McpError> {
+    Position::from_client(line, character).map_err(|e| map_bridge_error(e.into()))
+}
+
+/// Parses a client-supplied ordered range.
+fn parse_range(range: &RangeParams) -> Result<PositionRange, McpError> {
+    PositionRange::from_client(
+        (range.start_line, range.start_character),
+        (range.end_line, range.end_character),
+    )
+    .map_err(|e| map_bridge_error(e.into()))
+}
+
+/// Parses a client-supplied ordered range of at most `MAX_RANGE_LINES` lines.
+fn parse_bounded_range(range: &RangeParams) -> Result<BoundedRange, McpError> {
+    BoundedRange::try_from(parse_range(range)?).map_err(|e| map_bridge_error(e.into()))
 }
 
 /// Builds an error with `data` as its payload; a failed serialization is
@@ -578,7 +609,7 @@ impl McplsServer {
         &self,
         Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<HoverResult>>, McpError> {
-        let file_path = parse_client_path(file_path)?;
+        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
         self.structured_result(
             translator
@@ -604,7 +635,7 @@ impl McplsServer {
             context,
         }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<DefinitionResult>>, McpError> {
-        let file_path = parse_client_path(file_path)?;
+        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
         self.structured_result(
             translator
@@ -633,7 +664,7 @@ impl McplsServer {
             context,
         }): Parameters<ReferencesParams>,
     ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
-        let file_path = parse_client_path(file_path)?;
+        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
         self.structured_result(
             translator
@@ -724,7 +755,7 @@ impl McplsServer {
             new_name,
         }): Parameters<RenameParams>,
     ) -> Result<Json<Addressed<RenameResult>>, McpError> {
-        let file_path = parse_client_path(file_path)?;
+        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
         self.structured_result(
             translator
@@ -759,7 +790,7 @@ impl McplsServer {
         self.structured_result(
             self.context
                 .translator
-                .handle_completions(file_path, Position { line, character }, trigger)
+                .handle_completions(file_path, parse_position(line, character)?, trigger)
                 .await,
         )
     }
@@ -838,13 +869,7 @@ impl McplsServer {
         &self,
         Parameters(CodeActionsParams {
             file_path,
-            range:
-                RangeParams {
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                },
+            range,
             kind_filter,
         }): Parameters<CodeActionsParams>,
     ) -> Result<Json<CodeActionsResult>, McpError> {
@@ -852,18 +877,7 @@ impl McplsServer {
         self.structured_result(
             self.context
                 .translator
-                .handle_code_actions(
-                    file_path,
-                    Position {
-                        line: start_line,
-                        character: start_character,
-                    },
-                    Position {
-                        line: end_line,
-                        character: end_character,
-                    },
-                    kind_filter,
-                )
+                .handle_code_actions(file_path, parse_bounded_range(&range)?, kind_filter)
                 .await,
         )
     }
@@ -877,7 +891,7 @@ impl McplsServer {
         &self,
         Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<CallHierarchyPrepareResult>>, McpError> {
-        let file_path = parse_client_path(file_path)?;
+        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
         self.structured_result(
             translator
@@ -934,7 +948,7 @@ impl McplsServer {
         self.structured_result(
             self.context
                 .translator
-                .handle_type_hierarchy_prepare(file_path, Position { line, character })
+                .handle_type_hierarchy_prepare(file_path, parse_position(line, character)?)
                 .await,
         )
     }
@@ -980,7 +994,7 @@ impl McplsServer {
         self.structured_result(
             self.context
                 .translator
-                .handle_prepare_rename(file_path, Position { line, character })
+                .handle_prepare_rename(file_path, parse_position(line, character)?)
                 .await,
         )
     }
@@ -1002,7 +1016,7 @@ impl McplsServer {
         self.structured_result(
             self.context
                 .translator
-                .handle_document_highlights(file_path, Position { line, character })
+                .handle_document_highlights(file_path, parse_position(line, character)?)
                 .await,
         )
     }
@@ -1018,13 +1032,7 @@ impl McplsServer {
         &self,
         Parameters(FormatRangeParams {
             file_path,
-            range:
-                RangeParams {
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                },
+            range,
             tab_size,
             insert_spaces,
         }): Parameters<FormatRangeParams>,
@@ -1035,14 +1043,7 @@ impl McplsServer {
                 .translator
                 .handle_format_range(
                     file_path,
-                    Position {
-                        line: start_line,
-                        character: start_character,
-                    },
-                    Position {
-                        line: end_line,
-                        character: end_character,
-                    },
+                    parse_bounded_range(&range)?,
                     tab_size,
                     insert_spaces,
                 )
@@ -1154,7 +1155,7 @@ impl McplsServer {
         self.structured_result(
             self.context
                 .translator
-                .handle_signature_help(file_path, Position { line, character })
+                .handle_signature_help(file_path, parse_position(line, character)?)
                 .await,
         )
     }
@@ -1171,7 +1172,7 @@ impl McplsServer {
             context,
         }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
-        let file_path = parse_client_path(file_path)?;
+        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
         self.structured_result(
             translator
@@ -1199,7 +1200,7 @@ impl McplsServer {
             context,
         }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
-        let file_path = parse_client_path(file_path)?;
+        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
         self.structured_result(
             translator
@@ -1232,7 +1233,7 @@ impl McplsServer {
         self.structured_result(
             self.context
                 .translator
-                .handle_declaration(file_path, Position { line, character })
+                .handle_declaration(file_path, parse_position(line, character)?)
                 .await,
         )
     }
@@ -1285,32 +1286,13 @@ impl McplsServer {
     )]
     async fn get_inlay_hints(
         &self,
-        Parameters(InlayHintsParams {
-            file_path,
-            range:
-                RangeParams {
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                },
-        }): Parameters<InlayHintsParams>,
+        Parameters(InlayHintsParams { file_path, range }): Parameters<InlayHintsParams>,
     ) -> Result<Json<InlayHintsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
         self.structured_result(
             self.context
                 .translator
-                .handle_inlay_hints(
-                    file_path,
-                    Position {
-                        line: start_line,
-                        character: start_character,
-                    },
-                    Position {
-                        line: end_line,
-                        character: end_character,
-                    },
-                )
+                .handle_inlay_hints(file_path, parse_range(&range)?)
                 .await,
         )
     }
@@ -2085,6 +2067,93 @@ mod tests {
                 "expected {debug} to map onto INVALID_PARAMS"
             );
         }
+    }
+
+    /// #617: a zero or oversized line, or a malformed range, is `-32602` for
+    /// every position- and range-taking tool, before any server is asked.
+    #[tokio::test]
+    async fn test_position_tools_reject_out_of_range_input_as_invalid_params() {
+        let server = create_test_server();
+        let position = |line: u32, character: u32| PositionParams {
+            file_path: PathBuf::from("/ws/a.rs"),
+            line,
+            character,
+        };
+        let range = |start: (u32, u32), end: (u32, u32)| RangeParams {
+            start_line: start.0,
+            start_character: start.1,
+            end_line: end.0,
+            end_character: end.1,
+        };
+        for (line, character) in [(0, 1), (1, 0), (1_000_001, 1), (1, 1_000_001)] {
+            let results = [
+                server
+                    .get_hover(at(Parameters(position(line, character))))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_definition(nav(Parameters(position(line, character))))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_references(Parameters(ReferencesParams {
+                        target: position(line, character).into(),
+                        include_declaration: false,
+                        context: crate::bridge::ResultContext::None,
+                    }))
+                    .await
+                    .map(|_| ()),
+                server
+                    .rename_symbol(Parameters(RenameParams {
+                        target: position(line, character).into(),
+                        new_name: "x".into(),
+                    }))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_completions(Parameters(CompletionsParams {
+                        position: position(line, character),
+                        trigger: None,
+                    }))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_inlay_hints(Parameters(InlayHintsParams {
+                        file_path: PathBuf::from("/ws/a.rs"),
+                        range: range((line, character), (line, character)),
+                    }))
+                    .await
+                    .map(|_| ()),
+            ];
+            for result in results {
+                let err = result.unwrap_err();
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "({line}, {character})");
+            }
+        }
+
+        let reversed = server
+            .get_inlay_hints(Parameters(InlayHintsParams {
+                file_path: PathBuf::from("/ws/a.rs"),
+                range: range((3, 1), (2, 1)),
+            }))
+            .await;
+        assert_eq!(
+            reversed.map(|_| ()).unwrap_err().code,
+            ErrorCode::INVALID_PARAMS
+        );
+
+        let oversized = server
+            .format_range(Parameters(FormatRangeParams {
+                file_path: PathBuf::from("/ws/a.rs"),
+                range: range((1, 1), (10_002, 1)),
+                tab_size: 4,
+                insert_spaces: true,
+            }))
+            .await;
+        assert_eq!(
+            oversized.map(|_| ()).unwrap_err().code,
+            ErrorCode::INVALID_PARAMS
+        );
     }
 
     /// #527: a startup failure reaches the client as an internal error that

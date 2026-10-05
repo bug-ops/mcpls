@@ -95,14 +95,14 @@ pub fn mcp_to_lsp_position(
     encoding: PositionEncoding,
 ) -> Converted<lsp_types::Position> {
     let column = convert_column(
-        position.character.saturating_sub(1),
+        position.lsp_character(),
         line_text,
         PositionEncoding::Utf16,
         encoding,
     );
     Converted {
         value: lsp_types::Position {
-            line: position.line.saturating_sub(1),
+            line: position.lsp_line(),
             character: column.value,
         },
         fidelity: column.fidelity,
@@ -461,7 +461,7 @@ mod tests {
         line_text: Option<&str>,
         encoding: PositionEncoding,
     ) -> Converted<lsp_types::Position> {
-        mcp_to_lsp_position(Position { line, character }, line_text, encoding)
+        mcp_to_lsp_position(Position::at(line, character), line_text, encoding)
     }
 
     fn mcp_at(
@@ -513,14 +513,6 @@ mod tests {
                 assert_eq!(char, mcp_char);
             }
         }
-    }
-
-    #[test]
-    fn test_saturating_sub_zero() {
-        // Edge case: MCP position 0 should not underflow
-        let lsp_pos = lsp_at(0, 0, None, PositionEncoding::Utf16).value;
-        assert_eq!(lsp_pos.line, 0);
-        assert_eq!(lsp_pos.character, 0);
     }
 
     /// Requirement: UTF-16 negotiated encoding must be byte-for-byte

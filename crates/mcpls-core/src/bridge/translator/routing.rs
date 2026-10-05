@@ -4,53 +4,12 @@
 use std::path::{Path, PathBuf};
 
 use super::Translator;
-use super::dto::Position;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
 use crate::bridge::{ClientPath, InFlightGuard, WorkspacePath, lock_std};
 use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
-
-/// Maximum allowed position value for validation.
-pub(super) const MAX_POSITION_VALUE: u32 = 1_000_000;
-
-/// Maximum allowed range size in lines.
-pub(super) const MAX_RANGE_LINES: u32 = 10_000;
-
-/// Reject a 1-based position that is zero or beyond [`MAX_POSITION_VALUE`].
-pub(super) fn validate_position(position: Position) -> Result<()> {
-    let Position { line, character } = position;
-    if line < 1 || character < 1 {
-        return Err(Error::InvalidToolParams(
-            "Line and character positions must be >= 1".to_string(),
-        ));
-    }
-    if line > MAX_POSITION_VALUE || character > MAX_POSITION_VALUE {
-        return Err(Error::InvalidToolParams(format!(
-            "Position values must be <= {MAX_POSITION_VALUE}"
-        )));
-    }
-    Ok(())
-}
-
-/// Reject a 1-based range whose ends are invalid positions, that spans more
-/// than [`MAX_RANGE_LINES`], or whose start is after its end.
-pub(super) fn validate_range(start: Position, end: Position) -> Result<()> {
-    validate_position(start)?;
-    validate_position(end)?;
-    if end.line.saturating_sub(start.line) > MAX_RANGE_LINES {
-        return Err(Error::InvalidToolParams(format!(
-            "Range size must be <= {MAX_RANGE_LINES} lines"
-        )));
-    }
-    if start.line > end.line || (start.line == end.line && start.character > end.character) {
-        return Err(Error::InvalidToolParams(
-            "Start position must be before or equal to end position".to_string(),
-        ));
-    }
-    Ok(())
-}
 
 /// Total time `Translator::flush_pending_closes` may spend per call.
 const FLUSH_PENDING_CLOSES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -2208,13 +2167,7 @@ mod tests {
             let path = path_a.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_hover(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                    )
+                    .handle_hover(client_path(path), Position::at(1, 1))
                     .await
             })
         };
@@ -2234,13 +2187,7 @@ mod tests {
             let path = path_b.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_hover(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                    )
+                    .handle_hover(client_path(path), Position::at(1, 1))
                     .await
             })
         };
@@ -2307,13 +2254,7 @@ mod tests {
                 let path_str = path_str.clone();
                 tokio::spawn(async move {
                     translator
-                        .handle_hover(
-                            client_path(path_str),
-                            Position {
-                                line: 1,
-                                character: 1,
-                            },
-                        )
+                        .handle_hover(client_path(path_str), Position::at(1, 1))
                         .await
                 })
             })
@@ -2856,14 +2797,7 @@ mod tests {
         let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
 
         let result = translator
-            .handle_rename(
-                client_path("/main.rs"),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                new_name,
-            )
+            .handle_rename(client_path("/main.rs"), Position::at(1, 1), new_name)
             .await;
 
         assert_matches!(result, Err(Error::InvalidToolParams(_)));
@@ -2885,10 +2819,7 @@ mod tests {
         let result = translator
             .handle_rename(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 "renamed".to_string(),
             )
             .await;
@@ -2918,14 +2849,7 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 5,
-                },
+                bounded(Position::at(1, 1), Position::at(1, 5)),
                 None,
             )
             .await;
@@ -2955,10 +2879,7 @@ mod tests {
         let result = translator
             .handle_signature_help(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
             )
             .await;
 
@@ -3094,10 +3015,7 @@ mod tests {
         let result = translator
             .handle_call_hierarchy_prepare(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
             )
             .await;
 
@@ -3126,14 +3044,7 @@ mod tests {
         let result = translator
             .handle_inlay_hints(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 10,
-                    character: 1,
-                },
+                span(Position::at(1, 1), Position::at(10, 1)),
             )
             .await;
 
@@ -3162,10 +3073,7 @@ mod tests {
         let result = translator
             .handle_hover(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
             )
             .await;
 
@@ -3194,10 +3102,7 @@ mod tests {
         let result = translator
             .handle_definition(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 ResultContext::None,
             )
             .await;
@@ -3227,10 +3132,7 @@ mod tests {
         let result = translator
             .handle_references(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 false,
                 ResultContext::None,
             )
@@ -3253,14 +3155,7 @@ mod tests {
         let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
 
         let result = translator
-            .handle_completions(
-                client_path("/main.rs"),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Some(trigger),
-            )
+            .handle_completions(client_path("/main.rs"), Position::at(1, 1), Some(trigger))
             .await;
 
         assert_matches!(result, Err(Error::InvalidToolParams(_)));
@@ -3282,10 +3177,7 @@ mod tests {
         let result = translator
             .handle_completions(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 None,
             )
             .await;
@@ -3364,10 +3256,7 @@ mod tests {
         let result = translator
             .handle_implementation(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 ResultContext::None,
             )
             .await;
@@ -3397,10 +3286,7 @@ mod tests {
         let result = translator
             .handle_type_definition(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 ResultContext::None,
             )
             .await;
@@ -3428,13 +3314,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_declaration(
-                client_path(&path),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-            )
+            .handle_declaration(client_path(&path), Position::at(1, 1))
             .await;
 
         assert!(matches!(
@@ -3495,10 +3375,7 @@ mod tests {
                 translator
                     .handle_rename(
                         client_path(path_str),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
+                        Position::at(1, 1),
                         "renamed".to_string(),
                     )
                     .await

@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::bridge::InvalidClientPath;
 use crate::bridge::resources::ResourceUriError;
+use crate::bridge::{InvalidClientPath, InvalidPosition, InvalidRange};
 use crate::config::{BuiltinServer, ServerId, ToolKind};
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
@@ -848,6 +848,14 @@ pub enum Error {
     #[error("invalid URI: {0}")]
     InvalidUri(String),
 
+    /// A client-supplied position is out of bounds.
+    #[error(transparent)]
+    InvalidPositionInput(#[from] InvalidPosition),
+
+    /// A client-supplied range is malformed or too large.
+    #[error(transparent)]
+    InvalidRangeInput(#[from] InvalidRange),
+
     /// A client-supplied `lsp-diagnostics://` resource URI was rejected.
     #[error(transparent)]
     ResourceUri(#[from] ResourceUriError),
@@ -1266,6 +1274,8 @@ impl Error {
             | Self::NotARegularFile(_)
             | Self::InvalidUri(_)
             | Self::ResourceUri(_)
+            | Self::InvalidPositionInput(_)
+            | Self::InvalidRangeInput(_)
             | Self::ListenFilterTooLarge { .. }
             | Self::DocumentNotFound(_)
             | Self::FileSizeLimitExceeded { .. } => McpErrorKind::InvalidParams,

@@ -1490,14 +1490,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_definition(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        ResultContext::None,
-                    )
+                    .handle_definition(client_path(path), Position::at(1, 1), ResultContext::None)
                     .await
             })
         };
@@ -1562,14 +1555,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_definition(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        ResultContext::None,
-                    )
+                    .handle_definition(client_path(path), Position::at(1, 1), ResultContext::None)
                     .await
             })
         };
@@ -1801,10 +1787,7 @@ mod tests {
                 translator
                     .handle_implementation(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
+                        Position::at(1, 1),
                         ResultContext::None,
                     )
                     .await
@@ -2061,10 +2044,7 @@ mod tests {
                 translator
                     .handle_type_definition(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
+                        Position::at(1, 1),
                         ResultContext::None,
                     )
                     .await
