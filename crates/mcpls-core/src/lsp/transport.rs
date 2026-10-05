@@ -331,7 +331,6 @@ fn parse_inbound_message(value: Value, redactions: &Redactions) -> Result<Inboun
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::fmt::Write as _;

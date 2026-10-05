@@ -45,7 +45,7 @@ use super::{WorkspaceRoots, lexically_normalize, uri_to_path};
 pub const RESOLVE_CONCURRENCY: usize = 8;
 
 /// How long a resolved path stays memoized.
-pub const MEMO_TTL: Duration = Duration::from_secs(60);
+pub const MEMO_TTL: Duration = Duration::from_mins(1);
 
 /// Maximum memoized paths; a full memo drops expired entries, then the oldest half.
 pub const MEMO_CAPACITY: usize = 8192;
@@ -356,8 +356,8 @@ pub async fn resolve_one(uri: &Uri, roots: &WorkspaceRoots) -> Option<PublishedD
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
@@ -406,10 +406,10 @@ mod tests {
     #[test]
     fn test_canonicalize_existing_prefix_rejects_parent_components() {
         let canon = |p: &Path| -> io::Result<PathBuf> { Ok(p.to_path_buf()) };
-        assert!(matches!(
+        assert_matches!(
             canonicalize_existing_prefix(Path::new("/ws/missing/../link/f.rs"), &canon),
             Err(Unresolved::ParentComponent)
-        ));
+        );
     }
 
     #[cfg(unix)]
@@ -453,10 +453,10 @@ mod tests {
         let canon = |_: &Path| -> io::Result<PathBuf> {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
         };
-        assert!(matches!(
+        assert_matches!(
             canonicalize_existing_prefix(Path::new("/a/b.rs"), &canon),
             Err(Unresolved::Transient(_))
-        ));
+        );
     }
 
     #[test]

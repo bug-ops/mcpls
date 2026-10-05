@@ -151,7 +151,10 @@ impl ListenLeaseSlot {
     pub fn start(&self) {
         if self
             .deadline
-            .set(super::liveness::after(self.window.draw()))
+            .set(super::saturating_deadline(
+                Instant::now(),
+                self.window.draw(),
+            ))
             .is_ok()
         {
             self.waker.wake();
@@ -241,7 +244,6 @@ pub(super) async fn attach_listen_lease(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use proptest::prelude::*;
 
@@ -349,7 +351,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_data(&mut body).await.unwrap(), b"a");
-        tokio::time::sleep(Duration::from_secs(3600)).await;
+        tokio::time::sleep(Duration::from_hours(1)).await;
         tx.send(Ok(axum::body::Bytes::from_static(b"b")))
             .await
             .unwrap();

@@ -44,7 +44,13 @@ enum DocumentDiagnosticReportResult {
     // all (rather than failing to deserialize) is the only thing that
     // matters, so today's behavior of degrading to an empty diagnostics list
     // is preserved.
-    Partial(#[allow(dead_code)] lsp_types::DocumentDiagnosticReportPartialResult),
+    Partial(
+        #[allow(
+            dead_code,
+            reason = "the partial-result payload is only deserialized, never read"
+        )]
+        lsp_types::DocumentDiagnosticReportPartialResult,
+    ),
 }
 
 /// Shared, never-mutated empty `workspace_roots` for an `EncodingCtx` built
@@ -431,7 +437,6 @@ impl Translator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -604,7 +609,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scenario covering every severity"
+    )]
     async fn test_handle_cached_diagnostics_multiple_severities() {
         let mut cache = NotificationCache::new();
         let temp_dir = TempDir::new().unwrap();

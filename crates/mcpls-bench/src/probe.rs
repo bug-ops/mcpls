@@ -263,7 +263,6 @@ fn payload<T: DeserializeOwned>(result: &CallToolResult) -> Result<T, Incorrect>
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use rmcp::model::ContentBlock;
     use serde_json::json;

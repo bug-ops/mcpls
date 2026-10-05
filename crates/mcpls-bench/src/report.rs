@@ -694,7 +694,6 @@ pub fn summarize(runs: &[RunRecord]) -> Vec<RegionSummary> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

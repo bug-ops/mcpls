@@ -553,7 +553,6 @@ impl<T: ServerText> ServerText for Contextual<T> {
 
 #[cfg(test)]
 mod contextual_tests {
-    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
@@ -592,7 +591,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod server_text_tests {
     use super::*;
 

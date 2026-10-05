@@ -147,7 +147,6 @@ async fn run(args: Args) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::time::Instant;
 

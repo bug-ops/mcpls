@@ -271,7 +271,10 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails, no server is configured, or
     /// the routed server does not advertise `workspaceSymbolProvider` support.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear request/response flow; splitting would scatter the steps"
+    )]
     pub async fn handle_workspace_symbol(
         &self,
         query: String,
@@ -456,7 +459,6 @@ struct RawWorkspaceSymbol {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -500,7 +502,10 @@ mod tests {
             detail: None,
             kind: lsp_types::SymbolKind::EnumMember,
             tags: None,
-            #[allow(deprecated)]
+            #[allow(
+                deprecated,
+                reason = "`deprecated` is a deprecated field of the LSP struct literal"
+            )]
             deprecated: None,
             range: lsp_types::Range {
                 start: lsp_types::Position {

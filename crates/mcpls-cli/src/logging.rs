@@ -272,7 +272,6 @@ pub fn init(level: &LogFilter, log_json: bool) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::sync::{Arc, Mutex};
@@ -503,10 +502,10 @@ mod tests {
             Err(InvalidLogFilter::NotALevel("warnn".into()))
         );
         assert_eq!("".parse::<LogFilter>(), Err(InvalidLogFilter::Empty));
-        assert!(matches!(
+        assert_matches!(
             "foo=bar=baz".parse::<LogFilter>(),
             Err(InvalidLogFilter::Syntax(_))
-        ));
+        );
     }
 
     #[test]

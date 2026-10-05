@@ -13,8 +13,7 @@ use tokio::time::Duration;
 use super::Translator;
 use super::restart::{NotificationReceivers, NotificationRouting};
 use super::servers::Backend;
-use crate::DiagnosticsRole;
-use crate::bridge::lock_std;
+use crate::bridge::{DiagnosticsRole, lock_std};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
 use crate::lsp::tsserver_pin::{configured_tsserver_path, warn_if_pin_ignored};
@@ -471,7 +470,6 @@ pub(super) enum BackoffPolicy {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::bridge::translator::clock::{Clock, FakeClock};

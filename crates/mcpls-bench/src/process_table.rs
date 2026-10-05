@@ -307,7 +307,6 @@ pub fn signalable_pid(pid: u32) -> Option<i32> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

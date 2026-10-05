@@ -61,6 +61,7 @@ pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
+allow_attributes_without_reason = "warn"
 assert_is_empty = "allow"
 
 [profile.release]

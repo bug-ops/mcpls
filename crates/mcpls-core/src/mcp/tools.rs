@@ -539,7 +539,6 @@ pub struct InlayHintsParams {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::path::Path;

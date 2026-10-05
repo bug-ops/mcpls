@@ -182,8 +182,10 @@ pub enum ServerSelection {
 impl ServerSelection {
     /// Whether this is the default [`Self::Explicit`] selection, so the
     /// serializer omits the key from entries that carry it.
-    // serde needs `&self` here despite Self being a trivially-Copy 1-byte enum.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if passes a reference"
+    )]
     #[must_use]
     pub(crate) const fn is_explicit(&self) -> bool {
         matches!(self, Self::Explicit)
@@ -605,7 +607,6 @@ impl LspServerConfig {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use tempfile::TempDir;
 

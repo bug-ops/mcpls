@@ -353,7 +353,10 @@ impl EncodingConverter {
     /// Returns an error if:
     /// - The byte offset is not on a character boundary
     /// - The encoding is unsupported
-    #[allow(clippy::cast_possible_truncation)] // LSP positions use u32, truncation acceptable
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "LSP positions are u32; truncation is acceptable"
+    )]
     pub fn byte_offset_to_character(&self, text: &str, byte_offset: usize) -> Result<u32, String> {
         if byte_offset > text.len() {
             let text_len = text.len();
@@ -390,7 +393,10 @@ impl EncodingConverter {
     /// Returns an error if:
     /// - The character offset is out of bounds
     /// - The encoding is unsupported
-    #[allow(clippy::cast_possible_truncation)] // LSP positions use u32, truncation acceptable
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "LSP positions are u32; truncation is acceptable"
+    )]
     pub fn character_to_byte_offset(
         &self,
         text: &str,
@@ -455,7 +461,6 @@ impl EncodingConverter {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

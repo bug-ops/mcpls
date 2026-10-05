@@ -23,7 +23,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
-use super::{HeaderReadTimeout, WriteStallTimeout};
+use super::config::{HeaderReadTimeout, WriteStallTimeout};
+use super::saturating_deadline;
 
 /// Longest the lingering close waits for the next byte or the EOF.
 const LINGER_READ_IDLE: Duration = Duration::from_secs(2);
@@ -56,13 +57,6 @@ fn min_progress(window: Duration) -> usize {
     usize::try_from(bytes)
         .unwrap_or(usize::MAX)
         .clamp(MIN_PROGRESS_FLOOR, MIN_PROGRESS_CEILING)
-}
-
-/// `now + after`, or a year ahead (effectively never) when the sum overflows.
-pub(super) fn deadline_after(now: Instant, after: Duration) -> Instant {
-    now.checked_add(after)
-        .or_else(|| now.checked_add(Duration::from_hours(24 * 365)))
-        .unwrap_or(now)
 }
 
 /// Bytes a completed write accepted; `0` for a pending or failed one.
@@ -154,7 +148,7 @@ impl<T> ConnectionIo<T> {
             (None, Poll::Pending) => {
                 self.timer
                     .as_mut()
-                    .reset(deadline_after(Instant::now(), self.write_stall));
+                    .reset(saturating_deadline(Instant::now(), self.write_stall));
                 stall.insert(StallWindow { progress: 0 })
             }
             (None, Poll::Ready(_)) => return poll,
@@ -182,10 +176,10 @@ impl<T> ConnectionIo<T> {
             return;
         }
         let now = Instant::now();
-        let total_deadline = deadline_after(now, self.linger_total);
+        let total_deadline = saturating_deadline(now, self.linger_total);
         self.timer
             .as_mut()
-            .reset(deadline_after(now, LINGER_READ_IDLE).min(total_deadline));
+            .reset(saturating_deadline(now, LINGER_READ_IDLE).min(total_deadline));
         self.discarded = 0;
         self.phase = Phase::Lingering { total_deadline };
     }
@@ -228,7 +222,7 @@ impl<T: AsyncRead + Unpin> ConnectionIo<T> {
         if progressed {
             self.timer
                 .as_mut()
-                .reset(deadline_after(Instant::now(), LINGER_READ_IDLE).min(total_deadline));
+                .reset(saturating_deadline(Instant::now(), LINGER_READ_IDLE).min(total_deadline));
         }
         if self.timer.as_mut().poll(cx).is_ready() {
             return self.finish_linger();
@@ -298,7 +292,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ConnectionIo<T> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::time::Duration;

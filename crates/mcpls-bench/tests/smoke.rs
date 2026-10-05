@@ -4,7 +4,12 @@
 //! the e2e CI job runs it with `--run-ignored ignored-only`.
 
 #![cfg(unix)]
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    missing_docs,
+    reason = "test code; a panic is the failure signal"
+)]
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -23,7 +23,8 @@
     clippy::unwrap_used,
     clippy::panic,
     clippy::missing_docs_in_private_items,
-    missing_docs
+    missing_docs,
+    reason = "test code; a panic is the failure signal"
 )]
 
 #[path = "common/assertions.rs"]
@@ -1329,7 +1330,7 @@ fn sc_restart_server(client: &mut McpClient, workspace: &Path) -> Result<(), Str
 
     let lib = workspace.join("src/lib.rs");
     let add_line = find_line(&lib, "pub fn add(");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let hover = client
             .call_tool(
