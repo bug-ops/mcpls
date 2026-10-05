@@ -40,10 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `lib.rs` split into `runtime/` and `transport.rs` into submodules; no behavior change. (#PR)
-- Log targets move to `mcpls_core::runtime::*` and `mcpls_core::transport::*`; `Transport` implements `Debug`. (#PR)
-- Connection I/O deadlines saturate at 30 years instead of one. (#PR)
-- Newer std APIs adopted at the sites missed by the MSRV 1.99 raise; `clippy::allow_attributes_without_reason` is enforced and unused lint suppressions removed. (#PR)
+- `lib.rs` split into `runtime/` and `transport.rs` into submodules; no behavior change. (#638)
+- Log targets move to `mcpls_core::runtime::*` and `mcpls_core::transport::*`; `Transport` implements `Debug`. (#638)
+- Connection I/O deadlines saturate at 30 years instead of one. (#638)
+- Newer std APIs adopted at the sites missed by the MSRV 1.99 raise; `clippy::allow_attributes_without_reason` is enforced and unused lint suppressions removed. (#638)
 - **Breaking:** `AllowedHost` rejects ports 0, 80 and 443 (`InvalidAllowedHost::DefaultPort`), so `--http-allowed-host x.example:443` fails at startup instead of answering `403`; `AllowedHost::port()` is no longer `const`. (#635)
 - **Breaking:** server timeouts, `position_encodings` and `language_id` are typed (`TimeoutSecs`, `IndexingReadyTimeoutSecs`, `PositionEncodings`, `LanguageId`) and rejected when the config is loaded, and the use-site clamps are gone; field and type changes in `ServerInitConfig`, `ServerSpawnFailure`, `ToolRouter`, `LspClient` and `Translator`, and a new `hint` field on `Error::LspInitFailed` and `Error::ServerExitedDuringInit`, affect embedders. (#635)
 - **Breaking:** the default TypeScript server pins `tsserver` to the one next to `typescript-language-server` instead of a workspace `node_modules`, for `npm -g` style symlink installs with a global `typescript`; Windows `.cmd`, pnpm, Volta, asdf, mise and `npx`/`bunx`/`node` launchers are not covered and log a warning. Opt out with `initialization_options.tsserver.path`. (#609)
