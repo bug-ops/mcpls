@@ -100,6 +100,7 @@ fn http_config(args: &Args, bind: std::net::SocketAddr) -> mcpls_core::HttpConfi
         .with_path(args.http_path.clone())
         .with_stream_liveness(args.http_stream_liveness.into())
         .with_allowed_origins(args.allowed_origins())
+        .with_allowed_hosts(args.allowed_hosts())
 }
 
 async fn run(args: Args) -> Result<()> {
@@ -185,6 +186,23 @@ mod tests {
             ["https://app.example.com:443", "http://[::1]:8080"]
         );
         assert_eq!(cfg.path.as_str(), "/api/mcp");
+    }
+
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_http_config_carries_the_allowed_hosts_of_the_command_line() {
+        use clap::Parser as _;
+
+        let args = Args::parse_from([
+            "mcpls",
+            "--http-allowed-host",
+            "Mcp.Example.com, [::1]:8080",
+        ]);
+
+        let cfg = http_config(&args, "0.0.0.0:3000".parse().unwrap());
+
+        let hosts: Vec<String> = cfg.allowed_hosts.iter().map(ToString::to_string).collect();
+        assert_eq!(hosts, ["mcp.example.com", "[::1]:8080"]);
     }
 
     #[test]

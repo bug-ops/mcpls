@@ -738,9 +738,9 @@ mcpls
 > [!WARNING]
 > **Authentication requirement**: mcpls performs **no authentication** on any transport, including HTTP. When binding to a non-loopback address (e.g., `0.0.0.0:3000`), you **must** place mcpls behind a reverse proxy that enforces authentication before forwarding requests.
 >
-> The reverse proxy should also rewrite the `Host` header, as rmcp's host validation only allows `localhost`, `127.0.0.1`, or `::1` by default.
+> The `Host` header must be `localhost`, `127.0.0.1`, `::1` (any port), the bound IP address when it is a specific non-loopback address, or one of the hosts listed with `--http-allowed-host` (`MCPLS_HTTP_ALLOWED_HOSTS`); there is no wildcard, so a `0.0.0.0` bind needs the names clients use listed. Alternatively the reverse proxy can rewrite the `Host` header.
 >
-> A request carrying an `Origin` header is accepted only when it names `localhost`, `127.0.0.1` or `[::1]` on the bound port, or one of the origins listed with `--http-allowed-origin` (`MCPLS_HTTP_ALLOWED_ORIGINS`); anything else, including `Origin: null`, is answered with `403`. Requests without `Origin` (every non-browser client) are unaffected. Allowed origins do not relax the `Host` check, which stays loopback-only, so they serve browser pages whose requests reach mcpls with a loopback `Host` (through a tunnel, or a proxy that rewrites `Host`).
+> A request carrying an `Origin` header is accepted only when it names `localhost`, `127.0.0.1` or `[::1]` on the bound port, or one of the origins listed with `--http-allowed-origin` (`MCPLS_HTTP_ALLOWED_ORIGINS`); anything else, including `Origin: null`, is answered with `403`. Requests without `Origin` (every non-browser client) are unaffected. Allowed origins do not relax the `Host` check, which runs first, so a browser page reaching mcpls by a non-loopback name needs that name in `--http-allowed-host` as well.
 >
 > **Example (nginx):**
 > ```nginx
@@ -770,13 +770,24 @@ mcpls
 
 ### `MCPLS_HTTP_ALLOWED_ORIGINS` (transport-http feature)
 
-Extra browser origins accepted by the HTTP transport besides the loopback origins on the bound port; repeat `--http-allowed-origin` or separate values with commas (spaces around a comma are ignored). Each value must be `http://` or `https://` followed by a host and an optional port; a missing port means the scheme default (80 or 443). A path, query, user information, wildcard, `null`, a non-numeric or out-of-range port or an unbracketed IPv6 host is a usage error (exit code 2). The host is matched case-insensitively. The `Host` header check is not affected and stays loopback-only (#597).
+Extra browser origins accepted by the HTTP transport besides the loopback origins on the bound port; repeat `--http-allowed-origin` or separate values with commas (spaces around a comma are ignored). Each value must be `http://` or `https://` followed by a host and an optional port; a missing port means the scheme default (80 or 443). A path, query, user information, wildcard, `null`, a non-numeric or out-of-range port or an unbracketed IPv6 host is a usage error (exit code 2). The host is matched case-insensitively. The `Host` header check is not affected; see `MCPLS_HTTP_ALLOWED_HOSTS`.
 
 **Default**: none
 
 ```bash
 export MCPLS_HTTP_ALLOWED_ORIGINS="https://app.example.com,http://[::1]:8080"
 mcpls --listen 127.0.0.1:3000
+```
+
+### `MCPLS_HTTP_ALLOWED_HOSTS` (transport-http feature)
+
+Extra `Host` header values accepted by the HTTP transport besides `localhost`, `127.0.0.1`, `::1` and the bound IP address when it is a specific non-loopback address; repeat `--http-allowed-host` or separate values with commas (spaces around a comma are ignored). Each value is a host name or IP address with an optional port (`mcp.example.com`, `mcp.example.com:8443`, `[2001:db8::1]:8443`); without a port any port matches, with one only that port does and a request that omits the port does not match. Clients and proxies omit `:80` and `:443`, so never pin those: list the host without a port. A wildcard, user information, scheme, path, empty port (`host:`), out-of-range port, trailing dot, non-ASCII character (write an internationalized name in punycode, `xn--...`) or unbracketed IPv6 address is a usage error (exit code 2). The host is matched case-insensitively.
+
+**Default**: none
+
+```bash
+export MCPLS_HTTP_ALLOWED_HOSTS="mcp.example.com:8443"
+mcpls --listen 0.0.0.0:8443
 ```
 
 ### `MCPLS_HTTP_STREAM_LIVENESS` (transport-http feature)

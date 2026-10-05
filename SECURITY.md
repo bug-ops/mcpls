@@ -21,7 +21,9 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
 `mcpls` does not sandbox the servers it spawns.
 
 - **Workspace-supplied `mcpls` config.** A project-local `./mcpls.toml` can name
-  server commands and environment. It is ignored unless you pass
+  server commands and environment, and set per-server `settings` and
+  `initialization_options`, which can steer what a server executes (for example
+  pyright's interpreter or rust-analyzer's `check.overrideCommand`). It is ignored unless you pass
   `--trust-project-config`. This flag governs only the `mcpls` config. It does
   not make the workspace itself safe to analyze.
 - **Language servers execute workspace code.** This is inherent to LSP and the

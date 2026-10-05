@@ -26,7 +26,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 007 | [[lsp/007-lsp-child-process-lifetime/spec\|lsp-child-process-lifetime]] | enhancement | P2 | implemented (#546) | #526 |
 | 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | implemented (declaration #567, type hierarchy, prepare rename, highlights, range formatting); semanticTokens and others non-goals | #567, #568, #569 |
 | 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | implemented | #572; #588, #589 (FR-019, FR-021) |
-| 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578 |
+| 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578; #598 (settings push and serve) |
 
 ## mcp
 
@@ -34,7 +34,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 |---|------|------|----------|--------|-------|
 | 001 | [[mcp/001-mcp-tool-surface-and-routing/spec\|mcp-tool-surface-and-routing]] | enhancement | P1 | implemented (retroactive) | — |
 | 002 | [[mcp/002-mcp-resources-diagnostics/spec\|mcp-resources-diagnostics]] | enhancement | P3 | draft | #115; #468 (FR-006, FR-007); #521 (FR-008); #535 (FR-009); #544, #545 (FR-009..FR-012) |
-| 003 | [[mcp/003-mcp-2026-stateless-adoption/spec\|mcp-2026-stateless-adoption]] | research | P3 | draft | #298; #493 (stateless subscriptions, closed as research); #522 (subscriptions/listen implemented) |
+| 003 | [[mcp/003-mcp-2026-stateless-adoption/spec\|mcp-2026-stateless-adoption]] | research | P3 | draft | #298; #493 (stateless subscriptions, closed as research); #522 (subscriptions/listen implemented); #593 (paced replay, bounded eviction record) |
 | 004 | [[mcp/004-mcp-tasks-sep2663-adoption/spec\|mcp-tasks-sep2663-adoption]] | research | P4 | draft | #119 |
 | 005 | [[mcp/005-tool-capability-discoverability/spec\|tool-capability-discoverability]] | research | P4 | implemented (#540) | #461 |
 | 006 | [[mcp/006-http-stream-liveness/spec\|http-stream-liveness]] | enhancement | P3 | implemented | #543 |
@@ -43,7 +43,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 009 | [[mcp/009-speculative-edit-diagnostic-preview/spec\|speculative-edit-diagnostic-preview]] | research | P4 | decided (non-goal, verify loop documented) | #570 |
 | 010 | [[mcp/010-http-session-keepalive-with-live-stream/spec\|http-session-keepalive-with-live-stream]] | enhancement | P3 | implemented | #573 |
 | 011 | [[mcp/011-client-path-boundary-parsing/spec\|client-path-boundary-parsing]] | bug | P2 | implemented (#580) | #575 |
-| 012 | [[mcp/012-http-typed-limits-origins-stream-deadline/spec\|http-typed-limits-origins-stream-deadline]] | enhancement | P3 | implemented | #584, #585, #587 |
+| 012 | [[mcp/012-http-typed-limits-origins-stream-deadline/spec\|http-typed-limits-origins-stream-deadline]] | enhancement | P3 | implemented | #584, #585, #587; #597, #600, #602 |
 
 ## bridge
 
@@ -70,7 +70,7 @@ neither belongs to a single `config`/`lsp`/`mcp`/`bridge` module.
 | 001 | [[runtime/001-log-json-bool-env-parsing/spec\|log-json-bool-env-parsing]] | bug | P2 | implemented (#314) | — |
 | 002 | [[runtime/002-sigterm-stdin-blocking-pool-hang/spec\|sigterm-stdin-blocking-pool-hang]] | bug | P1 | implemented (#321, #328) | — |
 | 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | implemented (tsserver pin, docs, SECURITY.md); untrusted-workspace mode deferred | #566 |
-| 004 | [[runtime/004-server-text-hygiene/spec\|server-text-hygiene]] | bug | P3 | implemented | #581, #582, #583 |
+| 004 | [[runtime/004-server-text-hygiene/spec\|server-text-hygiene]] | bug | P3 | implemented | #581, #582, #583; #599 |
 
 ## testing
 

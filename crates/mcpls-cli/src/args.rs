@@ -139,9 +139,8 @@ pub struct Args {
     ///
     /// Must be `http://` or `https://` with a host and optional port, and no
     /// path, query or user information; a missing port means the scheme
-    /// default. For pages whose requests reach mcpls with a loopback `Host`
-    /// (a tunnel, or a proxy that rewrites `Host`); a non-loopback `Host` is
-    /// still rejected. Only meaningful when `--listen` is set.
+    /// default. The request's `Host` must be allowed as well; see
+    /// `--http-allowed-host`. Only meaningful when `--listen` is set.
     #[cfg(feature = "transport-http")]
     #[arg(
         long = "http-allowed-origin",
@@ -151,10 +150,40 @@ pub struct Args {
         value_parser = parse_allowed_origin
     )]
     http_allowed_origins: Vec<Option<mcpls_core::AllowedOrigin>>,
+
+    /// `Host` header value accepted by the HTTP transport, besides `localhost`,
+    /// `127.0.0.1`, `::1` and the bound IP address (repeatable or
+    /// comma-separated).
+    ///
+    /// A host name or IP address with an optional port, for example
+    /// `mcp.example.com` or `mcp.example.com:8443`; without a port any port
+    /// matches, with one a request must send that port. Never pin `:80` or
+    /// `:443`: clients omit them, so list the host without a port. No
+    /// wildcards, user information, scheme, path, trailing dot or non-ASCII
+    /// (use punycode). For deployments
+    /// reached through a name (a reverse proxy, a tunnel) or when binding to
+    /// `0.0.0.0`; browser origins are allowed separately with
+    /// `--http-allowed-origin`. Only meaningful when `--listen` is set.
+    #[cfg(feature = "transport-http")]
+    #[arg(
+        long = "http-allowed-host",
+        value_name = "HOST",
+        env = "MCPLS_HTTP_ALLOWED_HOSTS",
+        value_delimiter = ',',
+        value_parser = parse_allowed_host
+    )]
+    http_allowed_hosts: Vec<Option<mcpls_core::AllowedHost>>,
 }
 
 #[cfg(feature = "transport-http")]
 impl Args {
+    /// The extra allowed `Host` values, without the empty segments an empty
+    /// variable, `,,` or a trailing comma leave behind.
+    #[must_use]
+    pub fn allowed_hosts(&self) -> Vec<mcpls_core::AllowedHost> {
+        self.http_allowed_hosts.iter().flatten().cloned().collect()
+    }
+
     /// The extra allowed origins, without the empty segments an empty
     /// variable, `,,` or a trailing comma leave behind.
     #[must_use]
@@ -173,6 +202,19 @@ impl Args {
 fn parse_allowed_origin(
     value: &str,
 ) -> Result<Option<mcpls_core::AllowedOrigin>, mcpls_core::InvalidAllowedOrigin> {
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        value.parse().map(Some)
+    }
+}
+
+/// Parses one `--http-allowed-host` value; a blank one is `None`, so
+/// `MCPLS_HTTP_ALLOWED_HOSTS=` and a trailing comma are no-ops.
+#[cfg(feature = "transport-http")]
+fn parse_allowed_host(
+    value: &str,
+) -> Result<Option<mcpls_core::AllowedHost>, mcpls_core::InvalidAllowedHost> {
     if value.trim().is_empty() {
         Ok(None)
     } else {
@@ -495,6 +537,59 @@ mod tests {
             ] {
                 let err =
                     Args::try_parse_from(["mcpls", "--http-allowed-origin", bad]).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{bad:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_http_allowed_host_defaults_to_none() {
+            let args = Args::parse_from(["mcpls"]);
+            assert!(args.allowed_hosts().is_empty());
+        }
+
+        #[test]
+        fn test_http_allowed_host_ignores_empty_segments() {
+            for value in ["", ",,", " , ", ",a.example.com,", "a.example.com,"] {
+                let args = Args::try_parse_from(["mcpls", "--http-allowed-host", value])
+                    .unwrap_or_else(|e| panic!("{value:?} rejected: {e}"));
+                let expected = usize::from(value.contains("a.example.com"));
+                assert_eq!(args.allowed_hosts().len(), expected, "{value:?}");
+            }
+        }
+
+        #[test]
+        fn test_http_allowed_host_repeats_and_splits_on_commas() {
+            let args = Args::parse_from([
+                "mcpls",
+                "--http-allowed-host",
+                "a.example.com",
+                "--http-allowed-host",
+                "B.example.com:8443, [::1]:9000",
+            ]);
+            let hosts: Vec<String> = args
+                .allowed_hosts()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(hosts, ["a.example.com", "b.example.com:8443", "[::1]:9000"]);
+        }
+
+        #[test]
+        fn test_http_allowed_host_rejected_by_clap() {
+            for bad in [
+                "*",
+                "*.example.com",
+                "user@example.com",
+                "https://a.example.com",
+                "a.example.com:",
+                "a.example.com:99999",
+                "a.example.com,*",
+            ] {
+                let err = Args::try_parse_from(["mcpls", "--http-allowed-host", bad]).unwrap_err();
                 assert_eq!(
                     err.kind(),
                     clap::error::ErrorKind::ValueValidation,

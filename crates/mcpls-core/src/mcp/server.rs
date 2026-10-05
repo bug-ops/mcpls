@@ -50,6 +50,7 @@ use crate::bridge::{
     WorkspaceSymbolResult, validate_path_against_roots,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
+use crate::redaction::{Redactions, ServerText};
 
 /// Built-in `serverInfo.title`, used when `[mcp].title` is not configured.
 const DEFAULT_SERVER_TITLE: &str = "MCPLS - MCP to LSP Bridge";
@@ -253,11 +254,18 @@ fn error_with_data(code: ErrorCode, message: String, data: &impl Serialize) -> M
 /// The handler's own return type -- not this helper's -- is what the `#[tool]` macro reads to
 /// derive `outputSchema`; it must spell `Result<Json<T>, McpError>` literally (no alias) for the
 /// macro to detect it. See `Json<T>`'s `IntoCallToolResult` impl, which this helper relies on.
-fn to_structured_tool_result<T: Serialize + JsonSchema>(
+///
+/// Server-supplied display prose in the value is redacted with `redactions` first; see
+/// [`ServerText`] for what counts as prose.
+fn to_structured_tool_result<T: Serialize + JsonSchema + ServerText>(
     result: crate::error::Result<T>,
+    redactions: &Redactions,
 ) -> Result<Json<T>, McpError> {
     match result {
-        Ok(value) => Ok(Json(value)),
+        Ok(mut value) => {
+            value.redact_server_text(redactions);
+            Ok(Json(value))
+        }
         Err(e) => Err(map_bridge_error(e)),
     }
 }
@@ -395,6 +403,21 @@ fn build_resource_diagnostics_response(
     signals: DiagnosticsRouteSignals,
 ) -> ResourceDiagnosticsResponse {
     ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry, signals)
+}
+
+// Diagnostics were redacted when they entered the cache or the pull path.
+impl ServerText for CachedDiagnosticsResponse {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self { result, signals: _ } = self;
+        result.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for DiagnosticsResponse {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self { result, signals: _ } = self;
+        result.redact_server_text(redactions);
+    }
 }
 
 #[tool_router(router = declared_tool_router)]
@@ -557,7 +580,7 @@ impl McplsServer {
     ) -> Result<Json<Addressed<HoverResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
-        to_structured_tool_result(
+        self.structured_result(
             translator
                 .with_resolved_target(
                     file_path,
@@ -583,7 +606,7 @@ impl McplsServer {
     ) -> Result<Json<Addressed<DefinitionResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
-        to_structured_tool_result(
+        self.structured_result(
             translator
                 .with_resolved_target(
                     file_path,
@@ -612,7 +635,7 @@ impl McplsServer {
     ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
-        to_structured_tool_result(
+        self.structured_result(
             translator
                 .with_resolved_target(
                     file_path,
@@ -681,7 +704,7 @@ impl McplsServer {
         };
         let signals = before.union(after);
 
-        to_structured_tool_result(result.map(|result| DiagnosticsResponse { result, signals }))
+        self.structured_result(result.map(|result| DiagnosticsResponse { result, signals }))
     }
 
     /// Rename a symbol across the workspace.
@@ -700,7 +723,7 @@ impl McplsServer {
     ) -> Result<Json<Addressed<RenameResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
-        to_structured_tool_result(
+        self.structured_result(
             translator
                 .with_resolved_target(
                     file_path,
@@ -730,7 +753,7 @@ impl McplsServer {
         }): Parameters<CompletionsParams>,
     ) -> Result<Json<CompletionsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_completions(file_path, Position { line, character }, trigger)
@@ -748,7 +771,7 @@ impl McplsServer {
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
     ) -> Result<Json<DocumentSymbolsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_document_symbols(file_path)
@@ -772,7 +795,7 @@ impl McplsServer {
         }): Parameters<FormatDocumentParams>,
     ) -> Result<Json<FormatDocumentResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_format_document(file_path, tab_size, insert_spaces)
@@ -793,7 +816,7 @@ impl McplsServer {
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<Json<WorkspaceSymbolResult>, McpError> {
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_workspace_symbol(query, kind_filter, limit)
@@ -823,7 +846,7 @@ impl McplsServer {
         }): Parameters<CodeActionsParams>,
     ) -> Result<Json<CodeActionsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_code_actions(
@@ -853,7 +876,7 @@ impl McplsServer {
     ) -> Result<Json<Addressed<CallHierarchyPrepareResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
-        to_structured_tool_result(
+        self.structured_result(
             translator
                 .with_resolved_target(
                     file_path,
@@ -876,7 +899,7 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<Json<IncomingCallsResult>, McpError> {
-        to_structured_tool_result(self.context.translator.handle_incoming_calls(item).await)
+        self.structured_result(self.context.translator.handle_incoming_calls(item).await)
     }
 
     /// Get outgoing calls (callees).
@@ -888,7 +911,7 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<Json<OutgoingCallsResult>, McpError> {
-        to_structured_tool_result(self.context.translator.handle_outgoing_calls(item).await)
+        self.structured_result(self.context.translator.handle_outgoing_calls(item).await)
     }
 
     /// Prepare type hierarchy at a position.
@@ -905,7 +928,7 @@ impl McplsServer {
         }): Parameters<PositionParams>,
     ) -> Result<Json<TypeHierarchyResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_type_hierarchy_prepare(file_path, Position { line, character })
@@ -922,7 +945,7 @@ impl McplsServer {
         &self,
         Parameters(TypeHierarchyWalkParams { item }): Parameters<TypeHierarchyWalkParams>,
     ) -> Result<Json<TypeHierarchyResult>, McpError> {
-        to_structured_tool_result(self.context.translator.handle_supertypes(item).await)
+        self.structured_result(self.context.translator.handle_supertypes(item).await)
     }
 
     /// Get the subtypes (derived types) of a type hierarchy item.
@@ -934,7 +957,7 @@ impl McplsServer {
         &self,
         Parameters(TypeHierarchyWalkParams { item }): Parameters<TypeHierarchyWalkParams>,
     ) -> Result<Json<TypeHierarchyResult>, McpError> {
-        to_structured_tool_result(self.context.translator.handle_subtypes(item).await)
+        self.structured_result(self.context.translator.handle_subtypes(item).await)
     }
 
     /// Check whether the symbol at a position can be renamed.
@@ -951,7 +974,7 @@ impl McplsServer {
         }): Parameters<PositionParams>,
     ) -> Result<Json<PrepareRenameResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_prepare_rename(file_path, Position { line, character })
@@ -973,7 +996,7 @@ impl McplsServer {
         }): Parameters<PositionParams>,
     ) -> Result<Json<DocumentHighlightsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_document_highlights(file_path, Position { line, character })
@@ -1004,7 +1027,7 @@ impl McplsServer {
         }): Parameters<FormatRangeParams>,
     ) -> Result<Json<FormatDocumentResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_format_range(
@@ -1076,7 +1099,7 @@ impl McplsServer {
             Err(e) => Err(e),
         };
 
-        to_structured_tool_result(result)
+        self.structured_result(result)
     }
 
     /// Get recent LSP server log messages.
@@ -1088,6 +1111,7 @@ impl McplsServer {
         &self,
         Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
     ) -> Result<Json<ServerLogsResult>, McpError> {
+        // Logs were redacted at ingestion (`ServerText` for `ServerLogsResult` is a no-op).
         let cache = self.context.notification_cache.lock().await;
         Ok(Json(Translator::handle_server_logs(
             &cache, limit, min_level,
@@ -1103,7 +1127,7 @@ impl McplsServer {
         &self,
         Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
     ) -> Result<Json<ServerMessagesResult>, McpError> {
-        to_structured_tool_result({
+        self.structured_result({
             let cache = self.context.notification_cache.lock().await;
             Translator::handle_server_messages(&cache, limit)
         })
@@ -1123,7 +1147,7 @@ impl McplsServer {
         }): Parameters<PositionParams>,
     ) -> Result<Json<SignatureHelpResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_signature_help(file_path, Position { line, character })
@@ -1145,7 +1169,7 @@ impl McplsServer {
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
-        to_structured_tool_result(
+        self.structured_result(
             translator
                 .with_resolved_target(
                     file_path,
@@ -1173,7 +1197,7 @@ impl McplsServer {
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         let translator = &self.context.translator;
-        to_structured_tool_result(
+        self.structured_result(
             translator
                 .with_resolved_target(
                     file_path,
@@ -1201,7 +1225,7 @@ impl McplsServer {
         }): Parameters<PositionParams>,
     ) -> Result<Json<LocationsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_declaration(file_path, Position { line, character })
@@ -1224,7 +1248,7 @@ impl McplsServer {
         &self,
         Parameters(RestartServerParams { target }): Parameters<RestartServerParams>,
     ) -> Result<Json<RestartServerResult>, McpError> {
-        to_structured_tool_result(self.context.translator.restart_servers(target).await)
+        self.structured_result(self.context.translator.restart_servers(target).await)
     }
 
     /// Report which tools are usable for which languages.
@@ -1243,7 +1267,7 @@ impl McplsServer {
             .map(|path| translator.language_for_path(path))
             .transpose();
         let snapshot = translator.tool_support_snapshot();
-        to_structured_tool_result(file_language.map(|file_language| {
+        self.structured_result(file_language.map(|file_language| {
             let languages =
                 file_language.map_or_else(|| snapshot.languages(), |language| vec![language]);
             ToolSupportReport::build(&snapshot, languages, self.context.mcp.tool_prefix.as_ref())
@@ -1269,7 +1293,7 @@ impl McplsServer {
         }): Parameters<InlayHintsParams>,
     ) -> Result<Json<InlayHintsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        to_structured_tool_result(
+        self.structured_result(
             self.context
                 .translator
                 .handle_inlay_hints(
@@ -1289,6 +1313,15 @@ impl McplsServer {
 }
 
 impl McplsServer {
+    /// [`to_structured_tool_result`] with the secrets of every live server
+    /// hidden from the result's display prose.
+    fn structured_result<T: Serialize + JsonSchema + ServerText>(
+        &self,
+        result: crate::error::Result<T>,
+    ) -> Result<Json<T>, McpError> {
+        to_structured_tool_result(result, &self.context.translator.server_text_redactions())
+    }
+
     /// Builds the diagnostics resource payload for `path`; split out of
     /// `read_resource` so tests can drive the real wiring without a
     /// `RequestContext`.
@@ -1542,6 +1575,7 @@ impl ServerHandler for McplsServer {
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // TODO(#612): redact server text in non-protocol tool errors and truncation cuts (follow-up of #599)
         let tcc = ToolCallContext::new(self, request, context);
         contain_panic(self.tool_router.call(tcc), "tool call").await
     }
@@ -1696,6 +1730,16 @@ impl ServerHandler for McplsServer {
     /// Over HTTP a stream also ends abruptly after its lease
     /// (`ListenLease`); a live client listens
     /// again and the replay below covers the gap.
+    ///
+    /// Replay and live delivery are paced (a burst of 32, then 320
+    /// notifications per second) on a best-effort basis: rmcp's client has no
+    /// end-to-end backpressure, so a stalled transport can compress the
+    /// spacing back into a burst. The supported
+    /// guarantee is client-side: a client using `Peer::listen_with_capacity`
+    /// with a capacity of at least `MAX_SUBSCRIPTIONS` never lags on the
+    /// replay alone. Live updates arriving during a replay share that buffer,
+    /// so a capacity of at least 2000 (twice `MAX_SUBSCRIPTIONS`) is
+    /// recommended.
     ///
     /// Streams are capped at `MAX_LISTEN_STREAMS` (shared by stdio and HTTP,
     /// independent of `max_concurrent_sessions`); beyond it the request fails
@@ -3275,6 +3319,52 @@ mod tests {
         );
     }
 
+    /// #599: display prose in a tool result is redacted with the secrets of
+    /// the live servers, while an edit's text passes through unmodified.
+    #[tokio::test]
+    async fn test_structured_result_redacts_prose_with_live_server_secrets() {
+        use crate::bridge::{FormatDocumentResult, HoverResult, Position2D, Range, TextEdit};
+        use crate::redaction::Redactions;
+
+        let server = create_test_server();
+        let (client, _fake, _lanes) = crate::test_lsp::fake_lsp_client_with_redactions(
+            Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]),
+        );
+        server
+            .context
+            .translator
+            .register_client(crate::config::ServerId::from("rust"), client);
+
+        let hover = server
+            .structured_result(Ok(HoverResult {
+                contents: "token SuperSecretValue123".to_owned(),
+                range: None,
+                positions_degraded: None,
+            }))
+            .unwrap();
+        assert_eq!(hover.0.contents, "token [redacted:API_TOKEN]");
+
+        let edits = server
+            .structured_result(Ok(FormatDocumentResult {
+                edits: vec![TextEdit {
+                    range: Range {
+                        start: Position2D {
+                            line: 1,
+                            character: 1,
+                        },
+                        end: Position2D {
+                            line: 1,
+                            character: 2,
+                        },
+                    },
+                    new_text: "SuperSecretValue123".to_owned(),
+                }],
+                positions_degraded: None,
+            }))
+            .unwrap();
+        assert_eq!(edits.0.edits[0].new_text, "SuperSecretValue123");
+    }
+
     /// #583: a configured secret echoed in a pushed diagnostic never reaches
     /// the cached-diagnostics tool or the diagnostics resource, while the
     /// URIs stay intact.
@@ -3651,6 +3741,7 @@ sleep 0.3
                 env: HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
+                settings: None,
                 timeout_seconds: 5,
                 request_timeout_seconds: 5,
                 heuristics: None,

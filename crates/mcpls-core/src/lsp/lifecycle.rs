@@ -26,7 +26,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
-use crate::config::LspServerConfig;
+use crate::config::{LspServerConfig, LspSettings};
 use crate::error::{Error, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::CONTENT_MODIFIED_RETRY_METHODS;
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
@@ -327,9 +327,9 @@ impl LspServer {
     /// 2. Sends initialize request with client capabilities
     /// 3. Receives server capabilities from initialize response
     /// 4. Sends initialized notification
-    /// 5. Sends `workspace/didChangeConfiguration` with null settings, which
-    ///    servers that wait for a configuration push (pyright) need before
-    ///    they answer requests
+    /// 5. Sends `workspace/didChangeConfiguration` with the configured
+    ///    settings (null when unset), which servers that wait for a
+    ///    configuration push (pyright) need before they answer requests
     ///
     /// # Errors
     ///
@@ -518,8 +518,14 @@ impl LspServer {
     /// [`crate::lsp::client::LspClient::server_request_result`]). Before
     /// this existed, deleting those capability lines would silently no-op
     /// the whole feature with an otherwise-green test suite.
+    ///
+    /// `workspace.configuration` is advertised only when `settings` are
+    /// configured: without them mcpls has nothing to answer with.
     #[allow(clippy::too_many_lines)]
-    fn client_capabilities(position_encodings: &[String]) -> ClientCapabilities {
+    fn client_capabilities(
+        position_encodings: &[String],
+        settings: Option<&LspSettings>,
+    ) -> ClientCapabilities {
         ClientCapabilities {
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(resolve_position_encodings(position_encodings)),
@@ -599,6 +605,7 @@ impl LspServer {
             }),
             workspace: Some(lsp_types::WorkspaceClientCapabilities {
                 workspace_folders: Some(true),
+                configuration: settings.map(|_| true),
                 ..Default::default()
             }),
             // Required per LSP 3.17 before a server may send $/progress at all -- see this fn's doc.
@@ -617,9 +624,13 @@ impl LspServer {
     /// Sends initialize request and waits for response, then sends the
     /// initialized and `workspace/didChangeConfiguration` notifications.
     ///
-    /// The settings are null rather than `{}`: some servers rebuild their
+    /// The pushed settings are the configured per-server settings. Without
+    /// any they are null rather than `{}`: some servers rebuild their
     /// preferences from an empty settings map and so drop their
-    /// `initialization_options`, while a non-map value is ignored.
+    /// `initialization_options`, while a non-map value is ignored. Because
+    /// configured settings are never empty (see [`LspSettings`]), servers
+    /// such as jdtls may replace their `initialization_options`-derived
+    /// preferences with them.
     #[cfg(test)]
     async fn initialize(
         client: &LspClient,
@@ -638,6 +649,14 @@ impl LspServer {
         process_id: Option<i32>,
     ) -> Result<(ServerCapabilities, PositionEncodingKind)> {
         debug!("Sending initialize request");
+        if config.initialization_options.is_some() && config.server_config.settings.is_some() {
+            warn!(
+                "server `{}` has both initialization_options and settings: servers that pull \
+                 workspace/configuration (rust-analyzer, jdtls) may replace the options with \
+                 the settings",
+                config.server_config.command
+            );
+        }
 
         let workspace_folders: Vec<WorkspaceFolder> = config
             .workspace_roots
@@ -650,7 +669,10 @@ impl LspServer {
             #[allow(deprecated)]
             root_uri: None,
             initialization_options: config.initialization_options.clone(),
-            capabilities: Self::client_capabilities(&config.position_encodings),
+            capabilities: Self::client_capabilities(
+                &config.position_encodings,
+                config.server_config.settings.as_ref(),
+            ),
             client_info: Some(ClientInfo {
                 name: "mcpls".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -709,11 +731,14 @@ impl LspServer {
         );
 
         notify_handshake::<InitializedNotification>(client, InitializedParams {}).await?;
-        // TODO(#598): push the configured per-server settings instead of null
         notify_handshake::<DidChangeConfigurationNotification>(
             client,
             DidChangeConfigurationParams {
-                settings: serde_json::Value::Null,
+                settings: config
+                    .server_config
+                    .settings
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, LspSettings::to_value),
             },
         )
         .await?;
@@ -1201,7 +1226,7 @@ mod tests {
     #[test]
     fn test_client_capabilities_advertises_work_done_progress() {
         let capabilities =
-            LspServer::client_capabilities(&["utf-8".to_string(), "utf-16".to_string()]);
+            LspServer::client_capabilities(&["utf-8".to_string(), "utf-16".to_string()], None);
 
         assert_eq!(
             capabilities.window.and_then(|w| w.work_done_progress),
@@ -1214,7 +1239,7 @@ mod tests {
     /// unreachable on them.
     #[test]
     fn test_client_capabilities_advertises_prepare_rename_support() {
-        let rename = LspServer::client_capabilities(&["utf-16".to_string()])
+        let rename = LspServer::client_capabilities(&["utf-16".to_string()], None)
             .text_document
             .and_then(|t| t.rename)
             .unwrap();
@@ -1377,6 +1402,7 @@ mod tests {
                 env,
                 file_patterns: vec!["**/*.py".to_string()],
                 initialization_options: Some(init_opts.clone()),
+                settings: None,
                 timeout_seconds: 10,
                 request_timeout_seconds: 10,
                 heuristics: None,
@@ -2011,33 +2037,102 @@ sleep 5
             init_task.await.unwrap().unwrap();
         }
 
-        #[tokio::test]
-        async fn test_initialize_pushes_null_settings_right_after_initialized() {
+        /// The three client frames of a handshake: `initialize`, `initialized`
+        /// and `workspace/didChangeConfiguration`.
+        struct Handshake {
+            initialize: serde_json::Value,
+            initialized: serde_json::Value,
+            configuration: serde_json::Value,
+        }
+
+        async fn handshake_with_settings(settings_json: Option<&str>) -> Handshake {
             let (client, mut server) = fake_lsp_client();
-            let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
+            let mut server_config = LspServerConfig::rust_analyzer();
+            server_config.settings = settings_json.map(|json| serde_json::from_str(json).unwrap());
+            let config = crate::test_lsp::init_config_for(server_config);
             let init_task =
                 tokio::spawn(async move { LspServer::initialize(&client, &config).await });
 
             let mut reader = BufReader::new(&mut server.write_stdout);
-            let request = read_framed_message(&mut reader).await;
-            assert_eq!(request["method"], "initialize");
+            let initialize = read_framed_message(&mut reader).await;
+            assert_eq!(initialize["method"], "initialize");
             write_success_response(
                 &mut server.read_half_stdin,
-                &request["id"].clone(),
+                &initialize["id"].clone(),
                 serde_json::json!({ "capabilities": {} }),
             )
             .await;
-
             let initialized = read_framed_message(&mut reader).await;
             let configuration = read_framed_message(&mut reader).await;
             init_task.await.unwrap().unwrap();
+            Handshake {
+                initialize,
+                initialized,
+                configuration,
+            }
+        }
 
-            assert_eq!(initialized["method"], "initialized");
-            assert_eq!(configuration["method"], "workspace/didChangeConfiguration");
+        #[tokio::test]
+        async fn test_initialize_pushes_null_settings_right_after_initialized() {
+            let wire = handshake_with_settings(None).await;
+
+            assert_eq!(wire.initialized["method"], "initialized");
             assert_eq!(
-                configuration["params"],
+                wire.configuration["method"],
+                "workspace/didChangeConfiguration"
+            );
+            assert_eq!(
+                wire.configuration["params"],
                 serde_json::json!({ "settings": null })
             );
+        }
+
+        #[tokio::test]
+        async fn test_initialize_pushes_configured_settings_and_advertises_configuration() {
+            let wire =
+                handshake_with_settings(Some(r#"{"python.analysis.typeCheckingMode": "strict"}"#))
+                    .await;
+
+            assert_eq!(
+                wire.initialize["params"]["capabilities"]["workspace"]["configuration"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                wire.configuration["params"],
+                serde_json::json!({
+                    "settings": { "python": { "analysis": { "typeCheckingMode": "strict" } } }
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn test_initialize_pushes_gopls_flat_and_yaml_url_keys_on_the_wire() {
+            let wire = handshake_with_settings(Some(
+                r#"{"gopls":{"ui.semanticTokens":true},
+                    "yaml.schemas":{"https://json.schemastore.org/x.json":"*.yml"}}"#,
+            ))
+            .await;
+
+            let settings =
+                serde_json::to_string(&wire.configuration["params"]["settings"]).unwrap();
+            assert!(
+                settings.contains(r#""gopls":{"ui.semanticTokens":true}"#),
+                "{settings}"
+            );
+            assert!(
+                settings.contains(
+                    r#""yaml":{"schemas":{"https://json.schemastore.org/x.json":"*.yml"}}"#
+                ),
+                "{settings}"
+            );
+        }
+
+        #[test]
+        fn test_workspace_configuration_not_advertised_without_settings() {
+            let workspace = LspServer::client_capabilities(&["utf-16".to_string()], None)
+                .workspace
+                .unwrap();
+            assert_eq!(workspace.configuration, None);
         }
 
         #[tokio::test]
@@ -2225,6 +2320,7 @@ sleep 5
             env,
             file_patterns: vec![],
             initialization_options: None,
+            settings: None,
             timeout_seconds: 5,
             request_timeout_seconds: 5,
             heuristics: None,
@@ -2360,6 +2456,7 @@ sleep 5
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
+                settings: None,
                 timeout_seconds: 30,
                 request_timeout_seconds: 30,
                 heuristics: None,
@@ -2374,6 +2471,7 @@ sleep 5
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
+                settings: None,
                 timeout_seconds: 30,
                 request_timeout_seconds: 30,
                 heuristics: None,

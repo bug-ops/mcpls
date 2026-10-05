@@ -23,6 +23,7 @@ use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots, lock_std
 use crate::config::{ServerId, ServerSettlement, ToolKind, ToolRouter};
 use crate::error::{ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
+use crate::redaction::Redactions;
 
 mod addressing;
 mod assist;
@@ -94,6 +95,8 @@ pub struct Translator {
     lsp_clients: Arc<StdMutex<HashMap<ServerId, LspClient>>>,
     /// LSP servers indexed by routing identity (held for lifetime management).
     lsp_servers: Arc<StdMutex<HashMap<ServerId, LspServer>>>,
+    /// Union of the live clients' redaction sets, rebuilt on change.
+    merged_redactions: StdMutex<Option<MergedRedactions>>,
     /// Document state tracker. Locks its own state internally, per path.
     document_tracker: Arc<DocumentTracker>,
     /// Resource limits `document_tracker` was last built with. Kept
@@ -194,6 +197,7 @@ impl Translator {
         Self {
             lsp_clients: Arc::new(StdMutex::new(HashMap::new())),
             lsp_servers: Arc::new(StdMutex::new(HashMap::new())),
+            merged_redactions: StdMutex::new(None),
             document_tracker: Arc::new(DocumentTracker::new(
                 ResourceLimits::default(),
                 HashMap::new(),
@@ -547,6 +551,31 @@ impl Translator {
         lock_std(&self.lsp_clients).insert(id.into(), client);
     }
 
+    /// The secrets of every live server's client, for hiding them in tool
+    /// results. The merged set is rebuilt only when the set of client
+    /// redaction sets changes (registration, restart, respawn), outside the
+    /// `lsp_clients` lock.
+    pub(crate) fn server_text_redactions(&self) -> Arc<Redactions> {
+        let sources: Vec<Arc<Redactions>> = lock_std(&self.lsp_clients)
+            .values()
+            .map(|client| Arc::clone(client.redactions()))
+            .filter(|set| !set.is_empty())
+            .collect();
+        let mut cache = lock_std(&self.merged_redactions);
+        if let Some(cached) = cache
+            .as_ref()
+            .filter(|cached| cached.is_built_from(&sources))
+        {
+            return Arc::clone(&cached.merged);
+        }
+        let merged = Arc::new(Redactions::union(sources.iter().map(Arc::as_ref)));
+        *cache = Some(MergedRedactions {
+            sources,
+            merged: Arc::clone(&merged),
+        });
+        merged
+    }
+
     /// Register an LSP server under its routing identity.
     pub(crate) fn register_server(&self, id: impl Into<ServerId>, server: LspServer) {
         lock_std(&self.lsp_servers).insert(id.into(), server);
@@ -688,6 +717,23 @@ impl Default for Translator {
     }
 }
 
+/// A merged redaction set and the per-client sets it was built from.
+#[derive(Debug)]
+struct MergedRedactions {
+    sources: Vec<Arc<Redactions>>,
+    merged: Arc<Redactions>,
+}
+
+impl MergedRedactions {
+    /// Whether `sources` are the same sets (by identity, in any order).
+    fn is_built_from(&self, sources: &[Arc<Redactions>]) -> bool {
+        self.sources.len() == sources.len()
+            && sources
+                .iter()
+                .all(|set| self.sources.iter().any(|known| Arc::ptr_eq(known, set)))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -703,6 +749,63 @@ mod tests {
     use crate::config::{ServerId, ToolKind, ToolRouter};
     use crate::error::Error;
     use crate::test_lsp::fake_lsp_client;
+
+    #[tokio::test]
+    async fn test_server_text_redactions_follow_live_clients_across_respawn() {
+        let translator = Translator::new();
+        assert!(translator.server_text_redactions().is_empty());
+
+        let (a, _fake_a, _lanes_a) = crate::test_lsp::fake_lsp_client_with_redactions(
+            Redactions::new([("A_TOKEN".to_owned(), "alpha-secret-111".to_owned())]),
+        );
+        let (b, _fake_b, _lanes_b) = crate::test_lsp::fake_lsp_client_with_redactions(
+            Redactions::new([("B_TOKEN".to_owned(), "bravo-secret-222".to_owned())]),
+        );
+        translator.register_client(ServerId::from("a"), a);
+        translator.register_client(ServerId::from("b"), b);
+        let both = translator.server_text_redactions();
+        assert_eq!(both.apply("alpha-secret-111"), "[redacted:A_TOKEN]");
+        assert_eq!(both.apply("bravo-secret-222"), "[redacted:B_TOKEN]");
+
+        let (respawned, _fake_c, _lanes_c) = crate::test_lsp::fake_lsp_client_with_redactions(
+            Redactions::new([("C_TOKEN".to_owned(), "charlie-secret-333".to_owned())]),
+        );
+        translator.register_client(ServerId::from("a"), respawned);
+        let after = translator.server_text_redactions();
+        assert_eq!(after.apply("alpha-secret-111"), "alpha-secret-111");
+        assert_eq!(after.apply("charlie-secret-333"), "[redacted:C_TOKEN]");
+        assert_eq!(after.apply("bravo-secret-222"), "[redacted:B_TOKEN]");
+    }
+
+    #[tokio::test]
+    async fn test_server_text_redactions_are_cached_and_do_not_relog() {
+        use tracing_subscriber::prelude::*;
+
+        let translator = Translator::new();
+        let (a, _fake_a, _lanes_a) = crate::test_lsp::fake_lsp_client_with_redactions(
+            Redactions::new([("A_TOKEN".to_owned(), "alpha-secret-111".to_owned())]),
+        );
+        let (b, _fake_b, _lanes_b) = crate::test_lsp::fake_lsp_client_with_redactions(
+            Redactions::new([("B_TOKEN".to_owned(), "A_TOKEN]".to_owned())]),
+        );
+        translator.register_client(ServerId::from("a"), a);
+        translator.register_client(ServerId::from("b"), b);
+
+        let logs = crate::test_lsp::CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(logs.clone());
+        let first = tracing::subscriber::with_default(subscriber, || {
+            let first = translator.server_text_redactions();
+            let second = translator.server_text_redactions();
+            let third = translator.server_text_redactions();
+            assert!(Arc::ptr_eq(&first, &second) && Arc::ptr_eq(&second, &third));
+            first
+        });
+
+        assert_eq!(logs.messages().len(), 1, "{:?}", logs.messages());
+        assert_eq!(first.apply("alpha-secret-111"), "[redacted:A_TOKEN]");
+    }
 
     #[tokio::test]
     async fn test_register_server_complete_fills_all_maps_under_init_config_id() {

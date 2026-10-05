@@ -6,6 +6,7 @@
 mod language;
 mod routing;
 mod server;
+mod settings;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -19,6 +20,7 @@ pub use server::{
     BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_HEURISTICS_DEPTH,
     MAX_TIMEOUT_SECONDS, ServerHeuristics,
 };
+pub use settings::{InvalidLspSettings, LspSettings};
 
 use crate::bridge::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE,
@@ -2563,6 +2565,7 @@ mod tests {
                 env: HashMap::new(),
                 file_patterns: vec!["**/*.c".to_string(), "**/*.h".to_string()],
                 initialization_options: None,
+                settings: None,
                 timeout_seconds: 30,
                 request_timeout_seconds: 30,
                 heuristics: None,
@@ -2590,6 +2593,7 @@ mod tests {
                 env: HashMap::new(),
                 file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
                 initialization_options: None,
+                settings: None,
                 timeout_seconds: 30,
                 request_timeout_seconds: 30,
                 heuristics: None,
@@ -2617,6 +2621,7 @@ mod tests {
                 env: HashMap::new(),
                 file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
                 initialization_options: None,
+                settings: None,
                 timeout_seconds: 30,
                 request_timeout_seconds: 30,
                 heuristics: None,
@@ -2644,6 +2649,7 @@ mod tests {
                 env: HashMap::new(),
                 file_patterns: vec!["**/*".to_string(), "**/*.{h,hpp}".to_string()],
                 initialization_options: None,
+                settings: None,
                 timeout_seconds: 30,
                 request_timeout_seconds: 30,
                 heuristics: None,

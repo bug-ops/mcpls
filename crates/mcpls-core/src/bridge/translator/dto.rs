@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSummary};
+use crate::redaction::{Redactions, ServerText};
 
 /// Convert an LSP integer-valued enum (`SymbolKind`, `CompletionItemKind`,
 /// `InlayHintKind`, ...) to its wire-format `u32`.
@@ -854,10 +855,753 @@ pub struct DocumentHighlightsResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
+impl ServerText for Location {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            uri,
+            range: _,
+            out_of_workspace: _,
+        } = self;
+        redactions.note_payload(uri);
+    }
+}
+
+impl ServerText for HoverResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            contents,
+            range: _,
+            positions_degraded: _,
+        } = self;
+        redactions.redact_in_place(contents);
+    }
+}
+
+impl ServerText for DefinitionResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            locations,
+            truncated: _,
+            positions_degraded: _,
+            enrichment: _,
+        } = self;
+        locations.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for ReferencesResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            locations,
+            truncated: _,
+            positions_degraded: _,
+            enrichment: _,
+        } = self;
+        locations.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for LocationsResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            locations,
+            truncated: _,
+            positions_degraded: _,
+            enrichment: _,
+        } = self;
+        locations.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for Diagnostic {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            range: _,
+            severity: _,
+            message,
+            code,
+        } = self;
+        redactions.redact_in_place(message);
+        if let Some(code) = code {
+            redactions.redact_in_place(code);
+        }
+    }
+}
+
+// Document diagnostics are redacted where they enter the cache or the pull path.
+impl ServerText for DiagnosticsResult {
+    fn redact_server_text(&mut self, _redactions: &Redactions) {
+        let Self {
+            diagnostics: _,
+            positions_degraded: _,
+        } = self;
+    }
+}
+
+impl ServerText for DocumentDiagnosticsResult {
+    fn redact_server_text(&mut self, _redactions: &Redactions) {
+        let Self {
+            diagnostics: _,
+            positions_degraded: _,
+            enrichment: _,
+        } = self;
+    }
+}
+
+impl ServerText for TextEdit {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self { range: _, new_text } = self;
+        redactions.note_payload(new_text);
+    }
+}
+
+impl ServerText for DocumentChanges {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self { uri, edits } = self;
+        redactions.note_payload(uri);
+        edits.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for RenameResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            changes,
+            dropped: _,
+            positions_degraded: _,
+        } = self;
+        changes.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for Completion {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            label,
+            kind: _,
+            detail,
+            documentation,
+        } = self;
+        redactions.note_payload(label);
+        for prose in [detail, documentation].into_iter().flatten() {
+            redactions.redact_in_place(prose);
+        }
+    }
+}
+
+impl ServerText for CompletionsResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            items,
+            positions_degraded: _,
+        } = self;
+        items.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for Symbol {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            name,
+            kind: _,
+            range: _,
+            selection_range: _,
+            children,
+        } = self;
+        redactions.note_payload(name);
+        if let Some(children) = children {
+            children.redact_server_text(redactions);
+        }
+    }
+}
+
+impl ServerText for DocumentSymbolsResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            symbols,
+            positions_degraded: _,
+        } = self;
+        symbols.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for FormatDocumentResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            edits,
+            positions_degraded: _,
+        } = self;
+        edits.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for WorkspaceSymbol {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            name,
+            kind: _,
+            location,
+            container_name,
+        } = self;
+        redactions.note_payload(name);
+        if let Some(container) = container_name {
+            redactions.note_payload(container);
+        }
+        location.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for WorkspaceSymbolResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            symbols,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+        symbols.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for CodeAction {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            title,
+            kind: _,
+            diagnostics,
+            edit,
+            command,
+            is_preferred: _,
+        } = self;
+        redactions.redact_in_place(title);
+        diagnostics.redact_server_text(redactions);
+        edit.redact_server_text(redactions);
+        command.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for WorkspaceEditDescription {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            changes,
+            dropped: _,
+        } = self;
+        changes.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for CommandDescription {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            title,
+            command,
+            arguments,
+        } = self;
+        redactions.redact_in_place(title);
+        redactions.note_payload(command);
+        for argument in arguments {
+            redactions.note_payload_json(argument);
+        }
+    }
+}
+
+impl ServerText for CodeActionsResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            actions,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+        actions.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for CallHierarchyItemResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            name,
+            kind: _,
+            detail,
+            uri,
+            range: _,
+            selection_range: _,
+            data,
+            out_of_workspace: _,
+        } = self;
+        redactions.note_payload(name);
+        if let Some(detail) = detail {
+            redactions.note_payload(detail);
+        }
+        redactions.note_payload(uri);
+        if let Some(data) = data {
+            redactions.note_payload_json(data);
+        }
+    }
+}
+
+impl ServerText for CallHierarchyPrepareResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            items,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+        items.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for IncomingCall {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            from,
+            from_ranges: _,
+        } = self;
+        from.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for IncomingCallsResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            calls,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+        calls.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for OutgoingCall {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self { to, from_ranges: _ } = self;
+        to.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for OutgoingCallsResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            calls,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+        calls.redact_server_text(redactions);
+    }
+}
+
+// Logs and messages are redacted when the notification enters the cache.
+impl ServerText for ServerLogsResult {
+    fn redact_server_text(&mut self, _redactions: &Redactions) {
+        let Self { logs: _ } = self;
+    }
+}
+
+impl ServerText for ServerMessagesResult {
+    fn redact_server_text(&mut self, _redactions: &Redactions) {
+        let Self { messages: _ } = self;
+    }
+}
+
+impl ServerText for SignatureParameter {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            label,
+            documentation,
+        } = self;
+        for prose in [label, documentation].into_iter().flatten() {
+            redactions.redact_in_place(prose);
+        }
+    }
+}
+
+impl ServerText for SignatureInfo {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            label,
+            documentation,
+            parameters,
+        } = self;
+        redactions.redact_in_place(label);
+        if let Some(documentation) = documentation {
+            redactions.redact_in_place(documentation);
+        }
+        parameters.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for SignatureHelpResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            signatures,
+            active_signature: _,
+            active_parameter: _,
+            positions_degraded: _,
+        } = self;
+        signatures.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for InlayHintEntry {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            position: _,
+            label,
+            kind: _,
+            padding_left: _,
+            padding_right: _,
+            tooltip,
+        } = self;
+        redactions.redact_in_place(label);
+        if let Some(tooltip) = tooltip {
+            redactions.redact_in_place(tooltip);
+        }
+    }
+}
+
+impl ServerText for InlayHintsResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            hints,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+        hints.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for TypeHierarchyItemResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            name,
+            kind: _,
+            detail,
+            uri,
+            range: _,
+            selection_range: _,
+            data,
+            out_of_workspace: _,
+        } = self;
+        redactions.note_payload(name);
+        if let Some(detail) = detail {
+            redactions.note_payload(detail);
+        }
+        redactions.note_payload(uri);
+        if let Some(data) = data {
+            redactions.note_payload_json(data);
+        }
+    }
+}
+
+impl ServerText for TypeHierarchyResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            items,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+        items.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for PrepareRenameOutcome {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        match self {
+            Self::Renameable {
+                range: _,
+                placeholder,
+            } => {
+                if let Some(placeholder) = placeholder {
+                    redactions.note_payload(placeholder);
+                }
+            }
+            Self::DefaultBehavior => {}
+            Self::NotRenameable { server_message } => {
+                if let Some(message) = server_message {
+                    redactions.redact_in_place(message);
+                }
+            }
+        }
+    }
+}
+
+impl ServerText for PrepareRenameResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            outcome,
+            positions_degraded: _,
+        } = self;
+        outcome.redact_server_text(redactions);
+    }
+}
+
+impl ServerText for DocumentHighlightsResult {
+    fn redact_server_text(&mut self, _redactions: &Redactions) {
+        let Self {
+            highlights: _,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{PositionDegradation, lsp_kind_to_u32};
+    use super::*;
+
+    const SECRET: &str = "SuperSecretValue123";
+
+    fn range() -> Range {
+        Range {
+            start: Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: Position2D {
+                line: 1,
+                character: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn test_server_text_redacts_prose_and_leaves_edit_payload() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut actions = vec![CodeAction {
+            title: format!("fix {SECRET}"),
+            kind: None,
+            diagnostics: vec![Diagnostic {
+                range: range(),
+                severity: DiagnosticSeverity::Error,
+                message: format!("bad {SECRET}"),
+                code: Some(format!("E-{SECRET}")),
+            }],
+            edit: Some(WorkspaceEditDescription {
+                changes: vec![DocumentChanges {
+                    uri: format!("file:///{SECRET}.rs"),
+                    edits: vec![TextEdit {
+                        range: range(),
+                        new_text: format!("let k = \"{SECRET}\";"),
+                    }],
+                }],
+                dropped: DroppedEdits::default(),
+            }),
+            command: None,
+            is_preferred: false,
+        }];
+
+        actions.redact_server_text(&set);
+
+        let action = &actions[0];
+        assert_eq!(action.title, "fix [redacted:API_TOKEN]");
+        assert_eq!(action.diagnostics[0].message, "bad [redacted:API_TOKEN]");
+        assert_eq!(
+            action.diagnostics[0].code.as_deref(),
+            Some("E-[redacted:API_TOKEN]")
+        );
+        let changes = &action.edit.as_ref().unwrap().changes[0];
+        assert!(changes.uri.contains(SECRET));
+        assert!(changes.edits[0].new_text.contains(SECRET));
+    }
+
+    #[test]
+    fn test_server_text_completion_keeps_label_and_redacts_detail_and_documentation() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut completion = Completion {
+            label: format!("use_{SECRET}"),
+            kind: Some(3),
+            detail: Some(format!("fn {SECRET}()")),
+            documentation: Some(format!("docs {SECRET}")),
+        };
+
+        completion.redact_server_text(&set);
+
+        assert_eq!(completion.label, format!("use_{SECRET}"));
+        assert_eq!(
+            completion.detail.as_deref(),
+            Some("fn [redacted:API_TOKEN]()")
+        );
+        assert_eq!(
+            completion.documentation.as_deref(),
+            Some("docs [redacted:API_TOKEN]")
+        );
+    }
+
+    #[test]
+    fn test_server_text_redacts_signature_label_documentation_and_parameters() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut result = SignatureHelpResult {
+            signatures: vec![SignatureInfo {
+                label: format!("f({SECRET})"),
+                documentation: Some(format!("doc {SECRET}")),
+                parameters: vec![SignatureParameter {
+                    label: Some(format!("p {SECRET}")),
+                    documentation: Some(format!("pd {SECRET}")),
+                }],
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(0),
+            positions_degraded: None,
+        };
+
+        result.redact_server_text(&set);
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains(SECRET), "{json}");
+        assert_eq!(json.matches("[redacted:API_TOKEN]").count(), 4, "{json}");
+    }
+
+    #[test]
+    fn test_server_text_redacts_inlay_label_and_tooltip() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut hint = InlayHintEntry {
+            position: Position2D {
+                line: 1,
+                character: 1,
+            },
+            label: format!(": {SECRET}"),
+            kind: None,
+            padding_left: None,
+            padding_right: None,
+            tooltip: Some(format!("tip {SECRET}")),
+        };
+
+        hint.redact_server_text(&set);
+
+        assert_eq!(hint.label, ": [redacted:API_TOKEN]");
+        assert_eq!(hint.tooltip.as_deref(), Some("tip [redacted:API_TOKEN]"));
+    }
+
+    #[test]
+    fn test_server_text_command_redacts_title_and_keeps_command_and_arguments() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut command = CommandDescription {
+            title: format!("run {SECRET}"),
+            command: format!("cmd.{SECRET}"),
+            arguments: vec![serde_json::json!({ "key": SECRET })],
+        };
+
+        command.redact_server_text(&set);
+
+        assert_eq!(command.title, "run [redacted:API_TOKEN]");
+        assert_eq!(command.command, format!("cmd.{SECRET}"));
+        assert_eq!(
+            command.arguments,
+            vec![serde_json::json!({ "key": SECRET })]
+        );
+    }
+
+    #[test]
+    fn test_server_text_leaves_symbol_and_hierarchy_identifiers() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut symbols = DocumentSymbolsResult {
+            symbols: vec![Symbol {
+                name: format!("sym_{SECRET}"),
+                kind: 12,
+                range: range(),
+                selection_range: range(),
+                children: Some(vec![Symbol {
+                    name: format!("child_{SECRET}"),
+                    kind: 12,
+                    range: range(),
+                    selection_range: range(),
+                    children: None,
+                }]),
+            }],
+            positions_degraded: None,
+        };
+        let mut item = CallHierarchyItemResult {
+            name: format!("call_{SECRET}"),
+            kind: 12,
+            detail: Some(format!("detail {SECRET}")),
+            uri: format!("file:///{SECRET}.rs"),
+            range: range(),
+            selection_range: range(),
+            data: Some(serde_json::json!({ "id": SECRET })),
+            out_of_workspace: false,
+        };
+        let mut type_item = TypeHierarchyItemResult {
+            name: format!("type_{SECRET}"),
+            kind: 5,
+            detail: None,
+            uri: format!("file:///{SECRET}.rs"),
+            range: range(),
+            selection_range: range(),
+            data: None,
+            out_of_workspace: false,
+        };
+        let before = (
+            serde_json::to_string(&symbols).unwrap(),
+            serde_json::to_string(&item).unwrap(),
+            serde_json::to_string(&type_item).unwrap(),
+        );
+
+        symbols.redact_server_text(&set);
+        item.redact_server_text(&set);
+        type_item.redact_server_text(&set);
+
+        let after = (
+            serde_json::to_string(&symbols).unwrap(),
+            serde_json::to_string(&item).unwrap(),
+            serde_json::to_string(&type_item).unwrap(),
+        );
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_server_text_with_no_secrets_rewrites_nothing() {
+        let mut hover = HoverResult {
+            contents: format!("doc {SECRET}"),
+            range: None,
+            positions_degraded: None,
+        };
+
+        hover.redact_server_text(&Redactions::default());
+
+        assert_eq!(hover.contents, format!("doc {SECRET}"));
+    }
+
+    #[test]
+    fn test_server_text_does_not_touch_already_redacted_diagnostics() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut result = DocumentDiagnosticsResult {
+            diagnostics: vec![ContextualDiagnostic::from(Diagnostic {
+                range: range(),
+                severity: DiagnosticSeverity::Error,
+                message: format!("echo {SECRET}"),
+                code: None,
+            })],
+            positions_degraded: None,
+            enrichment: None,
+        };
+
+        result.redact_server_text(&set);
+
+        assert_eq!(result.diagnostics[0].message, format!("echo {SECRET}"));
+    }
+
+    #[test]
+    fn test_server_text_redacts_hover_and_prepare_rename_message() {
+        let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
+        let mut hover = HoverResult {
+            contents: format!("doc {SECRET}"),
+            range: None,
+            positions_degraded: None,
+        };
+        let mut outcome = PrepareRenameOutcome::NotRenameable {
+            server_message: Some(format!("no {SECRET}")),
+        };
+
+        hover.redact_server_text(&set);
+        outcome.redact_server_text(&set);
+
+        assert_eq!(hover.contents, "doc [redacted:API_TOKEN]");
+        assert_eq!(
+            outcome,
+            PrepareRenameOutcome::NotRenameable {
+                server_message: Some("no [redacted:API_TOKEN]".to_owned())
+            }
+        );
+    }
 
     #[test]
     fn test_position_degradation_request_outranks_response() {

@@ -19,6 +19,7 @@ use super::dto::{Diagnostic, Location, Position2D, PositionDegradation, Range, S
 use super::routing::{Capability, IndexingGate};
 use super::symbols::{DocumentSymbolTree, FetchedSymbols, FlatSymbol, symbol_tree};
 use crate::error::Error;
+use crate::redaction::{Redactions, ServerText};
 
 /// Upper bound on the number of distinct files one call enriches.
 const MAX_ENRICHED_FILES: usize = 16;
@@ -548,6 +549,40 @@ impl Translator {
     }
 }
 
+impl ServerText for EnclosingSymbol {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            name_path,
+            kind: _,
+            range: _,
+            fidelity: _,
+        } = self;
+        for segment in name_path {
+            redactions.note_payload(segment);
+        }
+    }
+}
+
+impl ServerText for EnclosingSymbolOutcome {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        match self {
+            Self::Resolved(symbol) => symbol.redact_server_text(redactions),
+            Self::TopLevel | Self::NotComputed { reason: _ } | Self::Unavailable { reason: _ } => {}
+        }
+    }
+}
+
+impl ServerText for ContextualLocation {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            location,
+            enclosing_symbol,
+        } = self;
+        location.redact_server_text(redactions);
+        enclosing_symbol.redact_server_text(redactions);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +595,37 @@ mod tests {
         assert_eq!(enrichment_file_cap(8), 2);
         assert_eq!(enrichment_file_cap(64), 16);
         assert_eq!(enrichment_file_cap(10_000), 16);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod server_text_tests {
+    use super::*;
+
+    #[test]
+    fn test_enclosing_symbol_name_path_passes_through() {
+        let secret = "SuperSecretValue123";
+        let set = Redactions::new([("API_TOKEN".to_owned(), secret.to_owned())]);
+        let mut outcome = EnclosingSymbolOutcome::Resolved(EnclosingSymbol {
+            name_path: vec![format!("mod_{secret}"), "f".to_owned()],
+            kind: 12,
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 2,
+                },
+            },
+            fidelity: SymbolFidelity::Hierarchical,
+        });
+        let before = outcome.clone();
+
+        outcome.redact_server_text(&set);
+
+        assert_eq!(outcome, before);
     }
 }

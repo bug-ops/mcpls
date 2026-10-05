@@ -66,6 +66,10 @@ stored in an error or returned, using the same secret set already applied to log
 | FR-008 | THE SYSTEM SHALL redact the `title` and `message` of `$/progress` payloads; they are never stored or served, so this is cache hygiene only | should |
 | FR-009 | THE SYSTEM SHALL NOT redact URIs (`uri`, `relatedInformation[].location.uri`, `codeDescription.href`): they are cache keys and links, and a path-valued secret (an `SSH_AUTH_SOCK`-style value) would otherwise corrupt them | must |
 | FR-010 | WHEN the redaction set is empty THE SYSTEM SHALL skip notification redaction, so the common case does not walk `data` on the reader task | should |
+| FR-012 | THE SYSTEM SHALL redact the server-controlled display prose of every tool result with the union of the secrets of all live servers, through the `ServerText` trait implemented by each result type and required by `to_structured_tool_result` (including `get_server_logs`); prose is hover contents, completion `detail` and `documentation`, code action and command `title`, signature and parameter `label` and `documentation`, inlay hint `label` and `tooltip`, the `message` and `code` of a diagnostic echoed in a code action, the prepare-rename `server_message` and restart failure messages | must |
+| FR-013 | THE SYSTEM SHALL NOT alter payload the client reuses verbatim: edits (`new_text`, rename and workspace edits), every `uri` and range, the completion `label`, identifiers (symbol names and containers, name paths, the prepare-rename placeholder), call and type hierarchy items (`name`, `detail`, `data`) and command `command` and `arguments`; WHEN such a payload holds a secret and debug logging is enabled THE SYSTEM SHALL log the secret's label only | must |
+| FR-014 | THE redaction set of a tool call SHALL be rebuilt from the live clients, so a respawned server is covered and `McplsServer::new` needs no argument; each string is redacted exactly once (cached diagnostics, logs and messages contribute nothing in FR-012) | must |
+| FR-015 | `Redactions::new` SHALL drop a candidate value that occurs inside any marker string of the set, so redaction is idempotent | must |
 | FR-011 | WHEN notification parameters fail to deserialize THE SYSTEM SHALL log the error category only, not serde's message, which can echo a value | must |
 
 ## 4. Non-Functional Requirements
@@ -85,6 +89,10 @@ stored in an error or returned, using the same secret set already applied to log
 | Secret is a key of `data` | Not redacted: keys are not values (FR-007) |
 | Secret appears in the URI of a related location | Kept (FR-009); the secret is still hidden everywhere else |
 | Secret split across two `data` strings | Not matched; the same limit as every other redaction path |
+| Secret inside an edit, identifier, round-trip item or command argument of a tool result | Left unmodified (FR-013), so display redaction is **partial**: the same result can still carry the secret in its payload |
+| Non-protocol tool error text | Not redacted yet; tracked in #612 |
+| Secret value (8 bytes or more) that occurs inside a redaction marker such as `redacted` | Dropped from the set with a `warn!` naming its label only (FR-015); it is then never redacted anywhere, logs included |
+| Server A echoes server B's secret in a log or diagnostic | Logs and diagnostics are redacted at ingestion with the emitting server's set only, so B's secret stays in the cache and `get_server_logs`; tool prose uses the union (FR-012) |
 
 ## 7. Success Criteria
 
@@ -93,6 +101,7 @@ stored in an error or returned, using the same secret set already applied to log
 | SC-001 | JSON log with hostile event and span fields | one line per event, no raw C1/bidi/tag character, expected decoded values |
 | SC-002 | Key order of an escaped line vs a clean line | identical |
 | SC-003 | Secret in a malformed frame | absent from the `LspProtocolError` text |
+| SC-005 | Secret in hover contents and in a code action title, edit text and URI | title and hover redacted; edit text and URI unchanged |
 | SC-004 | Secret in message, `MarkupContent`, nested `data` and related information read through `get_cached_diagnostics`, the diagnostics resource and a `get_diagnostics` pull | absent; URIs unchanged; no duplicate between a pulled and a cached item |
 
 ## 10. See Also
@@ -100,4 +109,4 @@ stored in an error or returned, using the same secret set already applied to log
 - [[constitution]] -- project principles
 - [[MOC-specs]] -- all specifications
 - [[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001]] -- server output handling
-- Code: `crates/mcpls-cli/src/logging.rs`, `crates/mcpls-core/src/redaction.rs`, `crates/mcpls-core/src/lsp/{client,transport,types}.rs`
+- Code: `crates/mcpls-cli/src/logging.rs`, `crates/mcpls-core/src/redaction.rs`, `crates/mcpls-core/src/lsp/{client,transport,types}.rs`, `crates/mcpls-core/src/bridge/translator/{dto,addressing,enclosing,restart}.rs`, `crates/mcpls-core/src/mcp/{server,tool_support}.rs`
