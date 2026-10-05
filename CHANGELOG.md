@@ -115,6 +115,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Listen replay is paced (burst 32, 320 per second, best effort) and the eviction record is a capped map; use `listen_with_capacity` of at least 2000 for a guarantee. (#593, #614)
 - Tool results redact configured secrets in server display text as `[redacted:NAME]`; edits, URIs, identifiers and command arguments are unchanged, so redaction is partial. (#599, #614)
 - `SECURITY.md` trust model names `settings` and `initialization_options`. (#598, #614)
+- **Breaking:** an unknown `--log-level` or `MCPLS_LOG` level is rejected at startup instead of silently disabling logging. (#PR)
+- **Breaking:** `Error::McpServer` and `Error::Transport` are replaced by `McpServerStart`, `TaskFailed` and `StdioCapture`, `ResourceUriError::DecodeFailed` is split, and `Error` gains `ResourceUri` and `PathToUri`; resource URI failures keep their source and the idle HTTP session close is time-bounded. (#PR)
+- **Breaking:** `validate_path_against_roots` is replaced by `WorkspaceRoots::validate` and `validate_blocking`, which return `WorkspacePath`; one canonicalization policy, path validation off the async workers, `Translator::cached_diagnostics_uri` is async and `pinned_initialization_options` takes `&WorkspaceRoots`. (#PR)
+- **Breaking:** `Position` holds non-zero integers built by `Position::from_client`, and a client line or column of 0 or above 1,000,000 is rejected by every position tool; `handle_format_range` and `handle_code_actions` take `BoundedRange`, `handle_inlay_hints` takes `PositionRange`. (#PR)
+- **Breaking:** `CallHierarchyItemResult` and `TypeHierarchyItemResult` are merged into `HierarchyItem`, the `item` of `get_incoming_calls` and `get_outgoing_calls` is typed, and `ContextualLocation` and `ContextualDiagnostic` are aliases of `Contextual<T>`. (#PR)
+- `tools/list` shrinks from about 181 KB to about 122 KB: schema descriptions drop rustdoc sections and are capped, with a size budget test. (#PR)
+- **Breaking:** `ServerInitConfig` gains a `redactions` field; `serve` hides the secrets of every configured server in tool and resource errors, and `Redactions` prints counts only in `Debug`. (#PR)
 
 ### Fixed
 
@@ -149,6 +156,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Servers that wait for a configuration push, such as pyright, answer requests: `workspace/didChangeConfiguration` with null settings follows `initialized`. (#610)
 - Configured secrets echoed in pushed and pulled diagnostics (message, source, code, related information, `data`) and `$/progress` text are redacted before caching. (#610)
 - POST and resume response streams are cut 1 hour after they open (`ResponseStreamDeadline`), so a vanished peer no longer pins its session slot; a peer that stops reading a response still holds it until TCP gives up (#600). (#610)
+- An empty top-level `settings` key is rejected as an empty segment. (#PR)
+- `workspace/configuration` answers an item that is not an object with `null` instead of the whole settings. (#PR)
+- A `prepare_rename` reply for a position that cannot be renamed no longer logs at ERROR. (#PR)
+- An HTTP peer that drains a response slower than 2 KiB/s per stall window, or sends a request body slower than `max(2 min, 4 x header_read_timeout)` in total, is cut and frees its connection permit. (#PR)
+- `GIT_AUTHOR_NAME`, `SSH_AUTH_SOCK` and `XAUTHORITY` are no longer redacted as secrets, while `passWord` and `AUTHORIZATION` stay redacted. (#PR)
 
 ## [0.6.0] - 2026-09-21
 
