@@ -12,6 +12,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | # | Slug | Type | Priority | Status | Issue |
 |---|------|------|----------|--------|-------|
 | 001 | [[config/001-config-discovery-and-heuristics/spec\|config-discovery-and-heuristics]] | enhancement | P1 | implemented (retroactive) | — |
+| 002 | [[config/002-typescript-7-native-server-support/spec\|typescript-7-native-server-support]] | bug | P1 | draft | #615 |
 
 ## lsp
 
@@ -27,6 +28,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | implemented (declaration #567, type hierarchy, prepare rename, highlights, range formatting); semanticTokens and others non-goals | #567, #568, #569 |
 | 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | implemented | #572; #588, #589 (FR-019, FR-021) |
 | 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578; #598 (settings push and serve) |
+| 011 | [[lsp/011-selection-folding-range-tools/spec\|selection-folding-range-tools]] | enhancement | P4 | draft | #616 |
 
 ## mcp
 
@@ -44,6 +46,8 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 010 | [[mcp/010-http-session-keepalive-with-live-stream/spec\|http-session-keepalive-with-live-stream]] | enhancement | P3 | implemented | #573 |
 | 011 | [[mcp/011-client-path-boundary-parsing/spec\|client-path-boundary-parsing]] | bug | P2 | implemented (#580) | #575 |
 | 012 | [[mcp/012-http-typed-limits-origins-stream-deadline/spec\|http-typed-limits-origins-stream-deadline]] | enhancement | P3 | implemented | #584, #585, #587; #597, #600, #602 |
+| 013 | [[mcp/013-http-allowed-host-default-port-rejection/spec\|http-allowed-host-default-port-rejection]] | enhancement | P3 | draft | — |
+| 014 | [[mcp/014-tools-list-payload-size/spec\|tools-list-payload-size]] | enhancement | P3 | draft | — |
 
 ## bridge
 
@@ -101,8 +105,8 @@ subsystem.
 >
 > Within each block, specs are ordered: any new retroactive foundational spec first (documents the
 > subsystem itself), then the original historical bug/enhancement specs in their original relative
-> order, then research/tracking specs last. `config` has only one spec today — a real reflection of
-> the `config/` module's spec coverage prior to this pass, not a placeholder.
+> order, then research/tracking specs last. `config` has two specs today — a real reflection of
+> the `config/` module's spec coverage, not a placeholder.
 >
 > Numbers are **block-scoped**, not global: `bridge/001` and `lsp/001` are different, unrelated
 > specs. Always cite a spec with its block prefix (e.g. `bridge/001`, never bare `001`).
