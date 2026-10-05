@@ -90,7 +90,11 @@ pub struct ToolSupportSnapshot {
 impl ToolSupportSnapshot {
     /// Every configured language, sorted.
     pub(crate) fn languages(&self) -> Vec<String> {
-        self.router.configured_languages()
+        self.router
+            .configured_languages()
+            .into_iter()
+            .map(String::from)
+            .collect()
     }
 
     /// Support for a per-document `tool` on files of `language`, gated on the
@@ -254,6 +258,7 @@ mod tests {
 
     use super::super::testing::translator_with_capabilities;
     use super::*;
+    use crate::config::LanguageId;
     use crate::test_lsp::client_path;
 
     fn rust_caps(hover: bool) -> ServerCapabilities {
@@ -272,7 +277,7 @@ mod tests {
         ToolSupportSnapshot {
             router: Arc::new(ToolRouter::catch_all([(
                 ServerId::from("rust"),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )])),
             expected: ids(expected),
             capabilities: caps
@@ -448,8 +453,10 @@ mod tests {
                     for g3 in g2..STAGES {
                         schedules += 1;
                         let gaps = [g0, g1, g2, g3];
-                        let translator = Translator::new()
-                            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+                        let translator = Translator::new().with_router(ToolRouter::catch_all([(
+                            id.clone(),
+                            LanguageId::from_static("rust"),
+                        )]));
                         translator.set_expected_servers(HashSet::from([id.clone()]));
                         let (client, _fake) = fake_lsp_client();
                         let mut client = Some(client);
@@ -516,9 +523,11 @@ mod tests {
                                 }
                                 schedules += 1;
                                 let gaps = [g0, g1, g2, g3, g4, g5];
-                                let translator = Translator::new().with_router(
-                                    ToolRouter::catch_all([(id.clone(), "rust".to_string())]),
-                                );
+                                let translator =
+                                    Translator::new().with_router(ToolRouter::catch_all([(
+                                        id.clone(),
+                                        LanguageId::from_static("rust"),
+                                    )]));
                                 let (client, _fake) = fake_lsp_client();
                                 translator.register_client(id.clone(), client);
                                 translator.register_server(
@@ -579,7 +588,8 @@ mod tests {
 
     #[test]
     fn language_without_live_route_is_listed_as_no_server() {
-        let mut router = ToolRouter::catch_all([(ServerId::from("rust"), "rust".to_string())]);
+        let mut router =
+            ToolRouter::catch_all([(ServerId::from("rust"), LanguageId::from_static("rust"))]);
         router.rebind_to_registered(&HashSet::new());
         let snap = ToolSupportSnapshot {
             router: Arc::new(router),

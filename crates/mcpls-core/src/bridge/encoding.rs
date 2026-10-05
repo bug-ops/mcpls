@@ -3,10 +3,25 @@
 //! Handles conversion between MCP (1-based) and LSP (0-based) positions,
 //! as well as UTF-8/UTF-16/UTF-32 encoding conversions.
 
+use serde::{Deserialize, Serialize};
+
 use super::translator::{Position, Position2D};
 
 /// Supported position encodings per LSP 3.17.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serializes as the LSP kind string (`"utf-8"`, `"utf-16"`, `"utf-32"`) and
+/// rejects any other string on deserialize.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::PositionEncoding;
+///
+/// assert_eq!(PositionEncoding::from_lsp("utf-32"), Some(PositionEncoding::Utf32));
+/// assert!(PositionEncoding::try_from("utf-7".to_string()).is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "&'static str")]
 pub enum PositionEncoding {
     /// UTF-8 code units.
     #[default]
@@ -17,16 +32,19 @@ pub enum PositionEncoding {
     Utf32,
 }
 
+/// A string that is not an LSP position encoding kind.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("invalid position encoding '{0}'; expected one of \"utf-8\", \"utf-16\", \"utf-32\"")]
+pub struct InvalidPositionEncoding(String);
+
 impl PositionEncoding {
+    /// Every encoding, in LSP-spec order.
+    pub const ALL: [Self; 3] = [Self::Utf8, Self::Utf16, Self::Utf32];
+
     /// Parse from LSP position encoding kind string.
     #[must_use]
     pub fn from_lsp(kind: &str) -> Option<Self> {
-        match kind {
-            "utf-8" => Some(Self::Utf8),
-            "utf-16" => Some(Self::Utf16),
-            "utf-32" => Some(Self::Utf32),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|e| e.to_lsp() == kind)
     }
 
     /// Convert to LSP position encoding kind string.
@@ -37,6 +55,30 @@ impl PositionEncoding {
             Self::Utf16 => "utf-16",
             Self::Utf32 => "utf-32",
         }
+    }
+
+    /// Convert to the [`lsp_types::PositionEncodingKind`] sent in `initialize`.
+    #[must_use]
+    pub const fn to_kind(self) -> lsp_types::PositionEncodingKind {
+        match self {
+            Self::Utf8 => lsp_types::PositionEncodingKind::UTF8,
+            Self::Utf16 => lsp_types::PositionEncodingKind::UTF16,
+            Self::Utf32 => lsp_types::PositionEncodingKind::UTF32,
+        }
+    }
+}
+
+impl TryFrom<String> for PositionEncoding {
+    type Error = InvalidPositionEncoding;
+
+    fn try_from(kind: String) -> Result<Self, Self::Error> {
+        Self::from_lsp(&kind).ok_or(InvalidPositionEncoding(kind))
+    }
+}
+
+impl From<PositionEncoding> for &'static str {
+    fn from(encoding: PositionEncoding) -> Self {
+        encoding.to_lsp()
     }
 }
 
@@ -416,6 +458,27 @@ impl EncodingConverter {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_string_kind_and_enum_round_trip_for_every_encoding() {
+        for encoding in PositionEncoding::ALL {
+            let kind = encoding.to_lsp();
+            assert_eq!(PositionEncoding::try_from(kind.to_string()), Ok(encoding));
+            assert_eq!(<&str>::from(encoding), kind);
+            assert_eq!(encoding.to_kind().as_str(), kind);
+        }
+    }
+
+    #[test]
+    fn test_invalid_encoding_error_lists_valid_values() {
+        let err = PositionEncoding::try_from("utf-7".to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("utf-7"));
+        for encoding in PositionEncoding::ALL {
+            assert!(err.contains(encoding.to_lsp()), "{err}");
+        }
+    }
 
     fn label_substring(
         label: &str,

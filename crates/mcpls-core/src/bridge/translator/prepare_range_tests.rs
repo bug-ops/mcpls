@@ -12,7 +12,7 @@ use super::Translator;
 use super::dto::{FormatDocumentResult, Position2D, PrepareRenameOutcome, PrepareRenameResult};
 use super::testing::*;
 use crate::bridge::{IndexingPolicy, WorkspaceRoots};
-use crate::config::{LspServerConfig, ServerId, ToolKind, ToolRouter};
+use crate::config::{LanguageId, LspServerConfig, ServerId, TimeoutSecs, ToolKind, ToolRouter};
 use crate::error::{Error, McpErrorKind, Result};
 use crate::lsp::LspServer;
 use crate::test_lsp::client_path;
@@ -225,15 +225,15 @@ async fn prepare_rename_rejects_zero_position() {
 
 fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
     LspServerConfig {
-        language_id: "rust".to_string(),
+        language_id: LanguageId::from_static("rust"),
         command: name.to_string(),
         args: vec![],
         env: std::collections::HashMap::new(),
         file_patterns: vec![],
         initialization_options: None,
         settings: None,
-        timeout_seconds: 30,
-        request_timeout_seconds: 30,
+        timeout_seconds: TimeoutSecs::new(30).unwrap(),
+        request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
         heuristics: None,
         name: Some(name.to_string()),
         handles: Some(handles),

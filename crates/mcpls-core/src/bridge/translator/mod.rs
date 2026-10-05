@@ -20,7 +20,9 @@ use self::restart::RestartGeneration;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots, lock_std};
-use crate::config::{ServerId, ServerSettlement, ToolKind, ToolRouter};
+use crate::config::{
+    IndexingReadyTimeoutSecs, LanguageId, ServerId, ServerSettlement, ToolKind, ToolRouter,
+};
 use crate::error::{ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 use crate::redaction::Redactions;
@@ -267,11 +269,10 @@ impl Translator {
     ///
     /// Only called during single-owner setup (mirrors [`Self::with_notification_cache`]),
     /// before the translator is shared. `serve()` wires this from
-    /// `workspace.indexing_ready_timeout_seconds`, already range-checked by
-    /// [`crate::config::ServerConfig::validate`].
+    /// `workspace.indexing_ready_timeout_seconds`, whose type already bounds it.
     #[must_use]
-    pub const fn with_indexing_ready_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.indexing_ready_timeout = timeout;
+    pub const fn with_indexing_ready_timeout(mut self, timeout: IndexingReadyTimeoutSecs) -> Self {
+        self.indexing_ready_timeout = timeout.as_duration();
         self
     }
 
@@ -403,9 +404,9 @@ impl Translator {
 
     /// Registers the client then the server, re-derives routes, then clears the
     /// expected id; that order keeps the snapshot's reads consistent.
-    pub(crate) fn settle_started(&self, server: LspServer) -> (ServerId, String) {
+    pub(crate) fn settle_started(&self, server: LspServer) -> (ServerId, LanguageId) {
         let id = server.init_config().server_config.id();
-        let language = server.client().language_id().to_string();
+        let language = server.client().language_id().clone();
         self.register_server_complete(server);
         self.rebind_router_to_settled();
         self.remove_settled_expected(&id);
@@ -434,7 +435,7 @@ impl Translator {
         let catch_all_states: Vec<String> = languages
             .iter()
             .map(|language| {
-                let state = match self.configured_router.catch_all_for(language) {
+                let state = match self.configured_router.catch_all_for(language.as_str()) {
                     None => "no catch-all".to_string(),
                     Some(catch_all) if catch_all == id => "it was the catch-all".to_string(),
                     Some(catch_all) if lock_std(&self.lsp_clients).contains_key(catch_all) => {
@@ -825,7 +826,7 @@ mod tests {
     ) -> crate::config::LspServerConfig {
         let mut config = crate::config::LspServerConfig::rust_analyzer();
         config.name = Some(name.to_string());
-        config.language_id = language.to_string();
+        config.language_id = LanguageId::new(language).unwrap();
         config.handles = handles;
         config
     }
@@ -1038,7 +1039,10 @@ mod tests {
         let id = config.id();
         let translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_expected_servers(HashSet::from([id.clone()]));
         let path = PathBuf::from("/ws/main.rs");
         let before = translator
@@ -1068,7 +1072,10 @@ mod tests {
         let id = config.id();
         let translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_expected_servers(HashSet::from([id.clone()]));
         translator
             .register_server_complete(crate::lsp::fake_lsp_server_with_config(config.clone()));
@@ -1089,7 +1096,7 @@ mod tests {
         let translator = Translator::new();
         let failure = |id: &str| ServerSpawnFailure {
             server_id: ServerId::from(id),
-            language_id: id.to_string(),
+            language_id: LanguageId::new(id).unwrap(),
             command: id.to_string(),
             reason: StartupFailure::InitTaskPanicked,
         };
@@ -1205,7 +1212,10 @@ mod tests {
         let lang = detect_language(&path, &HashMap::new());
         let id = ServerId::from(lang.clone());
 
-        let translator = Translator::new().with_router(ToolRouter::catch_all([(id.clone(), lang)]));
+        let translator = Translator::new().with_router(ToolRouter::catch_all([(
+            id.clone(),
+            LanguageId::new(lang).unwrap(),
+        )]));
         let mut expected = HashSet::new();
         expected.insert(id);
         translator.set_expected_servers(expected);

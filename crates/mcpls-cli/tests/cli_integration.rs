@@ -465,3 +465,17 @@ fn test_invalid_http_path_env_exits_with_usage_error_in_stdio_mode() {
         .code(2)
         .stderr(predicate::str::contains("panicked").not());
 }
+
+#[cfg(feature = "transport-http")]
+#[test]
+fn test_default_port_allowed_host_env_exits_with_usage_error_before_binding() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .env("MCPLS_HTTP_ALLOWED_HOSTS", "a.example,b.example:443")
+        .args(["--listen", "127.0.0.1:0"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("list the host without a port"))
+        .stderr(predicate::str::contains("starting mcpls").not());
+}

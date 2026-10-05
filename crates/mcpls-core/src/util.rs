@@ -1,6 +1,9 @@
 //! Small helpers shared across `mcpls-core` modules.
 
 use std::borrow::Cow;
+use std::io::Read as _;
+use std::num::NonZeroU64;
+use std::path::Path;
 use std::string::FromUtf8Error;
 
 /// Byte cap for a bounded read against a `max`-byte size limit: `max + 1`
@@ -49,6 +52,67 @@ pub fn check_bounded_utf8(buf: Vec<u8>, max: u64) -> BoundedReadOutcome {
         Ok(s) => BoundedReadOutcome::Ok(s),
         Err(e) => BoundedReadOutcome::InvalidUtf8(e),
     }
+}
+
+/// Why [`read_regular_file_bounded`] did not return the file's bytes.
+#[derive(thiserror::Error, Debug)]
+pub enum BoundedFileError {
+    /// Opening or reading the file failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The path is not a regular file (a FIFO, device, directory, ...).
+    #[error("not a regular file")]
+    NotRegular,
+    /// The file is larger than the allowed number of bytes.
+    #[error("larger than {max} bytes")]
+    TooLarge {
+        /// The byte limit that was exceeded.
+        max: u64,
+    },
+}
+
+/// Reads the regular file at `path` if it is at most `max` bytes, without ever
+/// blocking on a special file.
+///
+/// On Unix the open uses `O_NONBLOCK`, so opening a FIFO (or a symlink to
+/// one) returns at once instead of waiting for a writer, and the file type is
+/// then checked on the open handle rather than on a separately stat'd path.
+/// `O_NOCTTY` keeps a symlink to a tty from becoming the controlling terminal.
+/// On Windows the handle must report `FILE_TYPE_DISK`, which rejects device
+/// names such as `NUL`; Win32 has no non-blocking open, so the open itself
+/// can still wait on a hostile path (see #442).
+///
+/// # Errors
+///
+/// [`BoundedFileError::NotRegular`] for anything but a regular file,
+/// [`BoundedFileError::TooLarge`] past `max` bytes, and
+/// [`BoundedFileError::Io`] for open or read failures.
+pub fn read_regular_file_bounded(
+    path: &Path,
+    max: NonZeroU64,
+) -> Result<Vec<u8>, BoundedFileError> {
+    let max = max.get();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    if !winapi_util::file::typ(&file).is_ok_and(|file_type| file_type.is_disk()) {
+        return Err(BoundedFileError::NotRegular);
+    }
+    if !file.metadata()?.is_file() {
+        return Err(BoundedFileError::NotRegular);
+    }
+    let mut buf = Vec::new();
+    file.take(bounded_read_cap(max)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        return Err(BoundedFileError::TooLarge { max });
+    }
+    Ok(buf)
 }
 
 /// Marker appended to a truncated string; the returned string can be up to
@@ -170,10 +234,76 @@ pub fn escape_control(s: &str) -> Cow<'_, str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn read_regular_file_bounded_reads_within_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_regular_file_bounded(&path, limit(2)).unwrap(), b"{}");
+        let empty = dir.path().join("empty.json");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(
+            read_regular_file_bounded(&empty, limit(2))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn limit(max: u64) -> NonZeroU64 {
+        NonZeroU64::new(max).unwrap()
+    }
+
+    #[test]
+    fn read_regular_file_bounded_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        std::fs::write(&path, b"{ }").unwrap();
+        assert_matches!(
+            read_regular_file_bounded(&path, limit(2)),
+            Err(BoundedFileError::TooLarge { max: 2 })
+        );
+    }
+
+    #[test]
+    fn read_regular_file_bounded_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_matches!(
+            read_regular_file_bounded(dir.path(), limit(10)),
+            Err(BoundedFileError::NotRegular)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_file_bounded_does_not_block_on_fifo_or_symlink_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo must succeed to set up this test");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcomes = [fifo, link].map(|path| read_regular_file_bounded(&path, limit(10)));
+            tx.send(outcomes).unwrap();
+        });
+        let outcomes = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("reading a FIFO must not block"));
+        for outcome in outcomes {
+            assert_matches!(outcome, Err(BoundedFileError::NotRegular));
+        }
+    }
 
     #[test]
     fn escape_control_borrows_clean_text() {

@@ -6,6 +6,8 @@ use std::path::Path;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
+use super::bounded_secs::TimeoutSecs;
+use super::language_id::LanguageId;
 use super::routing::{ServerId, ToolKind};
 use super::settings::LspSettings;
 use crate::bridge::IndexingPolicy;
@@ -154,7 +156,7 @@ impl ServerHeuristics {
 #[serde(deny_unknown_fields)]
 pub struct LspServerConfig {
     /// Language identifier (e.g., "rust", "python", "typescript").
-    pub language_id: String,
+    pub language_id: LanguageId,
 
     /// Command to start the LSP server.
     pub command: String,
@@ -178,7 +180,10 @@ pub struct LspServerConfig {
     /// tsserver is not run. Setting `tsserver.path` here overrides the pin,
     /// for example to opt back in to the workspace's TypeScript. Setting any
     /// other options disables the pin: mcpls does not merge into user options.
-    /// See `SECURITY.md` for the trust model.
+    /// TypeScript 7 and later ship no tsserver, so there is nothing to pin: with
+    /// only that installed the server fails to initialize, and the error says
+    /// so. A native `tsc --lsp --stdio` command gets no pin and no generated
+    /// options. See `SECURITY.md` for the trust model.
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
 
@@ -194,8 +199,8 @@ pub struct LspServerConfig {
     /// after initialization; see [`Self::request_timeout_seconds`] for that.
     /// The LSP server's `shutdown` request during teardown uses a separate,
     /// fixed 5-second timeout that is not configurable by this field.
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub timeout_seconds: TimeoutSecs,
 
     /// Per-request timeout in seconds, applied to each LSP request issued
     /// while translating an MCP tool call (hover, definition, references, etc.).
@@ -208,8 +213,8 @@ pub struct LspServerConfig {
     /// seconds. Completion requests are further capped at 10 seconds
     /// regardless of this value; see
     /// [`crate::lsp::LspClient::completion_timeout`].
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout_seconds: u64,
+    #[serde(default)]
+    pub request_timeout_seconds: TimeoutSecs,
 
     /// Heuristics for determining if this server should be spawned.
     /// If not specified, the server will always attempt to spawn.
@@ -244,25 +249,13 @@ pub struct LspServerConfig {
     pub indexing: IndexingPolicy,
 }
 
-const fn default_timeout() -> u64 {
-    30
-}
-
-const fn default_request_timeout() -> u64 {
-    30
-}
-
 /// Maximum allowed value, in seconds, for both [`LspServerConfig::timeout_seconds`]
-/// and [`LspServerConfig::request_timeout_seconds`].
+/// and [`LspServerConfig::request_timeout_seconds`], enforced by [`TimeoutSecs`].
 ///
-/// Both fields are passed straight into `Duration::from_secs` — `timeout_seconds`
-/// in the `initialize` handshake (`lsp::lifecycle::LspServer::initialize`),
-/// `request_timeout_seconds` in [`crate::lsp::LspClient::request_timeout`].
 /// tokio's `timeout`/`sleep` fall back to `Instant::far_future()` for
 /// astronomically large durations instead of panicking, so an unbounded value
 /// on either field (misconfiguration or typo) would silently disable the
-/// timeout rather than fail with a diagnosable error. One shared constant
-/// bounds both, since the underlying defect and fix are identical for each.
+/// timeout rather than fail with a diagnosable error.
 ///
 /// Set to 900 (15 minutes), not a rounder 3600 (1 hour): [`LspClient::request`]
 /// retries a request up to 4 times total on a `-32802` (`ServerCancelled`) or
@@ -336,7 +329,7 @@ impl BuiltinServer {
             Self::RustAnalyzer => "rustup component add rust-analyzer",
             Self::Pyright => "npm install -g pyright",
             Self::TypescriptLanguageServer => {
-                "npm install -g typescript-language-server typescript"
+                "npm install -g typescript-language-server typescript@6"
             }
             Self::Gopls => "go install golang.org/x/tools/gopls@latest",
             Self::Clangd => {
@@ -422,22 +415,22 @@ impl LspServerConfig {
     /// Build a built-in server config, filling in every field not passed as
     /// a parameter.
     fn builtin(
-        language_id: &str,
+        language_id: LanguageId,
         server: BuiltinServer,
         args: &[&str],
         file_patterns: &[&str],
         markers: impl IntoIterator<Item = &'static str>,
     ) -> Self {
         Self {
-            language_id: language_id.to_string(),
+            language_id,
             command: server.command().to_string(),
             args: args.iter().map(ToString::to_string).collect(),
             env: HashMap::new(),
             file_patterns: file_patterns.iter().map(ToString::to_string).collect(),
             initialization_options: None,
             settings: None,
-            timeout_seconds: default_timeout(),
-            request_timeout_seconds: default_request_timeout(),
+            timeout_seconds: TimeoutSecs::DEFAULT,
+            request_timeout_seconds: TimeoutSecs::DEFAULT,
             heuristics: Some(ServerHeuristics::with_markers(markers)),
             name: None,
             handles: None,
@@ -449,7 +442,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn rust_analyzer() -> Self {
         Self::builtin(
-            "rust",
+            const { LanguageId::from_static("rust") },
             BuiltinServer::RustAnalyzer,
             &[],
             &["**/*.rs"],
@@ -461,7 +454,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn pyright() -> Self {
         Self::builtin(
-            "python",
+            const { LanguageId::from_static("python") },
             BuiltinServer::Pyright,
             &["--stdio"],
             &["**/*.py"],
@@ -482,7 +475,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn typescript() -> Self {
         Self::builtin(
-            "typescript",
+            const { LanguageId::from_static("typescript") },
             BuiltinServer::TypescriptLanguageServer,
             &["--stdio"],
             &["**/*.ts", "**/*.tsx"],
@@ -494,7 +487,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn gopls() -> Self {
         Self::builtin(
-            "go",
+            const { LanguageId::from_static("go") },
             BuiltinServer::Gopls,
             &["serve"],
             &["**/*.go"],
@@ -506,7 +499,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn clangd() -> Self {
         Self::builtin(
-            "cpp",
+            const { LanguageId::from_static("cpp") },
             BuiltinServer::Clangd,
             &[],
             &["**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp"],
@@ -523,7 +516,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn zls() -> Self {
         Self::builtin(
-            "zig",
+            const { LanguageId::from_static("zig") },
             BuiltinServer::Zls,
             &[],
             &["**/*.zig"],
@@ -538,6 +531,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::config::ToolRouter;
 
     #[test]
     fn test_early_exit_hint_only_for_rust_analyzer() {
@@ -560,7 +554,7 @@ mod tests {
         assert!(config.env.is_empty());
         assert_eq!(config.file_patterns, vec!["**/*.rs"]);
         assert!(config.initialization_options.is_none());
-        assert_eq!(config.timeout_seconds, 30);
+        assert_eq!(config.timeout_seconds, TimeoutSecs::DEFAULT);
     }
 
     #[test]
@@ -573,7 +567,7 @@ mod tests {
         assert!(config.env.is_empty());
         assert_eq!(config.file_patterns, vec!["**/*.py"]);
         assert!(config.initialization_options.is_none());
-        assert_eq!(config.timeout_seconds, 30);
+        assert_eq!(config.timeout_seconds, TimeoutSecs::DEFAULT);
     }
 
     #[test]
@@ -586,12 +580,7 @@ mod tests {
         assert!(config.env.is_empty());
         assert_eq!(config.file_patterns, vec!["**/*.ts", "**/*.tsx"]);
         assert!(config.initialization_options.is_none());
-        assert_eq!(config.timeout_seconds, 30);
-    }
-
-    #[test]
-    fn test_default_timeout() {
-        assert_eq!(default_timeout(), 30);
+        assert_eq!(config.timeout_seconds, TimeoutSecs::DEFAULT);
     }
 
     #[test]
@@ -600,15 +589,15 @@ mod tests {
         env.insert("RUST_LOG".to_string(), "debug".to_string());
 
         let config = LspServerConfig {
-            language_id: "custom".to_string(),
+            language_id: LanguageId::from_static("custom"),
             command: "custom-lsp".to_string(),
             args: vec!["--flag".to_string()],
             env: env.clone(),
             file_patterns: vec!["**/*.custom".to_string()],
             initialization_options: Some(serde_json::json!({"key": "value"})),
             settings: None,
-            timeout_seconds: 60,
-            request_timeout_seconds: 45,
+            timeout_seconds: TimeoutSecs::new(60).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(45).unwrap(),
             heuristics: None,
             name: None,
             handles: None,
@@ -621,7 +610,7 @@ mod tests {
         assert_eq!(config.env.get("RUST_LOG"), Some(&"debug".to_string()));
         assert_eq!(config.file_patterns, vec!["**/*.custom"]);
         assert!(config.initialization_options.is_some());
-        assert_eq!(config.timeout_seconds, 60);
+        assert_eq!(config.timeout_seconds.get(), 60);
     }
 
     #[test]
@@ -639,11 +628,6 @@ mod tests {
             deserialized.request_timeout_seconds,
             original.request_timeout_seconds
         );
-    }
-
-    #[test]
-    fn test_default_request_timeout() {
-        assert_eq!(default_request_timeout(), 30);
     }
 
     #[test]
@@ -780,15 +764,15 @@ mod tests {
     #[test]
     fn test_should_spawn_without_heuristics() {
         let config = LspServerConfig {
-            language_id: "test".to_string(),
+            language_id: LanguageId::from_static("test"),
             command: "test-lsp".to_string(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
-            timeout_seconds: 30,
-            request_timeout_seconds: 30,
+            timeout_seconds: TimeoutSecs::new(30).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
             name: None,
             handles: None,
@@ -1098,5 +1082,87 @@ mod tests {
         assert!(EXCLUDED_DIRECTORIES.contains(&".git"));
         assert!(EXCLUDED_DIRECTORIES.contains(&"__pycache__"));
         assert!(EXCLUDED_DIRECTORIES.contains(&".venv"));
+    }
+
+    const NATIVE_ENTRY: &str = r#"[[lsp_servers]]
+language_id = "typescript"
+command = "/home/me/ts7/node_modules/.bin/tsc"
+args = ["--lsp", "--stdio"]
+file_patterns = ["**/*.ts", "**/*.tsx"]"#;
+
+    fn repo_file(relative: &str) -> String {
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR").map_or_else(
+            || std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            Into::into,
+        );
+        std::fs::read_to_string(manifest.join("../..").join(relative)).unwrap()
+    }
+
+    fn native_entries(extra: &str) -> Vec<LspServerConfig> {
+        let text = format!("{NATIVE_ENTRY}\n{extra}");
+        toml::from_str::<crate::config::ServerConfig>(&text)
+            .unwrap()
+            .lsp_servers
+    }
+
+    #[test]
+    fn test_docs_agree_with_typescript_install_hint() {
+        let hint = BuiltinServer::TypescriptLanguageServer.install_hint();
+        let pin = hint.split_whitespace().last().unwrap();
+        assert!(pin.starts_with("typescript@"), "{hint}");
+
+        let mut checked = 0;
+        for file in [
+            "README.md",
+            "docs/user-guide/getting-started.md",
+            "docs/user-guide/installation.md",
+            "docs/user-guide/troubleshooting.md",
+            "docs/user-guide/configuration.md",
+        ] {
+            for line in repo_file(file).lines() {
+                if !(line.contains("npm install -g") && line.contains("typescript")) {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    line.split(|c: char| !(c.is_alphanumeric() || matches!(c, '@' | '.' | '-')))
+                        .any(|word| word == pin),
+                    "{file}: {line}"
+                );
+                if line.contains("typescript-language-server") {
+                    assert!(line.contains(hint), "{file}: {line}");
+                }
+            }
+        }
+        assert!(checked >= 4, "only {checked} install lines found");
+    }
+
+    #[test]
+    fn test_documented_native_entry_is_in_the_user_guide() {
+        assert!(repo_file("docs/user-guide/configuration.md").contains(NATIVE_ENTRY));
+    }
+
+    #[test]
+    fn test_native_entry_replacing_default_typescript_entry_routes() {
+        let router = ToolRouter::from_configs(&native_entries("")).unwrap();
+        assert!(router.has_language("typescript"));
+    }
+
+    #[test]
+    fn test_native_entry_appended_to_default_is_rejected() {
+        let mut configs = vec![LspServerConfig::typescript()];
+        configs.extend(native_entries(""));
+        let err = ToolRouter::from_configs(&configs).unwrap_err().to_string();
+        assert!(err.contains("duplicate server id"), "{err}");
+    }
+
+    #[test]
+    fn test_named_native_entry_appended_to_default_is_rejected() {
+        let mut named = native_entries("");
+        named[0].name = Some("native-ts".to_string());
+        let mut configs = vec![LspServerConfig::typescript()];
+        configs.extend(named);
+        let err = ToolRouter::from_configs(&configs).unwrap_err().to_string();
+        assert!(err.contains("two catch-all servers"), "{err}");
     }
 }

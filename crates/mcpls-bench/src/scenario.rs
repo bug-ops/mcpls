@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use mcpls_core::bridge::Position2D;
+use mcpls_core::config::LanguageId;
 use serde::{Deserialize, Serialize};
 
 /// A full 40-character lowercase hexadecimal git commit id.
@@ -263,7 +264,7 @@ pub struct Executable {
 #[serde(deny_unknown_fields)]
 pub struct ServerSpec {
     /// LSP language identifier the server handles.
-    pub language_id: String,
+    pub language_id: LanguageId,
     /// Glob patterns of files routed to this server.
     pub file_patterns: Vec<String>,
     /// Arguments passed to the server on spawn.
