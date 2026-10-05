@@ -209,6 +209,13 @@ pub struct ServerInitConfig {
     /// this can't assume the value was already checked. If nothing parses,
     /// falls back to `config::default_position_encodings()`'s default.
     pub position_encodings: Vec<String>,
+    /// Secrets of every configured server, hidden in this server's output.
+    ///
+    /// [`LspServer::spawn`] adds the secrets of this server's own
+    /// configuration and current environment, so an empty set still hides
+    /// them; `serve` fills it with the secrets of every configured server, so
+    /// a server that echoes another's secret has it hidden too.
+    pub redactions: Arc<Redactions>,
 }
 
 /// The terminal outcome of starting one configured server.
@@ -342,12 +349,8 @@ impl LspServer {
     /// - The `initialized` or `workspace/didChangeConfiguration` notification
     ///   cannot be written ([`Error::LspInitFailed`])
     pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
-        let redactions = Arc::new(Redactions::for_server(
-            &config.server_config,
-            std::env::vars_os().filter_map(|(name, value)| {
-                Some((name.into_string().ok()?, value.into_string().ok()?))
-            }),
-        ));
+        let own = Redactions::for_server(&config.server_config, current_environment());
+        let redactions = Arc::new(Redactions::union([config.redactions.as_ref(), &own]));
         Self::log_spawn(&config.server_config, &redactions);
 
         let command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
@@ -1075,6 +1078,13 @@ fn spawn_error(command: String, source: std::io::Error) -> Error {
     }
 }
 
+/// The process environment as `(name, value)` pairs, skipping non-UTF-8 entries.
+pub fn current_environment() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
 /// Build the `workspace/workspaceFolders` entry for one configured root.
 ///
 /// Reserved characters have to be percent-encoded here: an unencoded `#`
@@ -1361,6 +1371,7 @@ mod tests {
             workspace_roots: vec![PathBuf::from("/tmp/workspace")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            redactions: std::sync::Arc::default(),
         };
 
         #[allow(clippy::redundant_clone)]
@@ -1376,6 +1387,7 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            redactions: std::sync::Arc::default(),
         };
 
         let debug_str = format!("{config:?}");
@@ -1419,6 +1431,7 @@ mod tests {
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            redactions: std::sync::Arc::default(),
         };
 
         assert!(config.initialization_options.is_some());
@@ -1432,6 +1445,7 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            redactions: std::sync::Arc::default(),
         };
 
         assert_eq!(config.workspace_roots.len(), 0);
@@ -1448,6 +1462,7 @@ mod tests {
             ],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            redactions: std::sync::Arc::default(),
         };
 
         assert_eq!(config.workspace_roots.len(), 3);
@@ -1602,6 +1617,7 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec![],
+            redactions: std::sync::Arc::default(),
         };
         let err = LspServer::spawn(config).await.unwrap_err();
         assert_matches!(err, Error::ServerNotFound { .. }, "got {err:?}");
@@ -1791,6 +1807,37 @@ echo 'fatal: bad toolchain' >&2
             panic!("got {err:?}");
         };
         assert_eq!(stderr.head(), "indexing forever");
+    }
+
+    /// #612: a secret of another configured server, handed in through the
+    /// init config, is hidden from this server's output although its own
+    /// configuration does not name it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_hides_another_servers_secret_from_stderr() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            "echo \"seen=$OTHER_VALUE own=$API_TOKEN\" >&2\nexit 1\n",
+        );
+        config
+            .server_config
+            .env
+            .insert("OTHER_VALUE".to_string(), "bravo-secret-222".to_string());
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        config.redactions = std::sync::Arc::new(Redactions::new([(
+            "B_TOKEN".to_owned(),
+            "bravo-secret-222".to_owned(),
+        )]));
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("seen=[redacted:B_TOKEN]"), "{text}");
+        assert!(text.contains("own=[redacted:API_TOKEN]"), "{text}");
     }
 
     /// Values configured in `env` never reach the error text.
@@ -2025,6 +2072,7 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: vec!["utf-32".to_string(), "utf-8".to_string()],
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =
@@ -2159,6 +2207,7 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =
@@ -2209,6 +2258,7 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =
@@ -2245,6 +2295,7 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =
@@ -2301,6 +2352,7 @@ sleep 5
                 workspace_roots,
                 initialization_options: None,
                 position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =

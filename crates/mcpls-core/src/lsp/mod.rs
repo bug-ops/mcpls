@@ -17,7 +17,9 @@ pub(crate) use client::{
 pub use client::{LspClient, SHUTDOWN_TIMEOUT};
 #[cfg(all(test, unix))]
 pub(crate) use lifecycle::fake_lsp_server_with_dead_loop_and_live_child;
-pub(crate) use lifecycle::{ExitGrace, SUPPORTED_SYMBOL_KINDS, ServerStartOutcome, child_env_var};
+pub(crate) use lifecycle::{
+    ExitGrace, SUPPORTED_SYMBOL_KINDS, ServerStartOutcome, child_env_var, current_environment,
+};
 pub use lifecycle::{LspServer, ServerInitConfig, ServerState};
 #[cfg(test)]
 pub(crate) use lifecycle::{fake_lsp_server, fake_lsp_server_with_config};

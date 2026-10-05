@@ -117,6 +117,7 @@ async fn spawn_rust_analyzer() -> LspServer {
         workspace_roots: vec![workspace_path.clone()],
         initialization_options: None,
         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+        redactions: std::sync::Arc::default(),
     };
 
     LspServer::spawn(server_init_config)
@@ -1092,6 +1093,7 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         workspace_roots: vec![workspace_path],
         initialization_options: None,
         position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+        redactions: std::sync::Arc::default(),
     };
 
     let mut server = LspServer::spawn(server_init_config)

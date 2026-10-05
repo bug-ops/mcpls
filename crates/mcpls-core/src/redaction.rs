@@ -153,12 +153,22 @@ impl<T: ServerText> ServerText for Option<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Secret {
     label: String,
     value: String,
     /// JSON- and `Debug`-escaped spellings of `value` that differ from it.
     escaped: Vec<String>,
+}
+
+/// Prints the label only: a derived `Debug` would print the secret itself
+/// wherever a struct holding a [`Redactions`] is formatted.
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secret")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Secret {
@@ -195,8 +205,17 @@ impl Secret {
 
 /// The secret values to hide from a server's output, longest first so a value
 /// that contains another is replaced whole.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Redactions(Vec<Secret>);
+
+/// Prints the number of secrets only, never a value.
+impl std::fmt::Debug for Redactions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Redactions")
+            .field("secrets", &self.0.len())
+            .finish()
+    }
+}
 
 impl Redactions {
     /// Builds the set from `(label, value)` candidates, dropping values under
@@ -282,19 +301,38 @@ impl Redactions {
         config: &LspServerConfig,
         inherited: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        let mut candidates: Vec<(String, String)> = config
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .chain(inherited)
+        Self::for_servers(std::iter::once(config), inherited)
+    }
+
+    /// The secrets any of `configs` can leak, over one `inherited`
+    /// environment: [`Self::for_server`] for every server, whether or not
+    /// its project markers matched, so a server that echoes another's secret
+    /// still has it hidden. Fails closed: a configured secret is hidden
+    /// everywhere, not only in the output of the server that owns it.
+    pub(crate) fn for_servers<'a>(
+        configs: impl IntoIterator<Item = &'a LspServerConfig>,
+        inherited: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        let inherited: Vec<(String, String)> = inherited
+            .into_iter()
             .filter(|(name, _)| is_secret_name(name))
             .collect();
-        collect_secret_args(&config.args, &mut candidates);
-        if let Some(options) = &config.initialization_options {
-            collect_secret_json(options, None, &mut candidates);
-        }
-        if let Some(settings) = &config.settings {
-            collect_secret_json(&settings.to_value(), None, &mut candidates);
+        let mut candidates = inherited;
+        for config in configs {
+            candidates.extend(
+                config
+                    .env
+                    .iter()
+                    .filter(|(name, _)| is_secret_name(name))
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+            collect_secret_args(&config.args, &mut candidates);
+            if let Some(options) = &config.initialization_options {
+                collect_secret_json(options, None, &mut candidates);
+            }
+            if let Some(settings) = &config.settings {
+                collect_secret_json(&settings.to_value(), None, &mut candidates);
+            }
         }
         Self::new(candidates)
     }
@@ -507,6 +545,42 @@ mod tests {
         config.args = Vec::new();
         config.initialization_options = None;
         config
+    }
+
+    #[test]
+    fn test_for_servers_covers_every_configured_server_over_one_environment() {
+        let mut first = server_config();
+        first
+            .env
+            .insert("FIRST_TOKEN".into(), "first-secret-value".into());
+        let mut second = server_config();
+        second.args = vec!["--api-key=second-secret-value".into()];
+
+        let set = Redactions::for_servers(
+            [&first, &second],
+            [(
+                "GITHUB_TOKEN".to_owned(),
+                "inherited-secret-value".to_owned(),
+            )],
+        );
+
+        for text in [
+            "first-secret-value",
+            "second-secret-value",
+            "inherited-secret-value",
+        ] {
+            assert!(set.apply(text).contains("[redacted:"), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_debug_never_prints_a_secret_value() {
+        let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
+
+        let printed = format!("{set:?} {:?}", set.0[0]);
+
+        assert!(!printed.contains("ghp_abcdefgh"), "{printed}");
+        assert!(printed.contains("secrets: 1"), "{printed}");
     }
 
     #[test]

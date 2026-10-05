@@ -597,6 +597,10 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
+    let startup_redactions = Arc::new(redaction::Redactions::for_servers(
+        &config.lsp_servers,
+        lsp::current_environment(),
+    ));
     let applicable_configs: Vec<ServerInitConfig> = config
         .lsp_servers
         .iter()
@@ -623,6 +627,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
                     |key| std::env::var_os(key),
                 ),
                 position_encodings: config.workspace.position_encodings.clone(),
+                redactions: Arc::clone(&startup_redactions),
             })
         })
         .collect();

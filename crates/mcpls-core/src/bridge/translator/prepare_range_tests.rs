@@ -214,6 +214,24 @@ async fn prepare_rename_invalid_offset_still_logs_an_error() {
     );
 }
 
+/// #612: the server's own rejection text goes through the result's
+/// `ServerText`, so a configured secret in it is hidden.
+#[tokio::test]
+async fn prepare_rename_not_renameable_message_is_redacted() {
+    use crate::redaction::{Redactions, ServerText as _};
+
+    let mut result = prepare_rename_with(Answer::Error(-32602, "cannot rename bravo-secret-222"))
+        .await
+        .unwrap();
+    result.redact_server_text(&Redactions::new([(
+        "B_TOKEN".to_owned(),
+        "bravo-secret-222".to_owned(),
+    )]));
+
+    let wire = serde_json::to_value(&result).unwrap();
+    assert_eq!(wire["server_message"], "cannot rename [redacted:B_TOKEN]");
+}
+
 #[tokio::test]
 async fn prepare_rename_out_of_range_position_stays_an_error() {
     let err = prepare_rename_with(Answer::Error(

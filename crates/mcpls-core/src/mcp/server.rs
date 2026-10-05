@@ -236,6 +236,27 @@ fn map_bridge_error(e: crate::error::Error) -> McpError {
     }
 }
 
+/// [`map_bridge_error`], with every configured secret hidden in the message and
+/// in `data` (a rewritten server error carries the server's raw message).
+///
+/// The one funnel for errors that can embed server text: a tool error, a
+/// resource error carrying a spawn failure's stderr, a listen failure. An
+/// error built from client input only keeps the plain [`map_bridge_error`].
+#[allow(clippy::needless_pass_by_value)]
+fn render_error(error: crate::error::Error, redactions: &Redactions) -> McpError {
+    let mut mapped = map_bridge_error(error);
+    if redactions.is_empty() {
+        return mapped;
+    }
+    if let Cow::Owned(message) = redactions.apply(&mapped.message) {
+        mapped.message = Cow::Owned(message);
+    }
+    if let Some(data) = &mut mapped.data {
+        redactions.redact_json(data);
+    }
+    mapped
+}
+
 /// Parses a client-supplied `file_path` at the tool boundary. Done in the
 /// tool method rather than while deserializing the parameters, because the MCP
 /// layer reports a deserialization failure as a tool-result error instead of
@@ -305,7 +326,7 @@ fn to_structured_tool_result<T: Serialize + JsonSchema + ServerText>(
             value.redact_server_text(redactions);
             Ok(Json(value))
         }
-        Err(e) => Err(map_bridge_error(e)),
+        Err(e) => Err(render_error(e, redactions)),
     }
 }
 
@@ -1318,6 +1339,11 @@ impl McplsServer {
 }
 
 impl McplsServer {
+    /// [`render_error`] with the secrets of every live server.
+    fn render_error(&self, error: crate::error::Error) -> McpError {
+        render_error(error, &self.context.translator.server_text_redactions())
+    }
+
     /// [`to_structured_tool_result`] with the secrets of every live server
     /// hidden from the result's display prose.
     fn structured_result<T: Serialize + JsonSchema + ServerText>(
@@ -1342,20 +1368,20 @@ impl McplsServer {
             .workspace_roots
             .validate(path)
             .await
-            .map_err(map_bridge_error)?;
+            .map_err(|e| self.render_error(e))?;
 
         // Build the URI from the canonicalized path (not the raw input path):
         // it must match what `diagnostics_pump` stores from LSP notifications,
         // which are always keyed by the canonical form.
-        let lsp_uri =
-            crate::bridge::path_to_uri(validated_path.as_path()).map_err(map_bridge_error)?;
+        let lsp_uri = crate::bridge::path_to_uri(validated_path.as_path())
+            .map_err(|e| self.render_error(e))?;
 
         let route_id = self
             .context
             .translator
             .diagnostics_route_for_path(validated_path.as_path())
             .into_read_result()
-            .map_err(map_bridge_error)?;
+            .map_err(|e| self.render_error(e))?;
 
         // Only the snapshot is taken under the cache lock: merging the sources
         // (dedupe, sort, size cap) runs after it is released, since
@@ -1478,9 +1504,7 @@ impl McplsServer {
         if let Some(((_, first), _)) = failed.split_first()
             && failed.len() == uris.canonical().count()
         {
-            return Err(map_bridge_error(crate::error::Error::ServerFailedToStart(
-                first.clone(),
-            )));
+            return Err(self.render_error(crate::error::Error::ServerFailedToStart(first.clone())));
         }
         for (uri, _) in &failed {
             registration.publish(uri).await;
@@ -1604,7 +1628,6 @@ impl ServerHandler for McplsServer {
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        // TODO(#612): redact server text in non-protocol tool errors and truncation cuts (follow-up of #599)
         let tcc = ToolCallContext::new(self, request, context);
         contain_panic(self.tool_router.call(tcc), "tool call").await
     }
@@ -1629,7 +1652,7 @@ impl ServerHandler for McplsServer {
                     path: validated_path,
                     uri: canonical_uri,
                 } = DiagnosticsResourceUri::resolve(&request.uri, &self.context.workspace_roots)
-                    .map_err(map_bridge_error)?;
+                    .map_err(|e| self.render_error(e))?;
 
                 // Record the subscription *before* checking the cache. This closes the race where
                 // a PublishDiagnostics notification lands between the cache check and the
@@ -1644,7 +1667,7 @@ impl ServerHandler for McplsServer {
                 let newly_subscribed = session
                     .subscribe(canonical_uri.clone(), request.uri.clone())
                     .await
-                    .map_err(|e| map_bridge_error(e.into()))?;
+                    .map_err(|e| self.render_error(e.into()))?;
                 if !newly_subscribed {
                     tracing::debug!(
                         "client re-subscribed to already-subscribed resource {canonical_uri}"
@@ -1669,15 +1692,15 @@ impl ServerHandler for McplsServer {
                             .unsubscribe(Some(&canonical_uri), &request.uri)
                             .await;
                     }
-                    return Err(map_bridge_error(crate::error::Error::ServerFailedToStart(
-                        failure,
-                    )));
+                    return Err(
+                        self.render_error(crate::error::Error::ServerFailedToStart(failure))
+                    );
                 }
 
                 // Build the URI from the canonicalized path, matching `read_resource` and
                 // what `diagnostics_pump` stores from LSP notifications.
-                let lsp_uri =
-                    crate::bridge::path_to_uri(&validated_path).map_err(map_bridge_error)?;
+                let lsp_uri = crate::bridge::path_to_uri(&validated_path)
+                    .map_err(|e| self.render_error(e))?;
                 let has_cached_diagnostics = {
                     let cache = self.context.notification_cache.lock().await;
                     cache.has_diagnostics(&lsp_uri)
@@ -1717,7 +1740,7 @@ impl ServerHandler for McplsServer {
                 ) {
                     Ok(resolved) => Some(resolved.uri),
                     Err(e) if is_unresolvable_resource(&e) => None,
-                    Err(e) => return Err(map_bridge_error(e)),
+                    Err(e) => return Err(self.render_error(e)),
                 };
 
                 if !session.unsubscribe(canonical.as_ref(), &request.uri).await {
@@ -1789,7 +1812,7 @@ impl ServerHandler for McplsServer {
         let Some((permit, uris)) = self
             .prepare_listen(requested, accepted)
             .await
-            .map_err(map_bridge_error)?
+            .map_err(|e| self.render_error(e))?
         else {
             return Ok(());
         };
@@ -2086,6 +2109,130 @@ mod tests {
                 "expected {debug} to map onto INVALID_PARAMS"
             );
         }
+    }
+
+    fn two_server_redactions(secret: &str) -> Redactions {
+        Redactions::new([
+            ("A_TOKEN".to_owned(), "alpha-secret-111".to_owned()),
+            ("B_TOKEN".to_owned(), secret.to_owned()),
+        ])
+    }
+
+    /// #612: server B's secret inside server A's error message, split by the
+    /// client's one 4 KiB cut, leaves no fragment in the tool error or in the
+    /// rewritten error's `data`, because it is redacted before the cut.
+    #[tokio::test]
+    async fn test_error_with_another_servers_secret_across_the_cut_leaves_no_fragment() {
+        use tokio::io::BufReader;
+
+        let secret = "bravo-secret-222-padded-to-straddle";
+        let union = two_server_redactions(secret);
+        let (client, mut fake, _lanes) =
+            crate::test_lsp::fake_lsp_client_with_redactions(union.clone());
+        let request = tokio::spawn(async move {
+            client
+                .request::<_, serde_json::Value>(
+                    "textDocument/hover",
+                    serde_json::json!({}),
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+        });
+        let mut reader = BufReader::new(&mut fake.write_stdout);
+        let wire = crate::test_lsp::read_framed_message(&mut reader).await;
+        let pad = "x".repeat(crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES - 20);
+        let message = format!("Invalid offset {pad}{secret}");
+        crate::test_lsp::write_error_response(
+            &mut fake.read_half_stdin,
+            &wire["id"],
+            -32602,
+            &message,
+        )
+        .await;
+
+        let error = request.await.unwrap().unwrap_err();
+        let rendered = render_error(error, &union);
+
+        let data = rendered
+            .data
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        for text in [rendered.message.to_string(), data] {
+            assert!(!text.contains(&secret[..4]), "{text}");
+        }
+    }
+
+    /// #612: an embedder's client whose own set lacks another server's
+    /// secret still has it hidden by the funnel, in the message and in `data`.
+    #[test]
+    fn test_render_error_hides_configured_secrets_in_message_and_data() {
+        let redactions = two_server_redactions("bravo-secret-222");
+        let rendered = render_error(
+            crate::error::Error::LspServerError {
+                code: -32602,
+                message: "Invalid offset LineCol { line: 9 } for bravo-secret-222".to_owned(),
+                data: None,
+            },
+            &redactions,
+        );
+        let data = rendered.data.as_ref().map(ToString::to_string).unwrap();
+        assert!(
+            !rendered.message.contains("bravo-secret-222"),
+            "{}",
+            rendered.message
+        );
+        assert!(data.contains("[redacted:B_TOKEN]"), "{data}");
+        assert!(!data.contains("bravo-secret-222"), "{data}");
+
+        let plain = render_error(
+            crate::error::Error::InvalidToolParams("nothing secret".into()),
+            &redactions,
+        );
+        assert!(
+            plain.message.contains("nothing secret"),
+            "{}",
+            plain.message
+        );
+    }
+
+    /// #612: a resource error built from a spawn failure whose text carries
+    /// another server's secret is hidden through the server's live set.
+    #[tokio::test]
+    async fn test_resource_error_from_a_startup_failure_hides_another_servers_secret() {
+        let server = create_test_server();
+        let (client, _fake, _lanes) = crate::test_lsp::fake_lsp_client_with_redactions(
+            two_server_redactions("bravo-secret-222"),
+        );
+        server
+            .context
+            .translator
+            .register_client(crate::config::ServerId::from("a"), client);
+        let failure =
+            crate::error::Error::ServerFailedToStart(Box::new(crate::error::ServerSpawnFailure {
+                server_id: crate::config::ServerId::from("b"),
+                language_id: "python".to_owned(),
+                command: "pyright".to_owned(),
+                reason: crate::error::StartupFailure::Spawn(Arc::new(
+                    crate::error::Error::LspInitFailed {
+                        message: "exited with token bravo-secret-222".to_owned(),
+                        stderr: None,
+                    },
+                )),
+            }));
+
+        let rendered = server.render_error(failure);
+
+        assert!(
+            !rendered.message.contains("bravo-secret-222"),
+            "{}",
+            rendered.message
+        );
+        assert!(
+            rendered.message.contains("[redacted:B_TOKEN]"),
+            "{}",
+            rendered.message
+        );
     }
 
     /// #617: a zero or oversized line, or a malformed range, is `-32602` for
@@ -3872,6 +4019,7 @@ sleep 0.3
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            redactions: std::sync::Arc::default(),
         };
 
         let seed = LspServer::spawn(config).await.unwrap();
