@@ -143,7 +143,7 @@
   {
     "name": "format_range",
     "title": "Format Range",
-    "description": "Format only a range with language-specific rules. Returns text edits the server reports for that range; edits are not filtered or applied. Keep the range end inside the file. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Format only a range with language-specific rules. Returns text edits the server reports for that range; edits are not filtered or applied. A line past the end of the file is rejected. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$defs": {
         "TabSize": {

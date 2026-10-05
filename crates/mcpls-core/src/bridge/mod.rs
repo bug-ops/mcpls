@@ -38,7 +38,7 @@ pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentTracker, ResourceLimits, path_to_uri,
     uri_to_path,
 };
-pub(crate) use state::{InFlightGuard, try_path_to_uri};
+pub(crate) use state::{InFlightGuard, LinePresence, try_path_to_uri};
 pub use translator::{
     AddressableTool, Addressed, BoundedRange, CheckedHierarchyItem, Completion, CompletionsResult,
     Contextual, ContextualDiagnostic, ContextualLocation, DefinitionResult, Diagnostic,

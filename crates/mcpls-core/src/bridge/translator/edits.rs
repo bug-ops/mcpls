@@ -24,6 +24,7 @@ use crate::config::ServerId;
 use crate::error::{Error, McpErrorKind, Result};
 use crate::escape_control;
 use crate::lsp::{LspClient, UnclassifiedError};
+use crate::redaction::Redactions;
 
 /// Validate the `kind_filter` of `handle_code_actions`.
 fn validate_kind_filter(kind_filter: Option<&str>) -> Result<()> {
@@ -502,34 +503,49 @@ async fn convert_text_edits(
     converted
 }
 
-/// JSON-RPC `InvalidParams`, the code servers use to reject a
-/// `textDocument/prepareRename` position that holds no renameable symbol.
-const JSONRPC_INVALID_PARAMS: i32 = -32602;
+/// The code of a `textDocument/prepareRename` failure that means "no renameable
+/// symbol here": `InvalidParams` (rust-analyzer) or the catch-all
+/// `UnknownErrorCode` (clangd).
+fn not_renameable_code(code: i32) -> Option<lsp_types::ErrorCodes> {
+    let code = lsp_types::ErrorCodes::from(code);
+    matches!(
+        code,
+        lsp_types::ErrorCodes::InvalidParams | lsp_types::ErrorCodes::UnknownErrorCode
+    )
+    .then_some(code)
+}
 
 /// Classify a failed `prepareRename` request.
 ///
-/// rust-analyzer rejects a position with no renameable symbol with `-32602`.
-/// clangd uses `-32001` for that and for an out-of-range line, so its answer
-/// stays a server error (pinned by a test). rust-analyzer reports an
-/// out-of-range position as `-32602` with its "Invalid offset" text, so
-/// `mcp_error_kind` is consulted first: a caller-fault position stays an
-/// error and is never read as "not renameable".
-fn prepare_rename_rejection(err: UnclassifiedError) -> Result<PrepareRenameOutcome> {
-    let message = match err.error() {
-        Error::LspServerError {
-            code: JSONRPC_INVALID_PARAMS,
-            message,
-            ..
-        } if !matches!(
-            err.error().mcp_error_kind(),
-            McpErrorKind::InvalidPosition(_)
-        ) =>
+/// rust-analyzer reports an out-of-range position as `-32602` with its
+/// "Invalid offset" text, so `mcp_error_kind` is consulted first: a
+/// caller-fault position stays an error and is never read as "not renameable".
+fn prepare_rename_rejection(
+    err: UnclassifiedError,
+    redactions: &Redactions,
+) -> Result<PrepareRenameOutcome> {
+    let (message, code) = match err.error() {
+        Error::LspServerError { code, message, .. }
+            if let Some(code) = not_renameable_code(*code)
+                && !matches!(
+                    err.error().mcp_error_kind(),
+                    McpErrorKind::InvalidPosition(_)
+                ) =>
         {
-            escape_control(message).into_owned()
+            (escape_control(message).into_owned(), code)
         }
         _ => return Err(err.surface()),
     };
     drop(err.handled());
+    if code == lsp_types::ErrorCodes::UnknownErrorCode {
+        tracing::warn!(
+            "prepareRename failed with the catch-all UnknownErrorCode; reported as not_renameable: {}",
+            crate::util::truncate_str(
+                &redactions.apply(&message),
+                crate::util::MAX_LOG_STRING_BYTES
+            )
+        );
+    }
     Ok(PrepareRenameOutcome::NotRenameable {
         server_message: Some(message),
     })
@@ -604,11 +620,12 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the position is invalid, the LSP request fails
-    /// for a reason other than rejecting the position, the file cannot be
-    /// opened, the routed server does not advertise rename preparation
-    /// support (`renameProvider.prepareProvider`), or the server is still
-    /// indexing the workspace.
+    /// Returns an error if the position is invalid or its line lies beyond
+    /// the end of the document ([`Error::PositionBeyondDocument`]), the LSP
+    /// request fails for a reason other than rejecting the position, the
+    /// file cannot be opened, the routed server does not advertise rename
+    /// preparation support (`renameProvider.prepareProvider`), or the server
+    /// is still indexing the workspace.
     pub async fn handle_prepare_rename(
         &self,
         file_path: ClientPath,
@@ -621,6 +638,7 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
+        self.require_line_in_document(&doc, position)?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
         let response_uri = uri.clone();
@@ -663,7 +681,7 @@ impl Translator {
                     server_message: None,
                 }
             }
-            Err(err) => prepare_rename_rejection(err)?,
+            Err(err) => prepare_rename_rejection(err, &self.server_text_redactions())?,
         };
 
         Ok(PrepareRenameResult {
@@ -720,8 +738,9 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the range is invalid (zero or oversized
-    /// positions, start after end), the LSP request fails, the file cannot be
-    /// opened, or the routed server does not advertise
+    /// positions, start after end), a line lies beyond the end of the
+    /// document ([`Error::PositionBeyondDocument`]), the LSP request fails,
+    /// the file cannot be opened, or the routed server does not advertise
     /// `documentRangeFormattingProvider` support.
     pub async fn handle_format_range(
         &self,
@@ -738,6 +757,8 @@ impl Translator {
                 IndexingGate::NotRequired,
             )
             .await?;
+        self.require_line_in_document(&doc, start)?;
+        self.require_line_in_document(&doc, end)?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
         let response_uri = uri.clone();

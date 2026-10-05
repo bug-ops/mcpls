@@ -910,6 +910,17 @@ pub enum Error {
     #[error(transparent)]
     InvalidHierarchyItemInput(#[from] InvalidHierarchyItem),
 
+    /// A client-supplied line lies beyond the end of the tracked document.
+    ///
+    /// Only the line is checked: an LSP server clamps a character past the
+    /// end of its line to the line length (LSP 3.17, `Position`), so such a
+    /// character is forwarded unchanged.
+    #[error("line {line} is beyond the end of the document")]
+    PositionBeyondDocument {
+        /// The 1-based line the client supplied.
+        line: std::num::NonZeroU32,
+    },
+
     /// A client-supplied `lsp-diagnostics://` resource URI was rejected.
     #[error(transparent)]
     ResourceUri(#[from] ResourceUriError),
@@ -1334,6 +1345,7 @@ impl Error {
             | Self::InvalidPositionInput(_)
             | Self::InvalidRangeInput(_)
             | Self::InvalidHierarchyItemInput(_)
+            | Self::PositionBeyondDocument { .. }
             | Self::ListenFilterTooLarge { .. }
             | Self::DocumentNotFound(_)
             | Self::FileSizeLimitExceeded { .. } => McpErrorKind::InvalidParams,
@@ -2371,6 +2383,15 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory"),
         };
         assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
+    }
+
+    #[test]
+    fn test_position_beyond_document_is_invalid_params_naming_the_line() {
+        let err = Error::PositionBeyondDocument {
+            line: std::num::NonZeroU32::new(7).unwrap(),
+        };
+        assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
+        assert_eq!(err.to_string(), "line 7 is beyond the end of the document");
     }
 
     /// #575: a malformed client path is caller-fault, whatever IO kind the

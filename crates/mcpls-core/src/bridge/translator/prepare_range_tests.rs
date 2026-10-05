@@ -17,6 +17,7 @@ use crate::bridge::{IndexingPolicy, WorkspaceRoots};
 use crate::config::{LanguageId, LspServerConfig, ServerId, TimeoutSecs, ToolKind, ToolRouter};
 use crate::error::{Error, McpErrorKind, Result};
 use crate::lsp::LspServer;
+use crate::redaction::Redactions;
 use crate::test_lsp::client_path;
 
 fn prepare_caps() -> lsp_types::ServerCapabilities {
@@ -46,9 +47,17 @@ enum Answer {
 }
 
 async fn prepare_rename_with(answer: Answer) -> Result<PrepareRenameResult> {
+    prepare_rename_redacting(answer, Redactions::default()).await
+}
+
+async fn prepare_rename_redacting(
+    answer: Answer,
+    redactions: Redactions,
+) -> Result<PrepareRenameResult> {
     let dir = TempDir::new().unwrap();
     let (translator, mut server) =
         translator_with_capabilities(&dir, &ServerId::from("rust"), prepare_caps());
+    let translator = translator.with_startup_redactions(Arc::new(redactions));
     let path = dir.path().join("a.rs");
     fs::write(&path, "fn old_name() {}").unwrap();
 
@@ -167,6 +176,13 @@ async fn prepare_rename_invalid_params_error_is_not_renameable() {
 }
 
 async fn logs_of(answer: Answer) -> Vec<(tracing::Level, String)> {
+    logs_of_redacting(answer, Redactions::default()).await
+}
+
+async fn logs_of_redacting(
+    answer: Answer,
+    redactions: Redactions,
+) -> Vec<(tracing::Level, String)> {
     use tracing_subscriber::prelude::*;
 
     let captured = crate::test_lsp::CapturedLogs::default();
@@ -175,7 +191,7 @@ async fn logs_of(answer: Answer) -> Vec<(tracing::Level, String)> {
             .with(captured.clone())
             .with(tracing_subscriber::filter::LevelFilter::DEBUG),
     );
-    drop(prepare_rename_with(answer).await);
+    drop(prepare_rename_redacting(answer, redactions).await);
     captured.entries()
 }
 
@@ -247,16 +263,193 @@ async fn prepare_rename_out_of_range_position_stays_an_error() {
 
 /// clangd rejects a position with no renameable symbol with `-32001`
 /// (`UnknownErrorCode`), not `-32602`; pinned so a change to the mapping is
-/// a conscious one.
+/// a conscious one. The code is LSP's catch-all, so the server's own text
+/// stays in `server_message`.
 #[tokio::test]
-async fn prepare_rename_clangd_no_symbol_error_stays_a_server_error() {
-    let err = prepare_rename_with(Answer::Error(
+async fn prepare_rename_clangd_no_symbol_error_is_not_renameable() {
+    let result = prepare_rename_with(Answer::Error(
         -32001,
         "Cannot rename symbol: there is no symbol at the given location",
     ))
     .await
+    .unwrap();
+    assert_eq!(
+        result.outcome,
+        PrepareRenameOutcome::NotRenameable {
+            server_message: Some(
+                "Cannot rename symbol: there is no symbol at the given location".to_string()
+            )
+        }
+    );
+}
+
+/// `RequestFailed` is a generic failure, not a "no symbol" answer.
+#[tokio::test]
+async fn prepare_rename_request_failed_stays_a_server_error() {
+    let err = prepare_rename_with(Answer::Error(-32803, "boom"))
+        .await
+        .unwrap_err();
+    assert_matches!(err, Error::LspServerError { code: -32803, .. });
+}
+
+fn tracked_translator(
+    dir: &TempDir,
+    caps: lsp_types::ServerCapabilities,
+    source: &str,
+) -> (Translator, std::path::PathBuf, impl Sized) {
+    let (translator, server) = translator_with_capabilities(dir, &ServerId::from("rust"), caps);
+    let path = dir.path().join("a.rs");
+    fs::write(&path, source).unwrap();
+    (translator, path, server)
+}
+
+#[tokio::test]
+async fn prepare_rename_line_beyond_the_document_is_rejected_before_the_request() {
+    let dir = TempDir::new().unwrap();
+    let (translator, path, _server) =
+        tracked_translator(&dir, prepare_caps(), "fn a() {}\nfn b() {}");
+
+    let err = timeout(
+        Duration::from_secs(5),
+        translator
+            .handle_prepare_rename(client_path(path.to_string_lossy().into_owned()), pos(3, 1)),
+    )
+    .await
+    .expect("must fail before any LSP round-trip")
     .unwrap_err();
-    assert_matches!(err, Error::LspServerError { code: -32001, .. });
+
+    assert_matches!(err, Error::PositionBeyondDocument { line } if line.get() == 3);
+    assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
+}
+
+#[tokio::test]
+async fn prepare_rename_catch_all_error_logs_a_warning() {
+    let logs = logs_of(Answer::Error(-32001, "internal clangd failure")).await;
+    assert!(
+        logs.iter()
+            .any(|(level, msg)| *level == tracing::Level::WARN
+                && msg.contains("UnknownErrorCode")
+                && msg.contains("internal clangd failure")),
+        "{logs:?}"
+    );
+    assert!(
+        error_response_logs(&logs, tracing::Level::ERROR).is_empty(),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn prepare_rename_catch_all_warning_redacts_the_server_message() {
+    let redactions = Redactions::new([("B_TOKEN".to_owned(), "bravo-secret-222".to_owned())]);
+    let logs = logs_of_redacting(
+        Answer::Error(-32001, "failed for bravo-secret-222"),
+        redactions,
+    )
+    .await;
+    let warnings: Vec<_> = logs
+        .iter()
+        .filter(|(level, _)| *level == tracing::Level::WARN)
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|(_, msg)| msg.contains("[redacted:B_TOKEN]")),
+        "{logs:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|(_, msg)| !msg.contains("bravo-secret-222")),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn capability_error_wins_over_a_line_beyond_the_document() {
+    let dir = TempDir::new().unwrap();
+    let (translator, path, _server) =
+        tracked_translator(&dir, lsp_types::ServerCapabilities::default(), "a\nb\n");
+    let file = || client_path(path.to_string_lossy().into_owned());
+
+    let rename = translator
+        .handle_prepare_rename(file(), pos(99, 1))
+        .await
+        .unwrap_err();
+    assert_matches!(rename, Error::CapabilityNotSupported { .. });
+    let format = translator
+        .handle_format_range(
+            file(),
+            bounded(pos(1, 1), pos(99, 1)),
+            TabSize::default(),
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert_matches!(format, Error::CapabilityNotSupported { .. });
+}
+
+#[tokio::test]
+async fn an_untracked_document_passes_the_line_check() {
+    use super::routing::{Capability, IndexingGate};
+
+    let dir = TempDir::new().unwrap();
+    let (translator, path, _server) = tracked_translator(&dir, prepare_caps(), "a\n");
+    let doc = translator
+        .prepare_gated_document(
+            &client_path(path.to_string_lossy().into_owned()),
+            Capability::PrepareRename,
+            IndexingGate::NotRequired,
+        )
+        .await
+        .unwrap();
+    assert_matches!(
+        translator.require_line_in_document(&doc, pos(99, 1)),
+        Err(Error::PositionBeyondDocument { line }) if line.get() == 99
+    );
+
+    translator.document_tracker.close(doc.path());
+
+    translator
+        .require_line_in_document(&doc, pos(99, 1))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn prepare_rename_character_past_the_line_end_is_forwarded() {
+    let dir = TempDir::new().unwrap();
+    let (translator, mut server) =
+        translator_with_capabilities(&dir, &ServerId::from("rust"), prepare_caps());
+    let path = dir.path().join("a.rs");
+    fs::write(&path, "fn a() {}").unwrap();
+    let translator = Arc::new(translator);
+    let handle = {
+        let translator = Arc::clone(&translator);
+        let path = path.to_string_lossy().into_owned();
+        tokio::spawn(async move {
+            translator
+                .handle_prepare_rename(client_path(path), pos(1, 999))
+                .await
+        })
+    };
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    assert_eq!(
+        read_framed_message(&mut wire).await["method"],
+        "textDocument/didOpen"
+    );
+    let request = read_framed_message(&mut wire).await;
+    assert_eq!(request["method"], "textDocument/prepareRename");
+    assert_eq!(request["params"]["position"]["character"], 998);
+    write_response(
+        &mut server.read_half_stdin,
+        &request["id"],
+        serde_json::Value::Null,
+    )
+    .await;
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -478,6 +671,75 @@ async fn format_range_converts_utf8_edit_columns() {
 async fn format_range_null_response_has_no_edits() {
     let (_, result) = format_range_with("a\nb\nc", None, serde_json::Value::Null).await;
     assert!(result.edits.is_empty());
+}
+
+#[tokio::test]
+async fn format_range_with_a_line_beyond_the_document_is_rejected_before_the_request() {
+    let dir = TempDir::new().unwrap();
+    let (translator, path, _server) = tracked_translator(&dir, range_caps(), "a\nb\n");
+    let client_file = || client_path(path.to_string_lossy().into_owned());
+
+    for (start, end, line) in [(pos(1, 1), pos(9, 1), 9), (pos(7, 1), pos(8, 1), 7)] {
+        let err = timeout(
+            Duration::from_secs(5),
+            translator.handle_format_range(
+                client_file(),
+                bounded(start, end),
+                TabSize::default(),
+                true,
+            ),
+        )
+        .await
+        .expect("must fail before any LSP round-trip")
+        .unwrap_err();
+        assert_matches!(err, Error::PositionBeyondDocument { line: l } if l.get() == line);
+    }
+}
+
+#[tokio::test]
+async fn format_range_end_character_past_the_line_end_is_forwarded() {
+    let dir = TempDir::new().unwrap();
+    let (translator, mut server) =
+        translator_with_capabilities(&dir, &ServerId::from("rust"), range_caps());
+    let path = dir.path().join("a.rs");
+    fs::write(&path, "a\nb\nc").unwrap();
+    let translator = Arc::new(translator);
+    let handle = {
+        let translator = Arc::clone(&translator);
+        let path = path.to_string_lossy().into_owned();
+        tokio::spawn(async move {
+            translator
+                .handle_format_range(
+                    client_path(path),
+                    bounded(pos(1, 1), pos(2, 999)),
+                    TabSize::default(),
+                    true,
+                )
+                .await
+        })
+    };
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    assert_eq!(
+        read_framed_message(&mut wire).await["method"],
+        "textDocument/didOpen"
+    );
+    let request = read_framed_message(&mut wire).await;
+    assert_eq!(request["method"], "textDocument/rangeFormatting");
+    assert_eq!(
+        request["params"]["range"]["end"],
+        serde_json::json!({"line": 1, "character": 998})
+    );
+    write_response(
+        &mut server.read_half_stdin,
+        &request["id"],
+        serde_json::Value::Null,
+    )
+    .await;
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

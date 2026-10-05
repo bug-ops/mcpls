@@ -1090,7 +1090,7 @@ impl McplsServer {
     // read-only: returns proposed text edits, does not apply them -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = concat!("Format only a range with language-specific rules. Returns text edits the server reports for that range; edits are not filtered or applied. Keep the range end inside the file. ", positions_note_request!()),
+        description = concat!("Format only a range with language-specific rules. Returns text edits the server reports for that range; edits are not filtered or applied. A line past the end of the file is rejected. ", positions_note_request!()),
         title = "Format Range"
     )]
     async fn format_range(
@@ -1610,6 +1610,7 @@ const fn is_unresolvable_resource(error: &crate::error::Error) -> bool {
         | Error::InvalidPositionInput(..)
         | Error::InvalidRangeInput(..)
         | Error::InvalidHierarchyItemInput(..)
+        | Error::PositionBeyondDocument { .. }
         | Error::ResourceUri(..)
         | Error::PathToUri(..)
         | Error::ServerTerminated
