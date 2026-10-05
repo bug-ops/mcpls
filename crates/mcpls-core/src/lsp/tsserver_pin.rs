@@ -7,10 +7,14 @@
 //! from that choice. Resolution mirrors node's own lookup for the server's
 //! `typescript` dependency, starting from the server's package directory.
 //!
-//! Only symlink installs are covered (npm, nvm, bun, Homebrew with a global
-//! `typescript` peer). Windows `.cmd` shims and script launchers (pnpm,
-//! Volta, asdf/mise) stay unresolved and are reported with a warning, never
-//! with a startup failure.
+//! Covered installs: symlinked executables (npm, nvm, bun, Homebrew with a
+//! global `typescript` peer), npm `.cmd`/`.ps1`/extensionless shims next to
+//! `node_modules/typescript-language-server`, pnpm global installs, and
+//! `node` or `bun` running the server's absolute `cli.mjs`. Shims are never
+//! executed or parsed. Package runners (`npx`, `bunx`, `pnpm dlx`,
+//! `deno npm:`) and version-manager shims (Volta, asdf, mise) stay
+//! unresolved and are reported with a warning, never with a startup
+//! failure; `initialization_options.tsserver.path` pins them by hand.
 //!
 //! TypeScript 7 and later ship a native compiler service and no
 //! `lib/tsserver.js`, so there is nothing to pin. Detection of that case only
@@ -21,7 +25,7 @@
 //! TypeScript 7 install outside every workspace root ([`select_typescript_server`]).
 
 use std::borrow::Cow;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -31,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::WorkspaceRoots;
 use crate::config::{BuiltinServer, LspServerConfig};
 use crate::error::InitFailureHint;
+use crate::lsp::command_path::{find_executable, is_executable_file};
 use crate::lsp::{LspNotification, child_env_var};
 use crate::util::read_regular_file_bounded;
 
@@ -42,6 +47,13 @@ const TSSERVER_RELATIVE: &str = "node_modules/typescript/lib/tsserver.js";
 const NATIVE_TSC_NAME: &str = "tsc";
 const NATIVE_BIN_DIR: &str = "bin";
 const NATIVE_TSC_ARGS: [&str; 2] = ["--lsp", "--stdio"];
+const NPM_SPECIFIER_PREFIX: &str = "npm:";
+const SCRIPT_INTERPRETERS: [&str; 2] = ["node", "bun"];
+const PACKAGE_RUNNERS: [&str; 7] = ["npx", "bunx", "pnpx", "pnpm", "yarn", "npm", "deno"];
+const PNPM_GLOBAL_DIR: &str = "global";
+/// Most `global/<store version>` entries a pnpm install is searched through;
+/// more is treated as ambiguous.
+const MAX_PNPM_GLOBAL_ENTRIES: usize = 16;
 /// Upper bound for a `package.json` read from a directory that may be
 /// workspace-supplied.
 const MAX_MANIFEST_BYTES: NonZeroU64 = match NonZeroU64::new(64 * 1024) {
@@ -56,9 +68,12 @@ const TYPESCRIPT_VERSION_METHOD: &str = "$/typescriptVersion";
 pub enum UnresolvedReason {
     /// The server executable was not found on the child's effective `PATH`.
     ServerNotOnPath,
-    /// A Windows shim or script launcher, whose package directory is not
-    /// reachable through the executable.
+    /// A shim, wrapper or version-manager launcher whose package directory
+    /// is not reachable through the executable.
     UnsupportedLauncher,
+    /// A package runner (`npx`, `bunx`, `pnpm dlx`, `deno npm:`) that
+    /// resolves the server outside mcpls' reach.
+    PackageRunner,
     /// No valid `typescript` package (with a `package.json` `version`) is
     /// installed next to the server package.
     NoTypescriptNextToServer,
@@ -74,7 +89,13 @@ impl fmt::Display for UnresolvedReason {
                 f.write_str("typescript-language-server was not found on PATH")
             }
             Self::UnsupportedLauncher => f.write_str(
-                "typescript-language-server is started through an unsupported launcher or shim",
+                "typescript-language-server is started through an unsupported launcher or shim; \
+                 set `initialization_options.tsserver.path` to pin a tsserver",
+            ),
+            Self::PackageRunner => f.write_str(
+                "typescript-language-server is started through a package runner (npx, bunx, \
+                 pnpm dlx, deno npm:); install it globally or set \
+                 `initialization_options.tsserver.path` to pin a tsserver",
             ),
             Self::NoTypescriptNextToServer => f.write_str(
                 "no valid typescript package is installed next to typescript-language-server",
@@ -136,11 +157,66 @@ pub struct TypescriptVersionParams {
 }
 
 /// Whether `arg` names the server package or script, as in `npx
-/// typescript-language-server@5` or `node .../typescript-language-server/lib/cli.mjs`.
+/// typescript-language-server@5`, `deno run npm:typescript-language-server` or
+/// `node .../typescript-language-server/lib/cli.mjs`.
 fn mentions_server(arg: &str) -> bool {
+    let arg = arg.strip_prefix(NPM_SPECIFIER_PREFIX).unwrap_or(arg);
     Path::new(arg)
         .components()
         .any(|part| part.as_os_str().to_string_lossy().starts_with(SERVER_STEM))
+}
+
+fn command_stem_is(command: &str, names: &[&str]) -> bool {
+    Path::new(command)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|stem| names.iter().any(|name| stem.eq_ignore_ascii_case(name)))
+}
+
+/// How the configured command reaches typescript-language-server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launch<'a> {
+    /// The server executable itself: a symlink, an npm shim or a pnpm shim.
+    Server(&'a Path),
+    /// `node` or `bun` running the server's absolute script.
+    Script(&'a Path),
+    /// A package runner that fetches or resolves the server on its own.
+    PackageRunner,
+    /// Any other command that names the server in its arguments.
+    UnknownWrapper,
+}
+
+/// The launch kind of `config`, or `None` when it does not involve
+/// typescript-language-server.
+fn classify(config: &LspServerConfig) -> Option<Launch<'_>> {
+    if BuiltinServer::TypescriptLanguageServer.matches_command(&config.command) {
+        return Some(Launch::Server(Path::new(&config.command)));
+    }
+    if !config.args.iter().any(|arg| mentions_server(arg)) {
+        return None;
+    }
+    let script = command_stem_is(&config.command, &SCRIPT_INTERPRETERS)
+        .then(|| {
+            config
+                .args
+                .iter()
+                .map(Path::new)
+                .find(|arg| arg.is_absolute() && arg.to_str().is_some_and(mentions_server))
+        })
+        .flatten();
+    if let Some(script) = script {
+        return Some(Launch::Script(script));
+    }
+    let runner = command_stem_is(&config.command, &PACKAGE_RUNNERS)
+        || config
+            .args
+            .iter()
+            .any(|arg| arg.starts_with(NPM_SPECIFIER_PREFIX));
+    Some(if runner {
+        Launch::PackageRunner
+    } else {
+        Launch::UnknownWrapper
+    })
 }
 
 /// The `package.json` field typescript-language-server requires of a
@@ -229,31 +305,67 @@ fn nearest_native_typescript(start: &Path) -> Option<PathBuf> {
         .and_then(|(state, package)| (state == TypescriptState::Native).then_some(package))
 }
 
-fn is_windows_launcher(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| {
-        ["cmd", "bat", "ps1"]
-            .iter()
-            .any(|launcher| ext.eq_ignore_ascii_case(launcher))
-    })
-}
-
-fn find_executable(command: &Path, path_var: Option<&OsString>) -> Option<PathBuf> {
-    if command.components().count() > 1 {
-        return command.is_file().then(|| command.to_path_buf());
-    }
-    std::env::split_paths(path_var?)
-        .map(|dir| dir.join(command))
-        .find(|candidate| candidate.is_file())
-}
-
-fn package_dir_of(executable: &Path) -> Option<PathBuf> {
-    let real = dunce::canonicalize(executable).ok()?;
+/// The canonical server package directory containing (or equal to) `path`.
+fn package_dir_of(path: &Path) -> Option<PathBuf> {
+    let real = dunce::canonicalize(path).ok()?;
     real.ancestors()
         .find(|dir| {
             dir.file_name().is_some_and(|name| name == SERVER_STEM)
                 && dir.join("package.json").is_file()
         })
         .map(Path::to_path_buf)
+}
+
+/// How an installed server executable leads to its package directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallLayout {
+    /// The executable is a symlink into the package (npm, nvm, bun, Homebrew).
+    Symlink,
+    /// A shim in the directory that holds `node_modules` (npm on Windows).
+    NpmShim,
+    /// A shim in a pnpm home whose packages live under `global/<version>`.
+    PnpmGlobal,
+}
+
+impl InstallLayout {
+    const ALL: [Self; 3] = [Self::Symlink, Self::NpmShim, Self::PnpmGlobal];
+
+    fn locate(self, executable: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Symlink => package_dir_of(executable),
+            Self::NpmShim => package_dir_of(&server_in_modules(executable.parent()?)),
+            Self::PnpmGlobal => pnpm_global_package(&executable.parent()?.join(PNPM_GLOBAL_DIR)),
+        }
+    }
+}
+
+fn server_in_modules(dir: &Path) -> PathBuf {
+    dir.join(NODE_MODULES).join(SERVER_STEM)
+}
+
+/// The one server package under a pnpm `global` directory; more than
+/// [`MAX_PNPM_GLOBAL_ENTRIES`] entries, or more than one distinct match, is
+/// ambiguous and yields `None`.
+fn pnpm_global_package(global: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(global)
+        .ok()?
+        .take(MAX_PNPM_GLOBAL_ENTRIES + 1)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if entries.len() > MAX_PNPM_GLOBAL_ENTRIES {
+        return None;
+    }
+    let mut packages = entries
+        .iter()
+        .filter_map(|entry| package_dir_of(&server_in_modules(&entry.path())));
+    let package = packages.next()?;
+    packages.all(|other| other == package).then_some(package)
+}
+
+fn locate_package(executable: &Path) -> Option<PathBuf> {
+    InstallLayout::ALL
+        .into_iter()
+        .find_map(|layout| layout.locate(executable))
 }
 
 /// Node's lookup of the `typescript` dependency: `node_modules` of every
@@ -286,35 +398,33 @@ impl ResolvedServer {
     }
 }
 
+fn server_package_dir(
+    config: &LspServerConfig,
+    launch: Launch<'_>,
+    parent_env: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf, UnresolvedReason> {
+    let unsupported = UnresolvedReason::UnsupportedLauncher;
+    match launch {
+        Launch::PackageRunner => Err(UnresolvedReason::PackageRunner),
+        Launch::UnknownWrapper => Err(unsupported),
+        Launch::Script(script) => package_dir_of(script).ok_or(unsupported),
+        Launch::Server(command) => {
+            let path_var = child_env_var(config, "PATH", parent_env);
+            let executable = find_executable(command, path_var.as_ref())
+                .ok_or(UnresolvedReason::ServerNotOnPath)?;
+            locate_package(&executable).ok_or(unsupported)
+        }
+    }
+}
+
 fn inspect(
     config: &LspServerConfig,
     parent_env: impl Fn(&str) -> Option<OsString>,
 ) -> Option<ResolvedServer> {
-    if !BuiltinServer::TypescriptLanguageServer.matches_command(&config.command) {
-        return config
-            .args
-            .iter()
-            .any(|arg| mentions_server(arg))
-            .then_some(ResolvedServer::unresolved(
-                UnresolvedReason::UnsupportedLauncher,
-            ));
-    }
-    let command = Path::new(&config.command);
-    if is_windows_launcher(command) {
-        return Some(ResolvedServer::unresolved(
-            UnresolvedReason::UnsupportedLauncher,
-        ));
-    }
-    let path_var = child_env_var(config, "PATH", parent_env);
-    let Some(executable) = find_executable(command, path_var.as_ref()) else {
-        return Some(ResolvedServer::unresolved(
-            UnresolvedReason::ServerNotOnPath,
-        ));
-    };
-    let Some(package_dir) = package_dir_of(&executable) else {
-        return Some(ResolvedServer::unresolved(
-            UnresolvedReason::UnsupportedLauncher,
-        ));
+    let launch = classify(config)?;
+    let package_dir = match server_package_dir(config, launch, parent_env) {
+        Ok(dir) => dir,
+        Err(reason) => return Some(ResolvedServer::unresolved(reason)),
     };
     if let Some(tsserver) = bundled_tsserver(&package_dir) {
         return Some(ResolvedServer {
@@ -337,13 +447,13 @@ fn inspect(
 /// Resolves the tsserver `config`'s server would bundle, or `None` when
 /// `config` does not launch typescript-language-server.
 ///
-/// A launcher that only names the server in its arguments (`npx`, `bunx`,
-/// `node cli.mjs`, wrappers) is `UnsupportedLauncher`, never silently
-/// unrelated.
+/// A launcher that only names the server in its arguments is
+/// `PackageRunner` (`npx`, `bunx`, `deno npm:`), pinned through its absolute
+/// script (`node`, `bun`), or `UnsupportedLauncher` (wrappers); it is never
+/// silently unrelated.
 ///
 /// `PATH` is read as the child sees it: the config's `env` override, else
 /// `parent_env`.
-// TODO(#604): pin npx/bunx/node launchers, .cmd and script shims (pnpm, Volta, asdf/mise)
 pub fn resolve(
     config: &LspServerConfig,
     parent_env: impl Fn(&str) -> Option<OsString>,
@@ -402,18 +512,6 @@ fn native_package_of(canonical: &Path) -> Option<&Path> {
         && name_is(package, "typescript")
         && typescript_state(package) == TypescriptState::Native)
         .then_some(package)
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
 }
 
 impl NativeTsc {
@@ -484,7 +582,8 @@ pub enum TsserverKept {
     /// The native `tsc` is a `node` script and `node` is not on the effective
     /// `PATH`.
     NodeNotOnPath,
-    /// The server is started through a shim or script launcher.
+    /// The server is started through an unsupported shim, wrapper or package
+    /// runner.
     UnsupportedLauncher,
     /// Native selection is only implemented on Unix, where `bin/tsc` is
     /// directly executable.
@@ -563,9 +662,9 @@ pub fn select_typescript_server(
     let resolved = inspect(config, &parent_env)?;
     let candidate = match resolved.resolution {
         TsserverResolution::Pinned(_) => return kept(TsserverKept::TsserverPinned),
-        TsserverResolution::Unresolved(UnresolvedReason::UnsupportedLauncher) => {
-            return kept(TsserverKept::UnsupportedLauncher);
-        }
+        TsserverResolution::Unresolved(
+            UnresolvedReason::UnsupportedLauncher | UnresolvedReason::PackageRunner,
+        ) => return kept(TsserverKept::UnsupportedLauncher),
         TsserverResolution::Unresolved(UnresolvedReason::NativeTypescriptNextToServer) => resolved
             .native_package
             .map(|package| native_tsc_in(&package)),
@@ -651,7 +750,6 @@ pub fn with_selected_typescript_server<'a>(
 ///
 /// Only reads manifests and checks file existence; it runs on the failure
 /// path only.
-// TODO(#604): shim installs (the default on Windows) get no TypeScript 7 init-failure hint
 pub fn init_failure_hint(
     config: &LspServerConfig,
     effective_options: Option<&serde_json::Value>,
@@ -670,7 +768,9 @@ pub fn init_failure_hint(
         }
         TsserverResolution::Pinned(_)
         | TsserverResolution::Unresolved(
-            UnresolvedReason::ServerNotOnPath | UnresolvedReason::UnsupportedLauncher,
+            UnresolvedReason::ServerNotOnPath
+            | UnresolvedReason::UnsupportedLauncher
+            | UnresolvedReason::PackageRunner,
         ) => false,
     };
     native.then_some(InitFailureHint::NativeTypescriptOnly)
@@ -790,6 +890,370 @@ mod major_tests {
 }
 
 #[cfg(test)]
+mod launch_tests {
+    use std::fs;
+
+    use super::*;
+
+    struct Install {
+        _dir: tempfile::TempDir,
+        base: PathBuf,
+    }
+
+    fn write(path: &Path, body: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        write(path, body);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn typescript(dir: &Path, version: &str, with_tsserver: bool) -> PathBuf {
+        let package = dir.join("node_modules/typescript");
+        write(
+            &package.join("package.json"),
+            &format!(r#"{{"version": "{version}"}}"#),
+        );
+        let tsserver = package.join(TSSERVER_IN_PACKAGE);
+        if with_tsserver {
+            write(&tsserver, "");
+        }
+        tsserver
+    }
+
+    fn server_package(modules_parent: &Path) {
+        let package = modules_parent.join("node_modules").join(SERVER_STEM);
+        write(&package.join("package.json"), "{}");
+        write(&package.join("lib/cli.mjs"), "");
+    }
+
+    fn install() -> Install {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        Install { _dir: dir, base }
+    }
+
+    fn config(command: &str, args: &[&str]) -> LspServerConfig {
+        let mut config = LspServerConfig::typescript();
+        config.command = command.to_string();
+        config.args = args.iter().map(ToString::to_string).collect();
+        config
+    }
+
+    fn env_with_path(dir: &Path) -> impl Fn(&str) -> Option<OsString> {
+        let path = std::env::join_paths([dir]).unwrap();
+        move |key| (key == "PATH").then(|| path.clone())
+    }
+
+    fn npm_shim_install(shim: &str, version: &str, with_tsserver: bool) -> (Install, PathBuf) {
+        let install = install();
+        let npm = install.base.join("npm");
+        write_executable(&npm.join(shim), "");
+        server_package(&npm);
+        let tsserver = typescript(&npm, version, with_tsserver);
+        (install, tsserver)
+    }
+
+    fn pnpm_home(install: &Install) -> PathBuf {
+        let home = install.base.join("pnpm");
+        write_executable(&home.join(SERVER_STEM), "");
+        home
+    }
+
+    const fn unsupported() -> TsserverResolution {
+        TsserverResolution::Unresolved(UnresolvedReason::UnsupportedLauncher)
+    }
+
+    #[test]
+    fn test_classify_covers_every_launch_kind() {
+        let cli = if cfg!(windows) {
+            "C:\\lib\\typescript-language-server\\lib\\cli.mjs"
+        } else {
+            "/lib/typescript-language-server/lib/cli.mjs"
+        };
+        let cases = [
+            (config(SERVER_STEM, &["--stdio"]), "server"),
+            (config("node", &[cli, "--stdio"]), "script"),
+            (config("bun", &[cli]), "script"),
+            (config("npx", &[SERVER_STEM, "--stdio"]), "runner"),
+            (config("bunx", &[SERVER_STEM]), "runner"),
+            (config("pnpm", &["dlx", SERVER_STEM]), "runner"),
+            (config("yarn", &["dlx", SERVER_STEM]), "runner"),
+            (
+                config("deno", &["run", "npm:typescript-language-server"]),
+                "runner",
+            ),
+            (
+                config("node", &["lib/typescript-language-server/cli.mjs"]),
+                "wrapper",
+            ),
+            (config("my-wrapper", &[SERVER_STEM]), "wrapper"),
+        ];
+        for (config, expected) in &cases {
+            let actual = match classify(config) {
+                Some(Launch::Server(_)) => "server",
+                Some(Launch::Script(_)) => "script",
+                Some(Launch::PackageRunner) => "runner",
+                Some(Launch::UnknownWrapper) => "wrapper",
+                None => "none",
+            };
+            assert_eq!(actual, *expected, "{} {:?}", config.command, config.args);
+        }
+        assert_eq!(classify(&config("pyright-langserver", &["--stdio"])), None);
+        assert_eq!(classify(&config("deno", &["run", "main.ts"])), None);
+    }
+
+    #[test]
+    fn test_npm_shims_are_pinned() {
+        for shim in [
+            "typescript-language-server.cmd",
+            "typescript-language-server.ps1",
+            SERVER_STEM,
+        ] {
+            let (install, tsserver) = npm_shim_install(shim, "5.4.0", true);
+            let resolved = resolve(&config(shim, &[]), env_with_path(&install.base.join("npm")));
+            assert_eq!(
+                resolved,
+                Some(TsserverResolution::Pinned(tsserver)),
+                "{shim}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shim_without_server_package_is_unsupported() {
+        let install = install();
+        let npm = install.base.join("npm");
+        write_executable(&npm.join("typescript-language-server.cmd"), "");
+        let resolved = resolve(
+            &config("typescript-language-server.cmd", &[]),
+            env_with_path(&npm),
+        );
+        assert_eq!(resolved, Some(unsupported()));
+    }
+
+    #[test]
+    fn test_pnpm_global_install_is_pinned() {
+        let install = install();
+        let home = pnpm_home(&install);
+        let store = home.join("global/5");
+        server_package(&store);
+        let tsserver = typescript(&store, "5.4.0", true);
+        let resolved = resolve(&config(SERVER_STEM, &[]), env_with_path(&home));
+        assert_eq!(resolved, Some(TsserverResolution::Pinned(tsserver)));
+    }
+
+    #[test]
+    fn test_pnpm_global_with_two_server_packages_is_ambiguous() {
+        let install = install();
+        let home = pnpm_home(&install);
+        for version in ["4", "5"] {
+            let store = home.join("global").join(version);
+            server_package(&store);
+            typescript(&store, "5.4.0", true);
+        }
+        let resolved = resolve(&config(SERVER_STEM, &[]), env_with_path(&home));
+        assert_eq!(resolved, Some(unsupported()));
+    }
+
+    #[test]
+    fn test_pnpm_global_with_too_many_entries_is_ambiguous() {
+        let install = install();
+        let home = pnpm_home(&install);
+        let store = home.join("global/0");
+        server_package(&store);
+        typescript(&store, "5.4.0", true);
+        for index in 1..=MAX_PNPM_GLOBAL_ENTRIES {
+            fs::create_dir_all(home.join("global").join(format!("extra{index}"))).unwrap();
+        }
+        let resolved = resolve(&config(SERVER_STEM, &[]), env_with_path(&home));
+        assert_eq!(resolved, Some(unsupported()));
+    }
+
+    #[test]
+    fn test_pnpm_global_with_exactly_the_entry_cap_is_still_pinned() {
+        let install = install();
+        let home = pnpm_home(&install);
+        let store = home.join("global/0");
+        server_package(&store);
+        let tsserver = typescript(&store, "5.4.0", true);
+        for index in 1..MAX_PNPM_GLOBAL_ENTRIES {
+            fs::create_dir_all(home.join("global").join(format!("extra{index}"))).unwrap();
+        }
+        let resolved = resolve(&config(SERVER_STEM, &[]), env_with_path(&home));
+        assert_eq!(resolved, Some(TsserverResolution::Pinned(tsserver)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shims_are_never_executed() {
+        let install = install();
+        let npm = install.base.join("npm");
+        let marker = install.base.join("shim-ran");
+        for shim in [SERVER_STEM, "typescript-language-server.cmd"] {
+            write_executable(
+                &npm.join(shim),
+                &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+            );
+        }
+        server_package(&npm);
+        typescript(&npm, "5.4.0", true);
+        let home = pnpm_home(&install);
+        write_executable(
+            &home.join(SERVER_STEM),
+            &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        );
+
+        for dir in [&npm, &home] {
+            resolve(&config(SERVER_STEM, &[]), env_with_path(dir));
+            resolve(
+                &config("typescript-language-server.cmd", &[]),
+                env_with_path(dir),
+            );
+            init_failure_hint(&config(SERVER_STEM, &[]), None, &[], env_with_path(dir));
+            pinned_initialization_options(
+                &config(SERVER_STEM, &[]),
+                &WorkspaceRoots::default(),
+                env_with_path(dir),
+            );
+        }
+
+        assert!(!marker.exists(), "a shim was executed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_non_executable_server_on_path_does_not_steer_the_pin() {
+        let install = install();
+        let decoy = install.base.join("decoy");
+        write(&decoy.join(SERVER_STEM), "");
+        server_package(&decoy);
+        let decoy_tsserver = typescript(&decoy, "5.4.0", true);
+        let real = install.base.join("real");
+        write_executable(&real.join(SERVER_STEM), "");
+        server_package(&real);
+        let real_tsserver = typescript(&real, "5.4.0", true);
+        let path = std::env::join_paths([&decoy, &real]).unwrap();
+
+        let resolved = resolve(&config(SERVER_STEM, &[]), |key| {
+            (key == "PATH").then(|| path.clone())
+        });
+
+        assert_eq!(resolved, Some(TsserverResolution::Pinned(real_tsserver)));
+        assert_ne!(resolved, Some(TsserverResolution::Pinned(decoy_tsserver)));
+    }
+
+    #[test]
+    fn test_absolute_node_script_is_pinned() {
+        let install = install();
+        let npm = install.base.join("npm");
+        server_package(&npm);
+        let tsserver = typescript(&npm, "5.4.0", true);
+        let cli = npm
+            .join("node_modules")
+            .join(SERVER_STEM)
+            .join("lib/cli.mjs");
+        for interpreter in ["node", "bun"] {
+            let config = config(interpreter, &[cli.to_str().unwrap(), "--stdio"]);
+            assert_eq!(
+                resolve(&config, |_| None),
+                Some(TsserverResolution::Pinned(tsserver.clone())),
+                "{interpreter}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_package_runner_warning_names_user_tsserver_path() {
+        for config in [
+            config("npx", &[SERVER_STEM, "--stdio"]),
+            config("deno", &["run", "npm:typescript-language-server"]),
+        ] {
+            assert_eq!(
+                resolve(&config, |_| None),
+                Some(TsserverResolution::Unresolved(
+                    UnresolvedReason::PackageRunner
+                ))
+            );
+        }
+        for reason in [
+            UnresolvedReason::PackageRunner,
+            UnresolvedReason::UnsupportedLauncher,
+        ] {
+            assert!(
+                reason
+                    .to_string()
+                    .contains("initialization_options.tsserver.path")
+            );
+        }
+    }
+
+    #[test]
+    fn test_init_failure_hint_covers_shim_install_with_typescript_seven() {
+        let (install, _) = npm_shim_install(SERVER_STEM, "7.0.1", false);
+        let hint = init_failure_hint(
+            &config(SERVER_STEM, &[]),
+            None,
+            &[],
+            env_with_path(&install.base.join("npm")),
+        );
+        assert_eq!(hint, Some(InitFailureHint::NativeTypescriptOnly));
+    }
+
+    #[test]
+    fn test_package_runner_gets_no_init_failure_hint() {
+        let hint = init_failure_hint(&config("npx", &[SERVER_STEM]), None, &[], |_| None);
+        assert_eq!(hint, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_selection_auto_picks_native_for_pnpm_shim_with_typescript_seven() {
+        use std::assert_matches;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let install = install();
+        let home = pnpm_home(&install);
+        let store = home.join("global/5");
+        server_package(&store);
+        typescript(&store, "7.0.1", false);
+        let tsc = store.join("node_modules/typescript/bin/tsc");
+        write(&tsc, "#!/bin/sh\n");
+        fs::set_permissions(&tsc, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut auto = config(SERVER_STEM, &[]);
+        auto.selection = crate::config::ServerSelection::Auto;
+        let choice =
+            select_typescript_server(&auto, &WorkspaceRoots::default(), env_with_path(&home));
+        assert_matches!(choice, Some(TypescriptServerChoice::Native(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pnpm_store_symlink_resolves_sibling_typescript() {
+        let install = install();
+        let home = pnpm_home(&install);
+        let store = home.join("global/5/node_modules/.pnpm/typescript-language-server@5.1.3");
+        server_package(&store);
+        let tsserver = typescript(&store, "5.4.0", true);
+        let global_modules = home.join("global/5/node_modules");
+        std::os::unix::fs::symlink(
+            store.join("node_modules").join(SERVER_STEM),
+            global_modules.join(SERVER_STEM),
+        )
+        .unwrap();
+        let resolved = resolve(&config(SERVER_STEM, &[]), env_with_path(&home));
+        assert_eq!(resolved, Some(TsserverResolution::Pinned(tsserver)));
+    }
+}
+
+#[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use std::{assert_matches, fs};
@@ -814,6 +1278,11 @@ mod tests {
         fs::create_dir_all(package.join("lib")).unwrap();
         fs::write(package.join("package.json"), "{}").unwrap();
         fs::write(package.join("lib/cli.mjs"), "").unwrap();
+        fs::set_permissions(
+            package.join("lib/cli.mjs"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         let tsserver = modules.join("typescript/lib/tsserver.js");
         if with_typescript {
             fs::create_dir_all(tsserver.parent().unwrap()).unwrap();
@@ -921,6 +1390,11 @@ mod tests {
         let shim_dir = layout.base.join("shims");
         fs::create_dir_all(&shim_dir).unwrap();
         fs::write(shim_dir.join(SERVER_STEM), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            shim_dir.join(SERVER_STEM),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         let resolved = resolve(&config(SERVER_STEM), env_with_path(&shim_dir));
         assert_eq!(
             resolved,
@@ -931,12 +1405,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_cmd_shim_is_unsupported() {
+    fn test_resolve_cmd_shim_not_on_path() {
         let resolved = resolve(&config("typescript-language-server.cmd"), |_| None);
         assert_eq!(
             resolved,
             Some(TsserverResolution::Unresolved(
-                UnresolvedReason::UnsupportedLauncher
+                UnresolvedReason::ServerNotOnPath
             ))
         );
     }
@@ -978,21 +1452,28 @@ mod tests {
 
     #[test]
     fn test_resolve_flags_launchers_naming_server_in_args() {
-        for (command, args) in [
-            ("npx", vec!["typescript-language-server", "--stdio"]),
-            ("bunx", vec!["typescript-language-server@5.1.3", "--stdio"]),
+        for (command, args, reason) in [
+            (
+                "npx",
+                vec!["typescript-language-server", "--stdio"],
+                UnresolvedReason::PackageRunner,
+            ),
+            (
+                "bunx",
+                vec!["typescript-language-server@5.1.3", "--stdio"],
+                UnresolvedReason::PackageRunner,
+            ),
             (
                 "node",
                 vec!["/opt/lib/node_modules/typescript-language-server/lib/cli.mjs"],
+                UnresolvedReason::UnsupportedLauncher,
             ),
         ] {
             let mut config = config(command);
             config.args = args.into_iter().map(String::from).collect();
             assert_eq!(
                 resolve(&config, |_| None),
-                Some(TsserverResolution::Unresolved(
-                    UnresolvedReason::UnsupportedLauncher
-                )),
+                Some(TsserverResolution::Unresolved(reason)),
                 "{command}"
             );
         }
@@ -1601,6 +2082,9 @@ mod tests {
     #[test]
     fn test_cmd_shim_launcher_keeps_tsserver() {
         let layout = global_install(false);
+        let cmd = layout.bin.join("typescript-language-server.cmd");
+        fs::write(&cmd, "").unwrap();
+        fs::set_permissions(&cmd, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         assert_eq!(
             select(
                 &layout,
