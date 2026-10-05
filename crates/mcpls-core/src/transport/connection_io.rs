@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
-use super::{HeaderReadTimeout, WriteStallTimeout};
+use super::config::{HeaderReadTimeout, WriteStallTimeout};
 
 /// Longest the lingering close waits for the next byte or the EOF.
 const LINGER_READ_IDLE: Duration = Duration::from_secs(2);
