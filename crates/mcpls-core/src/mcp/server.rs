@@ -48,8 +48,9 @@ use crate::bridge::{
     FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult, IndexingState,
     InlayHintsResult, LocationsResult, NotificationCache, OutgoingCallsResult, Position,
     PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
-    RestartServerResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SymbolTarget,
-    Translator, TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
+    RestartServerResult, SelectionRangesResult, ServerLogsResult, ServerMessagesResult,
+    SignatureHelpResult, SymbolTarget, Translator, TypeHierarchyResult, WorkspaceRoots,
+    WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -1083,6 +1084,28 @@ impl McplsServer {
             self.context
                 .translator
                 .handle_document_highlights(file_path, parse_position(line, character)?)
+                .await,
+        )
+    }
+
+    /// Get the chain of ranges enclosing a position.
+    #[tool(
+        description = concat!("Ranges enclosing a position, innermost first (identifier, expression, statement, block), as the server reports them; their values can be passed to get_code_actions or format_range. Capped at a fixed maximum; `truncated: true` means the outermost were dropped. Empty is valid. ", positions_note_request!()),
+        title = "Selection Ranges"
+    )]
+    async fn get_selection_ranges(
+        &self,
+        Parameters(PositionParams {
+            file_path,
+            line,
+            character,
+        }): Parameters<PositionParams>,
+    ) -> Result<Json<SelectionRangesResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
+        self.structured_result(
+            self.context
+                .translator
+                .handle_selection_range(file_path, parse_position(line, character)?)
                 .await,
         )
     }
@@ -4854,6 +4877,7 @@ sleep 0.3
             ("prepare_rename", true, false, true),
             ("get_document_highlights", true, false, true),
             ("format_range", true, false, true),
+            ("get_selection_ranges", true, false, true),
             ("get_cached_diagnostics", true, false, true),
             ("get_server_logs", true, false, true),
             ("get_server_messages", true, false, true),
@@ -6303,6 +6327,10 @@ sleep 0.3
                 .get_document_highlights(Parameters(position()))
                 .await
                 .map(|_| ()),
+            McpTool::GetSelectionRanges => server
+                .get_selection_ranges(Parameters(position()))
+                .await
+                .map(|_| ()),
             McpTool::FormatRange => server
                 .format_range(Parameters(FormatRangeParams {
                     file_path: PathBuf::from(file_path.clone()),
@@ -6469,7 +6497,7 @@ sleep 0.3
         let report = report_json(&fixture.server, None).await;
 
         assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
-        assert_eq!(report["tools"].as_array().unwrap().len(), 29);
+        assert_eq!(report["tools"].as_array().unwrap().len(), 30);
 
         let hover = tool_entry(&report, "get_hover");
         assert_eq!(hover["coverage"], "some");

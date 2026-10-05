@@ -46,6 +46,7 @@ mod prepare_range_tests;
 mod respawn;
 mod restart;
 mod routing;
+mod selection_range;
 mod servers;
 mod support;
 mod symbols;

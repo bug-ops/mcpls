@@ -3336,6 +3336,122 @@
     }
   },
   {
+    "name": "get_selection_ranges",
+    "title": "Selection Ranges",
+    "description": "Ranges enclosing a position, innermost first (identifier, expression, statement, block), as the server reports them; their values can be passed to get_code_actions or format_range. Capped at a fixed maximum; `truncated: true` means the outermost were dropped. Empty is valid. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "character": {
+          "description": "Character/column number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_path": {
+          "description": "Absolute path to the file.",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "PositionDegradation": {
+          "description": "How a non-UTF-16 server's `character` offsets became inexact in a result.",
+          "oneOf": [
+            {
+              "const": "response",
+              "type": "string"
+            },
+            {
+              "const": "request",
+              "type": "string"
+            }
+          ]
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "positions_degraded": {
+          "$ref": "#/$defs/PositionDegradation",
+          "description": "Set only when the queried position or some returned `character`\noffsets are inexact (non-UTF-16"
+        },
+        "ranges": {
+          "description": "Ranges enclosing the position, innermost first, as the server reported\nthem (not merged, reordered",
+          "items": {
+            "$ref": "#/$defs/Range"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "description": "Whether the chain was longer than `MAX_SELECTION_CHAIN` and the\noutermost ranges were dropped.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ranges"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Selection Ranges",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
     "name": "get_server_logs",
     "title": "Server Logs",
     "description": "Recent server log messages. Filter by level (error, warning, info, debug) for debugging.",

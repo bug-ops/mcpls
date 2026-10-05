@@ -1169,6 +1169,41 @@ pub struct DocumentHighlightEntry {
     pub kind: DocumentHighlightKind,
 }
 
+/// Most ranges one selection chain returns; a longer chain is cut to its
+/// innermost ranges.
+pub const MAX_SELECTION_CHAIN: usize = 32;
+
+/// Result of a selection range request: the ranges enclosing a position.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{MAX_SELECTION_CHAIN, SelectionRangesResult};
+///
+/// let result: SelectionRangesResult = serde_json::from_value(serde_json::json!({
+///     "ranges": [],
+/// }))?;
+/// assert!(result.ranges.is_empty() && !result.truncated);
+/// assert_eq!(MAX_SELECTION_CHAIN, 32);
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SelectionRangesResult {
+    /// Ranges enclosing the position, innermost first, as the server reported
+    /// them (not merged, reordered or added).
+    pub ranges: Vec<Range>,
+    /// Whether the chain was longer than `MAX_SELECTION_CHAIN` and the
+    /// outermost ranges were dropped. Omitted when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Set only when the queried position or some returned `character`
+    /// offsets are inexact (non-UTF-16 servers only); omitted when all are
+    /// exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
+    pub positions_degraded: Option<PositionDegradation>,
+}
+
 /// Result of a document highlights request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentHighlightsResult {
@@ -1646,6 +1681,16 @@ impl ServerText for DocumentHighlightsResult {
     fn redact_server_text(&mut self, _redactions: &Redactions) {
         let Self {
             highlights: _,
+            truncated: _,
+            positions_degraded: _,
+        } = self;
+    }
+}
+
+impl ServerText for SelectionRangesResult {
+    fn redact_server_text(&mut self, _redactions: &Redactions) {
+        let Self {
+            ranges: _,
             truncated: _,
             positions_degraded: _,
         } = self;

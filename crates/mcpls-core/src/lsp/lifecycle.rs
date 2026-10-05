@@ -619,6 +619,9 @@ impl LspServer {
                     ),
                     ..Default::default()
                 }),
+                selection_range: Some(lsp_types::SelectionRangeClientCapabilities {
+                    dynamic_registration: Some(false),
+                }),
                 code_action: Some(lsp_types::CodeActionClientCapabilities {
                     dynamic_registration: Some(false),
                     data_support: Some(true),
@@ -1247,6 +1250,16 @@ mod tests {
             rename.prepare_support_default_behavior,
             Some(lsp_types::PrepareSupportDefaultBehavior::Identifier)
         );
+    }
+
+    #[test]
+    fn test_client_capabilities_advertises_selection_range() {
+        let capabilities = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
+            .text_document
+            .and_then(|t| t.selection_range)
+            .unwrap();
+
+        assert_eq!(capabilities.dynamic_registration, Some(false));
     }
 
     #[test]

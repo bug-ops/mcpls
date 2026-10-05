@@ -56,6 +56,7 @@ pub(super) enum McpTool {
     PrepareRename,
     GetDocumentHighlights,
     FormatRange,
+    GetSelectionRanges,
     GetCachedDiagnostics,
     GetServerLogs,
     GetServerMessages,
@@ -70,7 +71,7 @@ pub(super) enum McpTool {
 
 impl McpTool {
     /// Every tool, in registration order.
-    pub(super) const ALL: [Self; 29] = [
+    pub(super) const ALL: [Self; 30] = [
         Self::GetHover,
         Self::GetDefinition,
         Self::GetReferences,
@@ -90,6 +91,7 @@ impl McpTool {
         Self::PrepareRename,
         Self::GetDocumentHighlights,
         Self::FormatRange,
+        Self::GetSelectionRanges,
         Self::GetCachedDiagnostics,
         Self::GetServerLogs,
         Self::GetServerMessages,
@@ -155,6 +157,9 @@ impl McpTool {
                 Document(ToolKind::DocumentHighlights),
             ),
             Self::FormatRange => ("format_range", Document(ToolKind::FormatRange)),
+            Self::GetSelectionRanges => {
+                ("get_selection_ranges", Document(ToolKind::SelectionRange))
+            }
             Self::GetCachedDiagnostics => ("get_cached_diagnostics", Local),
             Self::GetServerLogs => ("get_server_logs", Local),
             Self::GetServerMessages => ("get_server_messages", Local),

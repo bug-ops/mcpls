@@ -149,6 +149,8 @@ pub enum Capability {
     DocumentHighlights,
     /// `documentRangeFormattingProvider` (`textDocument/rangeFormatting`).
     FormatRange,
+    /// `selectionRangeProvider` (`textDocument/selectionRange`).
+    SelectionRange,
 }
 
 #[expect(
@@ -156,7 +158,7 @@ pub enum Capability {
     reason = "compile-time check; the loop condition keeps `i` below `ALL.len()`"
 )]
 const _: () = {
-    assert!(Capability::ALL.len() == Capability::FormatRange as usize + 1);
+    assert!(Capability::ALL.len() == Capability::SelectionRange as usize + 1);
     assert!(Capability::ALL.len() <= u32::BITS as usize);
     let mut i = 0;
     while i < Capability::ALL.len() {
@@ -167,7 +169,7 @@ const _: () = {
 
 impl Capability {
     /// Every capability, in discriminant order.
-    pub(crate) const ALL: [Self; 19] = [
+    pub(crate) const ALL: [Self; 20] = [
         Self::Completions,
         Self::SignatureHelp,
         Self::InlayHints,
@@ -187,6 +189,7 @@ impl Capability {
         Self::PrepareRename,
         Self::DocumentHighlights,
         Self::FormatRange,
+        Self::SelectionRange,
     ];
 
     /// The [`ToolKind`] whose route this capability gates -- the single
@@ -211,6 +214,7 @@ impl Capability {
             Self::TypeHierarchy => ToolKind::TypeHierarchy,
             Self::DocumentHighlights => ToolKind::DocumentHighlights,
             Self::FormatRange => ToolKind::FormatRange,
+            Self::SelectionRange => ToolKind::SelectionRange,
         }
     }
 
@@ -277,6 +281,7 @@ impl Capability {
             Self::PrepareRename => "renameProvider.prepareProvider",
             Self::DocumentHighlights => "documentHighlightProvider",
             Self::FormatRange => "documentRangeFormattingProvider",
+            Self::SelectionRange => "selectionRangeProvider",
         }
     }
 
@@ -411,6 +416,14 @@ impl Capability {
                 Some(
                     lsp_types::DocumentRangeFormattingProvider::Bool(true)
                         | lsp_types::DocumentRangeFormattingProvider::DocumentRangeFormattingOptions(_)
+                )
+            ),
+            Self::SelectionRange => matches!(
+                caps.selection_range_provider,
+                Some(
+                    lsp_types::SelectionRangeProvider::Bool(true)
+                        | lsp_types::SelectionRangeProvider::SelectionRangeOptions(_)
+                        | lsp_types::SelectionRangeProvider::SelectionRangeRegistrationOptions(_)
                 )
             ),
         }
@@ -3513,6 +3526,41 @@ mod tests {
         assert!(
             result.is_ok(),
             "fake server answered, expected Ok: {result:?}"
+        );
+    }
+
+    /// `forms` are the provider forms that advertise the capability.
+    fn assert_gates_on_provider_forms<P>(
+        supported: impl Fn(Option<P>) -> bool,
+        forms: impl IntoIterator<Item = P>,
+        disabled: P,
+    ) {
+        for form in forms {
+            assert!(supported(Some(form)));
+        }
+        assert!(!supported(Some(disabled)));
+        assert!(!supported(None));
+    }
+
+    #[test]
+    fn selection_range_capability_gates_on_every_provider_form() {
+        use lsp_types::SelectionRangeProvider as Provider;
+
+        assert_gates_on_provider_forms(
+            |provider| {
+                Capability::SelectionRange.is_supported(&lsp_types::ServerCapabilities {
+                    selection_range_provider: provider,
+                    ..Default::default()
+                })
+            },
+            [
+                Provider::Bool(true),
+                Provider::SelectionRangeOptions(lsp_types::SelectionRangeOptions::default()),
+                Provider::SelectionRangeRegistrationOptions(
+                    lsp_types::SelectionRangeRegistrationOptions::default(),
+                ),
+            ],
+            Provider::Bool(false),
         );
     }
 }

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `get_selection_ranges` tool (`textDocument/selectionRange`) and the `selection_range` `handles` value; chains are capped at 32 ranges. (#PR)
 - HTTP sessions now receive `resources/updated` on their GET stream for the resources they subscribed to. (#525)
 - `get_tool_support` tool reporting which tools are usable for which languages, per configured server capabilities. (#540)
 - Default server `instructions` now point to `get_tool_support`; `ToolRouter` is `Clone` and gains `configured_languages()`. (#540)

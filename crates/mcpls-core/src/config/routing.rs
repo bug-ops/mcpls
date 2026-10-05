@@ -87,7 +87,7 @@ impl From<&str> for ServerId {
 /// use mcpls_core::config::ToolKind;
 ///
 /// assert_eq!(ToolKind::Hover.as_str(), "hover");
-/// assert_eq!(ToolKind::ALL.len(), 19);
+/// assert_eq!(ToolKind::ALL.len(), 20);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +131,8 @@ pub enum ToolKind {
     DocumentHighlights,
     /// `textDocument/rangeFormatting`.
     FormatRange,
+    /// `textDocument/selectionRange`.
+    SelectionRange,
 }
 
 impl ToolKind {
@@ -156,6 +158,7 @@ impl ToolKind {
         Self::TypeHierarchy,
         Self::DocumentHighlights,
         Self::FormatRange,
+        Self::SelectionRange,
     ];
 
     /// The `snake_case` name used in config `handles` lists and error messages.
@@ -181,6 +184,7 @@ impl ToolKind {
             Self::TypeHierarchy => "type_hierarchy",
             Self::DocumentHighlights => "document_highlights",
             Self::FormatRange => "format_range",
+            Self::SelectionRange => "selection_range",
         }
     }
 }
@@ -964,7 +968,7 @@ mod tests {
     fn test_tool_kind_as_str_and_all_len() {
         assert_eq!(ToolKind::Hover.as_str(), "hover");
         assert_eq!(ToolKind::CallHierarchy.as_str(), "call_hierarchy");
-        assert_eq!(ToolKind::ALL.len(), 19);
+        assert_eq!(ToolKind::ALL.len(), 20);
 
         // `ALL` is a slice now, so nothing pins its element count at compile
         // time the way `[Self; 15]` used to -- guard against duplicate or
