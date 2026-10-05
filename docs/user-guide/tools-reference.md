@@ -136,6 +136,7 @@ array, `selectionRange` on call hierarchy items (so they round-trip into `get_in
 | [format_document](#format_document) | `textDocument/formatting` | Document formatting |
 | [format_range](#format_range) | `textDocument/rangeFormatting` | Formatting of a range |
 | [get_selection_ranges](#get_selection_ranges) | `textDocument/selectionRange` | Ranges enclosing a position, innermost first |
+| [get_folding_ranges](#get_folding_ranges) | `textDocument/foldingRange` | Foldable regions of a file |
 
 ### Refactoring Tools
 
@@ -1461,6 +1462,47 @@ Same as `get_hover`: `file_path`, `line`, `character`.
 - One position per call; the request does not wait for indexing
 - A response nested more than about 125 levels fails only this call, not the server connection
 - Requires `selectionRangeProvider`; routed by the `selection_range` `handles` value
+
+---
+
+## get_folding_ranges
+
+Get the foldable regions of a file (blocks, functions, import groups, comment blocks, marked regions): a cheap structural overview without names or bodies.
+
+### Parameters
+
+```json
+{
+  "file_path": "/absolute/path/to/file.rs",
+  "kind": "imports"
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | Yes | Absolute path to the file |
+| `kind` | string | No | `all` (default), `comment`, `imports` or `region`; regions without a kind or with a server-defined one are returned only by `all` |
+
+### Returns
+
+```json
+{
+  "regions": [
+    { "start_line": 1, "end_line": 4, "kind": "imports" },
+    { "start_line": 6, "end_line": 20, "start_character": 12, "kind": "unspecified", "collapsed_text": "{...}" }
+  ]
+}
+```
+
+`kind` is `comment`, `imports`, `region` or `unspecified`. Lines are 1-based; `start_character` and `end_character` appear only when the server sends them (an absent one means the end of that line). `truncated` (omitted when `false`) is `true` when more than 10,000 matching regions exist. `positions_degraded` is set on non-UTF-16 servers when a returned offset is inexact.
+
+### Notes
+
+- Regions are ordered by start line, then longest first, whatever order the server used; regions that end before they start are dropped
+- The kind filter applies before the cap
+- `collapsed_text` is escaped, has configured secrets redacted, and is cut to 256 bytes
+- The request does not wait for indexing
+- Requires `foldingRangeProvider`; routed by the `folding_range` `handles` value
 
 ---
 

@@ -151,6 +151,8 @@ pub enum Capability {
     FormatRange,
     /// `selectionRangeProvider` (`textDocument/selectionRange`).
     SelectionRange,
+    /// `foldingRangeProvider` (`textDocument/foldingRange`).
+    FoldingRange,
 }
 
 #[expect(
@@ -158,7 +160,7 @@ pub enum Capability {
     reason = "compile-time check; the loop condition keeps `i` below `ALL.len()`"
 )]
 const _: () = {
-    assert!(Capability::ALL.len() == Capability::SelectionRange as usize + 1);
+    assert!(Capability::ALL.len() == Capability::FoldingRange as usize + 1);
     assert!(Capability::ALL.len() <= u32::BITS as usize);
     let mut i = 0;
     while i < Capability::ALL.len() {
@@ -169,7 +171,7 @@ const _: () = {
 
 impl Capability {
     /// Every capability, in discriminant order.
-    pub(crate) const ALL: [Self; 20] = [
+    pub(crate) const ALL: [Self; 21] = [
         Self::Completions,
         Self::SignatureHelp,
         Self::InlayHints,
@@ -190,6 +192,7 @@ impl Capability {
         Self::DocumentHighlights,
         Self::FormatRange,
         Self::SelectionRange,
+        Self::FoldingRange,
     ];
 
     /// The [`ToolKind`] whose route this capability gates -- the single
@@ -215,6 +218,7 @@ impl Capability {
             Self::DocumentHighlights => ToolKind::DocumentHighlights,
             Self::FormatRange => ToolKind::FormatRange,
             Self::SelectionRange => ToolKind::SelectionRange,
+            Self::FoldingRange => ToolKind::FoldingRange,
         }
     }
 
@@ -282,6 +286,7 @@ impl Capability {
             Self::DocumentHighlights => "documentHighlightProvider",
             Self::FormatRange => "documentRangeFormattingProvider",
             Self::SelectionRange => "selectionRangeProvider",
+            Self::FoldingRange => "foldingRangeProvider",
         }
     }
 
@@ -424,6 +429,14 @@ impl Capability {
                     lsp_types::SelectionRangeProvider::Bool(true)
                         | lsp_types::SelectionRangeProvider::SelectionRangeOptions(_)
                         | lsp_types::SelectionRangeProvider::SelectionRangeRegistrationOptions(_)
+                )
+            ),
+            Self::FoldingRange => matches!(
+                caps.folding_range_provider,
+                Some(
+                    lsp_types::FoldingRangeProvider::Bool(true)
+                        | lsp_types::FoldingRangeProvider::FoldingRangeOptions(_)
+                        | lsp_types::FoldingRangeProvider::FoldingRangeRegistrationOptions(_)
                 )
             ),
         }
@@ -3558,6 +3571,28 @@ mod tests {
                 Provider::SelectionRangeOptions(lsp_types::SelectionRangeOptions::default()),
                 Provider::SelectionRangeRegistrationOptions(
                     lsp_types::SelectionRangeRegistrationOptions::default(),
+                ),
+            ],
+            Provider::Bool(false),
+        );
+    }
+
+    #[test]
+    fn folding_range_capability_gates_on_every_provider_form() {
+        use lsp_types::FoldingRangeProvider as Provider;
+
+        assert_gates_on_provider_forms(
+            |provider| {
+                Capability::FoldingRange.is_supported(&lsp_types::ServerCapabilities {
+                    folding_range_provider: provider,
+                    ..Default::default()
+                })
+            },
+            [
+                Provider::Bool(true),
+                Provider::FoldingRangeOptions(lsp_types::FoldingRangeOptions::default()),
+                Provider::FoldingRangeRegistrationOptions(
+                    lsp_types::FoldingRangeRegistrationOptions::default(),
                 ),
             ],
             Provider::Bool(false),

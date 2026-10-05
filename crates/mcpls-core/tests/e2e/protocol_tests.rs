@@ -169,7 +169,7 @@ fn test_e2e_get_tool_support_reports_every_tool() -> Result<()> {
     let tools = report["tools"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("tools should be an array: {report}"))?;
-    assert_eq!(tools.len(), 30, "{report}");
+    assert_eq!(tools.len(), 31, "{report}");
     let logs = tools
         .iter()
         .find(|tool| tool["name"] == "get_server_logs")
@@ -196,7 +196,7 @@ fn test_e2e_list_tools() -> Result<()> {
         .as_array()
         .unwrap_or_else(|| panic!("tools should be an array"));
 
-    assert_eq!(tools.len(), 30, "Should have exactly 30 tools");
+    assert_eq!(tools.len(), 31, "Should have exactly 31 tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
@@ -221,6 +221,7 @@ fn test_e2e_list_tools() -> Result<()> {
         "get_document_highlights",
         "format_range",
         "get_selection_ranges",
+        "get_folding_ranges",
         "get_cached_diagnostics",
         "get_server_logs",
         "get_server_messages",

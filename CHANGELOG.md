@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `get_folding_ranges` tool (`textDocument/foldingRange`) with a `kind` filter and the `folding_range` `handles` value; collapsed text is redacted and cut to 256 bytes. (#PR)
 - `get_selection_ranges` tool (`textDocument/selectionRange`) and the `selection_range` `handles` value; chains are capped at 32 ranges. (#PR)
 - HTTP sessions now receive `resources/updated` on their GET stream for the resources they subscribed to. (#525)
 - `get_tool_support` tool reporting which tools are usable for which languages, per configured server capabilities. (#540)

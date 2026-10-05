@@ -38,6 +38,7 @@ mod enclosing;
 #[cfg(test)]
 mod enclosing_tests;
 mod encoding_ctx;
+mod folding_range;
 mod hierarchy;
 mod highlights;
 mod navigation;

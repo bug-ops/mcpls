@@ -32,11 +32,11 @@ use super::session::{ListenPermit, ListenRegistration, ListenUris, SubscriptionR
 use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
-    DeclarationParams, DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams,
-    FormatRangeParams, InlayHintsParams, NavigationParams, PositionParams, RangeParams,
-    ReferencesParams, RenameParams, RestartServerParams, ServerLogsParams, ServerMessagesParams,
-    SymbolTargetInput, SymbolTargetParams, ToolSupportParams, TypeHierarchyWalkParams,
-    WorkspaceSymbolParams,
+    DeclarationParams, DiagnosticsParams, DocumentSymbolsParams, FoldingRangesParams,
+    FormatDocumentParams, FormatRangeParams, InlayHintsParams, NavigationParams, PositionParams,
+    RangeParams, ReferencesParams, RenameParams, RestartServerParams, ServerLogsParams,
+    ServerMessagesParams, SymbolTargetInput, SymbolTargetParams, ToolSupportParams,
+    TypeHierarchyWalkParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
@@ -45,9 +45,9 @@ use crate::bridge::{
     AddressableTool, Addressed, BoundedRange, CallHierarchyPrepareResult, CheckedHierarchyItem,
     ClientPath, CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo,
     DiagnosticsResult, DocumentDiagnosticsResult, DocumentHighlightsResult, DocumentSymbolsResult,
-    FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult, IndexingState,
-    InlayHintsResult, LocationsResult, NotificationCache, OutgoingCallsResult, Position,
-    PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
+    FoldingRangesResult, FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult,
+    IndexingState, InlayHintsResult, LocationsResult, NotificationCache, OutgoingCallsResult,
+    Position, PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
     RestartServerResult, SelectionRangesResult, ServerLogsResult, ServerMessagesResult,
     SignatureHelpResult, SymbolTarget, Translator, TypeHierarchyResult, WorkspaceRoots,
     WorkspaceSymbolResult,
@@ -1090,7 +1090,7 @@ impl McplsServer {
 
     /// Get the chain of ranges enclosing a position.
     #[tool(
-        description = concat!("Ranges enclosing a position, innermost first (identifier, expression, statement, block), as the server reports them; their values can be passed to get_code_actions or format_range. Capped at a fixed maximum; `truncated: true` means the outermost were dropped. Empty is valid. ", positions_note_request!()),
+        description = "Ranges enclosing a position, innermost first, as the server reports them; their values can be passed to get_code_actions or format_range. Capped at a fixed maximum; `truncated: true` means the outermost were dropped. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was inexact: do not trust the result.",
         title = "Selection Ranges"
     )]
     async fn get_selection_ranges(
@@ -1106,6 +1106,24 @@ impl McplsServer {
             self.context
                 .translator
                 .handle_selection_range(file_path, parse_position(line, character)?)
+                .await,
+        )
+    }
+
+    /// Get the foldable regions of a file.
+    #[tool(
+        description = "Foldable regions of a file (blocks, imports, comments, marked regions): 1-based lines, optional columns, `kind`, collapsed text. Sorted by start line, longest first. Capped at a fixed maximum; `truncated: true` means more exist.",
+        title = "Folding Ranges"
+    )]
+    async fn get_folding_ranges(
+        &self,
+        Parameters(FoldingRangesParams { file_path, kind }): Parameters<FoldingRangesParams>,
+    ) -> Result<Json<FoldingRangesResult>, McpError> {
+        let file_path = parse_client_path(file_path)?;
+        self.structured_result(
+            self.context
+                .translator
+                .handle_folding_range(file_path, kind)
                 .await,
         )
     }
@@ -4878,6 +4896,7 @@ sleep 0.3
             ("get_document_highlights", true, false, true),
             ("format_range", true, false, true),
             ("get_selection_ranges", true, false, true),
+            ("get_folding_ranges", true, false, true),
             ("get_cached_diagnostics", true, false, true),
             ("get_server_logs", true, false, true),
             ("get_server_messages", true, false, true),
@@ -6327,6 +6346,13 @@ sleep 0.3
                 .get_document_highlights(Parameters(position()))
                 .await
                 .map(|_| ()),
+            McpTool::GetFoldingRanges => server
+                .get_folding_ranges(Parameters(FoldingRangesParams {
+                    file_path: PathBuf::from(file_path.clone()),
+                    kind: crate::bridge::FoldingKindFilter::All,
+                }))
+                .await
+                .map(|_| ()),
             McpTool::GetSelectionRanges => server
                 .get_selection_ranges(Parameters(position()))
                 .await
@@ -6497,7 +6523,7 @@ sleep 0.3
         let report = report_json(&fixture.server, None).await;
 
         assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
-        assert_eq!(report["tools"].as_array().unwrap().len(), 30);
+        assert_eq!(report["tools"].as_array().unwrap().len(), 31);
 
         let hover = tool_entry(&report, "get_hover");
         assert_eq!(hover["coverage"], "some");

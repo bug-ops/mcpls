@@ -305,6 +305,15 @@ pub fn escape_control(s: &str) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
+/// [`escape_control`] for an owned string: clean text is returned as is,
+/// without a copy.
+pub fn escape_control_owned(text: String) -> String {
+    match escape_control(&text) {
+        Cow::Borrowed(_) => text,
+        Cow::Owned(escaped) => escaped,
+    }
+}
+
 /// Aborts the wrapped [`JoinHandle`] when dropped, including on an unwind out
 /// of the enclosing scope -- unlike a bare `.abort()` call placed at the end
 /// of a function body, which is skipped if that scope is left early (a

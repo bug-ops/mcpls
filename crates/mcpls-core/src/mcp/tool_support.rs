@@ -57,6 +57,7 @@ pub(super) enum McpTool {
     GetDocumentHighlights,
     FormatRange,
     GetSelectionRanges,
+    GetFoldingRanges,
     GetCachedDiagnostics,
     GetServerLogs,
     GetServerMessages,
@@ -71,7 +72,7 @@ pub(super) enum McpTool {
 
 impl McpTool {
     /// Every tool, in registration order.
-    pub(super) const ALL: [Self; 30] = [
+    pub(super) const ALL: [Self; 31] = [
         Self::GetHover,
         Self::GetDefinition,
         Self::GetReferences,
@@ -92,6 +93,7 @@ impl McpTool {
         Self::GetDocumentHighlights,
         Self::FormatRange,
         Self::GetSelectionRanges,
+        Self::GetFoldingRanges,
         Self::GetCachedDiagnostics,
         Self::GetServerLogs,
         Self::GetServerMessages,
@@ -160,6 +162,7 @@ impl McpTool {
             Self::GetSelectionRanges => {
                 ("get_selection_ranges", Document(ToolKind::SelectionRange))
             }
+            Self::GetFoldingRanges => ("get_folding_ranges", Document(ToolKind::FoldingRange)),
             Self::GetCachedDiagnostics => ("get_cached_diagnostics", Local),
             Self::GetServerLogs => ("get_server_logs", Local),
             Self::GetServerMessages => ("get_server_messages", Local),
