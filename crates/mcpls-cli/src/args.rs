@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser};
+use mcpls_core::WorkspaceTrust;
+use mcpls_core::config::{ConfigOrigin, ServerId};
 
 use crate::logging::LogFilter;
 
@@ -51,6 +54,34 @@ impl From<HttpStreamLiveness> for mcpls_core::StreamLiveness {
     }
 }
 
+/// Trust placed in the analyzed workspace, selected by `--workspace-trust`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum WorkspaceTrustMode {
+    /// Start every applicable language server.
+    #[default]
+    Trusted,
+    /// Start only the servers named with `--allow-server`.
+    Untrusted,
+}
+
+/// Where `--config` came from: the environment when only `MCPLS_CONFIG` set it.
+fn config_origin(matches: &ArgMatches) -> ConfigOrigin {
+    match matches.value_source("config") {
+        Some(ValueSource::EnvVariable) => ConfigOrigin::Environment,
+        _ => ConfigOrigin::Argument,
+    }
+}
+
+/// Parses one `--allow-server` id; an empty one is rejected so a stray `--allow-server ""`
+/// cannot read as consent.
+fn parse_server_id(value: &str) -> Result<ServerId, String> {
+    if value.trim().is_empty() {
+        Err("a server id cannot be empty".to_string())
+    } else {
+        Ok(ServerId::from(value))
+    }
+}
+
 /// Universal MCP to LSP Bridge
 ///
 /// Exposes Language Server Protocol capabilities as MCP tools,
@@ -83,6 +114,27 @@ pub struct Args {
     /// other value is a parse error at startup.
     #[arg(long, env = "MCPLS_TRUST_PROJECT_CONFIG", value_parser = parse_bool_flag)]
     pub trust_project_config: bool,
+
+    /// Whether to trust the analyzed workspace: `trusted` or `untrusted`.
+    ///
+    /// Language servers run code the workspace supplies (build scripts,
+    /// procedural macros, tsconfig plugins). With `untrusted`, mcpls starts
+    /// only the servers named with `--allow-server`, and refuses a config file
+    /// or a server executable that lies inside the workspace. It is not a
+    /// sandbox: an allowed server still runs workspace code. Command line
+    /// only, so a config file planted in the workspace cannot grant consent.
+    /// Conflicts with `--trust-project-config`.
+    #[arg(long, value_enum, default_value_t = WorkspaceTrustMode::Trusted)]
+    pub workspace_trust: WorkspaceTrustMode,
+
+    /// Start this server in an untrusted workspace (repeatable).
+    ///
+    /// The id is the server's `name`, else its `language_id` (`rust`,
+    /// `python`, ...). Requires `--workspace-trust untrusted`. Consent to a
+    /// server is not consent to an executable the workspace supplies: one that
+    /// lies inside the workspace is still refused.
+    #[arg(long, value_name = "ID", value_parser = parse_server_id)]
+    pub allow_server: Vec<ServerId>,
 
     /// Logging level or filter directives
     ///
@@ -179,6 +231,46 @@ pub struct Args {
         value_parser = parse_allowed_host
     )]
     http_allowed_hosts: Vec<Option<mcpls_core::AllowedHost>>,
+}
+
+impl Args {
+    /// Parses the process arguments and reports where `--config` came from.
+    ///
+    /// Exits the process with the usage error clap reports for invalid
+    /// arguments.
+    pub fn parse_with_config_origin() -> (Self, ConfigOrigin) {
+        let matches = Self::command().get_matches();
+        let args = Self::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+        (args, config_origin(&matches))
+    }
+
+    /// The workspace trust the command line selects.
+    ///
+    /// # Errors
+    ///
+    /// An `ArgumentConflict` usage error (exit code 2 through
+    /// [`clap::Error::exit`]) when `--allow-server` is given without
+    /// `--workspace-trust untrusted`, or `--workspace-trust untrusted` is
+    /// combined with `--trust-project-config` (also set by
+    /// `MCPLS_TRUST_PROJECT_CONFIG`).
+    pub fn workspace_trust(&self) -> Result<WorkspaceTrust, clap::Error> {
+        let conflict = |message: &str| {
+            Self::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+        };
+        match self.workspace_trust {
+            WorkspaceTrustMode::Trusted if !self.allow_server.is_empty() => Err(conflict(
+                "--allow-server requires --workspace-trust untrusted",
+            )),
+            WorkspaceTrustMode::Trusted => Ok(WorkspaceTrust::Trusted),
+            WorkspaceTrustMode::Untrusted if self.trust_project_config => Err(conflict(
+                "--workspace-trust untrusted conflicts with --trust-project-config \
+                 (or MCPLS_TRUST_PROJECT_CONFIG): an untrusted workspace's own config is never trusted",
+            )),
+            WorkspaceTrustMode::Untrusted => {
+                Ok(WorkspaceTrust::untrusted(self.allow_server.iter().cloned()))
+            }
+        }
+    }
 }
 
 #[cfg(feature = "transport-http")]
@@ -282,6 +374,95 @@ mod tests {
     fn test_trust_project_config_flag() {
         let args = Args::parse_from(["mcpls", "--trust-project-config"]);
         assert!(args.trust_project_config);
+    }
+
+    #[test]
+    fn test_config_given_as_an_argument_has_the_argument_origin() {
+        let matches = Args::command()
+            .try_get_matches_from(["mcpls", "--config", "/etc/mcpls.toml"])
+            .unwrap();
+        assert_eq!(config_origin(&matches), ConfigOrigin::Argument);
+    }
+
+    #[test]
+    fn test_workspace_trust_defaults_to_trusted() {
+        let args = Args::parse_from(["mcpls"]);
+        assert_eq!(args.workspace_trust().unwrap(), WorkspaceTrust::Trusted);
+    }
+
+    #[test]
+    fn test_untrusted_collects_the_allowed_servers() {
+        let args = Args::parse_from([
+            "mcpls",
+            "--workspace-trust",
+            "untrusted",
+            "--allow-server",
+            "rust",
+            "--allow-server",
+            "python",
+        ]);
+        assert_eq!(
+            args.workspace_trust().unwrap(),
+            WorkspaceTrust::untrusted(["rust", "python"].map(ServerId::from))
+        );
+    }
+
+    #[test]
+    fn test_untrusted_without_allowed_servers_allows_none() {
+        let args = Args::parse_from(["mcpls", "--workspace-trust", "untrusted"]);
+        assert_eq!(
+            args.workspace_trust().unwrap(),
+            WorkspaceTrust::untrusted([])
+        );
+    }
+
+    #[test]
+    fn test_allow_server_without_untrusted_is_a_conflict() {
+        for extra in [&[][..], &["--workspace-trust", "trusted"][..]] {
+            let args = Args::parse_from(
+                ["mcpls", "--allow-server", "rust"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            );
+            let err = args.workspace_trust().unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn test_untrusted_conflicts_with_trust_project_config() {
+        let args = Args::parse_from([
+            "mcpls",
+            "--workspace-trust",
+            "untrusted",
+            "--trust-project-config",
+        ]);
+        let err = args.workspace_trust().unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(err.to_string().contains("--trust-project-config"));
+    }
+
+    #[test]
+    fn test_workspace_trust_rejects_unknown_mode_and_empty_server_id() {
+        assert!(Args::try_parse_from(["mcpls", "--workspace-trust", "paranoid"]).is_err());
+        assert!(Args::try_parse_from(["mcpls", "--allow-server", ""]).is_err());
+        assert!(Args::try_parse_from(["mcpls", "--allow-server"]).is_err());
+    }
+
+    #[test]
+    fn test_workspace_trust_flags_ignore_the_environment() {
+        let command = Args::command();
+        for id in ["workspace_trust", "allow_server"] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            assert!(
+                arg.get_env().is_none(),
+                "{id} must not read the environment"
+            );
+        }
     }
 
     #[test]

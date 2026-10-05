@@ -8,8 +8,8 @@ use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
-use mcpls_core::ProjectConfigTrust;
+use mcpls_core::config::ConfigOrigin;
+use mcpls_core::{ProjectConfigTrust, WorkspaceTrust};
 use tokio::runtime::Runtime;
 
 mod args;
@@ -40,7 +40,8 @@ impl Outcome {
 }
 
 fn main() {
-    let args = Args::parse();
+    let (args, config_origin) = Args::parse_with_config_origin();
+    let trust = args.workspace_trust().unwrap_or_else(|err| err.exit());
 
     // Initialize logging. No subscriber is installed yet, so failures here
     // must go straight to stderr.
@@ -63,7 +64,7 @@ fn main() {
     // Route fatal errors through the tracing subscriber (rather than the
     // default `Result` `Termination` printer) so they honor --log-json too.
     let outcome = block_on_guarded(runtime, async {
-        match run(args).await {
+        match run(args, trust, config_origin).await {
             Ok(()) => Outcome::Success,
             Err(err) => {
                 tracing::error!(error = ?err, "mcpls exited with an error");
@@ -103,20 +104,29 @@ fn http_config(args: &Args, bind: std::net::SocketAddr) -> mcpls_core::HttpConfi
         .with_allowed_hosts(args.allowed_hosts())
 }
 
-async fn run(args: Args) -> Result<()> {
+async fn run(args: Args, trust: WorkspaceTrust, config_origin: ConfigOrigin) -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
 
-    // Load configuration
+    // Load configuration. In untrusted mode the file that was actually loaded
+    // must lie outside the workspace, whichever way it was found.
     let config = if let Some(config_path) = &args.config {
-        mcpls_core::ServerConfig::load_from(config_path)
-            .with_context(|| format!("failed to load config from {}", config_path.display()))?
+        let mut config = mcpls_core::ServerConfig::load_from(config_path)
+            .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+        if matches!(trust, WorkspaceTrust::Untrusted(_)) {
+            config
+                .ensure_outside_workspace(config_path, config_origin)
+                .context("untrusted workspace mode refused the config file")?;
+        }
+        config.workspace_trust = trust;
+        config
     } else {
-        let trust = if args.trust_project_config {
+        let project_trust = if args.trust_project_config {
             ProjectConfigTrust::Trusted
         } else {
             ProjectConfigTrust::Untrusted
         };
-        mcpls_core::ServerConfig::load_with_trust(trust).context("failed to load configuration")?
+        mcpls_core::ServerConfig::load_discovered(project_trust, &trust)
+            .context("failed to load configuration")?
     };
 
     tracing::debug!(
