@@ -170,74 +170,35 @@ impl ToolSupportSnapshot {
     }
 }
 
-/// A boundary in [`Translator::tool_support_snapshot`]'s sequential reads.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotStage {
-    Start,
-    ExpectedRead,
-    ServersRead,
-    ClientsRead,
-    ExpectedReread,
-    RouterRead,
-}
-
-/// The snapshot's sequential reads, in the one order both the production
-/// path and the observed test path use. The optional observer is invoked at
-/// each boundary and expands to nothing when absent.
-macro_rules! snapshot_reads {
-    ($translator:expr $(, $observe:ident)?) => {{
-        let translator = $translator;
-        $($observe(SnapshotStage::Start);)?
-        let mut expected = lock_std(&translator.expected_servers).clone();
-        $($observe(SnapshotStage::ExpectedRead);)?
-        let capabilities = lock_std(&translator.lsp_servers)
-            .iter()
+impl Translator {
+    /// Copy the registries `get_tool_support` reads: one `servers` guard, then
+    /// one router clone. A server is a single slot, so a healthy server is
+    /// seen as registered or expected, never as neither (which would be
+    /// misreported as `no_server`), whatever registration or restart is
+    /// doing at the same moment.
+    pub(crate) fn tool_support_snapshot(&self) -> ToolSupportSnapshot {
+        let servers = lock_std(&self.servers);
+        let expected = servers.expected();
+        let capabilities = servers
+            .running_servers()
             .map(|(id, server)| (id.clone(), CapabilitySet::of(server.capabilities())))
             .collect();
-        $($observe(SnapshotStage::ServersRead);)?
-        let registered = lock_std(&translator.lsp_clients).keys().cloned().collect();
-        $($observe(SnapshotStage::ClientsRead);)?
-        // A restart deregisters (expected first, then the maps) the other way
-        // round from registration, so the early read alone can miss it.
-        expected.extend(lock_std(&translator.expected_servers).iter().cloned());
-        $($observe(SnapshotStage::ExpectedReread);)?
-        let router = Arc::clone(&lock_std(&translator.router));
-        $($observe(SnapshotStage::RouterRead);)?
+        let registered = servers
+            .ids()
+            .filter(|id| servers.client(id).is_some())
+            .cloned()
+            .collect();
+        drop(servers);
+        // Read after the registry: a settlement writes the registry first and
+        // the router after, so a router that is newer than the registry only
+        // moves routes toward servers that are already registered or expected.
+        let router = self.router_snapshot();
         ToolSupportSnapshot {
             router,
             expected,
             capabilities,
             registered,
         }
-    }};
-}
-
-impl Translator {
-    /// Copy the registries `get_tool_support` reads, taking each lock once,
-    /// sequentially, and never nested.
-    ///
-    /// Read order is `expected_servers`, then `lsp_servers`, then
-    /// `lsp_clients`, then `expected_servers` again (unioned with the first
-    /// read), then the router. Registration writes the client, the server,
-    /// rebinds the router, then clears `expected_servers`; a restart inserts
-    /// into `expected_servers` before removing from the maps and removes
-    /// from it after restoring them. Reading `expected_servers` before the
-    /// maps covers the first, reading it again after covers the second: a
-    /// healthy server is seen as registered or expected, never as neither
-    /// (which would be misreported as `no_server`).
-    pub(crate) fn tool_support_snapshot(&self) -> ToolSupportSnapshot {
-        snapshot_reads!(self)
-    }
-
-    /// [`Self::tool_support_snapshot`] with `observe` called at every
-    /// boundary between reads, so a test can interleave registration writes.
-    #[cfg(test)]
-    fn tool_support_snapshot_observed(
-        &self,
-        mut observe: impl FnMut(SnapshotStage),
-    ) -> ToolSupportSnapshot {
-        snapshot_reads!(self, observe)
     }
 
     /// The language of the file at `path`, after workspace-root validation.
@@ -245,9 +206,12 @@ impl Translator {
     /// # Errors
     ///
     /// Returns the same path-validation errors as every document tool.
-    pub(crate) fn language_for_path(&self, path: &ClientPath) -> Result<String> {
-        let validated = self.validate_path(path)?;
-        Ok(self.language_candidates(&validated).language().to_string())
+    pub(crate) async fn language_for_path(&self, path: &ClientPath) -> Result<String> {
+        let validated = self.validate_path(path).await?;
+        Ok(self
+            .language_candidates(validated.as_path())
+            .language()
+            .to_string())
     }
 }
 
@@ -433,157 +397,49 @@ mod tests {
         );
     }
 
-    /// Applies the four registration writes in the order production performs
-    /// them (`Translator::settle_started`: client then server; then
-    /// `rebind_router`; then the expected-set removal, here
-    /// `clear_expected_servers`) at every boundary between the snapshot's
-    /// reads, over all 70 monotone placements. A healthy server must never
-    /// read as `no_server`.
+    /// A server's whole lifecycle, step by step (expected, registered, taken
+    /// out for a restart, restored): at no step does a snapshot read it as
+    /// `no_server`, because each step is one slot transition.
     #[tokio::test]
-    async fn healthy_server_never_misreported_for_any_write_read_interleaving() {
+    async fn server_is_never_misreported_across_registration_and_restart_steps() {
         use crate::lsp::LspServer;
-        use crate::test_lsp::fake_lsp_client;
 
-        const STAGES: usize = 6;
         let id = ServerId::from("rust");
-        let mut schedules = 0;
-        for g0 in 0..STAGES {
-            for g1 in g0..STAGES {
-                for g2 in g1..STAGES {
-                    for g3 in g2..STAGES {
-                        schedules += 1;
-                        let gaps = [g0, g1, g2, g3];
-                        let translator = Translator::new().with_router(ToolRouter::catch_all([(
-                            id.clone(),
-                            LanguageId::from_static("rust"),
-                        )]));
-                        translator.set_expected_servers(HashSet::from([id.clone()]));
-                        let (client, _fake) = fake_lsp_client();
-                        let mut client = Some(client);
+        let translator = Translator::new().with_router(ToolRouter::catch_all([(
+            id.clone(),
+            LanguageId::from_static("rust"),
+        )]));
+        let check = |step: &str| {
+            let snap = translator.tool_support_snapshot();
+            assert_ne!(
+                snap.document_support("rust", ToolKind::Hover),
+                RouteSupport::NoServer,
+                "document route, {step}"
+            );
+            assert_ne!(
+                snap.workspace_support(ToolKind::WorkspaceSymbols),
+                RouteSupport::NoServer,
+                "workspace route, {step}"
+            );
+        };
 
-                        let snap = translator.tool_support_snapshot_observed(|stage| {
-                            for (step, gap) in gaps.iter().enumerate() {
-                                if *gap != stage as usize {
-                                    continue;
-                                }
-                                match step {
-                                    0 => translator
-                                        .register_client(id.clone(), client.take().unwrap()),
-                                    1 => translator.register_server(
-                                        id.clone(),
-                                        LspServer::new_for_test(rust_caps(true)),
-                                    ),
-                                    2 => translator.rebind_router(&HashSet::from([id.clone()])),
-                                    _ => translator.clear_expected_servers(),
-                                }
-                            }
-                        });
-
-                        assert_ne!(
-                            snap.document_support("rust", ToolKind::Hover),
-                            RouteSupport::NoServer,
-                            "document route, gaps {gaps:?}"
-                        );
-                        assert_ne!(
-                            snap.workspace_support(ToolKind::WorkspaceSymbols),
-                            RouteSupport::NoServer,
-                            "workspace route, gaps {gaps:?}"
-                        );
-                    }
-                }
-            }
-        }
-        assert_eq!(schedules, 126);
-    }
-
-    /// The restart's deregistration writes, in production order (insert into
-    /// `expected_servers`, remove server, remove client, restore server,
-    /// restore client, clear `expected_servers`) at every boundary between
-    /// the snapshot's reads. A server that is healthy before and after must
-    /// never read as `no_server` in between.
-    #[tokio::test]
-    async fn restarting_server_never_misreported_for_any_deregistration_interleaving() {
-        use crate::lsp::LspServer;
-        use crate::test_lsp::fake_lsp_client;
-
-        const STAGES: usize = 6;
-        let id = ServerId::from("rust");
-        let mut schedules = 0;
-        for g0 in 0..STAGES {
-            for g1 in g0..STAGES {
-                for g2 in g1..STAGES {
-                    for g3 in g2..STAGES {
-                        for g4 in g3..STAGES {
-                            for g5 in g4..STAGES {
-                                // Stopping the old process takes far longer than a
-                                // snapshot, so a whole restart never fits inside the
-                                // window between its first and last reads.
-                                if g0 >= 1 && g5 <= 3 {
-                                    continue;
-                                }
-                                schedules += 1;
-                                let gaps = [g0, g1, g2, g3, g4, g5];
-                                let translator =
-                                    Translator::new().with_router(ToolRouter::catch_all([(
-                                        id.clone(),
-                                        LanguageId::from_static("rust"),
-                                    )]));
-                                let (client, _fake) = fake_lsp_client();
-                                translator.register_client(id.clone(), client);
-                                translator.register_server(
-                                    id.clone(),
-                                    LspServer::new_for_test(rust_caps(true)),
-                                );
-                                let mut held_client = None;
-
-                                let snap = translator.tool_support_snapshot_observed(|stage| {
-                                    for (step, gap) in gaps.iter().enumerate() {
-                                        if *gap != stage as usize {
-                                            continue;
-                                        }
-                                        match step {
-                                            0 => {
-                                                lock_std(&translator.expected_servers)
-                                                    .insert(id.clone());
-                                            }
-                                            1 => {
-                                                lock_std(&translator.lsp_servers).remove(&id);
-                                            }
-                                            2 => {
-                                                held_client =
-                                                    lock_std(&translator.lsp_clients).remove(&id);
-                                            }
-                                            3 => translator.register_server(
-                                                id.clone(),
-                                                LspServer::new_for_test(rust_caps(true)),
-                                            ),
-                                            4 => {
-                                                if let Some(client) = held_client.take() {
-                                                    translator.register_client(id.clone(), client);
-                                                }
-                                            }
-                                            _ => translator.clear_expected_servers(),
-                                        }
-                                    }
-                                });
-
-                                assert_ne!(
-                                    snap.document_support("rust", ToolKind::Hover),
-                                    RouteSupport::NoServer,
-                                    "document route, gaps {gaps:?}"
-                                );
-                                assert_ne!(
-                                    snap.workspace_support(ToolKind::WorkspaceSymbols),
-                                    RouteSupport::NoServer,
-                                    "workspace route, gaps {gaps:?}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert_eq!(schedules, 462 - 28);
+        translator.set_expected_servers(HashSet::from([id.clone()]));
+        check("expected");
+        translator.register_server(id.clone(), LspServer::new_for_test(rust_caps(true)));
+        check("registered");
+        let held = lock_std(&translator.servers).take_for_restart(&id);
+        check("taken for restart");
+        let refused = lock_std(&translator.servers).restore(&id, held.unwrap());
+        assert!(refused.is_none());
+        check("restored");
+        translator.clear_expected_servers();
+        check("expectation cleared");
+        assert_eq!(
+            translator
+                .tool_support_snapshot()
+                .document_support("rust", ToolKind::Hover),
+            RouteSupport::Supported { server: id }
+        );
     }
 
     #[test]
@@ -649,12 +505,16 @@ mod tests {
         let file = dir.path().join("a.rs");
         std::fs::write(&file, "").unwrap();
         assert_eq!(
-            translator.language_for_path(&client_path(&file)).unwrap(),
+            translator
+                .language_for_path(&client_path(&file))
+                .await
+                .unwrap(),
             "rust"
         );
         assert!(
             translator
                 .language_for_path(&client_path("/definitely/missing.rs"))
+                .await
                 .is_err()
         );
     }

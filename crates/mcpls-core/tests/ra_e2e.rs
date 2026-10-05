@@ -794,7 +794,7 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
 ///
 /// Returns the prepared item for use by sub-cases 12 and 13.
 ///
-/// Since `CallHierarchyItemResult` now serializes `selectionRange` in camelCase,
+/// Since `HierarchyItem` now serializes `selectionRange` in camelCase,
 /// the item round-trips correctly without any field renaming.
 fn prepare_call_hierarchy_item(client: &mut McpClient, workspace: &Path) -> Result<Value, String> {
     let lib = workspace.join("src/lib.rs");

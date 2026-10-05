@@ -13,8 +13,8 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use url::Url;
 
-use super::state::{encode_rfc3986_path_chars, uri_to_path};
-use super::{ClientPath, WorkspaceRoots, validate_path_against_roots};
+use super::state::{encode_rfc3986_path_chars, file_url, uri_to_path};
+use super::{ClientPath, InvalidClientPath, WorkspaceRoots};
 
 /// URI scheme used for diagnostic resources.
 const SCHEME: &str = "lsp-diagnostics";
@@ -50,15 +50,17 @@ pub enum ResourceUriError {
     #[error("expected '{SCHEME}:///' prefix in URI: {0}")]
     InvalidScheme(String),
 
-    /// The URI path could not be decoded to a filesystem path.
-    #[error("failed to decode URI to filesystem path: {0}")]
-    DecodeFailed(String),
-}
+    /// The URI is not parseable as a URL.
+    #[error("malformed resource URI: {0}")]
+    UrlParse(#[source] url::ParseError),
 
-impl From<ResourceUriError> for crate::error::Error {
-    fn from(err: ResourceUriError) -> Self {
-        Self::InvalidUri(err.to_string())
-    }
+    /// The URI does not name a filesystem path.
+    #[error("URI does not name a filesystem path: {0}")]
+    NotAFilePath(String),
+
+    /// The decoded path is not an acceptable client path.
+    #[error("decoded URI path is not acceptable: {0}")]
+    ClientPath(#[source] InvalidClientPath),
 }
 
 /// Errors produced when adding a URI to a [`ResourceSubscriptions`] set.
@@ -109,8 +111,8 @@ impl From<SubscriptionError> for crate::error::Error {
 /// assert!(uri.starts_with("lsp-diagnostics:///"));
 /// ```
 pub fn make_uri(path: &Path) -> Result<String, ResourceUriError> {
-    let file_url = Url::from_file_path(path)
-        .map_err(|()| ResourceUriError::InvalidPath(path.display().to_string()))?;
+    let file_url =
+        file_url(path).ok_or_else(|| ResourceUriError::InvalidPath(path.display().to_string()))?;
 
     // Replace the "file" scheme with our custom scheme while keeping the
     // percent-encoded path and authority (empty) components.
@@ -154,12 +156,12 @@ pub fn parse_uri(uri: &str) -> Result<ClientPath, ResourceUriError> {
     }
 
     let file_uri = format!("file://{after_prefix}");
-    let url = Url::parse(&file_uri).map_err(|e| ResourceUriError::DecodeFailed(e.to_string()))?;
+    let url = Url::parse(&file_uri).map_err(ResourceUriError::UrlParse)?;
 
     let path = url
         .to_file_path()
-        .map_err(|()| ResourceUriError::DecodeFailed(file_uri))?;
-    ClientPath::try_from(path).map_err(|e| ResourceUriError::DecodeFailed(e.to_string()))
+        .map_err(|()| ResourceUriError::NotAFilePath(file_uri))?;
+    ClientPath::try_from(path).map_err(ResourceUriError::ClientPath)
 }
 
 /// A `lsp-diagnostics:///` resource URI in the form the diagnostics pump
@@ -285,9 +287,10 @@ impl DiagnosticsResourceUri {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::InvalidUri`] when `raw` is not a well-formed
-    /// `lsp-diagnostics:///` URI, or the workspace validation error when the
-    /// path is missing or outside `roots`.
+    /// Returns [`crate::Error::ResourceUri`] when `raw` is not a well-formed
+    /// `lsp-diagnostics:///` URI, the workspace validation error when the
+    /// path is missing or outside `roots`, or [`crate::Error::PathToUri`] when
+    /// the canonical path cannot be encoded again.
     pub(crate) fn resolve(
         raw: &str,
         roots: &WorkspaceRoots,
@@ -295,9 +298,9 @@ impl DiagnosticsResourceUri {
         let parsed = parse_uri(raw)?;
         // `canonicalize` yields a `\\?\` verbatim path on Windows, which LSP
         // servers never publish; `dunce` strips it where that is safe.
-        let validated = validate_path_against_roots(&parsed, roots)?;
-        let path = dunce::simplified(&validated).to_path_buf();
-        let uri = Self(make_uri(&path)?);
+        let validated = roots.validate_blocking(&parsed)?;
+        let path = dunce::simplified(validated.as_path()).to_path_buf();
+        let uri = Self(make_uri(&path).map_err(|_| crate::Error::PathToUri(path.clone()))?);
         Ok(ResolvedResource { path, uri })
     }
 
@@ -506,6 +509,13 @@ mod tests {
     // URI codec
     // ------------------------------------------------------------------
 
+    #[cfg(windows)]
+    #[test]
+    fn test_make_uri_encodes_a_windows_rooted_path_without_a_drive() {
+        let uri = make_uri(Path::new(r"\ws\main.rs")).unwrap();
+        assert_eq!(uri, "lsp-diagnostics:///ws/main.rs");
+    }
+
     #[test]
     fn test_make_uri_rejects_relative_path() {
         let result = make_uri(Path::new("relative/path.rs"));
@@ -520,8 +530,9 @@ mod tests {
 
     #[test]
     fn test_parse_uri_rejects_decoded_nul() {
-        let result = parse_uri("lsp-diagnostics:///ws/a%00b.rs");
-        assert_matches!(result, Err(ResourceUriError::DecodeFailed(_)));
+        let drive = if cfg!(windows) { "C:/" } else { "" };
+        let result = parse_uri(&format!("lsp-diagnostics:///{drive}ws/a%00b.rs"));
+        assert_matches!(result, Err(ResourceUriError::ClientPath(_)));
     }
 
     #[test]
@@ -638,7 +649,7 @@ mod tests {
             &WorkspaceRoots::from_configured(&[root]).unwrap(),
         )
         .unwrap_err();
-        assert_matches!(err, crate::Error::InvalidUri(_), "got {err:?}");
+        assert_matches!(err, crate::Error::ResourceUri(_), "got {err:?}");
     }
 
     #[test]
@@ -649,7 +660,7 @@ mod tests {
             &WorkspaceRoots::from_configured(&[root]).unwrap(),
         )
         .unwrap_err();
-        assert_matches!(err, crate::Error::InvalidUri(_), "got {err:?}");
+        assert_matches!(err, crate::Error::ResourceUri(_), "got {err:?}");
     }
 
     /// #571: a subscribe URI naming a file through the configured symlinked
@@ -804,6 +815,7 @@ mod tests {
             &roots_of(&root),
             &client_path(&link),
         )
+        .await
         .unwrap();
         assert_eq!(published.canonical(), &client_side);
     }

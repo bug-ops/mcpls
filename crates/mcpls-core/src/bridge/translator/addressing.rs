@@ -559,7 +559,7 @@ impl Translator {
     ///
     /// # async fn run(translator: &Translator) -> Result<(), Box<dyn std::error::Error>> {
     /// let file = ClientPath::try_from(PathBuf::from("/ws/src/lib.rs"))?;
-    /// let target = SymbolTarget::Position(Position { line: 3, character: 5 });
+    /// let target = SymbolTarget::Position(Position::from_client(3, 5)?);
     /// let resolved = translator
     ///     .resolve_symbol_target(&file, target, AddressableTool::Hover)
     ///     .await?;
@@ -598,10 +598,7 @@ impl Translator {
                 let located = locate_identifier(self, &fetched.ctx, &uri, entry).await;
                 match located {
                     IdentifierPosition::Verified(position, source) => Ok(ResolvedTarget {
-                        position: Position {
-                            line: position.line,
-                            character: position.character,
-                        },
+                        position: Position::from_server_output(&position),
                         resolved: Some(ResolvedSymbol {
                             name: entry.name.clone(),
                             kind: u32::from(entry.kind),

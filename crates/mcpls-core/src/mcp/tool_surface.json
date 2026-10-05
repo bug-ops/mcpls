@@ -34,7 +34,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -57,12 +56,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -122,7 +119,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         }
       },
       "required": [
@@ -200,7 +197,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -223,12 +219,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -288,7 +282,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         }
       },
       "required": [
@@ -326,7 +320,6 @@
           "description": "A single diagnostic.",
           "properties": {
             "code": {
-              "description": "Optional diagnostic code.",
               "type": [
                 "string",
                 "null"
@@ -337,12 +330,10 @@
               "type": "string"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range where the diagnostic applies."
+              "$ref": "#/$defs/Range"
             },
             "severity": {
-              "$ref": "#/$defs/DiagnosticSeverity",
-              "description": "Severity of the diagnostic."
+              "$ref": "#/$defs/DiagnosticSeverity"
             }
           },
           "required": [
@@ -367,7 +358,6 @@
             },
             {
               "const": "information",
-              "description": "Informational diagnostic.",
               "type": "string"
             },
             {
@@ -381,7 +371,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -404,12 +393,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -443,15 +430,15 @@
           "type": "array"
         },
         "indexing_in_progress": {
-          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during this read; the diagnostics may reflect a partial index.",
+          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
           "type": "boolean"
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "push_notifications_degraded": {
-          "description": "`true` if the language server publishing this file's diagnostics crashed and was\nrestarted during this mcpls session. Diagnostics it delivers only by push (e.g.\nrust-analyzer's flycheck/clippy) are no longer received, so the returned\ndiagnostics may be incomplete until mcpls restarts.",
+          "description": "`true` if the language server publishing this file's diagnostics crashed and was\nrestarted during",
           "type": "boolean"
         }
       },
@@ -472,7 +459,7 @@
   {
     "name": "get_code_actions",
     "title": "Code Actions",
-    "description": "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -604,7 +591,6 @@
           "description": "A single diagnostic.",
           "properties": {
             "code": {
-              "description": "Optional diagnostic code.",
               "type": [
                 "string",
                 "null"
@@ -615,12 +601,10 @@
               "type": "string"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range where the diagnostic applies."
+              "$ref": "#/$defs/Range"
             },
             "severity": {
-              "$ref": "#/$defs/DiagnosticSeverity",
-              "description": "Severity of the diagnostic."
+              "$ref": "#/$defs/DiagnosticSeverity"
             }
           },
           "required": [
@@ -645,7 +629,6 @@
             },
             {
               "const": "information",
-              "description": "Informational diagnostic.",
               "type": "string"
             },
             {
@@ -677,34 +660,28 @@
           "type": "object"
         },
         "DroppedEdits": {
-          "description": "Counts of `WorkspaceEdit` entries withheld during conversion to MCP DTOs,\nbroken down by reason (#475).\n\n`convert_workspace_edit` silently discarded such entries with only a\n`tracing` log line, so a client applying a [`RenameResult`] or\n`WorkspaceEditDescription` straight to disk could not tell \"nothing to\nrename\" apart from \"some of the rename was withheld\" -- this makes that\ndistinction visible in the result itself.",
           "properties": {
             "exceeds_item_cap": {
-              "description": "Edits not admitted because the response exceeded\n`MAX_NORMALIZED_LOCATIONS` (#487), including whole files skipped once\nthe budget was spent.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "out_of_workspace": {
-              "description": "Entries referencing a URI outside every configured workspace root.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "shadowed_by_changes": {
-              "description": "`documentChanges` text-document edits ignored because a non-empty\n`changes` map took precedence and did not already name their URI\n(#498).",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "unsupported_file_operation": {
-              "description": "`CreateFile`/`RenameFile`/`DeleteFile` document changes, which mcpls\ndoes not translate into MCP DTOs.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "unsupported_snippet_edit": {
-              "description": "`SnippetTextEdit` entries, which mcpls does not translate since it\nadvertises no `snippetEditSupport`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -716,7 +693,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -739,12 +715,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -824,10 +798,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `actions`, their diagnostics, or their edits were capped below\nthe LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487);\na per-action `dropped.exceeds_item_cap` pinpoints dropped edits.\nOmitted (defaults to `false`) when serialized.",
+          "description": "Whether `actions`, their diagnostics, or their edits were capped below\nthe LSP server's full",
           "type": "boolean"
         }
       },
@@ -924,12 +898,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -953,7 +925,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         }
       },
       "required": [
@@ -971,20 +943,18 @@
   {
     "name": "get_definition",
     "title": "Go to Definition",
-    "description": "Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`.",
+    "description": "Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
         "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.\n\nOnly tools whose input schema declares `context` act on it.\n\n# Examples\n\n```\nuse mcpls_core::bridge::ResultContext;\n\nassert_eq!(ResultContext::default(), ResultContext::None);\nlet parsed: ResultContext = serde_json::from_str(\"\\\"enclosing_symbol\\\"\").unwrap();\nassert_eq!(parsed, ResultContext::EnclosingSymbol);\n```",
+          "description": "Extra context a tool can attach to each returned item.",
           "oneOf": [
             {
               "const": "none",
-              "description": "Return the plain result with no extra lookups.",
               "type": "string"
             },
             {
               "const": "enclosing_symbol",
-              "description": "Attach the innermost enclosing symbol (name path, kind, range) to each\nitem, at the cost of one `textDocument/documentSymbol` request per\ndistinct file, capped per call.",
               "type": "string"
             }
           ]
@@ -1004,7 +974,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
           "type": [
             "string",
             "null"
@@ -1013,7 +983,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
+          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -1031,7 +1001,7 @@
         },
         "symbol_kind": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
           "type": [
             "string",
             "null"
@@ -1039,7 +1009,7 @@
         },
         "symbol_name": {
           "default": null,
-          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`.",
           "type": [
             "string",
             "null"
@@ -1054,19 +1024,16 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.",
           "properties": {
             "enclosing_symbol": {
-              "$ref": "#/$defs/EnclosingSymbolOutcome",
-              "description": "Present only when `context: \"enclosing_symbol\"` was requested."
+              "$ref": "#/$defs/EnclosingSymbolOutcome"
             },
             "out_of_workspace": {
-              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (a legitimate\nresult routinely points into the standard library or a dependency),\nso callers that want to apply their own policy toward out-of-workspace\nlocations can check this flag. The check is purely lexical -- it does\nnot resolve symlinks. A root counts together with the spellings it\nwas configured or launched under (for example a symlinked path or the\nshell's logical working directory), but a location reached through any\nother symlink (e.g. a package manager's symlinked dependency store)\ncan read `true` even though it is genuinely inside the workspace. Also\nalways `true` when no workspace roots are configured: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
               "type": "boolean"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range within the document."
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -1083,25 +1050,21 @@
           "description": "The innermost symbol containing an item.",
           "properties": {
             "fidelity": {
-              "$ref": "#/$defs/SymbolFidelity",
-              "description": "How complete `name_path` is."
+              "$ref": "#/$defs/SymbolFidelity"
             },
             "kind": {
-              "description": "LSP numeric symbol kind, the same value `get_document_symbols`\nreports (usable as a `kind_filter`).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name_path": {
-              "description": "Symbol names from the outermost ancestor down to the symbol itself.",
               "items": {
                 "type": "string"
               },
               "type": "array"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the symbol (1-based)."
+              "$ref": "#/$defs/Range"
             }
           },
           "required": [
@@ -1113,11 +1076,10 @@
           "type": "object"
         },
         "EnclosingSymbolOutcome": {
-          "description": "What is known about the enclosing symbol of one item.\n\n`top_level` means the file's symbols were read and none contains the\nitem. `not_computed` and `unavailable` mean nothing is known and must\nnever be read as top level.",
+          "description": "What is known about the enclosing symbol of one item.",
           "oneOf": [
             {
               "$ref": "#/$defs/EnclosingSymbol",
-              "description": "The innermost containing symbol.",
               "properties": {
                 "status": {
                   "const": "resolved",
@@ -1130,7 +1092,6 @@
               "type": "object"
             },
             {
-              "description": "No symbol of the file contains the item.",
               "properties": {
                 "status": {
                   "const": "top_level",
@@ -1161,7 +1122,6 @@
               "type": "object"
             },
             {
-              "description": "The lookup was attempted and failed.",
               "properties": {
                 "reason": {
                   "$ref": "#/$defs/UnavailableReason",
@@ -1184,17 +1144,14 @@
           "description": "Result-level statement about how complete the enrichment is.",
           "properties": {
             "cut_short": {
-              "description": "Whether the file cap or the time budget skipped some files, so a\nretry with fewer items may enrich more.",
               "type": "boolean"
             },
             "files_enriched": {
-              "description": "Distinct files whose symbol tree was obtained.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "files_skipped": {
-              "description": "Distinct files for which no symbol tree was obtained, for any reason.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -1212,22 +1169,18 @@
           "oneOf": [
             {
               "const": "file_cap",
-              "description": "The call already enriched the maximum number of distinct files.",
               "type": "string"
             },
             {
               "const": "out_of_workspace",
-              "description": "The file is outside every workspace root, so it is not opened.",
               "type": "string"
             },
             {
               "const": "tracker_limit",
-              "description": "The document tracker is at its limit and could not open the file.",
               "type": "string"
             },
             {
               "const": "deadline",
-              "description": "The call's overall enrichment time budget was spent.",
               "type": "string"
             }
           ]
@@ -1236,7 +1189,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -1259,12 +1211,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -1274,12 +1224,10 @@
           "oneOf": [
             {
               "const": "selection_range",
-              "description": "The server's `selectionRange` start, verified to spell the name.",
               "type": "string"
             },
             {
               "const": "inferred",
-              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
               "type": "string"
             }
           ]
@@ -1303,32 +1251,26 @@
           "type": "object"
         },
         "ResolvedSymbol": {
-          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
           "properties": {
             "container": {
-              "description": "Enclosing symbol, when the server reports one.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "Numeric LSP `SymbolKind`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "The symbol's name as the server reports it.",
               "type": "string"
             },
             "position": {
-              "$ref": "#/$defs/Position2D",
-              "description": "The 1-based position that was queried."
+              "$ref": "#/$defs/Position2D"
             },
             "position_source": {
-              "$ref": "#/$defs/PositionSource",
-              "description": "How `position` was determined."
+              "$ref": "#/$defs/PositionSource"
             }
           },
           "required": [
@@ -1344,12 +1286,10 @@
           "oneOf": [
             {
               "const": "hierarchical",
-              "description": "Built from the server's `DocumentSymbol` ancestor chain: complete.",
               "type": "string"
             },
             {
               "const": "flat",
-              "description": "Built from a flat `SymbolInformation` list: at most one container\nsegment from `containerName`, so ancestors may be missing.",
               "type": "string"
             }
           ]
@@ -1359,17 +1299,14 @@
           "oneOf": [
             {
               "const": "capability_absent",
-              "description": "The routed server does not advertise `documentSymbolProvider`.",
               "type": "string"
             },
             {
               "const": "request_failed",
-              "description": "The `documentSymbol` request or file open failed.",
               "type": "string"
             },
             {
               "const": "timed_out",
-              "description": "The `documentSymbol` request timed out.",
               "type": "string"
             }
           ]
@@ -1379,7 +1316,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how many files were enriched or skipped, and whether\nthe file cap or time budget cut it short."
+          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
         },
         "locations": {
           "description": "Locations of the definition.",
@@ -1390,7 +1327,7 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "resolved_symbol": {
           "anyOf": [
@@ -1404,7 +1341,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
           "type": "boolean"
         }
       },
@@ -1423,20 +1360,18 @@
   {
     "name": "get_diagnostics",
     "title": "Diagnostics",
-    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`.",
+    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
         "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.\n\nOnly tools whose input schema declares `context` act on it.\n\n# Examples\n\n```\nuse mcpls_core::bridge::ResultContext;\n\nassert_eq!(ResultContext::default(), ResultContext::None);\nlet parsed: ResultContext = serde_json::from_str(\"\\\"enclosing_symbol\\\"\").unwrap();\nassert_eq!(parsed, ResultContext::EnclosingSymbol);\n```",
+          "description": "Extra context a tool can attach to each returned item.",
           "oneOf": [
             {
               "const": "none",
-              "description": "Return the plain result with no extra lookups.",
               "type": "string"
             },
             {
               "const": "enclosing_symbol",
-              "description": "Attach the innermost enclosing symbol (name path, kind, range) to each\nitem, at the cost of one `textDocument/documentSymbol` request per\ndistinct file, capped per call.",
               "type": "string"
             }
           ]
@@ -1447,7 +1382,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
+          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -1462,7 +1397,7 @@
     "outputSchema": {
       "$defs": {
         "ContextualDiagnostic": {
-          "description": "A [`Diagnostic`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.",
           "properties": {
             "code": {
               "description": "Optional diagnostic code.",
@@ -1510,7 +1445,6 @@
             },
             {
               "const": "information",
-              "description": "Informational diagnostic.",
               "type": "string"
             },
             {
@@ -1524,25 +1458,21 @@
           "description": "The innermost symbol containing an item.",
           "properties": {
             "fidelity": {
-              "$ref": "#/$defs/SymbolFidelity",
-              "description": "How complete `name_path` is."
+              "$ref": "#/$defs/SymbolFidelity"
             },
             "kind": {
-              "description": "LSP numeric symbol kind, the same value `get_document_symbols`\nreports (usable as a `kind_filter`).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name_path": {
-              "description": "Symbol names from the outermost ancestor down to the symbol itself.",
               "items": {
                 "type": "string"
               },
               "type": "array"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the symbol (1-based)."
+              "$ref": "#/$defs/Range"
             }
           },
           "required": [
@@ -1554,11 +1484,10 @@
           "type": "object"
         },
         "EnclosingSymbolOutcome": {
-          "description": "What is known about the enclosing symbol of one item.\n\n`top_level` means the file's symbols were read and none contains the\nitem. `not_computed` and `unavailable` mean nothing is known and must\nnever be read as top level.",
+          "description": "What is known about the enclosing symbol of one item.",
           "oneOf": [
             {
               "$ref": "#/$defs/EnclosingSymbol",
-              "description": "The innermost containing symbol.",
               "properties": {
                 "status": {
                   "const": "resolved",
@@ -1571,7 +1500,6 @@
               "type": "object"
             },
             {
-              "description": "No symbol of the file contains the item.",
               "properties": {
                 "status": {
                   "const": "top_level",
@@ -1602,7 +1530,6 @@
               "type": "object"
             },
             {
-              "description": "The lookup was attempted and failed.",
               "properties": {
                 "reason": {
                   "$ref": "#/$defs/UnavailableReason",
@@ -1625,17 +1552,14 @@
           "description": "Result-level statement about how complete the enrichment is.",
           "properties": {
             "cut_short": {
-              "description": "Whether the file cap or the time budget skipped some files, so a\nretry with fewer items may enrich more.",
               "type": "boolean"
             },
             "files_enriched": {
-              "description": "Distinct files whose symbol tree was obtained.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "files_skipped": {
-              "description": "Distinct files for which no symbol tree was obtained, for any reason.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -1653,22 +1577,18 @@
           "oneOf": [
             {
               "const": "file_cap",
-              "description": "The call already enriched the maximum number of distinct files.",
               "type": "string"
             },
             {
               "const": "out_of_workspace",
-              "description": "The file is outside every workspace root, so it is not opened.",
               "type": "string"
             },
             {
               "const": "tracker_limit",
-              "description": "The document tracker is at its limit and could not open the file.",
               "type": "string"
             },
             {
               "const": "deadline",
-              "description": "The call's overall enrichment time budget was spent.",
               "type": "string"
             }
           ]
@@ -1677,7 +1597,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -1700,12 +1619,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -1733,12 +1650,10 @@
           "oneOf": [
             {
               "const": "hierarchical",
-              "description": "Built from the server's `DocumentSymbol` ancestor chain: complete.",
               "type": "string"
             },
             {
               "const": "flat",
-              "description": "Built from a flat `SymbolInformation` list: at most one container\nsegment from `containerName`, so ancestors may be missing.",
               "type": "string"
             }
           ]
@@ -1748,17 +1663,14 @@
           "oneOf": [
             {
               "const": "capability_absent",
-              "description": "The routed server does not advertise `documentSymbolProvider`.",
               "type": "string"
             },
             {
               "const": "request_failed",
-              "description": "The `documentSymbol` request or file open failed.",
               "type": "string"
             },
             {
               "const": "timed_out",
-              "description": "The `documentSymbol` request timed out.",
               "type": "string"
             }
           ]
@@ -1775,18 +1687,18 @@
         },
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and the file has\ndiagnostics: how many files were enriched or skipped."
+          "description": "Set only when `context: \"enclosing_symbol\"` was requested and the file has\ndiagnostics: how many"
         },
         "indexing_in_progress": {
-          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during this read; the diagnostics may reflect a partial index.",
+          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
           "type": "boolean"
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "push_notifications_degraded": {
-          "description": "`true` if the language server publishing this file's diagnostics crashed and was\nrestarted during this mcpls session. Diagnostics it delivers only by push (e.g.\nrust-analyzer's flycheck/clippy) are no longer received, so the returned\ndiagnostics may be incomplete until mcpls restarts.",
+          "description": "`true` if the language server publishing this file's diagnostics crashed and was\nrestarted during",
           "type": "boolean"
         }
       },
@@ -1879,7 +1791,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -1902,12 +1813,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -1942,10 +1851,10 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `highlights` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`). Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `highlights` was capped below the LSP server's full response\n(see",
           "type": "boolean"
         }
       },
@@ -1984,7 +1893,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2007,12 +1915,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -2080,7 +1986,7 @@
       "properties": {
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "symbols": {
           "description": "List of symbols in the document.",
@@ -2121,7 +2027,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
           "type": [
             "string",
             "null"
@@ -2143,7 +2049,7 @@
         },
         "symbol_kind": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
           "type": [
             "string",
             "null"
@@ -2151,7 +2057,7 @@
         },
         "symbol_name": {
           "default": null,
-          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`.",
           "type": [
             "string",
             "null"
@@ -2169,7 +2075,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2192,12 +2097,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -2207,12 +2110,10 @@
           "oneOf": [
             {
               "const": "selection_range",
-              "description": "The server's `selectionRange` start, verified to spell the name.",
               "type": "string"
             },
             {
               "const": "inferred",
-              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
               "type": "string"
             }
           ]
@@ -2236,32 +2137,26 @@
           "type": "object"
         },
         "ResolvedSymbol": {
-          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
           "properties": {
             "container": {
-              "description": "Enclosing symbol, when the server reports one.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "Numeric LSP `SymbolKind`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "The symbol's name as the server reports it.",
               "type": "string"
             },
             "position": {
-              "$ref": "#/$defs/Position2D",
-              "description": "The 1-based position that was queried."
+              "$ref": "#/$defs/Position2D"
             },
             "position_source": {
-              "$ref": "#/$defs/PositionSource",
-              "description": "How `position` was determined."
+              "$ref": "#/$defs/PositionSource"
             }
           },
           "required": [
@@ -2288,7 +2183,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "range": {
           "anyOf": [
@@ -2328,36 +2223,20 @@
   {
     "name": "get_incoming_calls",
     "title": "Incoming Calls",
-    "description": "Functions calling the specified item. Takes call hierarchy item, returns callers, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Functions calling the specified item. Takes call hierarchy item, returns callers, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "item": {
-          "description": "The call hierarchy item to get calls for (from prepare response)."
-        }
-      },
-      "required": [
-        "item"
-      ],
-      "type": "object"
-    },
-    "outputSchema": {
       "$defs": {
-        "CallHierarchyItemResult": {
-          "description": "A call hierarchy item.",
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
           "properties": {
-            "data": {
-              "description": "Opaque data to pass to incoming/outgoing calls."
-            },
+            "data": {},
             "detail": {
-              "description": "More detail for this item.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2367,7 +2246,6 @@
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
               "type": "boolean"
             },
             "range": {
@@ -2375,8 +2253,104 @@
               "description": "Range of the symbol."
             },
             "selectionRange": {
+              "$ref": "#/$defs/Range"
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/HierarchyItem",
+          "description": "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy,"
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
+          "properties": {
+            "data": {},
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "type": "boolean"
+            },
+            "range": {
               "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -2396,7 +2370,7 @@
           "description": "An incoming call (caller of the current item).",
           "properties": {
             "from": {
-              "$ref": "#/$defs/CallHierarchyItemResult",
+              "$ref": "#/$defs/HierarchyItem",
               "description": "The item that calls the current item."
             },
             "from_ranges": {
@@ -2417,7 +2391,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2440,12 +2413,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -2487,10 +2458,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `calls` (together with their `from_ranges`) was capped below\nthe LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487).\nOmitted (defaults to `false`) when serialized.",
+          "description": "Whether `calls` (together with their `from_ranges`) was capped below\nthe LSP server's full response",
           "type": "boolean"
         }
       },
@@ -2605,7 +2576,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2628,12 +2598,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -2657,10 +2625,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `hints` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`, #487). Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `hints` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`,",
           "type": "boolean"
         }
       },
@@ -2679,36 +2647,20 @@
   {
     "name": "get_outgoing_calls",
     "title": "Outgoing Calls",
-    "description": "Functions called by the specified item. Takes call hierarchy item, returns callees, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Functions called by the specified item. Takes call hierarchy item, returns callees, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "item": {
-          "description": "The call hierarchy item to get calls for (from prepare response)."
-        }
-      },
-      "required": [
-        "item"
-      ],
-      "type": "object"
-    },
-    "outputSchema": {
       "$defs": {
-        "CallHierarchyItemResult": {
-          "description": "A call hierarchy item.",
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
           "properties": {
-            "data": {
-              "description": "Opaque data to pass to incoming/outgoing calls."
-            },
+            "data": {},
             "detail": {
-              "description": "More detail for this item.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2718,7 +2670,6 @@
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
               "type": "boolean"
             },
             "range": {
@@ -2726,8 +2677,104 @@
               "description": "Range of the symbol."
             },
             "selectionRange": {
+              "$ref": "#/$defs/Range"
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/HierarchyItem",
+          "description": "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy,"
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
+          "properties": {
+            "data": {},
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "type": "boolean"
+            },
+            "range": {
               "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -2754,7 +2801,7 @@
               "type": "array"
             },
             "to": {
-              "$ref": "#/$defs/CallHierarchyItemResult",
+              "$ref": "#/$defs/HierarchyItem",
               "description": "The item being called."
             }
           },
@@ -2768,7 +2815,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -2791,12 +2837,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -2838,10 +2882,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `calls` (together with their `from_ranges`) was capped below\nthe LSP server's full response (see `MAX_NORMALIZED_LOCATIONS`, #487).\nOmitted (defaults to `false`) when serialized.",
+          "description": "Whether `calls` (together with their `from_ranges`) was capped below\nthe LSP server's full response",
           "type": "boolean"
         }
       },
@@ -2860,20 +2904,18 @@
   {
     "name": "get_references",
     "title": "Find References",
-    "description": "References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`.",
+    "description": "References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
         "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.\n\nOnly tools whose input schema declares `context` act on it.\n\n# Examples\n\n```\nuse mcpls_core::bridge::ResultContext;\n\nassert_eq!(ResultContext::default(), ResultContext::None);\nlet parsed: ResultContext = serde_json::from_str(\"\\\"enclosing_symbol\\\"\").unwrap();\nassert_eq!(parsed, ResultContext::EnclosingSymbol);\n```",
+          "description": "Extra context a tool can attach to each returned item.",
           "oneOf": [
             {
               "const": "none",
-              "description": "Return the plain result with no extra lookups.",
               "type": "string"
             },
             {
               "const": "enclosing_symbol",
-              "description": "Attach the innermost enclosing symbol (name path, kind, range) to each\nitem, at the cost of one `textDocument/documentSymbol` request per\ndistinct file, capped per call.",
               "type": "string"
             }
           ]
@@ -2893,7 +2935,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
           "type": [
             "string",
             "null"
@@ -2902,7 +2944,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
+          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -2925,7 +2967,7 @@
         },
         "symbol_kind": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
           "type": [
             "string",
             "null"
@@ -2933,7 +2975,7 @@
         },
         "symbol_name": {
           "default": null,
-          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`.",
           "type": [
             "string",
             "null"
@@ -2948,19 +2990,16 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.",
           "properties": {
             "enclosing_symbol": {
-              "$ref": "#/$defs/EnclosingSymbolOutcome",
-              "description": "Present only when `context: \"enclosing_symbol\"` was requested."
+              "$ref": "#/$defs/EnclosingSymbolOutcome"
             },
             "out_of_workspace": {
-              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (a legitimate\nresult routinely points into the standard library or a dependency),\nso callers that want to apply their own policy toward out-of-workspace\nlocations can check this flag. The check is purely lexical -- it does\nnot resolve symlinks. A root counts together with the spellings it\nwas configured or launched under (for example a symlinked path or the\nshell's logical working directory), but a location reached through any\nother symlink (e.g. a package manager's symlinked dependency store)\ncan read `true` even though it is genuinely inside the workspace. Also\nalways `true` when no workspace roots are configured: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
               "type": "boolean"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range within the document."
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -2977,25 +3016,21 @@
           "description": "The innermost symbol containing an item.",
           "properties": {
             "fidelity": {
-              "$ref": "#/$defs/SymbolFidelity",
-              "description": "How complete `name_path` is."
+              "$ref": "#/$defs/SymbolFidelity"
             },
             "kind": {
-              "description": "LSP numeric symbol kind, the same value `get_document_symbols`\nreports (usable as a `kind_filter`).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name_path": {
-              "description": "Symbol names from the outermost ancestor down to the symbol itself.",
               "items": {
                 "type": "string"
               },
               "type": "array"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the symbol (1-based)."
+              "$ref": "#/$defs/Range"
             }
           },
           "required": [
@@ -3007,11 +3042,10 @@
           "type": "object"
         },
         "EnclosingSymbolOutcome": {
-          "description": "What is known about the enclosing symbol of one item.\n\n`top_level` means the file's symbols were read and none contains the\nitem. `not_computed` and `unavailable` mean nothing is known and must\nnever be read as top level.",
+          "description": "What is known about the enclosing symbol of one item.",
           "oneOf": [
             {
               "$ref": "#/$defs/EnclosingSymbol",
-              "description": "The innermost containing symbol.",
               "properties": {
                 "status": {
                   "const": "resolved",
@@ -3024,7 +3058,6 @@
               "type": "object"
             },
             {
-              "description": "No symbol of the file contains the item.",
               "properties": {
                 "status": {
                   "const": "top_level",
@@ -3055,7 +3088,6 @@
               "type": "object"
             },
             {
-              "description": "The lookup was attempted and failed.",
               "properties": {
                 "reason": {
                   "$ref": "#/$defs/UnavailableReason",
@@ -3078,17 +3110,14 @@
           "description": "Result-level statement about how complete the enrichment is.",
           "properties": {
             "cut_short": {
-              "description": "Whether the file cap or the time budget skipped some files, so a\nretry with fewer items may enrich more.",
               "type": "boolean"
             },
             "files_enriched": {
-              "description": "Distinct files whose symbol tree was obtained.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "files_skipped": {
-              "description": "Distinct files for which no symbol tree was obtained, for any reason.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -3106,22 +3135,18 @@
           "oneOf": [
             {
               "const": "file_cap",
-              "description": "The call already enriched the maximum number of distinct files.",
               "type": "string"
             },
             {
               "const": "out_of_workspace",
-              "description": "The file is outside every workspace root, so it is not opened.",
               "type": "string"
             },
             {
               "const": "tracker_limit",
-              "description": "The document tracker is at its limit and could not open the file.",
               "type": "string"
             },
             {
               "const": "deadline",
-              "description": "The call's overall enrichment time budget was spent.",
               "type": "string"
             }
           ]
@@ -3130,7 +3155,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -3153,12 +3177,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -3168,12 +3190,10 @@
           "oneOf": [
             {
               "const": "selection_range",
-              "description": "The server's `selectionRange` start, verified to spell the name.",
               "type": "string"
             },
             {
               "const": "inferred",
-              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
               "type": "string"
             }
           ]
@@ -3197,32 +3217,26 @@
           "type": "object"
         },
         "ResolvedSymbol": {
-          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
           "properties": {
             "container": {
-              "description": "Enclosing symbol, when the server reports one.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "Numeric LSP `SymbolKind`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "The symbol's name as the server reports it.",
               "type": "string"
             },
             "position": {
-              "$ref": "#/$defs/Position2D",
-              "description": "The 1-based position that was queried."
+              "$ref": "#/$defs/Position2D"
             },
             "position_source": {
-              "$ref": "#/$defs/PositionSource",
-              "description": "How `position` was determined."
+              "$ref": "#/$defs/PositionSource"
             }
           },
           "required": [
@@ -3238,12 +3252,10 @@
           "oneOf": [
             {
               "const": "hierarchical",
-              "description": "Built from the server's `DocumentSymbol` ancestor chain: complete.",
               "type": "string"
             },
             {
               "const": "flat",
-              "description": "Built from a flat `SymbolInformation` list: at most one container\nsegment from `containerName`, so ancestors may be missing.",
               "type": "string"
             }
           ]
@@ -3253,17 +3265,14 @@
           "oneOf": [
             {
               "const": "capability_absent",
-              "description": "The routed server does not advertise `documentSymbolProvider`.",
               "type": "string"
             },
             {
               "const": "request_failed",
-              "description": "The `documentSymbol` request or file open failed.",
               "type": "string"
             },
             {
               "const": "timed_out",
-              "description": "The `documentSymbol` request timed out.",
               "type": "string"
             }
           ]
@@ -3273,7 +3282,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how many files were enriched or skipped, and whether\nthe file cap or time budget cut it short."
+          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
         },
         "locations": {
           "description": "Locations of all references.",
@@ -3284,7 +3293,7 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "resolved_symbol": {
           "anyOf": [
@@ -3298,7 +3307,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more references\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
           "type": "boolean"
         }
       },
@@ -3563,12 +3572,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -3612,7 +3619,7 @@
               ]
             },
             "label": {
-              "description": "Label of the parameter, or `None` when the server gave an offset pair\ninto the signature label that does not resolve to a substring of it\n(out of range, inside a character, or reversed).",
+              "description": "Label of the parameter, or `None` when the server gave an offset pair\ninto the signature label that",
               "type": [
                 "string",
                 "null"
@@ -3651,7 +3658,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "signatures": {
           "description": "Available signatures.",
@@ -3676,14 +3683,56 @@
   {
     "name": "get_subtypes",
     "title": "Subtypes",
-    "description": "Subtypes (derived classes, implementors) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Subtypes (derived classes, implementors) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
+          "properties": {
+            "data": {},
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range"
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -3718,41 +3767,50 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/HierarchyItem",
+          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes"
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
           "properties": {
-            "data": {
-              "description": "Opaque data to pass back unchanged."
-            },
+            "data": {},
             "detail": {
-              "description": "More detail for this item.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "Name of the type.",
+              "description": "Name of the symbol.",
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
               "type": "boolean"
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Range of the type."
+              "description": "Range of the symbol."
             },
             "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -3767,27 +3825,11 @@
             "selectionRange"
           ],
           "type": "object"
-        }
-      },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "item": {
-          "$ref": "#/$defs/TypeHierarchyItemResult",
-          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
-        }
-      },
-      "required": [
-        "item"
-      ],
-      "type": "object"
-    },
-    "outputSchema": {
-      "$defs": {
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -3810,12 +3852,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -3837,55 +3877,6 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
-          "properties": {
-            "data": {
-              "description": "Opaque data to pass back unchanged."
-            },
-            "detail": {
-              "description": "More detail for this item.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "name": {
-              "description": "Name of the type.",
-              "type": "string"
-            },
-            "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
-              "type": "boolean"
-            },
-            "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the type."
-            },
-            "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
-            },
-            "uri": {
-              "description": "URI of the document.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "name",
-            "kind",
-            "uri",
-            "range",
-            "selectionRange"
-          ],
-          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3893,16 +3884,16 @@
         "items": {
           "description": "Type hierarchy items at the position, or the supertypes/subtypes of\nthe queried item.",
           "items": {
-            "$ref": "#/$defs/TypeHierarchyItemResult"
+            "$ref": "#/$defs/HierarchyItem"
           },
           "type": "array"
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`). Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`).",
           "type": "boolean"
         }
       },
@@ -3921,14 +3912,56 @@
   {
     "name": "get_supertypes",
     "title": "Supertypes",
-    "description": "Supertypes (base classes, implemented interfaces) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Supertypes (base classes, implemented interfaces) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
+          "properties": {
+            "data": {},
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range"
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -3963,41 +3996,50 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/HierarchyItem",
+          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes"
+        }
+      },
+      "required": [
+        "item"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
           "properties": {
-            "data": {
-              "description": "Opaque data to pass back unchanged."
-            },
+            "data": {},
             "detail": {
-              "description": "More detail for this item.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "Name of the type.",
+              "description": "Name of the symbol.",
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
               "type": "boolean"
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Range of the type."
+              "description": "Range of the symbol."
             },
             "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -4012,27 +4054,11 @@
             "selectionRange"
           ],
           "type": "object"
-        }
-      },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "item": {
-          "$ref": "#/$defs/TypeHierarchyItemResult",
-          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
-        }
-      },
-      "required": [
-        "item"
-      ],
-      "type": "object"
-    },
-    "outputSchema": {
-      "$defs": {
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -4055,12 +4081,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -4082,55 +4106,6 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
-          "properties": {
-            "data": {
-              "description": "Opaque data to pass back unchanged."
-            },
-            "detail": {
-              "description": "More detail for this item.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "name": {
-              "description": "Name of the type.",
-              "type": "string"
-            },
-            "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
-              "type": "boolean"
-            },
-            "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the type."
-            },
-            "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
-            },
-            "uri": {
-              "description": "URI of the document.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "name",
-            "kind",
-            "uri",
-            "range",
-            "selectionRange"
-          ],
-          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4138,16 +4113,16 @@
         "items": {
           "description": "Type hierarchy items at the position, or the supertypes/subtypes of\nthe queried item.",
           "items": {
-            "$ref": "#/$defs/TypeHierarchyItemResult"
+            "$ref": "#/$defs/HierarchyItem"
           },
           "type": "array"
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`). Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`).",
           "type": "boolean"
         }
       },
@@ -4187,7 +4162,7 @@
           "type": "string"
         },
         "RouteShape": {
-          "description": "One route of a tool in the report: the languages sharing this support\nstatus (absent for workspace-wide tools) and the status itself.",
+          "description": "One route of a tool in the report: the languages sharing this support\nstatus (absent for",
           "oneOf": [
             {
               "description": "The routed server is registered and advertises the tool's capability.",
@@ -4271,7 +4246,7 @@
           "type": "object"
         },
         "ServerId": {
-          "description": "Unique identity of a configured LSP server within a workspace.\n\nDerived from [`LspServerConfig::id`]: a server's explicit `name` if set,\notherwise its `language_id`. This is the key used throughout the bridge\nlayer (`Translator::lsp_clients`, `lsp_servers`, notification receivers)\ninstead of a raw language string, so two servers sharing a language no\nlonger silently overwrite each other.",
+          "description": "Unique identity of a configured LSP server within a workspace.",
           "type": "string"
         },
         "ToolCoverage": {
@@ -4368,7 +4343,7 @@
   {
     "name": "go_to_declaration",
     "title": "Go to Declaration",
-    "description": "Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -4399,19 +4374,16 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.",
           "properties": {
             "enclosing_symbol": {
-              "$ref": "#/$defs/EnclosingSymbolOutcome",
-              "description": "Present only when `context: \"enclosing_symbol\"` was requested."
+              "$ref": "#/$defs/EnclosingSymbolOutcome"
             },
             "out_of_workspace": {
-              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (a legitimate\nresult routinely points into the standard library or a dependency),\nso callers that want to apply their own policy toward out-of-workspace\nlocations can check this flag. The check is purely lexical -- it does\nnot resolve symlinks. A root counts together with the spellings it\nwas configured or launched under (for example a symlinked path or the\nshell's logical working directory), but a location reached through any\nother symlink (e.g. a package manager's symlinked dependency store)\ncan read `true` even though it is genuinely inside the workspace. Also\nalways `true` when no workspace roots are configured: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
               "type": "boolean"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range within the document."
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -4428,25 +4400,21 @@
           "description": "The innermost symbol containing an item.",
           "properties": {
             "fidelity": {
-              "$ref": "#/$defs/SymbolFidelity",
-              "description": "How complete `name_path` is."
+              "$ref": "#/$defs/SymbolFidelity"
             },
             "kind": {
-              "description": "LSP numeric symbol kind, the same value `get_document_symbols`\nreports (usable as a `kind_filter`).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name_path": {
-              "description": "Symbol names from the outermost ancestor down to the symbol itself.",
               "items": {
                 "type": "string"
               },
               "type": "array"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the symbol (1-based)."
+              "$ref": "#/$defs/Range"
             }
           },
           "required": [
@@ -4458,11 +4426,10 @@
           "type": "object"
         },
         "EnclosingSymbolOutcome": {
-          "description": "What is known about the enclosing symbol of one item.\n\n`top_level` means the file's symbols were read and none contains the\nitem. `not_computed` and `unavailable` mean nothing is known and must\nnever be read as top level.",
+          "description": "What is known about the enclosing symbol of one item.",
           "oneOf": [
             {
               "$ref": "#/$defs/EnclosingSymbol",
-              "description": "The innermost containing symbol.",
               "properties": {
                 "status": {
                   "const": "resolved",
@@ -4475,7 +4442,6 @@
               "type": "object"
             },
             {
-              "description": "No symbol of the file contains the item.",
               "properties": {
                 "status": {
                   "const": "top_level",
@@ -4506,7 +4472,6 @@
               "type": "object"
             },
             {
-              "description": "The lookup was attempted and failed.",
               "properties": {
                 "reason": {
                   "$ref": "#/$defs/UnavailableReason",
@@ -4529,17 +4494,14 @@
           "description": "Result-level statement about how complete the enrichment is.",
           "properties": {
             "cut_short": {
-              "description": "Whether the file cap or the time budget skipped some files, so a\nretry with fewer items may enrich more.",
               "type": "boolean"
             },
             "files_enriched": {
-              "description": "Distinct files whose symbol tree was obtained.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "files_skipped": {
-              "description": "Distinct files for which no symbol tree was obtained, for any reason.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -4557,22 +4519,18 @@
           "oneOf": [
             {
               "const": "file_cap",
-              "description": "The call already enriched the maximum number of distinct files.",
               "type": "string"
             },
             {
               "const": "out_of_workspace",
-              "description": "The file is outside every workspace root, so it is not opened.",
               "type": "string"
             },
             {
               "const": "tracker_limit",
-              "description": "The document tracker is at its limit and could not open the file.",
               "type": "string"
             },
             {
               "const": "deadline",
-              "description": "The call's overall enrichment time budget was spent.",
               "type": "string"
             }
           ]
@@ -4581,7 +4539,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -4604,12 +4561,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -4637,12 +4592,10 @@
           "oneOf": [
             {
               "const": "hierarchical",
-              "description": "Built from the server's `DocumentSymbol` ancestor chain: complete.",
               "type": "string"
             },
             {
               "const": "flat",
-              "description": "Built from a flat `SymbolInformation` list: at most one container\nsegment from `containerName`, so ancestors may be missing.",
               "type": "string"
             }
           ]
@@ -4652,17 +4605,14 @@
           "oneOf": [
             {
               "const": "capability_absent",
-              "description": "The routed server does not advertise `documentSymbolProvider`.",
               "type": "string"
             },
             {
               "const": "request_failed",
-              "description": "The `documentSymbol` request or file open failed.",
               "type": "string"
             },
             {
               "const": "timed_out",
-              "description": "The `documentSymbol` request timed out.",
               "type": "string"
             }
           ]
@@ -4672,7 +4622,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how many files were enriched or skipped, and whether\nthe file cap or time budget cut it short."
+          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
         },
         "locations": {
           "description": "Locations found.",
@@ -4690,10 +4640,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
           "type": "boolean"
         }
       },
@@ -4712,20 +4662,18 @@
   {
     "name": "go_to_implementation",
     "title": "Go to Implementation",
-    "description": "Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`.",
+    "description": "Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
         "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.\n\nOnly tools whose input schema declares `context` act on it.\n\n# Examples\n\n```\nuse mcpls_core::bridge::ResultContext;\n\nassert_eq!(ResultContext::default(), ResultContext::None);\nlet parsed: ResultContext = serde_json::from_str(\"\\\"enclosing_symbol\\\"\").unwrap();\nassert_eq!(parsed, ResultContext::EnclosingSymbol);\n```",
+          "description": "Extra context a tool can attach to each returned item.",
           "oneOf": [
             {
               "const": "none",
-              "description": "Return the plain result with no extra lookups.",
               "type": "string"
             },
             {
               "const": "enclosing_symbol",
-              "description": "Attach the innermost enclosing symbol (name path, kind, range) to each\nitem, at the cost of one `textDocument/documentSymbol` request per\ndistinct file, capped per call.",
               "type": "string"
             }
           ]
@@ -4745,7 +4693,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
           "type": [
             "string",
             "null"
@@ -4754,7 +4702,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
+          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -4772,7 +4720,7 @@
         },
         "symbol_kind": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
           "type": [
             "string",
             "null"
@@ -4780,7 +4728,7 @@
         },
         "symbol_name": {
           "default": null,
-          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`.",
           "type": [
             "string",
             "null"
@@ -4795,19 +4743,16 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.",
           "properties": {
             "enclosing_symbol": {
-              "$ref": "#/$defs/EnclosingSymbolOutcome",
-              "description": "Present only when `context: \"enclosing_symbol\"` was requested."
+              "$ref": "#/$defs/EnclosingSymbolOutcome"
             },
             "out_of_workspace": {
-              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (a legitimate\nresult routinely points into the standard library or a dependency),\nso callers that want to apply their own policy toward out-of-workspace\nlocations can check this flag. The check is purely lexical -- it does\nnot resolve symlinks. A root counts together with the spellings it\nwas configured or launched under (for example a symlinked path or the\nshell's logical working directory), but a location reached through any\nother symlink (e.g. a package manager's symlinked dependency store)\ncan read `true` even though it is genuinely inside the workspace. Also\nalways `true` when no workspace roots are configured: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
               "type": "boolean"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range within the document."
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -4824,25 +4769,21 @@
           "description": "The innermost symbol containing an item.",
           "properties": {
             "fidelity": {
-              "$ref": "#/$defs/SymbolFidelity",
-              "description": "How complete `name_path` is."
+              "$ref": "#/$defs/SymbolFidelity"
             },
             "kind": {
-              "description": "LSP numeric symbol kind, the same value `get_document_symbols`\nreports (usable as a `kind_filter`).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name_path": {
-              "description": "Symbol names from the outermost ancestor down to the symbol itself.",
               "items": {
                 "type": "string"
               },
               "type": "array"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the symbol (1-based)."
+              "$ref": "#/$defs/Range"
             }
           },
           "required": [
@@ -4854,11 +4795,10 @@
           "type": "object"
         },
         "EnclosingSymbolOutcome": {
-          "description": "What is known about the enclosing symbol of one item.\n\n`top_level` means the file's symbols were read and none contains the\nitem. `not_computed` and `unavailable` mean nothing is known and must\nnever be read as top level.",
+          "description": "What is known about the enclosing symbol of one item.",
           "oneOf": [
             {
               "$ref": "#/$defs/EnclosingSymbol",
-              "description": "The innermost containing symbol.",
               "properties": {
                 "status": {
                   "const": "resolved",
@@ -4871,7 +4811,6 @@
               "type": "object"
             },
             {
-              "description": "No symbol of the file contains the item.",
               "properties": {
                 "status": {
                   "const": "top_level",
@@ -4902,7 +4841,6 @@
               "type": "object"
             },
             {
-              "description": "The lookup was attempted and failed.",
               "properties": {
                 "reason": {
                   "$ref": "#/$defs/UnavailableReason",
@@ -4925,17 +4863,14 @@
           "description": "Result-level statement about how complete the enrichment is.",
           "properties": {
             "cut_short": {
-              "description": "Whether the file cap or the time budget skipped some files, so a\nretry with fewer items may enrich more.",
               "type": "boolean"
             },
             "files_enriched": {
-              "description": "Distinct files whose symbol tree was obtained.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "files_skipped": {
-              "description": "Distinct files for which no symbol tree was obtained, for any reason.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -4953,22 +4888,18 @@
           "oneOf": [
             {
               "const": "file_cap",
-              "description": "The call already enriched the maximum number of distinct files.",
               "type": "string"
             },
             {
               "const": "out_of_workspace",
-              "description": "The file is outside every workspace root, so it is not opened.",
               "type": "string"
             },
             {
               "const": "tracker_limit",
-              "description": "The document tracker is at its limit and could not open the file.",
               "type": "string"
             },
             {
               "const": "deadline",
-              "description": "The call's overall enrichment time budget was spent.",
               "type": "string"
             }
           ]
@@ -4977,7 +4908,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -5000,12 +4930,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -5015,12 +4943,10 @@
           "oneOf": [
             {
               "const": "selection_range",
-              "description": "The server's `selectionRange` start, verified to spell the name.",
               "type": "string"
             },
             {
               "const": "inferred",
-              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
               "type": "string"
             }
           ]
@@ -5044,32 +4970,26 @@
           "type": "object"
         },
         "ResolvedSymbol": {
-          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
           "properties": {
             "container": {
-              "description": "Enclosing symbol, when the server reports one.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "Numeric LSP `SymbolKind`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "The symbol's name as the server reports it.",
               "type": "string"
             },
             "position": {
-              "$ref": "#/$defs/Position2D",
-              "description": "The 1-based position that was queried."
+              "$ref": "#/$defs/Position2D"
             },
             "position_source": {
-              "$ref": "#/$defs/PositionSource",
-              "description": "How `position` was determined."
+              "$ref": "#/$defs/PositionSource"
             }
           },
           "required": [
@@ -5085,12 +5005,10 @@
           "oneOf": [
             {
               "const": "hierarchical",
-              "description": "Built from the server's `DocumentSymbol` ancestor chain: complete.",
               "type": "string"
             },
             {
               "const": "flat",
-              "description": "Built from a flat `SymbolInformation` list: at most one container\nsegment from `containerName`, so ancestors may be missing.",
               "type": "string"
             }
           ]
@@ -5100,17 +5018,14 @@
           "oneOf": [
             {
               "const": "capability_absent",
-              "description": "The routed server does not advertise `documentSymbolProvider`.",
               "type": "string"
             },
             {
               "const": "request_failed",
-              "description": "The `documentSymbol` request or file open failed.",
               "type": "string"
             },
             {
               "const": "timed_out",
-              "description": "The `documentSymbol` request timed out.",
               "type": "string"
             }
           ]
@@ -5120,7 +5035,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how many files were enriched or skipped, and whether\nthe file cap or time budget cut it short."
+          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
         },
         "locations": {
           "description": "Locations found.",
@@ -5138,7 +5053,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "resolved_symbol": {
           "anyOf": [
@@ -5152,7 +5067,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
           "type": "boolean"
         }
       },
@@ -5171,20 +5086,18 @@
   {
     "name": "go_to_type_definition",
     "title": "Go to Type Definition",
-    "description": "Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`.",
+    "description": "Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
         "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.\n\nOnly tools whose input schema declares `context` act on it.\n\n# Examples\n\n```\nuse mcpls_core::bridge::ResultContext;\n\nassert_eq!(ResultContext::default(), ResultContext::None);\nlet parsed: ResultContext = serde_json::from_str(\"\\\"enclosing_symbol\\\"\").unwrap();\nassert_eq!(parsed, ResultContext::EnclosingSymbol);\n```",
+          "description": "Extra context a tool can attach to each returned item.",
           "oneOf": [
             {
               "const": "none",
-              "description": "Return the plain result with no extra lookups.",
               "type": "string"
             },
             {
               "const": "enclosing_symbol",
-              "description": "Attach the innermost enclosing symbol (name path, kind, range) to each\nitem, at the cost of one `textDocument/documentSymbol` request per\ndistinct file, capped per call.",
               "type": "string"
             }
           ]
@@ -5204,7 +5117,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
           "type": [
             "string",
             "null"
@@ -5213,7 +5126,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
+          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -5231,7 +5144,7 @@
         },
         "symbol_kind": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
           "type": [
             "string",
             "null"
@@ -5239,7 +5152,7 @@
         },
         "symbol_name": {
           "default": null,
-          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`.",
           "type": [
             "string",
             "null"
@@ -5254,19 +5167,16 @@
     "outputSchema": {
       "$defs": {
         "ContextualLocation": {
-          "description": "A [`Location`] optionally carrying its enclosing symbol.",
+          "description": "An item optionally carrying its enclosing symbol.",
           "properties": {
             "enclosing_symbol": {
-              "$ref": "#/$defs/EnclosingSymbolOutcome",
-              "description": "Present only when `context: \"enclosing_symbol\"` was requested."
+              "$ref": "#/$defs/EnclosingSymbolOutcome"
             },
             "out_of_workspace": {
-              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (a legitimate\nresult routinely points into the standard library or a dependency),\nso callers that want to apply their own policy toward out-of-workspace\nlocations can check this flag. The check is purely lexical -- it does\nnot resolve symlinks. A root counts together with the spellings it\nwas configured or launched under (for example a symlinked path or the\nshell's logical working directory), but a location reached through any\nother symlink (e.g. a package manager's symlinked dependency store)\ncan read `true` even though it is genuinely inside the workspace. Also\nalways `true` when no workspace roots are configured: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
               "type": "boolean"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range within the document."
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -5283,25 +5193,21 @@
           "description": "The innermost symbol containing an item.",
           "properties": {
             "fidelity": {
-              "$ref": "#/$defs/SymbolFidelity",
-              "description": "How complete `name_path` is."
+              "$ref": "#/$defs/SymbolFidelity"
             },
             "kind": {
-              "description": "LSP numeric symbol kind, the same value `get_document_symbols`\nreports (usable as a `kind_filter`).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name_path": {
-              "description": "Symbol names from the outermost ancestor down to the symbol itself.",
               "items": {
                 "type": "string"
               },
               "type": "array"
             },
             "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the symbol (1-based)."
+              "$ref": "#/$defs/Range"
             }
           },
           "required": [
@@ -5313,11 +5219,10 @@
           "type": "object"
         },
         "EnclosingSymbolOutcome": {
-          "description": "What is known about the enclosing symbol of one item.\n\n`top_level` means the file's symbols were read and none contains the\nitem. `not_computed` and `unavailable` mean nothing is known and must\nnever be read as top level.",
+          "description": "What is known about the enclosing symbol of one item.",
           "oneOf": [
             {
               "$ref": "#/$defs/EnclosingSymbol",
-              "description": "The innermost containing symbol.",
               "properties": {
                 "status": {
                   "const": "resolved",
@@ -5330,7 +5235,6 @@
               "type": "object"
             },
             {
-              "description": "No symbol of the file contains the item.",
               "properties": {
                 "status": {
                   "const": "top_level",
@@ -5361,7 +5265,6 @@
               "type": "object"
             },
             {
-              "description": "The lookup was attempted and failed.",
               "properties": {
                 "reason": {
                   "$ref": "#/$defs/UnavailableReason",
@@ -5384,17 +5287,14 @@
           "description": "Result-level statement about how complete the enrichment is.",
           "properties": {
             "cut_short": {
-              "description": "Whether the file cap or the time budget skipped some files, so a\nretry with fewer items may enrich more.",
               "type": "boolean"
             },
             "files_enriched": {
-              "description": "Distinct files whose symbol tree was obtained.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "files_skipped": {
-              "description": "Distinct files for which no symbol tree was obtained, for any reason.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -5412,22 +5312,18 @@
           "oneOf": [
             {
               "const": "file_cap",
-              "description": "The call already enriched the maximum number of distinct files.",
               "type": "string"
             },
             {
               "const": "out_of_workspace",
-              "description": "The file is outside every workspace root, so it is not opened.",
               "type": "string"
             },
             {
               "const": "tracker_limit",
-              "description": "The document tracker is at its limit and could not open the file.",
               "type": "string"
             },
             {
               "const": "deadline",
-              "description": "The call's overall enrichment time budget was spent.",
               "type": "string"
             }
           ]
@@ -5436,7 +5332,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -5459,12 +5354,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -5474,12 +5367,10 @@
           "oneOf": [
             {
               "const": "selection_range",
-              "description": "The server's `selectionRange` start, verified to spell the name.",
               "type": "string"
             },
             {
               "const": "inferred",
-              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
               "type": "string"
             }
           ]
@@ -5503,32 +5394,26 @@
           "type": "object"
         },
         "ResolvedSymbol": {
-          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
           "properties": {
             "container": {
-              "description": "Enclosing symbol, when the server reports one.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "Numeric LSP `SymbolKind`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "The symbol's name as the server reports it.",
               "type": "string"
             },
             "position": {
-              "$ref": "#/$defs/Position2D",
-              "description": "The 1-based position that was queried."
+              "$ref": "#/$defs/Position2D"
             },
             "position_source": {
-              "$ref": "#/$defs/PositionSource",
-              "description": "How `position` was determined."
+              "$ref": "#/$defs/PositionSource"
             }
           },
           "required": [
@@ -5544,12 +5429,10 @@
           "oneOf": [
             {
               "const": "hierarchical",
-              "description": "Built from the server's `DocumentSymbol` ancestor chain: complete.",
               "type": "string"
             },
             {
               "const": "flat",
-              "description": "Built from a flat `SymbolInformation` list: at most one container\nsegment from `containerName`, so ancestors may be missing.",
               "type": "string"
             }
           ]
@@ -5559,17 +5442,14 @@
           "oneOf": [
             {
               "const": "capability_absent",
-              "description": "The routed server does not advertise `documentSymbolProvider`.",
               "type": "string"
             },
             {
               "const": "request_failed",
-              "description": "The `documentSymbol` request or file open failed.",
               "type": "string"
             },
             {
               "const": "timed_out",
-              "description": "The `documentSymbol` request timed out.",
               "type": "string"
             }
           ]
@@ -5579,7 +5459,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how many files were enriched or skipped, and whether\nthe file cap or time budget cut it short."
+          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
         },
         "locations": {
           "description": "Locations found.",
@@ -5597,7 +5477,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "resolved_symbol": {
           "anyOf": [
@@ -5611,7 +5491,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations\nexist than are returned here. Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
           "type": "boolean"
         }
       },
@@ -5630,7 +5510,7 @@
   {
     "name": "prepare_call_hierarchy",
     "title": "Prepare Call Hierarchy",
-    "description": "Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -5646,7 +5526,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
           "type": [
             "string",
             "null"
@@ -5668,7 +5548,7 @@
         },
         "symbol_kind": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
           "type": [
             "string",
             "null"
@@ -5676,7 +5556,7 @@
         },
         "symbol_name": {
           "default": null,
-          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`.",
           "type": [
             "string",
             "null"
@@ -5690,21 +5570,17 @@
     },
     "outputSchema": {
       "$defs": {
-        "CallHierarchyItemResult": {
-          "description": "A call hierarchy item.",
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
           "properties": {
-            "data": {
-              "description": "Opaque data to pass to incoming/outgoing calls."
-            },
+            "data": {},
             "detail": {
-              "description": "More detail for this item.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -5714,7 +5590,6 @@
               "type": "string"
             },
             "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`] for the exact semantics\nand caveats (advisory only, lexical, symlink-unaware).",
               "type": "boolean"
             },
             "range": {
@@ -5722,8 +5597,7 @@
               "description": "Range of the symbol."
             },
             "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+              "$ref": "#/$defs/Range"
             },
             "uri": {
               "description": "URI of the document.",
@@ -5743,7 +5617,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -5766,12 +5639,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -5781,12 +5652,10 @@
           "oneOf": [
             {
               "const": "selection_range",
-              "description": "The server's `selectionRange` start, verified to spell the name.",
               "type": "string"
             },
             {
               "const": "inferred",
-              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
               "type": "string"
             }
           ]
@@ -5810,32 +5679,26 @@
           "type": "object"
         },
         "ResolvedSymbol": {
-          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
           "properties": {
             "container": {
-              "description": "Enclosing symbol, when the server reports one.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "Numeric LSP `SymbolKind`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "The symbol's name as the server reports it.",
               "type": "string"
             },
             "position": {
-              "$ref": "#/$defs/Position2D",
-              "description": "The 1-based position that was queried."
+              "$ref": "#/$defs/Position2D"
             },
             "position_source": {
-              "$ref": "#/$defs/PositionSource",
-              "description": "How `position` was determined."
+              "$ref": "#/$defs/PositionSource"
             }
           },
           "required": [
@@ -5852,7 +5715,7 @@
         "items": {
           "description": "List of callable items at the position.",
           "items": {
-            "$ref": "#/$defs/CallHierarchyItemResult"
+            "$ref": "#/$defs/HierarchyItem"
           },
           "type": "array"
         },
@@ -5865,7 +5728,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "resolved_symbol": {
           "anyOf": [
@@ -5879,7 +5742,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`, #516). Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`,",
           "type": "boolean"
         }
       },
@@ -5932,7 +5795,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -5955,12 +5817,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -6012,7 +5872,7 @@
           "type": "object"
         },
         {
-          "description": "The server accepts a rename here but leaves the identifier range to the\nclient's own word-selection rule; no range is invented.",
+          "description": "The server accepts a rename here but leaves the identifier range to the\nclient's own word-selection",
           "properties": {
             "status": {
               "const": "default_behavior",
@@ -6025,7 +5885,7 @@
           "type": "object"
         },
         {
-          "description": "The position cannot be renamed. Distinct from a transport failure and\nfrom a server that does not support rename preparation.",
+          "description": "The position cannot be renamed.",
           "properties": {
             "server_message": {
               "description": "The server's own explanation, when it reported one as an error.",
@@ -6048,7 +5908,7 @@
       "properties": {
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         }
       },
       "type": "object"
@@ -6063,7 +5923,7 @@
   {
     "name": "prepare_type_hierarchy",
     "title": "Prepare Type Hierarchy",
-    "description": "Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -6093,11 +5953,53 @@
     },
     "outputSchema": {
       "$defs": {
+        "HierarchyItem": {
+          "description": "A call or type hierarchy item.",
+          "properties": {
+            "data": {},
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "out_of_workspace": {
+              "type": "boolean"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range"
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -6120,12 +6022,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -6147,55 +6047,6 @@
             "end"
           ],
           "type": "object"
-        },
-        "TypeHierarchyItemResult": {
-          "description": "A type hierarchy item, returned by `prepare_type_hierarchy`,\n`get_supertypes` and `get_subtypes` and accepted back as the typed `item`\ninput of the latter two.\n\n# Examples\n\n```\nuse mcpls_core::bridge::TypeHierarchyItemResult;\n\nlet item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({\n    \"name\": \"Base\", \"kind\": 5, \"uri\": \"file:///a.cpp\",\n    \"range\": {\"start\": {\"line\": 1, \"character\": 1}, \"end\": {\"line\": 2, \"character\": 1}},\n    \"selectionRange\": {\"start\": {\"line\": 1, \"character\": 7}, \"end\": {\"line\": 1, \"character\": 11}},\n}))\n.unwrap();\nassert_eq!(item.name, \"Base\");\nassert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());\n```\n\nSame shape as a call hierarchy item; `data` is opaque to the caller\nand meaningful only to the server that produced the item.",
-          "properties": {
-            "data": {
-              "description": "Opaque data to pass back unchanged."
-            },
-            "detail": {
-              "description": "More detail for this item.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "kind": {
-              "description": "LSP numeric symbol kind (e.g. 5 for Class).",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "name": {
-              "description": "Name of the type.",
-              "type": "string"
-            },
-            "out_of_workspace": {
-              "description": "Whether this item is not provably inside any configured workspace\nroot -- see [`Location::out_of_workspace`]. Ignored on input.",
-              "type": "boolean"
-            },
-            "range": {
-              "$ref": "#/$defs/Range",
-              "description": "Range of the type."
-            },
-            "selectionRange": {
-              "$ref": "#/$defs/Range",
-              "description": "Selection range (identifier location)."
-            },
-            "uri": {
-              "description": "URI of the document.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "name",
-            "kind",
-            "uri",
-            "range",
-            "selectionRange"
-          ],
-          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6203,16 +6054,16 @@
         "items": {
           "description": "Type hierarchy items at the position, or the supertypes/subtypes of\nthe queried item.",
           "items": {
-            "$ref": "#/$defs/TypeHierarchyItemResult"
+            "$ref": "#/$defs/HierarchyItem"
           },
           "type": "array"
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
-          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`). Omitted (defaults to `false`) when\nserialized.",
+          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`).",
           "type": "boolean"
         }
       },
@@ -6231,7 +6082,7 @@
   {
     "name": "rename_symbol",
     "title": "Rename Symbol",
-    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. An ambiguous name never produces an edit. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. An ambiguous name never produces an edit. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -6247,7 +6098,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name.",
+          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
           "type": [
             "string",
             "null"
@@ -6273,7 +6124,7 @@
         },
         "symbol_kind": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value.",
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
           "type": [
             "string",
             "null"
@@ -6281,7 +6132,7 @@
         },
         "symbol_name": {
           "default": null,
-          "description": "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them.",
+          "description": "Name of a symbol defined in this file, instead of `line`/`character`.",
           "type": [
             "string",
             "null"
@@ -6318,34 +6169,28 @@
           "type": "object"
         },
         "DroppedEdits": {
-          "description": "Counts of `WorkspaceEdit` entries withheld during conversion to MCP DTOs,\nbroken down by reason (#475).\n\n`convert_workspace_edit` silently discarded such entries with only a\n`tracing` log line, so a client applying a [`RenameResult`] or\n`WorkspaceEditDescription` straight to disk could not tell \"nothing to\nrename\" apart from \"some of the rename was withheld\" -- this makes that\ndistinction visible in the result itself.",
           "properties": {
             "exceeds_item_cap": {
-              "description": "Edits not admitted because the response exceeded\n`MAX_NORMALIZED_LOCATIONS` (#487), including whole files skipped once\nthe budget was spent.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "out_of_workspace": {
-              "description": "Entries referencing a URI outside every configured workspace root.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "shadowed_by_changes": {
-              "description": "`documentChanges` text-document edits ignored because a non-empty\n`changes` map took precedence and did not already name their URI\n(#498).",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "unsupported_file_operation": {
-              "description": "`CreateFile`/`RenameFile`/`DeleteFile` document changes, which mcpls\ndoes not translate into MCP DTOs.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "unsupported_snippet_edit": {
-              "description": "`SnippetTextEdit` entries, which mcpls does not translate since it\nadvertises no `snippetEditSupport`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -6357,7 +6202,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -6380,12 +6224,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -6395,12 +6237,10 @@
           "oneOf": [
             {
               "const": "selection_range",
-              "description": "The server's `selectionRange` start, verified to spell the name.",
               "type": "string"
             },
             {
               "const": "inferred",
-              "description": "The only whole-word occurrence of the name inside the symbol's range,\nfound in the document text because the server gave no usable\n`selectionRange`.",
               "type": "string"
             }
           ]
@@ -6424,32 +6264,26 @@
           "type": "object"
         },
         "ResolvedSymbol": {
-          "description": "The symbol a name resolved to, reported so the caller can audit and reuse\nthe queried position.",
           "properties": {
             "container": {
-              "description": "Enclosing symbol, when the server reports one.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "kind": {
-              "description": "Numeric LSP `SymbolKind`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
             "name": {
-              "description": "The symbol's name as the server reports it.",
               "type": "string"
             },
             "position": {
-              "$ref": "#/$defs/Position2D",
-              "description": "The 1-based position that was queried."
+              "$ref": "#/$defs/Position2D"
             },
             "position_source": {
-              "$ref": "#/$defs/PositionSource",
-              "description": "How `position` was determined."
+              "$ref": "#/$defs/PositionSource"
             }
           },
           "required": [
@@ -6490,7 +6324,7 @@
         },
         "dropped": {
           "$ref": "#/$defs/DroppedEdits",
-          "description": "Entries withheld from `changes` -- see [`DroppedEdits`]. A non-empty\nvalue means the rename is incomplete even if `changes` is non-empty,\nand callers must not treat this result as the full rename otherwise."
+          "description": "Entries withheld from `changes` -- see [`DroppedEdits`]."
         },
         "positions_degraded": {
           "anyOf": [
@@ -6501,7 +6335,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "resolved_symbol": {
           "anyOf": [
@@ -6558,7 +6392,7 @@
     "outputSchema": {
       "$defs": {
         "IndexingState": {
-          "description": "Workspace-indexing readiness of a routed LSP server.\n\nTracked separately from the `initialize`/`initialized` handshake\ncompletion (`ServerState::is_ready`). A server can finish the handshake\nand still be mid-index for tens of seconds afterward, during which\nwhole-workspace queries (hover, definition, references, completions,\ncode actions) can silently return an empty/`null` result\nindistinguishable from a genuine \"nothing found\".\n\n`Unknown` and `Ready` are treated identically by\n`Translator::wait_for_indexing_ready` (proceed without waiting): a server\nthat never emits a recognized readiness signal must never be penalized\nwith an artificial delay, and the only way to tell \"no signal ever comes\"\napart from \"just hasn't reported yet\" would require guessing at a\nserver's protocol support, so both stay unblocked. Only `Loading` -- a\npositive signal that indexing is actively in progress -- triggers a\nbounded wait.",
+          "description": "Workspace-indexing readiness of a routed LSP server.",
           "oneOf": [
             {
               "const": "unknown",
@@ -6578,7 +6412,7 @@
           ]
         },
         "RestartFailure": {
-          "description": "Why a restart failed after the old process was already stopped.\n\nThe server stays registered as dead; the next tool call retries the spawn\nunder the normal crash-loop backoff.",
+          "description": "Why a restart failed after the old process was already stopped.",
           "oneOf": [
             {
               "description": "The replacement process could not be started.",
@@ -6632,7 +6466,7 @@
           ]
         },
         "ServerId": {
-          "description": "Unique identity of a configured LSP server within a workspace.\n\nDerived from [`LspServerConfig::id`]: a server's explicit `name` if set,\notherwise its `language_id`. This is the key used throughout the bridge\nlayer (`Translator::lsp_clients`, `lsp_servers`, notification receivers)\ninstead of a raw language string, so two servers sharing a language no\nlonger silently overwrite each other.",
+          "description": "Unique identity of a configured LSP server within a workspace.",
           "type": "string"
         },
         "ServerRestartEntry": {
@@ -6642,7 +6476,7 @@
               "description": "The server runs a freshly initialized process.",
               "properties": {
                 "coalesced": {
-                  "description": "Another restart of the same server finished while this request\nwaited, so no second restart was performed.",
+                  "description": "Another restart of the same server finished while this request\nwaited, so no second restart was",
                   "type": "boolean"
                 },
                 "indexing_state": {
@@ -6650,7 +6484,7 @@
                   "description": "Indexing readiness of the new process."
                 },
                 "push_notifications_degraded": {
-                  "description": "Push diagnostics for this server are still not live. A restart\nclears this; it stays set if a crash respawn raced in afterwards\nand restarting again is needed.",
+                  "description": "Push diagnostics for this server are still not live.",
                   "type": "boolean"
                 },
                 "status": {
@@ -6718,7 +6552,7 @@
               "type": "object"
             },
             {
-              "description": "The server never started (or failed at startup), so there is no\nprocess to restart. Fix the cause and restart mcpls.",
+              "description": "The server never started (or failed at startup), so there is no\nprocess to restart.",
               "properties": {
                 "message": {
                   "description": "Why the server is not running.",
@@ -6773,12 +6607,12 @@
   {
     "name": "workspace_symbol_search",
     "title": "Workspace Symbol Search",
-    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact.",
+    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "kind_filter": {
-          "description": "Optional filter by symbol kind: a name (function, class, variable, etc.) or the numeric LSP SymbolKind value from a result's kind field. A name is validated against the known kinds; a numeric value is accepted as-is with no validation, so one that matches no symbol returns an empty result rather than an error.",
+          "description": "Optional filter by symbol kind: a name (function, class, variable, etc.) or the numeric LSP",
           "type": [
             "string",
             "null"
@@ -6807,7 +6641,7 @@
           "description": "Location in a document.",
           "properties": {
             "out_of_workspace": {
-              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g. the standard library or a crates.io dependency).\n\nAdvisory only, not a security/safety guarantee: read-only navigation\nresults are never filtered by workspace containment (a legitimate\nresult routinely points into the standard library or a dependency),\nso callers that want to apply their own policy toward out-of-workspace\nlocations can check this flag. The check is purely lexical -- it does\nnot resolve symlinks. A root counts together with the spellings it\nwas configured or launched under (for example a symlinked path or the\nshell's logical working directory), but a location reached through any\nother symlink (e.g. a package manager's symlinked dependency store)\ncan read `true` even though it is genuinely inside the workspace. Also\nalways `true` when no workspace roots are configured: without a\nconfigured root, nothing can be vouched for as inside the workspace.\nOmitted (defaults to `false`) when serialized.",
+              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g.",
               "type": "boolean"
             },
             "range": {
@@ -6829,7 +6663,6 @@
           "description": "Position in a document (1-based for MCP).",
           "properties": {
             "character": {
-              "description": "Character offset (1-based).",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -6852,12 +6685,10 @@
           "oneOf": [
             {
               "const": "response",
-              "description": "Only offsets in the returned data may be inexact. The result still\ndescribes the symbol that was asked about; keep it and treat the\nreturned `character` values as approximate.",
               "type": "string"
             },
             {
               "const": "request",
-              "description": "The queried position was sent to the server unconverted, so the result\nmay describe a different symbol. Do not trust it.",
               "type": "string"
             }
           ]
@@ -6924,7 +6755,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only); omitted when all are exact. Tells whether the queried position\nor only the returned offsets are affected."
+          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "symbols": {
           "description": "List of symbols found.",
@@ -6934,7 +6765,7 @@
           "type": "array"
         },
         "truncated": {
-          "description": "Whether more symbols matched than are returned in `symbols` -- set\nwhenever any are dropped, whether by the caller's own smaller\n`limit` or by the server-side maximum it's clamped to (see\n`MAX_NORMALIZED_LOCATIONS`, #474); this does not distinguish which of\nthe two caused it. Omitted (defaults to `false`) when serialized.",
+          "description": "Whether more symbols matched than are returned in `symbols` -- set\nwhenever any are dropped,",
           "type": "boolean"
         }
       },

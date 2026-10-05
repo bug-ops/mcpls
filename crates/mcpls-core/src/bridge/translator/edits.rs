@@ -12,25 +12,21 @@ use tokio::task::JoinSet;
 use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
-    CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, DroppedEdits,
+    BoundedRange, CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, DroppedEdits,
     FormatDocumentResult, Position, PrepareRenameOutcome, PrepareRenameResult, RenameResult,
     TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate, validate_position, validate_range};
+use super::routing::{Capability, IndexingGate};
 use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
 use crate::error::{Error, McpErrorKind, Result};
 use crate::escape_control;
-use crate::lsp::LspClient;
+use crate::lsp::{LspClient, UnclassifiedError};
 
-/// Validate parameters for `handle_code_actions`.
-fn validate_code_action_params(
-    start: Position,
-    end: Position,
-    kind_filter: Option<&str>,
-) -> Result<()> {
+/// Validate the `kind_filter` of `handle_code_actions`.
+fn validate_kind_filter(kind_filter: Option<&str>) -> Result<()> {
     const VALID_ACTION_KINDS: &[&str] = &[
         "quickfix",
         "refactor",
@@ -51,7 +47,7 @@ fn validate_code_action_params(
         )));
     }
 
-    validate_range(start, end)
+    Ok(())
 }
 
 /// Maximum length, in bytes, of a `rename_symbol` `new_name` parameter.
@@ -518,17 +514,22 @@ const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// out-of-range position as `-32602` with its "Invalid offset" text, so
 /// `mcp_error_kind` is consulted first: a caller-fault position stays an
 /// error and is never read as "not renameable".
-fn prepare_rename_rejection(err: Error) -> Result<PrepareRenameOutcome> {
-    let message = match &err {
+fn prepare_rename_rejection(err: UnclassifiedError) -> Result<PrepareRenameOutcome> {
+    let message = match err.error() {
         Error::LspServerError {
             code: JSONRPC_INVALID_PARAMS,
             message,
             ..
-        } if !matches!(err.mcp_error_kind(), McpErrorKind::InvalidPosition(_)) => {
+        } if !matches!(
+            err.error().mcp_error_kind(),
+            McpErrorKind::InvalidPosition(_)
+        ) =>
+        {
             escape_control(message).into_owned()
         }
-        _ => return Err(err),
+        _ => return Err(err.surface()),
     };
+    drop(err.handled());
     Ok(PrepareRenameOutcome::NotRenameable {
         server_message: Some(message),
     })
@@ -614,8 +615,6 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<PrepareRenameResult> {
-        validate_position(position)?;
-
         let doc = self
             .prepare_gated_document(
                 &file_path,
@@ -637,7 +636,10 @@ impl Translator {
         };
 
         let response = client
-            .request_typed::<lsp_types::PrepareRenameRequest>(params, client.request_timeout())
+            .request_typed_classified::<lsp_types::PrepareRenameRequest>(
+                params,
+                client.request_timeout(),
+            )
             .await;
         let outcome = match response {
             Ok(Some(lsp_types::PrepareRenameResult::Range(range))) => {
@@ -725,13 +727,11 @@ impl Translator {
     pub async fn handle_format_range(
         &self,
         file_path: ClientPath,
-        start: Position,
-        end: Position,
+        range: BoundedRange,
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
-        validate_range(start, end)?;
-
+        let (start, end) = (range.range().start(), range.range().end());
         let doc = self
             .prepare_gated_document(
                 &file_path,
@@ -786,11 +786,11 @@ impl Translator {
     pub async fn handle_code_actions(
         &self,
         file_path: ClientPath,
-        start: Position,
-        end: Position,
+        range: BoundedRange,
         kind_filter: Option<String>,
     ) -> Result<CodeActionsResult> {
-        validate_code_action_params(start, end, kind_filter.as_deref())?;
+        validate_kind_filter(kind_filter.as_deref())?;
+        let (start, end) = (range.range().start(), range.range().end());
 
         let doc = self
             .prepare_gated_document(&file_path, Capability::CodeActions, IndexingGate::Required)
@@ -922,10 +922,7 @@ mod tests {
                 translator
                     .handle_rename(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 4,
-                        },
+                        Position::at(1, 4),
                         "new_name".to_string(),
                     )
                     .await
@@ -1034,10 +1031,7 @@ mod tests {
                 translator
                     .handle_rename(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 4,
-                        },
+                        Position::at(1, 4),
                         "new_name".to_string(),
                     )
                     .await
@@ -1137,14 +1131,7 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 client_path("/tmp/test.rs"),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 10,
-                },
+                bounded(Position::at(1, 1), Position::at(1, 10)),
                 Some("invalid_kind".to_string()),
             )
             .await;
@@ -1166,14 +1153,7 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 10,
-                },
+                bounded(Position::at(1, 1), Position::at(1, 10)),
                 Some("quickfix".to_string()),
             )
             .await;
@@ -1197,14 +1177,7 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 10,
-                },
+                bounded(Position::at(1, 1), Position::at(1, 10)),
                 Some("refactor".to_string()),
             )
             .await;
@@ -1227,14 +1200,7 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 10,
-                },
+                bounded(Position::at(1, 1), Position::at(1, 10)),
                 Some("refactor.extract".to_string()),
             )
             .await;
@@ -1257,59 +1223,12 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 10,
-                },
+                bounded(Position::at(1, 1), Position::at(1, 10)),
                 Some("source.organizeImports".to_string()),
             )
             .await;
         assert!(result.is_err());
         assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
-    }
-
-    #[tokio::test]
-    async fn test_handle_code_actions_invalid_range_zero() {
-        let translator = Translator::new();
-        let result = translator
-            .handle_code_actions(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 0,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 10,
-                },
-                None,
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[tokio::test]
-    async fn test_handle_code_actions_invalid_range_order() {
-        let translator = Translator::new();
-        let result = translator
-            .handle_code_actions(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 10,
-                    character: 5,
-                },
-                Position {
-                    line: 5,
-                    character: 1,
-                },
-                None,
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
     #[tokio::test]
@@ -1328,14 +1247,7 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
-                Position {
-                    line: 1,
-                    character: 5,
-                },
-                Position {
-                    line: 1,
-                    character: 5,
-                },
+                bounded(Position::at(1, 5), Position::at(1, 5)),
                 None,
             )
             .await;
@@ -1584,7 +1496,7 @@ mod tests {
     }
 
     /// #558: an edit whose URI uses an alias spelling of a root (configured
-    /// symlink, logical `$PWD`) is kept, like `validate_path_against_roots`
+    /// symlink, logical `$PWD`) is kept, like `WorkspaceRoots::validate`
     /// would admit it; an unrelated URI is still dropped.
     #[cfg(unix)]
     #[tokio::test]
@@ -2449,14 +2361,7 @@ mod tests {
         let err = translator
             .handle_code_actions(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 10,
-                },
+                bounded(Position::at(1, 1), Position::at(1, 10)),
                 None,
             )
             .await
@@ -2507,14 +2412,7 @@ mod tests {
                 translator
                     .handle_code_actions(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        Position {
-                            line: 1,
-                            character: 10,
-                        },
+                        bounded(Position::at(1, 1), Position::at(1, 10)),
                         None,
                     )
                     .await
@@ -2585,14 +2483,7 @@ mod tests {
                 translator
                     .handle_code_actions(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        Position {
-                            line: 1,
-                            character: 10,
-                        },
+                        bounded(Position::at(1, 1), Position::at(1, 10)),
                         None,
                     )
                     .await
@@ -2697,14 +2588,7 @@ mod tests {
                 translator
                     .handle_code_actions(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        Position {
-                            line: 1,
-                            character: 10,
-                        },
+                        bounded(Position::at(1, 1), Position::at(1, 10)),
                         None,
                     )
                     .await
@@ -2787,14 +2671,7 @@ mod tests {
                 translator
                     .handle_code_actions(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        Position {
-                            line: 1,
-                            character: 10,
-                        },
+                        bounded(Position::at(1, 1), Position::at(1, 10)),
                         None,
                     )
                     .await
@@ -2887,14 +2764,7 @@ mod tests {
                 translator
                     .handle_code_actions(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        Position {
-                            line: 1,
-                            character: 10,
-                        },
+                        bounded(Position::at(1, 1), Position::at(1, 10)),
                         None,
                     )
                     .await
@@ -2995,14 +2865,7 @@ mod tests {
                 translator
                     .handle_code_actions(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        Position {
-                            line: 1,
-                            character: 10,
-                        },
+                        bounded(Position::at(1, 1), Position::at(1, 10)),
                         None,
                     )
                     .await
@@ -3074,10 +2937,7 @@ mod tests {
         let err = translator
             .handle_rename(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 4,
-                },
+                Position::at(1, 4),
                 "new_name".to_string(),
             )
             .await
@@ -3128,10 +2988,7 @@ mod tests {
                 translator
                     .handle_rename(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 4,
-                        },
+                        Position::at(1, 4),
                         "new_name".to_string(),
                     )
                     .await

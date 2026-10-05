@@ -8,8 +8,8 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, SignatureHelpResult,
-    SignatureInfo, SignatureParameter, lsp_kind_to_u32,
+    Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, PositionRange,
+    SignatureHelpResult, SignatureInfo, SignatureParameter, lsp_kind_to_u32,
 };
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
@@ -279,9 +279,9 @@ impl Translator {
     pub async fn handle_inlay_hints(
         &self,
         file_path: ClientPath,
-        start: Position,
-        end: Position,
+        range: PositionRange,
     ) -> Result<InlayHintsResult> {
+        let (start, end) = (range.start(), range.end());
         let doc = self
             .prepare_gated_document(
                 &file_path,
@@ -407,10 +407,7 @@ mod tests {
         let err = translator
             .handle_completions(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 None,
             )
             .await
@@ -459,14 +456,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_completions(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        None,
-                    )
+                    .handle_completions(client_path(path), Position::at(1, 1), None)
                     .await
             })
         };
@@ -519,7 +509,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_inlay_hints(client_path(path), pos(1, 1), pos(1, 13))
+                    .handle_inlay_hints(client_path(path), span(pos(1, 1), pos(1, 13)))
                     .await
             })
         };
@@ -576,7 +566,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_inlay_hints(client_path(path), pos(1, 1), pos(1, 13))
+                    .handle_inlay_hints(client_path(path), span(pos(1, 1), pos(1, 13)))
                     .await
             })
         };

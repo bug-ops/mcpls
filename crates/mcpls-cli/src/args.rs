@@ -1,8 +1,11 @@
 //! Command-line argument parsing.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::Parser;
+
+use crate::logging::LogFilter;
 
 /// Parses a boolean flag/env value, accepting common truthy and falsy
 /// spellings beyond the strict `"true"`/`"false"` that `str::parse::<bool>`
@@ -81,11 +84,14 @@ pub struct Args {
     #[arg(long, env = "MCPLS_TRUST_PROJECT_CONFIG", value_parser = parse_bool_flag)]
     pub trust_project_config: bool,
 
-    /// Logging level
+    /// Logging level or filter directives
     ///
-    /// Valid values: trace, debug, info, warn, error
-    #[arg(short, long, default_value = "info", env = "MCPLS_LOG")]
-    pub log_level: String,
+    /// A level (trace, debug, info, warn, error, off) or comma-separated
+    /// `target=level` directives such as `info,mcpls_core=debug`. A bare word
+    /// must be a level (`mcpls_core` alone is rejected; use `mcpls_core=trace`),
+    /// and an unknown level is rejected at startup.
+    #[arg(short, long, default_value = "info", env = "MCPLS_LOG", value_parser = LogFilter::from_str)]
+    pub log_level: LogFilter,
 
     /// Output logs as JSON (for structured logging)
     ///
@@ -262,7 +268,7 @@ mod tests {
     fn test_default_args() {
         let args = Args::parse_from(["mcpls"]);
         assert!(args.config.is_none());
-        assert_eq!(args.log_level, "info");
+        assert_eq!(args.log_level.as_str(), "info");
         assert!(!args.log_json);
     }
 
@@ -297,14 +303,15 @@ mod tests {
     #[test]
     fn test_log_level_arg() {
         let args = Args::parse_from(["mcpls", "--log-level", "debug"]);
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_str(), "debug");
     }
 
     #[test]
     fn test_log_level_short_flag() {
         let args = Args::parse_from(["mcpls", "-l", "trace"]);
         assert_eq!(
-            args.log_level, "trace",
+            args.log_level.as_str(),
+            "trace",
             "Short flag -l should work for log-level"
         );
     }
@@ -316,7 +323,8 @@ mod tests {
         for level in &valid_levels {
             let args = Args::parse_from(["mcpls", "--log-level", level]);
             assert_eq!(
-                args.log_level, *level,
+                args.log_level.as_str(),
+                *level,
                 "Log level {level} should be accepted"
             );
         }
@@ -327,7 +335,8 @@ mod tests {
         let args = Args::parse_from(["mcpls", "--log-json"]);
         assert!(args.log_json, "Flag --log-json should enable JSON logging");
         assert_eq!(
-            args.log_level, "info",
+            args.log_level.as_str(),
+            "info",
             "Default log level should still be info"
         );
     }
@@ -350,7 +359,7 @@ mod tests {
         ]);
 
         assert_eq!(args.config, Some(PathBuf::from("/custom/config.toml")));
-        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.log_level.as_str(), "debug");
         assert!(args.log_json);
     }
 
@@ -370,11 +379,18 @@ mod tests {
     }
 
     #[test]
-    fn test_log_level_case_sensitive() {
+    fn test_log_level_preserves_case() {
         let args = Args::parse_from(["mcpls", "--log-level", "DEBUG"]);
-        assert_eq!(
-            args.log_level, "DEBUG",
-            "Log level should preserve case (validation happens later)"
+        assert_eq!(args.log_level.as_str(), "DEBUG");
+    }
+
+    #[test]
+    fn test_log_level_typo_is_rejected_at_parse() {
+        let result = Args::try_parse_from(["mcpls", "--log-level", "debgu"]);
+        assert!(
+            result
+                .err()
+                .is_some_and(|err| err.to_string().contains("invalid log level 'debgu'"))
         );
     }
 
@@ -390,7 +406,7 @@ mod tests {
         ]);
 
         assert_eq!(args.config, Some(PathBuf::from("/path/to/config.toml")));
-        assert_eq!(args.log_level, "warn");
+        assert_eq!(args.log_level.as_str(), "warn");
         assert!(args.log_json);
     }
 

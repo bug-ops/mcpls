@@ -27,7 +27,9 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, LspSettings, PositionEncodings};
-use crate::error::{Error, InitFailureHint, Result, ServerSpawnFailure, StartupFailure};
+use crate::error::{
+    BackgroundTask, Error, InitFailureHint, Result, ServerSpawnFailure, StartupFailure, StdioStream,
+};
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 #[cfg(unix)]
 use crate::lsp::process::Binding;
@@ -199,6 +201,13 @@ pub struct ServerInitConfig {
     /// Sent as `capabilities.general.positionEncodings` during [`LspServer::spawn`]'s
     /// `initialize` handshake, in the configured order.
     pub position_encodings: PositionEncodings,
+    /// Secrets of every configured server, hidden in this server's output.
+    ///
+    /// [`LspServer::spawn`] adds the secrets of this server's own
+    /// configuration and current environment, so an empty set still hides
+    /// them; `serve` fills it with the secrets of every configured server, so
+    /// a server that echoes another's secret has it hidden too.
+    pub redactions: Arc<Redactions>,
 }
 
 /// The terminal outcome of starting one configured server.
@@ -332,12 +341,8 @@ impl LspServer {
     /// - The `initialized` or `workspace/didChangeConfiguration` notification
     ///   cannot be written ([`Error::LspInitFailed`])
     pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
-        let redactions = Arc::new(Redactions::for_server(
-            &config.server_config,
-            std::env::vars_os().filter_map(|(name, value)| {
-                Some((name.into_string().ok()?, value.into_string().ok()?))
-            }),
-        ));
+        let own = Redactions::for_server(&config.server_config, current_environment());
+        let redactions = Arc::new(Redactions::union([config.redactions.as_ref(), &own]));
         Self::log_spawn(&config.server_config, &redactions);
 
         let command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
@@ -371,14 +376,14 @@ impl LspServer {
 
         let stdin = child
             .take_stdin()
-            .ok_or_else(|| Error::Transport("Failed to capture stdin".to_string()))?;
+            .ok_or(Error::StdioCapture(StdioStream::Stdin))?;
         let stdout = child
             .take_stdout()
-            .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
+            .ok_or(Error::StdioCapture(StdioStream::Stdout))?;
 
         let stderr = child
             .take_stderr()
-            .ok_or_else(|| Error::Transport("Failed to capture stderr".to_string()))?;
+            .ok_or(Error::StdioCapture(StdioStream::Stderr))?;
         let stderr_capture = StderrCapture::start(stderr);
 
         let transport = LspTransport::with_redactions(stdin, stdout, Arc::clone(&redactions));
@@ -1042,7 +1047,14 @@ where
 /// Whether `error` means the connection to the server is gone, as opposed to
 /// the server answering with a failure of its own.
 const fn is_connection_loss(error: &Error) -> bool {
-    matches!(error, Error::ServerTerminated | Error::Transport(_))
+    matches!(
+        error,
+        Error::ServerTerminated
+            | Error::TaskFailed {
+                task: BackgroundTask::LspReceiver,
+                ..
+            }
+    )
 }
 
 /// Exit status of `child` if it has exited (or does so within
@@ -1061,16 +1073,20 @@ fn spawn_error(command: String, source: std::io::Error) -> Error {
     }
 }
 
+/// The process environment as `(name, value)` pairs, skipping non-UTF-8 entries.
+pub fn current_environment() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
 /// Build the `workspace/workspaceFolders` entry for one configured root.
 ///
 /// Reserved characters have to be percent-encoded here: an unencoded `#`
 /// would truncate the path into a URI fragment, and `[` / `]` are rejected
 /// outright by `Uri`.
 fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
-    let uri = try_path_to_uri(root).ok_or_else(|| {
-        let root_display = root.display();
-        Error::InvalidUri(format!("Invalid workspace root: {root_display}"))
-    })?;
+    let uri = try_path_to_uri(root).ok_or_else(|| Error::PathToUri(root.to_path_buf()))?;
     Ok(WorkspaceFolder {
         uri,
         name: root
@@ -1291,7 +1307,7 @@ mod tests {
     #[test]
     fn test_workspace_folder_rejects_relative_root() {
         let err = workspace_folder(Path::new("relative/root")).unwrap_err();
-        assert_matches!(err, Error::InvalidUri(_), "got {err:?}");
+        assert_matches!(err, Error::PathToUri(_), "got {err:?}");
     }
 
     #[test]
@@ -1334,6 +1350,7 @@ mod tests {
             workspace_roots: vec![PathBuf::from("/tmp/workspace")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
             position_encodings: PositionEncodings::DEFAULT,
+            redactions: std::sync::Arc::default(),
         };
 
         #[allow(clippy::redundant_clone)]
@@ -1349,6 +1366,7 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: PositionEncodings::DEFAULT,
+            redactions: std::sync::Arc::default(),
         };
 
         let debug_str = format!("{config:?}");
@@ -1392,6 +1410,7 @@ mod tests {
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
             position_encodings: PositionEncodings::DEFAULT,
+            redactions: std::sync::Arc::default(),
         };
 
         assert!(config.initialization_options.is_some());
@@ -1405,6 +1424,7 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: PositionEncodings::DEFAULT,
+            redactions: std::sync::Arc::default(),
         };
 
         assert_eq!(config.workspace_roots.len(), 0);
@@ -1421,6 +1441,7 @@ mod tests {
             ],
             initialization_options: None,
             position_encodings: PositionEncodings::DEFAULT,
+            redactions: std::sync::Arc::default(),
         };
 
         assert_eq!(config.workspace_roots.len(), 3);
@@ -1575,15 +1596,25 @@ mod tests {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: PositionEncodings::DEFAULT,
+            redactions: std::sync::Arc::default(),
         };
         let err = LspServer::spawn(config).await.unwrap_err();
         assert_matches!(err, Error::ServerNotFound { .. }, "got {err:?}");
     }
 
-    #[test]
-    fn test_is_connection_loss_excludes_server_replies() {
+    #[tokio::test]
+    async fn test_is_connection_loss_excludes_server_replies() {
+        let join_error = tokio::spawn(async { panic!("receiver died") })
+            .await
+            .unwrap_err();
         assert!(is_connection_loss(&Error::ServerTerminated));
-        assert!(is_connection_loss(&Error::Transport("eof".to_string())));
+        assert!(is_connection_loss(&Error::TaskFailed {
+            task: BackgroundTask::LspReceiver,
+            source: join_error,
+        }));
+        assert!(!is_connection_loss(&Error::StdioCapture(
+            StdioStream::Stdin
+        )));
         assert!(!is_connection_loss(&Error::LspServerError {
             code: -32603,
             message: "bad".to_string(),
@@ -1755,6 +1786,37 @@ echo 'fatal: bad toolchain' >&2
             panic!("got {err:?}");
         };
         assert_eq!(stderr.head(), "indexing forever");
+    }
+
+    /// #612: a secret of another configured server, handed in through the
+    /// init config, is hidden from this server's output although its own
+    /// configuration does not name it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_hides_another_servers_secret_from_stderr() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = crate::test_lsp::sh_script_init_config(
+            dir.path(),
+            "echo \"seen=$OTHER_VALUE own=$API_TOKEN\" >&2\nexit 1\n",
+        );
+        config
+            .server_config
+            .env
+            .insert("OTHER_VALUE".to_string(), "bravo-secret-222".to_string());
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        config.redactions = std::sync::Arc::new(Redactions::new([(
+            "B_TOKEN".to_owned(),
+            "bravo-secret-222".to_owned(),
+        )]));
+
+        let err = LspServer::spawn(config).await.unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("seen=[redacted:B_TOKEN]"), "{text}");
+        assert!(text.contains("own=[redacted:API_TOKEN]"), "{text}");
     }
 
     /// Values configured in `env` never reach the error text.
@@ -1994,6 +2056,7 @@ sleep 5
                     PositionEncoding::Utf8,
                 ])
                 .unwrap(),
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =
@@ -2128,6 +2191,7 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: PositionEncodings::DEFAULT,
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =
@@ -2178,6 +2242,7 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: PositionEncodings::DEFAULT,
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =
@@ -2214,6 +2279,7 @@ sleep 5
                 workspace_roots: vec![],
                 initialization_options: None,
                 position_encodings: PositionEncodings::DEFAULT,
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =
@@ -2270,6 +2336,7 @@ sleep 5
                 workspace_roots,
                 initialization_options: None,
                 position_encodings: PositionEncodings::DEFAULT,
+                redactions: std::sync::Arc::default(),
             };
 
             let init_task =

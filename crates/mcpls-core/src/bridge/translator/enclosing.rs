@@ -140,74 +140,48 @@ pub struct EnrichmentSummary {
     pub cut_short: bool,
 }
 
-/// A [`Location`] optionally carrying its enclosing symbol.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ContextualLocation {
-    /// The location itself.
+/// An item optionally carrying its enclosing symbol.
+///
+/// Serializes as the item's own fields with `enclosing_symbol` alongside, so
+/// the default output of a tool is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "Contextual{T}")]
+pub struct Contextual<T> {
+    /// The item itself.
     #[serde(flatten)]
-    pub location: Location,
+    pub inner: T,
     /// Present only when `context: "enclosing_symbol"` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "EnclosingSymbolOutcome")]
     pub enclosing_symbol: Option<EnclosingSymbolOutcome>,
 }
 
-impl From<Location> for ContextualLocation {
-    fn from(location: Location) -> Self {
-        Self {
-            location,
-            enclosing_symbol: None,
-        }
-    }
-}
-
-impl Deref for ContextualLocation {
-    type Target = Location;
-
-    fn deref(&self) -> &Location {
-        &self.location
-    }
-}
+/// A [`Location`] optionally carrying its enclosing symbol.
+pub type ContextualLocation = Contextual<Location>;
 
 /// A [`Diagnostic`] optionally carrying its enclosing symbol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ContextualDiagnostic {
-    /// The diagnostic itself.
-    #[serde(flatten)]
-    pub diagnostic: Diagnostic,
-    /// Present only when `context: "enclosing_symbol"` was requested.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "EnclosingSymbolOutcome")]
-    pub enclosing_symbol: Option<EnclosingSymbolOutcome>,
-}
+pub type ContextualDiagnostic = Contextual<Diagnostic>;
 
-impl From<Diagnostic> for ContextualDiagnostic {
-    fn from(diagnostic: Diagnostic) -> Self {
+impl<T> From<T> for Contextual<T> {
+    fn from(inner: T) -> Self {
         Self {
-            diagnostic,
+            inner,
             enclosing_symbol: None,
         }
     }
 }
 
-impl Deref for ContextualDiagnostic {
-    type Target = Diagnostic;
+impl<T> Deref for Contextual<T> {
+    type Target = T;
 
-    fn deref(&self) -> &Diagnostic {
-        &self.diagnostic
+    fn deref(&self) -> &T {
+        &self.inner
     }
 }
 
-/// Locations after the optional enrichment pass.
-pub(super) struct ContextualLocations {
-    pub(super) locations: Vec<ContextualLocation>,
-    pub(super) enrichment: Option<EnrichmentSummary>,
-    pub(super) positions_degraded: Option<PositionDegradation>,
-}
-
-/// Diagnostics after the optional enrichment pass.
-pub(super) struct ContextualDiagnostics {
-    pub(super) diagnostics: Vec<ContextualDiagnostic>,
+/// Items after the optional enrichment pass.
+pub(super) struct Contextualized<T> {
+    pub(super) items: Vec<Contextual<T>>,
     pub(super) enrichment: Option<EnrichmentSummary>,
     pub(super) positions_degraded: Option<PositionDegradation>,
 }
@@ -369,38 +343,18 @@ impl Translator {
         locations: Vec<Location>,
         context: ResultContext,
         positions_degraded: Option<PositionDegradation>,
-    ) -> ContextualLocations {
-        if context == ResultContext::None || locations.is_empty() {
-            return ContextualLocations {
-                locations: locations
-                    .into_iter()
-                    .map(ContextualLocation::from)
-                    .collect(),
-                enrichment: None,
-                positions_degraded,
-            };
-        }
-        let hits: Vec<Hit<'_>> = locations
-            .iter()
-            .map(|location| Hit {
+    ) -> Contextualized<Location> {
+        self.contextualize_items(
+            locations,
+            &(),
+            context,
+            positions_degraded,
+            |(), location| Hit {
                 uri: &location.uri,
                 range: &location.range,
-            })
-            .collect();
-        let resolution = self.resolve_enclosing(&hits).await;
-        let locations = locations
-            .into_iter()
-            .zip(resolution.outcomes)
-            .map(|(location, outcome)| ContextualLocation {
-                location,
-                enclosing_symbol: Some(outcome),
-            })
-            .collect();
-        ContextualLocations {
-            locations,
-            enrichment: Some(resolution.summary),
-            positions_degraded: positions_degraded.max(resolution.positions_degraded),
-        }
+            },
+        )
+        .await
     }
 
     /// Attaches enclosing symbols to the diagnostics of the file `uri` when
@@ -411,35 +365,49 @@ impl Translator {
         diagnostics: Vec<Diagnostic>,
         context: ResultContext,
         positions_degraded: Option<PositionDegradation>,
-    ) -> ContextualDiagnostics {
-        if context == ResultContext::None || diagnostics.is_empty() {
-            return ContextualDiagnostics {
-                diagnostics: diagnostics
-                    .into_iter()
-                    .map(ContextualDiagnostic::from)
-                    .collect(),
+    ) -> Contextualized<Diagnostic> {
+        self.contextualize_items(
+            diagnostics,
+            uri,
+            context,
+            positions_degraded,
+            |uri, diagnostic| Hit {
+                uri,
+                range: &diagnostic.range,
+            },
+        )
+        .await
+    }
+
+    /// `shared` is data every hit borrows from besides its own item, such as
+    /// the one URI of a file's diagnostics.
+    async fn contextualize_items<T: Send, S: Sync + ?Sized>(
+        &self,
+        items: Vec<T>,
+        shared: &S,
+        context: ResultContext,
+        positions_degraded: Option<PositionDegradation>,
+        hit: impl for<'a> Fn(&'a S, &'a T) -> Hit<'a> + Sync,
+    ) -> Contextualized<T> {
+        if context == ResultContext::None || items.is_empty() {
+            return Contextualized {
+                items: items.into_iter().map(Contextual::from).collect(),
                 enrichment: None,
                 positions_degraded,
             };
         }
-        let hits: Vec<Hit<'_>> = diagnostics
-            .iter()
-            .map(|diagnostic| Hit {
-                uri,
-                range: &diagnostic.range,
-            })
-            .collect();
+        let hits: Vec<Hit<'_>> = items.iter().map(|item| hit(shared, item)).collect();
         let resolution = self.resolve_enclosing(&hits).await;
-        let diagnostics = diagnostics
+        let items = items
             .into_iter()
             .zip(resolution.outcomes)
-            .map(|(diagnostic, outcome)| ContextualDiagnostic {
-                diagnostic,
+            .map(|(inner, outcome)| Contextual {
+                inner,
                 enclosing_symbol: Some(outcome),
             })
             .collect();
-        ContextualDiagnostics {
-            diagnostics,
+        Contextualized {
+            items,
             enrichment: Some(resolution.summary),
             positions_degraded: positions_degraded.max(resolution.positions_degraded),
         }
@@ -519,7 +487,7 @@ impl Translator {
         if remaining.is_zero() {
             return not_computed(NotComputedReason::Deadline);
         }
-        let Some(path) = self.parse_file_uri(&lsp_types::Uri::from(uri)).ok() else {
+        let Ok(path) = self.parse_file_uri(&lsp_types::Uri::from(uri)).await else {
             return not_computed(NotComputedReason::OutOfWorkspace);
         };
         *attempted = attempted.saturating_add(1);
@@ -572,14 +540,39 @@ impl ServerText for EnclosingSymbolOutcome {
     }
 }
 
-impl ServerText for ContextualLocation {
+impl<T: ServerText> ServerText for Contextual<T> {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         let Self {
-            location,
+            inner,
             enclosing_symbol,
         } = self;
-        location.redact_server_text(redactions);
+        inner.redact_server_text(redactions);
         enclosing_symbol.redact_server_text(redactions);
+    }
+}
+
+#[cfg(test)]
+mod contextual_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn test_contextual_serializes_flat_for_any_inner_type() {
+        let item = Contextual {
+            inner: serde_json::json!({"name": "f"}),
+            enclosing_symbol: Some(EnclosingSymbolOutcome::TopLevel),
+        };
+        let value = serde_json::to_value(&item).unwrap();
+        assert_eq!(value["name"], "f");
+        assert_eq!(value["enclosing_symbol"]["status"], "top_level");
+
+        let plain = Contextual::from(serde_json::json!({"name": "f"}));
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("enclosing_symbol")
+                .is_none()
+        );
     }
 }
 

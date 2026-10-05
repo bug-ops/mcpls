@@ -2,9 +2,13 @@
 //!
 //! [`ConnectionIo`] adds two bounds hyper does not provide:
 //!
-//! - a write-stall deadline: a write that makes no progress for
-//!   [`WriteStallTimeout`] fails with [`io::ErrorKind::TimedOut`], so a peer
-//!   that stops reading frees its connection permit;
+//! - a write-stall deadline: a write the peer does not drain at a minimum
+//!   rate fails with [`io::ErrorKind::TimedOut`], so a peer that stops
+//!   reading, or reads a trickle, frees its connection permit. A write that
+//!   goes pending opens a stall window of [`WriteStallTimeout`]; the window
+//!   closes when a flush completes or the peer has taken at least
+//!   [`MIN_WRITE_RATE_BYTES_PER_SEC`] times the window in bytes, and the
+//!   connection is cut when it expires first;
 //! - a lingering close: after the FIN, incoming bytes are discarded until the
 //!   peer closes, so a response sent while the request body is still unread
 //!   (an early `403` or `413`) is not turned into a reset that eats the status.
@@ -35,16 +39,49 @@ const LINGER_READS_PER_POLL: usize = 16;
 
 const LINGER_READ_BUFFER: usize = 4096;
 
+/// Slowest peer drain rate, in bytes per second, that keeps a stall window
+/// from expiring.
+const MIN_WRITE_RATE_BYTES_PER_SEC: u32 = 2048;
+
+/// Bounds of the bytes a peer must take within one stall window.
+const MIN_PROGRESS_FLOOR: usize = 4 * 1024;
+const MIN_PROGRESS_CEILING: usize = 1 << 20;
+
+/// Bytes the peer must take within a stall window of `window`.
+fn min_progress(window: Duration) -> usize {
+    let bytes = window
+        .as_millis()
+        .saturating_mul(u128::from(MIN_WRITE_RATE_BYTES_PER_SEC))
+        / 1000;
+    usize::try_from(bytes)
+        .unwrap_or(usize::MAX)
+        .clamp(MIN_PROGRESS_FLOOR, MIN_PROGRESS_CEILING)
+}
+
 /// `now + after`, or a year ahead (effectively never) when the sum overflows.
-fn deadline_after(now: Instant, after: Duration) -> Instant {
+pub(super) fn deadline_after(now: Instant, after: Duration) -> Instant {
     now.checked_add(after)
         .or_else(|| now.checked_add(Duration::from_hours(24 * 365)))
         .unwrap_or(now)
 }
 
+/// Bytes a completed write accepted; `0` for a pending or failed one.
+const fn bytes_written(poll: &Poll<io::Result<usize>>) -> usize {
+    match poll {
+        Poll::Ready(Ok(written)) => *written,
+        Poll::Ready(Err(_)) | Poll::Pending => 0,
+    }
+}
+
+/// An open stall window: the bytes the peer has taken since it opened.
+#[derive(Debug, Clone, Copy)]
+struct StallWindow {
+    progress: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Phase {
-    Serving { stall_armed: bool },
+    Serving { stall: Option<StallWindow> },
     Lingering { total_deadline: Instant },
     Done,
 }
@@ -61,6 +98,7 @@ pub(super) struct ConnectionIo<T> {
     timer: Pin<Box<Sleep>>,
     shutdown: Pin<Box<WaitForCancellationFutureOwned>>,
     write_stall: Duration,
+    min_progress: usize,
     linger_total: Duration,
     discarded: usize,
     phase: Phase,
@@ -83,30 +121,48 @@ impl<T> ConnectionIo<T> {
             timer: Box::pin(tokio::time::sleep(write_stall.get())),
             shutdown: Box::pin(shutdown.cancelled_owned()),
             write_stall: write_stall.get(),
+            min_progress: min_progress(write_stall.get()),
             linger_total: header_read_timeout.get().min(MAX_LINGER),
             discarded: 0,
-            phase: Phase::Serving { stall_armed: false },
+            phase: Phase::Serving { stall: None },
         }
     }
 
-    /// Applies the stall deadline to the outcome of a write-side poll.
+    /// Applies the stall window to the outcome of a write-side poll.
+    ///
+    /// `flushed` is true for a completed flush: hyper flushes only once its
+    /// write buffer is empty, so that is the one proof the peer drained
+    /// everything it was offered. A write that completes only adds to the
+    /// window's progress; hyper may keep writing into a peer that took a few
+    /// bytes per window, and the window then still expires.
     fn watch_write<R>(
         &mut self,
         cx: &mut Context<'_>,
         poll: Poll<io::Result<R>>,
+        flushed: bool,
+        written: usize,
     ) -> Poll<io::Result<R>> {
-        let Phase::Serving { stall_armed } = &mut self.phase else {
+        let Phase::Serving { stall } = &mut self.phase else {
             return poll;
         };
-        if poll.is_ready() {
-            *stall_armed = false;
+        if matches!(poll, Poll::Ready(Err(_))) || (flushed && poll.is_ready()) {
+            *stall = None;
             return poll;
         }
-        if !*stall_armed {
-            *stall_armed = true;
-            self.timer
-                .as_mut()
-                .reset(deadline_after(Instant::now(), self.write_stall));
+        let window = match (stall.as_mut(), &poll) {
+            (Some(window), _) => window,
+            (None, Poll::Pending) => {
+                self.timer
+                    .as_mut()
+                    .reset(deadline_after(Instant::now(), self.write_stall));
+                stall.insert(StallWindow { progress: 0 })
+            }
+            (None, Poll::Ready(_)) => return poll,
+        };
+        window.progress = window.progress.saturating_add(written);
+        if window.progress >= self.min_progress {
+            *stall = None;
+            return poll;
         }
         if self.timer.as_mut().poll(cx).is_ready() {
             // A peer that stopped reading gets no linger: dropping the stream closes it.
@@ -116,7 +172,7 @@ impl<T> ConnectionIo<T> {
                 "write to the peer made no progress",
             )));
         }
-        Poll::Pending
+        poll
     }
 
     /// Enters the linger unless the server is already shutting down.
@@ -203,7 +259,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ConnectionIo<T> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
-        this.watch_write(cx, poll)
+        let written = bytes_written(&poll);
+        this.watch_write(cx, poll, false, written)
     }
 
     fn poll_write_vectored(
@@ -213,7 +270,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ConnectionIo<T> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
-        this.watch_write(cx, poll)
+        let written = bytes_written(&poll);
+        this.watch_write(cx, poll, false, written)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -223,14 +281,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ConnectionIo<T> {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_flush(cx);
-        this.watch_write(cx, poll)
+        this.watch_write(cx, poll, true, 0)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if matches!(this.phase, Phase::Serving { .. }) {
             let poll = Pin::new(&mut this.inner).poll_shutdown(cx);
-            match this.watch_write(cx, poll) {
+            match this.watch_write(cx, poll, true, 0) {
                 Poll::Ready(Ok(())) => this.begin_linger(cx),
                 other => return other,
             }
@@ -242,6 +300,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ConnectionIo<T> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -335,6 +394,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn test_stalled_vectored_write_times_out_after_the_deadline() {
+        let mut io = wrap(Stuck);
+        let start = Instant::now();
+        let bufs = [io::IoSlice::new(b"head"), io::IoSlice::new(b"body")];
+
+        let err = io.write_vectored(&bufs).await.unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), STALL);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_stalled_shutdown_times_out_after_the_deadline() {
         let mut io = wrap(Stuck);
         let start = Instant::now();
@@ -346,25 +417,96 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_progress_disarms_and_the_next_stall_gets_a_fresh_deadline() {
+    async fn test_a_peer_trickling_below_the_minimum_rate_is_cut_at_the_first_deadline() {
         let (near, mut far) = tokio::io::duplex(8);
         let mut io = wrap(near);
         let start = Instant::now();
-        let writer = tokio::spawn(async move { io.write_all(&[0; 64]).await });
+        let writer = tokio::spawn(async move { io.write_all(&vec![0; 100_000]).await });
+        let reader = tokio::spawn(async move {
+            let mut chunk = [0u8; 8];
+            loop {
+                tokio::time::sleep(STALL / 4).await;
+                if far.read_exact(&mut chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let err = writer.await.unwrap().unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), STALL);
+        reader.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_peer_draining_at_the_minimum_rate_survives_many_windows() {
+        let (near, mut far) = tokio::io::duplex(32 * 1024);
+        let mut io = wrap(near);
+        let start = Instant::now();
+        let total = 400_000usize;
+        let writer = tokio::spawn(async move { io.write_all(&vec![0; total]).await });
+        let reader = tokio::spawn(async move {
+            let mut taken = 0;
+            let mut chunk = vec![0u8; 32 * 1024];
+            while taken < total {
+                tokio::time::sleep(STALL / 2).await;
+                taken += far.read(&mut chunk).await.unwrap();
+            }
+        });
+
+        writer.await.unwrap().unwrap();
+        reader.await.unwrap();
+
+        assert!(start.elapsed() > STALL * 3, "{:?}", start.elapsed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_writes_the_peer_accepts_at_once_never_open_a_window() {
+        let (near, _far) = tokio::io::duplex(1024);
+        let mut io = wrap(near);
+        for _ in 0..8 {
+            io.write_all(&[1; 16]).await.unwrap();
+            tokio::time::sleep(STALL * 2).await;
+        }
+        assert_matches!(io.phase, Phase::Serving { stall: None });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_completed_flush_closes_the_window_and_the_next_stall_starts_fresh() {
+        let (near, mut far) = tokio::io::duplex(64);
+        let mut io = wrap(near);
+        let start = Instant::now();
+        io.write_all(&[0; 64]).await.unwrap();
+        let writer = tokio::spawn(async move {
+            io.write_all(&[0; 64]).await.unwrap();
+            io.flush().await.unwrap();
+            io.write_all(&[0; 128]).await
+        });
 
         tokio::time::sleep(STALL / 2).await;
-        let mut drained = [0u8; 8];
+        let mut drained = [0u8; 64];
         far.read_exact(&mut drained).await.unwrap();
-
         tokio::time::sleep(STALL * 3 / 4).await;
         assert!(
             !writer.is_finished(),
-            "a stall that began after progress must not fire at the first deadline"
+            "a stall that began after a flush must not fire at the first deadline"
         );
 
         let err = writer.await.unwrap().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(start.elapsed(), STALL / 2 + STALL);
+    }
+
+    #[test]
+    fn test_min_progress_scales_with_the_window_and_is_clamped() {
+        assert_eq!(min_progress(Duration::from_secs(30)), 61_440);
+        assert_eq!(min_progress(Duration::from_millis(1)), MIN_PROGRESS_FLOOR);
+        assert_eq!(
+            min_progress(Duration::from_secs(10_000)),
+            MIN_PROGRESS_CEILING
+        );
+        assert_eq!(min_progress(Duration::MAX), MIN_PROGRESS_CEILING);
     }
 
     #[tokio::test(start_paused = true)]

@@ -40,8 +40,9 @@ related:
 
 - **Tools (open question 1).** Six tools, one per concern: `prepare_type_hierarchy`,
   `get_supertypes`, `get_subtypes`, `prepare_rename`, `get_document_highlights`, `format_range`.
-  The supertypes and subtypes `item` input is the typed `TypeHierarchyItemResult`, not untyped
-  JSON (NFR-002); call hierarchy keeps its existing untyped `item`.
+  The supertypes and subtypes `item` input is the typed `HierarchyItem`, not untyped
+  JSON (NFR-002). Call hierarchy shares the same `HierarchyItem` for output and for the `item` input
+  of incoming and outgoing calls (#618); a malformed item fails at deserialization.
 - **Routing (question 2).** One `ToolKind::TypeHierarchy` covers prepare, supertypes and subtypes
   (FR-014: the item is producer-bound). `prepare_rename` routes through `ToolKind::Rename`, so the
   verdict comes from the server that performs the rename. New kinds `TypeHierarchy`,
@@ -314,6 +315,7 @@ several is decided in the plan (see Open Questions).
 | FR-026 | WHEN an agent requests formatting for a 1-based line and column range, plus tab size and insert-spaces options THE SYSTEM SHALL return the text edits the server reports for `textDocument/rangeFormatting`, under the same options semantics as `format_document` | should |
 | FR-027 | WHEN the start of a formatting range is after its end, or either lies outside the document THE SYSTEM SHALL reject the request with an invalid-parameters error and issue no LSP request | should |
 | FR-028 | WHEN the routed server does not advertise the capability a Group C tool needs (`documentHighlightProvider`, `documentRangeFormattingProvider`, or rename preparation) THE SYSTEM SHALL return the typed capability-not-supported error | should |
+| FR-029 | WHEN a not-renameable answer is returned as a normal result THE SYSTEM SHALL log the underlying server error response below ERROR (an expected outcome), while a position rejected as invalid stays an ERROR-logged tool error | should |
 
 ### Cross-cutting (all groups)
 

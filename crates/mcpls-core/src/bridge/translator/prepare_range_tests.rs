@@ -164,6 +164,74 @@ async fn prepare_rename_invalid_params_error_is_not_renameable() {
     );
 }
 
+async fn logs_of(answer: Answer) -> Vec<(tracing::Level, String)> {
+    use tracing_subscriber::prelude::*;
+
+    let captured = crate::test_lsp::CapturedLogs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(captured.clone())
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    drop(prepare_rename_with(answer).await);
+    captured.entries()
+}
+
+fn error_response_logs(
+    logs: &[(tracing::Level, String)],
+    level: tracing::Level,
+) -> Vec<&(tracing::Level, String)> {
+    logs.iter()
+        .filter(|(l, msg)| *l == level && msg.contains("LSP error response"))
+        .collect()
+}
+
+#[tokio::test]
+async fn prepare_rename_not_renameable_does_not_log_an_error() {
+    let logs = logs_of(Answer::Error(-32602, "No references found at position")).await;
+    assert!(
+        error_response_logs(&logs, tracing::Level::ERROR).is_empty(),
+        "{logs:?}"
+    );
+    assert_eq!(
+        error_response_logs(&logs, tracing::Level::DEBUG).len(),
+        1,
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn prepare_rename_invalid_offset_still_logs_an_error() {
+    let logs = logs_of(Answer::Error(
+        -32602,
+        "Invalid offset LineCol { line: 9, col: 0 } (line index length: 16)",
+    ))
+    .await;
+    assert_eq!(
+        error_response_logs(&logs, tracing::Level::ERROR).len(),
+        1,
+        "{logs:?}"
+    );
+}
+
+/// #612: the server's own rejection text goes through the result's
+/// `ServerText`, so a configured secret in it is hidden.
+#[tokio::test]
+async fn prepare_rename_not_renameable_message_is_redacted() {
+    use crate::redaction::{Redactions, ServerText as _};
+
+    let mut result = prepare_rename_with(Answer::Error(-32602, "cannot rename bravo-secret-222"))
+        .await
+        .unwrap();
+    result.redact_server_text(&Redactions::new([(
+        "B_TOKEN".to_owned(),
+        "bravo-secret-222".to_owned(),
+    )]));
+
+    let wire = serde_json::to_value(&result).unwrap();
+    assert_eq!(wire["server_message"], "cannot rename [redacted:B_TOKEN]");
+}
+
 #[tokio::test]
 async fn prepare_rename_out_of_range_position_stays_an_error() {
     let err = prepare_rename_with(Answer::Error(
@@ -213,14 +281,6 @@ async fn prepare_rename_requires_prepare_provider_not_just_rename() {
         .await
         .unwrap_err();
     assert_matches!(err, Error::CapabilityNotSupported { .. });
-}
-
-#[tokio::test]
-async fn prepare_rename_rejects_zero_position() {
-    let result = Translator::new()
-        .handle_prepare_rename(client_path("a.rs"), pos(0, 1))
-        .await;
-    assert_matches!(result, Err(Error::InvalidToolParams(_)));
 }
 
 fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
@@ -331,7 +391,7 @@ async fn format_range_with(
         let path = path.to_string_lossy().into_owned();
         tokio::spawn(async move {
             translator
-                .handle_format_range(client_path(path), pos(2, 1), pos(3, 6), 2, false)
+                .handle_format_range(client_path(path), bounded(pos(2, 1), pos(3, 6)), 2, false)
                 .await
         })
     };
@@ -413,21 +473,6 @@ async fn format_range_null_response_has_no_edits() {
 }
 
 #[tokio::test]
-async fn format_range_rejects_reversed_and_zero_ranges() {
-    let translator = Translator::new();
-    for (start, end) in [
-        (pos(3, 1), pos(2, 1)),
-        (pos(2, 5), pos(2, 4)),
-        (pos(0, 1), pos(2, 1)),
-    ] {
-        let result = translator
-            .handle_format_range(client_path("a.rs"), start, end, 4, true)
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-}
-
-#[tokio::test]
 async fn format_range_without_capability_is_rejected() {
     let dir = TempDir::new().unwrap();
     let (translator, _server) = translator_with_capabilities(
@@ -440,8 +485,7 @@ async fn format_range_without_capability_is_rejected() {
     let err = translator
         .handle_format_range(
             client_path(path.to_string_lossy().into_owned()),
-            pos(1, 1),
-            pos(2, 1),
+            bounded(pos(1, 1), pos(2, 1)),
             4,
             true,
         )

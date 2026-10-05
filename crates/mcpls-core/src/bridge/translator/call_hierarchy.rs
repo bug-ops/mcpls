@@ -8,65 +8,48 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    CallHierarchyItemResult, CallHierarchyPrepareResult, IncomingCall, IncomingCallsResult,
-    OutgoingCall, OutgoingCallsResult, Position,
+    CallHierarchyPrepareResult, HierarchyItem, IncomingCall, IncomingCallsResult, OutgoingCall,
+    OutgoingCallsResult, Position, PositionDegradation, Range,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate, validate_position};
+use super::routing::{Capability, IndexingGate};
 use crate::bridge::ClientPath;
-use crate::error::{Error, Result};
-
-/// Parsed form of an MCP-facing `CallHierarchyItemResult` JSON value (1-based
-/// coordinates), before its ranges are converted back to the routed server's
-/// negotiated encoding -- which requires resolving that server first (from
-/// [`Self::uri`]), so that step is left to callers via
-/// [`call_hierarchy_item_to_lsp`].
-struct ParsedCallHierarchyItem {
-    uri: lsp_types::Uri,
-    mcp: CallHierarchyItemResult,
-}
-
-/// Deserialize an MCP-facing `CallHierarchyItemResult` JSON value and parse
-/// its URI.
-///
-/// MCP clients receive `CallHierarchyItemResult` from `prepare_call_hierarchy`
-/// and pass it back opaquely to `get_incoming_calls` / `get_outgoing_calls`.
-fn parse_mcp_call_hierarchy_item(item: serde_json::Value) -> Result<ParsedCallHierarchyItem> {
-    let mcp: CallHierarchyItemResult = serde_json::from_value(item)
-        .map_err(|e| Error::InvalidToolParams(format!("Invalid call hierarchy item: {e}")))?;
-
-    // `gen-lsp-types`'s `Uri` is an opaque string wrapper with no validating
-    // parse, so constructing it is infallible -- the malformed-URI rejection
-    // this call used to provide is gone. Downstream consumers (e.g.
-    // `parse_file_uri`) still validate the `file://` scheme and reject what
-    // they can't use.
-    let uri = lsp_types::Uri::from(mcp.uri.as_str());
-
-    Ok(ParsedCallHierarchyItem { uri, mcp })
-}
-
-/// Convert a parsed MCP call hierarchy item (1-based coordinates) into a
-/// `lsp_types::CallHierarchyItem` (0-based, in `ctx`'s negotiated encoding).
-///
-/// `uri` is the opened document's own canonical URI, not the client's raw
-/// string: the server must read the file mcpls validated, not a spelling
-/// (`sym/../f`) that resolves elsewhere on its side.
-async fn call_hierarchy_item_to_lsp(
-    parsed: ParsedCallHierarchyItem,
-    uri: lsp_types::Uri,
-    ctx: &EncodingCtx,
-) -> CallHierarchyItem {
-    hierarchy_item_to_lsp(parsed.mcp, uri, ctx).await
-}
+use crate::error::Result;
 
 /// Convert LSP call hierarchy item to MCP call hierarchy item.
-async fn convert_call_hierarchy_item(
-    item: CallHierarchyItem,
-    ctx: &EncodingCtx,
-) -> CallHierarchyItemResult {
+async fn convert_call_hierarchy_item(item: CallHierarchyItem, ctx: &EncodingCtx) -> HierarchyItem {
     hierarchy_item_to_mcp(item, ctx).await
+}
+
+/// Which side of the queried item a call walk follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallDirection {
+    Incoming,
+    Outgoing,
+}
+
+/// One call of a walk: the peer item and where in the call's document the
+/// call occurs.
+struct WalkedCall {
+    peer: HierarchyItem,
+    from_ranges: Vec<Range>,
+}
+
+/// The calls of one walk, capped by an [`ItemBudget`].
+struct CallWalk {
+    calls: Vec<WalkedCall>,
+    truncated: bool,
+    positions_degraded: Option<PositionDegradation>,
+}
+
+/// An LSP call before conversion: the peer, its ranges, and the document those
+/// ranges belong to.
+struct RawCall {
+    peer: CallHierarchyItem,
+    from_ranges: Vec<lsp_types::Range>,
+    ranges_uri: lsp_types::Uri,
 }
 
 impl Translator {
@@ -81,8 +64,6 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<CallHierarchyPrepareResult> {
-        validate_position(position)?;
-
         let doc = self
             .prepare_gated_document(
                 &file_path,
@@ -139,71 +120,22 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails, the item is invalid, the
-    /// routed server does not advertise `callHierarchyProvider` support, or
-    /// the server is still indexing the workspace after
-    /// `INDEXING_READY_TIMEOUT`.
-    pub async fn handle_incoming_calls(
-        &self,
-        item: serde_json::Value,
-    ) -> Result<IncomingCallsResult> {
-        // Deserialize as our own type (1-based coords).
-        let parsed = parse_mcp_call_hierarchy_item(item)?;
-
-        // Same ToolKind/route as `handle_call_hierarchy_prepare`.
-        let path = self.parse_file_uri(&parsed.uri)?;
-        let doc = self
-            .prepare_gated_document_for_path(
-                &path,
-                Capability::CallHierarchy,
-                IndexingGate::Required,
-            )
-            .await?;
-        let (server_id, client, _uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let lsp_item = call_hierarchy_item_to_lsp(parsed, doc.uri().clone(), &ctx).await;
-
-        let params = CallHierarchyIncomingCallsParams {
-            item: lsp_item,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::CallHierarchyIncomingCallsRequest>(
-                params,
-                client.request_timeout(),
-            )
-            .await?;
-
-        // Pre-allocate and build result. Not filtered to workspace roots --
-        // see `handle_call_hierarchy_prepare`'s comment above.
-        let mut budget = ItemBudget::new();
-        let mut calls = Vec::new();
-
-        for call in response.unwrap_or_default() {
-            // A call is kept together with all its ranges or not at all.
-            if !budget.spend_whole(call.from_ranges.len().saturating_add(1)) {
-                continue;
-            }
-            // Per the LSP spec, `fromRanges` are ranges within the *caller's*
-            // document (`call.from.uri`), not the queried item's document.
-            let from_uri = call.from.uri.clone();
-            let mut from_ranges = Vec::with_capacity(call.from_ranges.len());
-            for range in call.from_ranges {
-                from_ranges.push(ctx.normalize_range(&from_uri, range).await);
-            }
-
-            calls.push(IncomingCall {
-                from: convert_call_hierarchy_item(call.from, &ctx).await,
-                from_ranges,
-            });
-        }
-
+    /// Returns an error if the LSP request fails, the routed server does not
+    /// advertise `callHierarchyProvider` support, or the server is still
+    /// indexing the workspace after `INDEXING_READY_TIMEOUT`.
+    pub async fn handle_incoming_calls(&self, item: HierarchyItem) -> Result<IncomingCallsResult> {
+        let walk = self.walk_calls(item, CallDirection::Incoming).await?;
         Ok(IncomingCallsResult {
-            calls,
-            truncated: budget.truncated(),
-            positions_degraded: ctx.positions_degraded(),
+            calls: walk
+                .calls
+                .into_iter()
+                .map(|call| IncomingCall {
+                    from: call.peer,
+                    from_ranges: call.from_ranges,
+                })
+                .collect(),
+            truncated: walk.truncated,
+            positions_degraded: walk.positions_degraded,
         })
     }
 
@@ -214,21 +146,32 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails, the item is invalid, the
-    /// routed server does not advertise `callHierarchyProvider` support, or
-    /// the server is still indexing the workspace after
-    /// `INDEXING_READY_TIMEOUT`.
-    pub async fn handle_outgoing_calls(
-        &self,
-        item: serde_json::Value,
-    ) -> Result<OutgoingCallsResult> {
-        // Deserialize as our own type (1-based coords).
-        let parsed = parse_mcp_call_hierarchy_item(item)?;
+    /// See [`Self::handle_incoming_calls`].
+    pub async fn handle_outgoing_calls(&self, item: HierarchyItem) -> Result<OutgoingCallsResult> {
+        let walk = self.walk_calls(item, CallDirection::Outgoing).await?;
+        Ok(OutgoingCallsResult {
+            calls: walk
+                .calls
+                .into_iter()
+                .map(|call| OutgoingCall {
+                    to: call.peer,
+                    from_ranges: call.from_ranges,
+                })
+                .collect(),
+            truncated: walk.truncated,
+            positions_degraded: walk.positions_degraded,
+        })
+    }
 
-        // Parse the URI and gate through the same chokepoint as
-        // `handle_incoming_calls` -- see that function's comment (#423).
-        // Same ToolKind/route as `prepare`.
-        let path = self.parse_file_uri(&parsed.uri)?;
+    /// Resolves, gates and queries one level of calls around `item`.
+    async fn walk_calls(&self, item: HierarchyItem, direction: CallDirection) -> Result<CallWalk> {
+        // `gen-lsp-types`'s `Uri` is an opaque string wrapper with no validating
+        // parse, so constructing it is infallible; `parse_file_uri` still
+        // validates the `file://` scheme and rejects what it can't use.
+        let item_uri = lsp_types::Uri::from(item.uri.as_str());
+        // Same ToolKind/route as `handle_call_hierarchy_prepare`; gated through
+        // the same chokepoint as every whole-workspace tool (#423).
+        let path = self.parse_file_uri(&item_uri).await?;
         let doc = self
             .prepare_gated_document_for_path(
                 &path,
@@ -236,47 +179,77 @@ impl Translator {
                 IndexingGate::Required,
             )
             .await?;
-        let (server_id, client, _uri) = (doc.server_id(), doc.client(), doc.uri());
+        let (server_id, client) = (doc.server_id(), doc.client());
         let ctx = self.encoding_ctx(server_id);
-        // Per the LSP spec, an outgoing call's `fromRanges` are ranges within
-        // the *queried* item's own document, not the callee's (`call.to.uri`).
+        // The document's own canonical URI, not the client's raw string: the
+        // server must read the file mcpls validated, not a spelling
+        // (`sym/../f`) that resolves elsewhere on its side.
         let source_uri = doc.uri().clone();
-        let lsp_item = call_hierarchy_item_to_lsp(parsed, source_uri.clone(), &ctx).await;
+        let lsp_item: CallHierarchyItem =
+            hierarchy_item_to_lsp(item, source_uri.clone(), &ctx).await;
 
-        let params = CallHierarchyOutgoingCallsParams {
-            item: lsp_item,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
+        let raw: Vec<RawCall> = match direction {
+            CallDirection::Incoming => client
+                .request_typed::<lsp_types::CallHierarchyIncomingCallsRequest>(
+                    CallHierarchyIncomingCallsParams {
+                        item: lsp_item,
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                        partial_result_params: PartialResultParams::default(),
+                    },
+                    client.request_timeout(),
+                )
+                .await?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|call| RawCall {
+                    // Per the LSP spec, `fromRanges` are ranges within the
+                    // *caller's* document, not the queried item's.
+                    ranges_uri: call.from.uri.clone(),
+                    peer: call.from,
+                    from_ranges: call.from_ranges,
+                })
+                .collect(),
+            CallDirection::Outgoing => client
+                .request_typed::<lsp_types::CallHierarchyOutgoingCallsRequest>(
+                    CallHierarchyOutgoingCallsParams {
+                        item: lsp_item,
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                        partial_result_params: PartialResultParams::default(),
+                    },
+                    client.request_timeout(),
+                )
+                .await?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|call| RawCall {
+                    // An outgoing call's `fromRanges` are ranges within the
+                    // *queried* item's own document, not the callee's.
+                    ranges_uri: source_uri.clone(),
+                    peer: call.to,
+                    from_ranges: call.from_ranges,
+                })
+                .collect(),
         };
 
-        let response = client
-            .request_typed::<lsp_types::CallHierarchyOutgoingCallsRequest>(
-                params,
-                client.request_timeout(),
-            )
-            .await?;
-
-        // Pre-allocate and build result. Not filtered to workspace roots --
-        // see `handle_call_hierarchy_prepare`'s comment above.
+        // Not filtered to workspace roots -- see `handle_call_hierarchy_prepare`.
         let mut budget = ItemBudget::new();
         let mut calls = Vec::new();
-
-        for call in response.unwrap_or_default() {
+        for call in raw {
+            // A call is kept together with all its ranges or not at all.
             if !budget.spend_whole(call.from_ranges.len().saturating_add(1)) {
                 continue;
             }
             let mut from_ranges = Vec::with_capacity(call.from_ranges.len());
             for range in call.from_ranges {
-                from_ranges.push(ctx.normalize_range(&source_uri, range).await);
+                from_ranges.push(ctx.normalize_range(&call.ranges_uri, range).await);
             }
-
-            calls.push(OutgoingCall {
-                to: convert_call_hierarchy_item(call.to, &ctx).await,
+            calls.push(WalkedCall {
+                peer: convert_call_hierarchy_item(call.peer, &ctx).await,
                 from_ranges,
             });
         }
 
-        Ok(OutgoingCallsResult {
+        Ok(CallWalk {
             calls,
             truncated: budget.truncated(),
             positions_degraded: ctx.positions_degraded(),
@@ -298,85 +271,18 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::{Position, Position2D, Range};
+    use crate::bridge::translator::dto::{Position2D, Range};
     use crate::bridge::translator::testing::*;
     use crate::bridge::{NotificationCache, WorkspaceRoots};
     use crate::config::ServerId;
+    use crate::error::Error;
     use crate::test_lsp::client_path;
 
-    #[tokio::test]
-    async fn test_handle_call_hierarchy_prepare_invalid_position_zero() {
-        let translator = Translator::new();
-        let result = translator
-            .handle_call_hierarchy_prepare(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 0,
-                    character: 1,
-                },
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-
-        let result = translator
-            .handle_call_hierarchy_prepare(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 1,
-                    character: 0,
-                },
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[tokio::test]
-    async fn test_handle_call_hierarchy_prepare_invalid_position_too_large() {
-        let translator = Translator::new();
-        let result = translator
-            .handle_call_hierarchy_prepare(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 1_000_001,
-                    character: 1,
-                },
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-
-        let result = translator
-            .handle_call_hierarchy_prepare(
-                client_path("/tmp/test.rs"),
-                Position {
-                    line: 1,
-                    character: 1_000_001,
-                },
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[tokio::test]
-    async fn test_handle_incoming_calls_invalid_json() {
-        let translator = Translator::new();
-        let invalid_item = serde_json::json!({"invalid": "structure"});
-        let result = translator.handle_incoming_calls(invalid_item).await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[tokio::test]
-    async fn test_handle_outgoing_calls_invalid_json() {
-        let translator = Translator::new();
-        let invalid_item = serde_json::json!({"invalid": "structure"});
-        let result = translator.handle_outgoing_calls(invalid_item).await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    /// Builds a `CallHierarchyItemResult` JSON value pointing at `path`, for
+    /// Builds a `HierarchyItem` JSON value pointing at `path`, for
     /// driving `handle_incoming_calls`/`handle_outgoing_calls` directly
     /// without a preceding `prepare_call_hierarchy` round trip.
     fn call_hierarchy_item_json(uri: &str) -> serde_json::Value {
-        serde_json::to_value(CallHierarchyItemResult {
+        serde_json::to_value(HierarchyItem {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
@@ -434,7 +340,7 @@ mod tests {
         let uri = Url::from_file_path(&path).unwrap().to_string();
 
         let err = translator
-            .handle_incoming_calls(call_hierarchy_item_json(&uri))
+            .handle_incoming_calls(hierarchy_item(call_hierarchy_item_json(&uri)))
             .await
             .unwrap_err();
 
@@ -469,7 +375,7 @@ mod tests {
         let uri = Url::from_file_path(&path).unwrap().to_string();
 
         let err = translator
-            .handle_outgoing_calls(call_hierarchy_item_json(&uri))
+            .handle_outgoing_calls(hierarchy_item(call_hierarchy_item_json(&uri)))
             .await
             .unwrap_err();
 
@@ -480,7 +386,7 @@ mod tests {
     }
 
     /// S4 lock-in for the documented `Uri`-validation-loss behavior change
-    /// (see the CHANGELOG entry for #297): `parse_mcp_call_hierarchy_item`
+    /// (see the CHANGELOG entry for #297): the call hierarchy item
     /// can no longer reject a malformed `uri` field at construction time
     /// (`gen-lsp-types`'s `Uri` has no validating parse). This drives a
     /// structurally-valid item whose `uri` field is `file://`-prefixed (so
@@ -528,7 +434,7 @@ mod tests {
             }
         });
 
-        let result = translator.handle_incoming_calls(item).await;
+        let result = translator.handle_incoming_calls(hierarchy_item(item)).await;
 
         assert_matches!(
             result,
@@ -539,7 +445,7 @@ mod tests {
     }
 
     /// As above, through `handle_outgoing_calls` -- same
-    /// `parse_mcp_call_hierarchy_item` code path, different caller.
+    /// item handling, different caller.
     #[tokio::test]
     async fn test_handle_outgoing_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
     {
@@ -572,7 +478,7 @@ mod tests {
             }
         });
 
-        let result = translator.handle_outgoing_calls(item).await;
+        let result = translator.handle_outgoing_calls(hierarchy_item(item)).await;
 
         assert_matches!(
             result,
@@ -637,7 +543,7 @@ mod tests {
         fs::write(&queried_path, "fn queried() {}").unwrap();
         let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
 
-        let item = CallHierarchyItemResult {
+        let item = HierarchyItem {
             name: "queried_method".to_string(),
             kind: 6, // SymbolKind::Method
             detail: None,
@@ -670,7 +576,9 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
+            tokio::spawn(
+                async move { translator.handle_incoming_calls(hierarchy_item(item)).await },
+            )
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -732,7 +640,7 @@ mod tests {
         fs::write(&caller_path, "aöb").unwrap();
         let caller_uri = Url::from_file_path(&caller_path).unwrap().to_string();
 
-        let item = CallHierarchyItemResult {
+        let item = HierarchyItem {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
@@ -765,7 +673,9 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
+            tokio::spawn(
+                async move { translator.handle_incoming_calls(hierarchy_item(item)).await },
+            )
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -846,7 +756,7 @@ mod tests {
         fs::write(&callee_path, "abc").unwrap();
         let callee_uri = Url::from_file_path(&callee_path).unwrap().to_string();
 
-        let item = CallHierarchyItemResult {
+        let item = HierarchyItem {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
@@ -879,7 +789,9 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(async move { translator.handle_outgoing_calls(item).await })
+            tokio::spawn(
+                async move { translator.handle_outgoing_calls(hierarchy_item(item)).await },
+            )
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -952,7 +864,7 @@ mod tests {
         let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
         let outside_uri = "file:///outside/workspace/stdlib.rs";
 
-        let item = CallHierarchyItemResult {
+        let item = HierarchyItem {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
@@ -985,7 +897,9 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
+            tokio::spawn(
+                async move { translator.handle_incoming_calls(hierarchy_item(item)).await },
+            )
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1056,7 +970,7 @@ mod tests {
         let queried_uri = Url::from_file_path(&queried_path).unwrap().to_string();
         let outside_uri = "file:///outside/workspace/stdlib.rs";
 
-        let item = CallHierarchyItemResult {
+        let item = HierarchyItem {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
@@ -1089,7 +1003,9 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(async move { translator.handle_outgoing_calls(item).await })
+            tokio::spawn(
+                async move { translator.handle_outgoing_calls(hierarchy_item(item)).await },
+            )
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1219,7 +1135,9 @@ mod tests {
         let incoming_handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
+            tokio::spawn(
+                async move { translator.handle_incoming_calls(hierarchy_item(item)).await },
+            )
         };
 
         let request = read_framed_message(&mut wire).await;
@@ -1290,12 +1208,18 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 match direction {
-                    Direction::Incoming => {
-                        serde_json::to_value(translator.handle_incoming_calls(item).await.unwrap())
-                    }
-                    Direction::Outgoing => {
-                        serde_json::to_value(translator.handle_outgoing_calls(item).await.unwrap())
-                    }
+                    Direction::Incoming => serde_json::to_value(
+                        translator
+                            .handle_incoming_calls(hierarchy_item(item))
+                            .await
+                            .unwrap(),
+                    ),
+                    Direction::Outgoing => serde_json::to_value(
+                        translator
+                            .handle_outgoing_calls(hierarchy_item(item))
+                            .await
+                            .unwrap(),
+                    ),
                 }
                 .unwrap()
             })

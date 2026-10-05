@@ -4,6 +4,7 @@
 //! to AI agents.
 
 mod handlers;
+mod schema_shape;
 mod server;
 mod session;
 mod tool_support;

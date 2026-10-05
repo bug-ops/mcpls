@@ -597,6 +597,10 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let extension_map = config.build_effective_extension_map();
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
+    let startup_redactions = Arc::new(redaction::Redactions::for_servers(
+        &config.lsp_servers,
+        lsp::current_environment(),
+    ));
     let applicable_configs: Vec<ServerInitConfig> = config
         .lsp_servers
         .iter()
@@ -619,10 +623,11 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
                 workspace_roots: workspace_roots.canonical().to_vec(),
                 initialization_options: lsp::tsserver_pin::pinned_initialization_options(
                     lsp_config,
-                    workspace_roots.canonical(),
+                    &workspace_roots,
                     |key| std::env::var_os(key),
                 ),
                 position_encodings: config.workspace.position_encodings.clone(),
+                redactions: Arc::clone(&startup_redactions),
             })
         })
         .collect();
@@ -648,6 +653,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
 
     let mut translator = Translator::new()
+        .with_startup_redactions(Arc::clone(&startup_redactions))
         .with_resource_limits(config.workspace.resource_limits())
         .with_extensions(extension_map)
         .with_router(router)
@@ -1187,8 +1193,7 @@ impl StartupSettler<'_> {
             pinned_tsserver,
             self.pump_shared.clone(),
         ));
-        self.translator
-            .set_notification_task(id.clone(), pump.clone());
+        self.translator.set_notification_task(&id, pump.clone());
         drop(serialized);
         self.pump_servers.insert(pump.id(), id.clone());
         self.tally.registered = self.tally.registered.saturating_add(1);

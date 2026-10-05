@@ -10,7 +10,7 @@ tags:
   - schema
   - performance
 created: 2026-10-05
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/001-mcp-tool-surface-and-routing/spec|mcp-tool-surface-and-routing]]"
@@ -23,7 +23,7 @@ related:
 > [!info] Metadata
 > **Type**: enhancement
 > **Priority**: P3
-> **Related issues**: not yet filed [NEEDS CLARIFICATION: issue number]
+> **Related issues**: #630
 > **Baseline commit**: 517cb53 (29 tools)
 
 ## 1. Overview
@@ -168,8 +168,8 @@ Priorities: `must` / `should` / `may`. Byte counts are UTF-8 bytes of the compac
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE serialized `tools` array SHALL NOT exceed the total budget: 130,000 B (baseline 171,465 B; stretch target 110,000 B) [NEEDS CLARIFICATION: confirm 130,000 B as the enforced figure and whether the stretch target becomes a tracked follow-up] | must |
-| FR-002 | EACH serialized `Tool` SHALL NOT exceed the per-tool budget: 9,000 B (baseline maximum 12,458 B, `get_references`) [NEEDS CLARIFICATION: confirm 9,000 B; a hand-sized override per tool is the alternative] | must |
+| FR-001 | THE serialized `tools` array SHALL NOT exceed the total budget: 130,000 B (baseline 171,465 B; stretch target 110,000 B) (130,000 B is the enforced figure; the stretch target is not tracked) | must |
+| FR-002 | EACH serialized `Tool` SHALL NOT exceed the per-tool budget: 9,000 B (baseline maximum 12,458 B, `get_references`) (9,000 B enforced for every tool; no per-tool override) | must |
 | FR-003 | THE sum of all `description` string bytes inside every `inputSchema` and `outputSchema` SHALL NOT exceed 35,000 B (baseline 73,444 B) | should |
 | FR-004 | THE system SHALL NOT emit, in any `inputSchema` or `outputSchema` `description`, a Markdown code fence (a line starting with three backticks), a Markdown heading line (a line starting with `#`), or a rustdoc section such as `# Examples`, `# Errors` or `# Panics` | must |
 | FR-005 | WHEN a definition is referenced by more than one tool THE system SHALL carry its long-form description at most once in `tools/list` (or in a shortened form per use) rather than the full text in every tool, subject to FR-009 | must |
@@ -182,7 +182,7 @@ Priorities: `must` / `should` / `may`. Byte counts are UTF-8 bytes of the compac
 | FR-012 | THE system SHALL provide a unit test that computes the per-tool and total serialized sizes of `build_tool_router(None).list_all()` and fails when FR-001 or FR-002 is violated, reporting the measured and permitted byte counts for every offending tool | must |
 | FR-013 | THE system SHALL provide a unit test that walks every schema `description` and fails on a FR-004 violation, reporting tool name, JSON path and the first offending line | must |
 | FR-014 | THE system SHALL provide a unit test that collects every `$ref` in every tool schema and asserts FR-007 and FR-008, and that each recursive definition is the only one left as `$ref` when FR-006 inlining is enabled | must |
-| FR-015 | THE system SHALL provide a unit test that asserts, for every tool, that the pre-change structural fingerprint (property names, `required`, types, enum values, nullability) equals the post-change one, so FR-009 is checked mechanically rather than by review [NEEDS CLARIFICATION: where the pre-change fingerprint is stored; a committed `tool_schema_shape.json` fixture is the proposed default] | should |
+| FR-015 | THE system SHALL provide a unit test that asserts, for every tool, that the pre-change structural fingerprint (property names, `required`, types, enum values, nullability) equals the post-change one, so FR-009 is checked mechanically rather than by review (the test shapes the same tree and compares it with the unshaped router, so no fixture is committed; it asserts that everything except string `description` and `title` annotations is identical) | should |
 | FR-016 | WHEN the schema shaping is applied THE system SHALL apply it in one place on the assembled router, so that the golden snapshot `tool_surface.json`, the prefixed router (`test_build_tool_router_with_prefix_renames_only_name`) and the e2e `tools/list` path all observe identical schemas | must |
 | FR-017 | WHEN `tool_surface.json` is regenerated for this change THE system SHALL keep the existing golden test (`test_tool_surface_matches_golden_snapshot`) as the guard against unintended further drift | must |
 | FR-018 | THE system SHOULD provide a repeatable way to print per-tool and total byte counts (for example the existing `dump_tool_surface` style `#[ignore]` test or a bench helper) so the baseline and budget can be re-measured without ad hoc scripts | should |
@@ -222,8 +222,8 @@ No new persistent data. Entities touched:
 | A type is recursive (`Symbol`) | Stays as `$defs` plus `$ref` (FR-007); inlining it would not terminate |
 | A shared definition is inlined (FR-006) and referenced twice in one schema (for example `Range` containing two `Position2D`) | Both copies appear; the measured total, not the intent, decides whether inlining is kept (FR-006) |
 | A type with a hand-flattened schema, such as `min_level` (`#[schemars(inline)]`) | Left as is; shaping must be idempotent over already-shaped schemas |
-| A configured tool-name prefix is set | Only `name` changes (existing prefix test); the budget is measured on the unprefixed router, and the prefix adds at most `29 x (prefix + 1)` bytes [NEEDS CLARIFICATION: whether the budget test should also assert a worst-case prefix] |
-| A client strict about `format` keywords sees `uint32` removed | Behaviour is unchanged for validation (`minimum` and `format` are annotations on top of `type: integer`); FR-009 allows dropping them only if the integer type and non-negativity remain expressible without them [NEEDS CLARIFICATION: keep `minimum: 0` and drop only `format`, or drop both] |
+| A configured tool-name prefix is set | Only `name` changes (existing prefix test); the budget is measured on the unprefixed router, and the prefix adds at most `29 x (prefix + 1)` bytes (the budget test does not assert a worst-case prefix) |
+| A client strict about `format` keywords sees `uint32` removed | Behaviour is unchanged for validation (`minimum` and `format` are annotations on top of `type: integer`); FR-009 allows dropping them only if the integer type and non-negativity remain expressible without them (resolved: keep both `format` and `minimum`) |
 | The e2e wire payload differs slightly from the in-process serialization | The in-process figure is authoritative for the budget; an e2e check records the wire length as information, not as a gate, to avoid transport-framing flakiness |
 
 ## 7. Success Criteria
@@ -275,14 +275,13 @@ Baseline values are those measured at commit `517cb53`.
 
 ## 9. Open Questions
 
-> [!question] Items to resolve before implementation
-> - [NEEDS CLARIFICATION: issue number for this finding; the MOC row uses a dash until filed.]
-> - [NEEDS CLARIFICATION: are 130,000 B total / 9,000 B per tool / 35,000 B description bytes the right enforced numbers, with 110,000 B as a stretch follow-up, or should the first change aim at the stretch directly?]
-> - [NEEDS CLARIFICATION: is the target client population one that counts tokens for `tools/list` (justifying structural changes such as inlining or dropping integer keywords), or only one that pays bytes (justifying only description shrinking)?]
-> - [NEEDS CLARIFICATION: `format: "uint32"` plus `minimum: 0`: drop both, drop `format` only, or keep both. See edge-case table.]
-> - [NEEDS CLARIFICATION: where the pre-change structural fingerprint lives for FR-015.]
-> - [NEEDS CLARIFICATION: should the budget additionally be asserted for a worst-case tool-name prefix?]
-> - [NEEDS CLARIFICATION: whether `get_tool_support` or another tool-level description should absorb the canonical `positions_degraded` explanation so per-schema copies can go to one line (see FR-010).]
+> [!success] Resolved
+> - Issue number: #630. The change is not breaking: tools, parameters, result fields and schemas keep their structure; only `description` annotations shrink.
+> - Budgets: 130,000 B total, 9,000 B per tool, 35,000 B schema description bytes, enforced; the 110,000 B stretch target is not tracked.
+> - Phase 3 (dropping `format` or `minimum`, inlining small definitions) is not applied: `format` and `minimum` are kept, because phases 1 and 2 meet the budgets.
+> - The structural check compares the shaped router with the unshaped router of the same tree.
+> - A definition carried by two or more tools keeps its own description only when it fits in 80 B, and its nested descriptions only when they fit in 24 B; the meaning of `positions_degraded`, `truncated`, `out_of_workspace` and the enrichment statuses lives in the tool descriptions (`out_of_workspace` through a shared sentence added to the 15 tools that carry it).
+> - Measured after #617 and #618 (typed hierarchy item inputs grew the unshaped surface): 181,350 B unshaped, 121,744 B shaped (6.4% headroom), largest tool 7,564 B, schema description bytes 26,995 B.
 
 ## 10. See Also
 

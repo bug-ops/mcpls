@@ -4,53 +4,12 @@
 use std::path::{Path, PathBuf};
 
 use super::Translator;
-use super::dto::Position;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
-use crate::bridge::{ClientPath, InFlightGuard, WorkspaceRoots, lexically_normalize, lock_std};
-use crate::config::{NoServerReason, ServerId, ToolKind, base_language_id};
+use crate::bridge::{ClientPath, InFlightGuard, WorkspacePath, lock_std};
+use crate::config::{NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
-
-/// Maximum allowed position value for validation.
-pub(super) const MAX_POSITION_VALUE: u32 = 1_000_000;
-
-/// Maximum allowed range size in lines.
-pub(super) const MAX_RANGE_LINES: u32 = 10_000;
-
-/// Reject a 1-based position that is zero or beyond [`MAX_POSITION_VALUE`].
-pub(super) fn validate_position(position: Position) -> Result<()> {
-    let Position { line, character } = position;
-    if line < 1 || character < 1 {
-        return Err(Error::InvalidToolParams(
-            "Line and character positions must be >= 1".to_string(),
-        ));
-    }
-    if line > MAX_POSITION_VALUE || character > MAX_POSITION_VALUE {
-        return Err(Error::InvalidToolParams(format!(
-            "Position values must be <= {MAX_POSITION_VALUE}"
-        )));
-    }
-    Ok(())
-}
-
-/// Reject a 1-based range whose ends are invalid positions, that spans more
-/// than [`MAX_RANGE_LINES`], or whose start is after its end.
-pub(super) fn validate_range(start: Position, end: Position) -> Result<()> {
-    validate_position(start)?;
-    validate_position(end)?;
-    if end.line.saturating_sub(start.line) > MAX_RANGE_LINES {
-        return Err(Error::InvalidToolParams(format!(
-            "Range size must be <= {MAX_RANGE_LINES} lines"
-        )));
-    }
-    if start.line > end.line || (start.line == end.line && start.character > end.character) {
-        return Err(Error::InvalidToolParams(
-            "Start position must be before or equal to end position".to_string(),
-        ));
-    }
-    Ok(())
-}
 
 /// Total time `Translator::flush_pending_closes` may spend per call.
 const FLUSH_PENDING_CLOSES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -83,68 +42,6 @@ impl PreparedDocument {
 
     pub(super) const fn uri(&self) -> &lsp_types::Uri {
         &self.uri
-    }
-}
-
-/// Validate that `path` is within one of `workspace_roots`.
-///
-/// Free function (rather than a `Translator` method) so callers that only need
-/// path validation — e.g. cache-only MCP handlers — can validate against a
-/// cloned, lock-free snapshot of the workspace roots instead of locking the
-/// full `Arc<Mutex<Translator>>`, which may be held elsewhere across a slow
-/// in-flight LSP round-trip.
-///
-/// The lexical check (absolute, `.`/`..` resolved, against the canonical roots
-/// and their aliases) is only a pre-filter: it rejects an out-of-workspace path
-/// without touching the filesystem, and it can only reject, never accept. The
-/// decision that counts uses the physical path: the original `path` is
-/// canonicalized (so `..` after a symlink is resolved against the real
-/// directory) and that canonical form must lie under a canonical root. The
-/// returned path is the canonical one.
-///
-/// # Errors
-///
-/// Returns `Error::NoWorkspaceRoots` if `workspace_roots` is empty -- fails
-/// closed rather than allowing unrestricted access -- and
-/// `Error::PathOutsideWorkspace` if the path is outside all configured
-/// workspace roots. When the lexical check admitted the path but it cannot be
-/// canonicalized, `Error::FileIo` is returned (for example it does not exist),
-/// or `Error::MalformedPath` when the path itself is malformed (it runs
-/// through a regular file, or has an invalid or over-long name).
-/// Empty and NUL-containing paths cannot reach this function: they are
-/// rejected when the [`ClientPath`] is parsed.
-pub fn validate_path_against_roots(
-    path: &ClientPath,
-    workspace_roots: &WorkspaceRoots,
-) -> Result<PathBuf> {
-    let path = path.as_path();
-    if workspace_roots.is_empty() {
-        return Err(Error::NoWorkspaceRoots(path.to_path_buf()));
-    }
-
-    let io_error = |source: std::io::Error| match source.kind() {
-        std::io::ErrorKind::NotADirectory
-        | std::io::ErrorKind::InvalidFilename
-        | std::io::ErrorKind::InvalidInput => Error::MalformedPath {
-            path: path.to_path_buf(),
-            source,
-        },
-        _ => Error::FileIo {
-            path: path.to_path_buf(),
-            source,
-        },
-    };
-    let absolute = std::path::absolute(path).map_err(io_error)?;
-    let normalized = lexically_normalize(dunce::simplified(&absolute));
-    if !workspace_roots.admits_lexically(&normalized) {
-        return Err(Error::PathOutsideWorkspace(path.to_path_buf()));
-    }
-
-    let canonical = dunce::canonicalize(path).map_err(io_error)?;
-    if workspace_roots.contains_canonical(&canonical) {
-        Ok(canonical)
-    } else {
-        Err(Error::PathOutsideWorkspace(path.to_path_buf()))
     }
 }
 
@@ -633,6 +530,19 @@ pub(super) fn lookup_route<T>(
     RouteLookup::Unrouted
 }
 
+/// The catch-all of `language` if it is still expected to register, read from
+/// the same `servers` guard as the rest of the lookup.
+fn pending_catch_all(
+    router: &ToolRouter,
+    servers: &super::servers::Servers,
+    language: &str,
+) -> Option<ServerId> {
+    router
+        .catch_all_for(language)
+        .filter(|catch_all| servers.is_expected(catch_all))
+        .cloned()
+}
+
 /// Where a file's diagnostics-route server stands, as seen by the cache-only
 /// diagnostics readers.
 ///
@@ -757,8 +667,8 @@ impl Translator {
     /// Returns `Error::NoWorkspaceRoots` if no workspace roots are
     /// configured (fails closed), or `Error::PathOutsideWorkspace` if the
     /// path is outside all configured workspace roots.
-    pub(crate) fn validate_path(&self, path: &ClientPath) -> Result<PathBuf> {
-        validate_path_against_roots(path, &self.workspace_roots)
+    pub(crate) async fn validate_path(&self, path: &ClientPath) -> Result<WorkspacePath> {
+        self.workspace_roots.validate(path).await
     }
 
     /// Resolve the client and routing identity for `path`/`tool`, giving the
@@ -776,10 +686,7 @@ impl Translator {
     ) -> Result<(ServerId, LspClient)> {
         let (id, client) = self.client_for_file(path, tool)?;
         self.respawn_if_dead(&id).await?;
-        let client = lock_std(&self.lsp_clients)
-            .get(&id)
-            .cloned()
-            .unwrap_or(client);
+        let client = lock_std(&self.servers).client(&id).unwrap_or(client);
         Ok((id, client))
     }
 
@@ -792,8 +699,8 @@ impl Translator {
     /// explicit `typescriptreact` server still wins over the `typescript`
     /// fallback when both are configured.
     ///
-    /// Locks `router`, `lsp_clients`, and (on the not-yet-registered path)
-    /// `expected_servers` only for their respective lookups — every guard is
+    /// Clones the router, then reads every closure's answer from one `servers`
+    /// guard (registered, expected, pending catch-all, failure) — every guard is
     /// dropped before this method returns.
     pub(super) fn client_for_file(
         &self,
@@ -801,14 +708,18 @@ impl Translator {
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient)> {
         let candidates = self.language_candidates(path);
-        let lookup = lookup_route(
-            &candidates,
-            |lang| lock_std(&self.router).resolve(lang, tool).cloned(),
-            |id| lock_std(&self.lsp_clients).get(id).cloned(),
-            |id| lock_std(&self.expected_servers).contains(id),
-            |lang| self.pending_catch_all(lang),
-            |id| self.startup_failure(id),
-        );
+        let router = self.router_snapshot();
+        let lookup = {
+            let servers = lock_std(&self.servers);
+            lookup_route(
+                &candidates,
+                |lang| router.resolve(lang, tool).cloned(),
+                |id| servers.client(id),
+                |id| servers.is_expected(id),
+                |lang| pending_catch_all(&router, &servers, lang),
+                |id| servers.failure(id).cloned(),
+            )
+        };
         match lookup {
             RouteLookup::Registered(id, client) => Ok((id, client)),
             // A route naming a server that is still initializing (e.g. a
@@ -856,14 +767,6 @@ impl Translator {
         }
     }
 
-    /// The catch-all of `language` if it is still expected to register.
-    fn pending_catch_all(&self, language: &str) -> Option<ServerId> {
-        let catch_all = lock_std(&self.router).catch_all_for(language).cloned()?;
-        lock_std(&self.expected_servers)
-            .contains(&catch_all)
-            .then_some(catch_all)
-    }
-
     /// The detected language of `path` plus its React base-language fallback.
     pub(super) fn language_candidates(&self, path: &Path) -> LanguageCandidates {
         LanguageCandidates::new(detect_language(path, &self.extension_map))
@@ -899,18 +802,18 @@ impl Translator {
     #[must_use]
     pub(crate) fn diagnostics_route_for_path(&self, path: &Path) -> DiagnosticsRoute {
         let candidates = self.language_candidates(path);
-        let lookup = lookup_route(
-            &candidates,
-            |lang| {
-                lock_std(&self.router)
-                    .resolve(lang, ToolKind::Diagnostics)
-                    .cloned()
-            },
-            |id| lock_std(&self.lsp_clients).contains_key(id).then_some(()),
-            |id| lock_std(&self.expected_servers).contains(id),
-            |lang| self.pending_catch_all(lang),
-            |id| self.startup_failure(id),
-        );
+        let router = self.router_snapshot();
+        let lookup = {
+            let servers = lock_std(&self.servers);
+            lookup_route(
+                &candidates,
+                |lang| router.resolve(lang, ToolKind::Diagnostics).cloned(),
+                |id| servers.client(id).map(|_| ()),
+                |id| servers.is_expected(id),
+                |lang| pending_catch_all(&router, &servers, lang),
+                |id| servers.failure(id).cloned(),
+            )
+        };
         match lookup {
             RouteLookup::Registered(id, ()) => DiagnosticsRoute::Live(id),
             RouteLookup::Initializing(id) => DiagnosticsRoute::Initializing(id),
@@ -955,9 +858,11 @@ impl Translator {
         file_path: &ClientPath,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient, PathBuf)> {
-        let validated_path = self.validate_path(file_path)?;
-        let (server_id, client) = self.resolve_client_for_file(&validated_path, tool).await?;
-        Ok((server_id, client, validated_path))
+        let validated_path = self.validate_path(file_path).await?;
+        let (server_id, client) = self
+            .resolve_client_for_file(validated_path.as_path(), tool)
+            .await?;
+        Ok((server_id, client, validated_path.into_path_buf()))
     }
 
     /// As [`Self::resolve_validated_client_for_file`], but for a caller that
@@ -968,11 +873,11 @@ impl Translator {
     /// input from scratch.
     async fn resolve_validated_client_for_path(
         &self,
-        path: &Path,
+        path: &WorkspacePath,
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient, PathBuf)> {
-        let (server_id, client) = self.resolve_client_for_file(path, tool).await?;
-        Ok((server_id, client, path.to_path_buf()))
+        let (server_id, client) = self.resolve_client_for_file(path.as_path(), tool).await?;
+        Ok((server_id, client, path.as_path().to_path_buf()))
     }
 
     /// Resolve the LSP client and ensure the document is open.
@@ -993,14 +898,24 @@ impl Translator {
     /// file can be routed to more than one server; a wedged server-A notify
     /// still holds this path's lock and can therefore delay a healthy
     /// server-B call for that *same* file.)
+    #[cfg(test)]
     pub(super) async fn prepare_document(
         &self,
         file_path: &ClientPath,
         tool: ToolKind,
     ) -> Result<PreparedDocument> {
-        let (server_id, client, validated_path) = self
-            .resolve_validated_client_for_file(file_path, tool)
-            .await?;
+        let path = self.validate_path(file_path).await?;
+        self.prepare_document_for_path(&path, tool).await
+    }
+
+    /// As [`Self::prepare_document`], for a path that is already validated.
+    pub(super) async fn prepare_document_for_path(
+        &self,
+        path: &WorkspacePath,
+        tool: ToolKind,
+    ) -> Result<PreparedDocument> {
+        let (server_id, client, validated_path) =
+            self.resolve_validated_client_for_path(path, tool).await?;
         self.open_prepared(server_id, client, &validated_path).await
     }
 
@@ -1076,7 +991,7 @@ impl Translator {
     /// doc for why this skips re-validation.
     pub(super) async fn prepare_gated_document_for_path(
         &self,
-        path: &Path,
+        path: &WorkspacePath,
         capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
@@ -1117,7 +1032,7 @@ impl Translator {
     /// tracking has stopped counting the document.
     ///
     /// `DocumentTracker` has no access to any server's [`LspClient`] --
-    /// `self.lsp_clients` is the registry for that, kept one layer up in
+    /// `self.servers` is the registry for that, kept one layer up in
     /// `Translator` -- so this is the chokepoint that reconciles its pending
     /// closes against it. Called after every `ensure_open` that could have
     /// triggered eviction, unconditionally, even when `ensure_open` itself
@@ -1141,7 +1056,7 @@ impl Translator {
                     continue;
                 };
                 for server_id in &claim.servers {
-                    let Some(client) = lock_std(&self.lsp_clients).get(server_id).cloned() else {
+                    let Some(client) = lock_std(&self.servers).client(server_id) else {
                         continue;
                     };
                     if let Err(err) = client
@@ -1206,11 +1121,11 @@ impl Translator {
         server_id: &ServerId,
         capability: Capability,
     ) -> Result<()> {
-        let servers = lock_std(&self.lsp_servers);
+        let servers = lock_std(&self.servers);
         check_capability(
             server_id,
             servers
-                .get(server_id)
+                .server(server_id)
                 .map(crate::lsp::LspServer::capabilities),
             capability,
         )
@@ -1230,10 +1145,10 @@ impl Translator {
     /// information is unavailable is to skip the extra round-trip, not to
     /// risk it against a server that may not implement it.
     pub(super) fn code_action_resolve_supported(&self, server_id: &ServerId) -> bool {
-        let servers = lock_std(&self.lsp_servers);
+        let servers = lock_std(&self.servers);
         matches!(
             servers
-                .get(server_id)
+                .server(server_id)
                 .map(crate::lsp::LspServer::capabilities)
                 .and_then(|caps| caps.code_action_provider.as_ref()),
             Some(lsp_types::CodeActionProvider::CodeActionOptions(
@@ -1254,7 +1169,7 @@ impl Translator {
     ///   otherwise cannot be converted to a path (see
     ///   [`crate::bridge::state::uri_to_path`])
     /// - The path is outside workspace boundaries
-    pub(super) fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<PathBuf> {
+    pub(super) async fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<WorkspacePath> {
         let path = crate::bridge::state::uri_to_path(uri).ok_or_else(|| {
             Error::InvalidToolParams(format!(
                 "Invalid URI, expected an absolute file:// URI but got: {}",
@@ -1262,7 +1177,7 @@ impl Translator {
             ))
         })?;
 
-        self.validate_path(&ClientPath::try_from(path)?)
+        self.validate_path(&ClientPath::try_from(path)?).await
     }
 }
 
@@ -1284,7 +1199,7 @@ mod tests {
     use crate::bridge::translator::dto::Position;
     use crate::bridge::translator::edits::MAX_NEW_NAME_LENGTH;
     use crate::bridge::translator::testing::*;
-    use crate::bridge::{NotificationCache, ResultContext};
+    use crate::bridge::{NotificationCache, ResultContext, WorkspaceRoots};
     use crate::config::{
         IndexingReadyTimeoutSecs, LanguageId, LspServerConfig, PositionEncodings, TimeoutSecs,
         ToolRouter,
@@ -1505,20 +1420,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_validate_path_no_workspace_roots_rejects_any_path() {
+    #[tokio::test]
+    async fn test_validate_path_no_workspace_roots_rejects_any_path() {
         let translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
         // With no workspace roots configured, access is rejected (fail closed)
-        let result = translator.validate_path(&client_path(test_file));
+        let result = translator.validate_path(&client_path(test_file)).await;
         assert_matches!(result, Err(Error::NoWorkspaceRoots(_)));
     }
 
-    #[test]
-    fn test_validate_path_within_workspace() {
+    #[tokio::test]
+    async fn test_validate_path_within_workspace() {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().to_path_buf();
@@ -1527,12 +1442,12 @@ mod tests {
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result = translator.validate_path(&client_path(test_file));
+        let result = translator.validate_path(&client_path(test_file)).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_validate_path_outside_workspace() {
+    #[tokio::test]
+    async fn test_validate_path_outside_workspace() {
         let mut translator = Translator::new();
         let temp_dir1 = TempDir::new().unwrap();
         let temp_dir2 = TempDir::new().unwrap();
@@ -1546,7 +1461,7 @@ mod tests {
         let test_file = temp_dir2.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
 
-        let result = translator.validate_path(&client_path(test_file));
+        let result = translator.validate_path(&client_path(test_file)).await;
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
@@ -1558,8 +1473,9 @@ mod tests {
         let outside = TempDir::new().unwrap();
         let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(outside.path().join("missing.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(outside.path().join("missing.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1569,8 +1485,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(root.path().join("../escape.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(root.path().join("../escape.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1582,8 +1499,9 @@ mod tests {
         fs::write(root.path().join("b.rs"), "").unwrap();
         let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(root.path().join("./a/../b.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(root.path().join("./a/../b.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_eq!(
             result.unwrap(),
@@ -1604,7 +1522,9 @@ mod tests {
         } = alias_fixture();
         fs::write(real.join("a.rs"), "").unwrap();
 
-        let result = validate_path_against_roots(&client_path(alias.join("a.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(alias.join("a.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_eq!(
             result.unwrap(),
@@ -1622,7 +1542,9 @@ mod tests {
         } = alias_fixture();
         fs::write(dir.path().join("outside.rs"), "").unwrap();
 
-        let result = validate_path_against_roots(&client_path(alias.join("../outside.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(alias.join("../outside.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1639,7 +1561,9 @@ mod tests {
             ..
         } = alias_fixture();
 
-        let result = validate_path_against_roots(&client_path(alias.join("missing.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(alias.join("missing.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::FileIo { .. }), "{result:?}");
     }
@@ -1659,8 +1583,9 @@ mod tests {
         fs::write(outside.path().join("secret.rs"), "").unwrap();
         std::os::unix::fs::symlink(outside.path(), real.join("link")).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(alias.join("link/secret.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(alias.join("link/secret.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1676,8 +1601,9 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
         let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
 
-        let result =
-            validate_path_against_roots(&client_path(root.path().join("link/secret.rs")), &roots);
+        let result = roots
+            .validate_blocking(&client_path(root.path().join("link/secret.rs")))
+            .map(crate::bridge::WorkspacePath::into_path_buf);
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
@@ -1724,7 +1650,7 @@ mod tests {
     async fn test_parse_file_uri_invalid_scheme() {
         let translator = Translator::new();
         let uri: lsp_types::Uri = lsp_types::Uri::from("http://example.com/file.rs");
-        let result = translator.parse_file_uri(&uri);
+        let result = translator.parse_file_uri(&uri).await;
         assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
@@ -1741,7 +1667,7 @@ mod tests {
         // Use url crate for cross-platform file URI creation
         let file_url = Url::from_file_path(&test_file).unwrap();
         let uri: lsp_types::Uri = lsp_types::Uri::from(file_url.as_str());
-        let result = translator.parse_file_uri(&uri);
+        let result = translator.parse_file_uri(&uri).await;
         assert!(result.is_ok());
     }
 
@@ -1765,8 +1691,8 @@ mod tests {
             "test fixture must exercise percent-encoding"
         );
         let uri: lsp_types::Uri = lsp_types::Uri::from(file_url.as_str());
-        let result = translator.parse_file_uri(&uri).unwrap();
-        assert_eq!(result, dunce::canonicalize(&test_file).unwrap());
+        let result = translator.parse_file_uri(&uri).await.unwrap();
+        assert_eq!(result.as_path(), dunce::canonicalize(&test_file).unwrap());
     }
 
     /// #411: an authority-bearing `file://` URI (e.g. `file://host/path`)
@@ -1776,7 +1702,7 @@ mod tests {
     async fn test_parse_file_uri_rejects_authority() {
         let translator = Translator::new();
         let uri: lsp_types::Uri = lsp_types::Uri::from("file://host/some/path.rs");
-        let result = translator.parse_file_uri(&uri);
+        let result = translator.parse_file_uri(&uri).await;
         assert_matches!(result, Err(Error::InvalidToolParams(_)));
     }
 
@@ -2279,13 +2205,7 @@ mod tests {
             let path = path_a.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_hover(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                    )
+                    .handle_hover(client_path(path), Position::at(1, 1))
                     .await
             })
         };
@@ -2305,13 +2225,7 @@ mod tests {
             let path = path_b.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_hover(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                    )
+                    .handle_hover(client_path(path), Position::at(1, 1))
                     .await
             })
         };
@@ -2378,13 +2292,7 @@ mod tests {
                 let path_str = path_str.clone();
                 tokio::spawn(async move {
                     translator
-                        .handle_hover(
-                            client_path(path_str),
-                            Position {
-                                line: 1,
-                                character: 1,
-                            },
-                        )
+                        .handle_hover(client_path(path_str), Position::at(1, 1))
                         .await
                 })
             })
@@ -2452,9 +2360,8 @@ mod tests {
         std::fs::write(&path, "p").unwrap();
         let other = dir.path().join("q.aa");
         std::fs::write(&other, "q").unwrap();
-        let client_a = lock_std(&translator.lsp_clients)
-            .get(&ServerId::from("lang_a"))
-            .cloned()
+        let client_a = lock_std(&translator.servers)
+            .client(&ServerId::from("lang_a"))
             .unwrap();
         tracker
             .ensure_open(&path, &ServerId::from("lang_a"), &client_a)
@@ -2927,14 +2834,7 @@ mod tests {
         let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
 
         let result = translator
-            .handle_rename(
-                client_path("/main.rs"),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                new_name,
-            )
+            .handle_rename(client_path("/main.rs"), Position::at(1, 1), new_name)
             .await;
 
         assert_matches!(result, Err(Error::InvalidToolParams(_)));
@@ -2956,10 +2856,7 @@ mod tests {
         let result = translator
             .handle_rename(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 "renamed".to_string(),
             )
             .await;
@@ -2989,14 +2886,7 @@ mod tests {
         let result = translator
             .handle_code_actions(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 1,
-                    character: 5,
-                },
+                bounded(Position::at(1, 1), Position::at(1, 5)),
                 None,
             )
             .await;
@@ -3026,10 +2916,7 @@ mod tests {
         let result = translator
             .handle_signature_help(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
             )
             .await;
 
@@ -3073,7 +2960,7 @@ mod tests {
             }
         });
 
-        let result = translator.handle_incoming_calls(item).await;
+        let result = translator.handle_incoming_calls(hierarchy_item(item)).await;
 
         assert_matches!(
             result,
@@ -3112,7 +2999,7 @@ mod tests {
             }
         });
 
-        let result = translator.handle_outgoing_calls(item).await;
+        let result = translator.handle_outgoing_calls(hierarchy_item(item)).await;
 
         assert_matches!(
             result,
@@ -3165,10 +3052,7 @@ mod tests {
         let result = translator
             .handle_call_hierarchy_prepare(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
             )
             .await;
 
@@ -3197,14 +3081,7 @@ mod tests {
         let result = translator
             .handle_inlay_hints(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Position {
-                    line: 10,
-                    character: 1,
-                },
+                span(Position::at(1, 1), Position::at(10, 1)),
             )
             .await;
 
@@ -3233,10 +3110,7 @@ mod tests {
         let result = translator
             .handle_hover(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
             )
             .await;
 
@@ -3265,10 +3139,7 @@ mod tests {
         let result = translator
             .handle_definition(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 ResultContext::None,
             )
             .await;
@@ -3298,10 +3169,7 @@ mod tests {
         let result = translator
             .handle_references(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 false,
                 ResultContext::None,
             )
@@ -3324,14 +3192,7 @@ mod tests {
         let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
 
         let result = translator
-            .handle_completions(
-                client_path("/main.rs"),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-                Some(trigger),
-            )
+            .handle_completions(client_path("/main.rs"), Position::at(1, 1), Some(trigger))
             .await;
 
         assert_matches!(result, Err(Error::InvalidToolParams(_)));
@@ -3353,10 +3214,7 @@ mod tests {
         let result = translator
             .handle_completions(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 None,
             )
             .await;
@@ -3435,10 +3293,7 @@ mod tests {
         let result = translator
             .handle_implementation(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 ResultContext::None,
             )
             .await;
@@ -3468,10 +3323,7 @@ mod tests {
         let result = translator
             .handle_type_definition(
                 client_path(path.to_string_lossy().into_owned()),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
+                Position::at(1, 1),
                 ResultContext::None,
             )
             .await;
@@ -3499,13 +3351,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_declaration(
-                client_path(&path),
-                Position {
-                    line: 1,
-                    character: 1,
-                },
-            )
+            .handle_declaration(client_path(&path), Position::at(1, 1))
             .await;
 
         assert!(matches!(
@@ -3566,10 +3412,7 @@ mod tests {
                 translator
                     .handle_rename(
                         client_path(path_str),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
+                        Position::at(1, 1),
                         "renamed".to_string(),
                     )
                     .await

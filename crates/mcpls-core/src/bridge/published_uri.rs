@@ -28,17 +28,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use lsp_types::Uri;
-use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::resources::{CanonicalForm, PublishedDiagnosticsUri};
+use super::workspace_roots::{CanonicalizeFn, Unresolved, canonicalize_existing_prefix};
 use super::{WorkspaceRoots, lexically_normalize, uri_to_path};
 
 /// Maximum canonicalizations running concurrently for one resolver.
@@ -61,59 +61,6 @@ pub const TRANSIENT_HOLDOFF: Duration = Duration::from_secs(2);
 
 /// A single canonicalization slower than this is logged (once per resolver).
 pub const SLOW_CANONICALIZE: Duration = Duration::from_millis(100);
-
-/// Canonicalizes one existing path; injectable so tests can simulate a slow
-/// or failing filesystem.
-pub type CanonicalizeFn = dyn Fn(&Path) -> io::Result<PathBuf> + Send + Sync;
-
-/// Why a published path has no canonical form right now.
-#[derive(Debug, Error)]
-pub enum Unresolved {
-    /// The filesystem failed in a way that may not repeat; never cached.
-    #[error("transient filesystem error: {0}")]
-    Transient(#[source] io::Error),
-    /// Not even the root of the path could be canonicalized.
-    #[error("no ancestor of the path exists")]
-    NoExistingAncestor,
-    /// A `..` component: resolving it lexically after a missing component
-    /// could step around a symlink, so the path is refused outright.
-    #[error("path contains a `..` component")]
-    ParentComponent,
-}
-
-/// Canonicalizes the longest existing ancestor of `path` with `canonicalize`
-/// and appends the remainder.
-///
-/// Falls back to the next ancestor only on [`io::ErrorKind::NotFound`] and
-/// [`io::ErrorKind::NotADirectory`]; every other error is [`Unresolved::Transient`].
-/// A path with a `..` component is [`Unresolved::ParentComponent`]: a legitimate
-/// server publishes canonical paths, and the lexical join of the missing tail
-/// would otherwise bypass symlinks that `..` should have followed.
-fn canonicalize_published(
-    path: &Path,
-    canonicalize: &CanonicalizeFn,
-) -> Result<PathBuf, Unresolved> {
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(Unresolved::ParentComponent);
-    }
-    for ancestor in path.ancestors() {
-        match canonicalize(ancestor) {
-            Ok(canonical) => {
-                return path
-                    .strip_prefix(ancestor)
-                    .map(|rest| lexically_normalize(&canonical.join(rest)))
-                    .map_err(|_| Unresolved::NoExistingAncestor);
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(e) => return Err(Unresolved::Transient(e)),
-        }
-    }
-    Err(Unresolved::NoExistingAncestor)
-}
 
 /// What a published URI announces, which decides how a persistent transient
 /// filesystem error is handled.
@@ -366,7 +313,7 @@ impl PublishedPathResolver {
     }
 }
 
-/// Runs [`canonicalize_published`] on the blocking pool, logging the first
+/// Runs [`canonicalize_existing_prefix`] on the blocking pool, logging the first
 /// call slower than [`SLOW_CANONICALIZE`].
 async fn canonicalize_blocking(
     path: PathBuf,
@@ -375,7 +322,7 @@ async fn canonicalize_blocking(
 ) -> Result<PathBuf, Unresolved> {
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        let outcome = canonicalize_published(&path, canonicalize.as_ref());
+        let outcome = canonicalize_existing_prefix(&path, canonicalize.as_ref());
         if started.elapsed() > SLOW_CANONICALIZE && !slow_logged.swap(true, Ordering::Relaxed) {
             warn!(
                 "canonicalizing a published diagnostics path took {:?} (> {SLOW_CANONICALIZE:?}); \
@@ -444,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn test_canonicalize_published_falls_back_on_not_found_and_not_a_directory() {
+    fn test_canonicalize_existing_prefix_falls_back_on_not_found_and_not_a_directory() {
         let canon = |p: &Path| -> io::Result<PathBuf> {
             match p.components().count() {
                 0..=2 => Ok(p.to_path_buf()),
@@ -452,15 +399,15 @@ mod tests {
                 _ => Err(io::Error::from(io::ErrorKind::NotFound)),
             }
         };
-        let resolved = canonicalize_published(Path::new("/a/b/c/d.rs"), &canon).unwrap();
+        let resolved = canonicalize_existing_prefix(Path::new("/a/b/c/d.rs"), &canon).unwrap();
         assert_eq!(resolved, Path::new("/a/b/c/d.rs"));
     }
 
     #[test]
-    fn test_canonicalize_published_rejects_parent_components() {
+    fn test_canonicalize_existing_prefix_rejects_parent_components() {
         let canon = |p: &Path| -> io::Result<PathBuf> { Ok(p.to_path_buf()) };
         assert!(matches!(
-            canonicalize_published(Path::new("/ws/missing/../link/f.rs"), &canon),
+            canonicalize_existing_prefix(Path::new("/ws/missing/../link/f.rs"), &canon),
             Err(Unresolved::ParentComponent)
         ));
     }
@@ -502,12 +449,12 @@ mod tests {
     }
 
     #[test]
-    fn test_canonicalize_published_other_errors_are_transient() {
+    fn test_canonicalize_existing_prefix_other_errors_are_transient() {
         let canon = |_: &Path| -> io::Result<PathBuf> {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
         };
         assert!(matches!(
-            canonicalize_published(Path::new("/a/b.rs"), &canon),
+            canonicalize_existing_prefix(Path::new("/a/b.rs"), &canon),
             Err(Unresolved::Transient(_))
         ));
     }

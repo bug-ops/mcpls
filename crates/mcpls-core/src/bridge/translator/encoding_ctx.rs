@@ -264,12 +264,12 @@ impl EncodingCtx {
     ///
     /// Advisory only, for a read-only navigation handler to annotate a
     /// result location (`Location::out_of_workspace`,
-    /// `CallHierarchyItemResult::out_of_workspace`) instead of rejecting it
+    /// `HierarchyItem::out_of_workspace`) instead of rejecting it
     /// -- never a safety/security gate. Delegates to
     /// [`WorkspaceRoots::admits_uri`], a purely lexical check over the
     /// canonical roots and their verified aliases: unlike
     /// [`Translator::validate_path`](super::Translator::validate_path) (via
-    /// `validate_path_against_roots`), it does **not** canonicalize `uri`. A
+    /// `WorkspaceRoots::validate`), it does **not** canonicalize `uri`. A
     /// location that reaches a workspace root through a symlink other than a
     /// recorded alias (e.g. a package manager's symlinked dependency store)
     /// can therefore come back `true` even though `validate_path` would
@@ -318,18 +318,19 @@ impl EncodingCtx {
         uri: &lsp_types::Uri,
         position: Position,
     ) -> lsp_types::Position {
-        let line_text = if self.encoding == PositionEncoding::Utf16 || position.character <= 1 {
-            None
-        } else {
-            read_line_text(uri, position.line.saturating_sub(1), self).await
-        };
+        let line_text =
+            if self.encoding == PositionEncoding::Utf16 || position.character().get() <= 1 {
+                None
+            } else {
+                read_line_text(uri, position.lsp_line(), self).await
+            };
         let converted = mcp_to_lsp_position(position, line_text.as_deref(), self.encoding);
         if converted.fidelity == ColumnFidelity::PassedThrough
             && self.record_degradation(PositionDegradation::Request)
         {
             tracing::warn!(
                 uri = uri.as_ref(),
-                line = position.line,
+                line = position.line().get(),
                 encoding = self.encoding.to_lsp(),
                 "could not convert MCP column exactly; passing it through unconverted, which \
                  is wrong for a non-UTF-16 server (logged once per response)"
@@ -393,8 +394,12 @@ impl EncodingCtx {
         range: &Range,
     ) -> lsp_types::Range {
         lsp_types::Range {
-            start: self.to_lsp(uri, range.start.clone().into()).await,
-            end: self.to_lsp(uri, range.end.clone().into()).await,
+            start: self
+                .to_lsp(uri, Position::from_server_output(&range.start))
+                .await,
+            end: self
+                .to_lsp(uri, Position::from_server_output(&range.end))
+                .await,
         }
     }
 }
@@ -506,15 +511,7 @@ mod tests {
         let uri = path_to_uri(&path).unwrap();
 
         let ctx = test_ctx_with(PositionEncoding::Utf8);
-        let lsp_pos = ctx
-            .to_lsp(
-                &uri,
-                Position {
-                    line: 1,
-                    character: 3,
-                },
-            )
-            .await;
+        let lsp_pos = ctx.to_lsp(&uri, Position::at(1, 3)).await;
         // "hé" is 3 bytes in UTF-8 (h=1, é=2); MCP column 3 (UTF-16, after
         // "hé") must re-derive to that byte offset via the disk-read line
         // text, matching the `encoding.rs`-level math for the same input.
@@ -572,15 +569,7 @@ mod tests {
         let uri = tracker.open(path.clone(), "héllo".to_string()).unwrap(); // live: accent
 
         let ctx = EncodingCtx::new(PositionEncoding::Utf8, tracker, WorkspaceRoots::default());
-        let lsp_pos = ctx
-            .to_lsp(
-                &uri,
-                Position {
-                    line: 1,
-                    character: 3,
-                },
-            )
-            .await;
+        let lsp_pos = ctx.to_lsp(&uri, Position::at(1, 3)).await;
         assert_eq!(
             lsp_pos.character, 3,
             "must convert against the tracker's live content (\"héllo\" -> byte 3), not disk's \
@@ -742,14 +731,7 @@ mod tests {
 
         assert_eq!(ctx.positions_degraded(), None, "no lookup has happened yet");
 
-        ctx.to_lsp(
-            &uri,
-            Position {
-                line: 1,
-                character: 3,
-            },
-        )
-        .await;
+        ctx.to_lsp(&uri, Position::at(1, 3)).await;
 
         assert_eq!(
             ctx.positions_degraded(),

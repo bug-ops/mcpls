@@ -2,20 +2,20 @@
 //!
 //! A [`WorkspaceRoots`] holds the canonical roots plus the lexical aliases a
 //! client may legitimately name them by (configured form, logical `$PWD`).
-//! Aliases are precomputed once so [`validate_path_against_roots`] can reject
-//! an out-of-workspace path without touching the filesystem.
-//!
-//! [`validate_path_against_roots`]: crate::bridge::validate_path_against_roots
+//! Aliases are precomputed once so [`WorkspaceRoots::validate`] can reject an
+//! out-of-workspace path without touching the filesystem.
 
 use std::ffi::OsString;
+use std::io;
 use std::path::{Component, Path, PathBuf, Prefix, PrefixComponent};
 use std::sync::Arc;
 
 use lsp_types::Uri;
+use thiserror::Error as ThisError;
 use tracing::{debug, info, warn};
 
-use super::uri_to_path;
-use crate::error::Error;
+use super::{ClientPath, uri_to_path};
+use crate::error::{BackgroundTask, Error};
 
 /// How path components are compared during containment checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,18 +93,90 @@ pub fn lexically_normalize(path: &Path) -> PathBuf {
     parts.iter().collect()
 }
 
-/// Canonicalizes the longest existing ancestor of `path` and appends the
-/// remainder, so a not-yet-created (or since-deleted) file still gets a
-/// canonical form.
-///
-/// Uses [`dunce::canonicalize`] so Windows paths stay free of the `\\?\`
-/// prefix when possible. Returns `None` when no ancestor can be canonicalized.
-pub fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
-    path.ancestors().find_map(|ancestor| {
-        let canonical = dunce::canonicalize(ancestor).ok()?;
-        let rest = path.strip_prefix(ancestor).ok()?;
-        Some(lexically_normalize(&canonical.join(rest)))
+/// Canonicalizes one existing path; injectable so tests can simulate a slow
+/// or failing filesystem.
+pub type CanonicalizeFn = dyn Fn(&Path) -> io::Result<PathBuf> + Send + Sync;
+
+/// Why a path has no canonical form right now.
+#[derive(Debug, ThisError)]
+pub enum Unresolved {
+    /// The filesystem failed in a way that may not repeat; never cached.
+    #[error("transient filesystem error: {0}")]
+    Transient(#[source] io::Error),
+    /// Not even the root of the path could be canonicalized.
+    #[error("no ancestor of the path exists")]
+    NoExistingAncestor,
+    /// A `..` component: resolving it lexically after a missing component
+    /// could step around a symlink, so the path is refused outright.
+    #[error("path contains a `..` component")]
+    ParentComponent,
+}
+
+/// Canonicalizes `path` on disk. A dangling symlink is `NotFound` for
+/// `canonicalize` but exists as a link, so falling back to its parent would
+/// admit a path whose write lands outside the workspace; it is refused.
+fn canonicalize_on_disk(path: &Path) -> io::Result<PathBuf> {
+    dunce::canonicalize(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound && std::fs::symlink_metadata(path).is_ok() {
+            io::Error::other("dangling symlink")
+        } else {
+            error
+        }
     })
+}
+
+/// Canonicalizes the longest existing ancestor of `path` with `canonicalize`
+/// and appends the remainder, so a not-yet-created (or since-deleted) file
+/// still gets a canonical form.
+///
+/// The single canonicalization policy of the bridge. Falls back to the next
+/// ancestor only on [`io::ErrorKind::NotFound`] and
+/// [`io::ErrorKind::NotADirectory`]; every other error is
+/// [`Unresolved::Transient`]. A path with a `..` component is
+/// [`Unresolved::ParentComponent`]: a legitimate server publishes canonical
+/// paths, and the lexical join of the missing tail would otherwise bypass
+/// symlinks that `..` should have followed.
+pub fn canonicalize_existing_prefix(
+    path: &Path,
+    canonicalize: &CanonicalizeFn,
+) -> Result<PathBuf, Unresolved> {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(Unresolved::ParentComponent);
+    }
+    for ancestor in path.ancestors() {
+        match canonicalize(ancestor) {
+            Ok(canonical) => {
+                return path
+                    .strip_prefix(ancestor)
+                    .map(|rest| lexically_normalize(&canonical.join(rest)))
+                    .map_err(|_| Unresolved::NoExistingAncestor);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => return Err(Unresolved::Transient(e)),
+        }
+    }
+    Err(Unresolved::NoExistingAncestor)
+}
+
+/// Classifies an I/O failure on a client path: a path that cannot name a file
+/// is malformed, anything else is an I/O error.
+fn path_io_error(path: &Path, source: io::Error) -> Error {
+    match source.kind() {
+        io::ErrorKind::NotADirectory
+        | io::ErrorKind::InvalidFilename
+        | io::ErrorKind::InvalidInput => Error::MalformedPath {
+            path: path.to_path_buf(),
+            source,
+        },
+        _ => Error::FileIo {
+            path: path.to_path_buf(),
+            source,
+        },
+    }
 }
 
 /// The process working directory in its physical form plus the logical
@@ -218,7 +290,8 @@ impl ResolvedRoot {
                 "Failed to canonicalize absolute workspace root {}: {source}, using non-canonical path",
                 root.display()
             );
-            canonicalize_existing_prefix(root).unwrap_or_else(|| root.to_path_buf())
+            canonicalize_existing_prefix(root, &canonicalize_on_disk)
+                .unwrap_or_else(|_| root.to_path_buf())
         });
         Self {
             canonical,
@@ -262,7 +335,8 @@ impl ResolvedRoot {
         self.aliases.iter().filter_map(|alias| {
             let form = stored_alias_form(alias)?;
             if form == self.canonical
-                || canonicalize_existing_prefix(&form).as_deref() == Some(self.canonical.as_path())
+                || canonicalize_existing_prefix(&form, &canonicalize_on_disk)
+                    .is_ok_and(|real| real == self.canonical)
             {
                 Some(form)
             } else {
@@ -339,9 +413,51 @@ fn verified_system_aliases(links_dir: &Path, roots: &[PathBuf]) -> Vec<PathBuf> 
         .collect()
 }
 
+/// A client path that passed workspace validation: lexically admitted and
+/// canonicalized under a canonical root.
+///
+/// The field is private and the only constructors are
+/// [`WorkspaceRoots::validate`] and [`WorkspaceRoots::validate_blocking`], so
+/// a function taking a `WorkspacePath` knows the path was checked once and
+/// need not canonicalize it again.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{ClientPath, WorkspaceRoots};
+///
+/// let dir = std::env::temp_dir();
+/// let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&dir))?;
+/// let path = roots.validate_blocking(&ClientPath::try_from(dir.clone())?)?;
+/// assert!(path.as_path().is_absolute());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkspacePath(PathBuf);
+
+impl WorkspacePath {
+    /// The canonical path.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// The canonical path, by value.
+    #[must_use]
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+impl AsRef<Path> for WorkspacePath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// The canonical workspace roots plus the lexical aliases they may be named by.
 ///
-/// A path is admitted by `validate_path_against_roots` only if it passes the
+/// A path is admitted by [`WorkspaceRoots::validate`] only if it passes the
 /// lexical pre-check against the canonical roots and their aliases (configured
 /// form, logical `$PWD`) *and* its physical, canonical form lies under a
 /// canonical root; the aliases only widen the pre-check.
@@ -469,6 +585,77 @@ impl WorkspaceRoots {
         Self::from_parts(self.canonical.to_vec(), aliases)
     }
 
+    /// Validates a client path against the roots, canonicalizing it on the
+    /// blocking pool so a slow filesystem cannot stall a runtime worker.
+    ///
+    /// See [`Self::validate_blocking`] for the checks and errors.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::validate_blocking`], plus [`Error::TaskFailed`] when the
+    /// blocking task panics.
+    pub async fn validate(&self, path: &ClientPath) -> Result<WorkspacePath, Error> {
+        self.lexical_gate(path)?;
+        let roots = self.clone();
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || roots.canonical_gate(&path))
+            .await
+            .map_err(|source| Error::TaskFailed {
+                task: BackgroundTask::PathValidation,
+                source,
+            })?
+    }
+
+    /// Validates a client path against the roots on the calling thread.
+    ///
+    /// The lexical check (absolute, `.`/`..` resolved, against the canonical
+    /// roots and their aliases) is only a pre-filter: it rejects an
+    /// out-of-workspace path without touching the filesystem and can only
+    /// reject, never accept. The decision that counts uses the physical
+    /// path: the original path is canonicalized (so `..` after a symlink is
+    /// resolved against the real directory) and that canonical form must lie
+    /// under a canonical root. The returned path is the canonical one.
+    ///
+    /// Touches the filesystem; async callers use [`Self::validate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoWorkspaceRoots`] if no root is configured -- fails
+    /// closed rather than allowing unrestricted access -- and
+    /// [`Error::PathOutsideWorkspace`] if the path is outside every root.
+    /// When the lexical check admitted the path but it cannot be
+    /// canonicalized, [`Error::FileIo`] is returned (for example it does not
+    /// exist), or [`Error::MalformedPath`] when the path itself is malformed
+    /// (it runs through a regular file, or has an invalid or over-long name).
+    pub fn validate_blocking(&self, path: &ClientPath) -> Result<WorkspacePath, Error> {
+        self.lexical_gate(path)?;
+        self.canonical_gate(path)
+    }
+
+    fn lexical_gate(&self, path: &ClientPath) -> Result<(), Error> {
+        let path = path.as_path();
+        if self.is_empty() {
+            return Err(Error::NoWorkspaceRoots(path.to_path_buf()));
+        }
+        let absolute = std::path::absolute(path).map_err(|source| path_io_error(path, source))?;
+        let normalized = lexically_normalize(dunce::simplified(&absolute));
+        if self.admits_lexically(&normalized) {
+            Ok(())
+        } else {
+            Err(Error::PathOutsideWorkspace(path.to_path_buf()))
+        }
+    }
+
+    fn canonical_gate(&self, path: &ClientPath) -> Result<WorkspacePath, Error> {
+        let path = path.as_path();
+        let canonical = dunce::canonicalize(path).map_err(|source| path_io_error(path, source))?;
+        if self.contains_canonical(&canonical) {
+            Ok(WorkspacePath(canonical))
+        } else {
+            Err(Error::PathOutsideWorkspace(path.to_path_buf()))
+        }
+    }
+
     /// The canonical roots, in configuration order.
     #[must_use]
     pub fn canonical(&self) -> &[PathBuf] {
@@ -494,8 +681,7 @@ impl WorkspaceRoots {
     /// server-supplied URI must use [`Self::admits_edit_uri`] instead.
     /// Read-only navigation results are deliberately not filtered (standard
     /// library and dependency locations are legitimately outside); opening
-    /// such a path still goes through the inbound `validate_path_against_roots`
-    /// gate. Empty roots admit nothing.
+    /// such a path still goes through the inbound [`Self::validate`] gate. Empty roots admit nothing.
     pub(crate) fn admits_uri(&self, uri: &Uri) -> bool {
         plain_absolute_path(uri).is_some_and(|path| self.admits_lexically(&path))
     }
@@ -515,8 +701,12 @@ impl WorkspaceRoots {
         if !self.admits_with(&path, CaseRule::Exact) {
             return false;
         }
-        match tokio::task::spawn_blocking(move || canonicalize_existing_prefix(&path)).await {
-            Ok(canonical) => canonical.is_some_and(|canonical| self.contains_canonical(&canonical)),
+        match tokio::task::spawn_blocking(move || {
+            canonicalize_existing_prefix(&path, &canonicalize_on_disk)
+        })
+        .await
+        {
+            Ok(canonical) => canonical.is_ok_and(|canonical| self.contains_canonical(&canonical)),
             Err(error) => {
                 tracing::warn!(%error, uri = uri.as_ref(), "edit URI canonicalization task failed; dropping the edit");
                 false
@@ -671,7 +861,9 @@ mod tests {
     fn test_canonicalize_existing_prefix_handles_missing_tail() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dunce::canonicalize(dir.path()).unwrap();
-        let result = canonicalize_existing_prefix(&dir.path().join("gone/x.rs")).unwrap();
+        let result =
+            canonicalize_existing_prefix(&dir.path().join("gone/x.rs"), &canonicalize_on_disk)
+                .unwrap();
         assert_eq!(result, canonical.join("gone/x.rs"));
     }
 
@@ -1079,5 +1271,49 @@ mod tests {
 
         assert!(roots.admits_lexically(&dir.path().join("a.rs")));
         assert!(!roots.admits_lexically(Path::new("/tmp/other-dir/a.rs")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_admits_edit_uri_refuses_a_path_under_an_unreadable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, base) = canonical_tempdir();
+        let probe = base.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root_bypasses_modes = std::fs::read_dir(&probe).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if root_bypasses_modes {
+            return;
+        }
+        let sealed = base.join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+        let uri = Uri::from(format!("file://{}", sealed.join("new.rs").display()).as_str());
+        assert!(roots.admits_edit_uri(&uri).await);
+
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let admitted = roots.admits_edit_uri(&uri).await;
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!admitted, "an unreadable ancestor must not be skipped over");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_admits_edit_uri_refuses_a_dangling_symlink() {
+        let (_dir, base) = canonical_tempdir();
+        let outside = tempfile::tempdir().unwrap();
+        let target = dunce::canonicalize(outside.path()).unwrap().join("x");
+        std::os::unix::fs::symlink(&target, base.join("evil.rs")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("nodir"), base.join("evil_dir")).unwrap();
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+
+        for name in ["evil.rs", "evil_dir/file.rs"] {
+            let uri = Uri::from(format!("file://{}", base.join(name).display()).as_str());
+            assert!(!roots.admits_edit_uri(&uri).await, "{name}");
+        }
+        assert!(!target.exists());
     }
 }

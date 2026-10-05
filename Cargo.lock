@@ -999,6 +999,7 @@ dependencies = [
  "predicates",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

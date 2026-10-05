@@ -10,7 +10,7 @@ use super::dto::{
     DocumentHighlightEntry, DocumentHighlightKind, DocumentHighlightsResult, Position,
 };
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate, validate_position};
+use super::routing::{Capability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
 
@@ -41,8 +41,6 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<DocumentHighlightsResult> {
-        validate_position(position)?;
-
         let doc = self
             .prepare_gated_document(
                 &file_path,
@@ -218,12 +216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_zero_position_and_missing_capability() {
-        let result = Translator::new()
-            .handle_document_highlights(client_path("/tmp/a.rs"), pos(1, 0))
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-
+    async fn rejects_missing_capability() {
         let dir = TempDir::new().unwrap();
         let (translator, _server) = translator_with_capabilities(
             &dir,

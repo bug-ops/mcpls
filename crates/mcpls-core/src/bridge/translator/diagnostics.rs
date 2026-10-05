@@ -1,7 +1,6 @@
 //! Diagnostics pull/push merging, cache-derived diagnostics, and server
 //! log/message retrieval.
 
-use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use lsp_types::{
@@ -15,13 +14,13 @@ use super::dto::{
     Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentDiagnosticsResult, Position2D,
     Range, ServerLogsResult, ServerMessagesResult,
 };
-use super::enclosing::{ContextualDiagnostics, ResultContext};
+use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
-use super::routing::validate_path_against_roots;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::notifications::{LogLevel, message_as_str};
 use crate::bridge::{
-    ClientPath, DiagnosticInfo, DocumentTracker, NotificationCache, WorkspaceRoots, path_to_uri,
+    ClientPath, DiagnosticInfo, DocumentTracker, NotificationCache, WorkspacePath, WorkspaceRoots,
+    path_to_uri,
 };
 use crate::config::ToolKind;
 use crate::error::Result;
@@ -93,11 +92,13 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the path is invalid or outside workspace boundaries.
-    pub fn cached_diagnostics_uri(
+    pub async fn cached_diagnostics_uri(
         workspace_roots: &WorkspaceRoots,
         file_path: &ClientPath,
     ) -> Result<Uri> {
-        Self::cached_diagnostics_path_and_uri(workspace_roots, file_path).map(|(_, uri)| uri)
+        Self::cached_diagnostics_path_and_uri(workspace_roots, file_path)
+            .await
+            .map(|(_, uri)| uri)
     }
 
     /// As [`Self::cached_diagnostics_uri`], but also returns the validated,
@@ -110,15 +111,15 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the path is invalid or outside workspace boundaries.
-    pub(crate) fn cached_diagnostics_path_and_uri(
+    pub(crate) async fn cached_diagnostics_path_and_uri(
         workspace_roots: &WorkspaceRoots,
         file_path: &ClientPath,
-    ) -> Result<(PathBuf, Uri)> {
-        let validated_path = validate_path_against_roots(file_path, workspace_roots)?;
+    ) -> Result<(WorkspacePath, Uri)> {
+        let validated_path = workspace_roots.validate(file_path).await?;
 
         // Use path_to_uri (strips \\?\ on Windows) so the key matches what
         // rust-analyzer stores in publishDiagnostics notifications.
-        let uri = path_to_uri(&validated_path)?;
+        let uri = path_to_uri(validated_path.as_path())?;
         Ok((validated_path, uri))
     }
 
@@ -163,8 +164,25 @@ impl Translator {
         context: ResultContext,
         notification_cache: &Mutex<NotificationCache>,
     ) -> Result<DocumentDiagnosticsResult> {
+        let path = self.validate_path(&file_path).await?;
+        self.handle_validated_diagnostics(&path, context, notification_cache)
+            .await
+    }
+
+    /// As [`Self::handle_diagnostics`], for a path the caller already
+    /// validated, so it is not canonicalized a second time.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::handle_diagnostics`], except for path validation.
+    pub(crate) async fn handle_validated_diagnostics(
+        &self,
+        path: &WorkspacePath,
+        context: ResultContext,
+        notification_cache: &Mutex<NotificationCache>,
+    ) -> Result<DocumentDiagnosticsResult> {
         let doc = self
-            .prepare_document(&file_path, ToolKind::Diagnostics)
+            .prepare_document_for_path(path, ToolKind::Diagnostics)
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -237,8 +255,8 @@ impl Translator {
             }
         }?;
 
-        let ContextualDiagnostics {
-            diagnostics,
+        let Contextualized {
+            items: diagnostics,
             enrichment,
             positions_degraded,
         } = self
@@ -465,6 +483,7 @@ mod tests {
             &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
+        .await
         .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
@@ -567,6 +586,7 @@ mod tests {
             &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
+        .await
         .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
@@ -683,6 +703,7 @@ mod tests {
             &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
+        .await
         .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
@@ -738,6 +759,7 @@ mod tests {
             &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
+        .await
         .unwrap();
         let diag_info = cache.diagnostics(&cache_key).cloned();
         let diags = Translator::diagnostics_from_cache_entry(
@@ -750,14 +772,15 @@ mod tests {
         assert_eq!(diags.diagnostics[0].code, Some("42".to_string()));
     }
 
-    #[test]
-    fn test_handle_cached_diagnostics_invalid_path() {
+    #[tokio::test]
+    async fn test_handle_cached_diagnostics_invalid_path() {
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("nonexistent/path/file.rs");
         let result = Translator::cached_diagnostics_uri(
             &WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             &client_path(&missing),
-        );
+        )
+        .await;
         assert_matches!(result, Err(Error::FileIo { .. }));
     }
 
@@ -1253,8 +1276,8 @@ mod tests {
         assert_eq!(messages.messages.len(), 0);
     }
 
-    #[test]
-    fn test_handle_cached_diagnostics_path_outside_workspace() {
+    #[tokio::test]
+    async fn test_handle_cached_diagnostics_path_outside_workspace() {
         let temp_dir1 = TempDir::new().unwrap();
         let temp_dir2 = TempDir::new().unwrap();
 
@@ -1266,7 +1289,8 @@ mod tests {
         let result = Translator::cached_diagnostics_uri(
             &WorkspaceRoots::from_configured(&workspace_roots).unwrap(),
             &client_path(&test_file),
-        );
+        )
+        .await;
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 

@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::WorkspaceRoots;
 use crate::config::{BuiltinServer, LspServerConfig};
 use crate::error::InitFailureHint;
 use crate::lsp::{LspNotification, child_env_var};
@@ -371,7 +372,7 @@ fn has_user_tsserver_path(options: &serde_json::Value) -> bool {
 /// server from starting.
 pub fn pinned_initialization_options(
     config: &LspServerConfig,
-    workspace_roots: &[PathBuf],
+    workspace_roots: &WorkspaceRoots,
     parent_env: impl Fn(&str) -> Option<OsString>,
 ) -> Option<serde_json::Value> {
     let user = config.initialization_options.clone();
@@ -391,10 +392,8 @@ pub fn pinned_initialization_options(
     }
     match resolution {
         TsserverResolution::Pinned(tsserver) => {
-            if workspace_roots
-                .iter()
-                .any(|root| tsserver.starts_with(root))
-            {
+            let canonical = dunce::canonicalize(&tsserver).unwrap_or_else(|_| tsserver.clone());
+            if workspace_roots.contains_canonical(&canonical) {
                 tracing::warn!(
                     server = %config.language_id,
                     tsserver = %tsserver.display(),
@@ -686,7 +685,45 @@ mod tests {
     fn test_unsupported_launcher_options_stay_unpinned() {
         let mut config = config("npx");
         config.args = vec!["typescript-language-server".into(), "--stdio".into()];
-        assert_eq!(pinned_initialization_options(&config, &[], |_| None), None);
+        assert_eq!(
+            pinned_initialization_options(&config, &WorkspaceRoots::default(), |_| None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_symlinked_typescript_resolving_into_workspace_is_warned() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let layout = global_install(true);
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = dunce::canonicalize(workspace.path()).unwrap();
+        fs::create_dir_all(ws.join("ts/lib")).unwrap();
+        fs::write(ws.join("ts/lib/tsserver.js"), "").unwrap();
+        fs::write(ws.join("ts/package.json"), r#"{"version": "5.0.0"}"#).unwrap();
+        let link = layout.base.join("prefix/lib/node_modules/typescript");
+        fs::remove_dir_all(&link).unwrap();
+        std::os::unix::fs::symlink(ws.join("ts"), &link).unwrap();
+
+        let captured = crate::test_lsp::CapturedLogs::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let options = pinned_initialization_options(
+            &config(SERVER_STEM),
+            &WorkspaceRoots::from_configured(std::slice::from_ref(&ws)).unwrap(),
+            env_with_path(&layout.bin),
+        );
+        drop(guard);
+
+        assert!(options.is_some());
+        assert!(
+            captured
+                .messages()
+                .iter()
+                .any(|m| m.contains("installed inside the workspace")),
+            "{:?}",
+            captured.messages()
+        );
     }
 
     #[test]
@@ -699,7 +736,7 @@ mod tests {
             tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
         let options = pinned_initialization_options(
             &config(SERVER_STEM),
-            std::slice::from_ref(&layout.base),
+            &WorkspaceRoots::from_configured(std::slice::from_ref(&layout.base)).unwrap(),
             env_with_path(&layout.bin),
         );
         drop(guard);
@@ -721,9 +758,12 @@ mod tests {
     #[test]
     fn test_pinned_options_serialize_tsserver_path() {
         let layout = global_install(true);
-        let options =
-            pinned_initialization_options(&config(SERVER_STEM), &[], env_with_path(&layout.bin))
-                .unwrap();
+        let options = pinned_initialization_options(
+            &config(SERVER_STEM),
+            &WorkspaceRoots::default(),
+            env_with_path(&layout.bin),
+        )
+        .unwrap();
         assert_eq!(
             configured_tsserver_path(Some(&options)),
             Some(layout.tsserver)
@@ -736,7 +776,11 @@ mod tests {
         let mut config = config(SERVER_STEM);
         let user = serde_json::json!({"tsserver": {"path": "/custom/tsserver.js"}});
         config.initialization_options = Some(user.clone());
-        let options = pinned_initialization_options(&config, &[], env_with_path(&layout.bin));
+        let options = pinned_initialization_options(
+            &config,
+            &WorkspaceRoots::default(),
+            env_with_path(&layout.bin),
+        );
         assert_eq!(options, Some(user));
     }
 
@@ -746,15 +790,22 @@ mod tests {
         let mut config = config(SERVER_STEM);
         let user = serde_json::json!({"preferences": {}});
         config.initialization_options = Some(user.clone());
-        let options = pinned_initialization_options(&config, &[], env_with_path(&layout.bin));
+        let options = pinned_initialization_options(
+            &config,
+            &WorkspaceRoots::default(),
+            env_with_path(&layout.bin),
+        );
         assert_eq!(options, Some(user));
     }
 
     #[test]
     fn test_unresolved_leaves_options_none() {
         let layout = global_install(false);
-        let options =
-            pinned_initialization_options(&config(SERVER_STEM), &[], env_with_path(&layout.bin));
+        let options = pinned_initialization_options(
+            &config(SERVER_STEM),
+            &WorkspaceRoots::default(),
+            env_with_path(&layout.bin),
+        );
         assert_eq!(options, None);
     }
 
@@ -762,7 +813,7 @@ mod tests {
     fn test_other_server_options_untouched() {
         let mut config = LspServerConfig::rust_analyzer();
         config.initialization_options = Some(serde_json::json!({"a": 1}));
-        let options = pinned_initialization_options(&config, &[], |_| None);
+        let options = pinned_initialization_options(&config, &WorkspaceRoots::default(), |_| None);
         assert_eq!(options, Some(serde_json::json!({"a": 1})));
     }
 
@@ -943,7 +994,10 @@ mod tests {
         let mut config = config("tsc");
         config.args = vec!["--lsp".into(), "--stdio".into()];
         assert_eq!(resolve(&config, |_| None), None);
-        assert_eq!(pinned_initialization_options(&config, &[], |_| None), None);
+        assert_eq!(
+            pinned_initialization_options(&config, &WorkspaceRoots::default(), |_| None),
+            None
+        );
     }
 
     #[test]
@@ -1017,6 +1071,7 @@ mod tests {
             workspace_roots: vec![root],
             initialization_options: None,
             position_encodings: crate::config::PositionEncodings::DEFAULT,
+            redactions: std::sync::Arc::default(),
         })
         .await
         .map(|_| ())

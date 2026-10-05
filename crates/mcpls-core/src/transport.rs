@@ -127,9 +127,13 @@ pub struct HttpConfig {
     ///
     /// Bounds slow-header and slow-body ("slowloris") clients: a stalled
     /// header closes the connection, a stalled body is answered with
-    /// `408 Request Timeout`. It never interrupts a response, so long-lived
-    /// SSE streams are unaffected, and it does not bound a client that
-    /// stops *reading* a response. Defaults to [`HeaderReadTimeout::DEFAULT`].
+    /// `408 Request Timeout`. A whole request body must also arrive within
+    /// four times this timeout, and within at least two minutes, so a client
+    /// trickling one chunk per window is cut too. It never interrupts a
+    /// response, so long-lived SSE streams are unaffected, and it does not
+    /// bound a client that stops *reading* a response
+    /// ([`HttpConfig::write_stall_timeout`] does). Defaults to
+    /// [`HeaderReadTimeout::DEFAULT`].
     pub header_read_timeout: HeaderReadTimeout,
     /// Maximum number of concurrently open TCP connections.
     ///
@@ -166,12 +170,18 @@ pub struct HttpConfig {
     /// permit, and the session slot is freed after the idle timeout.
     /// Defaults to [`ResponseStreamDeadline::DEFAULT`].
     pub response_stream_deadline: ResponseStreamDeadline,
-    /// Longest a write to the peer may make no progress before the
-    /// connection is closed.
+    /// Longest a write to the peer may stay stalled before the connection is
+    /// closed.
     ///
-    /// Frees the connection permit of a peer that stops reading a response.
-    /// A peer that drains one send buffer per timeout window is not
-    /// detected. Defaults to [`WriteStallTimeout::DEFAULT`].
+    /// Frees the connection permit of a peer that stops reading a response or
+    /// reads it too slowly: a write that goes pending opens a window of this
+    /// length, which closes when a flush completes or the peer has taken at
+    /// least 2 KiB per second of the window (between 4 KiB and 1 MiB); a
+    /// window that expires first closes the connection. A streamed (SSE)
+    /// response is flushed after every frame, so each flush closes the window
+    /// and the floor there is one frame per window, the same a quiet
+    /// legitimate subscriber gives; the rate floor binds responses written in
+    /// large buffers. Defaults to [`WriteStallTimeout::DEFAULT`].
     pub write_stall_timeout: WriteStallTimeout,
 }
 
@@ -1443,7 +1453,7 @@ pub(crate) async fn run_stdio(
 ) -> Result<(), crate::Error> {
     let service = tokio::select! {
         result = mcp_server.serve(rmcp::transport::stdio()) => {
-            result.map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?
+            result.map_err(|e| crate::Error::McpServerStart(Box::new(e)))?
         }
         () = shutdown_signal.recv() => {
             tracing::info!("shutdown signal received during handshake, stopping stdio transport");
@@ -1454,7 +1464,10 @@ pub(crate) async fn run_stdio(
     tokio::select! {
         result = service.waiting() => result
             .map(|_| ())
-            .map_err(|e| crate::Error::McpServer(format!("MCP server error: {e}"))),
+            .map_err(|source| crate::Error::TaskFailed {
+                task: crate::error::BackgroundTask::McpService,
+                source,
+            }),
         () = shutdown_signal.recv() => {
             tracing::info!("shutdown signal received, stopping stdio transport");
             Ok(())
@@ -1828,11 +1841,10 @@ pub(crate) async fn serve_http(
 /// taken before `accept` so a full house leaves new connections queued in
 /// the kernel rather than accepted-and-idle.
 ///
-/// Every stream goes through [`ConnectionIo`]: a write that makes no progress
-/// for `write_stall` closes the connection, and a clean close lingers to
-/// discard the unread request body.
+/// Every stream goes through [`ConnectionIo`]: a write the peer drains slower
+/// than the minimum rate over a `write_stall` window closes the connection,
+/// and a clean close lingers to discard the unread request body.
 #[cfg(feature = "transport-http")]
-// TODO(#613): a peer trickling one read or body chunk per timeout window holds its permit indefinitely; needs a minimum-rate bound
 async fn serve_http1(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -1912,13 +1924,27 @@ async fn serve_http1(
     while connections.join_next().await.is_some() {}
 }
 
-/// Request body that fails once no frame has arrived for `timeout`, flagging
-/// `expired` so [`enforce_body_inactivity`] can answer `408`.
+/// Shortest total time a request body may take, whatever the configured
+/// `header_read_timeout` is.
+#[cfg(feature = "transport-http")]
+const MIN_BODY_DEADLINE: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// Total time a request body may take: four idle windows, at least
+/// [`MIN_BODY_DEADLINE`].
+#[cfg(feature = "transport-http")]
+fn body_deadline(header_read_timeout: HeaderReadTimeout) -> std::time::Duration {
+    MIN_BODY_DEADLINE.max(header_read_timeout.get().saturating_mul(4))
+}
+
+/// Request body that fails once no frame has arrived for `timeout`, or the
+/// whole body has taken longer than its total deadline, flagging `expired` so
+/// [`enforce_body_inactivity`] can answer `408`.
 #[cfg(feature = "transport-http")]
 struct InactivityBody {
     inner: axum::body::Body,
     timeout: std::time::Duration,
     sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    total: std::pin::Pin<Box<tokio::time::Sleep>>,
     expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1949,6 +1975,11 @@ impl http_body::Body for InactivityBody {
         use std::task::Poll;
 
         let this = self.get_mut();
+        if this.total.as_mut().poll(cx).is_ready() {
+            this.expired
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Poll::Ready(Some(Err(axum::Error::new(BodyInactivity))));
+        }
         match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(frame) => {
                 this.sleep = Box::pin(tokio::time::sleep(this.timeout));
@@ -1975,12 +2006,13 @@ impl http_body::Body for InactivityBody {
     }
 }
 
-/// Bounds the pause between request-body chunks by `timeout`, answering
-/// `408 Request Timeout` when a client stalls mid-body.
+/// Bounds the pause between request-body chunks by `timeout`, and the whole
+/// body by [`body_deadline`], answering `408 Request Timeout` when a client
+/// stalls or trickles mid-body.
 ///
 /// `header_read_timeout` only covers the request head, so without this a POST
-/// announcing a body it never sends would pin its connection and permit
-/// forever.
+/// announcing a body it never sends, or sending one byte per window, would
+/// pin its connection and permit forever.
 #[cfg(feature = "transport-http")]
 async fn enforce_body_inactivity(
     axum::extract::State(timeout): axum::extract::State<HeaderReadTimeout>,
@@ -1998,6 +2030,10 @@ async fn enforce_body_inactivity(
             inner: body,
             timeout: timeout.get(),
             sleep: Box::pin(tokio::time::sleep(timeout.get())),
+            total: Box::pin(tokio::time::sleep_until(connection_io::deadline_after(
+                tokio::time::Instant::now(),
+                body_deadline(timeout),
+            ))),
             expired: std::sync::Arc::clone(&expired),
         })
     };
@@ -2252,15 +2288,30 @@ impl CappedSessionManager {
             let inner = std::sync::Arc::clone(&self.inner);
             let id = id.clone();
             tokio::spawn(async move {
-                if let Err(e) = inner.close_session(&id).await {
-                    tracing::debug!(
-                        session = %SessionFingerprint(&id),
-                        "closing idle HTTP session failed: {e}"
-                    );
-                }
+                close_session_bounded(&id, inner.close_session(&id)).await;
             });
         }
         idle_ids.len()
+    }
+}
+
+/// Awaits `close` for at most [`liveness::SESSION_CLOSE_TIMEOUT`], so a wedged
+/// session worker cannot park the detached closing task forever.
+#[cfg(feature = "transport-http")]
+async fn close_session_bounded<E: std::fmt::Display>(
+    id: &SessionId,
+    close: impl std::future::Future<Output = Result<(), E>>,
+) {
+    match tokio::time::timeout(liveness::SESSION_CLOSE_TIMEOUT, close).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(
+            session = %SessionFingerprint(id),
+            "closing idle HTTP session failed: {e}"
+        ),
+        Err(_elapsed) => tracing::debug!(
+            session = %SessionFingerprint(id),
+            "closing idle HTTP session timed out"
+        ),
     }
 }
 
@@ -2725,8 +2776,8 @@ mod tests {
         let result = outcome.unwrap();
         assert_matches!(
             result,
-            Err(crate::Error::McpServer(_)),
-            "expected a McpServer error from the failed handshake, got: {result:?}"
+            Err(crate::Error::McpServerStart(_)),
+            "expected a McpServerStart error from the failed handshake, got: {result:?}"
         );
     }
 
@@ -3075,6 +3126,65 @@ mod tests {
             assert!(n > 0);
 
             server_task.abort();
+        }
+
+        /// A body trickling one chunk just inside every idle window still
+        /// fails once its total deadline passes, flagging the 408.
+        #[tokio::test(start_paused = true)]
+        async fn test_a_trickling_request_body_expires_at_the_total_deadline() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::time::Duration;
+
+            let idle = HeaderReadTimeout::new(Duration::from_secs(30)).unwrap();
+            let chunks = futures::stream::unfold(0_u32, |count| async move {
+                tokio::time::sleep(Duration::from_secs(29)).await;
+                Some((
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x")),
+                    count + 1,
+                ))
+            });
+            let expired = Arc::new(AtomicBool::new(false));
+            let mut body = Box::pin(super::super::InactivityBody {
+                inner: axum::body::Body::from_stream(chunks),
+                timeout: idle.get(),
+                sleep: Box::pin(tokio::time::sleep(idle.get())),
+                total: Box::pin(tokio::time::sleep(super::super::body_deadline(idle))),
+                expired: Arc::clone(&expired),
+            });
+            let start = tokio::time::Instant::now();
+
+            let outcome = loop {
+                let frame =
+                    std::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx)).await;
+                if let Some(Err(error)) = frame {
+                    break error;
+                }
+            };
+
+            assert!(outcome.to_string().contains("stalled"), "{outcome}");
+            assert!(expired.load(Ordering::Relaxed));
+            assert!(
+                start.elapsed() >= Duration::from_mins(2),
+                "{:?}",
+                start.elapsed()
+            );
+            assert!(
+                start.elapsed() < Duration::from_mins(3),
+                "{:?}",
+                start.elapsed()
+            );
+        }
+
+        #[test]
+        fn test_body_deadline_is_four_idle_windows_with_a_floor_and_never_overflows() {
+            use std::time::Duration;
+
+            let deadline =
+                |idle: Duration| super::super::body_deadline(HeaderReadTimeout::new(idle).unwrap());
+            assert_eq!(deadline(Duration::from_secs(5)), Duration::from_mins(2));
+            assert_eq!(deadline(Duration::from_secs(60)), Duration::from_mins(4));
+            assert_eq!(deadline(Duration::MAX), Duration::MAX);
         }
 
         /// Security M1: a POST announcing a body it never sends is answered
@@ -4755,6 +4865,38 @@ mod tests {
             assert!(manager.activity(&idle_id).is_none());
             assert!(manager.activity(&busy_id).is_some());
             assert!(manager.create_session().await.is_ok());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_close_session_bounded_drops_a_wedged_close_at_the_timeout() {
+            struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for SetOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let guard = SetOnDrop(std::sync::Arc::clone(&dropped));
+            let id: rmcp::transport::streamable_http_server::session::SessionId = "wedged".into();
+            let closer = tokio::spawn(async move {
+                super::super::close_session_bounded(&id, async move {
+                    let _guard = guard;
+                    std::future::pending::<Result<(), std::convert::Infallible>>().await
+                })
+                .await;
+            });
+
+            tokio::task::yield_now().await;
+            tokio::time::advance(
+                super::super::liveness::SESSION_CLOSE_TIMEOUT + std::time::Duration::from_secs(1),
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), closer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         }
 
         // `manager` lives to the end of the test.

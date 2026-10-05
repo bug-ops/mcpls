@@ -50,8 +50,8 @@ after a bounded time, without changing any default behavior for existing deploym
 
 ### Out of Scope
 
-- A peer that trickles one read or one request-body chunk per timeout window still holds its
-  permit; that needs a minimum-rate bound (#613).
+- A peer that trickles one read or one request-body chunk per timeout window held its permit;
+  FR-015 and FR-017 add the minimum-rate and total-body bounds (#613).
 
 ## 3. Functional Requirements
 
@@ -71,8 +71,9 @@ after a bounded time, without changing any default behavior for existing deploym
 | FR-012 | `AllowedHost` SHALL store a lowercase host with IPv6 brackets and an optional port, and display as `host` or `host:port` so the value re-parses as an authority in rmcp's allowlist, which falls back to a raw string for entries it cannot parse; no port matches any port, a port matches only that port | must |
 | FR-013 | THE accepted `Host` values SHALL be the loopback names (`localhost`, `127.0.0.1`, `[::1]`, any port), the bound IP literal on any port WHEN the bind address is neither unspecified nor loopback (a client reaching a `:80` or `:443` bind sends no port, and rmcp requires a pinned port to be present), and `HttpConfig::allowed_hosts` (`with_allowed_hosts`); there is no wildcard, so a `0.0.0.0` or `[::]` bind accepts only the loopback names and the configured hosts | must |
 | FR-014 | THE CLI SHALL expose `--http-allowed-host` (repeatable, `MCPLS_HTTP_ALLOWED_HOSTS`, comma-separated, blank segments ignored) mirroring `--http-allowed-origin`, and the non-loopback bind warning and the DNS-rebinding documentation SHALL describe the real `Host` rules | must |
-| FR-015 | EVERY accepted connection SHALL fail a write that makes no progress for `WriteStallTimeout` (default 30 s, non-zero, `HttpConfig::write_stall_timeout`, no CLI flag) with `TimedOut`, covering `poll_write`, `poll_write_vectored` and `poll_shutdown`; a write with progress disarms the timer and the next stall starts a fresh deadline; a peer that drains one send buffer per window is not detected | must |
+| FR-015 | EVERY accepted connection SHALL fail a write that makes no progress for `WriteStallTimeout` (default 30 s, non-zero, `HttpConfig::write_stall_timeout`, no CLI flag) with `TimedOut`, covering `poll_write`, `poll_write_vectored` and `poll_shutdown`; a stall window opens when a write goes pending and closes only when a flush completes or the peer has taken at least `2048 B/s` times the window (clamped to 4 KiB to 1 MiB, integer arithmetic); a window that expires first fails the write, so a peer that drains a trickle per window is cut at the first deadline | must |
 | FR-016 | A CLEAN connection close SHALL send the FIN and then discard incoming bytes until EOF, a read error, 2 s without data, 1 MiB discarded or `min(header_read_timeout, 30 s)` in total, reading at most 16 buffers per poll, resetting the idle timer once per batch and sharing one timer with the stall deadline, so an early `403` or `413` reaches a peer that is still sending a body of up to 1 MiB (a longer body is reset after the cap); closes after a header timeout, a stall or an error do not linger, and no linger starts (or a running one ends) once the server is shutting down | must |
+| FR-017 | A REQUEST body SHALL arrive within `max(2 min, 4 x header_read_timeout)` in total, counted from when the body is first polled and never reset, in addition to the idle pause bound; the deadline is computed with saturating arithmetic so a huge `header_read_timeout` cannot overflow; an expired body is answered `408 Request Timeout` | must |
 
 ## 4. Non-Functional Requirements
 

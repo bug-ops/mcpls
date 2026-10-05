@@ -1,8 +1,11 @@
 //! Public MCP-facing result/data-transfer types returned by the tool-call
 //! handlers in the sibling domain modules.
 
+use std::num::NonZeroU32;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSummary};
 use crate::redaction::{Redactions, ServerText};
@@ -24,29 +27,211 @@ pub struct Position2D {
     pub character: u32,
 }
 
+/// Largest line or character value a client may supply.
+pub const MAX_POSITION_VALUE: u32 = 1_000_000;
+
+/// Largest line span of a range given to a range-taking tool.
+pub const MAX_RANGE_LINES: u32 = 10_000;
+
+/// Why a client-supplied position was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InvalidPosition {
+    /// A line or character below 1; positions are 1-based.
+    #[error("Line and character positions must be >= 1")]
+    ZeroBased,
+    /// A line or character above [`MAX_POSITION_VALUE`].
+    #[error("Position values must be <= {MAX_POSITION_VALUE}")]
+    TooLarge,
+}
+
+/// Why a client-supplied range was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InvalidRange {
+    /// The start position is invalid.
+    #[error("invalid range start: {0}")]
+    Start(InvalidPosition),
+    /// The end position is invalid.
+    #[error("invalid range end: {0}")]
+    End(InvalidPosition),
+    /// The start lies after the end.
+    #[error("Start position must be before or equal to end position")]
+    Reversed,
+    /// The range spans more than [`MAX_RANGE_LINES`] lines.
+    #[error("Range size must be <= {MAX_RANGE_LINES} lines")]
+    TooManyLines,
+}
+
 /// A 1-based MCP position taken as input by `Translator::handle_*` methods.
 ///
 /// Kept distinct from [`Position2D`] (which carries an *output* position back
-/// to the caller) so passing a position into a handler always goes through a
-/// named-field struct literal (`Position { line, character }`) instead of two
-/// adjacent bare `u32` arguments -- a call site that swaps `line` and
-/// `character` no longer compiles instead of silently sending a wrong
-/// position to the LSP server (#322).
+/// to the caller) and made of two [`NonZeroU32`]s, so a zero position cannot
+/// exist and a call site that swaps `line` and `character` still names them
+/// (#322). A position typed by a client goes through [`Self::from_client`],
+/// the only fallible constructor; positions derived from server output
+/// convert infallibly through `Position::from_server_output`.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{InvalidPosition, Position};
+///
+/// let position = Position::from_client(3, 5)?;
+/// assert_eq!((position.line().get(), position.character().get()), (3, 5));
+/// assert_eq!(Position::from_client(0, 1), Err(InvalidPosition::ZeroBased));
+/// # Ok::<(), InvalidPosition>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
-    /// Line number (1-based).
-    pub line: u32,
-    /// Character offset (1-based).
-    pub character: u32,
+    line: NonZeroU32,
+    character: NonZeroU32,
 }
 
-impl From<Position2D> for Position {
-    /// Reuses an output position as a handler input position; both are
-    /// 1-based MCP positions.
-    fn from(position: Position2D) -> Self {
+impl Position {
+    /// Builds a position from client-supplied 1-based numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPosition::ZeroBased`] for a zero line or character
+    /// and [`InvalidPosition::TooLarge`] above [`MAX_POSITION_VALUE`].
+    pub const fn from_client(line: u32, character: u32) -> Result<Self, InvalidPosition> {
+        let (Some(line), Some(character)) = (NonZeroU32::new(line), NonZeroU32::new(character))
+        else {
+            return Err(InvalidPosition::ZeroBased);
+        };
+        if line.get() > MAX_POSITION_VALUE || character.get() > MAX_POSITION_VALUE {
+            return Err(InvalidPosition::TooLarge);
+        }
+        Ok(Self { line, character })
+    }
+
+    /// Line number (1-based).
+    #[must_use]
+    pub const fn line(self) -> NonZeroU32 {
+        self.line
+    }
+
+    /// Character offset (1-based).
+    #[must_use]
+    pub const fn character(self) -> NonZeroU32 {
+        self.character
+    }
+
+    /// Zero-based LSP line.
+    #[must_use]
+    pub const fn lsp_line(self) -> u32 {
+        self.line.get().saturating_sub(1)
+    }
+
+    /// Zero-based character offset, still in UTF-16 units.
+    #[must_use]
+    pub const fn lsp_character(self) -> u32 {
+        self.character.get().saturating_sub(1)
+    }
+
+    /// Reuses a position taken from server output, which is already 1-based
+    /// MCP form, as a handler input position. Deliberately not a `From`
+    /// impl: a position typed by a client must go through
+    /// [`Self::from_client`]. A zero, which converted LSP output never
+    /// carries, clamps to 1.
+    pub(crate) fn from_server_output(position: &Position2D) -> Self {
+        let clamp = |value: u32| NonZeroU32::new(value).unwrap_or(NonZeroU32::MIN);
         Self {
-            line: position.line,
-            character: position.character,
+            line: clamp(position.line),
+            character: clamp(position.character),
+        }
+    }
+
+    /// Builds a fixture position, panicking on an invalid one.
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn at(line: u32, character: u32) -> Self {
+        Self::from_client(line, character).expect("fixture position is valid")
+    }
+}
+
+/// An ordered pair of positions, `start <= end`.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{InvalidRange, Position, PositionRange};
+///
+/// let start = Position::from_client(1, 1).unwrap();
+/// let end = Position::from_client(2, 4).unwrap();
+/// assert!(PositionRange::new(start, end).is_ok());
+/// assert_eq!(PositionRange::new(end, start), Err(InvalidRange::Reversed));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionRange {
+    start: Position,
+    end: Position,
+}
+
+impl PositionRange {
+    /// Builds an ordered range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidRange::Reversed`] when `start` lies after `end`.
+    pub fn new(start: Position, end: Position) -> Result<Self, InvalidRange> {
+        let ordered = (start.line, start.character) <= (end.line, end.character);
+        if ordered {
+            Ok(Self { start, end })
+        } else {
+            Err(InvalidRange::Reversed)
+        }
+    }
+
+    /// Builds a range from client-supplied 1-based numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the invalid endpoint or [`InvalidRange::Reversed`].
+    pub fn from_client(
+        (start_line, start_character): (u32, u32),
+        (end_line, end_character): (u32, u32),
+    ) -> Result<Self, InvalidRange> {
+        let start =
+            Position::from_client(start_line, start_character).map_err(InvalidRange::Start)?;
+        let end = Position::from_client(end_line, end_character).map_err(InvalidRange::End)?;
+        Self::new(start, end)
+    }
+
+    /// First position of the range.
+    #[must_use]
+    pub const fn start(self) -> Position {
+        self.start
+    }
+
+    /// Last position of the range.
+    #[must_use]
+    pub const fn end(self) -> Position {
+        self.end
+    }
+}
+
+/// A [`PositionRange`] spanning at most [`MAX_RANGE_LINES`] lines, taken by
+/// the tools whose server-side cost grows with the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedRange(PositionRange);
+
+impl BoundedRange {
+    /// The underlying ordered range.
+    #[must_use]
+    pub const fn range(self) -> PositionRange {
+        self.0
+    }
+}
+
+impl TryFrom<PositionRange> for BoundedRange {
+    type Error = InvalidRange;
+
+    fn try_from(range: PositionRange) -> Result<Self, Self::Error> {
+        let span = range.end.line.get().saturating_sub(range.start.line.get());
+        if span > MAX_RANGE_LINES {
+            Err(InvalidRange::TooManyLines)
+        } else {
+            Ok(Self(range))
         }
     }
 }
@@ -479,43 +664,11 @@ pub struct CodeActionsResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// A call hierarchy item.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CallHierarchyItemResult {
-    /// Name of the symbol.
-    pub name: String,
-    /// LSP numeric symbol kind (e.g. 12 for Function).
-    pub kind: u32,
-    /// More detail for this item.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    /// URI of the document.
-    pub uri: String,
-    /// Range of the symbol.
-    pub range: Range,
-    /// Selection range (identifier location).
-    ///
-    /// Serialized as `selectionRange` (camelCase) so that the value returned by
-    /// `prepare_call_hierarchy` round-trips correctly when the MCP client passes
-    /// it back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize
-    /// it as `lsp_types::CallHierarchyItem` (camelCase).
-    #[serde(rename = "selectionRange")]
-    pub selection_range: Range,
-    /// Opaque data to pass to incoming/outgoing calls.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-    /// Whether this item is not provably inside any configured workspace
-    /// root -- see [`Location::out_of_workspace`] for the exact semantics
-    /// and caveats (advisory only, lexical, symlink-unaware).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub out_of_workspace: bool,
-}
-
 /// Result of call hierarchy prepare request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CallHierarchyPrepareResult {
     /// List of callable items at the position.
-    pub items: Vec<CallHierarchyItemResult>,
+    pub items: Vec<HierarchyItem>,
     /// Whether `items` was capped below the LSP server's full response (see
     /// `MAX_NORMALIZED_LOCATIONS`, #516). Omitted (defaults to `false`) when
     /// serialized.
@@ -532,7 +685,7 @@ pub struct CallHierarchyPrepareResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IncomingCall {
     /// The item that calls the current item.
-    pub from: CallHierarchyItemResult,
+    pub from: HierarchyItem,
     /// Ranges where the call occurs.
     pub from_ranges: Vec<Range>,
 }
@@ -558,7 +711,7 @@ pub struct IncomingCallsResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OutgoingCall {
     /// The item being called.
-    pub to: CallHierarchyItemResult,
+    pub to: HierarchyItem,
     /// Ranges where the call occurs.
     pub from_ranges: Vec<Range>,
 }
@@ -700,48 +853,54 @@ pub struct InlayHintsResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// A type hierarchy item, returned by `prepare_type_hierarchy`,
-/// `get_supertypes` and `get_subtypes` and accepted back as the typed `item`
-/// input of the latter two.
+/// A call or type hierarchy item.
+///
+/// Returned by the hierarchy tools and accepted back as the typed `item`
+/// input of the walking tools (`get_incoming_calls`, `get_outgoing_calls`,
+/// `get_supertypes`, `get_subtypes`). LSP's call and type hierarchy items carry the same fields, so one shape
+/// serves both. `data` is opaque to the caller and meaningful only to the
+/// server that produced the item.
 ///
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::bridge::TypeHierarchyItemResult;
+/// use mcpls_core::bridge::HierarchyItem;
 ///
-/// let item: TypeHierarchyItemResult = serde_json::from_value(serde_json::json!({
+/// let item: HierarchyItem = serde_json::from_value(serde_json::json!({
 ///     "name": "Base", "kind": 5, "uri": "file:///a.cpp",
 ///     "range": {"start": {"line": 1, "character": 1}, "end": {"line": 2, "character": 1}},
 ///     "selectionRange": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 11}},
 /// }))
 /// .unwrap();
 /// assert_eq!(item.name, "Base");
-/// assert!(serde_json::from_value::<TypeHierarchyItemResult>(serde_json::json!({})).is_err());
+/// assert!(serde_json::from_value::<HierarchyItem>(serde_json::json!({})).is_err());
 /// ```
-///
-/// Same shape as a call hierarchy item; `data` is opaque to the caller
-/// and meaningful only to the server that produced the item.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TypeHierarchyItemResult {
-    /// Name of the type.
+pub struct HierarchyItem {
+    /// Name of the symbol.
     pub name: String,
-    /// LSP numeric symbol kind (e.g. 5 for Class).
+    /// LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).
     pub kind: u32,
     /// More detail for this item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// URI of the document.
     pub uri: String,
-    /// Range of the type.
+    /// Range of the symbol.
     pub range: Range,
     /// Selection range (identifier location).
+    ///
+    /// Serialized as `selectionRange` (camelCase) so that a returned item
+    /// round-trips when the MCP client passes it back to a walking tool.
     #[serde(rename = "selectionRange")]
     pub selection_range: Range,
     /// Opaque data to pass back unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
     /// Whether this item is not provably inside any configured workspace
-    /// root -- see [`Location::out_of_workspace`]. Ignored on input.
+    /// root -- see [`Location::out_of_workspace`] for the exact semantics
+    /// and caveats (advisory only, lexical, symlink-unaware). Ignored on
+    /// input.
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_workspace: bool,
 }
@@ -751,7 +910,7 @@ pub struct TypeHierarchyItemResult {
 pub struct TypeHierarchyResult {
     /// Type hierarchy items at the position, or the supertypes/subtypes of
     /// the queried item.
-    pub items: Vec<TypeHierarchyItemResult>,
+    pub items: Vec<HierarchyItem>,
     /// Whether `items` was capped below the LSP server's full response (see
     /// `MAX_NORMALIZED_LOCATIONS`). Omitted (defaults to `false`) when
     /// serialized.
@@ -1115,29 +1274,6 @@ impl ServerText for CodeActionsResult {
     }
 }
 
-impl ServerText for CallHierarchyItemResult {
-    fn redact_server_text(&mut self, redactions: &Redactions) {
-        let Self {
-            name,
-            kind: _,
-            detail,
-            uri,
-            range: _,
-            selection_range: _,
-            data,
-            out_of_workspace: _,
-        } = self;
-        redactions.note_payload(name);
-        if let Some(detail) = detail {
-            redactions.note_payload(detail);
-        }
-        redactions.note_payload(uri);
-        if let Some(data) = data {
-            redactions.note_payload_json(data);
-        }
-    }
-}
-
 impl ServerText for CallHierarchyPrepareResult {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         let Self {
@@ -1268,7 +1404,7 @@ impl ServerText for InlayHintsResult {
     }
 }
 
-impl ServerText for TypeHierarchyItemResult {
+impl ServerText for HierarchyItem {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         let Self {
             name,
@@ -1509,7 +1645,7 @@ mod tests {
             }],
             positions_degraded: None,
         };
-        let mut item = CallHierarchyItemResult {
+        let mut item = HierarchyItem {
             name: format!("call_{SECRET}"),
             kind: 12,
             detail: Some(format!("detail {SECRET}")),
@@ -1519,7 +1655,7 @@ mod tests {
             data: Some(serde_json::json!({ "id": SECRET })),
             out_of_workspace: false,
         };
-        let mut type_item = TypeHierarchyItemResult {
+        let mut type_item = HierarchyItem {
             name: format!("type_{SECRET}"),
             kind: 5,
             detail: None,
@@ -1653,5 +1789,65 @@ mod tests {
     fn test_lsp_kind_to_u32_preserves_custom_values_above_u8_range() {
         let kind = lsp_types::InlayHintKind::Custom(300);
         assert_eq!(lsp_kind_to_u32(kind), 300u32);
+    }
+
+    #[test]
+    fn test_position_from_client_bounds() {
+        assert_eq!(Position::from_client(0, 1), Err(InvalidPosition::ZeroBased));
+        assert_eq!(Position::from_client(1, 0), Err(InvalidPosition::ZeroBased));
+        assert_eq!(
+            Position::from_client(MAX_POSITION_VALUE + 1, 1),
+            Err(InvalidPosition::TooLarge)
+        );
+        assert_eq!(
+            Position::from_client(1, MAX_POSITION_VALUE + 1),
+            Err(InvalidPosition::TooLarge)
+        );
+        let max = Position::from_client(MAX_POSITION_VALUE, MAX_POSITION_VALUE).unwrap();
+        assert_eq!((max.lsp_line(), max.lsp_character()), (999_999, 999_999));
+    }
+
+    #[test]
+    fn test_position_from_output_position_is_not_capped_and_clamps_zero() {
+        let big = Position::from_server_output(&Position2D {
+            line: MAX_POSITION_VALUE + 7,
+            character: 2_000_000,
+        });
+        assert_eq!(big.line().get(), MAX_POSITION_VALUE + 7);
+        let clamped = Position::from_server_output(&Position2D {
+            line: 0,
+            character: 0,
+        });
+        assert_eq!((clamped.line().get(), clamped.character().get()), (1, 1));
+    }
+
+    #[test]
+    fn test_position_range_orders_and_bounds() {
+        let at = Position::at;
+        assert!(PositionRange::new(at(1, 5), at(1, 5)).is_ok());
+        assert_eq!(
+            PositionRange::new(at(2, 1), at(1, 9)),
+            Err(InvalidRange::Reversed)
+        );
+        assert_eq!(
+            PositionRange::new(at(1, 5), at(1, 4)),
+            Err(InvalidRange::Reversed)
+        );
+        assert_eq!(
+            PositionRange::from_client((0, 1), (1, 1)),
+            Err(InvalidRange::Start(InvalidPosition::ZeroBased))
+        );
+        assert_eq!(
+            PositionRange::from_client((1, 1), (1, 0)),
+            Err(InvalidRange::End(InvalidPosition::ZeroBased))
+        );
+
+        let within = PositionRange::new(at(1, 1), at(1 + MAX_RANGE_LINES, 1)).unwrap();
+        assert!(BoundedRange::try_from(within).is_ok());
+        let beyond = PositionRange::new(at(1, 1), at(2 + MAX_RANGE_LINES, 1)).unwrap();
+        assert_eq!(
+            BoundedRange::try_from(beyond),
+            Err(InvalidRange::TooManyLines)
+        );
     }
 }

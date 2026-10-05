@@ -119,6 +119,7 @@ async fn spawn_rust_analyzer() -> LspServer {
         workspace_roots: vec![workspace_path.clone()],
         initialization_options: None,
         position_encodings: PositionEncodings::DEFAULT,
+        redactions: std::sync::Arc::default(),
     };
 
     LspServer::spawn(server_init_config)
@@ -212,10 +213,7 @@ async fn wait_for_hover_ready(
             .await
             .handle_hover(
                 client_path(file_path.clone()),
-                Position {
-                    line,
-                    character: col,
-                },
+                Position::from_client(line, col).unwrap(),
             )
             .await;
 
@@ -318,10 +316,7 @@ async fn test_hover_on_std_vec() {
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
             client_path(file_path.to_string_lossy().into_owned()),
-            Position {
-                line: string_line,
-                character: string_col,
-            },
+            Position::from_client(string_line, string_col).unwrap(),
         ),
     )
     .await;
@@ -362,10 +357,7 @@ async fn test_hover_on_u64_type() {
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
             client_path(file_path.to_string_lossy().into_owned()),
-            Position {
-                line: 19,
-                character: 13, // Position on "u64"
-            },
+            Position::from_client(19, 13).unwrap(),
         ),
     )
     .await;
@@ -402,10 +394,7 @@ async fn test_definition_user_struct() {
         Duration::from_secs(10),
         translator.lock().await.handle_definition(
             client_path(types_file.to_string_lossy().into_owned()),
-            Position {
-                line: 9,
-                character: 16, // Position on "User"
-            },
+            Position::from_client(9, 16).unwrap(),
             mcpls_core::bridge::ResultContext::None,
         ),
     )
@@ -453,10 +442,7 @@ async fn test_definition_across_files() {
         Duration::from_secs(10),
         translator.lock().await.handle_definition(
             client_path(functions_file.to_string_lossy().into_owned()),
-            Position {
-                line: 3,
-                character: 24, // Position on "Repository"
-            },
+            Position::from_client(3, 24).unwrap(),
             mcpls_core::bridge::ResultContext::None,
         ),
     )
@@ -494,10 +480,7 @@ async fn test_references_create_repo_function() {
         Duration::from_secs(10),
         translator.lock().await.handle_references(
             client_path(functions_file.to_string_lossy().into_owned()),
-            Position {
-                line: 7,
-                character: 12, // Position on "create_repo"
-            },
+            Position::from_client(7, 12).unwrap(),
             true, // Include declaration
             mcpls_core::bridge::ResultContext::None,
         ),
@@ -538,10 +521,7 @@ async fn test_references_user_struct() {
         Duration::from_secs(10),
         translator.lock().await.handle_references(
             client_path(lib_file.to_string_lossy().into_owned()),
-            Position {
-                line: 18,
-                character: 15, // Position on "User"
-            },
+            Position::from_client(18, 15).unwrap(),
             true,
             mcpls_core::bridge::ResultContext::None,
         ),
@@ -806,10 +786,7 @@ async fn test_completions_basic() {
         Duration::from_secs(10),
         translator.lock().await.handle_completions(
             client_path(functions_file.to_string_lossy().into_owned()),
-            Position {
-                line: 23,
-                character: 11, // Position after "repo."
-            },
+            Position::from_client(23, 11).unwrap(),
             None,
         ),
     )
@@ -885,10 +862,7 @@ async fn test_invalid_file_path() {
         .await
         .handle_hover(
             client_path("/nonexistent/file.rs"),
-            Position {
-                line: 1,
-                character: 1,
-            },
+            Position::from_client(1, 1).unwrap(),
         )
         .await;
 
@@ -912,10 +886,7 @@ async fn test_out_of_bounds_position() {
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
             client_path(lib_file.to_string_lossy().into_owned()),
-            Position {
-                line: 99999, // Way beyond file bounds
-                character: 1,
-            },
+            Position::from_client(99999, 1).unwrap(), // Way beyond file bounds
         ),
     )
     .await;
@@ -1124,6 +1095,7 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         workspace_roots: vec![workspace_path],
         initialization_options: None,
         position_encodings: PositionEncodings::DEFAULT,
+        redactions: std::sync::Arc::default(),
     };
 
     let mut server = LspServer::spawn(server_init_config)

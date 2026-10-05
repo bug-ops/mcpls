@@ -300,12 +300,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
 }
 
 /// Minimal [`ServerInitConfig`] around `server_config` for test fixtures.
-pub const fn init_config_for(server_config: LspServerConfig) -> ServerInitConfig {
+pub fn init_config_for(server_config: LspServerConfig) -> ServerInitConfig {
     ServerInitConfig {
         server_config,
         workspace_roots: vec![],
         initialization_options: None,
         position_encodings: PositionEncodings::DEFAULT,
+        redactions: std::sync::Arc::default(),
     }
 }
 

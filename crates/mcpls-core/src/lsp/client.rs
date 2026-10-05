@@ -14,7 +14,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, error, trace, warn};
 
 use crate::config::{LanguageId, LspServerConfig, LspSettings, ServerId};
-use crate::error::{Error, Result};
+use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader};
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
@@ -562,7 +562,24 @@ impl LspClient {
         P: Serialize,
         R: DeserializeOwned,
     {
-        let params_value = Self::omit_null_params(serde_json::to_value(params)?);
+        Box::pin(self.request_inner(method, params, timeout_duration))
+            .await
+            .map_err(UnclassifiedError::surface)
+    }
+
+    async fn request_inner<P, R>(
+        &self,
+        method: &str,
+        params: P,
+        timeout_duration: Duration,
+    ) -> std::result::Result<R, UnclassifiedError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let params_value = Self::omit_null_params(
+            serde_json::to_value(params).map_err(|e| UnclassifiedError::logged(e.into()))?,
+        );
         let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
 
         for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
@@ -586,25 +603,32 @@ impl LspClient {
 
             debug!("Sending request: {} (id={:?})", method, id);
 
-            self.register_and_send_request(request, response_tx).await?;
+            self.register_and_send_request(request, response_tx)
+                .await
+                .map_err(UnclassifiedError::logged)?;
 
             let outcome = match timeout(timeout_duration, response_rx).await {
-                Ok(received) => received.map_err(|_| Error::ServerTerminated)?,
+                Ok(received) => {
+                    received.map_err(|_| UnclassifiedError::logged(Error::ServerTerminated))?
+                }
                 Err(_elapsed) => {
                     // The response may still arrive after this point (the
                     // server is just slow, not dead), but nothing will ever
                     // read it again -- drop the now-orphaned entry instead of
                     // leaking it in `pending_requests` forever.
                     self.pending_requests.lock().await.remove(&id);
-                    return Err(Error::Timeout(timeout_duration));
+                    return Err(UnclassifiedError::logged(Error::Timeout(timeout_duration)));
                 }
             };
 
             match outcome {
                 Ok(result_value) => {
                     return serde_json::from_value(result_value).map_err(|e| {
-                        self.redactions
-                            .protocol_error(format_args!("Failed to deserialize response: {e}"))
+                        UnclassifiedError::logged(
+                            self.redactions.protocol_error(format_args!(
+                                "Failed to deserialize response: {e}"
+                            )),
+                        )
                     });
                 }
                 Err(Error::LspServerError {
@@ -628,11 +652,11 @@ impl LspClient {
                             method,
                             id
                         );
-                        return Err(Error::LspServerError {
+                        return Err(UnclassifiedError::logged(Error::LspServerError {
                             code,
                             message,
                             data,
-                        });
+                        }));
                     }
                     warn!(
                         "LSP error response: {} (code {}) on '{}' (id={:?}), will retry",
@@ -643,29 +667,32 @@ impl LspClient {
                     );
                     // continue loop for next attempt
                 }
-                Err(Error::LspServerError {
-                    code,
-                    message,
-                    data,
-                }) => {
-                    error!(
-                        "LSP error response: {} (code {}) on '{}' (id={:?})",
-                        Self::truncate_error_message_for_log(&message),
-                        code,
-                        method,
-                        id
-                    );
-                    return Err(Error::LspServerError {
-                        code,
-                        message,
-                        data,
-                    });
+                Err(error @ Error::LspServerError { .. }) => {
+                    return Err(UnclassifiedError::server_response(error, method, id));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(UnclassifiedError::logged(e)),
             }
         }
 
-        Err(Error::ServerTerminated)
+        Err(UnclassifiedError::logged(Error::ServerTerminated))
+    }
+
+    /// Like [`Self::request_typed`], but a server error response is returned
+    /// unlogged, wrapped in an [`UnclassifiedError`] so the caller decides
+    /// whether it is an error surfaced to the user or an expected outcome.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::request`].
+    pub(crate) async fn request_typed_classified<R>(
+        &self,
+        params: R::Params,
+        timeout_duration: Duration,
+    ) -> std::result::Result<R::Result, UnclassifiedError>
+    where
+        R: lsp_types::Request,
+    {
+        Box::pin(self.request_inner(R::METHOD.as_str(), params, timeout_duration)).await
     }
 
     /// Send a typed LSP request, deriving both the method string and the
@@ -827,7 +854,10 @@ impl LspClient {
             match task.as_mut() {
                 Some(task) => match task.await {
                     Ok(result) => result,
-                    Err(e) => Err(Error::Transport(format!("Receiver task failed: {e}"))),
+                    Err(source) => Err(Error::TaskFailed {
+                        task: BackgroundTask::LspReceiver,
+                        source,
+                    }),
                 },
                 None => Ok(()),
             }
@@ -1250,7 +1280,8 @@ impl LspClient {
     /// Without settings every item gets `Null`, whatever its shape and even
     /// when `items` is absent (the reply before settings existed). With
     /// settings an item gets its section (the whole object when `section` is
-    /// absent, `Null` when it is unknown or not a string); only a missing
+    /// absent, `Null` when it is unknown, not a string, or the item is not an
+    /// object); only a missing
     /// `items` list is answered with `-32602`. `scopeUri` is never read.
     fn workspace_configuration_result(
         params: Option<&Value>,
@@ -1269,13 +1300,135 @@ impl LspClient {
         })?;
         let sections = items
             .iter()
-            .map(|item| match item.get("section") {
-                None | Some(Value::Null) => settings.section(None),
-                Some(Value::String(section)) => settings.section(Some(section)),
-                Some(_) => Value::Null,
+            .map(|item| match ConfigurationItem::parse(item) {
+                ConfigurationItem::Whole => settings.section(None),
+                ConfigurationItem::Section(section) => settings.section(Some(section)),
+                ConfigurationItem::Uninterpretable => Value::Null,
             })
             .collect();
         Ok(Value::Array(sections))
+    }
+}
+
+/// Logs a server error response that reached the caller, under the prefix a
+/// log-grep alert watches for.
+fn log_surfaced_error(method: &str, id: &RequestId, code: i32, message: &str) {
+    error!(
+        "LSP error response: {} (code {}) on '{}' (id={:?})",
+        LspClient::truncate_error_message_for_log(message),
+        code,
+        method,
+        id
+    );
+}
+
+/// A failed request whose severity is still undecided.
+///
+/// A server error response is logged only once the caller says whether it is
+/// surfaced as an error ([`Self::surface`], ERROR) or turned into an expected
+/// outcome ([`Self::handled`], DEBUG). There is deliberately no conversion
+/// into [`Error`], so `?` does not compile and the choice cannot be skipped.
+#[derive(Debug)]
+#[must_use = "call `surface()` or `handled()` to log and unwrap the error"]
+pub struct UnclassifiedError(Option<Box<Unclassified>>);
+
+#[derive(Debug)]
+struct Unclassified {
+    error: Error,
+    unlogged: Option<(String, RequestId)>,
+}
+
+impl UnclassifiedError {
+    fn logged(error: Error) -> Self {
+        Self(Some(Box::new(Unclassified {
+            error,
+            unlogged: None,
+        })))
+    }
+
+    fn server_response(error: Error, method: &str, id: RequestId) -> Self {
+        Self(Some(Box::new(Unclassified {
+            error,
+            unlogged: Some((method.to_owned(), id)),
+        })))
+    }
+
+    fn take(mut self) -> Unclassified {
+        self.0.take().map_or_else(
+            || unreachable!("an UnclassifiedError holds its error until classified"),
+            |inner| *inner,
+        )
+    }
+
+    /// The wrapped error, for classification before logging.
+    pub(crate) fn error(&self) -> &Error {
+        self.0.as_ref().map_or_else(
+            || unreachable!("an UnclassifiedError holds its error until classified"),
+            |inner| &inner.error,
+        )
+    }
+
+    /// The error returned to the caller as a failure; a server error response
+    /// is logged at ERROR.
+    pub(crate) fn surface(self) -> Error {
+        let Unclassified { error, unlogged } = self.take();
+        if let (Some((method, id)), Error::LspServerError { code, message, .. }) =
+            (&unlogged, &error)
+        {
+            log_surfaced_error(method, id, *code, message);
+        }
+        error
+    }
+
+    /// The error of an expected outcome; a server error response is logged at
+    /// DEBUG.
+    pub(crate) fn handled(self) -> Error {
+        let Unclassified { error, unlogged } = self.take();
+        if let (Some((method, id)), Error::LspServerError { code, message, .. }) =
+            (&unlogged, &error)
+        {
+            debug!(
+                "LSP error response handled by the caller: {} (code {}) on '{}' (id={:?})",
+                LspClient::truncate_error_message_for_log(message),
+                code,
+                method,
+                id
+            );
+        }
+        error
+    }
+}
+
+/// A dropped, unclassified server error response is logged at ERROR, so
+/// `.ok()`, `let _ =` or an ignoring match arm cannot hide it.
+impl Drop for UnclassifiedError {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take()
+            && let (Some((method, id)), Error::LspServerError { code, message, .. }) =
+                (&inner.unlogged, &inner.error)
+        {
+            log_surfaced_error(method, id, *code, message);
+        }
+    }
+}
+
+/// How one `workspace/configuration` item selects part of the settings.
+enum ConfigurationItem<'a> {
+    Whole,
+    Section(&'a str),
+    Uninterpretable,
+}
+
+impl<'a> ConfigurationItem<'a> {
+    fn parse(item: &'a Value) -> Self {
+        let Value::Object(object) = item else {
+            return Self::Uninterpretable;
+        };
+        match object.get("section") {
+            None | Some(Value::Null) => Self::Whole,
+            Some(Value::String(section)) => Self::Section(section),
+            Some(_) => Self::Uninterpretable,
+        }
     }
 }
 
@@ -1547,6 +1700,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_workspace_configuration_non_object_item_gets_null() {
+        let settings = sample_settings();
+        let result = LspClient::workspace_configuration_result(
+            Some(&serde_json::json!({
+                "items": [
+                    { "section": "python.analysis" },
+                    { "section": "missing.x" },
+                    {},
+                    { "section": 5 },
+                    "x",
+                    null,
+                    7
+                ]
+            })),
+            Some(&settings),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!([
+                { "typeCheckingMode": "strict" },
+                null,
+                settings.to_value(),
+                null,
+                null,
+                null,
+                null
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn test_message_loop_answers_workspace_configuration_from_settings() {
         use tokio::io::BufReader;
@@ -1594,7 +1780,7 @@ mod tests {
             serde_json::json!([
                 null,
                 settings.to_value(),
-                settings.to_value(),
+                null,
                 { "ui.semanticTokens": true }
             ])
         );

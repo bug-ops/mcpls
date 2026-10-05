@@ -34,7 +34,8 @@ use crate::bridge::lock_std;
 
 const PROBE_ID_PREFIX: &str = "mcpls-liveness-";
 const OUTBOUND_CAPACITY: usize = 16;
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on closing one session, shared by every detached close.
+pub(super) const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const FAR_FUTURE: Duration = Duration::from_hours(262_800);
 
 /// `delay` from now, saturating at [`FAR_FUTURE`] so an absurd configured
@@ -304,7 +305,7 @@ impl StreamProbe {
     /// worker cannot stall it.
     fn close_standalone_stream(self) {
         tokio::spawn(async move {
-            let closed = tokio::time::timeout(CLOSE_TIMEOUT, async {
+            let closed = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, async {
                 let handle = self
                     .manager
                     .sessions

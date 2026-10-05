@@ -58,7 +58,7 @@ Setting `MCPLS_LOG_JSON`/`--log-json` or `MCPLS_TRUST_PROJECT_CONFIG` to any of 
 
 ### Out of Scope
 
-- Changing the `MCPLS_LOG` / `--log-level` parsing (already permissive — validated later, not at parse time; see `test_log_level_case_sensitive`)
+- Changing the `MCPLS_LOG` / `--log-level` parsing (validated separately; see FR-009)
 - Adding boolean-convention parsing to any other config surface (e.g. `mcpls.toml` fields) — this spec covers only the two CLI/env flags named above
 - Redesigning `logging::init` or the crash-path JSON guarantee itself (only the arg-parsing entry point that gates it)
 - Introducing a general-purpose "flexible bool" crate dependency without evaluating the custom-parser alternative first (see Open Questions)
@@ -147,6 +147,7 @@ Use EARS notation. Prefix with FR-NNN.
 | FR-006 | WHEN no value is supplied for `--log-json`/`MCPLS_LOG_JSON` THE SYSTEM SHALL default to JSON logging disabled (compact logging), preserving current default behavior | must |
 | FR-007 | WHEN no value is supplied for `--trust-project-config`/`MCPLS_TRUST_PROJECT_CONFIG` THE SYSTEM SHALL default to trust disabled, preserving current default behavior | must |
 | FR-008 | WHERE the fix changes argument parsing THE SYSTEM SHALL apply the identical accepted-value set and case-insensitivity to both `log_json` and `trust_project_config` (no divergence between the two flags) | must |
+| FR-009 | WHEN `--log-level` or `MCPLS_LOG` is empty, malformed, or contains a bare comma-separated word that is not a level THE SYSTEM SHALL reject startup at argument parsing with a message naming the offending word (full `target=level` directive syntax stays accepted) | must |
 
 ## 4. Non-Functional Requirements
 

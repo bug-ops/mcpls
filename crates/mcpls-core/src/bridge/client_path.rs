@@ -21,7 +21,7 @@ pub enum InvalidClientPath {
 /// A non-empty, NUL-free path supplied by an MCP client.
 ///
 /// The path may be relative or contain `.`/`..`; whether it lies inside the
-/// workspace is decided later by `validate_path_against_roots`. The MCP tool
+/// workspace is decided later by `WorkspaceRoots::validate`. The MCP tool
 /// methods parse their `file_path` into a `ClientPath` first thing (not while
 /// deserializing the parameters, which rmcp reports as a tool-result error
 /// rather than a JSON-RPC error), so a malformed path is `-32602`.

@@ -26,16 +26,72 @@ const MAX_LABEL_CHARS: usize = 64;
 
 /// Upper-case substrings that make an environment variable, flag or JSON key
 /// name denote a secret.
-// TODO(#611): exclude well-known non-secret env names that match AUTH/KEY (GIT_AUTHOR_*, SSH_AUTH_SOCK, XAUTHORITY); they over-redact tool display text
 const SECRET_NAME_PATTERNS: [&str; 6] = ["TOKEN", "KEY", "SECRET", "PASSW", "CRED", "AUTH"];
+
+/// Whole name segments (upper-case) that contain a secret pattern but name
+/// something benign, such as the `AUTH` of `GIT_AUTHOR_NAME`.
+const BENIGN_SEGMENTS: [&str; 7] = [
+    "AUTHOR",
+    "AUTHORS",
+    "AUTHORITY",
+    "XAUTHORITY",
+    "KEYBOARD",
+    "KEYMAP",
+    "TOKENIZERS",
+];
+
+/// Whole names (upper-case) that are benign although their segments joined
+/// would match: `SSH_AUTH_SOCK` holds a socket path.
+const BENIGN_NAMES: [&str; 1] = ["SSH_AUTH_SOCK"];
+
+/// Splits `name` into segments at `_`, `-` and `.`, and at camel-case
+/// boundaries (`proxyAuth`, and the end of an acronym in `XMLHttp`).
+fn name_segments(name: &str) -> impl Iterator<Item = &str> {
+    name.split(['_', '-', '.']).flat_map(|piece| {
+        let mut starts = vec![0];
+        let chars: Vec<(usize, char)> = piece.char_indices().collect();
+        for (index, window) in chars.windows(2).enumerate() {
+            let [(_, before), (start, after)] = window else {
+                continue;
+            };
+            let next_is_lower = chars
+                .get(index.saturating_add(2))
+                .is_some_and(|(_, next)| next.is_lowercase());
+            let lower_to_upper =
+                (before.is_lowercase() || before.is_ascii_digit()) && after.is_uppercase();
+            let acronym_end = before.is_uppercase() && after.is_uppercase() && next_is_lower;
+            if lower_to_upper || acronym_end {
+                starts.push(*start);
+            }
+        }
+        starts.push(piece.len());
+        starts
+            .windows(2)
+            .filter_map(|bounds| match bounds {
+                [from, to] => piece.get(*from..*to),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    })
+}
 
 /// Whether `name` (an environment variable, a flag without its dashes, or a
 /// JSON key) denotes a secret, ignoring case.
+///
+/// Fails closed: the segments that are exactly a benign word are dropped, the
+/// rest are joined and matched by substring, so `passWord` and `AUTHORIZATION`
+/// stay secret while `GIT_AUTHOR_NAME` and `XAUTHORITY` do not.
 pub fn is_secret_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
+    if BENIGN_NAMES.contains(&name.to_ascii_uppercase().as_str()) {
+        return false;
+    }
+    let kept: String = name_segments(name)
+        .map(str::to_ascii_uppercase)
+        .filter(|segment| !BENIGN_SEGMENTS.contains(&segment.as_str()))
+        .collect();
     SECRET_NAME_PATTERNS
         .iter()
-        .any(|pattern| upper.contains(pattern))
+        .any(|pattern| kept.contains(pattern))
 }
 
 /// Text known to carry no configured secret: it was redacted when built or is
@@ -97,12 +153,22 @@ impl<T: ServerText> ServerText for Option<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Secret {
     label: String,
     value: String,
     /// JSON- and `Debug`-escaped spellings of `value` that differ from it.
     escaped: Vec<String>,
+}
+
+/// Prints the label only: a derived `Debug` would print the secret itself
+/// wherever a struct holding a [`Redactions`] is formatted.
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secret")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Secret {
@@ -139,8 +205,17 @@ impl Secret {
 
 /// The secret values to hide from a server's output, longest first so a value
 /// that contains another is replaced whole.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Redactions(Vec<Secret>);
+
+/// Prints the number of secrets only, never a value.
+impl std::fmt::Debug for Redactions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Redactions")
+            .field("secrets", &self.0.len())
+            .finish()
+    }
+}
 
 impl Redactions {
     /// Builds the set from `(label, value)` candidates, dropping values under
@@ -226,19 +301,38 @@ impl Redactions {
         config: &LspServerConfig,
         inherited: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        let mut candidates: Vec<(String, String)> = config
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .chain(inherited)
+        Self::for_servers(std::iter::once(config), inherited)
+    }
+
+    /// The secrets any of `configs` can leak, over one `inherited`
+    /// environment: [`Self::for_server`] for every server, whether or not
+    /// its project markers matched, so a server that echoes another's secret
+    /// still has it hidden. Fails closed: a configured secret is hidden
+    /// everywhere, not only in the output of the server that owns it.
+    pub(crate) fn for_servers<'a>(
+        configs: impl IntoIterator<Item = &'a LspServerConfig>,
+        inherited: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        let inherited: Vec<(String, String)> = inherited
+            .into_iter()
             .filter(|(name, _)| is_secret_name(name))
             .collect();
-        collect_secret_args(&config.args, &mut candidates);
-        if let Some(options) = &config.initialization_options {
-            collect_secret_json(options, None, &mut candidates);
-        }
-        if let Some(settings) = &config.settings {
-            collect_secret_json(&settings.to_value(), None, &mut candidates);
+        let mut candidates = inherited;
+        for config in configs {
+            candidates.extend(
+                config
+                    .env
+                    .iter()
+                    .filter(|(name, _)| is_secret_name(name))
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+            collect_secret_args(&config.args, &mut candidates);
+            if let Some(options) = &config.initialization_options {
+                collect_secret_json(options, None, &mut candidates);
+            }
+            if let Some(settings) = &config.settings {
+                collect_secret_json(&settings.to_value(), None, &mut candidates);
+            }
         }
         Self::new(candidates)
     }
@@ -264,6 +358,9 @@ impl Redactions {
 
     /// [`Self::apply`] in place; `text` is written only when a secret occurs.
     pub(crate) fn redact_in_place(&self, text: &mut String) {
+        if self.is_empty() {
+            return;
+        }
         if let Cow::Owned(redacted) = self.apply(text) {
             *text = redacted;
         }
@@ -451,6 +548,44 @@ mod tests {
         config.args = Vec::new();
         config.initialization_options = None;
         config
+    }
+
+    #[test]
+    fn test_for_servers_covers_every_configured_server_over_one_environment() {
+        let mut first = server_config();
+        first
+            .env
+            .insert("FIRST_TOKEN".into(), "first-secret-value".into());
+        let mut second = server_config();
+        second.args = vec!["--api-key=second-secret-value".into()];
+
+        let set = Redactions::for_servers(
+            [&first, &second],
+            [(
+                "GITHUB_TOKEN".to_owned(),
+                "inherited-secret-value".to_owned(),
+            )],
+        );
+
+        for text in [
+            "first-secret-value",
+            "second-secret-value",
+            "inherited-secret-value",
+        ] {
+            assert!(set.apply(text).contains("[redacted:"), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_debug_never_prints_a_secret_value() {
+        let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
+        let other_value = redactions(&[("API_TOKEN", "zzzz_ijklmnop")]);
+
+        let printed = format!("{set:?} {:?}", set.0[0]);
+        let printed_other = format!("{other_value:?} {:?}", other_value.0[0]);
+
+        assert!(printed.eq(&printed_other));
+        assert!(printed.contains("secrets: 1"));
     }
 
     #[test]
@@ -673,6 +808,62 @@ mod tests {
         for name in ["RUSTUP_TOOLCHAIN", "JAVA_HOME", "GOFLAGS", "PATH"] {
             assert!(!is_secret_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn test_secret_name_stays_fail_closed_across_segment_boundaries() {
+        for name in [
+            "AUTHORIZATION",
+            "HTTP_PROXY_AUTHORIZATION",
+            "http.proxyAuthorization",
+            "GIT_AUTHOR_TOKEN",
+            "OPENAI_API_KEY",
+            "apiKey",
+            "APIKEY",
+            "AUTHTOKEN",
+            "db_passwd",
+            "passWord",
+            "passWd",
+            "dbPassWord",
+            "myToKen",
+            "XMLHttpKey",
+            "SSH_AUTH_SOCK_TOKEN",
+            "AUTHORS_KEY",
+            "tokenizers_apikey",
+            "ключ_TOKEN",
+        ] {
+            assert!(is_secret_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_secret_name_skips_well_known_benign_names() {
+        for name in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "SSH_AUTH_SOCK",
+            "ssh_auth_sock",
+            "XAUTHORITY",
+            "XAuthority",
+            "TOKENIZERS_PARALLELISM",
+            "KEYBOARD_LAYOUT",
+            "keymap",
+        ] {
+            assert!(!is_secret_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_name_segments_split_on_separators_and_camel_case() {
+        let segments = |name| name_segments(name).collect::<Vec<_>>();
+        assert_eq!(
+            segments("GIT_AUTHOR-NAME.x"),
+            ["GIT", "AUTHOR", "NAME", "x"]
+        );
+        assert_eq!(segments("proxyAuthorization"), ["proxy", "Authorization"]);
+        assert_eq!(segments("XMLHttpKey"), ["XML", "Http", "Key"]);
+        assert_eq!(segments("v2Key"), ["v2", "Key"]);
+        assert_eq!(segments(""), [""]);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::dto::{
     DefinitionResult, HoverResult, Location, LocationsResult, Position, PositionDegradation,
     ReferencesResult,
 };
-use super::enclosing::{ContextualLocation, ContextualLocations, ResultContext};
+use super::enclosing::{ContextualLocation, Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::indexing::{
@@ -185,7 +185,7 @@ impl ItemBudget {
 /// (e.g. the standard library or a crates.io dependency) -- dropping those
 /// would break ordinary navigation. Any subsequent attempt to open or read
 /// the path this location names still goes through the inbound
-/// `validate_path_against_roots` gate (`mcp/server.rs`), which fails closed,
+/// `WorkspaceRoots::validate` gate (`mcp/server.rs`), which fails closed,
 /// so the untrusted-URI concern is already covered downstream.
 async fn lsp_locations_to_mcp(
     locs: Vec<lsp_types::Location>,
@@ -522,7 +522,7 @@ impl Translator {
         &self,
         normalized: NormalizedLocations,
         context: ResultContext,
-    ) -> ContextualLocations {
+    ) -> Contextualized<Location> {
         self.contextualize_locations(normalized.locations, context, normalized.positions_degraded)
             .await
     }
@@ -592,8 +592,8 @@ impl Translator {
             )
             .await?;
         let truncated = normalized.truncated;
-        let ContextualLocations {
-            locations,
+        let Contextualized {
+            items: locations,
             enrichment,
             positions_degraded,
         } = self.contextualize(normalized, context).await;
@@ -646,8 +646,8 @@ impl Translator {
 
         let normalized = lsp_locations_to_mcp(response.unwrap_or_default(), &ctx).await;
         let truncated = normalized.truncated;
-        let ContextualLocations {
-            locations,
+        let Contextualized {
+            items: locations,
             enrichment,
             positions_degraded,
         } = self.contextualize(normalized, context).await;
@@ -684,8 +684,8 @@ impl Translator {
             )
             .await?;
         let truncated = normalized.truncated;
-        let ContextualLocations {
-            locations,
+        let Contextualized {
+            items: locations,
             enrichment,
             positions_degraded,
         } = self.contextualize(normalized, context).await;
@@ -723,8 +723,8 @@ impl Translator {
             )
             .await?;
         let truncated = normalized.truncated;
-        let ContextualLocations {
-            locations,
+        let Contextualized {
+            items: locations,
             enrichment,
             positions_degraded,
         } = self.contextualize(normalized, context).await;
@@ -1490,14 +1490,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_definition(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        ResultContext::None,
-                    )
+                    .handle_definition(client_path(path), Position::at(1, 1), ResultContext::None)
                     .await
             })
         };
@@ -1540,7 +1533,7 @@ mod tests {
     /// goto-definition into the standard library or a crates.io dependency
     /// is normal, expected navigation, not an attack. The untrusted-URI
     /// concern is instead covered downstream, by the inbound
-    /// `validate_path_against_roots` gate any subsequent open/read of the
+    /// `WorkspaceRoots::validate` gate any subsequent open/read of the
     /// path would hit.
     #[tokio::test]
     async fn test_handle_definition_does_not_filter_out_of_workspace_location() {
@@ -1562,14 +1555,7 @@ mod tests {
             let path = path.to_string_lossy().to_string();
             tokio::spawn(async move {
                 translator
-                    .handle_definition(
-                        client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
-                        ResultContext::None,
-                    )
+                    .handle_definition(client_path(path), Position::at(1, 1), ResultContext::None)
                     .await
             })
         };
@@ -1801,10 +1787,7 @@ mod tests {
                 translator
                     .handle_implementation(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
+                        Position::at(1, 1),
                         ResultContext::None,
                     )
                     .await
@@ -2061,10 +2044,7 @@ mod tests {
                 translator
                     .handle_type_definition(
                         client_path(path),
-                        Position {
-                            line: 1,
-                            character: 1,
-                        },
+                        Position::at(1, 1),
                         ResultContext::None,
                     )
                     .await

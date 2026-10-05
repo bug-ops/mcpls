@@ -6,9 +6,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position,
-    RestartTarget, ResultContext, ServerIds, SymbolName, SymbolQuery, SymbolTarget,
-    TypeHierarchyItemResult, parse_symbol_kind,
+    HierarchyItem, InvalidPosition, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
+    MAX_SYMBOL_NAME_BYTES, Position, RestartTarget, ResultContext, ServerIds, SymbolName,
+    SymbolQuery, SymbolTarget, parse_symbol_kind,
 };
 use crate::config::ServerId;
 
@@ -97,8 +97,43 @@ struct SymbolTargetWire {
 pub struct SymbolTargetParams {
     /// Absolute path to the file.
     pub file_path: PathBuf,
-    /// The symbol to act on.
-    pub target: SymbolTarget,
+    /// The symbol to act on, as the client wrote it.
+    pub target: SymbolTargetInput,
+}
+
+/// A symbol addressed by position or by name, before the position is checked.
+///
+/// The position stays raw so a bad value is rejected as invalid parameters
+/// (JSON-RPC `-32602`) by [`Self::into_target`] in the tool method, not as a
+/// deserialization failure, which MCP reports as a tool-result error.
+#[derive(Debug, Clone)]
+pub enum SymbolTargetInput {
+    /// A 1-based position, unchecked.
+    Position {
+        /// Line number (1-based).
+        line: u32,
+        /// Character offset (1-based).
+        character: u32,
+    },
+    /// A symbol name with optional qualifiers.
+    Name(SymbolQuery),
+}
+
+impl SymbolTargetInput {
+    /// Checks the position and yields the typed target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPosition`] for a position below 1 or above
+    /// [`MAX_POSITION_VALUE`](crate::bridge::MAX_POSITION_VALUE).
+    pub fn into_target(self) -> Result<SymbolTarget, InvalidPosition> {
+        match self {
+            Self::Position { line, character } => {
+                Position::from_client(line, character).map(SymbolTarget::Position)
+            }
+            Self::Name(query) => Ok(SymbolTarget::Name(query)),
+        }
+    }
 }
 
 impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
@@ -112,7 +147,7 @@ impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
                         "`symbol_kind` and `container` apply only with `symbol_name`".to_string(),
                     );
                 }
-                SymbolTarget::Position(Position { line, character })
+                SymbolTargetInput::Position { line, character }
             }
             (None, None, Some(name)) => {
                 let kind = wire
@@ -125,7 +160,7 @@ impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
                         parse_symbol_kind(kind)
                     })
                     .transpose()?;
-                SymbolTarget::Name(SymbolQuery {
+                SymbolTargetInput::Name(SymbolQuery {
                     name: SymbolName::try_new(name).map_err(|e| e.to_string())?,
                     kind,
                     container: wire
@@ -162,10 +197,10 @@ impl From<PositionParams> for SymbolTargetParams {
     fn from(position: PositionParams) -> Self {
         Self {
             file_path: position.file_path,
-            target: SymbolTarget::Position(Position {
+            target: SymbolTargetInput::Position {
                 line: position.line,
                 character: position.character,
-            }),
+            },
         }
     }
 }
@@ -345,8 +380,10 @@ pub struct CodeActionsParams {
 )]
 pub struct CallHierarchyCallsParams {
     /// The call hierarchy item to get calls for (from prepare response).
-    #[schemars(description = "The call hierarchy item to get calls for (from prepare response).")]
-    pub item: serde_json::Value,
+    #[schemars(
+        description = "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy, get_incoming_calls or get_outgoing_calls."
+    )]
+    pub item: HierarchyItem,
 }
 
 /// Parameters for the `get_supertypes` and `get_subtypes` tools.
@@ -359,7 +396,7 @@ pub struct TypeHierarchyWalkParams {
     #[schemars(
         description = "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
     )]
-    pub item: TypeHierarchyItemResult,
+    pub item: HierarchyItem,
 }
 
 /// Parameters for the `format_range` tool.
@@ -504,6 +541,7 @@ pub struct InlayHintsParams {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::assert_matches;
     use std::path::Path;
 
     use super::*;
@@ -603,12 +641,12 @@ mod tests {
         let json = serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2});
         let references: ReferencesParams = serde_json::from_value(json).unwrap();
         assert_eq!(references.target.file_path.as_path(), Path::new("/a.rs"));
-        assert_eq!(
+        assert_matches!(
             references.target.target,
-            SymbolTarget::Position(Position {
+            SymbolTargetInput::Position {
                 line: 1,
                 character: 2
-            })
+            }
         );
         assert!(!references.include_declaration);
 
@@ -621,7 +659,7 @@ mod tests {
         });
         let references: ReferencesParams = serde_json::from_value(json).unwrap();
         assert!(references.include_declaration);
-        let SymbolTarget::Name(query) = references.target.target else {
+        let SymbolTargetInput::Name(query) = references.target.target else {
             panic!("expected a name target");
         };
         assert_eq!(query.name.as_str(), "parse");
@@ -657,7 +695,7 @@ mod tests {
             let json =
                 serde_json::json!({"file_path": "/a.rs", "symbol_name": "f", "symbol_kind": value});
             let params: SymbolTargetParams = serde_json::from_value(json).unwrap();
-            let SymbolTarget::Name(query) = params.target else {
+            let SymbolTargetInput::Name(query) = params.target else {
                 panic!("expected a name target");
             };
             query.kind

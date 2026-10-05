@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::Translator;
-use super::dto::Position;
+use super::dto::{BoundedRange, Position, PositionRange};
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
@@ -27,8 +27,18 @@ pub(super) fn canonical_dir(dir: &TempDir) -> PathBuf {
 }
 
 /// Shorthand for building a [`Position`] test fixture.
-pub(super) const fn pos(line: u32, character: u32) -> Position {
-    Position { line, character }
+pub(super) fn pos(line: u32, character: u32) -> Position {
+    Position::at(line, character)
+}
+
+/// An ordered range fixture, panicking when `start` lies after `end`.
+pub(super) fn span(start: Position, end: Position) -> PositionRange {
+    PositionRange::new(start, end).expect("fixture range is ordered")
+}
+
+/// A range fixture within the size cap.
+pub(super) fn bounded(start: Position, end: Position) -> BoundedRange {
+    BoundedRange::try_from(span(start, end)).expect("fixture range is within the size cap")
 }
 
 /// A UTF-16 `EncodingCtx`, matching the pre-negotiation behavior: no
@@ -255,6 +265,7 @@ mod sh_servers {
             workspace_roots: vec![],
             initialization_options: None,
             position_encodings: PositionEncodings::DEFAULT,
+            redactions: std::sync::Arc::default(),
         }
     }
 
@@ -350,3 +361,8 @@ pub(super) use sh_servers::{
     pid_is_running, stub_server_config, write_crash_after_init_script,
     write_protocol_server_script, write_responder_script, write_slow_exit_server_script,
 };
+
+/// A hierarchy item parsed from JSON, panicking on a malformed one.
+pub(super) fn hierarchy_item(json: serde_json::Value) -> super::dto::HierarchyItem {
+    serde_json::from_value(json).expect("fixture hierarchy item is valid")
+}
