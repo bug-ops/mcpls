@@ -9,7 +9,7 @@ tags:
   - schema
   - performance
 created: 2026-10-05
-status: draft
+status: implemented
 related:
   - "[[mcp/014-tools-list-payload-size/spec|spec]]"
   - "[[constitution]]"
@@ -20,7 +20,7 @@ related:
 > [!info] References
 > **Spec**: [[mcp/014-tools-list-payload-size/spec|tools-list-payload-size]]
 > **Baseline**: commit `517cb53`, 29 tools, 171,465 B compact
-> **Status**: draft; blocked only on the spec's open `[NEEDS CLARIFICATION]` items for phase 3
+> **Status**: implemented (phases 1 and 2; phase 3 not needed)
 
 ## 1. Architecture
 
@@ -194,7 +194,7 @@ Before shortening, confirm each statement survives in one canonical place per to
 
 ## 9. Rollout Plan
 
-- Single PR, three commits matching the phases; `perf(mcp):` Conventional Commit type. The change is a metadata-only reduction with no tool, parameter or result change, so it is not marked breaking; descriptions that clients may display do change [NEEDS CLARIFICATION: whether a changed `description` string alone should be treated as breaking for the CHANGELOG]. Pre-v1 so no deprecation path.
+- Single PR, three commits matching the phases; `perf(mcp):` Conventional Commit type. The change is a metadata-only reduction with no tool, parameter or result change, so it is not marked breaking; descriptions that clients may display do change (a changed `description` string alone is not treated as breaking). Pre-v1 so no deprecation path.
 - `CHANGELOG.md` `[Unreleased]`: one line, "`tools/list` payload reduced from about 171 KB to under 130 KB; schema descriptions no longer embed rustdoc examples", with the PR link.
 - Update the testing documents under `.local/testing/` per the project rules (do not edit the continuous-improvement rule file): add a regression case "tools/list size under budget and no rustdoc code in schemas" to `regressions.md`, a measurement recipe to `process-notes.md`, and reset the `mcp` row in `coverage-status.md`.
 - No feature flag; the shaping is deterministic and always on.

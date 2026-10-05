@@ -27,6 +27,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
+use super::schema_shape::shape_tool_schemas;
 use super::session::{ListenPermit, ListenRegistration, ListenUris, SubscriptionRegistry, Target};
 use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
@@ -128,6 +129,13 @@ macro_rules! name_addressing_note {
 macro_rules! enclosing_symbol_note {
     () => {
         "Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`."
+    };
+}
+
+/// Tool-description sentence for the tools whose results flag `out_of_workspace`.
+macro_rules! out_of_workspace_note {
+    () => {
+        "`out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory)."
     };
 }
 
@@ -554,6 +562,22 @@ impl McplsServer {
         self.context.session.registry()
     }
 
+    /// The declared tools with the read-only annotation default applied and
+    /// their schemas exactly as the generator produced them.
+    ///
+    /// [`Self::build_tool_router`] shapes these schemas; this stays separate so
+    /// the schema-shaping tests can compare the two.
+    pub(super) fn unshaped_tool_router() -> ToolRouter<Self> {
+        let mut router = Self::declared_tool_router();
+        for route in router.map.values_mut() {
+            let title = route.attr.title.clone();
+            route.attr.annotations.get_or_insert_with(|| {
+                ToolAnnotations::from_raw(title, Some(true), Some(false), Some(true), None)
+            });
+        }
+        router
+    }
+
     /// Router for every MCP tool, with the read-only classification applied
     /// and, when `prefix` is configured, every tool name rewritten to
     /// `{prefix}_{name}`.
@@ -579,14 +603,9 @@ impl McplsServer {
     /// `test_no_route_is_ever_disabled` below), but a latent bug the moment
     /// that changes: any future `disable_route` call must name the
     /// already-prefixed tool name and must run strictly after this rename.
-    fn build_tool_router(prefix: Option<&ToolPrefix>) -> ToolRouter<Self> {
-        let mut router = Self::declared_tool_router();
-        for route in router.map.values_mut() {
-            let title = route.attr.title.clone();
-            route.attr.annotations.get_or_insert_with(|| {
-                ToolAnnotations::from_raw(title, Some(true), Some(false), Some(true), None)
-            });
-        }
+    pub(super) fn build_tool_router(prefix: Option<&ToolPrefix>) -> ToolRouter<Self> {
+        let mut router = Self::unshaped_tool_router();
+        shape_tool_schemas(router.map.values_mut().map(|route| &mut route.attr));
         if let Some(prefix) = prefix {
             debug_assert!(router.map.keys().all(|name| router.has_route(name)));
             let unprefixed = std::mem::take(&mut router.map);
@@ -625,7 +644,7 @@ impl McplsServer {
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = concat!("Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!()),
+        description = concat!("Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
         title = "Go to Definition"
     )]
     async fn get_definition(
@@ -653,7 +672,7 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = concat!("References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!()),
+        description = concat!("References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
         title = "Find References"
     )]
     async fn get_references(
@@ -687,7 +706,7 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!(), " ", enclosing_symbol_note!()),
+        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
         title = "Diagnostics"
     )]
     async fn get_diagnostics(
@@ -745,7 +764,7 @@ impl McplsServer {
     // read-only: returns a proposed WorkspaceEdit, does not apply it -- mcpls
     // has no write-back path today; revisit if that changes.
     #[tool(
-        description = concat!("Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. ", name_addressing_note!(), " An ambiguous name never produces an edit. ", positions_note_request!()),
+        description = concat!("Rename symbol across workspace. Returns text edits for all files where symbol is used. A non-empty `dropped` field means some edits were withheld (e.g. out-of-workspace files, or `exceeds_item_cap` when a file's edits exceed the fixed maximum) -- the rename is then incomplete even though `changes` is non-empty. ", name_addressing_note!(), " An ambiguous name never produces an edit. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Rename Symbol"
     )]
     async fn rename_symbol(
@@ -839,7 +858,7 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = concat!("Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. ", positions_note_response!()),
+        description = concat!("Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. ", positions_note_response!(), " ", out_of_workspace_note!()),
         title = "Workspace Symbol Search"
     )]
     async fn workspace_symbol_search(
@@ -862,7 +881,7 @@ impl McplsServer {
     // read-only: returns proposed CodeAction edits, does not apply them --
     // mcpls has no write-back path today; revisit if that changes.
     #[tool(
-        description = concat!("Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. ", positions_note_request!()),
+        description = concat!("Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Code Actions"
     )]
     async fn get_code_actions(
@@ -884,7 +903,7 @@ impl McplsServer {
 
     /// Prepare call hierarchy at a position.
     #[tool(
-        description = concat!("Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", name_addressing_note!(), " ", positions_note_request!()),
+        description = concat!("Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Prepare Call Hierarchy"
     )]
     async fn prepare_call_hierarchy(
@@ -909,7 +928,7 @@ impl McplsServer {
 
     /// Get incoming calls (callers).
     #[tool(
-        description = concat!("Functions calling the specified item. Takes call hierarchy item, returns callers, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        description = concat!("Functions calling the specified item. Takes call hierarchy item, returns callers, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Incoming Calls"
     )]
     async fn get_incoming_calls(
@@ -921,7 +940,7 @@ impl McplsServer {
 
     /// Get outgoing calls (callees).
     #[tool(
-        description = concat!("Functions called by the specified item. Takes call hierarchy item, returns callees, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        description = concat!("Functions called by the specified item. Takes call hierarchy item, returns callees, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Outgoing Calls"
     )]
     async fn get_outgoing_calls(
@@ -933,7 +952,7 @@ impl McplsServer {
 
     /// Prepare type hierarchy at a position.
     #[tool(
-        description = concat!("Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        description = concat!("Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Prepare Type Hierarchy"
     )]
     async fn prepare_type_hierarchy(
@@ -955,7 +974,7 @@ impl McplsServer {
 
     /// Get the supertypes (bases) of a type hierarchy item.
     #[tool(
-        description = concat!("Supertypes (base classes, implemented interfaces) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        description = concat!("Supertypes (base classes, implemented interfaces) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Supertypes"
     )]
     async fn get_supertypes(
@@ -967,7 +986,7 @@ impl McplsServer {
 
     /// Get the subtypes (derived types) of a type hierarchy item.
     #[tool(
-        description = concat!("Subtypes (derived classes, implementors) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!()),
+        description = concat!("Subtypes (derived classes, implementors) of a type hierarchy item. Takes an item exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes; returns one level, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Subtypes"
     )]
     async fn get_subtypes(
@@ -1162,7 +1181,7 @@ impl McplsServer {
 
     /// Go to implementation locations.
     #[tool(
-        description = concat!("Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!()),
+        description = concat!("Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
         title = "Go to Implementation"
     )]
     async fn go_to_implementation(
@@ -1190,7 +1209,7 @@ impl McplsServer {
 
     /// Go to type definition location.
     #[tool(
-        description = concat!("Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!()),
+        description = concat!("Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
         title = "Go to Type Definition"
     )]
     async fn go_to_type_definition(
@@ -1218,7 +1237,7 @@ impl McplsServer {
 
     /// Go to declaration location.
     #[tool(
-        description = concat!("Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!()),
+        description = concat!("Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Go to Declaration"
     )]
     async fn go_to_declaration(
