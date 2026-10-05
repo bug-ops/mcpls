@@ -11,7 +11,7 @@ tags:
   - typescript
   - compatibility
 created: 2026-10-05
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[config/001-config-discovery-and-heuristics/spec|config-discovery-and-heuristics]]"
@@ -85,7 +85,7 @@ workspace lookup and fails.
 **Observed, not yet verified against mcpls.** The native TypeScript 7 server reports diagnostics
 only through pull (`textDocument/diagnostic`). mcpls supports pull diagnostics
 (`bridge/translator/diagnostics.rs`), but the end-to-end behavior against the native server needs a
-live check ([NEEDS CLARIFICATION: see FR-008]). Neither TypeScript server supports type hierarchy.
+live check (FR-008, verified: the pull path works). Neither TypeScript server supports type hierarchy.
 At least one independent MCP LSP bridge already handles the split: when the workspace's own
 `typescript` package is version 7 or later it starts that package's `tsc --lsp --stdio`, otherwise
 `typescript-language-server`, and a user-defined TypeScript server always takes precedence.
@@ -205,10 +205,10 @@ section 9.
 |----|------------|----------|
 | FR-001 | THE SYSTEM SHALL ship an install hint for the built-in TypeScript server (`BuiltinServer::install_hint`) and a README install block that, when followed, yield a `typescript-language-server` that initializes, and SHALL state which `typescript` major versions that server supports | must |
 | FR-002 | THE SYSTEM SHALL keep `README.md`, `docs/user-guide/getting-started.md`, `docs/user-guide/configuration.md` and the `BuiltinServer` install hint consistent with each other on the TypeScript install command and the supported `typescript` majors | must |
-| FR-003 | WHEN resolving the `typescript` package next to `typescript-language-server` and that package is major version 7 or later (or lacks `lib/tsserver.js` while carrying a `package.json` `version`) THE SYSTEM SHALL classify the situation with a dedicated typed reason, distinct from "no valid typescript package installed" | must |
-| FR-004 | WHEN the situation of FR-003 is detected THE SYSTEM SHALL log a warning that names TypeScript 7 and the remedy, instead of the current misleading "no valid typescript package" text | must |
+| FR-003 | WHEN resolving the `typescript` package next to `typescript-language-server`, or in a workspace root's node lookup path, and that package is major version 7 or later (or lacks `lib/tsserver.js` while carrying a `package.json` `version`) THE SYSTEM SHALL classify the situation with a dedicated typed reason, distinct from "no valid typescript package installed" | must |
+| FR-004 | WHEN the situation of FR-003 is detected next to the server THE SYSTEM SHALL log a warning that names TypeScript 7 and the remedy, instead of the current misleading "no valid typescript package" text | must |
 | FR-005 | WHEN `typescript-language-server` fails during initialization AND the situation of FR-003 was detected for that server THE SYSTEM SHALL add static guidance to the surfaced error naming TypeScript 7 as the likely cause and listing the remedies: install a JavaScript-based `typescript` next to the server, or configure the native server explicitly | must |
-| FR-006 | THE SYSTEM SHALL document, with a copy-pasteable example, how to configure the native TypeScript server explicitly (`command` resolving to the TypeScript 7 `tsc`, `args = ["--lsp", "--stdio"]`) for `language_id = "typescript"`, including the Windows shim name and that the workspace-local binary is workspace-supplied code | must |
+| FR-006 | THE SYSTEM SHALL document, with a copy-pasteable example, how to configure the native TypeScript server explicitly (`command` resolving to the TypeScript 7 `tsc`, `args = ["--lsp", "--stdio"]`) for `language_id = "typescript"`, including the Windows shim name, that the existing on-disk `typescript` entry must be replaced (a second catch-all entry for `typescript` is rejected at startup, with or without its own `name`), that the `command` is the absolute path of a `tsc` outside the workspace, and that a workspace-local or `PATH`-resolved binary is workspace-supplied code | must |
 | FR-007 | WHERE automatic native-server selection exists AND no user-defined TypeScript server entry is present AND TypeScript 7 is resolvable from a location outside the workspace THE SYSTEM SHALL start `tsc --lsp --stdio` from that install instead of `typescript-language-server` | should |
 | FR-008 | THE SYSTEM SHALL verify live that `get_diagnostics` against the native TypeScript server returns the file's errors through the pull path (`textDocument/diagnostic`), including servers that advertise `diagnosticProvider` without push diagnostics, and SHALL record the result in the testing playbooks | must |
 | FR-009 | THE SYSTEM SHALL verify live that the native server accepts mcpls's `initialize` parameters, the workspace-configuration push (see [[lsp/010-workspace-configuration-push/spec|lsp/010]]) and shutdown, and that no `tsserver.path` pin is sent to a server that is not `typescript-language-server` | must |
@@ -224,7 +224,7 @@ section 9.
 | NFR-001 | Type safety | The TypeScript server flavor (JavaScript tsserver-based vs native) and the detected `typescript` package state SHALL be closed typed values (enums), not strings or booleans; the major version SHALL be parsed into a typed value, per [[constitution]] |
 | NFR-002 | Security | Automatic selection SHALL NOT widen the set of workspace-supplied executables mcpls starts by default compared with [[runtime/003-workspace-supplied-code-execution/spec|runtime/003]]; `SECURITY.md` SHALL describe the native server's workspace-code exposure per its verified behavior |
 | NFR-003 | Graceful degradation | Detection and selection failures SHALL NOT prevent mcpls or other servers from starting; they degrade to documented behavior |
-| NFR-004 | Performance | Detection SHALL read only the filesystem layout already read by the tsserver pin and add no LSP requests and no process spawns before the server is started |
+| NFR-004 | Performance | Detection SHALL only read package manifests (size-capped, opened without blocking on special files) and check file existence, in the server package's node lookup path and in each workspace root's node lookup path; it SHALL add no execution, no LSP requests and no process spawns |
 | NFR-005 | Portability | Detection and selection SHALL be valid on Linux, macOS and Windows; platform-specific executable names (shims) SHALL be handled or reported explicitly, never assumed |
 | NFR-006 | Error hygiene | Added error text SHALL be static mcpls text; no value from the server or workspace is interpolated beyond the sanitized excerpt rules of [[runtime/004-server-text-hygiene/spec|runtime/004]] |
 | NFR-007 | Honesty of claims | Documentation SHALL NOT claim a pinned or selected native server makes an untrusted workspace safe |
@@ -248,7 +248,7 @@ No persistent data. In-memory typed values only.
 |----------|-------------------|
 | Global `typescript` 7 next to `typescript-language-server`, no workspace TypeScript | Detected (FR-003); error and warning name TypeScript 7 (FR-004, FR-005); with automatic selection the native server starts (FR-007) |
 | Global `typescript` 7, workspace has its own `typescript` 5 with `tsserver.js` | Pin is not applied; the server selects the workspace tsserver and starts, which is the workspace-code exposure the pin normally prevents. The warning must say so; automatic selection (if adopted) prefers the out-of-workspace native server |
-| Workspace has `typescript` 7 only, no global TypeScript | `typescript-language-server` fails; guidance applies. The workspace-local `tsc` is not auto-started (FR-011); the user may configure it explicitly (FR-006, US-005) |
+| Workspace has `typescript` 7 only, no global TypeScript | `typescript-language-server` fails; guidance applies, detected through the workspace root's manifest read. The workspace-local `tsc` is not auto-started (FR-011); the user may configure it explicitly (FR-006, US-005) |
 | `typescript` package present but `package.json` has no `version` | Existing behavior: pin skipped, reason "no valid typescript package" |
 | `typescript` 7 found in an ancestor `node_modules` after a nearer package without `tsserver.js` | Resolution follows the same node lookup order as the pin; the nearest valid install decides |
 | User-defined TypeScript server entry with `tsc --lsp --stdio` | Honored unchanged (US-005); no pin generated since the command is not `typescript-language-server`; `initialization_options` forwarded as given |
@@ -315,26 +315,32 @@ containing `export function f(a: string): number { return a.length; }` plus a de
 - Execute a `tsc` from a workspace `node_modules` by default.
 - Hard-code an absolute path to TypeScript or its server.
 - Interpolate server-supplied or workspace-supplied text into the added guidance.
-- Match on the upstream error string as the only trigger for guidance without a typed detection ([NEEDS CLARIFICATION: see section 9]).
+- Match on the upstream error string as the only trigger for guidance without a typed detection.
 - Auto-install TypeScript or the server.
 - Claim that the native server or the pin makes an untrusted workspace safe.
 
 ## 9. Open Questions
 
-> [!question] Decisions needed before a plan
-> - [NEEDS CLARIFICATION: scope decision, guidance only (FR-001 to FR-006, FR-008 to FR-010), or additionally automatic native-server selection (FR-007, FR-011 to FR-013)? Recommended for P1: ship the guidance and verification first as one change, then decide automatic selection after the live checks show the native server is a fully working default.]
-> - [NEEDS CLARIFICATION: which `typescript` range does the install hint pin so that `typescript-language-server` works (the last JavaScript-based major, expected 6.x)? Confirm the exact range and that `typescript-language-server` 6.0.1 supports it, live.]
-> - [NEEDS CLARIFICATION: which signal identifies the native package: `package.json` major version 7 or later, absence of `lib/tsserver.js`, or presence of `lib/tsc.js` and `bin/tsc`? Pre-release and `7.0.1-rc`-style versions and the `@typescript/native-preview` package (tsgo) need an explicit decision.]
-> - [NEEDS CLARIFICATION: where does automatic selection happen, given the default config is static and project-marker heuristics decide only whether a server applies (see [[config/001-config-discovery-and-heuristics/spec|config/001]])? A second built-in entry, a resolution step at registration, or a spawn-time substitution each change the routing identity and the config-visible behavior differently.]
-> - [NEEDS CLARIFICATION: what is the out-of-workspace lookup order for the native `tsc` (next to the resolved `typescript-language-server`, global npm prefix, `PATH`), and is a `PATH` entry that points into the workspace treated as workspace-supplied?]
-> - [NEEDS CLARIFICATION: does the TypeScript 7 npm `bin/tsc` run a Node wrapper that starts a platform-specific native binary (`lib/getExePath.*`)? If so, is the native binary a separately installed optional-dependency package, and does resolution of that binary look inside the workspace?]
-> - [NEEDS CLARIFICATION: workspace-code exposure of the native server itself: does it load tsconfig plugins or other workspace-supplied code, and does it have an upstream control equivalent to `tsserver.path`? Required before the `SECURITY.md` row is written (NFR-002); verify live as the typescript-language-server row was.]
-> - [NEEDS CLARIFICATION: pull diagnostics against the native server: does it advertise `diagnosticProvider`, does it ever push, and does the existing pull-and-cache merge need a change (FR-008)? Live check required.]
-> - [NEEDS CLARIFICATION: does the native server honor `workspace/didChangeConfiguration` and `workspace/configuration` as pushed by mcpls, and which settings keys does it read (FR-009)?]
-> - [NEEDS CLARIFICATION: consent for a workspace-local `tsc`: is the user's explicit `[[lsp_servers]]` entry sufficient, or should it additionally require `--trust-project-config` when that entry comes from a project-local `mcpls.toml` (the existing gate already covers this, confirm no new mechanism is needed)?]
-> - [NEEDS CLARIFICATION: should the guidance of FR-005 also be triggered by the upstream message alone when detection could not run (for example, launcher installs), accepting the fragility of matching text, or is typed detection the only trigger?]
-> - [NEEDS CLARIFICATION: does the installed hint need an OS-specific variant on Windows, where the npm-installed server is a `.cmd` shim (existing `is_npm_package` note), and does the native `tsc` shim need the same?]
-> - [NEEDS CLARIFICATION: issue number to record in the Metadata callout once filed.]
+> [!success] Resolved
+> All questions of the draft are answered below and by the live checks of #615 (L1-L8). Automatic
+> selection (FR-007, FR-011 to FR-013) stays open as a follow-up.
+
+### Resolutions (implemented for #615)
+
+Delivered scope: guidance only (FR-001 to FR-006, FR-008 to FR-010). Automatic selection
+(FR-007, FR-011 to FR-013) is deferred to a follow-up: the default config is written to disk, so
+the provenance of the default entry is lost and a `flavor = "auto"` key written into the generated
+entry is needed first; files without the key are treated as explicit.
+
+- Install hint: `npm install -g typescript-language-server typescript@6` (verified live with TypeScript 6.0.3).
+- Native-package signal: `package.json` major version 7 or later and no `lib/tsserver.js`. Pre-release versions use their leading digits (`7.0.1-rc` is 7). `@typescript/native-preview` is not detected.
+- Typed detection is the only trigger for the guidance; the upstream error text is not matched.
+- Detection reads manifests only: capped at 64 KiB and opened with `O_NONBLOCK` and a file-type check on the handle (`GetFileType` on Windows), so on Unix a FIFO or a symlink to one cannot block startup (Windows has no non-blocking open, #442).
+- The hint is attached to an initialize failure when only TypeScript 7 is reachable next to the server, or, with no TypeScript next to the server, in a workspace root's node lookup path (monorepo parents included).
+- Windows: the explicit entry uses the absolute `tsc.cmd` path. A `.cmd` shim launcher of `typescript-language-server` is `UnsupportedLauncher` and gets no hint (#604).
+- Live results (2026-10-05, TypeScript 6.0.3 and 7.0.2): hover, definition, references and `get_diagnostics` (pull, `textDocument/diagnostic`) are correct on the native server; it accepts `initialize`, the configuration push and shutdown (FR-008, FR-009); type hierarchy is reported as not advertised (FR-010). `bin/tsc` resolves its platform binary from the `typescript` package's own path, not from the cwd or workspace, then `execve`s into it (needs `node` on `PATH`). Neither the native `tsc` nor `typescript-language-server` loads tsconfig `plugins`.
+- Consent for a workspace-local `tsc` is the user's own `[[lsp_servers]]` entry; the existing project-config trust gate already covers a project-local `mcpls.toml`.
+- Explicit native entry: replace the existing `typescript` entry; adding a second entry fails with "duplicate server id" (unnamed) or "two catch-all servers" (named).
 
 ## 10. See Also
 

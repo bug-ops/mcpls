@@ -235,7 +235,7 @@ initialization as an invalid `file://` URI.
 **Default**: `["utf-8", "utf-16"]`
 **Options**: `"utf-8"`, `"utf-16"`, `"utf-32"`
 
-Preferred position encodings for LSP communication, offered to each spawned server during the `initialize` handshake in the listed order.
+Preferred position encodings for LSP communication, offered to each spawned server during the `initialize` handshake in the listed order. The list must be non-empty and contain only the options above; mcpls rejects the config at load time otherwise.
 
 ```toml
 [workspace]
@@ -481,10 +481,10 @@ Glob pattern syntax:
 
 ### `timeout_seconds`
 
-**Type**: Integer
+**Type**: Integer (1 to 900)
 **Default**: `30`
 
-Timeout in seconds for the `initialize` handshake during server startup.
+Timeout in seconds for the `initialize` handshake during server startup. Values outside 1 to 900 are rejected at load time.
 Servers that load a large project before answering `initialize` (e.g.
 OmniSharp on a big Unity/C# solution) need this raised - the default 30 s can
 otherwise cut the server off mid-initialization.
@@ -501,10 +501,10 @@ timeout_seconds = 60  # Increase for servers slow to complete `initialize`
 
 ### `request_timeout_seconds`
 
-**Type**: Integer
+**Type**: Integer (1 to 900)
 **Default**: `30`
 
-Timeout in seconds applied to each individual LSP request issued while
+Timeout in seconds (1 to 900, rejected at load time otherwise) applied to each individual LSP request issued while
 translating an MCP tool call (hover, definition, references, diagnostics,
 rename, etc.). Independent of `timeout_seconds`, which only bounds the
 `initialize` handshake.
@@ -781,7 +781,7 @@ mcpls --listen 127.0.0.1:3000
 
 ### `MCPLS_HTTP_ALLOWED_HOSTS` (transport-http feature)
 
-Extra `Host` header values accepted by the HTTP transport besides `localhost`, `127.0.0.1`, `::1` and the bound IP address when it is a specific non-loopback address; repeat `--http-allowed-host` or separate values with commas (spaces around a comma are ignored). Each value is a host name or IP address with an optional port (`mcp.example.com`, `mcp.example.com:8443`, `[2001:db8::1]:8443`); without a port any port matches, with one only that port does and a request that omits the port does not match. Clients and proxies omit `:80` and `:443`, so never pin those: list the host without a port. A wildcard, user information, scheme, path, empty port (`host:`), out-of-range port, trailing dot, non-ASCII character (write an internationalized name in punycode, `xn--...`) or unbracketed IPv6 address is a usage error (exit code 2). The host is matched case-insensitively.
+Extra `Host` header values accepted by the HTTP transport besides `localhost`, `127.0.0.1`, `::1` and the bound IP address when it is a specific non-loopback address; repeat `--http-allowed-host` or separate values with commas (spaces around a comma are ignored). Each value is a host name or IP address with an optional port (`mcp.example.com`, `mcp.example.com:8443`, `[2001:db8::1]:8443`); without a port any port matches, with one only that port does and a request that omits the port does not match. Clients and proxies omit `:80` and `:443`, so a pin to either (or to port 0) is a usage error: list the host without a port. A wildcard, user information, scheme, path, empty port (`host:`), out-of-range port, trailing dot, non-ASCII character (write an internationalized name in punycode, `xn--...`) or unbracketed IPv6 address is a usage error (exit code 2). The host is matched case-insensitively.
 
 **Default**: none
 
@@ -935,6 +935,36 @@ file_patterns = ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"]
 preferences.quotePreference = "single"
 preferences.importModuleSpecifierPreference = "relative"
 ```
+
+### TypeScript 7 (native server)
+
+TypeScript 7 is the native port of the compiler. Its npm package ships no `lib/tsserver.js`, so
+`typescript-language-server` cannot use it. You have two options:
+
+1. Keep `typescript-language-server` and install a JavaScript-based TypeScript next to it
+   (`npm install -g typescript-language-server typescript@6`). Installing `typescript@6` globally replaces a global TypeScript 7 `tsc`.
+2. Run the TypeScript 7 native server, `tsc --lsp --stdio`. Edit the existing `typescript` entry
+   of your config file (or remove it first) so that its `command` and `args` are:
+
+```toml
+[[lsp_servers]]
+language_id = "typescript"
+command = "/home/me/ts7/node_modules/.bin/tsc"
+args = ["--lsp", "--stdio"]
+file_patterns = ["**/*.ts", "**/*.tsx"]
+```
+
+Do not add this as a second `typescript` entry next to the default one: two entries for one
+language that both omit `handles` are rejected at startup, with a "duplicate server id" error
+when both are unnamed and with a "two catch-all servers" error even when the new one has its own
+`name`.
+
+Use the absolute path of a TypeScript 7 install **outside the workspace**: `<npm prefix>/bin/tsc`
+(`<npm prefix>\tsc.cmd` on Windows). To keep TypeScript 7 next to a TypeScript 6 install, put it
+in a separate prefix, for example `npm install --prefix ~/ts7 typescript@7`. A `tsc` from the
+workspace's `node_modules`, or a bare `tsc` that `PATH` may resolve into the workspace, is workspace-supplied code that mcpls
+would run: see the [Trust model](#trust-model). The native server reports diagnostics through
+pull requests only and does not support type hierarchy.
 
 ### Go Project
 

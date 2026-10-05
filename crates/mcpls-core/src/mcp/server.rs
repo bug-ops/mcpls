@@ -1851,6 +1851,9 @@ mod tests {
     use super::*;
     use crate::bridge::resources::ResourceSubscriptions;
     use crate::bridge::{Capability, LogLevel, ResultContext};
+    use crate::config::LanguageId;
+    #[cfg(unix)]
+    use crate::config::{PositionEncodings, TimeoutSecs};
     use crate::mcp::tool_support::ToolBackend;
     use crate::test_lsp::client_path;
 
@@ -2066,7 +2069,7 @@ mod tests {
         let error =
             crate::error::Error::ServerFailedToStart(Box::new(crate::error::ServerSpawnFailure {
                 server_id: crate::config::ServerId::from("rust"),
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 command: "rust-analyzer".to_string(),
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
                     crate::error::Error::ServerNotFound {
@@ -2359,7 +2362,7 @@ mod tests {
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
         translator.set_workspace_roots(
@@ -2432,7 +2435,7 @@ mod tests {
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
         translator.set_workspace_roots(
@@ -2503,7 +2506,7 @@ mod tests {
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
         translator.set_workspace_roots(
@@ -2590,7 +2593,7 @@ mod tests {
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
         translator.set_workspace_roots(
@@ -2896,7 +2899,7 @@ mod tests {
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
         translator.set_workspace_roots(
@@ -3542,7 +3545,10 @@ mod tests {
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let translator = Arc::new(
             Translator::new()
-                .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    owner.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
         let _fake = register_fake_client(&translator, &owner);
@@ -3601,7 +3607,10 @@ mod tests {
         );
         let translator = Arc::new(
             Translator::new()
-                .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    owner.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
         let _fake = register_fake_client(&translator, &owner);
@@ -3654,7 +3663,10 @@ mod tests {
         );
         let translator = Arc::new(
             Translator::new()
-                .with_router(ToolRouter::catch_all([(owner.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    owner.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
         let _fake = register_fake_client(&translator, &owner);
@@ -3735,15 +3747,15 @@ sleep 0.3
         let id = ServerId::from("rust");
         let config = ServerInitConfig {
             server_config: LspServerConfig {
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 command: "sh".to_string(),
                 args: vec![script_path.to_string_lossy().to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
-                timeout_seconds: 5,
-                request_timeout_seconds: 5,
+                timeout_seconds: TimeoutSecs::new(5).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                 heuristics: None,
                 name: Some("rust".to_string()),
                 handles: None,
@@ -3751,7 +3763,7 @@ sleep 0.3
             },
             workspace_roots: vec![],
             initialization_options: None,
-            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            position_encodings: PositionEncodings::DEFAULT,
         };
 
         let seed = LspServer::spawn(config).await.unwrap();
@@ -3759,7 +3771,10 @@ sleep 0.3
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let translator = Arc::new(
             Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_notification_cache(Arc::clone(&notification_cache))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
         );
@@ -3874,11 +3889,14 @@ sleep 0.3
 
         let id = ServerId::from("rust");
         let translator = Translator::new()
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]))
             .with_extensions(crate::test_lsp::test_extensions());
         translator.record_startup_failures(&[ServerSpawnFailure {
             server_id: id,
-            language_id: "rust".to_string(),
+            language_id: LanguageId::from_static("rust"),
             command: "rust-analyzer".to_string(),
             reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
                 command: "rust-analyzer".to_string(),
@@ -5085,7 +5103,10 @@ sleep 0.3
                 ("rs".to_string(), "rust".to_string()),
                 ("py".to_string(), "python".to_string()),
             ]))
-            .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
         );
@@ -5094,7 +5115,7 @@ sleep 0.3
             RustServerState::FailedToStart => {
                 translator.record_startup_failures(&[ServerSpawnFailure {
                     server_id: id,
-                    language_id: "rust".to_string(),
+                    language_id: LanguageId::from_static("rust"),
                     command: "rust-analyzer".to_string(),
                     reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
                         command: "rust-analyzer".to_string(),
@@ -5437,7 +5458,7 @@ sleep 0.3
         servers: Vec<(&str, &str, lsp_types::ServerCapabilities)>,
         mcp: McpConfig,
     ) -> SupportFixture {
-        use crate::config::{ServerId, ToolRouter};
+        use crate::config::{LanguageId, ServerId, ToolRouter};
         use crate::lsp::LspServer;
         use crate::test_lsp::fake_lsp_client;
 
@@ -5446,7 +5467,7 @@ sleep 0.3
         std::fs::write(&file, "fn main() {}").unwrap();
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all(servers.iter().map(
-                |(id, language, _)| (ServerId::from(*id), (*language).to_string()),
+                |(id, language, _)| (ServerId::from(*id), LanguageId::new(*language).unwrap()),
             )))
             .with_extensions(std::collections::HashMap::from([
                 ("rs".to_string(), "rust".to_string()),
@@ -5991,7 +6012,7 @@ sleep 0.3
 
         let translator = Translator::new().with_router(ToolRouter::catch_all([(
             ServerId::from("rust"),
-            "rust".to_string(),
+            LanguageId::from_static("rust"),
         )]));
         translator.set_expected_servers(HashSet::from([ServerId::from("rust")]));
         let server = McplsServer::new(

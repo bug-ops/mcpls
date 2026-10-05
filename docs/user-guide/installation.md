@@ -186,8 +186,8 @@ file_patterns = ["**/*.py"]
 **Installation:**
 
 ```bash
-# Install typescript and language server
-npm install -g typescript typescript-language-server
+# Install the language server with a JavaScript-based TypeScript (TypeScript 7 ships no tsserver)
+npm install -g typescript-language-server typescript@6
 
 # Verify installation
 typescript-language-server --version

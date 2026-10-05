@@ -14,7 +14,7 @@ use super::encoding_ctx::EncodingCtx;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DiagnosticInfo, DocumentTracker, WorkspaceRoots};
-use crate::config::{ServerId, ToolRouter};
+use crate::config::{LanguageId, ServerId, ToolRouter};
 use crate::lsp::LspServer;
 pub(super) use crate::test_lsp::{
     FakeServer, fake_lsp_client, read_framed_message, write_error_response, write_response,
@@ -125,7 +125,7 @@ pub(super) fn translator_with_capabilities(
             .with_extensions(extensions)
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )]));
     translator
         .set_workspace_roots(WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap());
@@ -154,7 +154,7 @@ pub(super) fn translator_with_capabilities_and_encoding(
             .with_extensions(extensions)
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )]));
     translator
         .set_workspace_roots(WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap());
@@ -177,7 +177,7 @@ mod sh_servers {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use crate::config::LspServerConfig;
+    use crate::config::{LanguageId, LspServerConfig, PositionEncodings, TimeoutSecs};
     use crate::lsp::ServerInitConfig;
     use crate::test_lsp::with_read_preamble;
 
@@ -234,7 +234,7 @@ mod sh_servers {
     ) -> ServerInitConfig {
         ServerInitConfig {
             server_config: LspServerConfig {
-                language_id: id.to_string(),
+                language_id: LanguageId::new(id).unwrap(),
                 command: "sh".to_string(),
                 args: vec![script.to_string_lossy().to_string()],
                 env: HashMap::new(),
@@ -245,8 +245,8 @@ mod sh_servers {
                 // tests spawn, to absorb CI scheduling jitter under
                 // concurrent nextest load (a bare `sh` invocation has no
                 // real work to do, so this never lengthens the happy path).
-                timeout_seconds: 20,
-                request_timeout_seconds: 20,
+                timeout_seconds: TimeoutSecs::new(20).unwrap(),
+                request_timeout_seconds: TimeoutSecs::new(20).unwrap(),
                 heuristics: None,
                 name: Some(id.to_string()),
                 handles: None,
@@ -254,7 +254,7 @@ mod sh_servers {
             },
             workspace_roots: vec![],
             initialization_options: None,
-            position_encodings: vec!["utf-8".to_string(), "utf-16".to_string()],
+            position_encodings: PositionEncodings::DEFAULT,
         }
     }
 

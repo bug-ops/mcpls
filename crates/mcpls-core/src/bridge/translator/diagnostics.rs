@@ -428,7 +428,7 @@ mod tests {
     use super::*;
     use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
-    use crate::config::{ServerId, ToolRouter};
+    use crate::config::{LanguageId, ServerId, ToolRouter};
     use crate::error::Error;
     use crate::test_lsp::client_path;
 
@@ -1279,7 +1279,7 @@ mod tests {
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::catch_all([(
                 ServerId::from("rust"),
-                "rust".to_string(),
+                LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -1378,7 +1378,7 @@ mod tests {
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
                     ServerId::from("rust"),
-                    "rust".to_string(),
+                    LanguageId::from_static("rust"),
                 )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -1472,7 +1472,7 @@ mod tests {
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
                     ServerId::from("rust"),
-                    "rust".to_string(),
+                    LanguageId::from_static("rust"),
                 )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -1542,7 +1542,7 @@ mod tests {
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
                     ServerId::from("rust"),
-                    "rust".to_string(),
+                    LanguageId::from_static("rust"),
                 )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),

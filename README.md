@@ -97,8 +97,10 @@ uv tool install ty@latest
 
 **TypeScript:**
 ```bash
-npm install -g typescript-language-server typescript
+npm install -g typescript-language-server typescript@6
 ```
+
+`typescript-language-server` needs a JavaScript-based TypeScript (5.x or 6.x): TypeScript 7 ships no `tsserver`. Installing `typescript@6` globally replaces a global TypeScript 7 `tsc`; to keep both, install TypeScript 7 into a separate prefix. To run the TypeScript 7 native server instead, see the [configuration guide](docs/user-guide/configuration.md#typescript-7-native-server).
 
 **Go (gopls):**
 ```bash

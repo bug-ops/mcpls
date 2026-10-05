@@ -467,7 +467,7 @@ mod tests {
     use super::*;
     use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
-    use crate::config::{ServerId, ToolRouter};
+    use crate::config::{LanguageId, ServerId, TimeoutSecs, ToolRouter};
     use crate::test_lsp::client_path;
 
     /// #355/#467 regression: `resolve_kind_filter`'s name-matching branch
@@ -578,7 +578,7 @@ mod tests {
         let translator = Translator::new();
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: ServerId::from("pyright"),
-            language_id: "python".to_string(),
+            language_id: LanguageId::from_static("python"),
             command: "pyright-langserver".to_string(),
             reason: crate::error::StartupFailure::InitTaskPanicked,
         }]);
@@ -610,7 +610,7 @@ mod tests {
         let translator = Translator::new().with_router(router);
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: failing_id.clone(),
-            language_id: "rust".to_string(),
+            language_id: LanguageId::from_static("rust"),
             command: "rust-analyzer".to_string(),
             reason: crate::error::StartupFailure::InitTaskPanicked,
         }]);
@@ -633,7 +633,7 @@ mod tests {
         translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: ServerId::from("other"),
-            language_id: "go".to_string(),
+            language_id: LanguageId::from_static("go"),
             command: "gopls".to_string(),
             reason: crate::error::StartupFailure::InitTaskPanicked,
         }]);
@@ -653,15 +653,15 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_no_claimant_names_tool() {
         let configs = vec![crate::config::LspServerConfig {
-            language_id: "python".to_string(),
+            language_id: LanguageId::from_static("python"),
             command: "pyright-langserver".to_string(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
-            timeout_seconds: 30,
-            request_timeout_seconds: 30,
+            timeout_seconds: TimeoutSecs::new(30).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
             name: Some("pyright".to_string()),
             handles: Some(vec![ToolKind::Hover]),

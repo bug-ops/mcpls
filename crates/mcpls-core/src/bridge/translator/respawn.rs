@@ -329,7 +329,7 @@ impl Translator {
         // the cache, and `clear_server_diagnostics` is scoped to one server's
         // own entries (#266), so a crashed rust-analyzer never wipes a
         // healthy pyright's cached diagnostics.
-        let diagnostics_route = self.is_diagnostics_route(&language_id, id);
+        let diagnostics_route = self.is_diagnostics_route(language_id.as_str(), id);
         let mut cleared = Vec::new();
         if let Some(cache) = &self.notification_cache {
             let mut cache = cache.lock().await;
@@ -531,7 +531,7 @@ mod tests {
             pid_is_running, stub_server_config, write_crash_after_init_script,
             write_responder_script,
         };
-        use crate::config::{ToolKind, ToolRouter};
+        use crate::config::{LanguageId, TimeoutSecs, ToolKind, ToolRouter};
         use crate::lsp::ServerInitConfig;
         use crate::test_lsp::with_read_preamble;
 
@@ -973,7 +973,10 @@ fi
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
             let translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_notification_cache(Arc::clone(&cache));
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
@@ -1058,7 +1061,10 @@ fi
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
             let translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_notification_cache(Arc::clone(&cache));
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
@@ -1121,7 +1127,10 @@ fi
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
             let translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_notification_cache(Arc::clone(&cache));
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
@@ -1179,8 +1188,10 @@ sleep 1
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
-            let translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]));
+            let translator = Translator::new().with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]));
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
             wait_until_dead(&translator, &id).await;
@@ -1235,30 +1246,30 @@ sleep 1
             // the diagnostics route.
             let configs = [
                 LspServerConfig {
-                    language_id: "rust".to_string(),
+                    language_id: LanguageId::from_static("rust"),
                     command: "sh".to_string(),
                     args: vec![],
                     env: HashMap::new(),
                     file_patterns: vec![],
                     initialization_options: None,
                     settings: None,
-                    timeout_seconds: 5,
-                    request_timeout_seconds: 5,
+                    timeout_seconds: TimeoutSecs::new(5).unwrap(),
+                    request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     heuristics: None,
                     name: Some("hover-only".to_string()),
                     handles: Some(vec![ToolKind::Hover]),
                     indexing: crate::bridge::IndexingPolicy::Auto,
                 },
                 LspServerConfig {
-                    language_id: "rust".to_string(),
+                    language_id: LanguageId::from_static("rust"),
                     command: "sh".to_string(),
                     args: vec![],
                     env: HashMap::new(),
                     file_patterns: vec![],
                     initialization_options: None,
                     settings: None,
-                    timeout_seconds: 5,
-                    request_timeout_seconds: 5,
+                    timeout_seconds: TimeoutSecs::new(5).unwrap(),
+                    request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     heuristics: None,
                     name: Some("diag-catchall".to_string()),
                     handles: None,
@@ -1290,7 +1301,7 @@ sleep 1
             // because of the `handles: Some([Hover])` restriction this test
             // means to exercise, which would pass for the wrong reason.
             let mut respawn_config = stub_server_config("hover-only", &respawn_script);
-            respawn_config.server_config.language_id = "rust".to_string();
+            respawn_config.server_config.language_id = LanguageId::from_static("rust");
             set_respawn_config(&translator, &hover_id, respawn_config);
 
             translator.respawn_if_dead(&hover_id).await.unwrap();
@@ -1330,7 +1341,10 @@ sleep 1
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
             let mut translator = Translator::new()
-                .with_router(ToolRouter::catch_all([(id.clone(), "rust".to_string())]))
+                .with_router(ToolRouter::catch_all([(
+                    id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
                 .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
             translator.set_workspace_roots(
                 WorkspaceRoots::from_configured(&[workspace.to_path_buf()]).unwrap(),

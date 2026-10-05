@@ -62,5 +62,11 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   resolved once at startup. The pin narrows one vector. It does not make an
   untrusted workspace safe.
 
+- **Explicitly configured workspace binaries.** A server `command` you configure,
+  for example a TypeScript 7 `tsc` for the native server (`tsc --lsp --stdio`),
+  is run as written. A `tsc` from the workspace's `node_modules`, or one that
+  `PATH` resolves into the workspace, is workspace-supplied code. The tsserver pin
+  does not apply to it.
+
 An untrusted-workspace mode is tracked in #603. Run `mcpls` against untrusted code only inside an environment you are willing to
 have that code execute in (a container or a disposable VM).

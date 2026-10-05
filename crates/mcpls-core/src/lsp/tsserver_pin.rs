@@ -11,18 +11,35 @@
 //! `typescript` peer). Windows `.cmd` shims and script launchers (pnpm,
 //! Volta, asdf/mise) stay unresolved and are reported with a warning, never
 //! with a startup failure.
+//!
+//! TypeScript 7 and later ship a native compiler service and no
+//! `lib/tsserver.js`, so there is nothing to pin. Detection of that case only
+//! reads size-capped package manifests and checks file existence; it never
+//! runs, or asks anything of, workspace code.
 
 use std::ffi::OsString;
+use std::fmt;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::LspServerConfig;
+use crate::config::{BuiltinServer, LspServerConfig};
+use crate::error::InitFailureHint;
 use crate::lsp::{LspNotification, child_env_var};
+use crate::util::read_regular_file_bounded;
 
 const SERVER_STEM: &str = "typescript-language-server";
 const NODE_MODULES: &str = "node_modules";
+const TYPESCRIPT_RELATIVE: &str = "node_modules/typescript";
+const TSSERVER_IN_PACKAGE: &str = "lib/tsserver.js";
 const TSSERVER_RELATIVE: &str = "node_modules/typescript/lib/tsserver.js";
+/// Upper bound for a `package.json` read from a directory that may be
+/// workspace-supplied.
+const MAX_MANIFEST_BYTES: NonZeroU64 = match NonZeroU64::new(64 * 1024) {
+    Some(max) => max,
+    None => panic!("the manifest limit must be non-zero"),
+};
 /// Method of the notification the server sends after `initialized`.
 const TYPESCRIPT_VERSION_METHOD: &str = "$/typescriptVersion";
 
@@ -37,18 +54,30 @@ pub enum UnresolvedReason {
     /// No valid `typescript` package (with a `package.json` `version`) is
     /// installed next to the server package.
     NoTypescriptNextToServer,
+    /// Only TypeScript 7 or later, which ships no tsserver, is installed next
+    /// to the server package.
+    NativeTypescriptNextToServer,
 }
 
-impl UnresolvedReason {
-    const fn describe(self) -> &'static str {
+impl fmt::Display for UnresolvedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ServerNotOnPath => "typescript-language-server was not found on PATH",
-            Self::UnsupportedLauncher => {
-                "typescript-language-server is started through an unsupported launcher or shim"
+            Self::ServerNotOnPath => {
+                f.write_str("typescript-language-server was not found on PATH")
             }
-            Self::NoTypescriptNextToServer => {
-                "no valid typescript package is installed next to typescript-language-server"
-            }
+            Self::UnsupportedLauncher => f.write_str(
+                "typescript-language-server is started through an unsupported launcher or shim",
+            ),
+            Self::NoTypescriptNextToServer => f.write_str(
+                "no valid typescript package is installed next to typescript-language-server",
+            ),
+            Self::NativeTypescriptNextToServer => write!(
+                f,
+                "only TypeScript 7 or later, which ships no tsserver, is installed next to \
+                 typescript-language-server; install a JavaScript-based TypeScript (`{}`) or \
+                 configure `tsc --lsp --stdio`",
+                BuiltinServer::TypescriptLanguageServer.install_hint()
+            ),
         }
     }
 }
@@ -116,17 +145,85 @@ fn mentions_server(arg: &str) -> bool {
 /// `typescript` install before it accepts that install's tsserver.
 #[derive(Deserialize)]
 struct PackageManifest {
-    #[allow(dead_code)] // Parsing fails without the field, which is the validity check.
     version: String,
+}
+
+/// The leading numeric component of a package version, so `7.0.1-rc` is 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TypescriptMajor(u32);
+
+impl TypescriptMajor {
+    /// First major version that ships the native compiler service instead of
+    /// `lib/tsserver.js`.
+    const FIRST_NATIVE: Self = Self(7);
+
+    fn parse(version: &str) -> Option<Self> {
+        let digits = version
+            .trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?;
+        digits.parse().ok().map(Self)
+    }
+
+    const fn is_native(self) -> bool {
+        self.0 >= Self::FIRST_NATIVE.0
+    }
+}
+
+/// What a `node_modules/typescript` directory offers typescript-language-server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypescriptState {
+    /// A valid install that ships `lib/tsserver.js`.
+    Tsserver,
+    /// A valid TypeScript 7 or later install without `lib/tsserver.js`.
+    Native,
+    /// Missing, invalid, unreadable or too large to trust.
+    Absent,
+}
+
+/// Reads `<package>/package.json` through the bounded, non-blocking reader,
+/// because the directory can be workspace-supplied.
+fn read_manifest(package: &Path) -> Option<PackageManifest> {
+    let bytes =
+        read_regular_file_bounded(&package.join("package.json"), MAX_MANIFEST_BYTES).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn typescript_state(package: &Path) -> TypescriptState {
+    let Some(manifest) = read_manifest(package) else {
+        return TypescriptState::Absent;
+    };
+    if package.join(TSSERVER_IN_PACKAGE).is_file() {
+        TypescriptState::Tsserver
+    } else if TypescriptMajor::parse(&manifest.version).is_some_and(TypescriptMajor::is_native) {
+        TypescriptState::Native
+    } else {
+        TypescriptState::Absent
+    }
 }
 
 fn is_valid_typescript_install(tsserver: &Path) -> bool {
     tsserver
         .parent()
         .and_then(Path::parent)
-        .map(|package| package.join("package.json"))
-        .and_then(|manifest| std::fs::read(manifest).ok())
-        .is_some_and(|bytes| serde_json::from_slice::<PackageManifest>(&bytes).is_ok())
+        .is_some_and(|package| read_manifest(package).is_some())
+}
+
+/// Node's lookup path for a package: every ancestor of `start` (itself
+/// included) that is not named `node_modules`.
+fn lookup_dirs(start: &Path) -> impl Iterator<Item = &Path> {
+    start
+        .ancestors()
+        .filter(|dir| dir.file_name().is_none_or(|name| name != NODE_MODULES))
+}
+
+/// Whether the nearest usable `typescript` install in node's lookup from
+/// `start` is TypeScript 7 or later; a nearer install with a tsserver wins.
+fn native_typescript_visible_from(start: &Path) -> bool {
+    lookup_dirs(start)
+        .map(|dir| typescript_state(&dir.join(TYPESCRIPT_RELATIVE)))
+        .find(|state| *state != TypescriptState::Absent)
+        == Some(TypescriptState::Native)
 }
 
 fn is_windows_launcher(path: &Path) -> bool {
@@ -164,9 +261,7 @@ fn package_dir_of(executable: &Path) -> Option<PathBuf> {
 /// (`package.json` with a `version`), because the server ignores an invalid
 /// one and silently falls through to the workspace's tsserver.
 fn bundled_tsserver(package_dir: &Path) -> Option<PathBuf> {
-    package_dir
-        .ancestors()
-        .filter(|dir| dir.file_name().is_none_or(|name| name != NODE_MODULES))
+    lookup_dirs(package_dir)
         .map(|dir| dir.join(TSSERVER_RELATIVE))
         .find(|candidate| candidate.is_file())
         .filter(|tsserver| is_valid_typescript_install(tsserver))
@@ -182,6 +277,7 @@ fn bundled_tsserver(package_dir: &Path) -> Option<PathBuf> {
 /// `PATH` is read as the child sees it: the config's `env` override, else
 /// `parent_env`.
 // TODO(#604): pin npx/bunx/node launchers, .cmd and script shims (pnpm, Volta, asdf/mise)
+// TODO(#634): auto-select the native tsc (spec config/002 FR-007, FR-011..013); needs default-entry provenance
 pub fn resolve(
     config: &LspServerConfig,
     parent_env: impl Fn(&str) -> Option<OsString>,
@@ -212,10 +308,54 @@ pub fn resolve(
             UnresolvedReason::UnsupportedLauncher,
         ));
     };
-    Some(bundled_tsserver(&package_dir).map_or(
-        TsserverResolution::Unresolved(UnresolvedReason::NoTypescriptNextToServer),
+    Some(bundled_tsserver(&package_dir).map_or_else(
+        || {
+            let reason = if native_typescript_visible_from(&package_dir) {
+                UnresolvedReason::NativeTypescriptNextToServer
+            } else {
+                UnresolvedReason::NoTypescriptNextToServer
+            };
+            TsserverResolution::Unresolved(reason)
+        },
         TsserverResolution::Pinned,
     ))
+}
+
+/// The guidance to attach to an `initialize` failure of `config`, when the
+/// cause is that only TypeScript 7 or later is available to
+/// typescript-language-server.
+///
+/// `effective_options` are the options the server was started with; a
+/// `tsserver.path` in them means the failure is not a missing tsserver. The
+/// workspace roots are checked because the server falls back to the
+/// workspace's TypeScript when none sits next to it. A shim or script
+/// launcher never gets the hint, since what the server would find is unknown.
+///
+/// Only reads manifests and checks file existence; it runs on the failure
+/// path only.
+// TODO(#604): shim installs (the default on Windows) get no TypeScript 7 init-failure hint
+pub fn init_failure_hint(
+    config: &LspServerConfig,
+    effective_options: Option<&serde_json::Value>,
+    workspace_roots: &[PathBuf],
+    parent_env: impl Fn(&str) -> Option<OsString>,
+) -> Option<InitFailureHint> {
+    if configured_tsserver_path(effective_options).is_some() {
+        return None;
+    }
+    let native = match resolve(config, parent_env)? {
+        TsserverResolution::Unresolved(UnresolvedReason::NativeTypescriptNextToServer) => true,
+        TsserverResolution::Unresolved(UnresolvedReason::NoTypescriptNextToServer) => {
+            workspace_roots
+                .iter()
+                .any(|root| native_typescript_visible_from(root))
+        }
+        TsserverResolution::Pinned(_)
+        | TsserverResolution::Unresolved(
+            UnresolvedReason::ServerNotOnPath | UnresolvedReason::UnsupportedLauncher,
+        ) => false,
+    };
+    native.then_some(InitFailureHint::NativeTypescriptOnly)
 }
 
 fn has_user_tsserver_path(options: &serde_json::Value) -> bool {
@@ -271,8 +411,7 @@ pub fn pinned_initialization_options(
         TsserverResolution::Unresolved(reason) => {
             tracing::warn!(
                 server = %config.language_id,
-                "tsserver not pinned: {}; a workspace-supplied tsserver may run",
-                reason.describe()
+                "tsserver not pinned: {reason}; a workspace-supplied tsserver may run"
             );
             None
         }
@@ -317,12 +456,30 @@ fn pin_ignored(params: Option<&serde_json::Value>) -> Option<TypescriptVersionPa
     (parsed.source != TsserverSource::UserSetting).then_some(parsed)
 }
 
+#[cfg(test)]
+mod major_tests {
+    use super::TypescriptMajor;
+
+    #[test]
+    fn test_typescript_major_parses_leading_digits() {
+        let major = TypescriptMajor::parse;
+        assert_eq!(major("7.0.1-rc.1"), Some(TypescriptMajor(7)));
+        assert_eq!(major("10.1.0"), Some(TypescriptMajor(10)));
+        assert_eq!(major("6.9.9"), Some(TypescriptMajor(6)));
+        assert_eq!(major("next"), None);
+        assert_eq!(major(""), None);
+        assert!(TypescriptMajor(7).is_native());
+        assert!(!TypescriptMajor(6).is_native());
+    }
+}
+
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::fs;
+    use std::{assert_matches, fs};
 
     use super::*;
+    use crate::config::BuiltinServer;
 
     struct Layout {
         _dir: tempfile::TempDir,
@@ -635,5 +792,243 @@ mod tests {
         assert_eq!(parse("workspace"), TsserverSource::Workspace);
         assert_eq!(parse("bundled"), TsserverSource::Bundled);
         assert_eq!(parse("future"), TsserverSource::Unknown);
+    }
+
+    /// Writes `<dir>/node_modules/typescript` with `version` and, when
+    /// `with_tsserver` is set, a `lib/tsserver.js`; returns the package dir.
+    fn write_typescript(dir: &Path, version: &str, with_tsserver: bool) -> PathBuf {
+        let package = dir.join(TYPESCRIPT_RELATIVE);
+        fs::create_dir_all(package.join("lib")).unwrap();
+        fs::write(
+            package.join("package.json"),
+            format!(r#"{{"version": "{version}"}}"#),
+        )
+        .unwrap();
+        if with_tsserver {
+            fs::write(package.join(TSSERVER_IN_PACKAGE), "").unwrap();
+        }
+        package
+    }
+
+    fn hint(
+        layout: &Layout,
+        config: &LspServerConfig,
+        roots: &[PathBuf],
+    ) -> Option<InitFailureHint> {
+        init_failure_hint(config, None, roots, env_with_path(&layout.bin))
+    }
+
+    #[test]
+    fn test_resolve_native_typescript_next_to_server() {
+        let layout = global_install(false);
+        write_typescript(&layout.base.join("prefix/lib"), "7.0.2", false);
+        let resolved = resolve(&config(SERVER_STEM), env_with_path(&layout.bin));
+        assert_eq!(
+            resolved,
+            Some(TsserverResolution::Unresolved(
+                UnresolvedReason::NativeTypescriptNextToServer
+            ))
+        );
+        assert_eq!(
+            hint(&layout, &config(SERVER_STEM), &[]),
+            Some(InitFailureHint::NativeTypescriptOnly)
+        );
+    }
+
+    #[test]
+    fn test_typescript_seven_shipping_tsserver_is_still_pinned() {
+        let layout = global_install(false);
+        write_typescript(&layout.base.join("prefix/lib"), "7.0.2", true);
+        let resolved = resolve(&config(SERVER_STEM), env_with_path(&layout.bin));
+        assert_matches!(resolved, Some(TsserverResolution::Pinned(_)));
+        assert_eq!(hint(&layout, &config(SERVER_STEM), &[]), None);
+    }
+
+    #[test]
+    fn test_hint_for_native_typescript_at_workspace_root() {
+        let layout = global_install(false);
+        let root = layout.base.join("ws");
+        write_typescript(&root, "7.0.2", false);
+        assert_eq!(
+            hint(&layout, &config(SERVER_STEM), std::slice::from_ref(&root)),
+            Some(InitFailureHint::NativeTypescriptOnly)
+        );
+    }
+
+    #[test]
+    fn test_hint_for_native_typescript_above_workspace_root() {
+        let layout = global_install(false);
+        let repo = layout.base.join("repo");
+        write_typescript(&repo, "7.0.2", false);
+        let root = repo.join("packages/app");
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            hint(&layout, &config(SERVER_STEM), std::slice::from_ref(&root)),
+            Some(InitFailureHint::NativeTypescriptOnly)
+        );
+    }
+
+    #[test]
+    fn test_nearest_typescript_with_tsserver_wins_over_native_above() {
+        let layout = global_install(false);
+        let repo = layout.base.join("repo");
+        write_typescript(&repo, "7.0.2", false);
+        let root = repo.join("packages/app");
+        write_typescript(&root, "5.4.0", true);
+        assert_eq!(
+            hint(&layout, &config(SERVER_STEM), std::slice::from_ref(&root)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_no_hint_for_old_typescript_at_workspace_root() {
+        let layout = global_install(false);
+        let root = layout.base.join("ws");
+        write_typescript(&root, "5.4.0", true);
+        assert_eq!(
+            hint(&layout, &config(SERVER_STEM), std::slice::from_ref(&root)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_no_hint_when_tsserver_path_is_configured() {
+        let layout = global_install(false);
+        write_typescript(&layout.base.join("prefix/lib"), "7.0.2", false);
+        let options = serde_json::json!({"tsserver": {"path": "/custom/tsserver.js"}});
+        assert_eq!(
+            init_failure_hint(
+                &config(SERVER_STEM),
+                Some(&options),
+                &[],
+                env_with_path(&layout.bin)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_no_hint_for_unsupported_launcher_or_other_server() {
+        let layout = global_install(false);
+        let root = layout.base.join("ws");
+        write_typescript(&root, "7.0.2", false);
+        let roots = std::slice::from_ref(&root);
+        assert_eq!(
+            hint(&layout, &config("typescript-language-server.cmd"), roots),
+            None
+        );
+        assert_eq!(hint(&layout, &config("pyright-langserver"), roots), None);
+    }
+
+    #[test]
+    fn test_oversize_manifest_is_treated_as_absent() {
+        let layout = global_install(false);
+        let root = layout.base.join("ws");
+        let package = write_typescript(&root, "7.0.2", false);
+        let padding = " ".repeat(usize::try_from(MAX_MANIFEST_BYTES.get()).unwrap());
+        fs::write(
+            package.join("package.json"),
+            format!(r#"{{"version": "7.0.2"{padding}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            hint(&layout, &config(SERVER_STEM), std::slice::from_ref(&root)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_native_command_gets_no_pin() {
+        let mut config = config("tsc");
+        config.args = vec!["--lsp".into(), "--stdio".into()];
+        assert_eq!(resolve(&config, |_| None), None);
+        assert_eq!(pinned_initialization_options(&config, &[], |_| None), None);
+    }
+
+    #[test]
+    fn test_native_next_to_server_warning_names_typescript_7() {
+        let text = UnresolvedReason::NativeTypescriptNextToServer.to_string();
+        assert!(text.contains("TypeScript 7"), "{text}");
+        assert!(
+            text.contains(BuiltinServer::TypescriptLanguageServer.install_hint()),
+            "{text}"
+        );
+    }
+
+    /// A `package.json` that is a FIFO must not hang resolution or the hint.
+    #[test]
+    fn test_fifo_manifest_does_not_block() {
+        let layout = global_install(false);
+        let next_to_server = write_typescript(&layout.base.join("prefix/lib"), "7.0.2", true);
+        let root = layout.base.join("ws");
+        let in_workspace = write_typescript(&root, "7.0.2", false);
+        for package in [&next_to_server, &in_workspace] {
+            let manifest = package.join("package.json");
+            fs::remove_file(&manifest).unwrap();
+            let status = std::process::Command::new("mkfifo")
+                .arg(&manifest)
+                .status()
+                .unwrap();
+            assert!(status.success(), "mkfifo must succeed to set up this test");
+        }
+        let bin = layout.bin;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_with_path(&bin);
+            let resolved = resolve(&config(SERVER_STEM), &env);
+            let hinted = init_failure_hint(&config(SERVER_STEM), None, &[root], &env);
+            tx.send((resolved, hinted)).unwrap();
+        });
+        let (resolved, hinted) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("a FIFO manifest must not block"));
+        assert_eq!(
+            resolved,
+            Some(TsserverResolution::Unresolved(
+                UnresolvedReason::NoTypescriptNextToServer
+            ))
+        );
+        assert_eq!(hinted, None);
+    }
+
+    /// An end-to-end failure: the server exits during `initialize` while only
+    /// TypeScript 7 is installed in the workspace.
+    #[tokio::test]
+    async fn test_spawn_failure_carries_native_typescript_hint() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::lsp::{LspServer, ServerInitConfig};
+
+        let layout = global_install(false);
+        let cli = layout
+            .base
+            .join("prefix/lib/node_modules")
+            .join(SERVER_STEM)
+            .join("lib/cli.mjs");
+        fs::write(&cli, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        let root = layout.base.join("ws");
+        write_typescript(&root, "7.0.2", false);
+
+        let server_config = config(layout.bin.join(SERVER_STEM).to_str().unwrap());
+        let err = LspServer::spawn(ServerInitConfig {
+            server_config,
+            workspace_roots: vec![root],
+            initialization_options: None,
+            position_encodings: crate::config::PositionEncodings::DEFAULT,
+        })
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert_matches!(
+            err,
+            crate::Error::ServerExitedDuringInit {
+                hint: Some(InitFailureHint::NativeTypescriptOnly),
+                ..
+            }
+        );
+        assert!(err.to_string().contains("TypeScript 7"), "{err}");
     }
 }
