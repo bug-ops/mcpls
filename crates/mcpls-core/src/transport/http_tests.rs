@@ -1,8 +1,6 @@
 //! End-to-end tests for the HTTP transport: each drives `run_http`,
 //! `serve_http` or `serve_http1` over a real loopback socket.
 
-#![allow(clippy::unwrap_used)]
-
 use std::net::SocketAddr;
 
 use super::config::{

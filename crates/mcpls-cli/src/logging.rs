@@ -272,7 +272,6 @@ pub fn init(level: &LogFilter, log_json: bool) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::sync::{Arc, Mutex};

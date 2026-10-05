@@ -257,7 +257,6 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 

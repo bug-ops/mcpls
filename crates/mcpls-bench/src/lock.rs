@@ -132,7 +132,6 @@ fn try_lock(path: &Path) -> Result<Attempt> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::cell::Cell;
 

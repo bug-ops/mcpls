@@ -526,7 +526,6 @@ fn process_rss(row: &ProcessRow) -> ProcessRss {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 

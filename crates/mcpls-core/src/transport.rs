@@ -43,7 +43,7 @@
 #[non_exhaustive]
 #[allow(
     clippy::large_enum_variant,
-    reason = "one `Transport` is built per process; boxing the HTTP variant would only break `Transport::Http(cfg)`"
+    reason = "fires only with `transport-http`; one `Transport` is built per process, and boxing the variant would break `Transport::Http(cfg)`"
 )]
 pub enum Transport {
     /// Standard I/O transport (default).
@@ -72,7 +72,8 @@ mod config;
 mod connection_io;
 #[cfg(feature = "transport-http")]
 mod http;
-#[cfg(all(test, feature = "transport-http"))]
+#[cfg(test)]
+#[cfg(feature = "transport-http")]
 mod http_tests;
 #[cfg(feature = "transport-http")]
 mod lease;
@@ -82,7 +83,8 @@ mod liveness;
 mod session_manager;
 mod shutdown;
 mod stdio;
-#[cfg(all(test, feature = "transport-http"))]
+#[cfg(test)]
+#[cfg(feature = "transport-http")]
 mod test_support;
 
 #[cfg(feature = "transport-http")]
@@ -124,7 +126,6 @@ fn saturating_deadline(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 

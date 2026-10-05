@@ -427,7 +427,6 @@ async fn handle_pump_exit(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod settler_tests {
     use super::*;
     use crate::bridge::WorkspaceRoots;
@@ -647,8 +646,8 @@ mod settler_tests {
     }
 }
 
-#[cfg(all(test, unix))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+#[cfg(unix)]
 mod startup_tests {
     use std::path::Path;
 
@@ -916,7 +915,6 @@ mod startup_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod init_supervision_tests {
     use std::assert_matches;
     use std::collections::HashSet;
@@ -1115,7 +1113,6 @@ mod init_supervision_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod plan_tests {
     use super::*;
     use crate::config::LspServerConfig;

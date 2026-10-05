@@ -795,7 +795,6 @@ impl ServerText for RestartServerResult {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::assert_matches;
 
@@ -1807,7 +1806,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod server_text_tests {
     use super::*;
 

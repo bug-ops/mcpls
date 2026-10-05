@@ -146,9 +146,8 @@ pub enum Capability {
     FormatRange,
 }
 
-#[allow(
+#[expect(
     clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
     reason = "compile-time check; the loop condition keeps `i` below `ALL.len()`"
 )]
 const _: () = {
@@ -1182,7 +1181,6 @@ impl Translator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;

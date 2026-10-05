@@ -1826,7 +1826,6 @@ pub fn detect_language(path: &Path, extension_map: &HashMap<String, String>) -> 
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 
@@ -2328,7 +2327,7 @@ mod tests {
             last_accessed: Instant::now(),
         };
 
-        #[allow(clippy::redundant_clone)]
+        #[allow(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
         let cloned = state.clone();
         assert_eq!(cloned.uri(), state.uri());
         assert_eq!(cloned.language_id(), state.language_id());
@@ -2363,7 +2362,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a table of extension mappings; splitting would scatter it"
+    )]
     fn test_detect_language_all_extensions() {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());

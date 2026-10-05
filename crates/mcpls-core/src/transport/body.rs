@@ -118,7 +118,6 @@ pub(super) async fn enforce_body_inactivity(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

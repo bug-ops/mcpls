@@ -296,7 +296,8 @@ impl LspServer {
     }
 
     /// Replace the config a respawn of this server would use.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn set_init_config(&mut self, config: ServerInitConfig) {
         self.init_config = config;
     }
@@ -557,7 +558,6 @@ impl LspServer {
     ///
     /// `workspace.configuration` is advertised only when `settings` are
     /// configured: without them mcpls has nothing to answer with.
-    #[allow(clippy::too_many_lines)]
     fn client_capabilities(
         position_encodings: &PositionEncodings,
         settings: Option<&LspSettings>,
@@ -708,7 +708,10 @@ impl LspServer {
 
         let params = InitializeParams {
             process_id,
-            #[allow(deprecated)]
+            #[allow(
+                deprecated,
+                reason = "`root_uri` is deprecated but the struct literal must still set it"
+            )]
             root_uri: None,
             initialization_options: config.initialization_options.clone(),
             capabilities: Self::client_capabilities(
@@ -1135,7 +1138,8 @@ pub fn fake_lsp_server_with_config(server_config: LspServerConfig) -> LspServer 
 
 /// A server whose child process (`sleep`) is alive but whose message loop
 /// dies at once on its inert transport -- the shape of a panicked loop.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub fn fake_lsp_server_with_dead_loop_and_live_child() -> LspServer {
     let child = tokio::process::Command::new("sleep")
         .arg("30")
@@ -1189,7 +1193,6 @@ impl LspServer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::collections::HashMap;
@@ -1353,7 +1356,7 @@ mod tests {
             redactions: std::sync::Arc::default(),
         };
 
-        #[allow(clippy::redundant_clone)]
+        #[allow(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
         let cloned = config.clone();
         assert_eq!(cloned.server_config.language_id, "rust");
         assert_eq!(cloned.workspace_roots.len(), 1);

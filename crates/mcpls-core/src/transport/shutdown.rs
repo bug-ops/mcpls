@@ -140,8 +140,8 @@ impl ShutdownSignal {
     }
 }
 
-#[cfg(all(test, unix))]
-#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::ShutdownSignal;
 

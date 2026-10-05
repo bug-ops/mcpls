@@ -52,7 +52,6 @@ pub mod transport;
 mod util;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod test_lsp;
 #[cfg(test)]
 mod test_support;
@@ -165,7 +164,6 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 ///     std::process::exit(exit_code);
 /// }
 /// ```
-#[allow(clippy::too_many_lines)]
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
@@ -312,7 +310,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::path::PathBuf;

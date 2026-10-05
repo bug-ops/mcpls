@@ -23,7 +23,8 @@
     clippy::unwrap_used,
     clippy::panic,
     clippy::missing_docs_in_private_items,
-    missing_docs
+    missing_docs,
+    reason = "test code; a panic is the failure signal"
 )]
 
 #[path = "common/assertions.rs"]

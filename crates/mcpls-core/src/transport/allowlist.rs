@@ -506,7 +506,6 @@ pub(super) fn effective_allowed_hosts(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -7,7 +7,8 @@
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::uninlined_format_args,
-    clippy::unnecessary_unwrap
+    clippy::unnecessary_unwrap,
+    reason = "test code; a panic is the failure signal"
 )]
 
 use std::path::Path;

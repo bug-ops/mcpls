@@ -492,7 +492,6 @@ async fn run_checked<S: AsRef<OsStr> + Sync>(command: &str, args: &[S], dir: &Pa
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

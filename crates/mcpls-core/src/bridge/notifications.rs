@@ -1628,7 +1628,6 @@ pub fn apply_lifecycle_notification(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use lsp_types::{Position, Range};
 

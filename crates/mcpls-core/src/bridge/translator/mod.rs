@@ -36,14 +36,12 @@ mod dto;
 mod edits;
 mod enclosing;
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod enclosing_tests;
 mod encoding_ctx;
 mod hierarchy;
 mod highlights;
 mod navigation;
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod prepare_range_tests;
 mod respawn;
 mod restart;
@@ -52,7 +50,6 @@ mod servers;
 mod support;
 mod symbols;
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod testing;
 mod type_hierarchy;
 
@@ -706,7 +703,6 @@ impl MergedRedactions {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::assert_matches;
     use std::collections::{HashMap, HashSet};

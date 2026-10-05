@@ -560,7 +560,6 @@ pub(super) async fn enforce_session_cap(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 
@@ -585,10 +584,10 @@ mod tests {
     /// once `max_sessions` sessions exist, the next `create_session` call
     /// fails with the capacity marker, and closing a session frees the
     /// slot back up for a subsequent `create_session` to succeed.
-    // `manager` is used until the end of the test — clippy's drop-tightening
-    // heuristic misreads that as an early-droppable temporary because
-    // `CappedSessionManager` embeds a `tokio::sync::Mutex`.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test]
     async fn test_capped_session_manager_enforces_hard_bound() {
         use rmcp::transport::streamable_http_server::session::SessionManager as _;
@@ -617,9 +616,10 @@ mod tests {
     /// this spawns `N > max_sessions` calls at once and asserts exactly
     /// `max_sessions` succeed — the one test shape that actually
     /// distinguishes the atomic-semaphore design from a TOCTOU race.
-    // `manager` is used until the end of the test — see the identical
-    // drop-tightening note on `test_capped_session_manager_enforces_hard_bound`.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test]
     async fn test_capped_session_manager_bounds_concurrent_create_session() {
         use rmcp::transport::streamable_http_server::session::SessionManager as _;
@@ -700,8 +700,10 @@ mod tests {
         assert!(activity.is_idle(tokio::time::Instant::now(), idle_secs(5)));
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_reap_idle_frees_permit_and_spares_touched_sessions() {
         let manager =
@@ -724,8 +726,10 @@ mod tests {
         assert!(manager.create_session().await.is_ok());
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_run_idle_reaper_closes_idle_session_and_stops_on_cancel() {
         let manager = std::sync::Arc::new(CappedSessionManager::new(
@@ -811,8 +815,10 @@ mod tests {
 
     /// #587: a response stream ends at its deadline, and only then does
     /// the session become reapable (after the idle timeout).
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_bounded_stream_ends_at_deadline_then_session_is_reaped() {
         use futures::StreamExt as _;
@@ -902,8 +908,10 @@ mod tests {
 
     /// #587 wiring: `create_stream` hands out a bounded stream. The tool
     /// call never completes, so only the deadline can end the stream.
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_create_stream_is_cut_at_the_response_stream_deadline() {
         use futures::StreamExt as _;
@@ -930,8 +938,10 @@ mod tests {
 
     /// #587 wiring: a request-wise `resume` (not the common channel) is
     /// bounded too.
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_request_wise_resume_is_cut_at_the_response_stream_deadline() {
         use futures::StreamExt as _;
@@ -968,8 +978,10 @@ mod tests {
             })
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_open_resume_stream_blocks_reaping() {
         let manager = quietly_probing_manager();
@@ -979,8 +991,10 @@ mod tests {
         serving.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_open_post_stream_blocks_reaping() {
         let manager =
@@ -995,8 +1009,10 @@ mod tests {
         serving.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_open_standalone_stream_blocks_reaping() {
         let manager = quietly_probing_manager();
@@ -1075,8 +1091,10 @@ mod tests {
 
     /// #573: rmcp's own `keep_alive` must not end a session whose client
     /// answers probes on an open GET stream.
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_answering_get_listener_outlives_rmcp_keep_alive() {
         let (manager, id, serving) = probed_session().await;
@@ -1093,8 +1111,10 @@ mod tests {
 
     /// With probing off, an open GET stream no longer holds a session: a
     /// quiet peer that may have vanished expires within the idle timeout.
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_disabled_liveness_get_stream_does_not_block_reaping() {
         let manager =
@@ -1108,8 +1128,10 @@ mod tests {
         serving.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_primary_timeout_closes_standalone_stream_and_clears_shadows() {
         let (manager, id, serving) = probed_session().await;
@@ -1131,8 +1153,10 @@ mod tests {
         serving.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_shadow_timeout_leaves_primary_stream_open() {
         let (manager, id, serving) = probed_session().await;
@@ -1154,8 +1178,10 @@ mod tests {
         serving.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_wedged_session_does_not_block_stream_end() {
         use futures::StreamExt as _;
@@ -1178,8 +1204,10 @@ mod tests {
         serving.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_ack_from_another_session_is_ignored_by_manager() {
         let manager = probing_manager(PROBE_STEP, PROBE_STEP * 2);
@@ -1196,8 +1224,10 @@ mod tests {
         serving_b.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_probe_replies_are_consumed_and_other_messages_forwarded() {
         let manager = probing_manager(PROBE_STEP, PROBE_STEP * 2);
@@ -1231,8 +1261,10 @@ mod tests {
         );
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_disabled_liveness_never_pings_or_ends_stream() {
         use futures::StreamExt as _;
@@ -1249,8 +1281,10 @@ mod tests {
         serving.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_request_wise_resume_is_not_tracked_as_standalone_stream() {
         let (manager, id, serving) = probed_session().await;
@@ -1264,8 +1298,10 @@ mod tests {
         serving.abort();
     }
 
-    // `manager` lives to the end of the test.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
     #[tokio::test(start_paused = true)]
     async fn test_probing_fails_closed_when_session_slot_is_gone() {
         let (manager, id, serving) = probed_session().await;

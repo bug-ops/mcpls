@@ -1436,7 +1436,6 @@ impl Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 
@@ -1860,7 +1859,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn test_error_from_json() {
         let json_str = "{invalid json}";
         let json_err = serde_json::from_str::<serde_json::Value>(json_str).unwrap_err();
@@ -1869,7 +1867,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn test_error_from_toml_de() {
         let toml_str = "[invalid toml";
         let toml_err = toml::from_str::<toml::Value>(toml_str).unwrap_err();

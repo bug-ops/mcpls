@@ -292,7 +292,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ConnectionIo<T> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::time::Duration;

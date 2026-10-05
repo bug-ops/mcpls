@@ -100,7 +100,7 @@ pub async fn diagnostics_pump(
 
 /// [`diagnostics_pump`] over a caller-supplied path resolver, so tests can
 /// inject a slow or hanging canonicalizer.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "internal test seam; each parameter is a distinct per-server input"
 )]
@@ -395,7 +395,6 @@ impl bridge::NotificationWiring for PumpWiring {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod pump_tests {
     use std::assert_matches;
     use std::time::Duration;

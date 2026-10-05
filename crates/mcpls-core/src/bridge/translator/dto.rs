@@ -143,7 +143,6 @@ impl Position {
 
     /// Builds a fixture position, panicking on an invalid one.
     #[cfg(test)]
-    #[allow(clippy::expect_used)]
     pub(crate) fn at(line: u32, character: u32) -> Self {
         Self::from_client(line, character).expect("fixture position is valid")
     }
@@ -277,7 +276,10 @@ pub struct Location {
 ///
 /// Takes `&bool` rather than `bool` because serde's `skip_serializing_if`
 /// always calls the predicate with a field reference.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `skip_serializing_if` requires `fn(&T) -> bool`"
+)]
 const fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -497,8 +499,10 @@ impl DroppedEdits {
     }
 }
 
-// Signature required by `#[serde(skip_serializing_if = "is_zero")]` on a `usize` field.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `skip_serializing_if` requires `fn(&T) -> bool`"
+)]
 const fn is_zero(count: &usize) -> bool {
     *count == 0
 }
@@ -1480,7 +1484,6 @@ impl ServerText for DocumentHighlightsResult {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

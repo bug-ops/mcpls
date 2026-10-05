@@ -103,7 +103,7 @@ impl McpTool {
     ];
 
     /// Byte length of the longest unprefixed tool name.
-    #[allow(
+    #[expect(
         clippy::indexing_slicing,
         reason = "the loop condition keeps `i` below `ALL.len()`"
     )]
@@ -286,7 +286,7 @@ impl ToolRoutes {
 /// One route of a tool in the report: the languages sharing this support
 /// status (absent for workspace-wide tools) and the status itself.
 #[derive(JsonSchema)]
-#[allow(
+#[expect(
     dead_code,
     reason = "describes the wire shape for schema generation only"
 )]
@@ -397,7 +397,6 @@ impl ServerText for ToolSupportReport {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

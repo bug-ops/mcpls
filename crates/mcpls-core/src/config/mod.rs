@@ -560,7 +560,10 @@ fn language_id_for_pattern_extension(server_language_id: &LanguageId, extension:
 ///
 /// Returns all built-in language extensions that MCPLS recognizes by default.
 /// These mappings are used when no custom configuration is provided.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a flat table of built-in extension mappings"
+)]
 fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
     vec![
         LanguageExtensionMapping {
@@ -1274,7 +1277,6 @@ impl Default for ServerConfig {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::{assert_matches, fs};
 

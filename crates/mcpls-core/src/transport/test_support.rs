@@ -1,7 +1,5 @@
 //! Constants shared by the HTTP transport's session-manager and end-to-end tests.
 
-#![allow(clippy::unwrap_used)]
-
 /// Idle timeout short enough for a test to see a session reaped.
 pub const TEST_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 

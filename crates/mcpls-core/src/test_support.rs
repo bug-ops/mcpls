@@ -20,7 +20,6 @@ pub struct CwdGuard {
 }
 
 impl CwdGuard {
-    #[allow(clippy::unwrap_used)]
     pub fn enter(dir: &Path) -> Self {
         let lock = CWD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let original_dir = std::env::current_dir().unwrap();
@@ -43,14 +42,12 @@ impl Drop for CwdGuard {
         // instead, since that's exactly the failure mode this guard
         // exists to prevent.
         if !std::thread::panicking() {
-            #[allow(clippy::expect_used)]
             restored.expect("CwdGuard failed to restore original working directory");
         }
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::CwdGuard;
 

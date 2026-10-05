@@ -244,7 +244,6 @@ pub(super) async fn attach_listen_lease(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use proptest::prelude::*;
 

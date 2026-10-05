@@ -190,11 +190,10 @@ fn rmcp_service_config(
 /// listener themselves and know the exact address before serving starts.
 /// `cfg.bind` is ignored; the listener's local address is authoritative.
 /// Shutdown behavior is documented on [`run_http`].
-// `session_manager` and `service` are moved into `app`, which is served until
-// shutdown — clippy's drop-tightening heuristic misreads that as an
-// early-droppable temporary because both types embed `tokio::sync` lock types
-// (`CappedSessionManager`'s `Mutex`, `StreamableHttpService`'s `RwLock`s).
-#[allow(clippy::significant_drop_tightening)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "moved into `app` and served until shutdown; the lint misreads the embedded lock types as early-droppable"
+)]
 pub async fn serve_http(
     listener: tokio::net::TcpListener,
     mcp_server: crate::mcp::McplsServer,
@@ -467,7 +466,6 @@ pub(super) const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

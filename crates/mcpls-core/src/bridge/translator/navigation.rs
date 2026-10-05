@@ -359,7 +359,7 @@ impl GotoParams for lsp_types::DeclarationParams {
 /// support would silently discard hover text from those servers, so this
 /// (and `marked_string_to_string`) carry a narrow, scoped allow rather than
 /// rewriting to `MarkupContent`-only.
-#[allow(deprecated)]
+#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
 fn extract_hover_contents(contents: lsp_types::Contents) -> String {
     match contents {
         lsp_types::Contents::MarkedString(marked_string) => marked_string_to_string(marked_string),
@@ -373,7 +373,7 @@ fn extract_hover_contents(contents: lsp_types::Contents) -> String {
 }
 
 /// Convert a marked string to a plain string.
-#[allow(deprecated)]
+#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
 fn marked_string_to_string(marked: lsp_types::MarkedString) -> String {
     match marked {
         lsp_types::MarkedString::String(s) => s,
@@ -779,7 +779,7 @@ impl Translator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
+#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;

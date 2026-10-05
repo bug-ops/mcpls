@@ -717,7 +717,7 @@ impl<T: ServerText> ServerText for Addressed<T> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
+#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
 mod tests {
     use super::*;
 
@@ -953,7 +953,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod resolver_tests {
     use std::sync::Arc;
     use std::{assert_matches, fs};
@@ -1454,7 +1453,6 @@ mod resolver_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod server_text_tests {
     use super::*;
     use crate::bridge::translator::dto::HoverResult;

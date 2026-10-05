@@ -162,7 +162,6 @@ async fn drain<R: AsyncRead + Unpin>(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

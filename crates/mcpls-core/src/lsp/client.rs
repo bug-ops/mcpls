@@ -1433,7 +1433,6 @@ impl<'a> ConfigurationItem<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
 
@@ -1572,7 +1571,7 @@ mod tests {
         let config = LspServerConfig::rust_analyzer();
         let client = LspClient::new(config);
 
-        #[allow(clippy::redundant_clone)]
+        #[allow(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
         let cloned = client.clone();
         assert_eq!(cloned.language_id(), "rust");
 

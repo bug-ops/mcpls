@@ -411,7 +411,6 @@ mod tests {
     }
 
     #[cfg(feature = "transport-http")]
-    #[allow(clippy::unwrap_used)]
     mod http_transport_tests {
         use std::net::SocketAddr;
 

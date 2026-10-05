@@ -356,7 +356,6 @@ pub async fn resolve_one(uri: &Uri, roots: &WorkspaceRoots) -> Option<PublishedD
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::assert_matches;
     use std::sync::Mutex;
