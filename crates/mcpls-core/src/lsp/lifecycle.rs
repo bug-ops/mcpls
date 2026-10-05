@@ -1001,7 +1001,7 @@ async fn contain(
                 server_id,
                 command,
                 started.elapsed(),
-                crate::panic_message(payload.as_ref())
+                crate::util::panic_message(payload.as_ref())
             );
             StartupFailure::InitTaskPanicked
         }

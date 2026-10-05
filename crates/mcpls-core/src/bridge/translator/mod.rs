@@ -66,9 +66,9 @@ pub use enclosing::{
     EnrichmentSummary, NotComputedReason, ResultContext, SymbolFidelity, UnavailableReason,
 };
 pub use restart::{
-    MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NotificationReceivers, NotificationWiring,
-    RestartFailure, RestartOutcome, RestartServerResult, RestartTarget, ServerIds, ServerIdsError,
-    ServerRestartEntry,
+    DiagnosticsRole, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NotificationReceivers,
+    NotificationWiring, RestartFailure, RestartOutcome, RestartServerResult, RestartTarget,
+    ServerIds, ServerIdsError, ServerRestartEntry,
 };
 pub use routing::Capability;
 pub use support::{RouteSupport, ToolSupportSnapshot};

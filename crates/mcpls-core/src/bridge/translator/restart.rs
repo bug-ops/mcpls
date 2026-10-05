@@ -21,7 +21,6 @@ use tokio::task::AbortHandle;
 use super::Translator;
 use super::respawn::BackoffPolicy;
 use super::servers::{Backend, Phase};
-use crate::DiagnosticsRole;
 use crate::bridge::{DiagnosticsKey, IndexingState, lock_std};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
@@ -313,6 +312,37 @@ pub(super) enum NotificationRouting<'a> {
     Discard,
     /// Re-wire the diagnostics pump (manual restart).
     Pump(&'a dyn NotificationWiring),
+}
+
+/// Whether a server's `publishDiagnostics` pushes are the ones the cache
+/// keeps for its language -- see #174 section 8.
+///
+/// The role is re-evaluated whenever a server settles: a catch-all that
+/// registered as `Secondary` becomes `Authoritative` when the explicit
+/// diagnostics server for its language fails afterwards. Pushes the catch-all
+/// made while it was `Secondary` are not replayed; the cache fills with its
+/// next publish for each file (the next `didOpen`/`didChange`). A file nobody
+/// opens may never get one, since mcpls sends no `didSave`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticsRole {
+    /// The server is the language's diagnostics route: its pushes are cached
+    /// and subscribers are notified.
+    Authoritative,
+    /// Another server owns the language's diagnostics (or none does): pushes
+    /// are skipped so they cannot overwrite or spuriously notify about the
+    /// owner's entries.
+    Secondary,
+}
+
+impl DiagnosticsRole {
+    /// The role of a server that is, or is not, the language's diagnostics route.
+    pub(crate) const fn from_route(is_diagnostics_route: bool) -> Self {
+        if is_diagnostics_route {
+            Self::Authoritative
+        } else {
+            Self::Secondary
+        }
+    }
 }
 
 /// The part of notification handling that lives in `serve_with`'s scope
@@ -847,7 +877,6 @@ mod tests {
         use tokio::sync::{Mutex, watch};
 
         use super::*;
-        use crate::PumpShared;
         use crate::bridge::translator::clock::{Clock, FakeClock};
         use crate::bridge::translator::testing::{
             stub_server_config, write_crash_after_init_script, write_protocol_server_script,
@@ -857,6 +886,7 @@ mod tests {
         use crate::config::{LanguageId, ToolRouter};
         use crate::error::{ServerSpawnFailure, StartupFailure};
         use crate::mcp::SubscriptionRegistry;
+        use crate::runtime::pump::{PumpShared, PumpWiring};
 
         struct Fixture {
             translator: Arc<Translator>,
@@ -899,14 +929,14 @@ mod tests {
             translator.register_server_complete(server);
 
             let (cancel, cancel_rx) = watch::channel(false);
-            let wiring = crate::PumpWiring {
-                shared: PumpShared {
+            let wiring = PumpWiring::new(
+                PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: SubscriptionRegistry::new(),
                     workspace_roots: translator.workspace_roots.clone(),
                 },
                 cancel_rx,
-            };
+            );
             let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Authoritative);
             translator.set_notification_task(&id, pump);
             if wired {
@@ -1462,14 +1492,14 @@ mod tests {
                 WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
             );
             let (_cancel, cancel_rx) = watch::channel(false);
-            let wiring = crate::PumpWiring {
-                shared: PumpShared {
+            let wiring = PumpWiring::new(
+                PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: SubscriptionRegistry::new(),
                     workspace_roots: translator.workspace_roots.clone(),
                 },
                 cancel_rx,
-            };
+            );
             let mut logs = Vec::new();
             for index in 0..6 {
                 let name = format!("s{index}");

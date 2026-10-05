@@ -1445,7 +1445,7 @@ async fn contain_panic<T>(
         Err(payload) => {
             tracing::error!(
                 "{operation} handler panicked: {}",
-                crate::panic_message(payload.as_ref())
+                crate::util::panic_message(payload.as_ref())
             );
             Err(McpError::internal_error(
                 format!("{operation} handler panicked"),

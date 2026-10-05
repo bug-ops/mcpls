@@ -1443,6 +1443,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_all_servers_failed_to_init_error() {
+        let failures = vec![
+            ServerSpawnFailure {
+                server_id: ServerId::from("rust"),
+                language_id: LanguageId::from_static("rust"),
+                command: "rust-analyzer".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
+            },
+            ServerSpawnFailure {
+                server_id: ServerId::from("python"),
+                language_id: LanguageId::from_static("python"),
+                command: "pyright".to_string(),
+                reason: StartupFailure::InitTaskPanicked,
+            },
+        ];
+
+        let err = Error::AllServersFailedToInit { failures };
+
+        assert!(err.to_string().contains("all LSP servers failed"));
+
+        // Verify failures are preserved
+        if let Error::AllServersFailedToInit { failures: f } = err {
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[0].language_id, "rust");
+            assert_eq!(f[1].language_id, "python");
+        } else {
+            panic!("Expected AllServersFailedToInit error");
+        }
+    }
+
+    #[test]
+    fn test_server_spawn_failure_display_names_init_panic() {
+        let failure = ServerSpawnFailure {
+            server_id: ServerId::from("typescript"),
+            language_id: LanguageId::from_static("typescript"),
+            command: "tsserver".to_string(),
+            reason: StartupFailure::InitTaskPanicked,
+        };
+
+        let display = failure.to_string();
+        assert!(display.contains("typescript"));
+        assert!(display.contains("tsserver"));
+        assert!(display.contains("panicked"));
+    }
+
+    #[test]
     fn test_ambiguity_display_lists_at_most_ten_candidates_and_the_hint() {
         let candidates: Vec<SymbolCandidate> = (1..=12)
             .map(|line| SymbolCandidate {

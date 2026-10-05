@@ -6,6 +6,8 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::string::FromUtf8Error;
 
+use tokio::task::JoinHandle;
+
 /// Byte cap for a bounded read against a `max`-byte size limit: `max + 1`
 /// when `max` is a real limit, so a read that reaches the cap is known to
 /// have exceeded it, or unbounded (`u64::MAX`) when `max == 0`, the
@@ -231,6 +233,27 @@ pub fn escape_control(s: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(escaped)
+}
+
+/// Aborts the wrapped [`JoinHandle`] when dropped, including on an unwind out
+/// of the enclosing scope -- unlike a bare `.abort()` call placed at the end
+/// of a function body, which is skipped if that scope is left early (a
+/// panic, or a future `?` added above it).
+pub struct AbortOnDrop<'a, T>(pub(crate) &'a JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<'_, T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Best-effort text of a panic payload, for logging.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 #[cfg(test)]

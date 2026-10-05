@@ -905,7 +905,7 @@ impl LspClient {
         let (reader_handle, mut msg_rx) = spawn_reader_task(reader);
         let result = {
             // Aborts the reader task the instant `message_loop_inner` returns, even via `?` (#451).
-            let _abort_reader_on_drop = crate::AbortOnDrop(&reader_handle);
+            let _abort_reader_on_drop = crate::util::AbortOnDrop(&reader_handle);
             Self::message_loop_inner(
                 &mut transport,
                 &mut msg_rx,
